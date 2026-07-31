@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Смета — Трапеза</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div class="doc" id="doc"><p class="muted center">Загружаем смету…</p></div>
+
+<div class="doc-actions no-print" id="actions" hidden>
+  <button class="btn" id="btnPrint" type="button">📄 Скачать PDF / печать</button>
+  <a class="btn btn-ghost" id="btnEdit" href="#">✏️ Изменить заказ</a>
+  <a class="btn btn-ghost" id="btnSend" href="#" target="_blank" rel="noopener">💬 Отправить нам</a>
+</div>
+
+<script src="/app.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const code = location.pathname.split('/').pop();
+
+async function init() {
+  const { order, totals, settings } = await getJSON('/api/orders/' + code);
+  document.title = `Смета № ${order.number} — ${settings.brand || 'Трапеза'}`;
+  render(order, totals, settings);
+
+  $('actions').hidden = false;
+  $('btnPrint').onclick = () => window.print();
+  $('btnEdit').href = '/?edit=' + encodeURIComponent(code);
+
+  const msg = `Здравствуйте! Отправляю смету № ${order.number} на ${order.guests} `
+    + `${plural(order.guests, 'гостя', 'гостей', 'гостей')}, `
+    + `итого ${rub(totals.grandTotal)}. Ссылка: ${location.href}`;
+  $('btnSend').href = `https://wa.me/${settings.phone_digits || ''}?text=${encodeURIComponent(msg)}`;
+  renderContactFab(settings, msg);
+}
+
+function render(order, totals, s) {
+  const hasTbd = order.items.some((i) => i.price_tbd);
+  let n = 0;
+  const rows = order.items.map((it) => {
+    n += 1;
+    const photo = it.photo
+      ? `<img src="/photos/${encodeURIComponent(it.photo)}" alt="${esc(it.name)}">`
+      : '<div class="photo-ph">фото блюда</div>';
+    const price = it.price_tbd ? 'уточн.' : money(it.price);
+    const sum = it.price_tbd ? '—' : money(it.qty * it.price);
+    return `<tr>
+      <td class="num">${n}</td>
+      <td class="name">${esc(it.name)}</td>
+      <td>${esc(it.unit || '')}</td>
+      <td class="qty-c">${it.qty}</td>
+      <td class="money">${price}</td>
+      <td class="money">${sum}</td>
+      <td class="photo-c">${photo}</td>
+    </tr>`;
+  }).join('');
+
+  const transportRow = totals.transport
+    ? `<tr class="subtotal"><td colspan="5" class="right">Транспортные расходы:</td>
+        <td class="money">${money(totals.transport)}</td><td></td></tr>`
+    : '';
+
+  $('doc').innerHTML = `
+  <div class="doc-head">
+    <div>
+      <div class="brand-name" style="color:var(--brown)">${esc(s.brand || 'Трапеза')}</div>
+      <div class="brand-sub">${esc(s.org_name || '')}</div>
+    </div>
+    <div class="brand-right">
+      <div class="brand-phone">${esc(s.phone || '')}</div>
+      <div class="brand-slogan">${esc(s.slogan || '')}</div>
+    </div>
+  </div>
+  <div class="doc-rule"></div>
+
+  <h1 class="doc-title">СМЕТА</h1>
+  <p class="doc-sub">${esc(order.title || '')}</p>
+
+  <table class="info">
+    <tr>
+      <td class="k">Заказчик:</td><td>${esc(order.client_name || '—')}</td>
+      <td class="k">Дата:</td><td>${esc(dateRu(order.event_date) || dateRu(order.created_at.slice(0, 10)))}</td>
+    </tr>
+    <tr>
+      <td class="k">Кол-во гостей:</td><td>${order.guests} ${plural(order.guests, 'человек', 'человека', 'человек')}</td>
+      <td class="k">Смета №:</td><td>${order.number}</td>
+    </tr>
+    <tr>
+      <td class="k">Место проведения:</td><td colspan="3">${esc(order.place || '—')}</td>
+    </tr>
+  </table>
+
+  <table class="menu">
+    <thead>
+      <tr>
+        <th style="width:36px">№</th>
+        <th>Наименование</th>
+        <th style="width:60px">Выход</th>
+        <th style="width:56px">Кол-во</th>
+        <th style="width:80px">Цена, руб.</th>
+        <th style="width:92px">Сумма, руб.</th>
+        <th style="width:100px">Фото</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows}
+      <tr class="subtotal">
+        <td colspan="5" class="right">ИТОГО по меню:</td>
+        <td class="money">${money(totals.menuTotal)}</td><td></td>
+      </tr>
+      ${transportRow}
+      <tr class="total">
+        <td colspan="5" class="right">ВСЕГО К ОПЛАТЕ:</td>
+        <td class="money">${money(totals.grandTotal)}</td><td></td>
+      </tr>
+    </tbody>
+  </table>
+
+  ${hasTbd ? '<p class="doc-note">* Цена по позициям, отмеченным «уточн.», уточняется и в итог пока не включена.</p>' : ''}
+  ${order.comment ? `<p class="doc-note"><b>Комментарий заказчика:</b> ${esc(order.comment)}</p>` : ''}
+  <p class="doc-note">${esc(s.smeta_note || '')}</p>
+
+  <div class="doc-signs">
+    <div>Исполнитель&nbsp; /&nbsp; ${esc(s.signer || '')}</div>
+    <div>Заказчик&nbsp; /&nbsp; ${esc(order.client_name || '____________')}</div>
+  </div>
+  <p class="doc-foot">* Фотографии блюд носят ознакомительный характер.</p>`;
+}
+
+init().catch((e) => {
+  $('doc').innerHTML = `<p class="notice">Не удалось открыть смету: ${esc(e.message)}</p>`;
+});
+</script>
+</body>
+</html>

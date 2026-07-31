@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Трапеза — соберите свой кофе-брейк</title>
+<meta name="description" content="Кейтеринг «Трапеза», Ижевск. Выберите блюда — получите готовую смету.">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div id="header"></div>
+
+<div class="wrap">
+  <div class="hero">
+    <h1>Соберите свой кофе-брейк</h1>
+    <p>Отметьте блюда и укажите количество гостей — мы сразу посчитаем стоимость
+       и оформим фирменную смету. Её можно сохранить, изменить или отправить нам.</p>
+  </div>
+
+  <div class="guests-bar">
+    <label for="guests">Количество гостей</label>
+    <input type="number" id="guests" min="1" max="1000" value="15" inputmode="numeric">
+    <button class="btn btn-ghost btn-sm" id="applyGuests" type="button">
+      Проставить всем позициям
+    </button>
+    <span class="muted" id="guestsHint" style="font-size:13px"></span>
+  </div>
+
+  <div id="menu"></div>
+
+  <div class="cartbar" id="cartbar">
+    <div>
+      <div class="sum" id="cartSum">0,00 руб.</div>
+      <div class="cnt" id="cartCnt">ничего не выбрано</div>
+    </div>
+    <button class="btn" id="checkout" type="button" disabled>Оформить смету →</button>
+  </div>
+</div>
+
+<div class="overlay" id="formOverlay" hidden>
+  <div class="modal">
+    <h2>Оформление сметы</h2>
+    <div class="field">
+      <label for="fName">Ваше имя *</label>
+      <input id="fName" placeholder="Как к вам обращаться" autocomplete="name">
+    </div>
+    <div class="grid-2">
+      <div class="field">
+        <label for="fPhone">Телефон *</label>
+        <input id="fPhone" placeholder="+7 ___ ___-__-__" inputmode="tel" autocomplete="tel">
+      </div>
+      <div class="field">
+        <label for="fDate">Дата мероприятия</label>
+        <input id="fDate" type="date">
+      </div>
+    </div>
+    <div class="field">
+      <label for="fPlace">Место проведения</label>
+      <input id="fPlace" placeholder="Адрес или название площадки">
+    </div>
+    <div class="field">
+      <label for="fComment">Комментарий</label>
+      <textarea id="fComment" rows="3" placeholder="Пожелания, аллергии, время подачи…"></textarea>
+    </div>
+    <p class="muted" style="font-size:13px">
+      Смета носит предварительный характер — менеджер свяжется с вами для подтверждения.
+    </p>
+    <div id="formError" class="notice" style="display:none;margin-bottom:12px"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap">
+      <button class="btn btn-ghost" id="formCancel" type="button">Отмена</button>
+      <button class="btn" id="formSubmit" type="button">Получить смету</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+<script>
+let SETTINGS = {};
+let MENU = [];
+const picked = new Map();          // id -> количество порций
+let editCode = null;               // если вернулись править существующую смету
+
+const $ = (id) => document.getElementById(id);
+
+async function init() {
+  const data = await getJSON('/api/bootstrap');
+  SETTINGS = data.settings;
+  MENU = data.menu;
+  $('header').innerHTML = brandHeader(SETTINGS);
+  document.title = `${SETTINGS.brand || 'Трапеза'} — соберите свой кофе-брейк`;
+  renderContactFab(SETTINGS);
+
+  // Возврат из сметы для правки
+  const params = new URLSearchParams(location.search);
+  if (params.get('edit')) await preload(params.get('edit'));
+
+  renderMenu();
+  recalc();
+}
+
+/** Подтягиваем ранее собранный заказ, чтобы клиент мог его изменить. */
+async function preload(code) {
+  try {
+    const { order } = await getJSON('/api/orders/' + code);
+    editCode = code;
+    $('guests').value = order.guests || 15;
+    const byName = new Map(MENU.map((m) => [m.name, m]));
+    for (const it of order.items) {
+      const m = byName.get(it.name);
+      if (m) picked.set(m.id, Number(it.qty) || 0);
+    }
+    $('fName').value = order.client_name || '';
+    $('fPhone').value = order.phone || '';
+    $('fDate').value = order.event_date || '';
+    $('fPlace').value = order.place || '';
+    $('fComment').value = order.comment || '';
+    $('guestsHint').textContent = `Правим смету № ${order.number}`;
+  } catch (e) {
+    console.warn('Не удалось загрузить смету для правки:', e.message);
+  }
+}
+
+function renderMenu() {
+  const cats = [];
+  for (const m of MENU) if (!cats.includes(m.category)) cats.push(m.category);
+  $('menu').innerHTML = cats.map((cat) => `
+    <h2 class="cat-title">${esc(cat)}</h2>
+    <div class="dishes">
+      ${MENU.filter((m) => m.category === cat).map(dishCard).join('')}
+    </div>`).join('');
+}
+
+// Обработчики вешаем один раз — карточки перерисовываются внутри контейнера.
+$('menu').addEventListener('click', onMenuClick);
+$('menu').addEventListener('input', onMenuInput);
+
+function dishCard(m) {
+  const qty = picked.get(m.id) || 0;
+  const photo = m.photo
+    ? `<div class="dish-photo" style="background-image:url('/photos/${encodeURIComponent(m.photo)}')"></div>`
+    : '<div class="dish-photo empty"></div>';
+  const price = m.price_tbd
+    ? '<span class="badge badge-tbd">цена уточняется</span>'
+    : `<span class="dish-price">${money(m.price)} ₽</span>`;
+  const control = qty > 0
+    ? `<button type="button" data-act="dec" data-id="${m.id}" aria-label="Меньше">−</button>
+       <input type="number" min="0" value="${qty}" data-act="set" data-id="${m.id}" inputmode="numeric">
+       <button type="button" data-act="inc" data-id="${m.id}" aria-label="Больше">+</button>`
+    : `<button type="button" class="btn btn-ghost btn-sm add" data-act="add" data-id="${m.id}">
+         Выбрать
+       </button>`;
+  return `
+  <div class="dish ${qty > 0 ? 'picked' : ''}" data-card="${m.id}">
+    ${photo}
+    <div class="dish-body">
+      <div class="dish-name">${esc(m.name)}</div>
+      <div class="dish-meta">
+        <span class="dish-unit">${esc(m.unit || '')}</span>
+        ${price}
+      </div>
+      <div class="qty">${control}</div>
+    </div>
+  </div>`;
+}
+
+function onMenuClick(e) {
+  const btn = e.target.closest('[data-act]');
+  if (!btn || btn.tagName === 'INPUT') return;
+  const id = Number(btn.dataset.id);
+  const act = btn.dataset.act;
+  const cur = picked.get(id) || 0;
+  if (act === 'add') picked.set(id, Number($('guests').value) || 1);
+  else if (act === 'inc') picked.set(id, cur + 1);
+  else if (act === 'dec') { if (cur <= 1) picked.delete(id); else picked.set(id, cur - 1); }
+  else return;
+  refreshCard(id);
+  recalc();
+}
+
+function onMenuInput(e) {
+  const input = e.target.closest('input[data-act="set"]');
+  if (!input) return;
+  const id = Number(input.dataset.id);
+  const v = Math.max(0, Number(input.value) || 0);
+  if (v === 0) { picked.delete(id); refreshCard(id); } else { picked.set(id, v); }
+  recalc();
+}
+
+function refreshCard(id) {
+  const el = document.querySelector(`[data-card="${id}"]`);
+  const m = MENU.find((x) => x.id === id);
+  if (el && m) el.outerHTML = dishCard(m);
+}
+
+function selectedItems() {
+  const out = [];
+  for (const m of MENU) {
+    const qty = picked.get(m.id);
+    if (qty > 0) {
+      out.push({ name: m.name, unit: m.unit, qty, price: m.price, price_tbd: m.price_tbd, photo: m.photo });
+    }
+  }
+  return out;
+}
+
+function recalc() {
+  const items = selectedItems();
+  const total = items.reduce((s, it) => s + (it.price_tbd ? 0 : it.qty * it.price), 0);
+  const tbd = items.filter((i) => i.price_tbd).length;
+  $('cartSum').textContent = rub(total);
+  $('cartCnt').textContent = items.length === 0
+    ? 'ничего не выбрано'
+    : `${items.length} ${plural(items.length, 'позиция', 'позиции', 'позиций')}`
+      + (tbd ? ` · ${tbd} по запросу` : '') + ' · без транспортных расходов';
+  $('checkout').disabled = items.length === 0;
+}
+
+$('applyGuests').onclick = () => {
+  const g = Math.max(1, Number($('guests').value) || 1);
+  for (const id of picked.keys()) picked.set(id, g);
+  renderMenu();
+  recalc();
+};
+
+$('checkout').onclick = () => { $('formOverlay').hidden = false; $('fName').focus(); };
+$('formCancel').onclick = () => { $('formOverlay').hidden = true; };
+$('formOverlay').addEventListener('click', (e) => {
+  if (e.target === $('formOverlay')) $('formOverlay').hidden = true;
+});
+
+$('formSubmit').onclick = async () => {
+  const err = $('formError');
+  const name = $('fName').value.trim();
+  const phone = $('fPhone').value.trim();
+  if (!name || !phone) {
+    err.textContent = 'Заполните имя и телефон — без них мы не сможем с вами связаться.';
+    err.style.display = 'block';
+    return;
+  }
+  err.style.display = 'none';
+  const btn = $('formSubmit');
+  btn.disabled = true;
+  btn.textContent = 'Отправляем…';
+  const guests = Math.max(1, Number($('guests').value) || 1);
+  const payload = {
+    title: `Кофе-брейк на ${guests} ${plural(guests, 'человека', 'человек', 'человек')}`,
+    client_name: name, phone, event_date: $('fDate').value,
+    place: $('fPlace').value.trim(), guests, comment: $('fComment').value.trim(),
+    items: selectedItems(),
+  };
+  try {
+    if (editCode) {
+      await putJSON('/api/orders/' + editCode, payload);
+      location.href = '/s/' + editCode;
+    } else {
+      const { code } = await postJSON('/api/orders', payload);
+      location.href = '/s/' + code;
+    }
+  } catch (e) {
+    err.textContent = e.message;
+    err.style.display = 'block';
+    btn.disabled = false;
+    btn.textContent = 'Получить смету';
+  }
+};
+
+init().catch((e) => {
+  document.body.innerHTML = `<div class="wrap"><p class="notice">Не удалось загрузить меню: ${esc(e.message)}</p></div>`;
+});
+</script>
+</body>
+</html>

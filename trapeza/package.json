@@ -1,0 +1,14 @@
+{
+  "name": "trapeza",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Трапеза — приём заказов, сметы и акты сверок",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "seed": "node seed.js"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0"
+  }
+}

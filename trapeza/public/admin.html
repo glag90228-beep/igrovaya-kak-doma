@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Трапеза — панель управления</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div id="header"></div>
+
+<!-- вход -->
+<div class="wrap" id="loginBox" hidden>
+  <div class="card" style="max-width:380px;margin:60px auto;padding:24px">
+    <h2 style="margin-top:0;color:var(--dark)">Вход в панель</h2>
+    <div class="field">
+      <label for="pw">Пароль</label>
+      <input type="password" id="pw" autocomplete="current-password">
+    </div>
+    <div class="notice" id="loginErr" style="display:none;margin-bottom:12px"></div>
+    <button class="btn" id="loginBtn" style="width:100%">Войти</button>
+  </div>
+</div>
+
+<!-- панель -->
+<div class="wrap" id="panel" hidden>
+  <div class="tabs">
+    <button data-tab="orders" class="on">Заявки</button>
+    <button data-tab="menu">Меню и цены</button>
+    <button data-tab="akt">Сверки</button>
+    <button data-tab="settings">Реквизиты</button>
+  </div>
+
+  <section id="tab-orders"></section>
+  <section id="tab-menu" hidden></section>
+  <section id="tab-akt" hidden></section>
+  <section id="tab-settings" hidden></section>
+</div>
+
+<script src="/app.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+let SETTINGS = {};
+let CPS = [];
+let curCp = null;
+
+// ------------------------------------------------- вход
+
+async function boot() {
+  const { settings } = await getJSON('/api/bootstrap');
+  SETTINGS = settings;
+  $('header').innerHTML = brandHeader(settings);
+  const { authorized } = await getJSON('/api/login');
+  if (authorized) showPanel(); else $('loginBox').hidden = false;
+}
+
+$('loginBtn').onclick = async () => {
+  try {
+    await postJSON('/api/login', { password: $('pw').value });
+    $('loginBox').hidden = true;
+    showPanel();
+  } catch (e) {
+    $('loginErr').textContent = e.message;
+    $('loginErr').style.display = 'block';
+  }
+};
+$('pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('loginBtn').click(); });
+
+function showPanel() {
+  $('panel').hidden = false;
+  loadOrders();
+}
+
+document.querySelectorAll('.tabs button').forEach((b) => {
+  b.onclick = () => {
+    document.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('on', x === b));
+    ['orders', 'menu', 'akt', 'settings'].forEach((t) => { $('tab-' + t).hidden = (t !== b.dataset.tab); });
+    if (b.dataset.tab === 'orders') loadOrders();
+    if (b.dataset.tab === 'menu') loadMenu();
+    if (b.dataset.tab === 'akt') loadCps();
+    if (b.dataset.tab === 'settings') loadSettings();
+  };
+});
+
+// ------------------------------------------------- заявки
+
+const STATUSES = ['новая', 'в работе', 'согласована', 'отменена'];
+
+async function loadOrders() {
+  const { orders } = await getJSON('/api/admin/orders');
+  const el = $('tab-orders');
+  if (!orders.length) {
+    el.innerHTML = '<p class="notice">Заявок пока нет. Они появятся здесь, как только клиент оформит смету на сайте.</p>';
+    return;
+  }
+  const fresh = orders.filter((o) => o.status === 'новая').length;
+  el.innerHTML = `
+    <div class="stat">
+      <div><div class="lbl">Всего заявок</div><div class="val">${orders.length}</div></div>
+      <div><div class="lbl">Новых</div><div class="val">${fresh}</div></div>
+    </div>
+    ${orders.map(orderCard).join('')}`;
+}
+
+function orderCard(o) {
+  const rows = o.items.map((it, i) => `
+    <tr data-oi="${o.id}">
+      <td class="center">${i + 1}</td>
+      <td><input value="${esc(it.name)}" data-f="name"></td>
+      <td style="width:96px"><input value="${esc(it.unit)}" data-f="unit"></td>
+      <td style="width:70px"><input type="number" value="${it.qty}" data-f="qty" min="0"></td>
+      <td style="width:92px"><input type="number" value="${it.price}" data-f="price" step="0.01" min="0"></td>
+      <td style="width:56px" class="center">
+        <input type="checkbox" data-f="price_tbd" ${it.price_tbd ? 'checked' : ''}
+               title="цена уточняется" style="width:auto">
+      </td>
+      <td class="center"><button class="btn btn-ghost btn-sm" data-del-item>✕</button></td>
+    </tr>`).join('');
+
+  return `
+  <div class="card" style="padding:16px;margin-bottom:14px" data-order="${o.id}">
+    <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:baseline">
+      <div>
+        <b style="font-size:17px">Смета № ${o.number}</b>
+        <span class="status-${esc(o.status.replace(/\s/g, '-'))}" style="margin-left:8px">${esc(o.status)}</span>
+        <div class="muted" style="font-size:13px">
+          ${esc(o.client_name || '—')} · ${esc(o.phone || '—')} ·
+          ${esc(dateRu(o.event_date) || 'дата не указана')} · ${o.guests} гост.
+        </div>
+        <div class="muted" style="font-size:13px">${esc(o.place || '')}</div>
+        ${o.comment ? `<div style="font-size:13px;margin-top:4px"><b>Комментарий:</b> ${esc(o.comment)}</div>` : ''}
+      </div>
+      <div class="right">
+        <div style="font-size:20px;font-weight:700;font-family:var(--serif);color:var(--dark)">
+          ${rub(o.totals.grandTotal)}
+        </div>
+        <a class="btn btn-ghost btn-sm" href="/s/${esc(o.code)}" target="_blank">Открыть смету ↗</a>
+      </div>
+    </div>
+
+    <div class="scroll-x" style="margin-top:12px">
+      <table class="grid">
+        <thead><tr>
+          <th>№</th><th>Наименование</th><th>Выход</th><th>Кол-во</th><th>Цена</th>
+          <th title="цена уточняется">Уточн.</th><th></th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+
+    <div class="grid-2" style="margin-top:12px">
+      <div class="field">
+        <label>Транспортные расходы, руб.</label>
+        <input type="number" value="${o.transport}" data-f="transport" step="0.01" min="0">
+      </div>
+      <div class="field">
+        <label>Статус</label>
+        <select data-f="status">
+          ${STATUSES.map((s) => `<option ${s === o.status ? 'selected' : ''}>${s}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn" data-save>Сохранить</button>
+      <button class="btn btn-ghost btn-sm" data-add-item>+ Добавить позицию</button>
+      <button class="btn btn-danger btn-sm" data-del-order style="margin-left:auto">Удалить заявку</button>
+    </div>
+  </div>`;
+}
+
+$('tab-orders').addEventListener('click', async (e) => {
+  const card = e.target.closest('[data-order]');
+  if (!card) return;
+  const id = Number(card.dataset.order);
+
+  if (e.target.closest('[data-del-item]')) {
+    e.target.closest('tr').remove();
+    return;
+  }
+  if (e.target.closest('[data-add-item]')) {
+    const tb = card.querySelector('tbody');
+    const n = tb.children.length + 1;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td class="center">${n}</td>
+      <td><input value="" data-f="name" placeholder="Наименование"></td>
+      <td><input value="" data-f="unit"></td>
+      <td><input type="number" value="1" data-f="qty" min="0"></td>
+      <td><input type="number" value="0" data-f="price" step="0.01" min="0"></td>
+      <td class="center"><input type="checkbox" data-f="price_tbd" style="width:auto"></td>
+      <td class="center"><button class="btn btn-ghost btn-sm" data-del-item>✕</button></td>`;
+    tb.appendChild(tr);
+    return;
+  }
+  if (e.target.closest('[data-del-order]')) {
+    if (!confirm('Удалить заявку без возможности восстановления?')) return;
+    await delJSON('/api/admin/orders/' + id);
+    loadOrders();
+    return;
+  }
+  if (e.target.closest('[data-save]')) {
+    const items = [...card.querySelectorAll('tbody tr')].map((tr) => ({
+      name: tr.querySelector('[data-f="name"]').value,
+      unit: tr.querySelector('[data-f="unit"]').value,
+      qty: Number(tr.querySelector('[data-f="qty"]').value) || 0,
+      price: Number(tr.querySelector('[data-f="price"]').value) || 0,
+      price_tbd: tr.querySelector('[data-f="price_tbd"]').checked ? 1 : 0,
+    })).filter((i) => i.name.trim());
+    const btn = e.target.closest('[data-save]');
+    btn.disabled = true; btn.textContent = 'Сохраняем…';
+    await putJSON('/api/admin/orders/' + id, {
+      items,
+      transport: Number(card.querySelector('[data-f="transport"]').value) || 0,
+      status: card.querySelector('[data-f="status"]').value,
+    });
+    loadOrders();
+  }
+});
+
+// ------------------------------------------------- меню
+
+async function loadMenu() {
+  const { menu } = await getJSON('/api/admin/menu');
+  $('tab-menu').innerHTML = `
+    <p class="notice">Здесь пополняется прайс. Загруженное фото сразу появляется у клиента и в смете.</p>
+    <div class="scroll-x">
+      <table class="grid">
+        <thead><tr>
+          <th style="width:34%">Наименование</th><th>Выход</th><th>Цена</th>
+          <th title="цена уточняется">Уточн.</th><th>Категория</th><th>Фото</th><th>Показ.</th><th></th>
+        </tr></thead>
+        <tbody>
+          ${menu.map(menuRow).join('')}
+          <tr data-newrow>
+            <td><input data-f="name" placeholder="Новая позиция"></td>
+            <td style="width:80px"><input data-f="unit" placeholder="50 гр"></td>
+            <td style="width:90px"><input type="number" data-f="price" value="0" step="0.01"></td>
+            <td class="center"><input type="checkbox" data-f="price_tbd" style="width:auto"></td>
+            <td style="width:150px"><input data-f="category" placeholder="Категория"></td>
+            <td></td><td></td>
+            <td><button class="btn btn-sm" data-add-menu>Добавить</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>`;
+}
+
+function menuRow(m) {
+  const img = m.photo
+    ? `<img src="/photos/${encodeURIComponent(m.photo)}" style="width:60px;height:42px;object-fit:cover;border-radius:4px">`
+    : '<span class="muted" style="font-size:12px">нет</span>';
+  return `
+  <tr data-menu="${m.id}">
+    <td><input value="${esc(m.name)}" data-f="name"></td>
+    <td style="width:80px"><input value="${esc(m.unit)}" data-f="unit"></td>
+    <td style="width:90px"><input type="number" value="${m.price}" data-f="price" step="0.01"></td>
+    <td class="center"><input type="checkbox" data-f="price_tbd" ${m.price_tbd ? 'checked' : ''} style="width:auto"></td>
+    <td style="width:150px"><input value="${esc(m.category)}" data-f="category"></td>
+    <td style="width:120px">
+      ${img}
+      <label class="btn btn-ghost btn-sm" style="margin-top:4px;display:inline-flex">
+        Фото…<input type="file" accept="image/png,image/jpeg,image/webp" data-photo hidden>
+      </label>
+    </td>
+    <td class="center"><input type="checkbox" data-f="active" ${m.active ? 'checked' : ''} style="width:auto"></td>
+    <td class="nowrap">
+      <button class="btn btn-sm" data-save-menu>✓</button>
+      <button class="btn btn-ghost btn-sm" data-del-menu>✕</button>
+    </td>
+  </tr>`;
+}
+
+$('tab-menu').addEventListener('change', async (e) => {
+  const file = e.target.closest('[data-photo]');
+  if (!file || !file.files[0]) return;
+  const tr = file.closest('[data-menu]');
+  const f = file.files[0];
+  // Имя кодируем — в заголовок HTTP нельзя положить кириллицу напрямую.
+  const res = await fetch('/api/admin/photo', {
+    method: 'POST', headers: { 'X-Filename': encodeURIComponent(f.name) }, body: f,
+  });
+  const data = await res.json();
+  if (!res.ok) { alert(data.error); return; }
+  await putJSON('/api/admin/menu/' + tr.dataset.menu, { photo: data.photo });
+  loadMenu();
+});
+
+$('tab-menu').addEventListener('click', async (e) => {
+  if (e.target.closest('[data-add-menu]')) {
+    const tr = e.target.closest('[data-newrow]');
+    const get = (f) => tr.querySelector(`[data-f="${f}"]`);
+    if (!get('name').value.trim()) return;
+    await postJSON('/api/admin/menu', {
+      name: get('name').value, unit: get('unit').value,
+      price: Number(get('price').value) || 0,
+      price_tbd: get('price_tbd').checked ? 1 : 0,
+      category: get('category').value || 'Разное',
+    });
+    loadMenu();
+    return;
+  }
+  const tr = e.target.closest('[data-menu]');
+  if (!tr) return;
+  const id = tr.dataset.menu;
+  if (e.target.closest('[data-save-menu]')) {
+    const get = (f) => tr.querySelector(`[data-f="${f}"]`);
+    await putJSON('/api/admin/menu/' + id, {
+      name: get('name').value, unit: get('unit').value,
+      price: Number(get('price').value) || 0,
+      price_tbd: get('price_tbd').checked ? 1 : 0,
+      category: get('category').value,
+      active: get('active').checked ? 1 : 0,
+    });
+    loadMenu();
+  }
+  if (e.target.closest('[data-del-menu]')) {
+    if (!confirm('Удалить позицию из меню?')) return;
+    await delJSON('/api/admin/menu/' + id);
+    loadMenu();
+  }
+});
+
+// ------------------------------------------------- сверки
+
+async function loadCps() {
+  const { counterparties } = await getJSON('/api/admin/counterparties');
+  CPS = counterparties;
+  $('tab-akt').innerHTML = `
+    <div class="scroll-x">
+      <table class="grid">
+        <thead><tr><th>Контрагент</th><th>Тип</th><th>Договор</th><th>Операций</th>
+          <th class="money">Сальдо</th><th></th></tr></thead>
+        <tbody>${CPS.map((c) => `
+          <tr>
+            <td><b>${esc(c.name)}</b><div class="muted" style="font-size:12px">
+              ${c.inn ? 'ИНН ' + esc(c.inn) : ''}</div></td>
+            <td>${c.kind === 'supplier' ? 'поставщик' : 'заказчик'}</td>
+            <td style="font-size:13px">${esc(c.contract)}</td>
+            <td class="center">${c.ops_count}</td>
+            <td class="money"><b>${rub(c.closing)}</b></td>
+            <td class="nowrap">
+              <button class="btn btn-sm" data-open-cp="${c.id}">Журнал</button>
+              <a class="btn btn-ghost btn-sm" href="/api/admin/akt/${c.id}.xlsx">Excel ↓</a>
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <button class="btn btn-ghost btn-sm" id="addCp" style="margin-top:12px">+ Новый контрагент</button>
+    <div id="cpDetail" style="margin-top:22px"></div>`;
+
+  $('addCp').onclick = async () => {
+    const name = prompt('Название контрагента:');
+    if (!name) return;
+    const kind = confirm('Это поставщик? ОК — поставщик, Отмена — заказчик.') ? 'supplier' : 'customer';
+    const { id } = await postJSON('/api/admin/counterparties', {
+      name, full_name: name, kind, opening_date: new Date().toISOString().slice(0, 10),
+      period_end: new Date().toISOString().slice(0, 10),
+    });
+    await loadCps();
+    openCp(id);
+  };
+
+  if (curCp) openCp(curCp);
+}
+
+$('tab-akt').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-open-cp]');
+  if (b) openCp(Number(b.dataset.openCp));
+});
+
+async function openCp(id) {
+  curCp = id;
+  const data = await getJSON('/api/admin/counterparties/' + id);
+  const cp = data.counterparty;
+  const isSup = cp.kind === 'supplier';
+  // Полные подписи — для плашек-итогов, короткие — для шапки таблицы,
+  // иначе колонка «Документ» схлопывается.
+  const debitLabel = isSup ? 'Наши оплаты (Дебет)' : 'Оплаты от контрагента (Дебет)';
+  const creditLabel = isSup ? 'Поставки нам (Кредит)' : 'Наши услуги (Кредит)';
+  const debitShort = isSup ? 'Оплаты, ₽' : 'Оплаты от к/а, ₽';
+  const creditShort = isSup ? 'Поставки, ₽' : 'Наши услуги, ₽';
+
+  $('cpDetail').innerHTML = `
+    <div class="card" style="padding:16px">
+      <h2 style="margin:0 0 4px;color:var(--dark)">${esc(cp.name)}</h2>
+      <div class="muted" style="font-size:13px;margin-bottom:12px">
+        ${esc(cp.contract)} · период ${dateRu(cp.opening_date)} — ${dateRu(cp.period_end)}
+      </div>
+
+      <div class="grid-2">
+        <div class="field"><label>Сальдо начальное, руб.</label>
+          <input type="number" step="0.01" value="${cp.opening_balance}" id="cpOpen"></div>
+        <div class="field"><label>Дата начала периода</label>
+          <input type="date" value="${esc(cp.opening_date)}" id="cpOpenDate"></div>
+        <div class="field"><label>Конец периода</label>
+          <input type="date" value="${esc(cp.period_end)}" id="cpEnd"></div>
+        <div class="field"><label>Подписант контрагента</label>
+          <input value="${esc(cp.signer)}" id="cpSigner" placeholder="И. Н. Сарычев"></div>
+      </div>
+      <button class="btn btn-sm" id="cpSave">Сохранить реквизиты</button>
+
+      <div class="stat">
+        <div><div class="lbl">${esc(debitLabel)}</div><div class="val">${rub(data.totalDebit)}</div></div>
+        <div><div class="lbl">${esc(creditLabel)}</div><div class="val">${rub(data.totalCredit)}</div></div>
+        <div><div class="lbl">${isSup ? 'Наш долг поставщику' : 'Долг в нашу пользу'}</div>
+             <div class="val">${rub(data.closing)}</div></div>
+      </div>
+
+      <div class="scroll-x">
+        <table class="grid">
+          <thead><tr>
+            <th style="width:132px">Дата</th><th style="width:104px">Тип</th>
+            <th style="min-width:240px">Документ</th>
+            <th class="money" style="width:118px" title="${esc(debitLabel)}">${esc(debitShort)}</th>
+            <th class="money" style="width:118px" title="${esc(creditLabel)}">${esc(creditShort)}</th>
+            <th class="money" style="width:110px">Сальдо</th><th style="width:84px"></th>
+          </tr></thead>
+          <tbody>
+            <tr><td colspan="5"><b>Сальдо на ${dateRu(cp.opening_date)}</b></td>
+                <td class="money"><b>${money(cp.opening_balance)}</b></td><td></td></tr>
+            ${data.rows.map((r) => `
+              <tr data-op="${r.id}">
+                <td style="width:130px"><input type="date" value="${esc(r.date)}" data-f="date"></td>
+                <td style="width:110px"><input value="${esc(r.kind)}" data-f="kind"></td>
+                <td><input value="${esc(r.doc)}" data-f="doc"></td>
+                <td style="width:120px"><input type="number" step="0.01" value="${r.debit || ''}" data-f="debit"></td>
+                <td style="width:120px"><input type="number" step="0.01" value="${r.credit || ''}" data-f="credit"></td>
+                <td class="money">${money(r.balance)}</td>
+                <td class="nowrap">
+                  <button class="btn btn-sm" data-save-op>✓</button>
+                  <button class="btn btn-ghost btn-sm" data-del-op>✕</button>
+                </td>
+              </tr>`).join('')}
+            <tr data-newop>
+              <td><input type="date" data-f="date" value="${new Date().toISOString().slice(0, 10)}"></td>
+              <td><input data-f="kind" placeholder="${isSup ? 'Поставка' : 'Приход'}"></td>
+              <td><input data-f="doc" placeholder="Документ, №"></td>
+              <td><input type="number" step="0.01" data-f="debit" placeholder="0"></td>
+              <td><input type="number" step="0.01" data-f="credit" placeholder="0"></td>
+              <td></td>
+              <td><button class="btn btn-sm" data-add-op>Добавить</button></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+        <a class="btn" href="/api/admin/akt/${cp.id}.xlsx">📊 Скачать акт сверки (Excel)</a>
+      </div>
+    </div>`;
+
+  $('cpSave').onclick = async () => {
+    await putJSON('/api/admin/counterparties/' + cp.id, {
+      opening_balance: Number($('cpOpen').value) || 0,
+      opening_date: $('cpOpenDate').value,
+      period_end: $('cpEnd').value,
+      signer: $('cpSigner').value,
+      kind: cp.kind, name: cp.name,
+    });
+    loadCps();
+  };
+}
+
+$('tab-akt').addEventListener('click', async (e) => {
+  if (e.target.closest('[data-add-op]')) {
+    const tr = e.target.closest('[data-newop]');
+    const get = (f) => tr.querySelector(`[data-f="${f}"]`);
+    await postJSON('/api/admin/operations', {
+      cp_id: curCp, date: get('date').value, kind: get('kind').value,
+      doc: get('doc').value || `${get('kind').value} (${dateRu(get('date').value)})`,
+      debit: Number(get('debit').value) || 0, credit: Number(get('credit').value) || 0,
+    });
+    loadCps();   // перерисует список и заново откроет журнал текущего контрагента
+    return;
+  }
+  const tr = e.target.closest('[data-op]');
+  if (!tr) return;
+  const id = tr.dataset.op;
+  if (e.target.closest('[data-save-op]')) {
+    const get = (f) => tr.querySelector(`[data-f="${f}"]`);
+    await putJSON('/api/admin/operations/' + id, {
+      date: get('date').value, kind: get('kind').value, doc: get('doc').value,
+      debit: Number(get('debit').value) || 0, credit: Number(get('credit').value) || 0,
+    });
+    loadCps();   // перерисует список и заново откроет журнал текущего контрагента
+  }
+  if (e.target.closest('[data-del-op]')) {
+    if (!confirm('Удалить операцию?')) return;
+    await delJSON('/api/admin/operations/' + id);
+    loadCps();   // перерисует список и заново откроет журнал текущего контрагента
+  }
+});
+
+// ------------------------------------------------- реквизиты
+
+const FIELDS = [
+  ['brand', 'Бренд'], ['org_name', 'Организация'], ['org_short', 'Кратко'],
+  ['org_full', 'Полное наименование (для актов)'], ['org_inn', 'ИНН'],
+  ['signer', 'Подписант'], ['phone', 'Телефон'], ['phone_digits', 'Телефон цифрами (для WhatsApp/Telegram)'],
+  ['slogan', 'Слоган'], ['transport_default', 'Транспортные расходы по умолчанию'],
+  ['smeta_note', 'Примечание в смете'], ['admin_password', 'Пароль от панели'],
+];
+
+async function loadSettings() {
+  const { settings } = await getJSON('/api/admin/settings');
+  $('tab-settings').innerHTML = `
+    <div class="card" style="padding:18px;max-width:640px">
+      ${FIELDS.map(([k, label]) => `
+        <div class="field">
+          <label>${esc(label)}</label>
+          ${k === 'smeta_note'
+            ? `<textarea rows="3" data-s="${k}">${esc(settings[k] || '')}</textarea>`
+            : `<input data-s="${k}" value="${esc(settings[k] || '')}">`}
+        </div>`).join('')}
+      <button class="btn" id="saveSettings">Сохранить</button>
+      <span class="muted" id="savedMsg" style="margin-left:10px"></span>
+    </div>`;
+  $('saveSettings').onclick = async () => {
+    const body = {};
+    document.querySelectorAll('[data-s]').forEach((i) => { body[i.dataset.s] = i.value; });
+    await putJSON('/api/admin/settings', body);
+    $('savedMsg').textContent = 'Сохранено ✓';
+    setTimeout(() => { $('savedMsg').textContent = ''; }, 2500);
+  };
+}
+
+boot().catch((e) => {
+  document.body.innerHTML = `<div class="wrap"><p class="notice">Ошибка: ${esc(e.message)}</p></div>`;
+});
+</script>
+</body>
+</html>
