@@ -6,7 +6,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "seed": "node seed.js"
+    "seed": "node seed.js",
+    "bot": "node bot.js"
   },
   "dependencies": {
     "exceljs": "^4.4.0"
