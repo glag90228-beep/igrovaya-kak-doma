@@ -25,7 +25,7 @@ const SETTINGS = {
 // Формат строки: [название, состав, выход, цена, категория, ценаУточняется].
 const MENU = require('./menu-data');
 // При изменении набора поднимаем версию — меню перезаливается, заказы/сверки не трогаем.
-const MENU_VERSION = '2026-08-furshet-1';
+const MENU_VERSION = '2026-08-furshet-2';
 
 // --- Контрагент 1: ИП Сарычев И. Н. (агентский договор, он нам должен) ---
 // Кредит = услуги, которые мы оказали; Дебет = оплаты, полученные от него.
@@ -136,7 +136,7 @@ function run() {
     db.exec('DELETE FROM menu_items');
     const ins = db.prepare(`INSERT INTO menu_items(name, description, unit, price, category, photo, price_tbd, sort)
                             VALUES(?,?,?,?,?,?,?,?)`);
-    MENU.forEach((m, i) => ins.run(m[0], m[1] || '', m[2], m[3], m[4], '', m[5] || 0, i));
+    MENU.forEach((m, i) => ins.run(m[0], m[1] || '', m[2], m[3], m[4], m[6] || '', m[5] || 0, i));
     setSetting('menu_version', MENU_VERSION);
     console.log(`  меню: загружено ${MENU.length} позиций (версия ${MENU_VERSION})`);
   }
