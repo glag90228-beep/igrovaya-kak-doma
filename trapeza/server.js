@@ -174,7 +174,7 @@ async function handleApi(req, res, url) {
       INSERT INTO orders(code, number, title, client_name, phone, event_date, place, guests,
                          comment, transport, status, created_at, updated_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-      code, number, String(body.title || 'Кофе-брейк'), String(body.client_name || ''),
+      code, number, String(body.title || 'Заказ'), String(body.client_name || ''),
       String(body.phone || ''), String(body.event_date || ''), String(body.place || ''),
       Number(body.guests) || 0, String(body.comment || ''), transport, 'новая', ts, ts);
     saveOrderItems(Number(info.lastInsertRowid), body.items);

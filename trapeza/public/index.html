@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Трапеза — соберите свой кофе-брейк</title>
+<title>Трапеза — соберите свой заказ</title>
 <meta name="description" content="Кейтеринг «Трапеза», Ижевск. Выберите блюда — получите готовую смету.">
 <link rel="stylesheet" href="/app.css">
 </head>
@@ -13,7 +13,7 @@
 
 <div class="wrap">
   <div class="hero">
-    <h1>Соберите свой кофе-брейк</h1>
+    <h1>Соберите свой заказ</h1>
     <p>Отметьте блюда и укажите количество гостей — мы сразу посчитаем стоимость
        и оформим фирменную смету. Её можно сохранить, изменить или отправить нам.</p>
   </div>
@@ -88,7 +88,7 @@ async function init() {
   SETTINGS = data.settings;
   MENU = data.menu;
   $('header').innerHTML = brandHeader(SETTINGS);
-  document.title = `${SETTINGS.brand || 'Трапеза'} — соберите свой кофе-брейк`;
+  document.title = `${SETTINGS.brand || 'Трапеза'} — соберите свой заказ`;
   renderContactFab(SETTINGS);
 
   // Возврат из сметы для правки
@@ -244,7 +244,7 @@ $('formSubmit').onclick = async () => {
   btn.textContent = 'Отправляем…';
   const guests = Math.max(1, Number($('guests').value) || 1);
   const payload = {
-    title: `Кофе-брейк на ${guests} ${plural(guests, 'человека', 'человек', 'человек')}`,
+    title: `Заказ на ${guests} ${plural(guests, 'человека', 'человек', 'человек')}`,
     client_name: name, phone, event_date: $('fDate').value,
     place: $('fPlace').value.trim(), guests, comment: $('fComment').value.trim(),
     items: selectedItems(),

@@ -252,7 +252,7 @@ async function startItems(tg, chatId, user, type, cpId) {
   await tg.sendMessage(chatId,
     `Составляем ${esc(what)}. Отправляйте позиции по одной в формате:\n`
     + '<code>Наименование; количество; цена</code>\n'
-    + 'Например: <code>Кофе-брейк на 20 чел.; 20; 650</code>\n\nКогда закончите — нажмите «Готово».',
+    + 'Например: <code>Канапе ассорти; 20; 650</code>\n\nКогда закончите — нажмите «Готово».',
     keyboard([[{ text: '✅ Готово', data: 'items.done' }]]));
 }
 

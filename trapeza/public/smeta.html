@@ -32,9 +32,10 @@ async function init() {
 
   const msg = `Здравствуйте! Отправляю смету № ${order.number} на ${order.guests} `
     + `${plural(order.guests, 'гостя', 'гостей', 'гостей')}, `
-    + `итого ${rub(totals.grandTotal)}. Ссылка: ${location.href}`;
-  $('btnSend').href = `https://wa.me/${settings.phone_digits || ''}?text=${encodeURIComponent(msg)}`;
-  renderContactFab(settings, msg);
+    + `итого ${rub(totals.grandTotal)}.`;
+  $('btnSend').href = `https://t.me/share/url?url=${encodeURIComponent(location.href)}`
+    + `&text=${encodeURIComponent(msg)}`;
+  renderContactFab(settings);
 }
 
 function render(order, totals, s) {

@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS orders (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   code        TEXT    NOT NULL UNIQUE,     -- публичная ссылка /s/<code>
   number      INTEGER NOT NULL,            -- Смета №
-  title       TEXT    NOT NULL DEFAULT 'Кофе-брейк',
+  title       TEXT    NOT NULL DEFAULT 'Заказ',
   client_name TEXT    NOT NULL DEFAULT '',
   phone       TEXT    NOT NULL DEFAULT '',
   event_date  TEXT    NOT NULL DEFAULT '',

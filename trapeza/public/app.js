@@ -49,19 +49,15 @@ function plural(n, one, few, many) {
   return many;
 }
 
-const WA_SVG = '<svg viewBox="0 0 24 24"><path d="M17.5 14.4c-.3-.2-1.7-.9-2-1-.3-.1-.5-.1-.7.1-.2.3-.7 1-.9 1.2-.2.2-.3.2-.6.1-1.7-.9-2.9-1.6-4-3.6-.3-.5.3-.5.9-1.6.1-.2 0-.4 0-.5s-.7-1.6-.9-2.2c-.2-.6-.5-.5-.7-.5h-.6c-.2 0-.5.1-.8.4-.3.3-1 1-1 2.5s1.1 2.9 1.2 3.1c.2.2 2.1 3.2 5.1 4.5 1.9.8 2.6.9 3.5.7.6-.1 1.7-.7 1.9-1.4.2-.7.2-1.2.2-1.4-.1-.2-.3-.2-.6-.4z"/><path d="M12 2a10 10 0 0 0-8.6 15L2 22l5.2-1.4A10 10 0 1 0 12 2zm0 18.2a8.2 8.2 0 0 1-4.2-1.2l-.3-.2-3.1.8.8-3-.2-.3A8.2 8.2 0 1 1 12 20.2z"/></svg>';
-const TG_SVG = '<svg viewBox="0 0 24 24"><path d="M21.9 4.3 18.7 19.4c-.2 1-.9 1.3-1.7.8l-4.7-3.5-2.3 2.2c-.3.3-.5.5-1 .5l.4-4.9 8.9-8c.4-.3-.1-.5-.6-.2L6.7 13.1l-4.7-1.5c-1-.3-1-1 .2-1.5l18.4-7.1c.9-.3 1.6.2 1.3 1.3z"/></svg>';
+const TG_SVG ='<svg viewBox="0 0 24 24"><path d="M21.9 4.3 18.7 19.4c-.2 1-.9 1.3-1.7.8l-4.7-3.5-2.3 2.2c-.3.3-.5.5-1 .5l.4-4.9 8.9-8c.4-.3-.1-.5-.6-.2L6.7 13.1l-4.7-1.5c-1-.3-1-1 .2-1.5l18.4-7.1c.9-.3 1.6.2 1.3 1.3z"/></svg>';
 
-/** Плавающие кнопки WhatsApp/Telegram. */
-function renderContactFab(settings, message) {
+/** Плавающая кнопка Telegram. */
+function renderContactFab(settings) {
   const digits = settings.phone_digits || '';
   if (!digits) return;
-  const text = encodeURIComponent(message || `Здравствуйте! Пишу с сайта «${settings.brand || 'Трапеза'}».`);
   const el = document.createElement('div');
   el.className = 'contact-fab';
   el.innerHTML = `
-    <a class="fab-wa" href="https://wa.me/${digits}?text=${text}" target="_blank" rel="noopener"
-       title="Написать в WhatsApp" aria-label="Написать в WhatsApp">${WA_SVG}</a>
     <a class="fab-tg" href="https://t.me/+${digits}" target="_blank" rel="noopener"
        title="Написать в Telegram" aria-label="Написать в Telegram">${TG_SVG}</a>`;
   document.body.appendChild(el);
