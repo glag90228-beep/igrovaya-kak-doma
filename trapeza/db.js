@@ -18,10 +18,11 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 CREATE TABLE IF NOT EXISTS menu_items (
-  id        INTEGER PRIMARY KEY AUTOINCREMENT,
-  name      TEXT    NOT NULL,
-  unit      TEXT    NOT NULL DEFAULT '',
-  price     REAL    NOT NULL DEFAULT 0,
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  name        TEXT    NOT NULL,
+  description TEXT    NOT NULL DEFAULT '',   -- состав / описание (показывается по клику)
+  unit        TEXT    NOT NULL DEFAULT '',
+  price       REAL    NOT NULL DEFAULT 0,
   price_tbd INTEGER NOT NULL DEFAULT 0,   -- 1 = «цена уточняется», в итог не входит
   category  TEXT    NOT NULL DEFAULT '',
   photo     TEXT    NOT NULL DEFAULT '',
@@ -88,6 +89,11 @@ CREATE TABLE IF NOT EXISTS operations (
 CREATE INDEX IF NOT EXISTS idx_ops_cp ON operations(cp_id, date, sort);
 CREATE INDEX IF NOT EXISTS idx_items_order ON order_items(order_id, sort);
 `);
+
+// Миграция: поле «состав» у позиций меню для ранее созданных баз.
+if (!db.prepare('PRAGMA table_info(menu_items)').all().some((c) => c.name === 'description')) {
+  db.exec("ALTER TABLE menu_items ADD COLUMN description TEXT NOT NULL DEFAULT ''");
+}
 
 // ---------- settings ----------
 function getSetting(key, fallback = null) {

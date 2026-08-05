@@ -21,29 +21,11 @@ const SETTINGS = {
   admin_password: 'trapeza',
 };
 
-// Меню: [название, выход, цена, категория, фото, ценаУточняется]
-const MENU = [
-  ['Брускетта с сёмгой с/с и творожным сыром', '50 гр', 150, 'Брускетты', 'brusketta-semga.png', 0],
-  ['Брускетта с пастромой копчёной, творожным сыром и черри', '50 гр', 120, 'Брускетты', 'brusketta-pastroma.png', 0],
-  ['Канапе из сальчичона, фетаксы и черри с микрозеленью', '50 гр', 125, 'Канапе', 'kanape-salchichon.png', 0],
-  ['Канапе с креветкой и черри', '50 гр', 0, 'Канапе', '', 1],
-
-  ['Мини-перепечи с мясом и капустой', '40 гр', 55, 'Выпечка', 'perepechi-myaso.png', 0],
-  ['Мини-перепечи с зелёным луком', '40 гр', 60, 'Выпечка', 'perepechi-zelenyi-luk.png', 0],
-  ['Мини-элеши «Курица-картофель»', '50 гр', 65, 'Выпечка', 'elesh-kurica-kartofel.png', 0],
-  ['Мини-кокроки с яблоком', '40 гр', 50, 'Выпечка', '', 0],
-  ['Кокроки с творогом', '40 гр', 50, 'Выпечка', '', 0],
-
-  ['Мини-безе с кремом чиз и голубикой', '30 гр', 100, 'Десерты', 'beze-golubika.png', 0],
-  ['Печенье курабье', '—', 0, 'Десерты', '', 1],
-  ['Брауни в индивидуальной упаковке', '—', 0, 'Десерты', '', 1],
-
-  ['Чай «Greenfield»', '200 мл', 50, 'Напитки', '', 0],
-  ['Вода «Увинская жемчужина» 0,5 л', '500 мл', 50, 'Напитки', '', 0],
-
-  ['Одноразовая бумажная тарелка 170 мм', '170 мм', 10, 'Сервировка и допы', '', 0],
-  ['Сливки порционные', '10 мл', 10, 'Сервировка и допы', '', 0],
-];
+// Меню грузится из отдельного файла (сгенерирован из фуршетного прайса и заказа).
+// Формат строки: [название, состав, выход, цена, категория, ценаУточняется].
+const MENU = require('./menu-data');
+// При изменении набора поднимаем версию — меню перезаливается, заказы/сверки не трогаем.
+const MENU_VERSION = '2026-08-furshet-1';
 
 // --- Контрагент 1: ИП Сарычев И. Н. (агентский договор, он нам должен) ---
 // Кредит = услуги, которые мы оказали; Дебет = оплаты, полученные от него.
@@ -149,21 +131,15 @@ function run() {
     if (getSetting(k) === null) setSetting(k, v);
   }
 
-  const menuCount = db.prepare('SELECT COUNT(*) AS n FROM menu_items').get().n;
-  if (menuCount === 0) {
-    const ins = db.prepare(`INSERT INTO menu_items(name, unit, price, category, photo, price_tbd, sort)
-                            VALUES(?,?,?,?,?,?,?)`);
-    MENU.forEach((m, i) => ins.run(m[0], m[1], m[2], m[3], m[4], m[5], i));
-    console.log(`  меню: добавлено ${MENU.length} позиций`);
+  // Меню перезаливаем при смене версии набора (заказы и сверки не трогаем).
+  if (getSetting('menu_version') !== MENU_VERSION) {
+    db.exec('DELETE FROM menu_items');
+    const ins = db.prepare(`INSERT INTO menu_items(name, description, unit, price, category, photo, price_tbd, sort)
+                            VALUES(?,?,?,?,?,?,?,?)`);
+    MENU.forEach((m, i) => ins.run(m[0], m[1] || '', m[2], m[3], m[4], '', m[5] || 0, i));
+    setSetting('menu_version', MENU_VERSION);
+    console.log(`  меню: загружено ${MENU.length} позиций (версия ${MENU_VERSION})`);
   }
-
-  // Нормализация ранее созданных баз: правописание, разделение категорий, слоган.
-  db.prepare("UPDATE menu_items SET name = 'Брускетта с сёмгой с/с и творожным сыром' "
-    + "WHERE name = 'Брускета с сёмгой с/с и творожным сыром'").run();
-  db.prepare("UPDATE menu_items SET category = 'Брускетты' "
-    + "WHERE category = 'Канапе и брускетты' AND name LIKE 'Брускет%'").run();
-  db.prepare("UPDATE menu_items SET category = 'Канапе' "
-    + "WHERE category = 'Канапе и брускетты' AND name LIKE 'Канапе%'").run();
   if (getSetting('slogan') === 'Кейтеринг · банкеты · кофе-брейки') {
     setSetting('slogan', SETTINGS.slogan);
   }

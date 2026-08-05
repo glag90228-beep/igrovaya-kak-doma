@@ -74,12 +74,17 @@
   </div>
 </div>
 
+<div class="overlay" id="detailOverlay" hidden>
+  <div class="modal detail" id="detailBox"></div>
+</div>
+
 <script src="/app.js"></script>
 <script>
 let SETTINGS = {};
 let MENU = [];
 const picked = new Map();          // id -> количество порций
 let editCode = null;               // если вернулись править существующую смету
+let detailId = null;               // открытая карточка блюда
 
 const $ = (id) => document.getElementById(id);
 
@@ -135,48 +140,106 @@ function renderMenu() {
 $('menu').addEventListener('click', onMenuClick);
 $('menu').addEventListener('input', onMenuInput);
 
+function qtyControl(m, big) {
+  const qty = picked.get(m.id) || 0;
+  if (qty > 0) {
+    return `<button type="button" data-act="dec" data-id="${m.id}" aria-label="Меньше">−</button>
+       <input type="number" min="0" value="${qty}" data-act="set" data-id="${m.id}" inputmode="numeric" aria-label="Количество порций">
+       <button type="button" data-act="inc" data-id="${m.id}" aria-label="Больше">+</button>`;
+  }
+  return big
+    ? `<button type="button" class="btn add" data-act="add" data-id="${m.id}" style="flex:1;height:44px">Добавить в заказ</button>`
+    : `<button type="button" class="btn btn-ghost btn-sm add" data-act="add" data-id="${m.id}">Выбрать</button>`;
+}
+
 function dishCard(m) {
   const qty = picked.get(m.id) || 0;
-  const photo = m.photo
-    ? `<div class="dish-photo" style="background-image:url('/photos/${encodeURIComponent(m.photo)}')"></div>`
-    : '<div class="dish-photo empty"></div>';
-  const price = m.price_tbd
-    ? '<span class="badge badge-tbd">цена уточняется</span>'
-    : `<span class="dish-price">${money(m.price)} ₽</span>`;
-  const control = qty > 0
-    ? `<button type="button" data-act="dec" data-id="${m.id}" aria-label="Меньше">−</button>
-       <input type="number" min="0" value="${qty}" data-act="set" data-id="${m.id}" inputmode="numeric">
-       <button type="button" data-act="inc" data-id="${m.id}" aria-label="Больше">+</button>`
-    : `<button type="button" class="btn btn-ghost btn-sm add" data-act="add" data-id="${m.id}">
-         Выбрать
-       </button>`;
+  const bg = m.photo ? `style="background-image:url('/photos/${encodeURIComponent(m.photo)}')"` : '';
+  const info = m.description ? '<span class="dish-info" aria-hidden="true">i</span>' : '';
   return `
   <div class="dish ${qty > 0 ? 'picked' : ''}" data-card="${m.id}">
-    ${photo}
+    <button type="button" class="dish-open" data-act="open" data-id="${m.id}" aria-label="Подробнее: ${esc(m.name)}">
+      <div class="dish-photo ${m.photo ? '' : 'empty'}" ${bg}>${info}</div>
+    </button>
     <div class="dish-body">
-      <div class="dish-name">${esc(m.name)}</div>
+      <button type="button" class="dish-open" data-act="open" data-id="${m.id}">
+        <div class="dish-name">${esc(m.name)}</div>
+      </button>
       <div class="dish-meta">
         <span class="dish-unit">${esc(m.unit || '')}</span>
-        ${price}
+        ${m.price_tbd ? '<span class="badge badge-tbd">цена уточняется</span>' : `<span class="dish-price">${money(m.price)} ₽</span>`}
       </div>
-      <div class="qty">${control}</div>
+      <div class="qty">${qtyControl(m, false)}</div>
     </div>
   </div>`;
+}
+
+function openDetail(id) {
+  const m = MENU.find((x) => x.id === id);
+  if (!m) return;
+  detailId = id;
+  const bg = m.photo ? `style="background-image:url('/photos/${encodeURIComponent(m.photo)}')"` : '';
+  $('detailBox').innerHTML = `
+    <div class="detail-photo ${m.photo ? '' : 'empty'}" ${bg}>
+      <button class="detail-close" type="button" id="detailClose" aria-label="Закрыть">✕</button>
+    </div>
+    <div class="detail-body">
+      <h2>${esc(m.name)}</h2>
+      <div class="detail-sub">
+        ${m.price_tbd ? '<span class="badge badge-tbd">цена уточняется</span>' : `<span class="p">${money(m.price)} ₽</span>`}
+        ${m.unit ? `<span class="u">${esc(m.unit)}</span>` : ''}
+      </div>
+      ${m.description ? `<p class="detail-desc"><span class="lbl">Состав</span>${esc(m.description)}</p>` : ''}
+      <div class="detail-actions"><div class="qty" id="detailQty">${qtyControl(m, true)}</div></div>
+    </div>`;
+  $('detailOverlay').hidden = false;
+  $('detailClose').onclick = closeDetail;
+}
+function refreshDetailQty() {
+  if (detailId == null || $('detailOverlay').hidden) return;
+  const m = MENU.find((x) => x.id === detailId);
+  if (m) $('detailQty').innerHTML = qtyControl(m, true);
+}
+function closeDetail() { $('detailOverlay').hidden = true; detailId = null; }
+
+function applyQtyAction(act, id) {
+  const cur = picked.get(id) || 0;
+  if (act === 'add') picked.set(id, Number($('guests').value) || 1);
+  else if (act === 'inc') picked.set(id, cur + 1);
+  else if (act === 'dec') { if (cur <= 1) picked.delete(id); else picked.set(id, cur - 1); }
+  else return false;
+  refreshCard(id);
+  refreshDetailQty();
+  recalc();
+  return true;
 }
 
 function onMenuClick(e) {
   const btn = e.target.closest('[data-act]');
   if (!btn || btn.tagName === 'INPUT') return;
   const id = Number(btn.dataset.id);
-  const act = btn.dataset.act;
-  const cur = picked.get(id) || 0;
-  if (act === 'add') picked.set(id, Number($('guests').value) || 1);
-  else if (act === 'inc') picked.set(id, cur + 1);
-  else if (act === 'dec') { if (cur <= 1) picked.delete(id); else picked.set(id, cur - 1); }
-  else return;
+  if (btn.dataset.act === 'open') { openDetail(id); return; }
+  applyQtyAction(btn.dataset.act, id);
+}
+
+// Управление количеством и закрытие внутри модалки деталей
+$('detailOverlay').addEventListener('click', (e) => {
+  if (e.target === $('detailOverlay')) { closeDetail(); return; }
+  const btn = e.target.closest('[data-act]');
+  if (btn && btn.tagName !== 'INPUT') applyQtyAction(btn.dataset.act, Number(btn.dataset.id));
+});
+$('detailOverlay').addEventListener('input', (e) => {
+  const inp = e.target.closest('input[data-act="set"]');
+  if (!inp) return;
+  const id = Number(inp.dataset.id);
+  const v = Math.max(0, Number(inp.value) || 0);
+  if (v === 0) picked.delete(id); else picked.set(id, v);
   refreshCard(id);
   recalc();
-}
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('detailOverlay').hidden) closeDetail();
+});
 
 function onMenuInput(e) {
   const input = e.target.closest('input[data-act="set"]');

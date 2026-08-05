@@ -256,9 +256,9 @@ async function handleApi(req, res, url) {
     if (pathname === '/api/admin/menu' && method === 'POST') {
       const b = await readJson(req);
       const maxSort = db.prepare('SELECT MAX(sort) AS s FROM menu_items').get().s || 0;
-      const info = db.prepare(`INSERT INTO menu_items(name, unit, price, price_tbd, category, photo, active, sort)
-                               VALUES(?,?,?,?,?,?,1,?)`).run(
-        String(b.name || ''), String(b.unit || ''), Number(b.price) || 0,
+      const info = db.prepare(`INSERT INTO menu_items(name, description, unit, price, price_tbd, category, photo, active, sort)
+                               VALUES(?,?,?,?,?,?,?,1,?)`).run(
+        String(b.name || ''), String(b.description || ''), String(b.unit || ''), Number(b.price) || 0,
         b.price_tbd ? 1 : 0, String(b.category || ''), String(b.photo || ''), maxSort + 1);
       return json(res, { id: Number(info.lastInsertRowid) }, 201);
     }
@@ -284,9 +284,10 @@ async function handleApi(req, res, url) {
         const b = await readJson(req);
         const cur = db.prepare('SELECT * FROM menu_items WHERE id=?').get(id);
         if (!cur) return fail(res, 404, 'Позиция не найдена');
-        db.prepare(`UPDATE menu_items SET name=?, unit=?, price=?, price_tbd=?, category=?,
+        db.prepare(`UPDATE menu_items SET name=?, description=?, unit=?, price=?, price_tbd=?, category=?,
                     photo=?, active=?, sort=? WHERE id=?`).run(
-          String(b.name ?? cur.name), String(b.unit ?? cur.unit),
+          String(b.name ?? cur.name), String(b.description ?? cur.description),
+          String(b.unit ?? cur.unit),
           b.price === undefined ? cur.price : Number(b.price) || 0,
           b.price_tbd === undefined ? cur.price_tbd : (b.price_tbd ? 1 : 0),
           String(b.category ?? cur.category), String(b.photo ?? cur.photo),

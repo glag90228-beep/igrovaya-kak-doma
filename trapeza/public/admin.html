@@ -332,7 +332,10 @@ function menuRow(m, j, n) {
         ${m.photo ? '<button class="btn btn-ghost btn-xs" data-del-photo>убрать</button>' : ''}
       </div>
     </td>
-    <td><input value="${esc(m.name)}" data-f="name" placeholder="Название"></td>
+    <td>
+      <input value="${esc(m.name)}" data-f="name" placeholder="Название">
+      <button type="button" class="btn btn-ghost btn-xs" data-desc style="margin-top:4px">${m.description ? 'Состав ✓' : 'Состав…'}</button>
+    </td>
     <td style="width:80px"><input value="${esc(m.unit)}" data-f="unit" placeholder="50 гр"></td>
     <td style="width:96px"><input type="number" value="${m.price}" data-f="price" step="0.01" min="0"></td>
     <td class="center"><input type="checkbox" data-f="price_tbd" ${m.price_tbd ? 'checked' : ''} style="width:auto"></td>
@@ -476,6 +479,12 @@ $('tab-menu').addEventListener('click', async (e) => {
   const id = Number(tr.dataset.menu);
   if (e.target.closest('[data-up]')) return moveItem(id, 'up');
   if (e.target.closest('[data-down]')) return moveItem(id, 'down');
+  if (e.target.closest('[data-desc]')) {
+    const m = MENU_CACHE.find((x) => x.id === id);
+    const v = prompt('Состав / описание блюда (показывается клиенту по клику):', m ? m.description : '');
+    if (v !== null) { await putJSON('/api/admin/menu/' + id, { description: v }); loadMenu(); }
+    return;
+  }
   if (e.target.closest('[data-save-menu]')) return saveRow(tr);
   if (e.target.closest('[data-dup]')) {
     const m = MENU_CACHE.find((x) => x.id === id);
