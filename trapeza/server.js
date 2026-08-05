@@ -262,6 +262,21 @@ async function handleApi(req, res, url) {
         b.price_tbd ? 1 : 0, String(b.category || ''), String(b.photo || ''), maxSort + 1);
       return json(res, { id: Number(info.lastInsertRowid) }, 201);
     }
+    // Массовая смена порядка: ids в нужной последовательности → sort = индекс.
+    if (pathname === '/api/admin/menu/reorder' && method === 'POST') {
+      const b = await readJson(req);
+      const ids = Array.isArray(b.ids) ? b.ids : [];
+      const upd = db.prepare('UPDATE menu_items SET sort=? WHERE id=?');
+      ids.forEach((id, i) => upd.run(i, Number(id)));
+      return json(res, { ok: true });
+    }
+    // Переименование категории сразу у всех позиций.
+    if (pathname === '/api/admin/menu/recategorize' && method === 'POST') {
+      const b = await readJson(req);
+      const to = String(b.to || '').trim();
+      if (to) db.prepare('UPDATE menu_items SET category=? WHERE category=?').run(to, String(b.from || ''));
+      return json(res, { ok: true });
+    }
     m = /^\/api\/admin\/menu\/(\d+)$/.exec(pathname);
     if (m) {
       const id = Number(m[1]);

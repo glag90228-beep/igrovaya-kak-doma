@@ -5,6 +5,27 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Трапеза — панель управления</title>
 <link rel="stylesheet" href="/app.css">
+<style>
+  .menu-toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:12px 0 16px; }
+  .menu-toolbar input[type=search] { flex:1; min-width:180px; padding:9px 12px; border:1px solid var(--line,#e4d8c7);
+    border-radius:9px; font:inherit; }
+  .cat-block { border:1px solid var(--line,#e4d8c7); border-radius:12px; padding:12px 14px; margin-bottom:16px;
+    background:var(--surface,#fff); }
+  .cat-head { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:8px; }
+  .cat-h-name { font-family:var(--serif,Georgia); font-size:18px; font-weight:700; color:var(--dark,#5e3f27); }
+  .cat-h-ctl { display:flex; gap:4px; }
+  .btn-xs { padding:3px 8px; font-size:13px; line-height:1.2; border-radius:7px; }
+  .menu-grid td { vertical-align:middle; }
+  .photo-cell { width:118px; }
+  .photo-cell img { width:60px; height:42px; object-fit:cover; border-radius:4px; display:block; }
+  .photo-btns { display:flex; gap:4px; margin-top:4px; flex-wrap:wrap; }
+  .order-ctl { white-space:nowrap; }
+  .row-dirty { background:#fff7e6 !important; }
+  .admin-toast { position:fixed; left:50%; bottom:22px; transform:translateX(-50%) translateY(10px);
+    background:var(--dark,#5e3f27); color:#f6efe6; padding:10px 18px; border-radius:10px; font-size:14px;
+    opacity:0; transition:opacity .2s, transform .2s; z-index:70; pointer-events:none; }
+  .admin-toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+</style>
 </head>
 <body>
 
@@ -220,100 +241,252 @@ $('tab-orders').addEventListener('click', async (e) => {
 
 // ------------------------------------------------- меню
 
-async function loadMenu() {
-  const { menu } = await getJSON('/api/admin/menu');
-  $('tab-menu').innerHTML = `
-    <p class="notice">Здесь пополняется прайс. Загруженное фото сразу появляется у клиента и в смете.</p>
-    <div class="scroll-x">
-      <table class="grid">
-        <thead><tr>
-          <th style="width:34%">Наименование</th><th>Выход</th><th>Цена</th>
-          <th title="цена уточняется">Уточн.</th><th>Категория</th><th>Фото</th><th>Показ.</th><th></th>
-        </tr></thead>
-        <tbody>
-          ${menu.map(menuRow).join('')}
-          <tr data-newrow>
-            <td><input data-f="name" placeholder="Новая позиция"></td>
-            <td style="width:80px"><input data-f="unit" placeholder="50 гр"></td>
-            <td style="width:90px"><input type="number" data-f="price" value="0" step="0.01"></td>
-            <td class="center"><input type="checkbox" data-f="price_tbd" style="width:auto"></td>
-            <td style="width:150px"><input data-f="category" placeholder="Категория"></td>
-            <td></td><td></td>
-            <td><button class="btn btn-sm" data-add-menu>Добавить</button></td>
-          </tr>
-        </tbody>
-      </table>
-    </div>`;
+let MENU_CACHE = [];
+let MENU_SEARCH = '';
+
+const catOf = (m) => m.category || 'Без категории';
+
+function categoriesInOrder() {
+  const cats = [];
+  for (const m of MENU_CACHE) if (!cats.includes(catOf(m))) cats.push(catOf(m));
+  return cats;
+}
+function itemsOf(cat) { return MENU_CACHE.filter((m) => catOf(m) === cat); }
+
+function toast(msg) {
+  let t = $('adminToast');
+  if (!t) { t = document.createElement('div'); t.id = 'adminToast'; t.className = 'admin-toast'; document.body.appendChild(t); }
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove('show'), 2000);
 }
 
-function menuRow(m) {
-  const img = m.photo
-    ? `<img src="/photos/${encodeURIComponent(m.photo)}" style="width:60px;height:42px;object-fit:cover;border-radius:4px">`
-    : '<span class="muted" style="font-size:12px">нет</span>';
+async function loadMenu() {
+  const { menu } = await getJSON('/api/admin/menu');
+  MENU_CACHE = menu;
+  renderMenuTab();
+}
+
+function renderMenuTab() {
+  const cats = categoriesInOrder();
+  const active = MENU_CACHE.filter((m) => m.active).length;
+  $('tab-menu').innerHTML = `
+    <div class="stat">
+      <div><div class="lbl">Позиций</div><div class="val">${MENU_CACHE.length}</div></div>
+      <div><div class="lbl">Показываются</div><div class="val">${active}</div></div>
+      <div><div class="lbl">Категорий</div><div class="val">${cats.length}</div></div>
+    </div>
+    <p class="notice">Меняйте состав меню как угодно: правки сразу видны клиенту и в смете.
+       Порядок — стрелками ↑/↓, скрыть позицию — снять галочку «Показ.».</p>
+    <div class="menu-toolbar">
+      <input id="menuSearch" type="search" placeholder="Поиск по названию…" value="${esc(MENU_SEARCH)}">
+      <button class="btn btn-ghost btn-sm" id="addCat">+ Категория</button>
+    </div>
+    ${cats.map((c, i) => catBlock(c, i, cats.length)).join('')
+      || '<p class="muted">Меню пусто. Нажмите «+ Категория», чтобы начать.</p>'}`;
+  $('menuSearch').oninput = (e) => { MENU_SEARCH = e.target.value; applyMenuSearch(); };
+  applyMenuSearch();
+}
+
+function catBlock(cat, i, count) {
+  const items = itemsOf(cat);
   return `
-  <tr data-menu="${m.id}">
-    <td><input value="${esc(m.name)}" data-f="name"></td>
-    <td style="width:80px"><input value="${esc(m.unit)}" data-f="unit"></td>
-    <td style="width:90px"><input type="number" value="${m.price}" data-f="price" step="0.01"></td>
-    <td class="center"><input type="checkbox" data-f="price_tbd" ${m.price_tbd ? 'checked' : ''} style="width:auto"></td>
-    <td style="width:150px"><input value="${esc(m.category)}" data-f="category"></td>
-    <td style="width:120px">
+  <div class="cat-block" data-cat="${esc(cat)}">
+    <div class="cat-head">
+      <div class="cat-h-name">${esc(cat)} <span class="muted" style="font-weight:400">· ${items.length}</span></div>
+      <div class="cat-h-ctl">
+        <button class="btn btn-ghost btn-xs" data-cat-up title="Категорию выше" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button class="btn btn-ghost btn-xs" data-cat-down title="Категорию ниже" ${i === count - 1 ? 'disabled' : ''}>↓</button>
+        <button class="btn btn-ghost btn-xs" data-cat-rename title="Переименовать">✎</button>
+      </div>
+    </div>
+    <div class="scroll-x">
+      <table class="grid menu-grid">
+        <thead><tr>
+          <th style="width:118px">Фото</th><th>Наименование</th><th>Выход</th><th>Цена</th>
+          <th title="цена уточняется">Уточн.</th><th>Категория</th><th title="показывать клиенту">Показ.</th>
+          <th title="порядок">⇅</th><th></th>
+        </tr></thead>
+        <tbody>${items.map((m, j) => menuRow(m, j, items.length)).join('')}</tbody>
+      </table>
+    </div>
+    <button class="btn btn-ghost btn-sm" data-add-here style="margin-top:8px">+ Позиция в «${esc(cat)}»</button>
+  </div>`;
+}
+
+function catSelect(current) {
+  const opts = categoriesInOrder()
+    .map((c) => `<option ${c === current ? 'selected' : ''}>${esc(c)}</option>`).join('');
+  return `<select data-f="category">${opts}<option value="__new__">➕ Новая категория…</option></select>`;
+}
+
+function menuRow(m, j, n) {
+  const img = m.photo
+    ? `<img src="/photos/${encodeURIComponent(m.photo)}" alt="">`
+    : '<span class="muted" style="font-size:12px">нет фото</span>';
+  return `
+  <tr data-menu="${m.id}" data-name="${esc((m.name || '').toLowerCase())}">
+    <td class="photo-cell">
       ${img}
-      <label class="btn btn-ghost btn-sm" style="margin-top:4px;display:inline-flex">
-        Фото…<input type="file" accept="image/png,image/jpeg,image/webp" data-photo hidden>
-      </label>
+      <div class="photo-btns">
+        <label class="btn btn-ghost btn-xs">Фото…<input type="file" accept="image/png,image/jpeg,image/webp" data-photo hidden></label>
+        ${m.photo ? '<button class="btn btn-ghost btn-xs" data-del-photo>убрать</button>' : ''}
+      </div>
     </td>
+    <td><input value="${esc(m.name)}" data-f="name" placeholder="Название"></td>
+    <td style="width:80px"><input value="${esc(m.unit)}" data-f="unit" placeholder="50 гр"></td>
+    <td style="width:96px"><input type="number" value="${m.price}" data-f="price" step="0.01" min="0"></td>
+    <td class="center"><input type="checkbox" data-f="price_tbd" ${m.price_tbd ? 'checked' : ''} style="width:auto"></td>
+    <td style="width:160px">${catSelect(catOf(m))}</td>
     <td class="center"><input type="checkbox" data-f="active" ${m.active ? 'checked' : ''} style="width:auto"></td>
+    <td class="order-ctl">
+      <button class="btn btn-ghost btn-xs" data-up title="Выше" ${j === 0 ? 'disabled' : ''}>↑</button>
+      <button class="btn btn-ghost btn-xs" data-down title="Ниже" ${j === n - 1 ? 'disabled' : ''}>↓</button>
+    </td>
     <td class="nowrap">
-      <button class="btn btn-sm" data-save-menu>✓</button>
-      <button class="btn btn-ghost btn-sm" data-del-menu>✕</button>
+      <button class="btn btn-sm" data-save-menu title="Сохранить">✓</button>
+      <button class="btn btn-ghost btn-sm" data-dup title="Дублировать">⧉</button>
+      <button class="btn btn-ghost btn-sm" data-del-menu title="Удалить">✕</button>
     </td>
   </tr>`;
 }
 
-$('tab-menu').addEventListener('change', async (e) => {
-  const file = e.target.closest('[data-photo]');
-  if (!file || !file.files[0]) return;
-  const tr = file.closest('[data-menu]');
-  const f = file.files[0];
-  // Имя кодируем — в заголовок HTTP нельзя положить кириллицу напрямую.
+function applyMenuSearch() {
+  const q = MENU_SEARCH.trim().toLowerCase();
+  document.querySelectorAll('#tab-menu .cat-block').forEach((block) => {
+    let visible = 0;
+    block.querySelectorAll('tr[data-menu]').forEach((tr) => {
+      const hit = !q || (tr.dataset.name || '').includes(q) || (block.dataset.cat || '').toLowerCase().includes(q);
+      tr.style.display = hit ? '' : 'none';
+      if (hit) visible += 1;
+    });
+    block.style.display = (q && visible === 0) ? 'none' : '';
+  });
+}
+
+/** Полный порядок id: категории по текущему порядку, внутри — как в кэше,
+ *  но у категории `overrideCat` берём переданный список. */
+function flatOrder(overrideCat, overrideItems) {
+  const ids = [];
+  for (const c of categoriesInOrder()) {
+    const list = (c === overrideCat) ? overrideItems : itemsOf(c);
+    ids.push(...list.map((m) => m.id));
+  }
+  return ids;
+}
+async function saveOrder(ids) { await postJSON('/api/admin/menu/reorder', { ids }); await loadMenu(); }
+
+async function moveItem(id, dir) {
+  const m = MENU_CACHE.find((x) => x.id === id);
+  const list = itemsOf(catOf(m));
+  const idx = list.findIndex((x) => x.id === id);
+  const j = dir === 'up' ? idx - 1 : idx + 1;
+  if (j < 0 || j >= list.length) return;
+  [list[idx], list[j]] = [list[j], list[idx]];
+  await saveOrder(flatOrder(catOf(m), list));
+}
+async function moveCategory(cat, dir) {
+  const cats = categoriesInOrder();
+  const idx = cats.indexOf(cat);
+  const j = dir === 'up' ? idx - 1 : idx + 1;
+  if (j < 0 || j >= cats.length) return;
+  [cats[idx], cats[j]] = [cats[j], cats[idx]];
+  const ids = [];
+  for (const c of cats) ids.push(...itemsOf(c).map((m) => m.id));
+  await saveOrder(ids);
+}
+
+async function saveRow(tr) {
+  const id = tr.dataset.menu;
+  const g = (f) => tr.querySelector(`[data-f="${f}"]`);
+  let category = g('category').value;
+  if (category === '__new__') category = catOf(MENU_CACHE.find((m) => m.id === Number(id)));
+  await putJSON('/api/admin/menu/' + id, {
+    name: g('name').value, unit: g('unit').value,
+    price: Number(g('price').value) || 0,
+    price_tbd: g('price_tbd').checked ? 1 : 0,
+    category, active: g('active').checked ? 1 : 0,
+  });
+  toast('Сохранено ✓');
+  loadMenu();
+}
+
+async function uploadPhoto(tr, file) {
   const res = await fetch('/api/admin/photo', {
-    method: 'POST', headers: { 'X-Filename': encodeURIComponent(f.name) }, body: f,
+    method: 'POST', headers: { 'X-Filename': encodeURIComponent(file.name) }, body: file,
   });
   const data = await res.json();
   if (!res.ok) { alert(data.error); return; }
   await putJSON('/api/admin/menu/' + tr.dataset.menu, { photo: data.photo });
   loadMenu();
+}
+
+$('tab-menu').addEventListener('change', async (e) => {
+  const file = e.target.closest('[data-photo]');
+  if (file && file.files[0]) { await uploadPhoto(file.closest('[data-menu]'), file.files[0]); return; }
+  const tr = e.target.closest('[data-menu]');
+  if (!tr) return;
+  const id = tr.dataset.menu;
+  if (e.target.matches('select[data-f="category"]')) {
+    let val = e.target.value;
+    if (val === '__new__') {
+      const name = prompt('Название новой категории:');
+      if (!name || !name.trim()) { loadMenu(); return; }
+      val = name.trim();
+    }
+    await putJSON('/api/admin/menu/' + id, { category: val });
+    loadMenu();
+    return;
+  }
+  if (e.target.matches('input[data-f="active"]')) {
+    await putJSON('/api/admin/menu/' + id, { active: e.target.checked ? 1 : 0 });
+    loadMenu();
+  }
 });
 
 $('tab-menu').addEventListener('click', async (e) => {
-  if (e.target.closest('[data-add-menu]')) {
-    const tr = e.target.closest('[data-newrow]');
-    const get = (f) => tr.querySelector(`[data-f="${f}"]`);
-    if (!get('name').value.trim()) return;
-    await postJSON('/api/admin/menu', {
-      name: get('name').value, unit: get('unit').value,
-      price: Number(get('price').value) || 0,
-      price_tbd: get('price_tbd').checked ? 1 : 0,
-      category: get('category').value || 'Разное',
-    });
-    loadMenu();
+  if (e.target.closest('#addCat')) {
+    const name = prompt('Название новой категории:');
+    if (name && name.trim()) {
+      await postJSON('/api/admin/menu', { name: 'Новая позиция', category: name.trim(), price: 0 });
+      loadMenu();
+    }
+    return;
+  }
+  const block = e.target.closest('[data-cat]');
+  if (e.target.closest('[data-cat-up]')) return moveCategory(block.dataset.cat, 'up');
+  if (e.target.closest('[data-cat-down]')) return moveCategory(block.dataset.cat, 'down');
+  if (e.target.closest('[data-cat-rename]')) {
+    const to = prompt('Новое название категории:', block.dataset.cat);
+    if (to && to.trim() && to.trim() !== block.dataset.cat) {
+      await postJSON('/api/admin/menu/recategorize', { from: block.dataset.cat, to: to.trim() });
+      loadMenu();
+    }
+    return;
+  }
+  if (e.target.closest('[data-add-here]')) {
+    const name = prompt('Название позиции:');
+    if (name && name.trim()) {
+      await postJSON('/api/admin/menu', { name: name.trim(), category: block.dataset.cat, price: 0 });
+      loadMenu();
+    }
     return;
   }
   const tr = e.target.closest('[data-menu]');
   if (!tr) return;
-  const id = tr.dataset.menu;
-  if (e.target.closest('[data-save-menu]')) {
-    const get = (f) => tr.querySelector(`[data-f="${f}"]`);
-    await putJSON('/api/admin/menu/' + id, {
-      name: get('name').value, unit: get('unit').value,
-      price: Number(get('price').value) || 0,
-      price_tbd: get('price_tbd').checked ? 1 : 0,
-      category: get('category').value,
-      active: get('active').checked ? 1 : 0,
+  const id = Number(tr.dataset.menu);
+  if (e.target.closest('[data-up]')) return moveItem(id, 'up');
+  if (e.target.closest('[data-down]')) return moveItem(id, 'down');
+  if (e.target.closest('[data-save-menu]')) return saveRow(tr);
+  if (e.target.closest('[data-dup]')) {
+    const m = MENU_CACHE.find((x) => x.id === id);
+    await postJSON('/api/admin/menu', {
+      name: m.name + ' (копия)', unit: m.unit, price: m.price,
+      price_tbd: m.price_tbd, category: m.category, photo: m.photo,
     });
     loadMenu();
+    return;
   }
+  if (e.target.closest('[data-del-photo]')) { await putJSON('/api/admin/menu/' + id, { photo: '' }); loadMenu(); return; }
   if (e.target.closest('[data-del-menu]')) {
     if (!confirm('Удалить позицию из меню?')) return;
     await delJSON('/api/admin/menu/' + id);
