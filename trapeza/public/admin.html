@@ -20,6 +20,7 @@
   .photo-cell img { width:60px; height:42px; object-fit:cover; border-radius:4px; display:block; }
   .photo-btns { display:flex; gap:4px; margin-top:4px; flex-wrap:wrap; }
   .order-ctl { white-space:nowrap; }
+  .desc-input { margin-top:4px; font-size:13px; line-height:1.4; resize:vertical; min-height:44px; }
   .row-dirty { background:#fff7e6 !important; }
   .admin-toast { position:fixed; left:50%; bottom:22px; transform:translateX(-50%) translateY(10px);
     background:var(--dark,#5e3f27); color:#f6efe6; padding:10px 18px; border-radius:10px; font-size:14px;
@@ -49,13 +50,11 @@
   <div class="tabs">
     <button data-tab="orders" class="on">Заявки</button>
     <button data-tab="menu">Меню и цены</button>
-    <button data-tab="akt">Сверки</button>
     <button data-tab="settings">Реквизиты</button>
   </div>
 
   <section id="tab-orders"></section>
   <section id="tab-menu" hidden></section>
-  <section id="tab-akt" hidden></section>
   <section id="tab-settings" hidden></section>
 </div>
 
@@ -63,8 +62,6 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let SETTINGS = {};
-let CPS = [];
-let curCp = null;
 
 // ------------------------------------------------- вход
 
@@ -96,10 +93,9 @@ function showPanel() {
 document.querySelectorAll('.tabs button').forEach((b) => {
   b.onclick = () => {
     document.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('on', x === b));
-    ['orders', 'menu', 'akt', 'settings'].forEach((t) => { $('tab-' + t).hidden = (t !== b.dataset.tab); });
+    ['orders', 'menu', 'settings'].forEach((t) => { $('tab-' + t).hidden = (t !== b.dataset.tab); });
     if (b.dataset.tab === 'orders') loadOrders();
     if (b.dataset.tab === 'menu') loadMenu();
-    if (b.dataset.tab === 'akt') loadCps();
     if (b.dataset.tab === 'settings') loadSettings();
   };
 });
@@ -275,8 +271,9 @@ function renderMenuTab() {
       <div><div class="lbl">Показываются</div><div class="val">${active}</div></div>
       <div><div class="lbl">Категорий</div><div class="val">${cats.length}</div></div>
     </div>
-    <p class="notice">Меняйте состав меню как угодно: правки сразу видны клиенту и в смете.
-       Порядок — стрелками ↑/↓, скрыть позицию — снять галочку «Показ.».</p>
+    <p class="notice">Меняйте меню как угодно: правки сразу видны клиенту и в смете.
+       Заполните <b>состав</b> — клиент увидит его, нажав на блюдо. Порядок — стрелками ↑/↓,
+       скрыть позицию — снять галочку «Показ.». После правок нажмите <b>✓</b> в строке.</p>
     <div class="menu-toolbar">
       <input id="menuSearch" type="search" placeholder="Поиск по названию…" value="${esc(MENU_SEARCH)}">
       <button class="btn btn-ghost btn-sm" id="addCat">+ Категория</button>
@@ -334,7 +331,8 @@ function menuRow(m, j, n) {
     </td>
     <td>
       <input value="${esc(m.name)}" data-f="name" placeholder="Название">
-      <button type="button" class="btn btn-ghost btn-xs" data-desc style="margin-top:4px">${m.description ? 'Состав ✓' : 'Состав…'}</button>
+      <textarea data-f="description" rows="2" class="desc-input"
+        placeholder="Состав — виден клиенту по клику на блюдо">${esc(m.description || '')}</textarea>
     </td>
     <td style="width:80px"><input value="${esc(m.unit)}" data-f="unit" placeholder="50 гр"></td>
     <td style="width:96px"><input type="number" value="${m.price}" data-f="price" step="0.01" min="0"></td>
@@ -404,7 +402,8 @@ async function saveRow(tr) {
   let category = g('category').value;
   if (category === '__new__') category = catOf(MENU_CACHE.find((m) => m.id === Number(id)));
   await putJSON('/api/admin/menu/' + id, {
-    name: g('name').value, unit: g('unit').value,
+    name: g('name').value, description: g('description').value.trim(),
+    unit: g('unit').value,
     price: Number(g('price').value) || 0,
     price_tbd: g('price_tbd').checked ? 1 : 0,
     category, active: g('active').checked ? 1 : 0,
@@ -479,12 +478,6 @@ $('tab-menu').addEventListener('click', async (e) => {
   const id = Number(tr.dataset.menu);
   if (e.target.closest('[data-up]')) return moveItem(id, 'up');
   if (e.target.closest('[data-down]')) return moveItem(id, 'down');
-  if (e.target.closest('[data-desc]')) {
-    const m = MENU_CACHE.find((x) => x.id === id);
-    const v = prompt('Состав / описание блюда (показывается клиенту по клику):', m ? m.description : '');
-    if (v !== null) { await putJSON('/api/admin/menu/' + id, { description: v }); loadMenu(); }
-    return;
-  }
   if (e.target.closest('[data-save-menu]')) return saveRow(tr);
   if (e.target.closest('[data-dup]')) {
     const m = MENU_CACHE.find((x) => x.id === id);
@@ -503,177 +496,6 @@ $('tab-menu').addEventListener('click', async (e) => {
   }
 });
 
-// ------------------------------------------------- сверки
-
-async function loadCps() {
-  const { counterparties } = await getJSON('/api/admin/counterparties');
-  CPS = counterparties;
-  $('tab-akt').innerHTML = `
-    <div class="scroll-x">
-      <table class="grid">
-        <thead><tr><th>Контрагент</th><th>Тип</th><th>Договор</th><th>Операций</th>
-          <th class="money">Сальдо</th><th></th></tr></thead>
-        <tbody>${CPS.map((c) => `
-          <tr>
-            <td><b>${esc(c.name)}</b><div class="muted" style="font-size:12px">
-              ${c.inn ? 'ИНН ' + esc(c.inn) : ''}</div></td>
-            <td>${c.kind === 'supplier' ? 'поставщик' : 'заказчик'}</td>
-            <td style="font-size:13px">${esc(c.contract)}</td>
-            <td class="center">${c.ops_count}</td>
-            <td class="money"><b>${rub(c.closing)}</b></td>
-            <td class="nowrap">
-              <button class="btn btn-sm" data-open-cp="${c.id}">Журнал</button>
-              <a class="btn btn-ghost btn-sm" href="/api/admin/akt/${c.id}.xlsx">Excel ↓</a>
-            </td>
-          </tr>`).join('')}
-        </tbody>
-      </table>
-    </div>
-    <button class="btn btn-ghost btn-sm" id="addCp" style="margin-top:12px">+ Новый контрагент</button>
-    <div id="cpDetail" style="margin-top:22px"></div>`;
-
-  $('addCp').onclick = async () => {
-    const name = prompt('Название контрагента:');
-    if (!name) return;
-    const kind = confirm('Это поставщик? ОК — поставщик, Отмена — заказчик.') ? 'supplier' : 'customer';
-    const { id } = await postJSON('/api/admin/counterparties', {
-      name, full_name: name, kind, opening_date: new Date().toISOString().slice(0, 10),
-      period_end: new Date().toISOString().slice(0, 10),
-    });
-    await loadCps();
-    openCp(id);
-  };
-
-  if (curCp) openCp(curCp);
-}
-
-$('tab-akt').addEventListener('click', (e) => {
-  const b = e.target.closest('[data-open-cp]');
-  if (b) openCp(Number(b.dataset.openCp));
-});
-
-async function openCp(id) {
-  curCp = id;
-  const data = await getJSON('/api/admin/counterparties/' + id);
-  const cp = data.counterparty;
-  const isSup = cp.kind === 'supplier';
-  // Полные подписи — для плашек-итогов, короткие — для шапки таблицы,
-  // иначе колонка «Документ» схлопывается.
-  const debitLabel = isSup ? 'Наши оплаты (Дебет)' : 'Оплаты от контрагента (Дебет)';
-  const creditLabel = isSup ? 'Поставки нам (Кредит)' : 'Наши услуги (Кредит)';
-  const debitShort = isSup ? 'Оплаты, ₽' : 'Оплаты от к/а, ₽';
-  const creditShort = isSup ? 'Поставки, ₽' : 'Наши услуги, ₽';
-
-  $('cpDetail').innerHTML = `
-    <div class="card" style="padding:16px">
-      <h2 style="margin:0 0 4px;color:var(--dark)">${esc(cp.name)}</h2>
-      <div class="muted" style="font-size:13px;margin-bottom:12px">
-        ${esc(cp.contract)} · период ${dateRu(cp.opening_date)} — ${dateRu(cp.period_end)}
-      </div>
-
-      <div class="grid-2">
-        <div class="field"><label>Сальдо начальное, руб.</label>
-          <input type="number" step="0.01" value="${cp.opening_balance}" id="cpOpen"></div>
-        <div class="field"><label>Дата начала периода</label>
-          <input type="date" value="${esc(cp.opening_date)}" id="cpOpenDate"></div>
-        <div class="field"><label>Конец периода</label>
-          <input type="date" value="${esc(cp.period_end)}" id="cpEnd"></div>
-        <div class="field"><label>Подписант контрагента</label>
-          <input value="${esc(cp.signer)}" id="cpSigner" placeholder="И. Н. Сарычев"></div>
-      </div>
-      <button class="btn btn-sm" id="cpSave">Сохранить реквизиты</button>
-
-      <div class="stat">
-        <div><div class="lbl">${esc(debitLabel)}</div><div class="val">${rub(data.totalDebit)}</div></div>
-        <div><div class="lbl">${esc(creditLabel)}</div><div class="val">${rub(data.totalCredit)}</div></div>
-        <div><div class="lbl">${isSup ? 'Наш долг поставщику' : 'Долг в нашу пользу'}</div>
-             <div class="val">${rub(data.closing)}</div></div>
-      </div>
-
-      <div class="scroll-x">
-        <table class="grid">
-          <thead><tr>
-            <th style="width:132px">Дата</th><th style="width:104px">Тип</th>
-            <th style="min-width:240px">Документ</th>
-            <th class="money" style="width:118px" title="${esc(debitLabel)}">${esc(debitShort)}</th>
-            <th class="money" style="width:118px" title="${esc(creditLabel)}">${esc(creditShort)}</th>
-            <th class="money" style="width:110px">Сальдо</th><th style="width:84px"></th>
-          </tr></thead>
-          <tbody>
-            <tr><td colspan="5"><b>Сальдо на ${dateRu(cp.opening_date)}</b></td>
-                <td class="money"><b>${money(cp.opening_balance)}</b></td><td></td></tr>
-            ${data.rows.map((r) => `
-              <tr data-op="${r.id}">
-                <td style="width:130px"><input type="date" value="${esc(r.date)}" data-f="date"></td>
-                <td style="width:110px"><input value="${esc(r.kind)}" data-f="kind"></td>
-                <td><input value="${esc(r.doc)}" data-f="doc"></td>
-                <td style="width:120px"><input type="number" step="0.01" value="${r.debit || ''}" data-f="debit"></td>
-                <td style="width:120px"><input type="number" step="0.01" value="${r.credit || ''}" data-f="credit"></td>
-                <td class="money">${money(r.balance)}</td>
-                <td class="nowrap">
-                  <button class="btn btn-sm" data-save-op>✓</button>
-                  <button class="btn btn-ghost btn-sm" data-del-op>✕</button>
-                </td>
-              </tr>`).join('')}
-            <tr data-newop>
-              <td><input type="date" data-f="date" value="${new Date().toISOString().slice(0, 10)}"></td>
-              <td><input data-f="kind" placeholder="${isSup ? 'Поставка' : 'Приход'}"></td>
-              <td><input data-f="doc" placeholder="Документ, №"></td>
-              <td><input type="number" step="0.01" data-f="debit" placeholder="0"></td>
-              <td><input type="number" step="0.01" data-f="credit" placeholder="0"></td>
-              <td></td>
-              <td><button class="btn btn-sm" data-add-op>Добавить</button></td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-        <a class="btn" href="/api/admin/akt/${cp.id}.xlsx">📊 Скачать акт сверки (Excel)</a>
-      </div>
-    </div>`;
-
-  $('cpSave').onclick = async () => {
-    await putJSON('/api/admin/counterparties/' + cp.id, {
-      opening_balance: Number($('cpOpen').value) || 0,
-      opening_date: $('cpOpenDate').value,
-      period_end: $('cpEnd').value,
-      signer: $('cpSigner').value,
-      kind: cp.kind, name: cp.name,
-    });
-    loadCps();
-  };
-}
-
-$('tab-akt').addEventListener('click', async (e) => {
-  if (e.target.closest('[data-add-op]')) {
-    const tr = e.target.closest('[data-newop]');
-    const get = (f) => tr.querySelector(`[data-f="${f}"]`);
-    await postJSON('/api/admin/operations', {
-      cp_id: curCp, date: get('date').value, kind: get('kind').value,
-      doc: get('doc').value || `${get('kind').value} (${dateRu(get('date').value)})`,
-      debit: Number(get('debit').value) || 0, credit: Number(get('credit').value) || 0,
-    });
-    loadCps();   // перерисует список и заново откроет журнал текущего контрагента
-    return;
-  }
-  const tr = e.target.closest('[data-op]');
-  if (!tr) return;
-  const id = tr.dataset.op;
-  if (e.target.closest('[data-save-op]')) {
-    const get = (f) => tr.querySelector(`[data-f="${f}"]`);
-    await putJSON('/api/admin/operations/' + id, {
-      date: get('date').value, kind: get('kind').value, doc: get('doc').value,
-      debit: Number(get('debit').value) || 0, credit: Number(get('credit').value) || 0,
-    });
-    loadCps();   // перерисует список и заново откроет журнал текущего контрагента
-  }
-  if (e.target.closest('[data-del-op]')) {
-    if (!confirm('Удалить операцию?')) return;
-    await delJSON('/api/admin/operations/' + id);
-    loadCps();   // перерисует список и заново откроет журнал текущего контрагента
-  }
-});
 
 // ------------------------------------------------- реквизиты
 
