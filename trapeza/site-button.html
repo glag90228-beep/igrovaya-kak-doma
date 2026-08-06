@@ -1,0 +1,82 @@
+<!--
+  «Трапеза» — кнопка «Собрать заказ» для сайта трапеза18.рф
+
+  Как использовать:
+  1) Замените ССЫЛКУ ниже (https://ССЫЛКА-НА-КОНСТРУКТОР) на адрес конструктора.
+  2) Вставьте нужный вариант в шаблон сайта перед закрывающим тегом </body>.
+
+  Вариант А — плавающая кнопка: видна всегда, на любой странице, не мешает контенту.
+  Вариант Б — обычная кнопка: вставляется в текст страницы или в меню.
+  Вариант В — пункт меню: обычная ссылка для навигации сайта.
+-->
+
+<!-- ======================= ВАРИАНТ А: плавающая кнопка ======================= -->
+<a href="https://ССЫЛКА-НА-КОНСТРУКТОР"
+   class="trapeza-fab"
+   target="_blank" rel="noopener"
+   aria-label="Собрать заказ и получить смету">
+  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+    <path d="M7 4h10a1 1 0 0 1 1 1v15.4a.6.6 0 0 1-.94.49L12 17.6l-5.06 3.29A.6.6 0 0 1 6 20.4V5a1 1 0 0 1 1-1z"/>
+  </svg>
+  <span>Собрать заказ</span>
+</a>
+
+<style>
+.trapeza-fab {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 9999;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 14px 22px;
+  border-radius: 999px;
+  background: #7a5230;
+  color: #fff !important;
+  font: 600 16px/1 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  text-decoration: none !important;
+  box-shadow: 0 6px 22px rgba(46, 36, 28, .35);
+  transition: transform .15s ease-out, background .15s;
+  /* чтобы кнопка не перекрывалась «домашней» полосой на iPhone */
+  margin-bottom: env(safe-area-inset-bottom, 0px);
+}
+.trapeza-fab:hover { background: #5e3f27; transform: translateY(-2px); }
+.trapeza-fab:active { transform: translateY(0); }
+.trapeza-fab:focus-visible { outline: 3px solid #efe3d2; outline-offset: 2px; }
+.trapeza-fab svg { width: 20px; height: 20px; fill: currentColor; flex: none; }
+
+/* На телефоне — компактнее, чтобы не закрывать содержимое */
+@media (max-width: 480px) {
+  .trapeza-fab { right: 14px; bottom: 14px; padding: 13px 18px; font-size: 15px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .trapeza-fab { transition: none; }
+}
+</style>
+
+
+<!-- ======================= ВАРИАНТ Б: обычная кнопка ========================
+<a href="https://ССЫЛКА-НА-КОНСТРУКТОР" class="trapeza-btn" target="_blank" rel="noopener">
+  Собрать заказ и узнать стоимость
+</a>
+
+<style>
+.trapeza-btn {
+  display: inline-block;
+  padding: 14px 28px;
+  border-radius: 10px;
+  background: #7a5230;
+  color: #fff !important;
+  font: 600 16px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  text-decoration: none !important;
+  transition: background .15s;
+}
+.trapeza-btn:hover { background: #5e3f27; }
+</style>
+============================================================================ -->
+
+
+<!-- ======================= ВАРИАНТ В: пункт меню ============================
+<a href="https://ССЫЛКА-НА-КОНСТРУКТОР" target="_blank" rel="noopener">Собрать заказ</a>
+============================================================================ -->
