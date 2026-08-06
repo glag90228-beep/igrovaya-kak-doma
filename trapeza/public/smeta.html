@@ -125,8 +125,20 @@ function render(order, totals, s) {
   <p class="doc-note">${esc(s.smeta_note || '')}</p>
 
   <div class="doc-signs">
-    <div>Исполнитель&nbsp; /&nbsp; ${esc(s.signer || '')}</div>
-    <div>Заказчик&nbsp; /&nbsp; ${esc(order.client_name || '____________')}</div>
+    <div class="sign-col">
+      <div class="sign-role">Исполнитель</div>
+      <div class="sign-line"></div>
+      <div class="sign-hint">подпись</div>
+      <div class="sign-name">${esc(s.signer || s.org_name || '')}</div>
+    </div>
+    <div class="sign-col">
+      <div class="sign-role">Заказчик</div>
+      <div class="sign-line"></div>
+      <div class="sign-hint">подпись</div>
+      <div class="sign-name">${esc(order.client_name || '')}</div>
+      ${order.client_name ? '' : '<div class="sign-hint">Ф. И. О.</div>'}
+      <div class="sign-date">«____» ______________ ${new Date().getFullYear()} г.</div>
+    </div>
   </div>
   <p class="doc-foot">* Фотографии блюд носят ознакомительный характер.</p>`;
 }
