@@ -23,9 +23,10 @@ const SETTINGS = {
 
 // Меню грузится из отдельного файла (сгенерирован из фуршетного прайса и заказа).
 // Формат строки: [название, состав, выход, цена, категория, ценаУточняется].
-const MENU = require('./menu-data');
+const MENU = require('./menu-data');            // фуршетное меню
+const MENU_BANKET = require('./menu-data-banket'); // банкетное (вечернее) меню
 // При изменении набора поднимаем версию — меню перезаливается, заказы/сверки не трогаем.
-const MENU_VERSION = '2026-08-furshet-2';
+const MENU_VERSION = '2026-08-furshet-banket-1';
 
 // --- Контрагент 1: ИП Сарычев И. Н. (агентский договор, он нам должен) ---
 // Кредит = услуги, которые мы оказали; Дебет = оплаты, полученные от него.
@@ -134,11 +135,16 @@ function run() {
   // Меню перезаливаем при смене версии набора (заказы и сверки не трогаем).
   if (getSetting('menu_version') !== MENU_VERSION) {
     db.exec('DELETE FROM menu_items');
-    const ins = db.prepare(`INSERT INTO menu_items(name, description, unit, price, category, photo, price_tbd, sort)
-                            VALUES(?,?,?,?,?,?,?,?)`);
-    MENU.forEach((m, i) => ins.run(m[0], m[1] || '', m[2], m[3], m[4], m[6] || '', m[5] || 0, i));
+    const ins = db.prepare(`INSERT INTO menu_items(name, description, unit, price, category, menu_type,
+                                                   photo, price_tbd, sort)
+                            VALUES(?,?,?,?,?,?,?,?,?)`);
+    let i = 0;
+    for (const [type, list] of [['furshet', MENU], ['banket', MENU_BANKET]]) {
+      list.forEach((m) => ins.run(m[0], m[1] || '', m[2], m[3], m[4], type, m[6] || '', m[5] || 0, i++));
+    }
     setSetting('menu_version', MENU_VERSION);
-    console.log(`  меню: загружено ${MENU.length} позиций (версия ${MENU_VERSION})`);
+    console.log(`  меню: загружено ${MENU.length} фуршет + ${MENU_BANKET.length} банкет `
+      + `= ${MENU.length + MENU_BANKET.length} позиций (версия ${MENU_VERSION})`);
   }
   if (getSetting('slogan') === 'Кейтеринг · банкеты · кофе-брейки') {
     setSetting('slogan', SETTINGS.slogan);

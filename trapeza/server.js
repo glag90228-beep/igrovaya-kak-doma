@@ -256,10 +256,12 @@ async function handleApi(req, res, url) {
     if (pathname === '/api/admin/menu' && method === 'POST') {
       const b = await readJson(req);
       const maxSort = db.prepare('SELECT MAX(sort) AS s FROM menu_items').get().s || 0;
-      const info = db.prepare(`INSERT INTO menu_items(name, description, unit, price, price_tbd, category, photo, active, sort)
-                               VALUES(?,?,?,?,?,?,?,1,?)`).run(
+      const info = db.prepare(`INSERT INTO menu_items(name, description, unit, price, price_tbd, category, menu_type, photo, active, sort)
+                               VALUES(?,?,?,?,?,?,?,?,1,?)`).run(
         String(b.name || ''), String(b.description || ''), String(b.unit || ''), Number(b.price) || 0,
-        b.price_tbd ? 1 : 0, String(b.category || ''), String(b.photo || ''), maxSort + 1);
+        b.price_tbd ? 1 : 0, String(b.category || ''),
+        b.menu_type === 'banket' ? 'banket' : 'furshet',
+        String(b.photo || ''), maxSort + 1);
       return json(res, { id: Number(info.lastInsertRowid) }, 201);
     }
     // Массовая смена порядка: ids в нужной последовательности → sort = индекс.
@@ -285,12 +287,14 @@ async function handleApi(req, res, url) {
         const cur = db.prepare('SELECT * FROM menu_items WHERE id=?').get(id);
         if (!cur) return fail(res, 404, 'Позиция не найдена');
         db.prepare(`UPDATE menu_items SET name=?, description=?, unit=?, price=?, price_tbd=?, category=?,
-                    photo=?, active=?, sort=? WHERE id=?`).run(
+                    menu_type=?, photo=?, active=?, sort=? WHERE id=?`).run(
           String(b.name ?? cur.name), String(b.description ?? cur.description),
           String(b.unit ?? cur.unit),
           b.price === undefined ? cur.price : Number(b.price) || 0,
           b.price_tbd === undefined ? cur.price_tbd : (b.price_tbd ? 1 : 0),
-          String(b.category ?? cur.category), String(b.photo ?? cur.photo),
+          String(b.category ?? cur.category),
+          b.menu_type === undefined ? cur.menu_type : (b.menu_type === 'banket' ? 'banket' : 'furshet'),
+          String(b.photo ?? cur.photo),
           b.active === undefined ? cur.active : (b.active ? 1 : 0),
           b.sort === undefined ? cur.sort : Number(b.sort) || 0, id);
         return json(res, { ok: true });

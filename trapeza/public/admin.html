@@ -239,15 +239,19 @@ $('tab-orders').addEventListener('click', async (e) => {
 
 let MENU_CACHE = [];
 let MENU_SEARCH = '';
+let ADM_TYPE = 'furshet';           // какое меню редактируем
 
+const TYPES = { furshet: 'Фуршетное меню', banket: 'Банкетное меню' };
+const typeOf = (m) => (m.menu_type === 'banket' ? 'banket' : 'furshet');
 const catOf = (m) => m.category || 'Без категории';
+const inType = (m) => typeOf(m) === ADM_TYPE;
 
 function categoriesInOrder() {
   const cats = [];
-  for (const m of MENU_CACHE) if (!cats.includes(catOf(m))) cats.push(catOf(m));
+  for (const m of MENU_CACHE) if (inType(m) && !cats.includes(catOf(m))) cats.push(catOf(m));
   return cats;
 }
-function itemsOf(cat) { return MENU_CACHE.filter((m) => catOf(m) === cat); }
+function itemsOf(cat) { return MENU_CACHE.filter((m) => inType(m) && catOf(m) === cat); }
 
 function toast(msg) {
   let t = $('adminToast');
@@ -264,10 +268,16 @@ async function loadMenu() {
 
 function renderMenuTab() {
   const cats = categoriesInOrder();
-  const active = MENU_CACHE.filter((m) => m.active).length;
+  const mine = MENU_CACHE.filter(inType);
+  const active = mine.filter((m) => m.active).length;
   $('tab-menu').innerHTML = `
+    <div class="menu-switch" id="admSwitch">
+      ${Object.entries(TYPES).map(([k, l]) =>
+        `<button type="button" data-type="${k}" class="${k === ADM_TYPE ? 'on' : ''}">${l}
+         <span class="muted" style="font-weight:400">· ${MENU_CACHE.filter((m) => typeOf(m) === k).length}</span></button>`).join('')}
+    </div>
     <div class="stat">
-      <div><div class="lbl">Позиций</div><div class="val">${MENU_CACHE.length}</div></div>
+      <div><div class="lbl">Позиций в меню</div><div class="val">${mine.length}</div></div>
       <div><div class="lbl">Показываются</div><div class="val">${active}</div></div>
       <div><div class="lbl">Категорий</div><div class="val">${cats.length}</div></div>
     </div>
@@ -281,6 +291,12 @@ function renderMenuTab() {
     ${cats.map((c, i) => catBlock(c, i, cats.length)).join('')
       || '<p class="muted">Меню пусто. Нажмите «+ Категория», чтобы начать.</p>'}`;
   $('menuSearch').oninput = (e) => { MENU_SEARCH = e.target.value; applyMenuSearch(); };
+  $('admSwitch').onclick = (e) => {
+    const b = e.target.closest('button[data-type]');
+    if (!b || b.dataset.type === ADM_TYPE) return;
+    ADM_TYPE = b.dataset.type;
+    renderMenuTab();
+  };
   applyMenuSearch();
 }
 
@@ -346,6 +362,8 @@ function menuRow(m, j, n) {
     <td class="nowrap">
       <button class="btn btn-sm" data-save-menu title="Сохранить">✓</button>
       <button class="btn btn-ghost btn-sm" data-dup title="Дублировать">⧉</button>
+      <button class="btn btn-ghost btn-sm" data-move
+        title="Перенести в ${m.menu_type === 'banket' ? 'фуршетное' : 'банкетное'} меню">⇄</button>
       <button class="btn btn-ghost btn-sm" data-del-menu title="Удалить">✕</button>
     </td>
   </tr>`;
@@ -449,7 +467,7 @@ $('tab-menu').addEventListener('click', async (e) => {
   if (e.target.closest('#addCat')) {
     const name = prompt('Название новой категории:');
     if (name && name.trim()) {
-      await postJSON('/api/admin/menu', { name: 'Новая позиция', category: name.trim(), price: 0 });
+      await postJSON('/api/admin/menu', { name: 'Новая позиция', category: name.trim(), price: 0, menu_type: ADM_TYPE });
       loadMenu();
     }
     return;
@@ -468,7 +486,7 @@ $('tab-menu').addEventListener('click', async (e) => {
   if (e.target.closest('[data-add-here]')) {
     const name = prompt('Название позиции:');
     if (name && name.trim()) {
-      await postJSON('/api/admin/menu', { name: name.trim(), category: block.dataset.cat, price: 0 });
+      await postJSON('/api/admin/menu', { name: name.trim(), category: block.dataset.cat, price: 0, menu_type: ADM_TYPE });
       loadMenu();
     }
     return;
@@ -482,9 +500,18 @@ $('tab-menu').addEventListener('click', async (e) => {
   if (e.target.closest('[data-dup]')) {
     const m = MENU_CACHE.find((x) => x.id === id);
     await postJSON('/api/admin/menu', {
-      name: m.name + ' (копия)', unit: m.unit, price: m.price,
-      price_tbd: m.price_tbd, category: m.category, photo: m.photo,
+      name: m.name + ' (копия)', description: m.description, unit: m.unit, price: m.price,
+      price_tbd: m.price_tbd, category: m.category, menu_type: typeOf(m), photo: m.photo,
     });
+    loadMenu();
+    return;
+  }
+  if (e.target.closest('[data-move]')) {
+    const m = MENU_CACHE.find((x) => x.id === id);
+    const to = typeOf(m) === 'banket' ? 'furshet' : 'banket';
+    if (!confirm(`Перенести «${m.name}» в ${TYPES[to].toLowerCase()}?`)) return;
+    await putJSON('/api/admin/menu/' + id, { menu_type: to });
+    toast('Перенесено в ' + TYPES[to].toLowerCase());
     loadMenu();
     return;
   }
