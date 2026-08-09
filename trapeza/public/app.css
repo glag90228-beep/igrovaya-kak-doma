@@ -393,7 +393,10 @@ table.grid tr:nth-child(even) td { background: var(--cream); }
      Отступы задаём сами, на содержимом. */
   @page { size: A4; margin: 0; }
   body { background: #fff; font-size: 11pt; margin: 0; }
-  .brand, .doc-actions, .contact-fab, .cartbar, .tabs, .no-print { display: none !important; }
+  /* На лист идёт только документ: шапка сайта, переключатель меню, поиск,
+     каталог, корзина и модальные окна на печать не выводятся. */
+  .brand, .doc-actions, .contact-fab, .cartbar, .tabs, .no-print,
+  .hero, .guests-bar, .menu-switch, .searchbar, .overlay, #menu { display: none !important; }
   .doc {
     box-shadow: none; border: 0; margin: 0; max-width: none;
     padding: 12mm 12mm 10mm;
