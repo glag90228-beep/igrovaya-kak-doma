@@ -43,6 +43,17 @@ const OUR_PHOTOS = {
   'img/menu/elesh-kurica-kartofel.png': 'elesh-kurica-kartofel.png',
 };
 
+// ---------- цены на карточках сайта ----------
+// На витрине сайта цены разошлись с прайсом. Приводим к прайсу — он источник правды.
+const PRICE_FIX = [
+  ['Брускетта с сёмгой слабосолёной', 180, 150],
+  ['Канапе с сыром Ламбер, виноградом и мятой', 160, 115],
+  ['Канапе из сальчичона, фетаксы и черри', 135, 125],
+  ['Сырный чизбол', 155, 150],
+  ['Брускетта с пастромой копчёной', 125, 120],
+  ['Мини элеш с курицей', 50, 55],
+];
+
 const furshet = require(path.join(TRAPEZA, 'menu-data.js'));
 const banket = require(path.join(TRAPEZA, 'menu-data-banket.js'));
 const items = [];
@@ -128,17 +139,119 @@ for (const [dest, file] of Object.entries(OUR_PHOTOS)) {
   fs.copyFileSync(path.join(TRAPEZA, 'photos', file), path.join(OUT, dest));
 }
 
+// цены на карточках витрины: и в разметке, и в микроразметке Schema.org
+function fixPrices(html, report) {
+  for (const [name, was, now] of PRICE_FIX) {
+    const card = new RegExp('(<h4 class="mc__name">' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      + '</h4><span class="mc__price">)' + was + '( ₽)', 'g');
+    const before = html;
+    html = html.replace(card, `$1${now}$2`);
+    if (html !== before) report.push(`${name}: ${was} → ${now} ₽`);
+
+    const ld = new RegExp('("name": "' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      + '", "offers": \\{"@type": "Offer", "price": ")' + was + '(")', 'g');
+    html = html.replace(ld, `$1${now}$2`);
+  }
+  return html;
+}
+
+// ---------- баннер калькулятора на главной ----------
+const BANNER = `
+<!-- ════ КАЛЬКУЛЯТОР МЕНЮ ════ -->
+<style>
+.kalc-band{background:var(--c-dark);color:#fff;padding:clamp(3rem,7vw,5.5rem) 0}
+.kalc-band__in{display:flex;gap:clamp(2rem,5vw,4rem);align-items:center;justify-content:space-between;flex-wrap:wrap}
+.kalc-band__text{flex:1 1 440px}
+.kalc-band h2{font-family:var(--ff-display);font-weight:600;font-size:clamp(2rem,4.6vw,3.4rem);
+  line-height:1.08;color:#fff;margin:1rem 0 .9rem}
+.kalc-band p{color:rgba(255,255,255,.72);font-size:clamp(1rem,1.4vw,1.12rem);line-height:1.7;max-width:52ch;margin-bottom:1.7rem}
+.kalc-band .kicker{color:var(--c-accent-2)}
+.kalc-band .kicker::before{background:var(--c-accent-2)}
+.kalc-band__note{margin-top:1rem!important;font-size:.86rem!important;color:rgba(255,255,255,.5)!important}
+.kalc-steps{flex:0 1 320px;list-style:none;display:grid;gap:.75rem;margin:0;padding:0}
+.kalc-steps li{display:flex;align-items:center;gap:1rem;border:1px solid rgba(201,168,106,.28);
+  border-radius:var(--r);background:rgba(255,255,255,.04);padding:1rem 1.2rem;font-size:.98rem}
+.kalc-steps b{font-family:var(--ff-display);font-size:1.25rem;color:var(--c-accent-2);
+  min-width:32px;font-variant-numeric:tabular-nums}
+@media(max-width:640px){.kalc-band__in{gap:2rem}}
+</style>
+<section class="kalc-band" id="kalkulyator" aria-label="Калькулятор меню">
+  <div class="wrap kalc-band__in">
+    <div class="kalc-band__text">
+      <span class="kicker">Новое · онлайн-расчёт</span>
+      <h2>Соберите заказ<br>и сразу увидите смету</h2>
+      <p>Всё фуршетное и банкетное меню с ценами и составом блюд. Отмечаете позиции,
+         указываете число гостей — получаете готовую смету. Её можно распечатать,
+         сохранить в PDF или отправить нам заявкой.</p>
+      <a class="btn btn--on-dark btn--lg" href="kalkulyator.html">Открыть калькулятор
+        <svg class="arrow" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"
+             fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+             style="width:18px;height:18px"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      <p class="kalc-band__note">132 позиции · расчёт за 2 минуты · без звонков</p>
+    </div>
+    <ol class="kalc-steps">
+      <li><b>01</b> Выбираете блюда</li>
+      <li><b>02</b> Указываете гостей</li>
+      <li><b>03</b> Получаете смету</li>
+    </ol>
+  </div>
+</section>
+`;
+
 // пункт «Калькулятор» во всех меню сайта ведёт на новую страницу
 const pages = fs.readdirSync(OUT).filter((f) => f.endsWith('.html') && f !== 'kalkulyator.html');
 let touched = 0;
+const priceReport = [];
 for (const f of pages) {
   const p = path.join(OUT, f);
   const before = fs.readFileSync(p, 'utf8');
   let after = before.replace(/href="furshet\.html#calc"/g, 'href="kalkulyator.html"');
-  // и «Рассчитать стоимость» в шапке страницы кейтеринга
-  if (f === 'furshet.html') after = after.replace(/href="#calc" class="btn btn--outline-light"/,
-    'href="kalkulyator.html" class="btn btn--outline-light"');
+
+  if (f === 'furshet.html') {
+    // «Рассчитать стоимость» в обложке ведёт в новый калькулятор
+    after = after.replace(/href="#calc" class="btn btn--outline-light"/,
+      'href="kalkulyator.html" class="btn btn--outline-light"');
+    after = fixPrices(after, priceReport);
+  }
+
+  if (f === 'index.html') {
+    // баннер сразу под первым экраном — его видно, не листая
+    after = after.replace('<!-- ════ SCROLLY', BANNER + '\n<!-- ════ SCROLLY');
+    after = after.replace('17 фуршетных позиций · от 50 ₽ за штуку',
+      '132 позиции меню · расчёт за 2 минуты');
+    after = after.replace('>Рассчитать фуршет ', '>Открыть калькулятор ');
+    if (!after.includes('kalc-band')) throw new Error('не удалось вставить баннер на главную');
+  }
+
   if (after !== before) { fs.writeFileSync(p, after); touched++; }
+}
+
+// меню отдельным файлом — его правит панель admin.php, страница подхватывает на лету
+fs.writeFileSync(path.join(OUT, 'menu.json'), JSON.stringify(
+  { updated: new Date().toISOString(), transport: 1000,
+    items: items.map((it, i) => ({ ...it, off: 0, sort: i })) },
+  null, 2));
+fs.copyFileSync(path.join(D, 'admin.php'), path.join(OUT, 'admin.php'));
+
+// .htaccess: сайт запрещает отдавать *.json — а калькулятору нужен menu.json.
+// Выводим его из-под запрета (отрицательный просмотр вперёд) и на всякий случай
+// разрешаем явно; резервные копии наружу не отдаём.
+const htPath = path.join(OUT, '.htaccess');
+if (fs.existsSync(htPath)) {
+  let ht = fs.readFileSync(htPath, 'utf8');
+  if (!ht.includes('menu.json')) {
+    const was = ht;
+    ht = ht.replace(
+      '<FilesMatch "\\.(htaccess|json|md)$">\n  Require all denied\n</FilesMatch>',
+      '<FilesMatch "^(?!menu\\.json$).*\\.(htaccess|json|md)$">\n  Require all denied\n</FilesMatch>\n'
+      + '\n# Меню калькулятора должно быть доступно странице (его пишет панель admin.php)\n'
+      + '<Files "menu.json">\n  Require all granted\n</Files>\n'
+      + '\n# Резервные копии меню наружу не отдаём\n'
+      + 'RedirectMatch 404 ^/menu-backup/');
+    if (ht === was) throw new Error('не удалось поправить .htaccess');
+    fs.writeFileSync(htPath, ht);
+    console.log('.htaccess: menu.json разрешён, menu-backup закрыт');
+  }
 }
 
 // карта сайта
@@ -154,3 +267,9 @@ if (!sm.includes('kalkulyator.html')) {
 console.log(`kalkulyator.html: ${(page.length / 1024).toFixed(0)} КБ, позиций ${items.length}`
   + ` (фуршет ${furshet.length} + банкет ${banket.length}), с фото ${items.filter((i) => i.ph).length}`);
 console.log(`ссылку «Калькулятор» поправили на ${touched} страницах, sitemap обновлён`);
+console.log('баннер калькулятора добавлен на главную, menu.json и admin.php готовы');
+console.log('цены на карточках сайта приведены к прайсу:');
+priceReport.forEach((r) => console.log('  • ' + r));
+if (priceReport.length !== PRICE_FIX.length) {
+  throw new Error('поправились не все цены: ' + priceReport.length + ' из ' + PRICE_FIX.length);
+}

@@ -4,6 +4,8 @@
    Заявка уходит тем же путём, что и остальные формы сайта — через sendForm(). */
 (function(){
 'use strict';
+/* Меню зашито в страницу, но если рядом лежит menu.json (его пишет панель
+   admin.php) — берём свежую версию оттуда. */
 var MENU = /*__MENU__*/[];
 var TRANSPORT = 1000;                 /* транспортные расходы по умолчанию */
 var ORG = {
@@ -364,8 +366,26 @@ $('kb-send').addEventListener('click', function(){
   });
 });
 
+function useMenu(list, transport){
+  MENU = list.filter(function(m){ return !m.off; });
+  if (transport > 0) TRANSPORT = transport;
+  picked = {};
+  draw();
+  tally();
+}
+
 document.body.classList.add('kb-page');
-draw();
-tally();
+useMenu(MENU, TRANSPORT);
+
+/* Свежее меню из панели. Не загрузилось (нет файла, открыли файл с диска) —
+   работаем на том, что зашито в страницу. */
+if (location.protocol !== 'file:') {
+  fetch('menu.json?v=' + Date.now(), { cache: 'no-store' })
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .then(function(j){
+      if (j && Array.isArray(j.items) && j.items.length) useMenu(j.items, Number(j.transport) || 0);
+    })
+    .catch(function(){ /* остаёмся на встроенном меню */ });
+}
 })();
 </script>
