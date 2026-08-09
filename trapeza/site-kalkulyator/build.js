@@ -22,37 +22,34 @@ if (!fs.existsSync(path.join(SRC, 'furshet.html'))) {
 // ---------- меню ----------
 // Фото: сначала то, что уже лежит на сайте (img/…), затем наши файлы (img/menu/…).
 const PHOTO = {
+  // Каждый снимок открыт и проверен глазами: на нём именно это блюдо.
   'Закуска «Рафаэлло»': 'img/rafaello.webp',
   'Сырный ЧИЗБОЛ': 'img/syrnyy-chizbol.webp',
+  'Мини-тарталетка с салатом полесский': 'img/tartlets.jpg',
   'Канапе из сыра Камамбер свежих ягод и мяты': 'img/kanape-kamamber-yagody.webp',
   'Канапе из сыра ламбер и винограда с мятой': 'img/kanape-lamber.webp',
   'Канапе из сальчичона, фетаксы и черри с микрозеленью': 'img/kanape-iz-salchichona-fetaksy-i-cherri.webp',
   'Канапе с креветкой и черри': 'img/kanape-s-krevetkoy.webp',
   'Брускетта с сёмгой с/с и творожным сыром': 'img/brusketta-s-semgoy-slabosolenoy.webp',
-  'Брускетта с пастромой копчёной, творожным сыром и черри': 'img/brusketta-pastroma.webp',
-  'Мини пирожок с мясом': 'img/mini-pirozhok-s-myasom.webp',
-  'Мини кокрок с яблоком': 'img/mini-kokrok-s-yablokom.webp',
-  'Мини элеш с куриной грудкой': 'img/mini-elesh-s-kuricey.webp',
-  'Мини-безе с кремом крем-чиз и голубикой': 'img/mini-beze-s-krem-chizom-i-golubikoy.webp',
-  'Мини-тарталетка с салатом полесский': 'img/tartlets.jpg',
-  // позиции, которые были только на витрине сайта
   'Брускетта с говядиной': 'img/brusketta-govyadina.webp',
-  'Мини профитроли с заварным кремом': 'img/mini-profitroli-s-zavarnym-kremom.webp',
+  'Брускетта с пастромой копчёной, творожным сыром и черри': 'img/brusketta-pastroma.webp',
+  'Мини-безе с кремом крем-чиз и голубикой': 'img/mini-beze-s-krem-chizom-i-golubikoy.webp',
   'Трайфл шоколадно-банановый / Красный бархат': 'img/zak_trayfl.webp',
   'Трюфели из тёмного шоколада с копчёной паприкой': 'img/zak_trufeli.webp',
-  // на снимке ассорти видны начинки с мясом/грибами и с зелёным луком —
-  // ставим его этим трём позициям, остальным перепечам фото не подходит
+  // на снимке ассорти видны начинки с мясом/грибами и с зелёным луком
   'Мини перепечи с мясом': 'img/mini-perepechi-v-assortimente.webp',
   'Мини перепечи с грибами': 'img/mini-perepechi-v-assortimente.webp',
   'Мини перепечи с зелёным луком': 'img/mini-perepechi-v-assortimente.webp',
-  // наш снимок — кладём в img/menu/
-  'Мини элеш «Курица-картофель»': 'img/menu/elesh-kurica-kartofel.png',
 };
-// У перепечей с мясом и с зелёным луком в архиве оказался один и тот же файл
-// (общее фото ассорти) — ставить его двум разным блюдам нельзя, оставили без фото.
-const OUR_PHOTOS = {
-  'img/menu/elesh-kurica-kartofel.png': 'elesh-kurica-kartofel.png',
-};
+
+// НЕ ставим (проверено глазами, имя файла обманывает):
+//   mini-pirozhok-s-myasom.webp, mini-kokrok-s-yablokom.webp,
+//   mini-elesh-s-kuricey.webp, mini-profitroli-s-zavarnym-kremom.webp —
+//     это один и тот же снимок стола на кофе-брейке, а не блюдо;
+//   photos/elesh-kurica-kartofel.png — на подносе сразу элеш и мини-безе;
+//   buffet1, brusch, canape1/2, coffee*, banquet, korporativ-stol, furshet-img* —
+//     общие виды накрытых столов.
+const OUR_PHOTOS = {};
 
 // ---------- цены на карточках сайта ----------
 // На витрине сайта цены разошлись с прайсом. Приводим к прайсу — он источник правды.

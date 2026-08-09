@@ -35,7 +35,9 @@
 .kb-open{display:flex;flex-direction:column;flex:1;width:100%;text-align:left;background:none;padding:0}
 .kb-modal__bar{height:14px;background:var(--c-accent);position:relative}
 .kb-modal__bar .kb-modal__close{top:.6rem;background:var(--c-surface);box-shadow:var(--shadow-sm)}
-.kb-card img{aspect-ratio:4/3;width:100%;object-fit:cover}
+.kb-card img,.kb-ph{width:100%;height:132px;object-fit:cover;display:block}
+.kb-ph{background:var(--c-bg2);display:grid;place-items:center;color:var(--c-accent)}
+.kb-ph svg{width:38px;height:38px;opacity:.28}
 .kb-body{padding:.95rem 1.05rem .3rem;display:flex;flex-direction:column;gap:.35rem;flex:1}
 /* Название — ровно две строки у всех карточек, чтобы цена и кнопка «Выбрать»
    стояли на одном уровне по всему ряду. */
@@ -126,6 +128,8 @@ table.kb-bill tbody tr:nth-child(even) td{background:var(--c-bg)}
   .kb-meta{flex-wrap:nowrap}
   .kb-unit{white-space:nowrap}
   .kb-act{padding:.55rem .8rem .85rem}
+  .kb-card img,.kb-ph{height:104px}
+  .kb-ph svg{width:30px;height:30px}
   .kb-bar__sum{font-size:1.3rem}
   .kb-signs{grid-template-columns:1fr;gap:1.6rem}
   /* На телефоне таблица сметы должна поместиться по ширине: убираем заданные

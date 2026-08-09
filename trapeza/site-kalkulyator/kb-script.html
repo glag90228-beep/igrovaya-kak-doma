@@ -15,6 +15,10 @@ var ORG = {
      + 'Количество и состав меню согласовываются с заказчиком.'
 };
 
+var PLATE = '<svg viewBox="0 0 48 48" aria-hidden="true">'
+  + '<circle cx="24" cy="24" r="17" fill="none" stroke="currentColor" stroke-width="1.6"/>'
+  + '<circle cx="24" cy="24" r="10" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>';
+
 var $ = function(id){ return document.getElementById(id); };
 var picked = {};                      /* индекс позиции → количество порций */
 var type = 'furshet';
@@ -76,7 +80,11 @@ function qtyHtml(i){
 
 function cardHtml(i){
   var m = MENU[i];
-  var img = m.ph ? '<img src="'+esc(m.ph)+'" alt="'+esc(m.n)+'" loading="lazy" decoding="async">' : '';
+  // Картинка есть у каждой карточки: либо снимок, либо спокойная заглушка —
+  // иначе соседи по ряду вытягиваются и между текстом и кнопкой зияет пустота.
+  var img = m.ph
+    ? '<img src="'+esc(m.ph)+'" alt="'+esc(m.n)+'" loading="lazy" decoding="async">'
+    : '<div class="kb-ph">'+PLATE+'</div>';
   var price = m.t ? '<span class="kb-tbd">цена уточняется</span>'
                   : '<span class="kb-price">'+moneyShort(m.p)+' ₽</span><span class="kb-unit">/ '+esc(m.u || 'шт')+'</span>';
   return '<article class="kb-card'+(picked[i] ? ' on' : '')+'">'
