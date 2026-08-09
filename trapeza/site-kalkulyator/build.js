@@ -276,15 +276,88 @@ if (fs.existsSync(htPath)) {
   }
 }
 
-// карта сайта
-const smPath = path.join(OUT, 'sitemap.xml');
-const sm = fs.readFileSync(smPath, 'utf8');
-if (!sm.includes('kalkulyator.html')) {
-  const today = new Date().toISOString().slice(0, 10);
-  fs.writeFileSync(smPath, sm.replace('</urlset>',
-    `  <url>\n    <loc>https://трапеза18.рф/kalkulyator.html</loc>\n`
-    + `    <lastmod>${today}</lastmod>\n    <changefreq>weekly</changefreq>\n    <priority>0.9</priority>\n  </url>\n</urlset>`));
+// ─────────────────────── SEO: карта сайта, robots и разметка организации
+// Яндекс.Вебмастер ругался на sitemap: в нём кириллические адреса, а протокол
+// требует ASCII — переписываем на punycode и добавляем новую страницу.
+
+const HOST = 'https://xn--18-6kcaym8cgr.xn--p1ai';   // трапеза18.рф в ASCII
+const iso = new Date().toISOString().slice(0, 10);
+const SITEMAP = [
+  ['/', 'weekly', '1.0'],
+  ['/kalkulyator.html', 'weekly', '0.9'],
+  ['/furshet.html', 'weekly', '0.9'],
+  ['/biznes-lanch.html', 'weekly', '0.9'],
+  ['/pirogi.html', 'weekly', '0.8'],
+  ['/pravila.html', 'monthly', '0.3'],
+  ['/rekvizity.html', 'monthly', '0.3'],
+];
+fs.writeFileSync(path.join(OUT, 'sitemap.xml'),
+  '<?xml version="1.0" encoding="UTF-8"?>\n'
+  + '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+  + SITEMAP.map(([u, freq, pr]) =>
+    `  <url>\n    <loc>${HOST}${u}</loc>\n    <lastmod>${iso}</lastmod>\n`
+    + `    <changefreq>${freq}</changefreq>\n    <priority>${pr}</priority>\n  </url>`).join('\n')
+  + '\n</urlset>\n');
+
+// robots.txt: адрес карты сайта тоже в ASCII, служебное закрываем,
+// menu.json разрешаем — иначе он подпадает под общий запрет *.json
+fs.writeFileSync(path.join(OUT, 'robots.txt'),
+  'User-agent: *\n'
+  + 'Allow: /\n'
+  + 'Allow: /menu.json\n'
+  + 'Disallow: /*.json$\n'
+  + 'Disallow: /admin.php\n'
+  + 'Disallow: /menu-backup/\n'
+  + '\n'
+  + `Sitemap: ${HOST}/sitemap.xml\n`);
+
+// Микроразметка организации на главной: адрес, часы работы и город —
+// по ней поисковик понимает, что сайт про Ижевск.
+const BUSINESS = {
+  '@context': 'https://schema.org',
+  '@type': 'FoodEstablishment',
+  '@id': HOST + '/#business',
+  name: 'Трапеза',
+  alternateName: 'Кейтеринг «Трапеза»',
+  description: 'Кейтеринг и доставка обедов в Ижевске: фуршеты, банкеты, корпоративы, '
+    + 'кофе-брейки, комплексные обеды в офис, пироги на заказ.',
+  url: HOST + '/',
+  telephone: '+7-912-454-14-81',
+  priceRange: '₽₽',
+  servesCuisine: 'Европейская, домашняя',
+  image: HOST + '/img/korporativ-stol.webp',
+  address: {
+    '@type': 'PostalAddress',
+    streetAddress: 'ул. Пушкинская, 214',
+    addressLocality: 'Ижевск',
+    addressRegion: 'Удмуртская Республика',
+    addressCountry: 'RU',
+  },
+  areaServed: [
+    { '@type': 'City', name: 'Ижевск' },
+    { '@type': 'AdministrativeArea', name: 'Удмуртская Республика' },
+  ],
+  openingHoursSpecification: [{
+    '@type': 'OpeningHoursSpecification',
+    dayOfWeek: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'],
+    opens: '08:00', closes: '16:00',
+  }],
+  sameAs: ['https://t.me/trapezaizh',
+    'https://max.ru/u/f9LHodD0cOIz8xuJ-IfBNwM6edcBt6rQkkcUaDH9taCFdfnYG6hHcI6o6Uo'],
+};
+
+{
+  const p = path.join(OUT, 'index.html');
+  let html = fs.readFileSync(p, 'utf8');
+  if (!html.includes('#business')) {
+    html = html.replace('</head>',
+      '<script type="application/ld+json">' + JSON.stringify(BUSINESS) + '</script>\n</head>');
+    fs.writeFileSync(p, html);
+    console.log('index.html: добавлена микроразметка организации (адрес, город, часы)');
+  }
 }
+
+console.log('sitemap.xml и robots.txt переписаны на ASCII-адреса');
 
 console.log(`kalkulyator.html: ${(page.length / 1024).toFixed(0)} КБ, позиций ${items.length}`
   + ` (фуршет ${furshet.length} + банкет ${banket.length}), с фото ${items.filter((i) => i.ph).length}`);
