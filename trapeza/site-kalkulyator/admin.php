@@ -5,9 +5,9 @@
  * Кладётся в корень сайта рядом с kalkulyator.html и menu.json.
  * Открывается по адресу https://трапеза18.рф/admin.php
  *
- * Пароль по умолчанию: trapeza2026 — смените его сразу:
+ * Пароль хранится не текстом, а хэшем. Сменить:
  *   php -r 'echo password_hash("новый-пароль", PASSWORD_DEFAULT);'
- * и подставьте результат в ADMIN_HASH ниже.
+ * и подставить результат в ADMIN_HASH ниже.
  *
  * Меню сохраняется одним JSON-запросом (не обычной формой) — иначе на длинном
  * списке PHP молча обрезает поля по max_input_vars и часть блюд теряется.
@@ -15,7 +15,7 @@
 
 declare(strict_types=1);
 
-const ADMIN_HASH = '$2y$12$TJnhzlpcEVFMj5BGkLuj4e5PpCI1evmyAfRDhpseo.vqxG8oE52n.';
+const ADMIN_HASH = '$2y$12$B7pkHuaC0KTclRG1DLkaEuphNQUDNawkq9EdFM7ntwZXW3lEzp2OW';
 const MENU_FILE  = __DIR__ . '/menu.json';
 const BACKUP_DIR = __DIR__ . '/menu-backup';
 const PHOTO_DIR  = __DIR__ . '/img/menu';
