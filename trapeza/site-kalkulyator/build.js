@@ -122,7 +122,10 @@ let newHead = head
 // микроразметку конкретной страницы фуршета убираем — она не про калькулятор
 newHead = newHead.replace(/<script type="application\/ld\+json">\{"@context": "https:\/\/schema\.org", "@type": "ItemList"[\s\S]*?<\/script>\n?/, '');
 
-const section = fs.readFileSync(path.join(D, 'kb-section.html'), 'utf8');
+const today = new Date();
+const stamp = `${String(today.getDate()).padStart(2, '0')}.${String(today.getMonth() + 1).padStart(2, '0')}.${today.getFullYear()}`;
+const section = fs.readFileSync(path.join(D, 'kb-section.html'), 'utf8')
+  .replace('<!--__DATE__-->', stamp);
 const script = fs.readFileSync(path.join(D, 'kb-script.html'), 'utf8')
   .replace('/*__MENU__*/[]', JSON.stringify(items));
 
@@ -262,6 +265,15 @@ if (fs.existsSync(htPath)) {
       + '\n# Резервные копии меню наружу не отдаём\n'
       + 'RedirectMatch 404 ^/menu-backup/');
     if (ht === was) throw new Error('не удалось поправить .htaccess');
+
+    // Сайт разрешает браузеру держать HTML сутки — после обновления калькулятора
+    // человек сутки видел бы старую страницу. Для неё и меню выключаем кэш.
+    ht = ht.replace('<IfModule mod_headers.c>',
+      '<IfModule mod_headers.c>\n'
+      + '  # Калькулятор и меню всегда берём свежие\n'
+      + '  <FilesMatch "^(kalkulyator\\.html|menu\\.json)$">\n'
+      + '    Header set Cache-Control "no-cache, must-revalidate"\n'
+      + '  </FilesMatch>\n');
     fs.writeFileSync(htPath, ht);
     console.log('.htaccess: menu.json разрешён, menu-backup закрыт');
   }

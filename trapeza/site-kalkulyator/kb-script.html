@@ -368,9 +368,16 @@ $('kb-send').addEventListener('click', function(){
   });
 });
 
-function useMenu(list, transport){
+function useMenu(list, transport, updated){
   MENU = list.filter(function(m){ return !m.off; });
   if (transport > 0) TRANSPORT = transport;
+  if (updated) {
+    var d = new Date(updated);
+    if (!isNaN(d)) {
+      $('kb-build').textContent = 'Меню от ' + ('0' + d.getDate()).slice(-2) + '.'
+        + ('0' + (d.getMonth() + 1)).slice(-2) + '.' + d.getFullYear();
+    }
+  }
   picked = {};
   draw();
   tally();
@@ -385,7 +392,7 @@ if (location.protocol !== 'file:') {
   fetch('menu.json?v=' + Date.now(), { cache: 'no-store' })
     .then(function(r){ return r.ok ? r.json() : null; })
     .then(function(j){
-      if (j && Array.isArray(j.items) && j.items.length) useMenu(j.items, Number(j.transport) || 0);
+      if (j && Array.isArray(j.items) && j.items.length) useMenu(j.items, Number(j.transport) || 0, j.updated);
     })
     .catch(function(){ /* остаёмся на встроенном меню */ });
 }

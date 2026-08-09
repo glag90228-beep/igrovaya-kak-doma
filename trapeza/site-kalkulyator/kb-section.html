@@ -17,6 +17,8 @@
 .kb-ghost{padding:.7rem 1.1rem;border:1px solid var(--c-line);border-radius:var(--r-sm);font-size:.86rem;font-weight:600;color:var(--c-ink2);transition:.2s}
 .kb-ghost:hover{border-color:var(--c-accent);color:var(--c-accent)}
 .kb-hint{font-size:.82rem;color:var(--c-muted)}
+/* Отметка версии — по ней сразу видно, какое меню сейчас на сайте. */
+.kb-build{font-size:.72rem;color:var(--c-muted);letter-spacing:.04em}
 
 .kb-search{display:flex;align-items:center;gap:.7rem;background:var(--c-surface);border:1px solid var(--c-line);border-radius:var(--r-pill);padding:.2rem .4rem .2rem 1rem}
 .kb-search svg{width:18px;height:18px;fill:var(--c-muted);flex:none}
@@ -205,6 +207,7 @@ table.kb-bill tbody tr:nth-child(even) td{background:var(--c-bg)}
           <button class="kb-ghost" id="kb-apply" type="button">Проставить всем позициям</button>
           <span class="kb-hint" id="kb-hint"></span>
         </div>
+        <div class="kb-build" id="kb-build">Меню от <!--__DATE__--></div>
         <div class="kb-search">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 2a8 8 0 1 0 4.9 14.3l5.4 5.4 1.4-1.4-5.4-5.4A8 8 0 0 0 10 2zm0 2a6 6 0 1 1 0 12 6 6 0 0 1 0-12z"/></svg>
           <input id="kb-q" type="search" placeholder="Поиск по блюдам: сёмга, перепечи, десерт…" aria-label="Поиск по блюдам">
