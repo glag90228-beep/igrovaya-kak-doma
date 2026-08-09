@@ -1,149 +1,152 @@
 <!--
   «Трапеза» — как добавить конструктор заказа на сайт трапеза18.рф
 
-  Один и тот же конструктор работает сразу двумя способами:
-    • отдельной ссылкой  — menu.трапеза18.рф (для соцсетей, QR, визиток, рассылок);
-    • внутри сайта       — блоком или встроенной страницей (варианты Б и В ниже).
+  Оформление подогнано под текущий сайт: тёмный фон, золотые акценты,
+  скруглённые «пилюли», крупный серифный заголовок.
 
-  Перед вставкой замените https://menu.трапеза18.рф на ваш реальный адрес.
-  Все варианты — в фирменных цветах, без внешних библиотек, работают на телефоне.
+  ВАЖНО. На сайте уже есть плавающая кнопка «Оставить заявку» справа внизу —
+  вторую плавающую кнопку не добавляем, чтобы они не спорили. Вместо этого:
+    • пункт меню «Калькулятор» ведёт на конструктор;
+    • на главной ставим блок-баннер (вариант А);
+    • на странице «Калькулятор» — встроенный конструктор (вариант Б).
+
+  Перед вставкой замените https://menu.трапеза18.рф на реальный адрес.
 -->
 
 <!-- ==================================================================
-     ВАРИАНТ А. Плавающая кнопка — видна всегда, на любой странице
-     Куда: перед </body> в шаблоне сайта (один раз на весь сайт).
+     ВАРИАНТ А. Блок-баннер в стиле сайта — на главную
      ================================================================== -->
-<a href="https://menu.трапеза18.рф" class="tz-fab" target="_blank" rel="noopener"
-   aria-label="Собрать заказ и получить смету">
-  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4h10a1 1 0 0 1 1 1v15.4a.6.6 0 0 1-.94.49L12 17.6l-5.06 3.29A.6.6 0 0 1 6 20.4V5a1 1 0 0 1 1-1z"/></svg>
-  <span>Собрать заказ</span>
-</a>
-
-<!-- ==================================================================
-     ВАРИАНТ Б. Блок-баннер в тексте страницы (главная / страница услуг)
-     Куда: в то место страницы, где хотите показать приглашение.
-     ================================================================== -->
-<section class="tz-banner">
-  <div class="tz-banner-in">
-    <div class="tz-banner-text">
-      <p class="tz-eyebrow">Онлайн-конструктор</p>
-      <h2>Соберите заказ и сразу узнайте стоимость</h2>
-      <p>Фуршетное и банкетное меню с составом блюд и ценами. Выбираете блюда,
+<section class="tz-band">
+  <div class="tz-band-in">
+    <div class="tz-band-text">
+      <span class="tz-pill">Онлайн-расчёт</span>
+      <h2>Соберите заказ<br>и сразу увидите смету</h2>
+      <p>Фуршетное и банкетное меню с составом блюд и ценами. Отмечаете блюда,
          указываете количество гостей — получаете готовую смету. Можно скачать,
-         распечатать или отправить нам в один тап.</p>
-      <a class="tz-btn" href="https://menu.трапеза18.рф" target="_blank" rel="noopener">
-        Открыть меню и собрать заказ →
-      </a>
-      <p class="tz-note">132 позиции · смета за 2 минуты · без звонков</p>
+         распечатать или отправить нам.</p>
+      <a class="tz-cta" href="https://menu.трапеза18.рф">Открыть калькулятор</a>
+      <p class="tz-small">132 позиции · расчёт за 2 минуты · без звонков</p>
     </div>
-    <ul class="tz-steps">
-      <li><b>1</b> Выбираете блюда</li>
-      <li><b>2</b> Указываете гостей</li>
-      <li><b>3</b> Получаете смету</li>
-    </ul>
+
+    <ol class="tz-steps">
+      <li><span>01</span> Выбираете блюда</li>
+      <li><span>02</span> Указываете гостей</li>
+      <li><span>03</span> Получаете смету</li>
+    </ol>
   </div>
 </section>
 
 <!-- ==================================================================
-     ВАРИАНТ В. Встроенная страница — конструктор внутри вашего сайта
-     Куда: на отдельную страницу сайта, например /menu.
-     Шапка и подвал сайта остаются вашими, конструктор — внутри.
+     ВАРИАНТ Б. Встроенный конструктор — на страницу «Калькулятор»
      ================================================================== -->
-<div class="tz-embed">
-  <iframe src="https://menu.трапеза18.рф" title="Конструктор заказа «Трапеза»"
-          loading="lazy" allow="clipboard-write"></iframe>
-</div>
-<p class="tz-embed-alt">
-  Не отображается? <a href="https://menu.трапеза18.рф" target="_blank" rel="noopener">Откройте меню в новом окне →</a>
-</p>
+<section class="tz-embed-wrap">
+  <div class="tz-embed-head">
+    <span class="tz-pill">Калькулятор</span>
+    <h2>Меню и расчёт стоимости</h2>
+    <p>Выберите блюда — стоимость посчитается сразу. Нажмите на блюдо, чтобы увидеть состав.</p>
+  </div>
+  <div class="tz-embed">
+    <iframe src="https://menu.трапеза18.рф" title="Калькулятор заказа «Трапеза»"
+            loading="lazy" allow="clipboard-write"></iframe>
+  </div>
+  <p class="tz-embed-alt">
+    Не отображается? <a href="https://menu.трапеза18.рф" target="_blank" rel="noopener">Открыть в новом окне →</a>
+  </p>
+</section>
+
+<!-- ==================================================================
+     ВАРИАНТ В. Пункт меню — просто ссылка в навигации сайта
+     <a href="https://menu.трапеза18.рф">Калькулятор</a>
+     ================================================================== -->
 
 
 <style>
-/* ---------- общие фирменные цвета ---------- */
-.tz-fab, .tz-banner, .tz-embed, .tz-embed-alt {
-  --tz-brown: #7a5230;
-  --tz-dark: #5e3f27;
-  --tz-cream: #faf6f1;
-  --tz-sand: #efe3d2;
-  --tz-line: #e4d8c7;
-  --tz-ink: #2e241c;
-  --tz-sans: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+.tz-band, .tz-embed-wrap {
+  --tz-dark: #17120f;        /* тёмный фон, как в шапке сайта */
+  --tz-dark-2: #221b16;
+  --tz-gold: #c9a47a;        /* золотой акцент ссылок и подписей */
+  --tz-bronze: #a9855c;      /* кнопки, как «Оставить заявку» */
+  --tz-cream: #f6f1ea;
+  --tz-line: rgba(201, 164, 122, .28);
+  --tz-serif: "Playfair Display", Georgia, "Times New Roman", serif;
+  --tz-sans: "Manrope", system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
 }
 
-/* ---------- А. плавающая кнопка ---------- */
-.tz-fab {
-  position: fixed; right: 20px; bottom: 20px; z-index: 9999;
-  display: inline-flex; align-items: center; gap: 9px;
-  padding: 14px 22px; border-radius: 999px;
-  background: var(--tz-brown); color: #fff !important;
+/* ---------- общие элементы ---------- */
+.tz-pill {
+  display: inline-block; padding: 7px 16px; border-radius: 999px;
+  border: 1px solid var(--tz-line); background: rgba(255, 255, 255, .05);
+  color: var(--tz-gold); font: 600 11px/1 var(--tz-sans);
+  letter-spacing: .18em; text-transform: uppercase;
+}
+.tz-cta {
+  display: inline-block; padding: 15px 32px; border-radius: 999px;
+  background: var(--tz-bronze); color: #fff !important;
   font: 600 16px/1 var(--tz-sans); text-decoration: none !important;
-  box-shadow: 0 6px 22px rgba(46, 36, 28, .35);
-  transition: transform .15s ease-out, background .15s;
-  margin-bottom: env(safe-area-inset-bottom, 0px);
+  transition: background .18s, transform .18s;
 }
-.tz-fab:hover { background: var(--tz-dark); transform: translateY(-2px); }
-.tz-fab:focus-visible { outline: 3px solid var(--tz-sand); outline-offset: 2px; }
-.tz-fab svg { width: 20px; height: 20px; fill: currentColor; flex: none; }
-@media (max-width: 480px) { .tz-fab { right: 14px; bottom: 14px; padding: 13px 18px; font-size: 15px; } }
+.tz-cta:hover { background: #b8925f; transform: translateY(-1px); }
+.tz-cta:focus-visible { outline: 3px solid var(--tz-gold); outline-offset: 3px; }
 
-/* ---------- Б. блок-баннер ---------- */
-.tz-banner {
-  background: var(--tz-cream); border-top: 3px solid var(--tz-brown);
-  padding: 40px 20px; font-family: var(--tz-sans); color: var(--tz-ink);
+/* ---------- А. блок-баннер ---------- */
+.tz-band {
+  background: var(--tz-dark); color: var(--tz-cream);
+  padding: 68px 22px; font-family: var(--tz-sans);
 }
-.tz-banner-in {
-  max-width: 1080px; margin: 0 auto; display: flex; gap: 40px;
+.tz-band-in {
+  max-width: 1120px; margin: 0 auto; display: flex; gap: 56px;
   align-items: center; justify-content: space-between; flex-wrap: wrap;
 }
-.tz-banner-text { flex: 1 1 420px; }
-.tz-eyebrow {
-  margin: 0 0 6px; font-size: 12px; font-weight: 700; letter-spacing: .1em;
-  text-transform: uppercase; color: var(--tz-brown);
+.tz-band-text { flex: 1 1 440px; }
+.tz-band h2 {
+  font-family: var(--tz-serif); font-weight: 400;
+  font-size: clamp(30px, 4.6vw, 50px); line-height: 1.1;
+  margin: 18px 0 14px; color: #fff;
 }
-.tz-banner h2 {
-  margin: 0 0 10px; font-size: clamp(23px, 3.4vw, 31px); line-height: 1.2;
-  color: var(--tz-dark); font-family: Georgia, "Times New Roman", serif;
+.tz-band p {
+  margin: 0 0 26px; font-size: 16px; line-height: 1.65;
+  color: rgba(246, 241, 234, .74); max-width: 52ch;
 }
-.tz-banner p { margin: 0 0 18px; font-size: 16px; line-height: 1.6; max-width: 56ch; }
-.tz-btn {
-  display: inline-block; padding: 15px 30px; border-radius: 10px;
-  background: var(--tz-brown); color: #fff !important;
-  font-weight: 600; font-size: 16px; text-decoration: none !important;
-  transition: background .15s;
-}
-.tz-btn:hover { background: var(--tz-dark); }
-.tz-note { margin: 12px 0 0 !important; font-size: 13.5px; color: #7a6a59; }
+.tz-small { margin: 16px 0 0 !important; font-size: 13px !important; color: rgba(246, 241, 234, .5) !important; }
+
 .tz-steps {
-  flex: 0 1 260px; list-style: none; margin: 0; padding: 0;
-  display: grid; gap: 10px;
+  flex: 0 1 300px; list-style: none; margin: 0; padding: 0; display: grid; gap: 12px;
+  counter-reset: none;
 }
 .tz-steps li {
-  display: flex; align-items: center; gap: 12px;
-  background: #fff; border: 1px solid var(--tz-line); border-radius: 12px;
-  padding: 14px 16px; font-size: 15px; font-weight: 600; color: var(--tz-dark);
+  display: flex; align-items: center; gap: 16px;
+  border: 1px solid var(--tz-line); border-radius: 16px;
+  background: var(--tz-dark-2); padding: 17px 20px;
+  font-size: 15.5px; color: var(--tz-cream);
 }
-.tz-steps b {
-  width: 30px; height: 30px; flex: none; border-radius: 50%;
-  background: var(--tz-sand); color: var(--tz-brown);
-  display: flex; align-items: center; justify-content: center; font-size: 15px;
+.tz-steps span {
+  font-family: var(--tz-serif); font-size: 19px; color: var(--tz-gold);
+  min-width: 30px; font-variant-numeric: tabular-nums;
 }
 
-/* ---------- В. встроенная страница ---------- */
-.tz-embed {
-  max-width: 1100px; margin: 0 auto; padding: 0 12px;
+/* ---------- Б. встроенный конструктор ---------- */
+.tz-embed-wrap { background: var(--tz-dark); padding: 54px 20px 40px; font-family: var(--tz-sans); }
+.tz-embed-head { max-width: 1120px; margin: 0 auto 26px; text-align: center; }
+.tz-embed-head h2 {
+  font-family: var(--tz-serif); font-weight: 400; color: #fff;
+  font-size: clamp(27px, 4vw, 42px); margin: 16px 0 10px;
 }
+.tz-embed-head p { margin: 0; color: rgba(246, 241, 234, .7); font-size: 16px; }
+.tz-embed { max-width: 1120px; margin: 0 auto; }
 .tz-embed iframe {
-  width: 100%; height: 82vh; min-height: 560px;
-  border: 1px solid var(--tz-line); border-radius: 14px; background: var(--tz-cream);
-  display: block;
+  width: 100%; height: 84vh; min-height: 580px; display: block;
+  border: 1px solid var(--tz-line); border-radius: 20px; background: var(--tz-cream);
 }
 .tz-embed-alt {
-  max-width: 1100px; margin: 10px auto 30px; padding: 0 12px;
-  font-family: var(--tz-sans); font-size: 14px; color: #7a6a59; text-align: center;
+  max-width: 1120px; margin: 14px auto 0; text-align: center;
+  font-size: 14px; color: rgba(246, 241, 234, .55);
 }
-.tz-embed-alt a { color: var(--tz-brown); }
+.tz-embed-alt a { color: var(--tz-gold); }
 
-@media (prefers-reduced-motion: reduce) {
-  .tz-fab, .tz-btn { transition: none; }
+@media (max-width: 640px) {
+  .tz-band { padding: 46px 18px; }
+  .tz-band-in { gap: 32px; }
+  .tz-embed iframe { height: 78vh; border-radius: 16px; }
 }
+@media (prefers-reduced-motion: reduce) { .tz-cta { transition: none; } }
 </style>

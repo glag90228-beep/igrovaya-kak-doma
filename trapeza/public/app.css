@@ -1,22 +1,36 @@
-/* Фирменный стиль «Трапезы». Палитра снята с оригинальных смет. */
+/* Фирменный стиль «Трапезы» — под оформление сайта трапеза18.рф:
+   тёмная шапка, золотые акценты, скруглённые «пилюли», серифные заголовки.
+   Палитра документов (сметы, акты) остаётся коричневой — см. --doc-*. */
 
 :root {
-  --brown: #7a5230;
-  --dark: #5e3f27;
+  --night: #17120f;          /* тёмный фон шапки, как на сайте */
+  --night-2: #221b16;
+  --gold: #c9a47a;           /* золотой акцент */
+  --bronze: #a9855c;         /* кнопки, как «Оставить заявку» */
+  --bronze-dark: #91714b;
+
+  --brown: #a9855c;          /* основной акцент интерфейса */
+  --dark: #17120f;
   --cream: #faf6f1;
-  --sand: #efe3d2;
-  --ink: #2e241c;
-  --muted: #6b5b4b;
-  --line: #e2d5c4;
+  --sand: #f0e7db;
+  --ink: #241d18;
+  --muted: #7a6a5b;
+  --line: #e6dbcc;
   --white: #fff;
   --ok: #3f7a4f;
   --warn: #a8641c;
   --danger: #a33b2c;
-  --serif: Georgia, "Times New Roman", "PT Serif", serif;
-  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --radius: 12px;
-  --shadow: 0 2px 10px rgba(94, 63, 39, .08);
-  --shadow-lg: 0 8px 30px rgba(94, 63, 39, .16);
+
+  /* палитра печатных документов — не меняем */
+  --doc-brown: #7a5230;
+  --doc-dark: #5e3f27;
+
+  --serif: "Playfair Display", Georgia, "Times New Roman", "PT Serif", serif;
+  --sans: "Manrope", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --radius: 16px;
+  --pill: 999px;
+  --shadow: 0 2px 12px rgba(35, 27, 20, .07);
+  --shadow-lg: 0 10px 34px rgba(35, 27, 20, .16);
 }
 
 * { box-sizing: border-box; }
@@ -32,9 +46,10 @@ body {
   font-size: 16px;
 }
 
-h1, h2, h3, .brand-name { font-family: var(--serif); font-weight: 700; }
+h1, h2, h3 { font-family: var(--serif); font-weight: 500; letter-spacing: -.01em; }
+.brand-name { font-family: var(--serif); font-weight: 500; }
 
-a { color: var(--brown); }
+a { color: var(--bronze); }
 
 img { max-width: 100%; display: block; }
 
@@ -43,38 +58,47 @@ img { max-width: 100%; display: block; }
 /* ---------------- шапка бренда ---------------- */
 
 .brand {
-  background: var(--white);
-  border-bottom: 3px solid var(--brown);
-  padding: 18px 0;
+  background: var(--night);
+  padding: 20px 0;
 }
 .brand-inner {
   display: flex; align-items: center; justify-content: space-between;
   gap: 16px; flex-wrap: wrap;
 }
 .brand-name {
-  font-size: 30px; color: var(--brown); letter-spacing: .5px; line-height: 1.1; margin: 0;
+  font-size: 30px; color: var(--doc-brown); letter-spacing: .5px; line-height: 1.1; margin: 0;
 }
-.brand-sub { font-size: 13px; color: var(--muted); margin-top: 2px; }
+.brand-sub { font-size: 13px; color: var(--muted); margin-top: 3px; }
 .brand-right { text-align: right; }
 .brand-phone {
-  font-size: 18px; font-weight: 700; color: var(--dark); text-decoration: none; white-space: nowrap;
+  font-size: 18px; font-weight: 700; color: var(--ink); text-decoration: none; white-space: nowrap;
 }
 .brand-slogan { font-size: 13px; color: var(--muted); }
+
+/* Тёмная шапка — только на страницах сайта; в смете (белый лист) те же
+   классы остаются тёмным текстом по светлому фону. */
+.brand .brand-name { color: #fff; }
+.brand .brand-sub { color: rgba(246, 241, 234, .6); }
+.brand .brand-phone { color: #fff; }
+.brand .brand-slogan {
+  font-size: 11.5px; color: var(--gold); letter-spacing: .16em;
+  text-transform: uppercase; margin-top: 3px;
+}
 
 /* ---------------- типовые элементы ---------------- */
 
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 8px;
-  padding: 11px 20px; border-radius: 10px; border: 1px solid transparent;
-  background: var(--brown); color: var(--white); font: inherit; font-weight: 600;
+  padding: 12px 24px; border-radius: var(--pill); border: 1px solid transparent;
+  background: var(--bronze); color: var(--white); font: inherit; font-weight: 600;
   cursor: pointer; text-decoration: none; transition: background .15s, transform .05s;
 }
-.btn:hover { background: var(--dark); }
+.btn:hover { background: var(--bronze-dark); }
 .btn:active { transform: translateY(1px); }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
-.btn-ghost { background: transparent; color: var(--brown); border-color: var(--line); }
+.btn-ghost { background: transparent; color: var(--bronze); border-color: var(--line); }
 .btn-ghost:hover { background: var(--sand); color: var(--dark); }
-.btn-sm { padding: 6px 12px; font-size: 14px; border-radius: 8px; }
+.btn-sm { padding: 8px 16px; font-size: 14px; }
 .btn-danger { background: var(--danger); }
 .btn-danger:hover { background: #832d21; }
 
@@ -125,19 +149,19 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 .guests-bar input { width: 90px; text-align: center; font-weight: 700; font-size: 17px; }
 
 /* переключатель «Фуршетное / Банкетное меню» */
-.menu-switch { display: flex; gap: 8px; flex-wrap: wrap; margin: 18px 0 4px; }
+.menu-switch { display: flex; gap: 8px; flex-wrap: wrap; margin: 20px 0 4px; }
 .menu-switch button {
-  font: inherit; font-weight: 600; font-size: 15px; padding: 11px 20px; border-radius: 10px;
-  border: 1px solid var(--line); background: var(--white); color: var(--dark);
+  font: inherit; font-weight: 600; font-size: 15px; padding: 12px 24px; border-radius: var(--pill);
+  border: 1px solid var(--line); background: var(--white); color: var(--ink);
   cursor: pointer; touch-action: manipulation; min-height: 44px;
 }
 .menu-switch button:hover { background: var(--sand); }
-.menu-switch button.on { background: var(--brown); color: #fff; border-color: var(--brown); }
-@media (max-width: 420px) { .menu-switch button { flex: 1; padding: 11px 10px; font-size: 14px; } }
+.menu-switch button.on { background: var(--night); color: #fff; border-color: var(--night); }
+@media (max-width: 420px) { .menu-switch button { flex: 1; padding: 12px 10px; font-size: 14px; } }
 
 .cat-title {
-  font-family: var(--serif); font-size: 21px; color: var(--dark);
-  margin: 26px 0 12px; padding-bottom: 6px; border-bottom: 2px solid var(--sand);
+  font-family: var(--serif); font-weight: 500; font-size: 25px; color: var(--ink);
+  margin: 32px 0 14px; padding-bottom: 8px; border-bottom: 1px solid var(--line);
 }
 
 .dishes { display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); gap: 12px; }
@@ -199,14 +223,14 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 /* липкая корзина */
 .cartbar {
   position: sticky; bottom: 0; z-index: 30; margin-top: 26px;
-  background: var(--dark); color: #fff; border-radius: 14px 14px 0 0;
-  padding: 14px 18px; display: flex; align-items: center; justify-content: space-between;
-  gap: 14px; flex-wrap: wrap; box-shadow: 0 -6px 24px rgba(46, 36, 28, .25);
+  background: var(--night); color: #fff; border-radius: 20px 20px 0 0;
+  padding: 15px 22px; display: flex; align-items: center; justify-content: space-between;
+  gap: 14px; flex-wrap: wrap; box-shadow: 0 -6px 26px rgba(23, 18, 15, .3);
 }
-.cartbar .sum { font-size: 20px; font-weight: 700; font-family: var(--serif); }
-.cartbar .cnt { font-size: 13px; opacity: .82; }
-.cartbar .btn { background: var(--sand); color: var(--dark); }
-.cartbar .btn:hover { background: #fff; }
+.cartbar .sum { font-size: 22px; font-weight: 500; font-family: var(--serif); }
+.cartbar .cnt { font-size: 13px; color: rgba(246, 241, 234, .62); }
+.cartbar .btn { background: var(--bronze); color: #fff; }
+.cartbar .btn:hover { background: #b8925f; }
 
 /* плавающие контакты */
 .contact-fab { position: fixed; right: 16px; bottom: 92px; z-index: 60; display: grid; gap: 10px; }
@@ -270,8 +294,8 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 }
 .doc-head { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .doc-head .brand-name { font-size: 26px; }
-.doc-rule { height: 2px; background: var(--brown); margin: 12px 0 18px; }
-.doc-title { text-align: center; font-family: var(--serif); font-size: 25px; color: var(--dark); margin: 0; }
+.doc-rule { height: 2px; background: var(--doc-brown); margin: 12px 0 18px; }
+.doc-title { text-align: center; font-family: var(--serif); font-size: 25px; color: var(--doc-dark); margin: 0; }
 .doc-sub { text-align: center; color: var(--muted); margin: 3px 0 18px; }
 
 table.info { width: 100%; border-collapse: collapse; margin-bottom: 18px; font-size: 14px; }
@@ -280,8 +304,8 @@ table.info td.k { background: var(--cream); font-weight: 600; width: 130px; whit
 
 table.menu { width: 100%; border-collapse: collapse; font-size: 14px; }
 table.menu th {
-  background: var(--brown); color: #fff; font-size: 12px; font-weight: 700;
-  padding: 9px 8px; text-align: left; border: 1px solid var(--brown);
+  background: var(--doc-brown); color: #fff; font-size: 12px; font-weight: 700;
+  padding: 9px 8px; text-align: left; border: 1px solid var(--doc-brown);
 }
 table.menu td { border: 1px solid var(--line); padding: 8px; vertical-align: middle; }
 table.menu tbody tr:nth-child(even) td { background: var(--cream); }
@@ -296,14 +320,14 @@ table.menu td.photo-c img { width: 88px; height: 59px; object-fit: cover; border
   font-size: 10px; color: var(--muted); background: var(--cream); text-align: center;
 }
 tr.total td {
-  background: var(--dark) !important; color: #fff; font-weight: 700; font-size: 15px;
-  border-color: var(--dark);
+  background: var(--doc-dark) !important; color: #fff; font-weight: 700; font-size: 15px;
+  border-color: var(--doc-dark);
 }
 tr.subtotal td { background: var(--sand) !important; font-weight: 700; }
 .doc-note { font-size: 12.5px; color: var(--muted); margin-top: 14px; line-height: 1.45; }
 .doc-signs { display: flex; justify-content: space-between; gap: 40px; margin-top: 38px; font-size: 14px; }
 .doc-signs .sign-col { flex: 1; max-width: 300px; }
-.doc-signs .sign-role { font-weight: 700; color: var(--dark); margin-bottom: 26px; }
+.doc-signs .sign-role { font-weight: 700; color: var(--doc-dark); margin-bottom: 26px; }
 .doc-signs .sign-line { border-bottom: 1px solid #55483c; }
 .doc-signs .sign-hint { font-size: 11px; color: var(--muted); margin-top: 3px; }
 .doc-signs .sign-name { font-size: 13px; margin-top: 6px; min-height: 18px; }
