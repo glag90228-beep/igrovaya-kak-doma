@@ -1,0 +1,371 @@
+<script>
+/* ════════ КАЛЬКУЛЯТОР МЕНЮ ════════
+   Список блюд подставляется при сборке страницы.
+   Заявка уходит тем же путём, что и остальные формы сайта — через sendForm(). */
+(function(){
+'use strict';
+var MENU = /*__MENU__*/[];
+var TRANSPORT = 1000;                 /* транспортные расходы по умолчанию */
+var ORG = {
+  brand:'Трапеза', org:'ИП Сарычева Мария Витальевна', phone:'+7 912 454-14-81',
+  slogan:'Кейтеринг · банкеты · фуршеты', signer:'М. В. Сарычева',
+  note:'Срок действия сметы — 7 дней. Цены указаны в рублях с учётом сервировки. '
+     + 'Количество и состав меню согласовываются с заказчиком.'
+};
+
+var $ = function(id){ return document.getElementById(id); };
+var picked = {};                      /* индекс позиции → количество порций */
+var type = 'furshet';
+var query = '';
+var detail = -1;
+var sent = false;
+
+/* ---------- вспомогательное ---------- */
+function money(n){
+  var v = Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+  var p = Math.abs(v).toFixed(2).split('.');
+  return (v < 0 ? '−' : '') + p[0].replace(/\B(?=(\d{3})+(?!\d))/g, ' ') + ',' + p[1];
+}
+function moneyShort(n){
+  return Number(n) % 1 === 0 ? String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ') : money(n);
+}
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+function plural(n, one, few, many){
+  var m100 = Math.abs(n) % 100, m10 = Math.abs(n) % 10;
+  if (m100 >= 11 && m100 <= 14) return many;
+  if (m10 === 1) return one;
+  if (m10 >= 2 && m10 <= 4) return few;
+  return many;
+}
+function dateRu(v){ if(!v) return ''; var p = v.split('-'); return p[2]+'.'+p[1]+'.'+p[0]; }
+function val(id){ var e = $(id); return e ? e.value.trim() : ''; }
+function guests(){ return Math.max(1, Number($('kb-guests').value) || 1); }
+
+function chosen(){
+  var out = [];
+  for (var i = 0; i < MENU.length; i++) if (picked[i] > 0) out.push({ i:i, m:MENU[i], q:picked[i] });
+  return out;
+}
+function sums(){
+  var list = chosen(), menuSum = 0, tbd = 0;
+  list.forEach(function(it){ if (it.m.t) tbd++; else menuSum += it.q * it.m.p; });
+  return { list:list, menuSum:menuSum, tbd:tbd, transport:TRANSPORT, total:menuSum + TRANSPORT };
+}
+
+/* ---------- каталог ---------- */
+function matches(m){
+  if (m.mt !== type) return false;
+  if (!query) return true;
+  return (m.n + ' ' + m.d + ' ' + m.c).toLowerCase().indexOf(query) >= 0;
+}
+
+function qtyHtml(i){
+  var q = picked[i] || 0;
+  if (!q) return '<button type="button" class="kb-add" data-a="add" data-i="'+i+'">Выбрать</button>';
+  return '<div class="kb-qty">'
+    + '<button type="button" data-a="dec" data-i="'+i+'" aria-label="Меньше">−</button>'
+    + '<input type="number" min="0" value="'+q+'" data-a="set" data-i="'+i+'" inputmode="numeric" aria-label="Количество порций">'
+    + '<button type="button" data-a="inc" data-i="'+i+'" aria-label="Больше">+</button></div>';
+}
+
+function cardHtml(i){
+  var m = MENU[i];
+  var img = m.ph ? '<img src="'+esc(m.ph)+'" alt="'+esc(m.n)+'" loading="lazy" decoding="async">' : '';
+  var price = m.t ? '<span class="kb-tbd">цена уточняется</span>'
+                  : '<span class="kb-price">'+moneyShort(m.p)+' ₽</span><span class="kb-unit">/ '+esc(m.u || 'шт')+'</span>';
+  return '<article class="kb-card'+(picked[i] ? ' on' : '')+'">'
+    + '<button type="button" class="kb-open" data-a="open" data-i="'+i+'" aria-label="Подробнее: '+esc(m.n)+'">'
+    +   img
+    +   '<div class="kb-body"><div class="kb-name">'+esc(m.n)+'</div>'
+    +   (m.d ? '<div class="kb-desc">'+esc(m.d)+'</div>' : '')
+    +   '<div class="kb-meta">'+price+'</div>'
+    +   (m.d ? '<div class="kb-more">состав →</div>' : '')
+    +   '</div></button>'
+    + '<div class="kb-act">'+qtyHtml(i)+'</div></article>';
+}
+
+function draw(){
+  var order = [], byCat = {};
+  for (var i = 0; i < MENU.length; i++) {
+    if (!matches(MENU[i])) continue;
+    var c = MENU[i].c;
+    if (!byCat[c]) { byCat[c] = []; order.push(c); }
+    byCat[c].push(i);
+  }
+  if (!order.length) {
+    $('kb-catalog').innerHTML = '<p class="kb-empty">Ничего не нашлось. Попробуйте другое слово '
+      + 'или загляните во второе меню.</p>';
+    return;
+  }
+  $('kb-catalog').innerHTML = order.map(function(c){
+    var ids = byCat[c];
+    return '<h2 class="kb-cat">'+esc(c)+' <span>'+ids.length+' '
+      + plural(ids.length,'позиция','позиции','позиций')+'</span></h2>'
+      + '<div class="kb-grid">'+ids.map(cardHtml).join('')+'</div>';
+  }).join('');
+}
+
+/* ---------- итог ---------- */
+function tally(){
+  var s = sums();
+  $('kb-total').textContent = moneyShort(s.menuSum) + ' ₽';
+  $('kb-count').textContent = s.list.length
+    ? s.list.length + ' ' + plural(s.list.length,'позиция','позиции','позиций')
+      + (s.tbd ? ' · ' + s.tbd + ' по запросу' : '') + ' · без транспортных расходов'
+    : 'ничего не выбрано';
+  $('kb-make').disabled = s.list.length === 0;
+  var g = guests();
+  $('kb-hint').textContent = s.list.length
+    ? 'на ' + g + ' ' + plural(g,'гостя','гостей','гостей') + ' · ' + moneyShort(s.total) + ' ₽ с транспортом'
+    : '';
+}
+
+function setQty(i, q){
+  q = Math.max(0, Math.min(999, Math.round(q) || 0));
+  if (q) picked[i] = q; else delete picked[i];
+}
+
+/* ---------- карточка блюда ---------- */
+function openDetail(i){
+  detail = i;
+  var m = MENU[i];
+  $('kb-modal-box').innerHTML =
+      (m.ph
+      ? '<div class="kb-modal__img" style="background-image:url('+esc(m.ph)+')">'
+        + '<button type="button" class="kb-modal__close" data-a="close" aria-label="Закрыть">&times;</button></div>'
+      : '<div class="kb-modal__bar">'
+        + '<button type="button" class="kb-modal__close" data-a="close" aria-label="Закрыть">&times;</button></div>')
+    + '<div class="kb-modal__in">'
+    +   '<h3 class="h3">'+esc(m.n)+'</h3>'
+    +   '<div>'+(m.t ? '<span class="kb-tbd">цена уточняется</span>'
+              : '<span class="kb-price">'+moneyShort(m.p)+' ₽</span> <span class="kb-unit">/ '+esc(m.u || 'шт')+'</span>')+'</div>'
+    +   (m.d ? '<div class="kb-modal__lbl">Состав</div><p style="font-size:.92rem;color:var(--c-ink2);line-height:1.6">'+esc(m.d)+'</p>' : '')
+    +   '<div class="kb-modal__lbl">'+esc(m.c)+'</div>'
+    +   '<div id="kb-modal-qty">'+qtyHtml(i)+'</div>'
+    +   '<p style="font-size:.8rem;color:var(--c-muted)">Возможны сезонные замены — уточним при подтверждении заказа.</p>'
+    + '</div>';
+  $('kb-ov').classList.add('open');
+}
+function closeDetail(){ $('kb-ov').classList.remove('open'); detail = -1; }
+
+/* ---------- смета ---------- */
+function sheetHtml(){
+  var s = sums(), g = guests(), n = 0;
+  var withPhoto = s.list.some(function(it){ return it.m.ph; });
+  var rows = s.list.map(function(it){
+    n++;
+    var m = it.m;
+    return '<tr><td class="num">'+n+'</td><td><b>'+esc(m.n)+'</b></td>'
+      + '<td class="c">'+esc(m.u || '')+'</td><td class="c">'+it.q+'</td>'
+      + '<td class="money">'+(m.t ? 'уточн.' : money(m.p))+'</td>'
+      + '<td class="money">'+(m.t ? '—' : money(it.q * m.p))+'</td>'
+      + (withPhoto ? '<td class="c">'+(m.ph ? '<img src="'+esc(m.ph)+'" alt="">' : '')+'</td>' : '')
+      + '</tr>';
+  }).join('');
+
+  var today = new Date();
+  var dd = ('0'+today.getDate()).slice(-2)+'.'+('0'+(today.getMonth()+1)).slice(-2)+'.'+today.getFullYear();
+  var name = val('kb-name'), place = val('kb-place'), note = val('kb-comment');
+  var ev = dateRu(val('kb-date'));
+  var tail = withPhoto ? '<td></td>' : '';
+
+  return ''
+  + '<div class="kb-doc-head"><div><div class="kb-doc-brand">'+ORG.brand+'</div>'
+  +   '<div class="kb-doc-sub">'+ORG.org+'</div></div>'
+  +   '<div style="text-align:right"><div class="kb-doc-phone">'+ORG.phone+'</div>'
+  +   '<div class="kb-doc-sub">'+ORG.slogan+'</div></div></div>'
+  + '<div class="kb-rule"></div>'
+  + '<div class="kb-doc-title">СМЕТА</div>'
+  + '<div class="kb-doc-lead">Заказ на '+g+' '+plural(g,'человека','человек','человек')+'</div>'
+  + '<table class="kb-info"><tr><td class="k">Заказчик:</td><td>'+(esc(name) || '—')+'</td>'
+  +   '<td class="k">Дата:</td><td>'+(ev || dd)+'</td></tr>'
+  +   '<tr><td class="k">Кол-во гостей:</td><td>'+g+' '+plural(g,'человек','человека','человек')+'</td>'
+  +   '<td class="k">Смета составлена:</td><td>'+dd+'</td></tr>'
+  +   '<tr><td class="k">Место проведения:</td><td colspan="3">'+(esc(place) || '—')+'</td></tr></table>'
+  + '<table class="kb-bill"><thead><tr><th style="width:34px">№</th><th>Наименование</th>'
+  +   '<th style="width:62px">Выход</th><th style="width:56px">Кол-во</th>'
+  +   '<th style="width:84px">Цена, ₽</th><th style="width:96px">Сумма, ₽</th>'
+  +   (withPhoto ? '<th style="width:84px">Фото</th>' : '')+'</tr></thead><tbody>'+rows
+  +   '<tr class="sub"><td colspan="5" style="text-align:right">ИТОГО по меню:</td>'
+  +     '<td class="money">'+money(s.menuSum)+'</td>'+tail+'</tr>'
+  +   '<tr class="sub"><td colspan="5" style="text-align:right">Транспортные расходы:</td>'
+  +     '<td class="money">'+money(s.transport)+'</td>'+tail+'</tr>'
+  +   '<tr class="grand"><td colspan="5" style="text-align:right">ВСЕГО К ОПЛАТЕ:</td>'
+  +     '<td class="money">'+money(s.total)+'</td>'+tail+'</tr></tbody></table>'
+  + (s.tbd ? '<p class="kb-note">* Позиции с пометкой «уточн.» считаем отдельно — в итог они пока не входят.</p>' : '')
+  + (note ? '<p class="kb-note"><b>Комментарий заказчика:</b> '+esc(note)+'</p>' : '')
+  + '<p class="kb-note">'+ORG.note+'</p>'
+  + '<div class="kb-signs"><div><div class="role">Исполнитель</div><div class="line"></div>'
+  +   '<div class="hint">подпись</div><div class="who">'+ORG.signer+'</div></div>'
+  +   '<div><div class="role">Заказчик</div><div class="line"></div><div class="hint">подпись</div>'
+  +   '<div class="who">'+esc(name)+'</div>'+(name ? '' : '<div class="hint">Ф. И. О.</div>')
+  +   '<div class="date">«____» ______________ '+today.getFullYear()+' г.</div></div></div>'
+  + '<p class="kb-note">* Фотографии блюд носят ознакомительный характер.</p>';
+}
+
+function renderSheet(){ $('kb-sheet').innerHTML = sheetHtml(); }
+
+/* ---------- текст заявки ---------- */
+function orderLines(){
+  var s = sums(), g = guests(), L = [];
+  s.list.forEach(function(it, n){
+    L.push(it.m.t
+      ? (n+1)+'. '+it.m.n+' — '+it.q+' шт. (цена уточняется)'
+      : (n+1)+'. '+it.m.n+' — '+it.q+' × '+money(it.m.p)+' = '+money(it.q * it.m.p)+' ₽');
+  });
+  return L.join('\n');
+}
+function orderText(){
+  var s = sums(), g = guests();
+  return 'Заявка с калькулятора «Трапеза»\n\n'
+    + 'Заказ на '+g+' '+plural(g,'человека','человек','человек')+'\n'
+    + (val('kb-date')  ? 'Дата: '+dateRu(val('kb-date'))+'\n' : '')
+    + (val('kb-place') ? 'Место: '+val('kb-place')+'\n' : '')
+    + '\nМеню:\n'+orderLines()
+    + '\n\nИТОГО по меню: '+money(s.menuSum)+' ₽'
+    + '\nТранспортные расходы: '+money(s.transport)+' ₽'
+    + '\nВСЕГО К ОПЛАТЕ: '+money(s.total)+' ₽'
+    + (val('kb-comment') ? '\n\nКомментарий: '+val('kb-comment') : '')
+    + '\n\n'+[val('kb-name') || 'Заказчик', val('kb-phone')].filter(Boolean).join(', ');
+}
+function copyText(t){
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(t).then(function(){ return true; }, function(){ return false; });
+  }
+  try {
+    var ta = document.createElement('textarea');
+    ta.value = t; ta.style.position = 'fixed'; ta.style.left = '-9999px';
+    document.body.appendChild(ta); ta.select();
+    var ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return Promise.resolve(ok);
+  } catch (e) { return Promise.resolve(false); }
+}
+
+/* ---------- события каталога ---------- */
+document.addEventListener('click', function(e){
+  var b = e.target.closest ? e.target.closest('[data-a]') : null;
+  if (!b) return;
+  var a = b.dataset.a, i = Number(b.dataset.i);
+  if (a === 'close') { closeDetail(); return; }
+  if (a === 'open')  { openDetail(i); return; }
+  if (a === 'add')   setQty(i, guests());
+  if (a === 'inc')   setQty(i, (picked[i] || 0) + 1);
+  if (a === 'dec')   setQty(i, (picked[i] || 0) - 1);
+  if (a === 'add' || a === 'inc' || a === 'dec') {
+    draw(); tally();
+    if (detail === i) $('kb-modal-qty').innerHTML = qtyHtml(i);
+    if (!$('kb-zone').hidden) renderSheet();
+  }
+});
+document.addEventListener('input', function(e){
+  var inp = e.target.closest ? e.target.closest('input[data-a="set"]') : null;
+  if (!inp) return;
+  setQty(Number(inp.dataset.i), Number(inp.value));
+  tally();
+  if (!$('kb-zone').hidden) renderSheet();
+});
+$('kb-ov').addEventListener('click', function(e){ if (e.target === $('kb-ov')) closeDetail(); });
+document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeDetail(); });
+
+$('kb-type').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-type]');
+  if (!b) return;
+  type = b.dataset.type;
+  Array.prototype.forEach.call(this.querySelectorAll('button'), function(x){
+    x.setAttribute('aria-pressed', x === b ? 'true' : 'false');
+  });
+  draw();
+});
+$('kb-q').addEventListener('input', function(){ query = this.value.trim().toLowerCase(); draw(); });
+$('kb-guests').addEventListener('input', tally);
+$('kb-apply').addEventListener('click', function(){
+  var g = guests(), any = false;
+  for (var k in picked) { picked[k] = g; any = true; }
+  if (!any) { $('kb-hint').textContent = 'Сначала выберите блюда — потом проставим всем это количество.'; return; }
+  draw(); tally();
+  if (!$('kb-zone').hidden) renderSheet();
+});
+
+/* ---------- смета и заявка ---------- */
+$('kb-make').addEventListener('click', function(){
+  renderSheet();
+  $('kb-zone').hidden = false;
+  $('kb-zone').scrollIntoView({ behavior:'smooth', block:'start' });
+});
+$('kb-back').addEventListener('click', function(){
+  $('kb-zone').hidden = true;
+  document.getElementById('kb-catalog').scrollIntoView({ behavior:'smooth', block:'start' });
+});
+$('kb-print').addEventListener('click', function(){
+  renderSheet();
+  try { window.print(); } catch (e) { alert('Откройте меню браузера → «Печать» и выберите «Сохранить в PDF».'); }
+});
+['kb-name','kb-place','kb-date','kb-comment'].forEach(function(id){
+  $(id).addEventListener('input', function(){ if (!$('kb-zone').hidden) renderSheet(); });
+});
+$('kb-copy').addEventListener('click', function(){
+  var btn = this;
+  copyText(orderText()).then(function(ok){
+    btn.textContent = ok ? 'Скопировано ✓' : 'Выделите текст сметы вручную';
+    setTimeout(function(){ btn.textContent = 'Скопировать заказ'; }, 2500);
+  });
+});
+
+$('kb-send').addEventListener('click', function(){
+  var err = $('kb-err'), btn = this;
+  var show = function(t){ err.textContent = t; err.hidden = false; };
+  if ($('kb-hp').value) return;                       /* ловушка для ботов */
+  if (sent) { show('Заявка уже отправлена — мы с вами свяжемся.'); return; }
+  var name = val('kb-name'), phone = val('kb-phone');
+  if (!name || !phone) { show('Заполните имя и телефон — без них мы не сможем перезвонить.'); return; }
+  if (!$('kb-consent').checked) { show('Отметьте согласие на обработку персональных данных.'); return; }
+  try {
+    var last = +localStorage.getItem('trapeza_last') || 0;
+    if (Date.now() - last < 60000) { show('Заявка уже отправлена. Подождите минуту перед повторной отправкой.'); return; }
+  } catch (e) {}
+
+  err.hidden = true;
+  btn.disabled = true; btn.textContent = 'Отправляем…';
+  var s = sums(), g = guests();
+  var data = {
+    'Тип': '🧾 СМЕТА С КАЛЬКУЛЯТОРА',
+    'Меню': type === 'banket' ? 'Банкетное' : 'Фуршетное',
+    'Имя': name, 'Телефон': phone,
+    'Дата': dateRu(val('kb-date')) || '—',
+    'Место': val('kb-place') || '—',
+    'Гостей': g,
+    'Позиции': '\n' + orderLines(),
+    'Итого по меню': money(s.menuSum) + ' ₽',
+    'Транспорт': money(s.transport) + ' ₽',
+    'Всего к оплате': money(s.total) + ' ₽',
+    'Комментарий': val('kb-comment') || '—'
+  };
+  sendForm(data).then(function(ok){
+    btn.disabled = false;
+    if (ok) {
+      sent = true;
+      try { localStorage.setItem('trapeza_last', Date.now()); } catch (e) {}
+      if (window.ym) ym(110252216, 'reachGoal', 'zayavka');
+      $('kb-form').hidden = true;
+      $('kb-ok').hidden = false;
+      renderSheet();
+      $('kb-ok').scrollIntoView({ behavior:'smooth', block:'center' });
+    } else {
+      btn.textContent = 'Оставить заявку';
+      copyText(orderText());
+      show('Не получилось отправить автоматически. Заказ скопирован — пришлите его нам в MAX '
+         + 'или позвоните по телефону +7 912 454-14-81.');
+    }
+  });
+});
+
+document.body.classList.add('kb-page');
+draw();
+tally();
+})();
+</script>

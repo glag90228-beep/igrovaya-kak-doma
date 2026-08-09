@@ -1,0 +1,234 @@
+<style>
+/* ════════ КАЛЬКУЛЯТОР МЕНЮ (конструктор сметы) ════════
+   Оформление собрано на токенах сайта: те же шрифты
+   (Cormorant Garamond для заголовков, Manrope для текста),
+   те же цвета, радиусы и тени. */
+.kb-panel{background:var(--c-surface);border:1px solid var(--c-line);border-radius:var(--r);padding:clamp(1.1rem,2.4vw,1.6rem);box-shadow:var(--shadow-sm)}
+.kb-toolbar{display:flex;flex-direction:column;gap:1rem;margin-bottom:1.6rem}
+.kb-seg{display:inline-flex;background:var(--c-bg2);padding:.35rem;border-radius:var(--r-pill);gap:.2rem;align-self:flex-start;max-width:100%}
+.kb-seg button{padding:.62rem 1.35rem;border-radius:var(--r-pill);font-size:.9rem;font-weight:600;color:var(--c-ink2);transition:.2s}
+.kb-seg button[aria-pressed="true"]{background:var(--c-accent);color:#fff}
+@media(max-width:420px){.kb-seg{display:flex;width:100%}.kb-seg button{flex:1;padding:.62rem .5rem;font-size:.84rem}}
+
+.kb-row{display:flex;flex-wrap:wrap;gap:.8rem;align-items:center}
+.kb-row label{font-size:.8rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--c-ink2)}
+.kb-num{width:104px;padding:.7rem .9rem;border:1px solid var(--c-line);border-radius:var(--r-sm);font:600 1rem var(--ff-body);color:var(--c-ink);background:var(--c-surface)}
+.kb-num:focus{outline:none;border-color:var(--c-accent)}
+.kb-ghost{padding:.7rem 1.1rem;border:1px solid var(--c-line);border-radius:var(--r-sm);font-size:.86rem;font-weight:600;color:var(--c-ink2);transition:.2s}
+.kb-ghost:hover{border-color:var(--c-accent);color:var(--c-accent)}
+.kb-hint{font-size:.82rem;color:var(--c-muted)}
+
+.kb-search{display:flex;align-items:center;gap:.7rem;background:var(--c-surface);border:1px solid var(--c-line);border-radius:var(--r-pill);padding:.2rem .4rem .2rem 1rem}
+.kb-search svg{width:18px;height:18px;fill:var(--c-muted);flex:none}
+.kb-search input{flex:1;border:none;background:none;padding:.8rem .4rem;font:400 .95rem var(--ff-body);color:var(--c-ink)}
+.kb-search input:focus{outline:none}
+
+.kb-cat{display:flex;align-items:baseline;gap:.7rem;margin:2.2rem 0 1rem;font-family:var(--ff-display);font-weight:600;font-size:clamp(1.35rem,2.6vw,1.9rem);color:var(--c-ink)}
+.kb-cat span{font-family:var(--ff-body);font-size:.78rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--c-muted)}
+.kb-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(238px,1fr));gap:clamp(.9rem,1.8vw,1.3rem)}
+
+.kb-card{display:flex;flex-direction:column;background:var(--c-surface);border:1px solid var(--c-line);border-radius:var(--r);overflow:hidden;transition:border-color .2s,box-shadow .25s,transform .2s var(--ease)}
+.kb-card:hover{border-color:var(--c-accent);box-shadow:var(--shadow-sm);transform:translateY(-2px)}
+.kb-card.on{border-color:var(--c-accent);box-shadow:0 0 0 1px var(--c-accent) inset}
+.kb-open{display:block;width:100%;text-align:left;background:none;padding:0}
+.kb-modal__bar{height:14px;background:var(--c-accent);position:relative}
+.kb-modal__bar .kb-modal__close{top:.6rem;background:var(--c-surface);box-shadow:var(--shadow-sm)}
+.kb-card img{aspect-ratio:4/3;width:100%;object-fit:cover}
+.kb-body{padding:.95rem 1.05rem .3rem;display:flex;flex-direction:column;gap:.35rem;flex:1}
+.kb-name{font-size:.96rem;font-weight:600;line-height:1.35;color:var(--c-ink);overflow-wrap:anywhere;hyphens:auto}
+.kb-desc{font-size:.8rem;color:var(--c-muted);line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.kb-meta{display:flex;align-items:baseline;gap:.5rem;margin-top:auto;padding-top:.5rem}
+.kb-price{font-family:var(--ff-display);font-size:1.24rem;font-weight:700;color:var(--c-accent)}
+.kb-unit{font-size:.78rem;color:var(--c-muted)}
+.kb-more{font-size:.78rem;color:var(--c-accent);font-weight:600}
+.kb-act{padding:.7rem 1.05rem 1.05rem}
+.kb-add{width:100%;justify-content:center;padding:.72rem 1rem;border-radius:var(--r-sm);background:var(--c-accent);color:#fff;font-weight:600;font-size:.9rem;transition:.2s}
+.kb-add:hover{background:var(--c-accent-d)}
+.kb-qty{display:flex;align-items:center;gap:.5rem}
+.kb-qty button{width:40px;height:40px;border:1px solid var(--c-line);border-radius:var(--r-sm);font-size:1.15rem;font-weight:600;color:var(--c-ink);background:var(--c-surface);transition:.2s}
+.kb-qty button:hover{border-color:var(--c-accent);color:var(--c-accent)}
+.kb-qty input{flex:1;min-width:0;height:40px;text-align:center;border:1px solid var(--c-line);border-radius:var(--r-sm);font:600 .98rem var(--ff-body);color:var(--c-ink)}
+.kb-qty input:focus{outline:none;border-color:var(--c-accent)}
+.kb-tbd{display:inline-block;padding:.2rem .55rem;border-radius:var(--r-pill);background:#FBF0DF;color:#8A6038;font-size:.72rem;font-weight:700}
+.kb-empty{padding:2.5rem 0;text-align:center;color:var(--c-muted)}
+
+/* нижняя панель с итогом */
+.kb-bar{position:fixed;left:0;right:0;bottom:0;z-index:95;background:var(--c-dark);color:#fff;padding:.85rem clamp(1rem,4vw,2.5rem);padding-bottom:calc(.85rem + var(--safe-b));display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;box-shadow:0 -12px 34px -20px rgba(0,0,0,.7)}
+.kb-bar__sum{font-family:var(--ff-display);font-size:1.55rem;font-weight:700;color:var(--c-accent-2);line-height:1.1}
+.kb-bar__cnt{font-size:.8rem;color:rgba(255,255,255,.65)}
+.kb-bar .btn{white-space:nowrap}
+.kb-bar .btn[disabled]{opacity:.45;cursor:not-allowed;transform:none!important}
+body.kb-page{padding-bottom:92px}
+
+/* карточка блюда */
+.kb-ov{display:none;position:fixed;inset:0;z-index:400;background:rgba(36,31,26,.85);padding:1.2rem;overflow-y:auto}
+.kb-ov.open{display:flex;align-items:center;justify-content:center}
+.kb-modal{max-width:480px;width:100%;background:#fff;border-radius:var(--r);overflow:hidden}
+.kb-modal__img{height:250px;background:var(--c-bg2) center/cover no-repeat;display:flex;align-items:center;justify-content:center;color:var(--c-muted);font-size:.82rem;position:relative}
+.kb-modal__close{position:absolute;top:.7rem;right:.7rem;width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,.92);font-size:1.5rem;line-height:1;color:var(--c-ink)}
+.kb-modal__in{padding:1.5rem 1.7rem 1.9rem;display:flex;flex-direction:column;gap:.7rem}
+.kb-modal__lbl{font-size:.7rem;letter-spacing:.14em;text-transform:uppercase;color:var(--c-muted);font-weight:700}
+
+/* смета */
+.kb-sheet{background:#fff;border:1px solid var(--c-line);border-radius:var(--r);box-shadow:var(--shadow);padding:clamp(1.4rem,3.4vw,2.6rem);max-width:900px;margin:0 auto}
+.kb-doc-head{display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap;align-items:flex-end}
+.kb-doc-brand{font-family:var(--ff-display);font-size:1.7rem;font-weight:700;color:var(--c-accent)}
+.kb-doc-sub{font-size:.85rem;color:var(--c-muted)}
+.kb-doc-phone{font-weight:700}
+.kb-rule{height:2px;background:var(--c-accent);margin:.8rem 0 1.4rem}
+.kb-doc-title{font-family:var(--ff-display);font-size:1.9rem;font-weight:700;text-align:center;letter-spacing:.06em;color:var(--c-ink)}
+.kb-doc-lead{text-align:center;color:var(--c-muted);font-size:.9rem;margin-bottom:1.3rem}
+table.kb-info{width:100%;border-collapse:collapse;font-size:.88rem;margin-bottom:1.2rem}
+table.kb-info td{border:1px solid var(--c-line);padding:.5rem .7rem}
+table.kb-info .k{background:var(--c-bg2);font-weight:600;width:23%}
+table.kb-bill{width:100%;border-collapse:collapse;font-size:.86rem}
+table.kb-bill th{background:var(--c-accent);color:#fff;padding:.55rem .6rem;text-align:left;font-size:.78rem;letter-spacing:.03em}
+table.kb-bill td{border:1px solid var(--c-line);padding:.5rem .6rem;vertical-align:middle}
+table.kb-bill tbody tr:nth-child(even) td{background:var(--c-bg)}
+.kb-bill .num{text-align:center;color:var(--c-muted);width:34px}
+.kb-bill .money{text-align:right;white-space:nowrap}
+.kb-bill .c{text-align:center}
+.kb-bill img{width:72px;height:54px;object-fit:cover;border-radius:6px}
+.kb-bill tr.sub td{background:var(--c-bg2)!important;font-weight:600}
+.kb-bill tr.grand td{background:var(--c-dark)!important;color:#fff;font-weight:700;font-size:.95rem}
+.kb-note{font-size:.8rem;color:var(--c-muted);margin-top:.9rem;line-height:1.6}
+.kb-signs{display:grid;grid-template-columns:1fr 1fr;gap:2.5rem;margin-top:2.2rem}
+.kb-signs .role{font-weight:700;color:var(--c-ink);margin-bottom:1.7rem;font-size:.9rem}
+.kb-signs .line{border-bottom:1px solid var(--c-ink2)}
+.kb-signs .hint{font-size:.7rem;color:var(--c-muted);margin-top:.25rem}
+.kb-signs .who{font-size:.84rem;margin-top:.45rem;min-height:1.1rem}
+.kb-signs .date{font-size:.78rem;color:var(--c-muted);margin-top:.6rem}
+.kb-acts{display:flex;gap:.7rem;flex-wrap:wrap;justify-content:center;margin-top:1.6rem}
+.kb-ok{max-width:900px;margin:0 auto 1.4rem;padding:1rem 1.2rem;border:1px solid #CFE3CF;border-left:4px solid #4F8A52;border-radius:var(--r-sm);background:#F2F8F1}
+.kb-ok b{color:#35652F}
+.kb-ok span{display:block;font-size:.88rem;color:var(--c-ink2);margin-top:.2rem}
+.kb-err{max-width:900px;margin:0 auto 1.4rem;padding:1rem 1.2rem;border:1px solid #E7CFCF;border-left:4px solid #A65454;border-radius:var(--r-sm);background:#FBF2F2;font-size:.9rem}
+
+/* На узких экранах у обложки страниц сайта нет боковых отступов — текст
+   упирается в край. Правим только на этой странице. */
+@media(max-width:640px){.page-hero__in{padding-left:1.2rem;padding-right:1.2rem}}
+
+@media(max-width:560px){
+  .kb-grid{grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:.7rem}
+  .kb-body{padding:.75rem .8rem .2rem}
+  .kb-name{font-size:.88rem}
+  .kb-desc{display:none}
+  .kb-act{padding:.55rem .8rem .85rem}
+  .kb-bar__sum{font-size:1.3rem}
+  .kb-signs{grid-template-columns:1fr;gap:1.6rem}
+  .kb-bill img{width:52px;height:40px}
+}
+
+@media print{
+  /* На лист идёт только смета: шапка сайта, каталог, панель и формы не печатаются. */
+  @page{size:A4;margin:0}
+  body{margin:0;background:#fff}
+  .site-header,.mobile-menu,.site-footer,.kb-bar,.kb-ov,.page-hero,
+  .kb-controls,#kb-catalog,.kb-acts,.kb-form,.kb-ok,.kb-err,.section.order,
+  .fab-cta,#privacy-modal{display:none!important}
+  .section{padding:0!important;background:#fff!important}
+  .kb-sheet{box-shadow:none;border:0;border-radius:0;max-width:none;padding:12mm 12mm 10mm}
+  table.kb-bill th,table.kb-bill tbody tr:nth-child(even) td,
+  .kb-bill tr.sub td,.kb-bill tr.grand td{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  tr,img{break-inside:avoid}
+}
+</style>
+
+<section class="page-hero">
+  <div class="page-hero__bg"><img src="img/etazherka-kanape.webp" loading="eager" fetchpriority="high" decoding="async" width="900" height="1200" alt="Этажерка с канапе на фуршете «Трапезы»"></div>
+  <div class="wrap page-hero__in">
+    <div class="breadcrumb"><a href="index.html">Главная</a> → Калькулятор</div>
+    <span class="page-hero__eyebrow">Расчёт по меню · Ижевск</span>
+    <h1 class="h1">Соберите заказ<br>и получите смету</h1>
+    <p class="lead">Фуршетное и банкетное меню целиком, с составом блюд и ценами. Отметьте позиции
+       и число гостей — стоимость посчитается сразу, а внизу появится готовая смета: её можно
+       распечатать, сохранить в PDF и отправить нам заявкой.</p>
+    <div class="page-hero__cta">
+      <a href="#kb-catalog" class="btn btn--on-dark">Начать расчёт</a>
+      <a href="furshet.html" class="btn btn--outline-light" style="color:#fff;border-color:rgba(255,255,255,.45)">О кейтеринге</a>
+    </div>
+  </div>
+</section>
+
+<section class="section" style="background:var(--c-bg2)">
+  <div class="wrap">
+
+    <div class="kb-controls">
+      <div class="kb-seg" id="kb-type" role="group" aria-label="Меню">
+        <button type="button" data-type="furshet" aria-pressed="true">Фуршетное меню</button>
+        <button type="button" data-type="banket" aria-pressed="false">Банкетное меню</button>
+      </div>
+
+      <div class="kb-panel kb-toolbar" style="margin-top:1rem">
+        <div class="kb-row">
+          <label for="kb-guests">Количество гостей</label>
+          <input class="kb-num" id="kb-guests" type="number" min="1" max="500" value="15" inputmode="numeric">
+          <button class="kb-ghost" id="kb-apply" type="button">Проставить всем позициям</button>
+          <span class="kb-hint" id="kb-hint"></span>
+        </div>
+        <div class="kb-search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 2a8 8 0 1 0 4.9 14.3l5.4 5.4 1.4-1.4-5.4-5.4A8 8 0 0 0 10 2zm0 2a6 6 0 1 1 0 12 6 6 0 0 1 0-12z"/></svg>
+          <input id="kb-q" type="search" placeholder="Поиск по блюдам: сёмга, перепечи, десерт…" aria-label="Поиск по блюдам">
+        </div>
+      </div>
+    </div>
+
+    <div id="kb-catalog"></div>
+  </div>
+</section>
+
+<section class="section" id="kb-zone" hidden style="background:var(--c-bg)">
+  <div class="wrap">
+    <div class="kb-ok" id="kb-ok" hidden><b>Заявка принята ✓</b>
+      <span>Мы получили ваш заказ и свяжемся с вами для подтверждения. Смету ниже можно распечатать или сохранить в PDF.</span></div>
+    <div class="kb-err" id="kb-err" hidden></div>
+
+    <div class="kb-sheet" id="kb-sheet"></div>
+
+    <div class="kb-panel kb-form" id="kb-form" style="max-width:900px;margin:1.6rem auto 0">
+      <h3 class="h3" style="margin-bottom:.4rem">Оставить заявку</h3>
+      <p class="muted" style="font-size:.9rem;margin-bottom:1.2rem">
+        Заявка придёт нам вместе с этой сметой — перезвоним и подтвердим состав и время подачи.</p>
+      <div class="kb-row" style="gap:1rem;align-items:stretch">
+        <div style="flex:1 1 220px"><label class="kb-hint" for="kb-name">Ваше имя *</label>
+          <input class="kb-num" id="kb-name" style="width:100%" type="text" placeholder="Как к вам обращаться" autocomplete="name"></div>
+        <div style="flex:1 1 220px"><label class="kb-hint" for="kb-phone">Телефон *</label>
+          <input class="kb-num" id="kb-phone" style="width:100%" type="tel" placeholder="+7 ___ ___-__-__" autocomplete="tel"></div>
+      </div>
+      <div class="kb-row" style="gap:1rem;margin-top:1rem;align-items:stretch">
+        <div style="flex:1 1 220px"><label class="kb-hint" for="kb-date">Дата мероприятия</label>
+          <input class="kb-num" id="kb-date" style="width:100%" type="date"></div>
+        <div style="flex:1 1 220px"><label class="kb-hint" for="kb-place">Место проведения</label>
+          <input class="kb-num" id="kb-place" style="width:100%" type="text" placeholder="Адрес или название площадки"></div>
+      </div>
+      <div style="margin-top:1rem"><label class="kb-hint" for="kb-comment">Комментарий</label>
+        <textarea class="kb-num" id="kb-comment" style="width:100%;height:auto" rows="2" maxlength="600"
+          placeholder="Пожелания, аллергии, удобное время подачи…"></textarea></div>
+      <input type="text" id="kb-hp" tabindex="-1" autocomplete="off" aria-hidden="true"
+             style="position:absolute;left:-9999px;opacity:0;width:0;height:0">
+      <label class="consent" style="display:flex;gap:.6rem;align-items:flex-start;margin-top:1rem;font-size:.84rem;color:var(--c-ink2)">
+        <input type="checkbox" id="kb-consent" style="margin-top:.2rem">
+        <span>Соглашаюсь на <a href="pravila.html">обработку персональных данных</a></span></label>
+      <div class="kb-acts" style="justify-content:flex-start;margin-top:1.2rem">
+        <button class="btn btn--accent btn--lg" id="kb-send" type="button">Оставить заявку</button>
+        <button class="btn btn--outline-light" id="kb-copy" type="button">Скопировать заказ</button>
+        <a class="btn btn--outline-light" href="tel:+79124541481">Позвонить</a>
+      </div>
+    </div>
+
+    <div class="kb-acts">
+      <button class="btn btn--accent" id="kb-print" type="button">Скачать PDF / печать</button>
+      <button class="btn btn--outline-light" id="kb-back" type="button">Изменить заказ</button>
+    </div>
+  </div>
+</section>
+
+<div class="kb-bar" id="kb-bar">
+  <div>
+    <div class="kb-bar__sum" id="kb-total">0 ₽</div>
+    <div class="kb-bar__cnt" id="kb-count">ничего не выбрано</div>
+  </div>
+  <button class="btn btn--on-dark btn--lg" id="kb-make" type="button" disabled>Сформировать смету ↓</button>
+</div>
+
+<div class="kb-ov" id="kb-ov"><div class="kb-modal" id="kb-modal-box"></div></div>
