@@ -8,12 +8,19 @@
 </head>
 <body>
 
+<div class="ok-banner no-print" id="okBanner" hidden>
+  <b>Заявка принята ✓</b>
+  <span>Мы получили ваш заказ и свяжемся с вами для подтверждения.
+        Смету ниже можно скачать или распечатать.</span>
+</div>
+
 <div class="doc" id="doc"><p class="muted center">Загружаем смету…</p></div>
 
 <div class="doc-actions no-print" id="actions" hidden>
   <button class="btn" id="btnPrint" type="button">📄 Скачать PDF / печать</button>
   <a class="btn btn-ghost" id="btnEdit" href="#">✏️ Изменить заказ</a>
-  <a class="btn btn-ghost" id="btnSend" href="#" target="_blank" rel="noopener">💬 Отправить нам</a>
+  <a class="btn btn-ghost" id="btnWrite" href="#" hidden target="_blank" rel="noopener">💬 Написать нам</a>
+  <a class="btn btn-ghost" id="btnCall" href="#" hidden>📞 Позвонить</a>
 </div>
 
 <script src="/app.js"></script>
@@ -30,11 +37,17 @@ async function init() {
   $('btnPrint').onclick = () => window.print();
   $('btnEdit').href = '/?edit=' + encodeURIComponent(code);
 
-  const msg = `Здравствуйте! Отправляю смету № ${order.number} на ${order.guests} `
-    + `${plural(order.guests, 'гостя', 'гостей', 'гостей')}, `
-    + `итого ${rub(totals.grandTotal)}.`;
-  $('btnSend').href = `https://t.me/share/url?url=${encodeURIComponent(location.href)}`
-    + `&text=${encodeURIComponent(msg)}`;
+  // Заявка уже у менеджера — клиенту предлагаем только связаться с нами.
+  if (settings.max_link) {
+    $('btnWrite').href = settings.max_link;
+    $('btnWrite').hidden = false;
+  }
+  const tel = (settings.phone || '').replace(/[^\d+]/g, '');
+  if (tel) {
+    $('btnCall').href = 'tel:' + tel;
+    $('btnCall').hidden = false;
+  }
+  if (new URLSearchParams(location.search).get('ok')) $('okBanner').hidden = false;
   renderContactFab(settings);
 }
 

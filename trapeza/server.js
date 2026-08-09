@@ -8,6 +8,7 @@ const crypto = require('node:crypto');
 const { db, getSetting, setSetting, allSettings, listMenu, computeBalance } = require('./db');
 const seed = require('./seed');
 const { buildAkt } = require('./lib/xlsx-akt');
+const { notifyOrder, checkBot, api: tgApi } = require('./lib/notify');
 
 const PORT = Number(process.env.PORT) || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -89,11 +90,33 @@ function requireAdmin(req, res) {
 
 // ---------------------------------------------------------------- нормализация данных
 
-/** Публичные настройки — без пароля админки. */
+/** Настройки, которые никогда не уходят в браузер. */
+const PRIVATE_SETTINGS = ['admin_password', 'tg_bot_token', 'tg_chat_id'];
+
+/** Публичные настройки — без пароля админки и служебных ключей бота. */
 function publicSettings() {
   const s = allSettings();
-  delete s.admin_password;
+  for (const k of PRIVATE_SETTINGS) delete s[k];
   return s;
+}
+
+/** Полный внешний адрес сметы — для ссылки в уведомлении менеджеру. */
+function smetaLink(req, code) {
+  const base = String(getSetting('public_url', '') || '').trim().replace(/\/+$/, '');
+  if (base) return `${base}/s/${code}`;
+  const host = req.headers['x-forwarded-host'] || req.headers.host || `localhost:${PORT}`;
+  const proto = req.headers['x-forwarded-proto'] || 'http';
+  return `${proto}://${host}/s/${code}`;
+}
+
+/** Уведомление менеджеру. Заказ уже сохранён — ошибки отправки его не роняют. */
+function pushNotification(req, code, kind) {
+  const order = loadOrderByCode(code);
+  if (!order) return;
+  notifyOrder({
+    order, kind, totals: orderTotals(order), settings: allSettings(),
+    link: smetaLink(req, code),
+  }).catch((e) => console.error('Уведомление о заявке:', e.message));
 }
 
 function loadOrderByCode(code) {
@@ -178,6 +201,7 @@ async function handleApi(req, res, url) {
       String(body.phone || ''), String(body.event_date || ''), String(body.place || ''),
       Number(body.guests) || 0, String(body.comment || ''), transport, 'новая', ts, ts);
     saveOrderItems(Number(info.lastInsertRowid), body.items);
+    pushNotification(req, code, 'new');
     return json(res, { code, number }, 201);
   }
 
@@ -202,6 +226,7 @@ async function handleApi(req, res, url) {
         Number(body.guests) || order.guests, String(body.comment ?? order.comment),
         nowIso(), order.id);
       if (Array.isArray(body.items)) saveOrderItems(order.id, body.items);
+      pushNotification(req, m[1], 'edit');
       const updated = loadOrderByCode(m[1]);
       return json(res, { order: updated, totals: orderTotals(updated) });
     }
@@ -327,6 +352,33 @@ async function handleApi(req, res, url) {
       const b = await readJson(req);
       for (const [k, v] of Object.entries(b)) setSetting(k, v);
       return json(res, { ok: true });
+    }
+
+    // Проверка бота: жив ли токен и в какие чаты он может писать.
+    // Чтобы чат нашёлся — напишите боту (или в группу с ботом) любое сообщение.
+    if (pathname === '/api/admin/tg-test' && method === 'POST') {
+      const b = await readJson(req);
+      const token = String(b.token || getSetting('tg_bot_token', '') || process.env.BOT_TOKEN || '');
+      try {
+        const info = await checkBot(token);
+        // Если чат уже выбран — шлём в него пробное сообщение.
+        const chatId = String(b.chat_id || getSetting('tg_chat_id', '') || '').trim();
+        let sent = null;
+        if (chatId) {
+          const r = await fetch(tgApi(token, 'sendMessage'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: '✅ Проверка связи: заявки с сайта будут приходить сюда.',
+            }),
+          }).then((x) => x.json());
+          sent = r.ok ? true : (r.description || 'не удалось отправить');
+        }
+        return json(res, { ...info, sent });
+      } catch (e) {
+        return fail(res, 400, e.message);
+      }
     }
 
     // --- сверки ---

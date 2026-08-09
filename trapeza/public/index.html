@@ -39,13 +39,13 @@
       <div class="sum" id="cartSum">0,00 руб.</div>
       <div class="cnt" id="cartCnt">ничего не выбрано</div>
     </div>
-    <button class="btn" id="checkout" type="button" disabled>Оформить смету →</button>
+    <button class="btn" id="checkout" type="button" disabled>Оставить заявку →</button>
   </div>
 </div>
 
 <div class="overlay" id="formOverlay" hidden>
   <div class="modal">
-    <h2>Оформление сметы</h2>
+    <h2>Оставить заявку</h2>
     <div class="field">
       <label for="fName">Ваше имя *</label>
       <input id="fName" placeholder="Как к вам обращаться" autocomplete="name">
@@ -69,12 +69,13 @@
       <textarea id="fComment" rows="3" placeholder="Пожелания, аллергии, время подачи…"></textarea>
     </div>
     <p class="muted" style="font-size:13px">
-      Смета носит предварительный характер — менеджер свяжется с вами для подтверждения.
+      Заявка сразу поступит менеджеру, и мы свяжемся с вами для подтверждения.
+      Смету можно будет скачать и распечатать.
     </p>
     <div id="formError" class="notice" style="display:none;margin-bottom:12px"></div>
     <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap">
       <button class="btn btn-ghost" id="formCancel" type="button">Отмена</button>
-      <button class="btn" id="formSubmit" type="button">Получить смету</button>
+      <button class="btn" id="formSubmit" type="button">Отправить заявку</button>
     </div>
   </div>
 </div>
@@ -334,16 +335,16 @@ $('formSubmit').onclick = async () => {
   try {
     if (editCode) {
       await putJSON('/api/orders/' + editCode, payload);
-      location.href = '/s/' + editCode;
+      location.href = '/s/' + editCode + '?ok=1';
     } else {
       const { code } = await postJSON('/api/orders', payload);
-      location.href = '/s/' + code;
+      location.href = '/s/' + code + '?ok=1';
     }
   } catch (e) {
     err.textContent = e.message;
     err.style.display = 'block';
     btn.disabled = false;
-    btn.textContent = 'Получить смету';
+    btn.textContent = 'Отправить заявку';
   }
 };
 

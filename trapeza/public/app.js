@@ -49,17 +49,27 @@ function plural(n, one, few, many) {
   return many;
 }
 
-const TG_SVG ='<svg viewBox="0 0 24 24"><path d="M21.9 4.3 18.7 19.4c-.2 1-.9 1.3-1.7.8l-4.7-3.5-2.3 2.2c-.3.3-.5.5-1 .5l.4-4.9 8.9-8c.4-.3-.1-.5-.6-.2L6.7 13.1l-4.7-1.5c-1-.3-1-1 .2-1.5l18.4-7.1c.9-.3 1.6.2 1.3 1.3z"/></svg>';
+const PHONE_SVG = '<svg viewBox="0 0 24 24"><path d="M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.2.4 2.4.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C10.6 21 3 13.4 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.3.2 2.5.6 3.6.1.4 0 .8-.2 1l-2.3 2.2z"/></svg>';
 
-/** Плавающая кнопка Telegram. */
+/**
+ * Плавающие кнопки связи: мессенджер MAX и звонок.
+ * Клиенту не показываем, куда именно уходит заявка — только способы связаться с нами.
+ */
 function renderContactFab(settings) {
-  const digits = settings.phone_digits || '';
-  if (!digits) return;
+  const parts = [];
+  if (settings.max_link) {
+    parts.push(`<a class="fab-max" href="${esc(settings.max_link)}" target="_blank" rel="noopener"
+       title="Написать нам в MAX" aria-label="Написать нам в MAX"><span>MAX</span></a>`);
+  }
+  const tel = (settings.phone || '').replace(/[^\d+]/g, '');
+  if (tel) {
+    parts.push(`<a class="fab-call" href="tel:${esc(tel)}"
+       title="Позвонить" aria-label="Позвонить нам">${PHONE_SVG}</a>`);
+  }
+  if (!parts.length) return;
   const el = document.createElement('div');
   el.className = 'contact-fab';
-  el.innerHTML = `
-    <a class="fab-tg" href="https://t.me/+${digits}" target="_blank" rel="noopener"
-       title="Написать в Telegram" aria-label="Написать в Telegram">${TG_SVG}</a>`;
+  el.innerHTML = parts.join('');
   document.body.appendChild(el);
 }
 

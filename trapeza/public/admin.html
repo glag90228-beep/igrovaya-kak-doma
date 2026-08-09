@@ -529,31 +529,85 @@ $('tab-menu').addEventListener('click', async (e) => {
 const FIELDS = [
   ['brand', 'Бренд'], ['org_name', 'Организация'], ['org_short', 'Кратко'],
   ['org_full', 'Полное наименование (для актов)'], ['org_inn', 'ИНН'],
-  ['signer', 'Подписант'], ['phone', 'Телефон'], ['phone_digits', 'Телефон цифрами (для WhatsApp/Telegram)'],
+  ['signer', 'Подписант'], ['phone', 'Телефон'], ['phone_digits', 'Телефон цифрами'],
   ['slogan', 'Слоган'], ['transport_default', 'Транспортные расходы по умолчанию'],
   ['smeta_note', 'Примечание в смете'], ['admin_password', 'Пароль от панели'],
 ];
+
+// Куда уходят заявки и как с нами связывается клиент.
+const NOTIFY_FIELDS = [
+  ['max_link', 'Ссылка на MAX (кнопка «Написать нам»)', 'Её видит клиент на сайте и в смете'],
+  ['public_url', 'Адрес конструктора', 'Например https://menu.трапеза18.рф — подставляется в ссылку на смету'],
+  ['tg_bot_token', 'Токен бота', 'Служебный. Клиенту не показывается'],
+  ['tg_chat_id', 'ID чата для заявок', 'Куда бот присылает заявки. Найдите кнопкой ниже'],
+];
+
+const field = (k, label, hint, settings) => `
+  <div class="field">
+    <label>${esc(label)}</label>
+    ${k === 'smeta_note'
+      ? `<textarea rows="3" data-s="${k}">${esc(settings[k] || '')}</textarea>`
+      : `<input data-s="${k}" value="${esc(settings[k] || '')}">`}
+    ${hint ? `<div class="muted" style="font-size:12px;margin-top:4px">${esc(hint)}</div>` : ''}
+  </div>`;
 
 async function loadSettings() {
   const { settings } = await getJSON('/api/admin/settings');
   $('tab-settings').innerHTML = `
     <div class="card" style="padding:18px;max-width:640px">
-      ${FIELDS.map(([k, label]) => `
-        <div class="field">
-          <label>${esc(label)}</label>
-          ${k === 'smeta_note'
-            ? `<textarea rows="3" data-s="${k}">${esc(settings[k] || '')}</textarea>`
-            : `<input data-s="${k}" value="${esc(settings[k] || '')}">`}
-        </div>`).join('')}
+      ${FIELDS.map(([k, label]) => field(k, label, '', settings)).join('')}
       <button class="btn" id="saveSettings">Сохранить</button>
       <span class="muted" id="savedMsg" style="margin-left:10px"></span>
+    </div>
+
+    <div class="card" style="padding:18px;max-width:640px;margin-top:16px">
+      <h3 style="margin:0 0 4px">Заявки и связь</h3>
+      <p class="muted" style="font-size:13px;margin:0 0 14px">
+        Заявка с сайта сохраняется в разделе «Заявки» и сразу дублируется в чат бота.
+        Чтобы чат нашёлся — напишите боту любое сообщение (или добавьте его в группу) и нажмите «Проверить бота».
+      </p>
+      ${NOTIFY_FIELDS.map(([k, label, hint]) => field(k, label, hint, settings)).join('')}
+      <button class="btn btn-ghost" id="tgTest">Проверить бота</button>
+      <span class="muted" id="tgMsg" style="margin-left:10px"></span>
+      <div id="tgChats" style="margin-top:12px"></div>
     </div>`;
-  $('saveSettings').onclick = async () => {
+
+  const save = async () => {
     const body = {};
     document.querySelectorAll('[data-s]').forEach((i) => { body[i.dataset.s] = i.value; });
     await putJSON('/api/admin/settings', body);
+  };
+
+  $('saveSettings').onclick = async () => {
+    await save();
     $('savedMsg').textContent = 'Сохранено ✓';
     setTimeout(() => { $('savedMsg').textContent = ''; }, 2500);
+  };
+
+  $('tgTest').onclick = async () => {
+    $('tgMsg').textContent = 'Проверяем…';
+    $('tgChats').innerHTML = '';
+    try {
+      await save();                       // сначала сохраняем то, что ввели
+      const r = await postJSON('/api/admin/tg-test', {});
+      $('tgMsg').textContent = `Бот @${r.username} на связи`
+        + (r.sent === true ? ' · пробное сообщение отправлено ✓'
+          : r.sent ? ` · ${r.sent}` : '');
+      $('tgChats').innerHTML = r.chats.length
+        ? '<div class="muted" style="font-size:13px;margin-bottom:6px">Чаты, доступные боту:</div>'
+          + r.chats.map((c) => `<button class="btn btn-ghost btn-sm" data-chat="${esc(c.id)}"
+              style="margin:0 6px 6px 0">${esc(c.title || c.type)} · ${esc(c.id)}</button>`).join('')
+        : '<div class="muted" style="font-size:13px">Чатов пока не видно — напишите боту сообщение и нажмите «Проверить бота» ещё раз.</div>';
+      $('tgChats').querySelectorAll('[data-chat]').forEach((b) => {
+        b.onclick = async () => {
+          document.querySelector('[data-s="tg_chat_id"]').value = b.dataset.chat;
+          await save();
+          $('tgMsg').textContent = 'Чат выбран и сохранён ✓';
+        };
+      });
+    } catch (e) {
+      $('tgMsg').textContent = 'Не получилось: ' + e.message;
+    }
   };
 }
 

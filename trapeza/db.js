@@ -4,10 +4,13 @@ const { DatabaseSync } = require('node:sqlite');
 const path = require('node:path');
 const fs = require('node:fs');
 
-const DATA_DIR = path.join(__dirname, 'data');
-fs.mkdirSync(DATA_DIR, { recursive: true });
+// Путь к базе можно переопределить — удобно для тестов и для разных площадок.
+const DB_FILE = process.env.TRAPEZA_DB
+  ? path.resolve(process.env.TRAPEZA_DB)
+  : path.join(__dirname, 'data', 'trapeza.db');
+fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
 
-const db = new DatabaseSync(path.join(DATA_DIR, 'trapeza.db'));
+const db = new DatabaseSync(DB_FILE);
 db.exec('PRAGMA journal_mode = WAL');
 db.exec('PRAGMA foreign_keys = ON');
 
@@ -139,4 +142,7 @@ function computeBalance(cp, ops) {
   return { rows, totalDebit, totalCredit, closing: running };
 }
 
-module.exports = { db, getSetting, setSetting, allSettings, listMenu, computeBalance, DATA_DIR };
+module.exports = {
+  db, getSetting, setSetting, allSettings, listMenu, computeBalance,
+  DB_FILE, DATA_DIR: path.dirname(DB_FILE),
+};
