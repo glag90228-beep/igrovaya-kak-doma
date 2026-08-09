@@ -597,7 +597,9 @@ async function loadSettings() {
         ? '<div class="muted" style="font-size:13px;margin-bottom:6px">Чаты, доступные боту:</div>'
           + r.chats.map((c) => `<button class="btn btn-ghost btn-sm" data-chat="${esc(c.id)}"
               style="margin:0 6px 6px 0">${esc(c.title || c.type)} · ${esc(c.id)}</button>`).join('')
-        : '<div class="muted" style="font-size:13px">Чатов пока не видно — напишите боту сообщение и нажмите «Проверить бота» ещё раз.</div>';
+        : '<div class="muted" style="font-size:13px">Чатов пока не видно — напишите боту сообщение и нажмите'
+          + ' «Проверить бота» ещё раз. Если параллельно запущен бот-генератор документов на том же токене,'
+          + ' остановите его на минуту: одновременно читать сообщения могут не оба.</div>';
       $('tgChats').querySelectorAll('[data-chat]').forEach((b) => {
         b.onclick = async () => {
           document.querySelector('[data-s="tg_chat_id"]').value = b.dataset.chat;
