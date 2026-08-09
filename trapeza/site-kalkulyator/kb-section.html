@@ -84,6 +84,7 @@ body.kb-page{padding-bottom:92px}
 table.kb-info{width:100%;border-collapse:collapse;font-size:.88rem;margin-bottom:1.2rem}
 table.kb-info td{border:1px solid var(--c-line);padding:.5rem .7rem}
 table.kb-info .k{background:var(--c-bg2);font-weight:600;width:23%}
+.kb-bill-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
 table.kb-bill{width:100%;border-collapse:collapse;font-size:.86rem}
 table.kb-bill th{background:var(--c-accent);color:#fff;padding:.55rem .6rem;text-align:left;font-size:.78rem;letter-spacing:.03em}
 table.kb-bill td{border:1px solid var(--c-line);padding:.5rem .6rem;vertical-align:middle}
@@ -91,6 +92,7 @@ table.kb-bill tbody tr:nth-child(even) td{background:var(--c-bg)}
 .kb-bill .num{text-align:center;color:var(--c-muted);width:34px}
 .kb-bill .money{text-align:right;white-space:nowrap}
 .kb-bill .c{text-align:center}
+.kb-bill .short{display:none}
 .kb-bill img{width:72px;height:54px;object-fit:cover;border-radius:6px}
 .kb-bill tr.sub td{background:var(--c-bg2)!important;font-weight:600}
 .kb-bill tr.grand td{background:var(--c-dark)!important;color:#fff;font-weight:700;font-size:.95rem}
@@ -124,7 +126,35 @@ table.kb-bill tbody tr:nth-child(even) td{background:var(--c-bg)}
   .kb-act{padding:.55rem .8rem .85rem}
   .kb-bar__sum{font-size:1.3rem}
   .kb-signs{grid-template-columns:1fr;gap:1.6rem}
-  .kb-bill img{width:52px;height:40px}
+  /* На телефоне таблица сметы должна поместиться по ширине: убираем заданные
+     ширины колонок, уменьшаем шрифт и отступы. Если всё же не влезет —
+     таблица прокручивается внутри своей рамки, а не тянет страницу. */
+  .kb-sheet{padding:1rem .7rem 1.3rem}
+  /* Смета на телефоне: жёсткая раскладка колонок в процентах — таблица
+     всегда помещается по ширине и ничего не обрезается. */
+  table.kb-bill{font-size:.72rem;table-layout:fixed}
+  table.kb-bill th{width:auto!important;padding:.4rem .22rem;font-size:.62rem;letter-spacing:0}
+  table.kb-bill td{padding:.4rem .22rem}
+  .kb-bill th:nth-child(1),.kb-bill td:nth-child(1){width:7%!important}
+  .kb-bill th:nth-child(2),.kb-bill td:nth-child(2){width:31%!important;overflow-wrap:break-word;hyphens:auto}
+  .kb-bill th:nth-child(3),.kb-bill td:nth-child(3){width:14%!important}
+  .kb-bill th:nth-child(4),.kb-bill td:nth-child(4){width:11%!important}
+  .kb-bill th:nth-child(5),.kb-bill td:nth-child(5){width:15%!important}
+  .kb-bill th:nth-child(6),.kb-bill td:nth-child(6){width:22%!important}
+  /* Крупные суммы переносим по строке, чтобы не вылезали за колонку. */
+  .kb-bill .money{font-size:.68rem;white-space:normal;overflow-wrap:anywhere}
+  .kb-bill tr.grand td{font-size:.76rem}
+  /* Колонка с фото на телефоне не нужна — снимки видно в каталоге. */
+  .kb-bill .ph{display:none}
+  /* Шапку сокращаем — длинные слова не дают колонкам сжаться. */
+  .kb-bill .cur,.kb-bill .full{display:none}
+  .kb-bill .short{display:inline}
+  /* Шапка сметы: пары «поле — значение» ложатся в два столбца, а не в четыре. */
+  table.kb-info{font-size:.78rem}
+  table.kb-info tr{display:grid;grid-template-columns:42% 1fr}
+  table.kb-info td{display:block}
+  table.kb-info .k{width:auto}
+  table.kb-info td[colspan]{grid-column:span 1}
 }
 
 @media print{
@@ -136,6 +166,7 @@ table.kb-bill tbody tr:nth-child(even) td{background:var(--c-bg)}
   .fab-cta,#privacy-modal{display:none!important}
   .section{padding:0!important;background:#fff!important}
   .kb-sheet{box-shadow:none;border:0;border-radius:0;max-width:none;padding:12mm 12mm 10mm}
+  .kb-bill-wrap{overflow:visible}
   table.kb-bill th,table.kb-bill tbody tr:nth-child(even) td,
   .kb-bill tr.sub td,.kb-bill tr.grand td{-webkit-print-color-adjust:exact;print-color-adjust:exact}
   tr,img{break-inside:avoid}

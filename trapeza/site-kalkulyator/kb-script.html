@@ -164,7 +164,7 @@ function sheetHtml(){
       + '<td class="c">'+esc(m.u || '')+'</td><td class="c">'+it.q+'</td>'
       + '<td class="money">'+(m.t ? 'уточн.' : money(m.p))+'</td>'
       + '<td class="money">'+(m.t ? '—' : money(it.q * m.p))+'</td>'
-      + (withPhoto ? '<td class="c">'+(m.ph ? '<img src="'+esc(m.ph)+'" alt="">' : '')+'</td>' : '')
+      + (withPhoto ? '<td class="c ph">'+(m.ph ? '<img src="'+esc(m.ph)+'" alt="">' : '')+'</td>' : '')
       + '</tr>';
   }).join('');
 
@@ -172,7 +172,7 @@ function sheetHtml(){
   var dd = ('0'+today.getDate()).slice(-2)+'.'+('0'+(today.getMonth()+1)).slice(-2)+'.'+today.getFullYear();
   var name = val('kb-name'), place = val('kb-place'), note = val('kb-comment');
   var ev = dateRu(val('kb-date'));
-  var tail = withPhoto ? '<td></td>' : '';
+  var tail = withPhoto ? '<td class="ph"></td>' : '';
 
   return ''
   + '<div class="kb-doc-head"><div><div class="kb-doc-brand">'+ORG.brand+'</div>'
@@ -187,16 +187,19 @@ function sheetHtml(){
   +   '<tr><td class="k">Кол-во гостей:</td><td>'+g+' '+plural(g,'человек','человека','человек')+'</td>'
   +   '<td class="k">Смета составлена:</td><td>'+dd+'</td></tr>'
   +   '<tr><td class="k">Место проведения:</td><td colspan="3">'+(esc(place) || '—')+'</td></tr></table>'
-  + '<table class="kb-bill"><thead><tr><th style="width:34px">№</th><th>Наименование</th>'
-  +   '<th style="width:62px">Выход</th><th style="width:56px">Кол-во</th>'
-  +   '<th style="width:84px">Цена, ₽</th><th style="width:96px">Сумма, ₽</th>'
-  +   (withPhoto ? '<th style="width:84px">Фото</th>' : '')+'</tr></thead><tbody>'+rows
+  + '<div class="kb-bill-wrap"><table class="kb-bill"><thead><tr><th style="width:34px">№</th>'
+  +   '<th><span class="full">Наименование</span><span class="short">Блюдо</span></th>'
+  +   '<th style="width:62px"><span class="full">Выход</span><span class="short">Вых.</span></th>'
+  +   '<th style="width:56px"><span class="full">Кол-во</span><span class="short">Кол.</span></th>'
+  +   '<th style="width:84px">Цена<span class="cur">, ₽</span></th>'
+  +   '<th style="width:96px">Сумма<span class="cur">, ₽</span></th>'
+  +   (withPhoto ? '<th class="ph" style="width:84px">Фото</th>' : '')+'</tr></thead><tbody>'+rows
   +   '<tr class="sub"><td colspan="5" style="text-align:right">ИТОГО по меню:</td>'
   +     '<td class="money">'+money(s.menuSum)+'</td>'+tail+'</tr>'
   +   '<tr class="sub"><td colspan="5" style="text-align:right">Транспортные расходы:</td>'
   +     '<td class="money">'+money(s.transport)+'</td>'+tail+'</tr>'
   +   '<tr class="grand"><td colspan="5" style="text-align:right">ВСЕГО К ОПЛАТЕ:</td>'
-  +     '<td class="money">'+money(s.total)+'</td>'+tail+'</tr></tbody></table>'
+  +     '<td class="money">'+money(s.total)+'</td>'+tail+'</tr></tbody></table></div>'
   + (s.tbd ? '<p class="kb-note">* Позиции с пометкой «уточн.» считаем отдельно — в итог они пока не входят.</p>' : '')
   + (note ? '<p class="kb-note"><b>Комментарий заказчика:</b> '+esc(note)+'</p>' : '')
   + '<p class="kb-note">'+ORG.note+'</p>'

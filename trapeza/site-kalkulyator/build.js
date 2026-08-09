@@ -34,6 +34,17 @@ const PHOTO = {
   'Мини кокрок с яблоком': 'img/mini-kokrok-s-yablokom.webp',
   'Мини элеш с куриной грудкой': 'img/mini-elesh-s-kuricey.webp',
   'Мини-безе с кремом крем-чиз и голубикой': 'img/mini-beze-s-krem-chizom-i-golubikoy.webp',
+  'Мини-тарталетка с салатом полесский': 'img/tartlets.jpg',
+  // позиции, которые были только на витрине сайта
+  'Брускетта с говядиной': 'img/brusketta-govyadina.webp',
+  'Мини профитроли с заварным кремом': 'img/mini-profitroli-s-zavarnym-kremom.webp',
+  'Трайфл шоколадно-банановый / Красный бархат': 'img/zak_trayfl.webp',
+  'Трюфели из тёмного шоколада с копчёной паприкой': 'img/zak_trufeli.webp',
+  // на снимке ассорти видны начинки с мясом/грибами и с зелёным луком —
+  // ставим его этим трём позициям, остальным перепечам фото не подходит
+  'Мини перепечи с мясом': 'img/mini-perepechi-v-assortimente.webp',
+  'Мини перепечи с грибами': 'img/mini-perepechi-v-assortimente.webp',
+  'Мини перепечи с зелёным луком': 'img/mini-perepechi-v-assortimente.webp',
   // наш снимок — кладём в img/menu/
   'Мини элеш «Курица-картофель»': 'img/menu/elesh-kurica-kartofel.png',
 };
@@ -53,6 +64,8 @@ const PRICE_FIX = [
   ['Брускетта с пастромой копчёной', 125, 120],
   ['Мини элеш с курицей', 50, 55],
 ];
+// «Канапе с креветкой» на витрине 155 ₽ — эту цену перенесли в прайс,
+// поэтому карточку не трогаем: она уже совпадает.
 
 const furshet = require(path.join(TRAPEZA, 'menu-data.js'));
 const banket = require(path.join(TRAPEZA, 'menu-data-banket.js'));
