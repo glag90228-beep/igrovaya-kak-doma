@@ -22,6 +22,7 @@ const PHOTO_DIR  = __DIR__ . '/img/menu';
 const PHOTO_URL  = 'img/menu';
 const MAX_PHOTO  = 4 * 1024 * 1024;          // 4 МБ на файл
 const TRIES_MAX  = 8;                         // попыток входа за 15 минут
+const TRIES_FILE = __DIR__ . '/menu-backup/.login';   // счётчик по адресу, не по сессии
 
 session_start([
   'cookie_httponly' => true,
@@ -79,20 +80,43 @@ function reply(array $data, int $code = 200): void {
 $error = '';
 $authorized = !empty($_SESSION['ok']);
 
+/**
+ * Счётчик неудачных входов держим на диске и по адресу: если считать в сессии,
+ * достаточно удалить cookie — и перебор снова разрешён.
+ */
+function login_tries(?bool $add = null): int {
+  @mkdir(dirname(TRIES_FILE), 0755, true);
+  $all = is_file(TRIES_FILE)
+    ? (json_decode((string)file_get_contents(TRIES_FILE), true) ?: []) : [];
+  $now = time();
+  foreach ($all as $k => $list) {
+    $all[$k] = array_values(array_filter($list, fn($t) => $t > $now - 900));
+    if (!$all[$k]) unset($all[$k]);
+  }
+  $ip = md5((string)($_SERVER['REMOTE_ADDR'] ?? 'x'));
+  if ($add === true) {
+    $all[$ip][] = $now;
+    @file_put_contents(TRIES_FILE, json_encode($all), LOCK_EX);
+  } elseif ($add === false) {
+    unset($all[$ip]);
+    @file_put_contents(TRIES_FILE, json_encode($all), LOCK_EX);
+  }
+  return count($all[$ip] ?? []);
+}
+
 if (($_POST['action'] ?? '') === 'login') {
-  $tries = $_SESSION['tries'] ?? ['n' => 0, 't' => time()];
-  if (time() - $tries['t'] > 900) $tries = ['n' => 0, 't' => time()];
-  if ($tries['n'] >= TRIES_MAX) {
+  if (login_tries() >= TRIES_MAX) {
     $error = 'Слишком много попыток. Подождите 15 минут.';
+    usleep(400000);
   } elseif (password_verify((string)($_POST['password'] ?? ''), ADMIN_HASH)) {
     session_regenerate_id(true);
     $_SESSION['ok'] = true;
     $_SESSION['csrf'] = bin2hex(random_bytes(16));
-    unset($_SESSION['tries']);
+    login_tries(false);
     $authorized = true;
   } else {
-    $tries['n']++;
-    $_SESSION['tries'] = $tries;
+    login_tries(true);
+    usleep(400000);                       // чуть замедляем перебор
     $error = 'Неверный пароль';
   }
 }
@@ -133,7 +157,9 @@ if ($api === 'save') {
       't'    => !empty($r['t']) ? 1 : 0,
       'c'    => mb_substr(trim((string)($r['c'] ?? '')), 0, 80) ?: 'Разное',
       'mt'   => (($r['mt'] ?? 'furshet') === 'banket') ? 'banket' : 'furshet',
-      'ph'   => preg_match('~^(img/[\w./-]+)?$~', (string)($r['ph'] ?? '')) ? (string)($r['ph'] ?? '') : '',
+      'ph'   => (preg_match('~^(img/[\w-]+(/[\w-]+)*\.(jpe?g|png|webp))?$~i', (string)($r['ph'] ?? ''))
+                  && strpos((string)($r['ph'] ?? ''), '..') === false)
+                 ? (string)($r['ph'] ?? '') : '',
       'off'  => !empty($r['off']) ? 1 : 0,
       'sort' => count($items),
     ];
@@ -169,6 +195,16 @@ if ($api === 'photo') {
   if ($ext === '') reply(['error' => 'Подойдут только JPG, PNG или WEBP'], 400);
 
   @mkdir(PHOTO_DIR, 0755, true);
+  // Загруженное фото должно оставаться картинкой: запрещаем выполнять
+  // что-либо в этой папке, даже если внутрь файла зашит код.
+  $guard = PHOTO_DIR . '/.htaccess';
+  if (!is_file($guard)) {
+    @file_put_contents($guard,
+      "php_flag engine off\n"
+      . "<IfModule mod_php.c>\n  php_admin_flag engine off\n</IfModule>\n"
+      . "RemoveHandler .php .phtml .php3 .php4 .php5 .php7 .php8 .pl .py .cgi\n"
+      . "AddType text/plain .php .phtml .php3 .php4 .php5 .php7 .php8\n");
+  }
   $name = bin2hex(random_bytes(6)) . '.' . $ext;
   if (!move_uploaded_file($f['tmp_name'], PHOTO_DIR . '/' . $name)) {
     reply(['error' => 'Не удалось сохранить фото — нет прав на папку img/menu'], 500);

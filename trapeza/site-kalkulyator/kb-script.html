@@ -273,7 +273,12 @@ function saveSheet(){
     body: JSON.stringify(sheetData()),
   })
     .then(function(r){ return r.json(); })
-    .then(function(j){ return (j && j.ok && j.url) ? j.url : ''; })
+    .then(function(j){
+      if (!j || !j.ok || !j.url) return '';
+      /* сервер вернул относительный адрес — абсолютный собираем здесь,
+         из адреса открытой страницы */
+      return j.url.charAt(0) === '/' ? location.origin + j.url : j.url;
+    })
     .catch(function(){ return ''; });
 }
 

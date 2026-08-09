@@ -15,6 +15,7 @@ const DIR      = __DIR__ . '/smeta';
 const KEEP_DAYS = 180;         // сколько храним сметы
 const MAX_ITEMS = 300;
 const RATE_MAX  = 30;          // сколько смет с одного адреса в час
+const MAX_FILES = 5000;        // общий потолок, чтобы папку нельзя было раздуть
 
 header('Content-Type: application/json; charset=utf-8');
 
@@ -182,7 +183,9 @@ $doc = '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">'
   . '</div></body></html>';
 
 // ---------- сохраняем ----------
-$code = date('ymd') . '-' . bin2hex(random_bytes(3));
+# 8 случайных байт: ссылку не подобрать перебором, а в смете лежат
+# имя и телефон заказчика — это персональные данные.
+$code = date('ymd') . '-' . bin2hex(random_bytes(8));
 if (file_put_contents(DIR . '/' . $code . '.html', $doc, LOCK_EX) === false) {
   reply(['error' => 'Не удалось сохранить смету'], 500);
 }
@@ -191,6 +194,13 @@ if (file_put_contents(DIR . '/' . $code . '.html', $doc, LOCK_EX) === false) {
 foreach (glob(DIR . '/*.html') ?: [] as $f) {
   if (filemtime($f) < time() - KEEP_DAYS * 86400) @unlink($f);
 }
+// и держим общий потолок: самые старые уходят первыми
+$all = glob(DIR . '/*.html') ?: [];
+if (count($all) > MAX_FILES) {
+  usort($all, fn($a, $b) => filemtime($a) <=> filemtime($b));
+  foreach (array_slice($all, 0, count($all) - MAX_FILES) as $f) @unlink($f);
+}
 
-$scheme = !empty($_SERVER['HTTPS']) ? 'https' : 'http';
-reply(['ok' => true, 'url' => $scheme . '://' . ($_SERVER['HTTP_HOST'] ?? '') . '/smeta/' . $code . '.html']);
+# Отдаём относительный адрес: абсолютный соберёт браузер из своего origin.
+# Если брать HTTP_HOST, подменённый заголовок увёл бы ссылку на чужой домен.
+reply(['ok' => true, 'url' => '/smeta/' . $code . '.html']);

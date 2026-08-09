@@ -70,7 +70,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   ok(posted.length === 1, 'заявка ушла', posted.length);
   const d = posted[0] || {};
   const url = d['Смета'] || '';
-  ok(/\/smeta\/\d{6}-[0-9a-f]{6}\.html$/.test(url), 'в заявке есть ссылка на смету', url);
+  ok(/\/smeta\/\d{6}-[0-9a-f]{16}\.html$/.test(url), 'в заявке есть ссылка на смету', url);
   const saved = fs.readdirSync(path.join(ROOT, 'smeta')).filter((f) => f.endsWith('.html'));
   ok(saved.length === 1, 'файл сметы сохранён на сервере', saved.join(', '));
   ok(!(await p.locator('#kb-ok a').isHidden()), 'клиенту показана ссылка на смету');
