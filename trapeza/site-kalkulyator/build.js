@@ -260,7 +260,10 @@ if (fs.existsSync(htPath)) {
       + '\n# Меню калькулятора должно быть доступно странице (его пишет панель admin.php)\n'
       + '<Files "menu.json">\n  Require all granted\n</Files>\n'
       + '\n# Резервные копии меню наружу не отдаём\n'
-      + 'RedirectMatch 404 ^/menu-backup/');
+      + 'RedirectMatch 404 ^/menu-backup/\n'
+      + '\n# Текстовые заметки в корне сайта (инструкции, пароли) наружу не отдаём.\n'
+      + '# robots.txt — исключение, он нужен поисковикам.\n'
+      + '<FilesMatch "^(?!robots\\.txt$).*\\.txt$">\n  Require all denied\n</FilesMatch>');
     if (ht === was) throw new Error('не удалось поправить .htaccess');
 
     // Сайт разрешает браузеру держать HTML сутки — после обновления калькулятора
