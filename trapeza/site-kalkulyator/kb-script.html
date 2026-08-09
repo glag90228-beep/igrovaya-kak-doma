@@ -22,7 +22,7 @@ var PLATE = '<svg viewBox="0 0 48 48" aria-hidden="true">'
 var $ = function(id){ return document.getElementById(id); };
 var picked = {};                      /* индекс позиции → количество порций */
 var type = 'furshet';
-var query = '';
+var QUERY = [];                       /* слова запроса, уже без окончаний */
 var detail = -1;
 var sent = false;
 
@@ -62,11 +62,35 @@ function sums(){
   return { list:list, menuSum:menuSum, tbd:tbd, transport:TRANSPORT, total:menuSum + TRANSPORT };
 }
 
+/* ---------- поиск ----------
+   «сёмга» и «семга» должны находиться одинаково, слова можно писать
+   в любом порядке и без окончаний: «перепечи мясо» найдёт
+   «Мини перепечи с мясом», «говядина» — «Брускетта с говядиной». */
+function norm(s){
+  return String(s == null ? '' : s).toLowerCase()
+    .replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, ' ').trim();
+}
+function stem(w){
+  if (w.length >= 9) return w.slice(0, w.length - 2);   // «тарталетка» → «тарталет»
+  if (w.length >= 5) return w.slice(0, w.length - 1);   // «сёмга» → «семг», «перепечи» → «перепеч»
+  return w;                                             // короткие слова не режем
+}
+function terms(q){
+  return norm(q).split(' ').filter(Boolean).map(stem);
+}
+function hit(m){
+  if (!QUERY.length) return true;
+  var hay = norm(m.n + ' ' + m.d + ' ' + m.c);
+  return QUERY.every(function(t){ return hay.indexOf(t) >= 0; });
+}
+
 /* ---------- каталог ---------- */
 function matches(m){
-  if (m.mt !== type) return false;
-  if (!query) return true;
-  return (m.n + ' ' + m.d + ' ' + m.c).toLowerCase().indexOf(query) >= 0;
+  return m.mt === type && hit(m);
+}
+function otherCount(){
+  var other = type === 'furshet' ? 'banket' : 'furshet';
+  return MENU.filter(function(m){ return m.mt === other && hit(m); }).length;
 }
 
 function qtyHtml(i){
@@ -105,9 +129,15 @@ function draw(){
     if (!byCat[c]) { byCat[c] = []; order.push(c); }
     byCat[c].push(i);
   }
+  var other = otherCount();
+  var otherName = type === 'furshet' ? 'банкетном' : 'фуршетном';
+  var switchTo = '<button type="button" class="kb-switch" data-a="other">Показать '
+    + other + ' ' + plural(other, 'позицию', 'позиции', 'позиций')
+    + ' в ' + otherName + ' меню →</button>';
+
   if (!order.length) {
-    $('kb-catalog').innerHTML = '<p class="kb-empty">Ничего не нашлось. Попробуйте другое слово '
-      + 'или загляните во второе меню.</p>';
+    $('kb-catalog').innerHTML = '<p class="kb-empty">В этом меню ничего не нашлось.'
+      + (other ? '<br>' + switchTo : '<br>Попробуйте другое слово.') + '</p>';
     return;
   }
   $('kb-catalog').innerHTML = order.map(function(c){
@@ -115,7 +145,8 @@ function draw(){
     return '<h2 class="kb-cat">'+esc(c)+' <span>'+ids.length+' '
       + plural(ids.length,'позиция','позиции','позиций')+'</span></h2>'
       + '<div class="kb-grid">'+ids.map(cardHtml).join('')+'</div>';
-  }).join('');
+  }).join('')
+    + (QUERY.length && other ? '<p class="kb-more-line">' + switchTo + '</p>' : '');
 }
 
 /* ---------- итог ---------- */
@@ -221,6 +252,31 @@ function sheetHtml(){
 
 function renderSheet(){ $('kb-sheet').innerHTML = sheetHtml(); }
 
+/* ---------- смета отдельной страницей ----------
+   Отправляем на сервер данные заказа, получаем ссылку на готовый документ
+   и кладём её в заявку — менеджер открывает и сразу видит, что заказали. */
+function sheetData(){
+  var s = sums(), g = guests();
+  return {
+    name: val('kb-name'), phone: val('kb-phone'), place: val('kb-place'),
+    comment: val('kb-comment'), date: dateRu(val('kb-date')),
+    guests: g, transport: s.transport,
+    items: s.list.map(function(it){
+      return { n: it.m.n, u: it.m.u, q: it.q, p: it.m.p, t: it.m.t ? 1 : 0 };
+    }),
+  };
+}
+function saveSheet(){
+  if (location.protocol === 'file:') return Promise.resolve('');
+  return fetch('smeta.php', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(sheetData()),
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(j){ return (j && j.ok && j.url) ? j.url : ''; })
+    .catch(function(){ return ''; });
+}
+
 /* ---------- текст заявки ---------- */
 function orderLines(){
   var s = sums(), g = guests(), L = [];
@@ -264,6 +320,15 @@ document.addEventListener('click', function(e){
   if (!b) return;
   var a = b.dataset.a, i = Number(b.dataset.i);
   if (a === 'close') { closeDetail(); return; }
+  if (a === 'other') {
+    type = type === 'furshet' ? 'banket' : 'furshet';
+    Array.prototype.forEach.call($('kb-type').querySelectorAll('button'), function(x){
+      x.setAttribute('aria-pressed', x.dataset.type === type ? 'true' : 'false');
+    });
+    draw();
+    $('kb-catalog').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return;
+  }
   if (a === 'open')  { openDetail(i); return; }
   if (a === 'add')   setQty(i, guests());
   if (a === 'inc')   setQty(i, (picked[i] || 0) + 1);
@@ -293,7 +358,7 @@ $('kb-type').addEventListener('click', function(e){
   });
   draw();
 });
-$('kb-q').addEventListener('input', function(){ query = this.value.trim().toLowerCase(); draw(); });
+$('kb-q').addEventListener('input', function(){ QUERY = terms(this.value); draw(); });
 $('kb-guests').addEventListener('input', tally);
 $('kb-apply').addEventListener('click', function(){
   var g = guests(), any = false;
@@ -344,6 +409,8 @@ $('kb-send').addEventListener('click', function(){
   err.hidden = true;
   btn.disabled = true; btn.textContent = 'Отправляем…';
   var s = sums(), g = guests();
+
+  saveSheet().then(function(sheetUrl){
   var data = {
     'Тип': '🧾 СМЕТА С КАЛЬКУЛЯТОРА',
     'Меню': type === 'banket' ? 'Банкетное' : 'Фуршетное',
@@ -357,6 +424,8 @@ $('kb-send').addEventListener('click', function(){
     'Всего к оплате': money(s.total) + ' ₽',
     'Комментарий': val('kb-comment') || '—'
   };
+  if (sheetUrl) data['Смета'] = sheetUrl;
+
   sendForm(data).then(function(ok){
     btn.disabled = false;
     if (ok) {
@@ -364,6 +433,11 @@ $('kb-send').addEventListener('click', function(){
       try { localStorage.setItem('trapeza_last', Date.now()); } catch (e) {}
       if (window.ym) ym(110252216, 'reachGoal', 'zayavka');
       $('kb-form').hidden = true;
+      if (sheetUrl) {
+        $('kb-ok').innerHTML = '<b>Заявка принята ✓</b><span>Мы получили ваш заказ и свяжемся '
+          + 'с вами для подтверждения. Смета сохранена — можно открыть с любого устройства: '
+          + '<a href="' + esc(sheetUrl) + '" target="_blank" rel="noopener">ссылка на смету</a>.</span>';
+      }
       $('kb-ok').hidden = false;
       renderSheet();
       $('kb-ok').scrollIntoView({ behavior:'smooth', block:'center' });
@@ -373,6 +447,7 @@ $('kb-send').addEventListener('click', function(){
       show('Не получилось отправить автоматически. Заказ скопирован — пришлите его нам в MAX '
          + 'или позвоните по телефону +7 912 454-14-81.');
     }
+  });
   });
 });
 

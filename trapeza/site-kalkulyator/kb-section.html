@@ -1,10 +1,20 @@
 <style>
 /* ════════ КАЛЬКУЛЯТОР МЕНЮ (конструктор сметы) ════════
+   Страница-каталог, а не рассказ о компании: отступы делаем плотнее,
+   чем на остальных страницах сайта, иначе меню растягивается на экраны. */
+.kb-page .page-hero{min-height:32svh}
+.kb-page .page-hero__in{padding-top:clamp(1.6rem,3vw,2.4rem);padding-bottom:clamp(1.6rem,3vw,2.4rem)}
+.kb-page .page-hero .h1{font-size:clamp(2rem,3.6vw,3rem);margin-bottom:.5rem}
+.kb-page .page-hero .lead{max-width:46ch}
+.kb-page .page-hero__cta{margin-top:1.1rem}
+.kb-page .section{padding:clamp(1.8rem,3.4vw,2.8rem) 0}
+.kb-page #kb-zone{padding-top:clamp(1.4rem,2.6vw,2.2rem)}
+
    Оформление собрано на токенах сайта: те же шрифты
    (Cormorant Garamond для заголовков, Manrope для текста),
    те же цвета, радиусы и тени. */
-.kb-panel{background:var(--c-surface);border:1px solid var(--c-line);border-radius:var(--r);padding:clamp(1.1rem,2.4vw,1.6rem);box-shadow:var(--shadow-sm)}
-.kb-toolbar{display:flex;flex-direction:column;gap:1rem;margin-bottom:1.6rem}
+.kb-panel{background:var(--c-surface);border:1px solid var(--c-line);border-radius:var(--r);padding:clamp(.9rem,1.8vw,1.2rem);box-shadow:var(--shadow-sm)}
+.kb-toolbar{display:flex;flex-direction:column;gap:.7rem;margin-bottom:.4rem}
 .kb-seg{display:inline-flex;background:var(--c-bg2);padding:.35rem;border-radius:var(--r-pill);gap:.2rem;align-self:flex-start;max-width:100%}
 .kb-seg button{padding:.62rem 1.35rem;border-radius:var(--r-pill);font-size:.9rem;font-weight:600;color:var(--c-ink2);transition:.2s}
 .kb-seg button[aria-pressed="true"]{background:var(--c-accent);color:#fff}
@@ -22,12 +32,12 @@
 
 .kb-search{display:flex;align-items:center;gap:.7rem;background:var(--c-surface);border:1px solid var(--c-line);border-radius:var(--r-pill);padding:.2rem .4rem .2rem 1rem}
 .kb-search svg{width:18px;height:18px;fill:var(--c-muted);flex:none}
-.kb-search input{flex:1;border:none;background:none;padding:.8rem .4rem;font:400 .95rem var(--ff-body);color:var(--c-ink)}
+.kb-search input{flex:1;border:none;background:none;padding:.65rem .4rem;font:400 .95rem var(--ff-body);color:var(--c-ink)}
 .kb-search input:focus{outline:none}
 
-.kb-cat{display:flex;align-items:baseline;gap:.7rem;margin:2.2rem 0 1rem;font-family:var(--ff-display);font-weight:600;font-size:clamp(1.35rem,2.6vw,1.9rem);color:var(--c-ink)}
+.kb-cat{display:flex;align-items:baseline;gap:.7rem;margin:1.5rem 0 .8rem;font-family:var(--ff-display);font-weight:600;font-size:clamp(1.35rem,2.6vw,1.9rem);color:var(--c-ink)}
 .kb-cat span{font-family:var(--ff-body);font-size:.78rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--c-muted)}
-.kb-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(238px,1fr));gap:clamp(.9rem,1.8vw,1.3rem)}
+.kb-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:clamp(.7rem,1.2vw,1rem)}
 
 .kb-card{display:flex;flex-direction:column;background:var(--c-surface);border:1px solid var(--c-line);border-radius:var(--r);overflow:hidden;transition:border-color .2s,box-shadow .25s,transform .2s var(--ease)}
 .kb-card:hover{border-color:var(--c-accent);box-shadow:var(--shadow-sm);transform:translateY(-2px)}
@@ -35,10 +45,10 @@
 .kb-open{display:flex;flex-direction:column;flex:1;width:100%;text-align:left;background:none;padding:0}
 .kb-modal__bar{height:14px;background:var(--c-accent);position:relative}
 .kb-modal__bar .kb-modal__close{top:.6rem;background:var(--c-surface);box-shadow:var(--shadow-sm)}
-.kb-card img,.kb-ph{width:100%;height:132px;object-fit:cover;display:block}
+.kb-card img,.kb-ph{width:100%;height:118px;object-fit:cover;display:block}
 .kb-ph{background:var(--c-bg2);display:grid;place-items:center;color:var(--c-accent)}
 .kb-ph svg{width:38px;height:38px;opacity:.28}
-.kb-body{padding:.95rem 1.05rem .3rem;display:flex;flex-direction:column;gap:.35rem;flex:1}
+.kb-body{padding:.75rem .9rem .25rem;display:flex;flex-direction:column;gap:.28rem;flex:1}
 /* Название — ровно две строки у всех карточек, чтобы цена и кнопка «Выбрать»
    стояли на одном уровне по всему ряду. */
 .kb-name{font-size:.96rem;font-weight:600;line-height:1.35;color:var(--c-ink);overflow-wrap:anywhere;
@@ -48,7 +58,7 @@
 .kb-price{font-family:var(--ff-display);font-size:1.24rem;font-weight:700;color:var(--c-accent);white-space:nowrap}
 .kb-unit{font-size:.78rem;color:var(--c-muted)}
 .kb-more{font-size:.78rem;color:var(--c-accent);font-weight:600;margin-left:auto;white-space:nowrap}
-.kb-act{padding:.7rem 1.05rem 1.05rem;margin-top:auto}
+.kb-act{padding:.6rem .9rem .9rem;margin-top:auto}
 .kb-add{width:100%;justify-content:center;padding:.72rem 1rem;border-radius:var(--r-sm);background:var(--c-accent);color:#fff;font-weight:600;font-size:.9rem;transition:.2s}
 .kb-add:hover{background:var(--c-accent-d)}
 .kb-qty{display:flex;align-items:center;gap:.5rem}
@@ -57,7 +67,11 @@
 .kb-qty input{flex:1;min-width:0;height:40px;text-align:center;border:1px solid var(--c-line);border-radius:var(--r-sm);font:600 .98rem var(--ff-body);color:var(--c-ink)}
 .kb-qty input:focus{outline:none;border-color:var(--c-accent)}
 .kb-tbd{display:inline-block;padding:.2rem .55rem;border-radius:var(--r-pill);background:#FBF0DF;color:#8A6038;font-size:.72rem;font-weight:700}
-.kb-empty{padding:2.5rem 0;text-align:center;color:var(--c-muted)}
+.kb-empty{padding:2rem 0;text-align:center;color:var(--c-muted);line-height:2.2}
+.kb-more-line{text-align:center;margin-top:1.4rem}
+.kb-switch{padding:.7rem 1.3rem;border:1px solid var(--c-accent);border-radius:var(--r-pill);
+ background:none;color:var(--c-accent);font:600 .9rem var(--ff-body);transition:.2s}
+.kb-switch:hover{background:var(--c-accent);color:#fff}
 
 /* нижняя панель с итогом */
 .kb-bar{position:fixed;left:0;right:0;bottom:0;z-index:95;background:var(--c-dark);color:#fff;padding:.85rem clamp(1rem,4vw,2.5rem);padding-bottom:calc(.85rem + var(--safe-b));display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;box-shadow:0 -12px 34px -20px rgba(0,0,0,.7)}
@@ -77,7 +91,7 @@ body.kb-page{padding-bottom:92px}
 .kb-modal__lbl{font-size:.7rem;letter-spacing:.14em;text-transform:uppercase;color:var(--c-muted);font-weight:700}
 
 /* смета */
-.kb-sheet{background:#fff;border:1px solid var(--c-line);border-radius:var(--r);box-shadow:var(--shadow);padding:clamp(1.4rem,3.4vw,2.6rem);max-width:900px;margin:0 auto}
+.kb-sheet{background:#fff;border:1px solid var(--c-line);border-radius:var(--r);box-shadow:var(--shadow);padding:clamp(1.2rem,2.6vw,2rem);max-width:900px;margin:0 auto}
 .kb-doc-head{display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap;align-items:flex-end}
 .kb-doc-brand{font-family:var(--ff-display);font-size:1.7rem;font-weight:700;color:var(--c-accent)}
 .kb-doc-sub{font-size:.85rem;color:var(--c-muted)}
@@ -185,9 +199,8 @@ table.kb-bill tbody tr:nth-child(even) td{background:var(--c-bg)}
     <div class="breadcrumb"><a href="index.html">Главная</a> → Калькулятор</div>
     <span class="page-hero__eyebrow">Расчёт по меню · Ижевск</span>
     <h1 class="h1">Соберите заказ<br>и получите смету</h1>
-    <p class="lead">Фуршетное и банкетное меню целиком, с составом блюд и ценами. Отметьте позиции
-       и число гостей — стоимость посчитается сразу, а внизу появится готовая смета: её можно
-       распечатать, сохранить в PDF и отправить нам заявкой.</p>
+    <p class="lead">Всё фуршетное и банкетное меню с ценами и составом. Отметьте блюда
+       и число гостей — смета соберётся сама.</p>
     <div class="page-hero__cta">
       <a href="#kb-catalog" class="btn btn--on-dark">Начать расчёт</a>
       <a href="furshet.html" class="btn btn--outline-light" style="color:#fff;border-color:rgba(255,255,255,.45)">О кейтеринге</a>

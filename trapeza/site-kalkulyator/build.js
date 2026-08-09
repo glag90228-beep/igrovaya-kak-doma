@@ -64,6 +64,14 @@ const PRICE_FIX = [
 // «Канапе с креветкой» на витрине 155 ₽ — эту цену перенесли в прайс,
 // поэтому карточку не трогаем: она уже совпадает.
 
+function plural(n, one, few, many) {
+  const m100 = Math.abs(n) % 100, m10 = Math.abs(n) % 10;
+  if (m100 >= 11 && m100 <= 14) return many;
+  if (m10 === 1) return one;
+  if (m10 >= 2 && m10 <= 4) return few;
+  return many;
+}
+
 const furshet = require(path.join(TRAPEZA, 'menu-data.js'));
 const banket = require(path.join(TRAPEZA, 'menu-data-banket.js'));
 const items = [];
@@ -200,7 +208,7 @@ const BANNER = `
         <svg class="arrow" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"
              fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
              style="width:18px;height:18px"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
-      <p class="kalc-band__note">132 позиции · расчёт за 2 минуты · без звонков</p>
+      <p class="kalc-band__note"><span class="kalc-count">__COUNT__</span> · расчёт за 2 минуты · без звонков</p>
     </div>
     <ol class="kalc-steps">
       <li><b>01</b> Выбираете блюда</li>
@@ -231,9 +239,28 @@ for (const f of pages) {
     // баннер сразу под первым экраном — его видно, не листая
     after = after.replace('<!-- ════ SCROLLY', BANNER + '\n<!-- ════ SCROLLY');
     after = after.replace('17 фуршетных позиций · от 50 ₽ за штуку',
-      '132 позиции меню · расчёт за 2 минуты');
+      '<span class="kalc-count">__COUNT__</span> меню · расчёт за 2 минуты');
     after = after.replace('>Рассчитать фуршет ', '>Открыть калькулятор ');
     if (!after.includes('kalc-band')) throw new Error('не удалось вставить баннер на главную');
+    // Число позиций подставляем при сборке и обновляем из menu.json,
+    // чтобы после правок в панели на главной не висела старая цифра.
+    const label = `${items.length} ${plural(items.length, 'позиция', 'позиции', 'позиций')}`;
+    after = after.split('__COUNT__').join(label);
+    after = after.replace('</body>', `<script>
+fetch('menu.json?v=' + Date.now(), { cache: 'no-store' })
+  .then(function (r) { return r.ok ? r.json() : null; })
+  .then(function (j) {
+    if (!j || !j.items) return;
+    var n = j.items.filter(function (i) { return !i.off; }).length;
+    var w = n % 100 >= 11 && n % 100 <= 14 ? 'позиций'
+      : n % 10 === 1 ? 'позиция' : n % 10 >= 2 && n % 10 <= 4 ? 'позиции' : 'позиций';
+    Array.prototype.forEach.call(document.querySelectorAll('.kalc-count'), function (el) {
+      el.textContent = n + ' ' + w;
+    });
+  })
+  .catch(function () { /* оставляем цифру со сборки */ });
+</script>
+</body>`);
   }
 
   if (after !== before) { fs.writeFileSync(p, after); touched++; }
@@ -245,6 +272,8 @@ fs.writeFileSync(path.join(OUT, 'menu.json'), JSON.stringify(
     items: items.map((it, i) => ({ ...it, off: 0, sort: i })) },
   null, 2));
 fs.copyFileSync(path.join(D, 'admin.php'), path.join(OUT, 'admin.php'));
+fs.copyFileSync(path.join(D, 'smeta.php'), path.join(OUT, 'smeta.php'));
+fs.mkdirSync(path.join(OUT, 'smeta'), { recursive: true });
 
 // .htaccess: сайт запрещает отдавать *.json — а калькулятору нужен menu.json.
 // Выводим его из-под запрета (отрицательный просмотр вперёд) и на всякий случай
@@ -263,8 +292,25 @@ if (fs.existsSync(htPath)) {
       + 'RedirectMatch 404 ^/menu-backup/\n'
       + '\n# Текстовые заметки в корне сайта (инструкции, пароли) наружу не отдаём.\n'
       + '# robots.txt — исключение, он нужен поисковикам.\n'
-      + '<FilesMatch "^(?!robots\\.txt$).*\\.txt$">\n  Require all denied\n</FilesMatch>');
+      + '<FilesMatch "^(?!robots\\.txt$).*\\.txt$">\n  Require all denied\n</FilesMatch>\n'
+      + '\n# Сохранённые сметы клиентов — не для поисковиков\n'
+      + '<IfModule mod_headers.c>\n'
+      + '  <FilesMatch "^smeta/">\n    Header set X-Robots-Tag "noindex, nofollow"\n  </FilesMatch>\n'
+      + '</IfModule>');
     if (ht === was) throw new Error('не удалось поправить .htaccess');
+
+    // Старые правила OpenCart перехватывают наши файлы: например
+    // «RewriteRule ^menu/?.*$ → /furshet.html» съедает menu.json, и меню
+    // из панели на сайт не попадает. Ставим в начало блока страховку:
+    // если файл или папка реально существуют — отдаём как есть.
+    ht = ht.replace('# ──────────── 301 РЕДИРЕКТЫ',
+      '# Существующие файлы и папки отдаём как есть — редиректы ниже\n'
+      + '# рассчитаны на старые адреса, которых на диске нет.\n'
+      + 'RewriteCond %{REQUEST_FILENAME} -f [OR]\n'
+      + 'RewriteCond %{REQUEST_FILENAME} -d\n'
+      + 'RewriteRule ^ - [L]\n\n'
+      + '# ──────────── 301 РЕДИРЕКТЫ');
+    if (!ht.includes('REQUEST_FILENAME')) throw new Error('не удалось поставить страховку в .htaccess');
 
     // Сайт разрешает браузеру держать HTML сутки — после обновления калькулятора
     // человек сутки видел бы старую страницу. Для неё и меню выключаем кэш.
@@ -311,6 +357,7 @@ fs.writeFileSync(path.join(OUT, 'robots.txt'),
   + 'Disallow: /*.json$\n'
   + 'Disallow: /admin.php\n'
   + 'Disallow: /menu-backup/\n'
+  + 'Disallow: /smeta/\n'
   + '\n'
   + `Sitemap: ${HOST}/sitemap.xml\n`);
 
