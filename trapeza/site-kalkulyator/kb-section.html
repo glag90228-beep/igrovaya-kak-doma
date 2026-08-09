@@ -30,18 +30,21 @@
 .kb-card{display:flex;flex-direction:column;background:var(--c-surface);border:1px solid var(--c-line);border-radius:var(--r);overflow:hidden;transition:border-color .2s,box-shadow .25s,transform .2s var(--ease)}
 .kb-card:hover{border-color:var(--c-accent);box-shadow:var(--shadow-sm);transform:translateY(-2px)}
 .kb-card.on{border-color:var(--c-accent);box-shadow:0 0 0 1px var(--c-accent) inset}
-.kb-open{display:block;width:100%;text-align:left;background:none;padding:0}
+.kb-open{display:flex;flex-direction:column;flex:1;width:100%;text-align:left;background:none;padding:0}
 .kb-modal__bar{height:14px;background:var(--c-accent);position:relative}
 .kb-modal__bar .kb-modal__close{top:.6rem;background:var(--c-surface);box-shadow:var(--shadow-sm)}
 .kb-card img{aspect-ratio:4/3;width:100%;object-fit:cover}
 .kb-body{padding:.95rem 1.05rem .3rem;display:flex;flex-direction:column;gap:.35rem;flex:1}
-.kb-name{font-size:.96rem;font-weight:600;line-height:1.35;color:var(--c-ink);overflow-wrap:anywhere;hyphens:auto}
+/* Название — ровно две строки у всех карточек, чтобы цена и кнопка «Выбрать»
+   стояли на одном уровне по всему ряду. */
+.kb-name{font-size:.96rem;font-weight:600;line-height:1.35;color:var(--c-ink);overflow-wrap:anywhere;
+ hyphens:auto;min-height:2.7em;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .kb-desc{font-size:.8rem;color:var(--c-muted);line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.kb-meta{display:flex;align-items:baseline;gap:.5rem;margin-top:auto;padding-top:.5rem}
-.kb-price{font-family:var(--ff-display);font-size:1.24rem;font-weight:700;color:var(--c-accent)}
+.kb-meta{display:flex;align-items:baseline;gap:.5rem;margin-top:auto;padding-top:.6rem}
+.kb-price{font-family:var(--ff-display);font-size:1.24rem;font-weight:700;color:var(--c-accent);white-space:nowrap}
 .kb-unit{font-size:.78rem;color:var(--c-muted)}
-.kb-more{font-size:.78rem;color:var(--c-accent);font-weight:600}
-.kb-act{padding:.7rem 1.05rem 1.05rem}
+.kb-more{font-size:.78rem;color:var(--c-accent);font-weight:600;margin-left:auto;white-space:nowrap}
+.kb-act{padding:.7rem 1.05rem 1.05rem;margin-top:auto}
 .kb-add{width:100%;justify-content:center;padding:.72rem 1rem;border-radius:var(--r-sm);background:var(--c-accent);color:#fff;font-weight:600;font-size:.9rem;transition:.2s}
 .kb-add:hover{background:var(--c-accent-d)}
 .kb-qty{display:flex;align-items:center;gap:.5rem}
@@ -111,8 +114,13 @@ table.kb-bill tbody tr:nth-child(even) td{background:var(--c-bg)}
 @media(max-width:560px){
   .kb-grid{grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:.7rem}
   .kb-body{padding:.75rem .8rem .2rem}
-  .kb-name{font-size:.88rem}
+  .kb-name{font-size:.88rem;min-height:2.5em;-webkit-line-clamp:3}
   .kb-desc{display:none}
+  /* В узкой карточке подпись «состав →» не помещается рядом с ценой —
+     карточка и так открывается по нажатию. */
+  .kb-more{display:none}
+  .kb-meta{flex-wrap:nowrap}
+  .kb-unit{white-space:nowrap}
   .kb-act{padding:.55rem .8rem .85rem}
   .kb-bar__sum{font-size:1.3rem}
   .kb-signs{grid-template-columns:1fr;gap:1.6rem}

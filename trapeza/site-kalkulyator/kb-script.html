@@ -84,8 +84,7 @@ function cardHtml(i){
     +   img
     +   '<div class="kb-body"><div class="kb-name">'+esc(m.n)+'</div>'
     +   (m.d ? '<div class="kb-desc">'+esc(m.d)+'</div>' : '')
-    +   '<div class="kb-meta">'+price+'</div>'
-    +   (m.d ? '<div class="kb-more">состав →</div>' : '')
+    +   '<div class="kb-meta">'+price+(m.d ? '<span class="kb-more">состав →</span>' : '')+'</div>'
     +   '</div></button>'
     + '<div class="kb-act">'+qtyHtml(i)+'</div></article>';
 }
