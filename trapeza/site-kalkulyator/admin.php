@@ -261,7 +261,16 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
  display:flex;align-items:baseline;gap:10px}
 .cat span{font-family:var(--sans);font-size:12px;font-weight:600;letter-spacing:.1em;
  text-transform:uppercase;color:var(--muted)}
-.row{display:grid;grid-template-columns:34px 1.7fr 2fr 74px 96px 108px 132px;gap:10px;align-items:start;
+.cat .tools{margin-left:auto;display:flex;gap:5px;flex-wrap:wrap}
+.cat .tools button{font:600 12px var(--sans);padding:5px 10px;border:1px solid var(--line);
+ border-radius:8px;background:#fff;color:var(--ink2);cursor:pointer}
+.cat .tools button:hover{border-color:var(--accent);color:var(--accent)}
+.cat .tools .ico{padding:5px 9px;font-size:13px;line-height:1}
+.dirty{position:fixed;left:0;right:0;bottom:56px;background:#FBF2F2;border-top:1px solid #E7CFCF;
+ color:#7A2F2F;padding:8px 20px;font-size:13px;z-index:29;display:none}
+.dirty.on{display:block}
+@media(max-width:900px){.cat{flex-wrap:wrap}.cat .tools{margin-left:0;width:100%}}
+.row{display:grid;grid-template-columns:30px 1.5fr 1.8fr 68px 88px 168px 120px;gap:9px;align-items:start;
  padding:11px;border:1px solid var(--line);border-radius:11px;background:#fff;margin-bottom:8px}
 .row.hidden-item{opacity:.55;background:var(--bg2)}
 .row.to-delete{opacity:.4;background:#FBF2F2;border-color:#E7CFCF}
@@ -341,8 +350,7 @@ head('Панель меню — Трапеза');
     </div>
     <div style="display:flex;gap:12px;align-items:flex-end;margin-top:12px;flex-wrap:wrap">
       <div style="flex:0 1 320px"><label>Категория</label>
-        <input id="new_c" list="cats" placeholder="Канапе">
-        <datalist id="cats"><?php foreach ($allCats as $c): ?><option value="<?= h($c) ?>"><?php endforeach; ?></datalist>
+        <select id="new_c"></select>
       </div>
       <button class="btn ghost" type="button" id="add">Добавить в список</button>
     </div>
@@ -361,16 +369,7 @@ head('Панель меню — Трапеза');
 
   <div id="list">
   <?php
-  $prev = null;
-  foreach ($items as $i => $it):
-    $key = ($it['mt'] ?? 'furshet') . '|' . ($it['c'] ?? '');
-    if ($key !== $prev):
-      $prev = $key; ?>
-      <h3 class="cat"><?= h($it['c'] ?? '') ?>
-        <span><?= ($it['mt'] ?? 'furshet') === 'banket' ? 'банкет' : 'фуршет' ?> · <?= (int)$counts[$key] ?></span>
-      </h3>
-    <?php endif; ?>
-
+  foreach ($items as $i => $it): ?>
     <div class="row<?= !empty($it['off']) ? ' hidden-item' : '' ?>" data-i="<?= $i ?>"
          data-search="<?= h(mb_strtolower(($it['n'] ?? '') . ' ' . ($it['d'] ?? '') . ' ' . ($it['c'] ?? ''))) ?>"
          data-mt="<?= h($it['mt'] ?? 'furshet') ?>">
@@ -395,7 +394,7 @@ head('Панель меню — Трапеза');
       </div>
 
       <div>
-        <input data-f="c" value="<?= h($it['c'] ?? '') ?>" list="cats" aria-label="Категория">
+        <select data-f="c" aria-label="Категория" data-value="<?= h($it['c'] ?? '') ?>"></select>
         <select data-f="mt" style="margin-top:6px">
           <option value="furshet" <?= ($it['mt'] ?? '') !== 'banket' ? 'selected' : '' ?>>фуршет</option>
           <option value="banket"  <?= ($it['mt'] ?? '') === 'banket' ? 'selected' : '' ?>>банкет</option>
@@ -414,6 +413,7 @@ head('Панель меню — Трапеза');
   </div>
 </div>
 
+<div class="dirty" id="dirty">Есть несохранённые изменения — не забудьте «Сохранить меню».</div>
 <div class="bar">
   <div class="state">Позиций: <b id="cnt"><?= count($items) ?></b> · после сохранения меню на сайте обновится сразу</div>
   <button class="btn" type="button" id="save">Сохранить меню</button>
@@ -423,6 +423,7 @@ head('Панель меню — Трапеза');
 var CSRF = <?= json_encode($csrf) ?>;
 var $ = function(id){ return document.getElementById(id); };
 var list = $('list'), msg = $('msg');
+var dirty = false;
 
 function say(text, bad){
   msg.innerHTML = '<div class="' + (bad ? 'err' : 'ok') + '">' + text.replace(/[<>]/g, '') + '</div>';
@@ -430,6 +431,192 @@ function say(text, bad){
 }
 function rows(){ return Array.prototype.slice.call(list.querySelectorAll('.row')); }
 function field(row, name){ return row.querySelector('[data-f="' + name + '"]'); }
+function esc(t){ return String(t == null ? '' : t).replace(/[&<>"]/g,
+  function(c){ return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]; }); }
+function touch(){ dirty = true; $('dirty').classList.add('on'); }
+
+window.addEventListener('beforeunload', function(e){
+  if (!dirty) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
+
+/* ══════════ КАТЕГОРИИ ══════════
+   Порядок категорий = порядок строк в списке: при сохранении позиции
+   нумеруются сверху вниз, поэтому достаточно двигать сами строки. */
+
+var MENUS = { furshet: 'фуршет', banket: 'банкет' };
+var order = [];                       /* ключи «меню|категория» в нужном порядке */
+
+function rowCat(r){ return (field(r, 'c').value || 'Разное').trim() || 'Разное'; }
+function rowMt(r){ return field(r, 'mt').value; }
+function keyOf(r){ return rowMt(r) + '|' + rowCat(r); }
+
+/** Все категории выбранного меню, в текущем порядке. */
+function catsOf(mt){
+  var seen = {}, out = [];
+  order.forEach(function(k){
+    var p = k.split('|');
+    if (p[0] === mt && !seen[k]) { seen[k] = 1; out.push(p.slice(1).join('|')); }
+  });
+  rows().forEach(function(r){
+    if (rowMt(r) !== mt) return;
+    var c = rowCat(r);
+    if (out.indexOf(c) < 0) out.push(c);
+  });
+  return out;
+}
+
+/** Выпадающий список категорий для строки и для формы добавления. */
+function fillCatSelect(sel, mt, value){
+  var cats = catsOf(mt);
+  if (value && cats.indexOf(value) < 0) cats.push(value);
+  sel.innerHTML = cats.map(function(c){
+    return '<option value="' + esc(c) + '"' + (c === value ? ' selected' : '') + '>' + esc(c) + '</option>';
+  }).join('') + '<option value="__new__">➕ новая категория…</option>';
+  sel.title = value || ''; /* длинное название не влезает в колонку — покажем подсказкой */
+}
+
+function refreshCatSelects(){
+  rows().forEach(function(r){ fillCatSelect(field(r, 'c'), rowMt(r), rowCat(r)); });
+  var mt = $('new_mt').value;
+  fillCatSelect($('new_c'), mt, $('new_c').value && $('new_c').value !== '__new__' ? $('new_c').value : catsOf(mt)[0]);
+}
+
+/** Перестраиваем список: строки группируются по категориям в порядке order. */
+function regroup(){
+  var groups = {}, keys = [];
+  rows().forEach(function(r){
+    var k = keyOf(r);
+    if (!groups[k]) { groups[k] = []; keys.push(k); }
+    groups[k].push(r);
+  });
+  /* сохраняем прежний порядок, новые категории добавляем в конец своего меню */
+  var ordered = order.filter(function(k){ return groups[k]; });
+  keys.forEach(function(k){
+    if (ordered.indexOf(k) >= 0) return;
+    var mt = k.split('|')[0];
+    var last = -1;
+    ordered.forEach(function(o, i){ if (o.split('|')[0] === mt) last = i; });
+    ordered.splice(last + 1, 0, k);
+  });
+  order = ordered;
+
+  Array.prototype.forEach.call(list.querySelectorAll('.cat'), function(h){ h.remove(); });
+  order.forEach(function(k){
+    var parts = k.split('|'), mt = parts[0], cat = parts.slice(1).join('|');
+    var head = document.createElement('h3');
+    head.className = 'cat';
+    head.dataset.key = k;
+    head.innerHTML = esc(cat) + ' <span>' + MENUS[mt] + ' · ' + groups[k].length + '</span>'
+      + '<span class="tools">'
+      + '<button type="button" class="ico" data-cat="up" title="Выше">↑</button>'
+      + '<button type="button" class="ico" data-cat="down" title="Ниже">↓</button>'
+      + '<button type="button" data-cat="rename">Переименовать</button>'
+      + '<button type="button" data-cat="move">В ' + (mt === 'furshet' ? 'банкетное' : 'фуршетное') + '</button>'
+      + '<button type="button" data-cat="merge">Объединить…</button>'
+      + '</span>';
+    list.appendChild(head);
+    groups[k].forEach(function(r){ list.appendChild(r); });
+  });
+  refreshCatSelects();
+  refresh();
+}
+
+/** Действия над категорией целиком. */
+list.addEventListener('click', function(e){
+  var btn = e.target.closest ? e.target.closest('[data-cat]') : null;
+  if (!btn) return;
+  var head = btn.closest('.cat');
+  var key = head.dataset.key;
+  var parts = key.split('|'), mt = parts[0], cat = parts.slice(1).join('|');
+  var act = btn.dataset.cat;
+  var inGroup = rows().filter(function(r){ return keyOf(r) === key; });
+
+  if (act === 'up' || act === 'down') {
+    var same = order.filter(function(k){ return k.split('|')[0] === mt; });
+    var i = same.indexOf(key), j = act === 'up' ? i - 1 : i + 1;
+    if (j < 0 || j >= same.length) return;
+    var a = order.indexOf(same[i]), b = order.indexOf(same[j]);
+    order[a] = same[j]; order[b] = same[i];
+    regroup(); touch();
+    document.querySelector('.cat[data-key="' + key.replace(/"/g, '\\"') + '"]')
+      .scrollIntoView({ behavior: 'smooth', block: 'center' });
+    return;
+  }
+
+  if (act === 'rename') {
+    var name = (prompt('Новое название категории:', cat) || '').trim();
+    if (!name || name === cat) return;
+    var exists = catsOf(mt).indexOf(name) >= 0;
+    if (exists && !confirm('Категория «' + name + '» уже есть. Объединить с ней ' 
+        + inGroup.length + ' ' + (inGroup.length === 1 ? 'позицию' : 'позиции') + '?')) return;
+    inGroup.forEach(function(r){ fillCatSelect(field(r, 'c'), mt, name); });
+    var at = order.indexOf(key);
+    if (at >= 0) order[at] = mt + '|' + name;
+    regroup(); touch();
+    say('Категория переименована в «' + name + '». Не забудьте сохранить меню.');
+    return;
+  }
+
+  if (act === 'move') {
+    var to = mt === 'furshet' ? 'banket' : 'furshet';
+    if (!confirm('Перенести «' + cat + '» (' + inGroup.length + ') в ' + MENUS[to] + 'ное меню?')) return;
+    inGroup.forEach(function(r){
+      field(r, 'mt').value = to;
+      r.dataset.mt = to;
+      fillCatSelect(field(r, 'c'), to, cat);
+    });
+    regroup(); touch();
+    say('Категория «' + cat + '» перенесена в ' + MENUS[to] + 'ное меню.');
+    return;
+  }
+
+  if (act === 'merge') {
+    var others = catsOf(mt).filter(function(c){ return c !== cat; });
+    if (!others.length) { say('В этом меню больше нет категорий', true); return; }
+    var target = prompt('С какой категорией объединить «' + cat + '»?\n\n'
+      + others.map(function(c, i){ return (i + 1) + '. ' + c; }).join('\n')
+      + '\n\nВведите номер или название:', '1');
+    if (!target) return;
+    target = /^\d+$/.test(target.trim()) ? others[parseInt(target, 10) - 1] : target.trim();
+    if (!target || others.indexOf(target) < 0) { say('Такой категории нет', true); return; }
+    inGroup.forEach(function(r){ fillCatSelect(field(r, 'c'), mt, target); });
+    order = order.filter(function(k){ return k !== key; });
+    regroup(); touch();
+    say('«' + cat + '» объединена с «' + target + '».');
+  }
+});
+
+/** Смена категории или меню у одной строки. */
+list.addEventListener('change', function(e){
+  var el = e.target;
+  if (el.dataset.f === 'c' && el.value === '__new__') {
+    var row = el.closest('.row');
+    var name = (prompt('Название новой категории:', '') || '').trim();
+    if (!name) { fillCatSelect(el, rowMt(row), rowCat(row)); return; }
+    fillCatSelect(el, rowMt(row), name);
+    regroup(); touch();
+    return;
+  }
+  if (el.dataset.f === 'c' || el.dataset.f === 'mt') {
+    var r2 = el.closest('.row');
+    if (el.dataset.f === 'mt') {
+      r2.dataset.mt = el.value;
+      fillCatSelect(field(r2, 'c'), el.value, rowCat(r2));
+    } else {
+      el.title = el.value;
+    }
+    regroup(); touch();
+  }
+});
+
+$('new_mt').addEventListener('change', refreshCatSelects);
+$('new_c').addEventListener('change', function(){
+  if (this.value !== '__new__') return;
+  var name = (prompt('Название новой категории:', '') || '').trim();
+  fillCatSelect(this, $('new_mt').value, name || catsOf($('new_mt').value)[0]);
+});
 
 function collect(){
   var out = [];
@@ -443,7 +630,7 @@ function collect(){
       u: field(r, 'u').value.trim(),
       p: field(r, 'p').value,
       t: field(r, 't').checked ? 1 : 0,
-      c: field(r, 'c').value.trim(),
+      c: rowCat(r),
       mt: field(r, 'mt').value,
       ph: field(r, 'ph').value,
       off: field(r, 'off').checked ? 1 : 0
@@ -472,8 +659,9 @@ function refresh(){
 
 $('q').addEventListener('input', refresh);
 $('mt').addEventListener('change', refresh);
-list.addEventListener('change', refresh);
-list.addEventListener('input', function(e){ if (e.target.dataset.f === 'n') refresh(); });
+list.addEventListener('change', function(){ refresh(); touch(); });
+list.addEventListener('input', function(e){ touch(); if (e.target.dataset.f === 'n') refresh(); });
+$('transport').addEventListener('input', touch);
 
 /* добавление строки */
 $('add').addEventListener('click', function(){
@@ -486,8 +674,10 @@ $('add').addEventListener('click', function(){
   field(row, 'd').value = '';
   field(row, 'u').value = $('new_u').value.trim();
   field(row, 'p').value = $('new_p').value.trim() || '0';
-  field(row, 'c').value = $('new_c').value.trim() || 'Разное';
   field(row, 'mt').value = $('new_mt').value;
+  row.dataset.mt = $('new_mt').value;
+  fillCatSelect(field(row, 'c'), $('new_mt').value,
+    ($('new_c').value && $('new_c').value !== '__new__') ? $('new_c').value : 'Разное');
   field(row, 'ph').value = '';
   field(row, 't').checked = false;
   field(row, 'off').checked = false;
@@ -497,7 +687,8 @@ $('add').addEventListener('click', function(){
   th.src = ''; th.style.display = 'none';
   list.appendChild(row);
   ['new_n', 'new_u', 'new_p'].forEach(function(id){ $(id).value = ''; });
-  refresh();
+  regroup();
+  touch();
   row.scrollIntoView({ behavior: 'smooth', block: 'center' });
   say('Блюдо «' + name + '» добавлено в список. Не забудьте сохранить меню.');
 });
@@ -554,6 +745,8 @@ function save(confirmed){
         .then(function(r){ return r.ok ? r.json() : null; })
         .then(function(j){
           if (j && j.items && j.items.length) {
+            dirty = false;
+            $('dirty').classList.remove('on');
             say(res.j.message + '. Обновляю список…');
             setTimeout(function(){ location.href = 'admin.php'; }, 700);
           } else {
@@ -574,6 +767,14 @@ function save(confirmed){
 }
 $('save').addEventListener('click', function(){ save(false); });
 
-refresh();
+/* стартовый порядок категорий берём из того, как сервер отдал строки */
+rows().forEach(function(r){
+  fillCatSelect(field(r, 'c'), field(r, 'mt').value, field(r, 'c').dataset.value || 'Разное');
+});
+rows().forEach(function(r){
+  var k = keyOf(r);
+  if (order.indexOf(k) < 0) order.push(k);
+});
+regroup();
 </script>
 </body></html>
