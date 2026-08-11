@@ -6,6 +6,7 @@
 
 const { esc, ru, page, formatMoney, amountInWords } = require('./doc-html');
 const { round2 } = require('./money');
+const { payQrSvg } = require('./qr-pay');
 
 /** doc: { number, date, items:[{name,qty,unit,price}], vat? (false=без НДС) } */
 function buildSchetHtml({ org, cp, doc }) {
@@ -24,6 +25,17 @@ function buildSchetHtml({ org, cp, doc }) {
       <td class="r">${formatMoney(sum)}</td>
     </tr>`;
   }).join('');
+
+  // Платёжный QR: рисуем, только если реквизитов хватает на рабочую строку.
+  const svg = doc.qr === false ? null : payQrSvg({
+    org, sum: total, payer: cp.full_name || cp.name,
+    purpose: `Оплата по счёту № ${doc.number || '1'} от ${ru(doc.date)}`
+      + (doc.vat ? '' : ', без НДС'),
+  }, { size: 150 });
+  const qrBlock = svg
+    ? `<div class="pay__qr">${svg}<div class="pay__cap">Оплата по QR<br>
+         <span class="muted">наведите камеру в приложении банка</span></div></div>`
+    : '';
 
   // Шапка с банковскими реквизитами получателя (поставщика)
   const bankBox = `
@@ -74,10 +86,15 @@ function buildSchetHtml({ org, cp, doc }) {
       </tbody>
     </table>
 
-    <p class="b">Всего наименований ${n} на сумму ${formatMoney(total)} руб.</p>
-    <p class="b">${amountInWords(total)}.</p>
-    <p class="note">Оплата данного счёта означает согласие с условиями поставки товара
-       (оказания услуг). Счёт действителен к оплате в течение 5 банковских дней.</p>
+    <div class="pay">
+      <div class="pay__text">
+        <p class="b">Всего наименований ${n} на сумму ${formatMoney(total)} руб.</p>
+        <p class="b">${amountInWords(total)}.</p>
+        <p class="note">Оплата данного счёта означает согласие с условиями поставки товара
+           (оказания услуг). Счёт действителен к оплате в течение 5 банковских дней.</p>
+      </div>
+      ${qrBlock}
+    </div>
 
     <div class="sign">
       <div style="flex:1">Руководитель<div class="line">${esc(org.signer || '')}</div></div>

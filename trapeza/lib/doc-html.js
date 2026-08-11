@@ -43,6 +43,15 @@ const CSS = `
   .sign .line { border-top: 1px solid #333; margin-top: 26px; padding-top: 3px; font-size: 10.5px; }
   .note { font-size: 10.5px; color: #4a3e31; margin-top: 10px; }
   .box { border: 1px solid #333; }
+  /* Итог и платёжный QR стоят рядом: код не уводит подписи на второй лист. */
+  .pay { display: flex; gap: 18px; align-items: flex-start; margin-top: 10px; }
+  .pay__text { flex: 1; }
+  .pay__text p:first-child { margin-top: 0; }
+  .pay__qr { width: 150px; text-align: center; border: 1px solid #cbb9a5;
+             border-radius: 4px; padding: 8px 8px 6px; background: #fff; }
+  .pay__qr svg { display: block; width: 100%; height: auto; }
+  .pay__cap { font-size: 10px; margin-top: 4px; font-weight: bold; line-height: 1.25; }
+  .pay__cap .muted { font-weight: normal; }
 `;
 
 function page(title, body) {
