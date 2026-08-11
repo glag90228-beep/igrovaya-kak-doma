@@ -53,6 +53,8 @@ const tap = (data) => handleUpdate(tg,
   { callback_query: { id: 'cb', from: USER, data, message: { chat: CHAT } } });
 
 const last = () => (sent[sent.length - 1] || {}).text || '';
+/** Деньги печатаются с неразрывными пробелами — для сравнений выравниваем. */
+const norm = (s) => String(s).replace(/\s/g, ' ');
 /** Ищем кнопку по подстроке текста и возвращаем её callback_data. */
 function button(sub) {
   for (let i = sent.length - 1; i >= 0; i--) {
@@ -208,7 +210,7 @@ function button(sub) {
   await tap('doc.make');
   ok(files.length === 10 && files[9].filename.startsWith('ТОРГ-12'), 'накладная сформирована', files[9].filename);
   // formatRub ставит неразрывный пробел — сравниваем по обычному
-  const cap9 = files[9].caption.replace(/\u00a0/g, ' ');
+  const cap9 = norm(files[9].caption);
   ok(cap9.includes('7 000,00'), 'сумма накладной посчитана', cap9.slice(0, 80));
 
   await tap(`d.dog:${cpId}`);
@@ -224,6 +226,53 @@ function button(sub) {
   ok(Boolean(updBtn), 'УПД виден в журнале', updBtn);
   await tap(`doc.get:${updBtn.split(':')[1]}`);
   ok(files.length === 12 && files[11].filename.startsWith('УПД'), 'УПД пересобирается из журнала', files[11].filename);
+
+  console.log('\n── разбор текста счёта ──');
+  const { parseInvoiceText } = require('./lib/vision');
+  const SCAN = `ООО «Ромашка»
+Счет на оплату № 148 от 03.08.2026
+Поставщик: ООО «Ромашка», ИНН 1832012345
+1  Кофе зерновой   5 кг   870,00   4 350,00
+2  Стаканы 300 мл  200 шт   9,50    1 900,00
+Итого: 6 250,00
+Всего к оплате: 6 250,00`;
+  const scan = parseInvoiceText(SCAN);
+  ok(scan.amount === 6250, 'сумма взята из «всего к оплате», а не самая большая цифра', String(scan.amount));
+  ok(scan.date === '2026-08-03', 'дата разобрана', scan.date);
+  ok(scan.docNo === '148', 'номер счёта найден', scan.docNo);
+  ok(scan.inn === '1832012345', 'ИНН найден', scan.inn);
+  const wordDate = parseInvoiceText('Акт от 11 августа 2026 г. Итого 1 200,50');
+  ok(wordDate.date === '2026-08-11' && wordDate.amount === 1200.5,
+    'дата словами и сумма с копейками', `${wordDate.date} / ${wordDate.amount}`);
+
+  console.log('\n── фото счёта ──');
+  const photoMsg = {
+    chat: CHAT, from: USER,
+    photo: [{ file_id: 'small' }, { file_id: 'big' }],
+  };
+  // без провайдера бот честно отказывается
+  delete process.env.VISION_PROVIDER;
+  await handleUpdate(tg, { message: photoMsg });
+  ok(last().includes('не подключено'), 'без провайдера бот честно говорит об этом', last().slice(0, 50));
+
+  // с заглушкой — распознаёт и предлагает выбрать контрагента
+  process.env.VISION_PROVIDER = 'mock';
+  process.env.VISION_MOCK = JSON.stringify({
+    date: '2026-08-03', amount: 6250, docNo: '148', inn: '1832012345', name: 'ООО «Заря»', text: SCAN,
+  });
+  tg.downloadFile = async () => Buffer.from('фото');
+  await handleUpdate(tg, { message: photoMsg });
+  ok(norm(last()).includes('6 250,00'), 'сумма со снимка показана', norm(last()).slice(0, 60));
+  ok(last().includes('узнал'), 'контрагент опознан по ИНН');
+  const phBtn = button('✅ ООО «Заря»');
+  ok(Boolean(phBtn), 'узнанный контрагент предложен первым', phBtn);
+  await tap(phBtn);
+  ok(last().includes('Что это за операция'), 'бот спрашивает приход или оплата');
+  await tap('ph.k:credit');
+  ok(last().includes('Текущее сальдо'), 'операция занесена со снимка');
+  ok(last().includes('занёс со снимка') || sent[sent.length - 2].text.includes('занёс со снимка'),
+    'в подтверждении сказано, что это с фотографии');
+  delete process.env.VISION_PROVIDER;
 
   console.log('\n── дебиторка ──');
   // второй контрагент-поставщик, которому должны мы
@@ -241,8 +290,9 @@ function button(sub) {
   await tap('debts');
   ok(last().includes('Нам должны') && last().includes('Мы должны'),
     'долги разделены на наши и чужие', last().slice(0, 60));
-  ok(last().includes('54 193') || last().replace(/ /g, ' ').includes('54 193,00'),
-    'сумма долга заказчика на месте');
+  // 94 193 − 40 000 + 6 250 со снимка = 60 443
+  ok(norm(last()).includes('60 443,00'), 'долг заказчика посчитан с учётом операции со снимка',
+    norm(last()).slice(0, 90));
   ok(last().includes('без движения'), 'показано, сколько дней тишины');
   ok(last().includes('⚠️'), 'застарелый долг помечен');
 

@@ -16,6 +16,7 @@ const { buildUpdHtml } = require('./lib/upd');
 const { buildTorg12Html } = require('./lib/torg12');
 const { buildDogovorHtml } = require('./lib/dogovor');
 const { pdfAvailable, htmlToPdf } = require('./lib/pdf');
+const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -456,6 +457,119 @@ async function resendDoc(tg, chatId, user, docId) {
 
 // ---------- платёжка (сумма + назначение) ----------
 
+// ---------- фотография счёта → операция ----------
+
+/**
+ * Присланное фото распознаём и предлагаем занести операцией.
+ * Ничего не сохраняем молча: пользователь видит, что прочиталось,
+ * и подтверждает. Ошибиться в сумме тут стоит дороже, чем переспросить.
+ */
+async function handlePhoto(tg, chatId, user, msg) {
+  if (!visionAvailable()) {
+    await tg.sendMessage(chatId,
+      'Распознавание фото пока не подключено — нужен внешний сервис.\n'
+      + `<i>${esc(visionHint())}</i>\n\n`
+      + 'Пока внесите операцию текстом: <code>15.06 приход 94193</code>', mainMenu());
+    return;
+  }
+
+  // самое крупное превью или картинка-документом
+  let fileId = null; let mime = 'image/jpeg';
+  if (msg.photo && msg.photo.length) {
+    fileId = msg.photo[msg.photo.length - 1].file_id;
+  } else if (msg.document && /^image\//.test(msg.document.mime_type || '')) {
+    fileId = msg.document.file_id;
+    mime = msg.document.mime_type;
+  }
+  if (!fileId) return;
+
+  await tg.sendChatAction(chatId, 'typing');
+  let buf;
+  try { buf = await tg.downloadFile(fileId); } catch (e) {
+    await tg.sendMessage(chatId, `Не смог забрать файл: ${esc(e.message)}`, mainMenu());
+    return;
+  }
+
+  const res = await readInvoice(buf, mime);
+  if (!res.ok) {
+    await tg.sendMessage(chatId,
+      `Распознать не вышло: ${esc(res.error)}\nВнесите операцию текстом.`, mainMenu());
+    return;
+  }
+  const f = res.fields || {};
+  if (!f.amount) {
+    await tg.sendMessage(chatId,
+      'Сумму на снимке разобрать не удалось — бывает при бликах и мятой бумаге.\n'
+      + 'Пришлите фото поровнее или внесите операцию текстом.', mainMenu());
+    return;
+  }
+
+  // если ИНН совпал с известным контрагентом — предложим его первым
+  const cps = bdb.listCps(user.id);
+  const digits = (s) => String(s || '').replace(/\D/g, '');
+  const matched = f.inn ? cps.find((c) => digits(c.inn) && digits(c.inn) === digits(f.inn)) : null;
+
+  bdb.setState(user.id, 'photo', { fields: f });
+
+  const rows = [];
+  if (matched) rows.push([{ text: `✅ ${matched.name}`, data: `ph.cp:${matched.id}` }]);
+  for (const c of cps) {
+    if (matched && c.id === matched.id) continue;
+    rows.push([{ text: `${c.kind === 'supplier' ? '📦' : '🧑‍💼'} ${c.name}`, data: `ph.cp:${c.id}` }]);
+  }
+  rows.push([{ text: '✖️ Отмена', data: 'menu' }]);
+
+  await tg.sendMessage(chatId,
+    'Со снимка прочитал:\n'
+    + `Сумма: <b>${formatRub(f.amount)}</b>\n`
+    + `Дата: ${f.date ? ru(f.date) : '<i>не видно, поставлю сегодняшнюю</i>'}\n`
+    + (f.docNo ? `Документ: № ${esc(f.docNo)}\n` : '')
+    + (f.name ? `Контрагент: ${esc(f.name)}\n` : '')
+    + (f.inn ? `ИНН: ${esc(f.inn)}${matched ? ' — узнал' : ' — такого контрагента нет'}\n` : '')
+    + '\nК кому отнести операцию?',
+    keyboard(rows));
+}
+
+async function photoPickKind(tg, chatId, user, cpId) {
+  const state = bdb.getState(user.id);
+  if (state.state !== 'photo') return;
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+  bdb.setState(user.id, 'photo', { ...state.data, cpId });
+  await tg.sendMessage(chatId,
+    `<b>${esc(cp.name)}</b> · ${formatRub(state.data.fields.amount)}\nЧто это за операция?`,
+    keyboard([
+      [{ text: '📈 Приход — мы оказали, нам должны', data: 'ph.k:credit' }],
+      [{ text: '📉 Оплата — нам заплатили', data: 'ph.k:debit' }],
+      [{ text: '✖️ Отмена', data: 'menu' }],
+    ]));
+}
+
+async function photoSaveOp(tg, chatId, user, kind) {
+  const state = bdb.getState(user.id);
+  if (state.state !== 'photo' || !state.data.cpId) return;
+  const f = state.data.fields;
+  const date = f.date || todayISO();
+  const human = kind === 'credit' ? 'Приход' : 'Оплата';
+  const op = {
+    date, kind: human,
+    doc: `${human}${f.docNo ? ` (${f.docNo})` : ''} (${ru(date)})`,
+    debit: kind === 'debit' ? f.amount : 0,
+    credit: kind === 'credit' ? f.amount : 0,
+    note: 'с фотографии',
+  };
+  const cpId = state.data.cpId;
+  bdb.clearState(user.id);
+  bdb.addOp(user.id, cpId, op);
+  const b = bdb.balanceOf(user.id, cpId);
+  const cp = bdb.getCp(user.id, cpId);
+  await tg.sendMessage(chatId,
+    `✅ ${human}: ${formatRub(f.amount)} (${ru(date)}) — занёс со снимка.\n`
+    + `Текущее сальдо: <b>${formatRub(Math.abs(round2(b.closing)))}</b>.`);
+  const { info, kb } = cpMenu(user.id, cp);
+  await tg.sendMessage(chatId, info, kb);
+}
+
 // ---------- дебиторка ----------
 
 const plural = (n, one, few, many) => {
@@ -669,7 +783,15 @@ async function showOrg(tg, chatId, user) {
 
 async function handleUpdate(tg, update) {
   if (update.callback_query) return handleCallback(tg, update.callback_query);
-  if (update.message && update.message.text) return handleMessage(tg, update.message);
+  const msg = update.message;
+  if (!msg) return undefined;
+  if (msg.photo || (msg.document && /^image\//.test(msg.document.mime_type || ''))) {
+    const from = msg.from || {};
+    const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
+    return handlePhoto(tg, msg.chat.id, user, msg);
+  }
+  if (msg.text) return handleMessage(tg, msg);
+  return undefined;
 }
 
 async function handleMessage(tg, msg) {
@@ -850,6 +972,8 @@ async function handleCallback(tg, cq) {
       await tg.sendMessage(chatId, `<b>${esc(t.name)}</b> по ${formatRub(t.price)} за ${esc(t.unit)}.\nСколько?`);
       return;
     }
+    if (data.startsWith('ph.cp:')) { await photoPickKind(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('ph.k:')) { await photoSaveOp(tg, chatId, user, data.slice(5)); return; }
     if (data === 'debts') { await showDebts(tg, chatId, user); return; }
     if (data === 'debt.akts') { await sendDebtAkts(tg, chatId, user); return; }
     if (data === 'debt.remind') { await debtReminder(tg, chatId, user); return; }

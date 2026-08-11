@@ -56,6 +56,17 @@ class Telegram {
   sendChatAction(chatId, action = 'upload_document') {
     return this.call('sendChatAction', { chat_id: chatId, action }).catch(() => {});
   }
+
+  /** Скачать присланный файл по file_id (фото счёта, скан). */
+  async downloadFile(fileId, maxBytes = 12 * 1024 * 1024) {
+    const info = await this.call('getFile', { file_id: fileId });
+    if (info.file_size && info.file_size > maxBytes) {
+      throw new Error('Файл слишком большой');
+    }
+    const res = await fetch(`https://api.telegram.org/file/bot${this.token}/${info.file_path}`);
+    if (!res.ok) throw new Error(`Не удалось скачать файл: ${res.status}`);
+    return Buffer.from(await res.arrayBuffer());
+  }
 }
 
 // ---- помощники для клавиатур ----
