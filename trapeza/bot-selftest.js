@@ -519,6 +519,25 @@ function button(sub) {
   await handleUpdate(tg, { callback_query: { id: 'c3', from: OTHER, data: `cp:${cpId}`, message: { chat: { id: 777002 } } } });
   ok(last().includes('не найден'), 'по прямой ссылке чужого контрагента тоже не отдаёт');
 
+  console.log('\n── общий браузер для PDF ──');
+  const pdf = require('./lib/pdf');
+  if (pdf.pdfAvailable()) {
+    const t0 = Date.now();
+    await pdf.htmlToPdf('<h1>раз</h1>');
+    const first = Date.now() - t0;
+    const t1 = Date.now();
+    await Promise.all([pdf.htmlToPdf('<h1>два</h1>'), pdf.htmlToPdf('<h1>три</h1>')]);
+    const pair = Date.now() - t1;
+    ok(pair < first * 2, 'браузер переиспользуется, а не поднимается заново',
+      `первый ${first} мс, следующие два ${pair} мс`);
+    await pdf.closePdf();
+    const buf = await pdf.htmlToPdf('<h1>после закрытия</h1>');
+    ok(buf && buf.length > 500, 'после закрытия браузер поднимается заново');
+    await pdf.closePdf();
+  } else {
+    console.log('  ·  Chromium недоступен, проверка пропущена');
+  }
+
   console.log('\n── картинки документов ──');
   const html = files.filter((f) => f.filename.endsWith('.html'));
   for (const f of html) {

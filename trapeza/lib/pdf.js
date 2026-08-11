@@ -1,7 +1,14 @@
 'use strict';
 
-// HTML → PDF через headless Chromium (Playwright). Кириллица и точная вёрстка.
-// Если Chromium недоступен на сервере — вызывающий код отправит HTML для печати.
+/**
+ * HTML → PDF через headless Chromium. Кириллица и точная вёрстка.
+ * Если Chromium недоступен, вызывающий код отправит HTML для печати.
+ *
+ * Браузер держим один на всех и закрываем по простою. Запуск Chromium —
+ * это секунда времени и сотни мегабайт памяти; поднимать его на каждый
+ * счёт нельзя, особенно на сервере с 2 ГБ, где два одновременных
+ * документа съедали бы всю память.
+ */
 
 let _chromium; // undefined = не пробовали, null = недоступен
 
@@ -23,38 +30,107 @@ function pdfAvailable() {
   return Boolean(loadChromium());
 }
 
-async function htmlToPdf(html, opts = {}) {
+// ─────────────────── общий браузер с закрытием по простою ───────────────────
+
+const IDLE_MS = Number(process.env.PDF_IDLE_MS || 120000);
+let browser = null;
+let idleTimer = null;
+let busy = 0;
+let starting = null;
+
+function scheduleClose() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(async () => {
+    if (busy > 0 || !browser) return;
+    const b = browser;
+    browser = null;
+    try { await b.close(); } catch (_) { /* уже упал */ }
+  }, IDLE_MS);
+  if (idleTimer.unref) idleTimer.unref(); // не держим процесс живым ради таймера
+}
+
+async function getBrowser() {
   const chromium = loadChromium();
   if (!chromium) throw new Error('Chromium/Playwright недоступен');
-  const launch = {};
+  if (browser && browser.isConnected && browser.isConnected()) return browser;
+  if (starting) return starting;
+
+  const launch = {
+    // Без этого Chromium падает в контейнерах с маленьким /dev/shm.
+    args: ['--disable-dev-shm-usage', '--no-sandbox'],
+  };
   if (process.env.CHROMIUM_PATH) launch.executablePath = process.env.CHROMIUM_PATH;
-  const browser = await chromium.launch(launch);
+
+  starting = chromium.launch(launch).then((b) => {
+    browser = b;
+    starting = null;
+    // Если браузер умер сам (нехватка памяти, обновление) — забудем ссылку,
+    // следующий вызов поднимет заново, а не будет биться в закрытый канал.
+    b.on('disconnected', () => { if (browser === b) browser = null; });
+    return b;
+  }).catch((e) => { starting = null; throw e; });
+
+  return starting;
+}
+
+/** Одна попытка рендера в уже поднятом браузере. */
+async function renderOnce(html, opts) {
+  const b = await getBrowser();
+  const page = await b.newPage();
   try {
-    const page = await browser.newPage();
     await page.setContent(html, { waitUntil: 'load' });
-    const buf = await page.pdf({
+    return await page.pdf({
       format: 'A4',
       printBackground: true,
       margin: { top: '12mm', bottom: '12mm', left: '12mm', right: '12mm' },
       ...opts,
     });
-    return buf;
   } finally {
-    await browser.close();
+    await page.close().catch(() => {});
   }
 }
 
-async function htmlToPng(html, path, opts = {}) {
-  const chromium = loadChromium();
-  if (!chromium) throw new Error('Chromium/Playwright недоступен');
-  const browser = await chromium.launch();
+async function htmlToPdf(html, opts = {}) {
+  busy += 1;
   try {
-    const page = await browser.newPage({ viewport: { width: 900, height: 1200 }, deviceScaleFactor: 2 });
-    await page.setContent(html, { waitUntil: 'load' });
-    await page.screenshot({ path, fullPage: true, ...opts });
+    try {
+      return await renderOnce(html, opts);
+    } catch (e) {
+      // Браузер мог умереть между вызовами — пробуем один раз с нуля.
+      if (browser) { try { await browser.close(); } catch (_) { /* ignore */ } browser = null; }
+      return await renderOnce(html, opts);
+    }
   } finally {
-    await browser.close();
+    busy -= 1;
+    scheduleClose();
   }
 }
 
-module.exports = { pdfAvailable, htmlToPdf, htmlToPng };
+async function htmlToPng(html, filePath, opts = {}) {
+  busy += 1;
+  try {
+    const b = await getBrowser();
+    const page = await b.newPage({ viewport: { width: 900, height: 1200 }, deviceScaleFactor: 2 });
+    try {
+      await page.setContent(html, { waitUntil: 'load' });
+      await page.screenshot({ path: filePath, fullPage: true, ...opts });
+    } finally {
+      await page.close().catch(() => {});
+    }
+  } finally {
+    busy -= 1;
+    scheduleClose();
+  }
+}
+
+/** Закрыть браузер сразу — для тестов и корректного завершения службы. */
+async function closePdf() {
+  clearTimeout(idleTimer);
+  if (browser) {
+    const b = browser;
+    browser = null;
+    await b.close().catch(() => {});
+  }
+}
+
+module.exports = { pdfAvailable, htmlToPdf, htmlToPng, closePdf };

@@ -16,7 +16,16 @@ if ! command -v node >/dev/null || [ "$(node -v | cut -c2-3)" -lt 22 ]; then
 fi
 node -v
 
-say "2/6 Пользователь и папки"
+say "2/6 Подкачка (Chromium для PDF любит память)"
+if [ "$(free -m | awk '/^Mem:/{print $2}')" -lt 4000 ] && [ "$(swapon --show | wc -l)" -eq 0 ]; then
+  fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
+  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  echo "Добавлено 2 ГБ подкачки."
+else
+  echo "Памяти хватает или подкачка уже есть."
+fi
+
+say "2b/6 Пользователь и папки"
 id -u trapeza >/dev/null 2>&1 || useradd --system --home "$APP" --shell /usr/sbin/nologin trapeza
 mkdir -p "$APP" "$APP/data" "$LOGS"
 
