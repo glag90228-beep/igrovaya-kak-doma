@@ -12,6 +12,9 @@ const { buildAkt } = require('./lib/xlsx-akt');
 const { buildAktUslugHtml } = require('./lib/akt-uslug');
 const { buildSchetHtml } = require('./lib/schet');
 const { buildPlatyozhkaHtml } = require('./lib/platyozhka');
+const { buildUpdHtml } = require('./lib/upd');
+const { buildTorg12Html } = require('./lib/torg12');
+const { buildDogovorHtml } = require('./lib/dogovor');
 const { pdfAvailable, htmlToPdf } = require('./lib/pdf');
 
 // ---------- утилиты дат/чисел ----------
@@ -63,8 +66,10 @@ function cpMenu(userId, cp) {
     [{ text: '➕ Внести операцию', data: `op:${cp.id}` }],
     [{ text: '📄 Акт сверки', data: `d.akt:${cp.id}` }, { text: '🧾 Акт услуг', data: `d.usl:${cp.id}` }],
     [{ text: '💰 Счёт на оплату', data: `d.sch:${cp.id}` }, { text: '🏦 Платёжка', data: `d.pp:${cp.id}` }],
+    [{ text: '📦 УПД', data: `d.upd:${cp.id}` }, { text: '🚚 ТОРГ-12', data: `d.torg12:${cp.id}` }],
+    [{ text: '📝 Договор', data: `d.dog:${cp.id}` }],
   ];
-  const lastSch = bdb.listDocs(userId, 1, cp.id).find((d) => d.type === 'sch' || d.type === 'usl');
+  const lastSch = bdb.listDocs(userId, 1, cp.id).find((d) => ITEM_DOCS[d.type]);
   if (lastSch) {
     rows.push([{ text: `🔁 Повторить: ${lastSch.title.toLowerCase()} № ${lastSch.number}`, data: `d.rep:${lastSch.id}` }]);
   }
@@ -260,7 +265,13 @@ async function genAktSverki(tg, chatId, user, cpId) {
 
 // ---------- сбор позиций (для акта услуг и счёта) ----------
 
-const WHAT = { usl: 'акт об оказании услуг', sch: 'счёт' };
+// Документы, которые набираются позициями: заголовок, сборщик и имя файла.
+const ITEM_DOCS = {
+  sch:    { title: 'Счёт на оплату',            build: buildSchetHtml,   file: 'Счет' },
+  usl:    { title: 'Акт об оказании услуг',     build: buildAktUslugHtml, file: 'Акт_услуг' },
+  upd:    { title: 'УПД',                       build: buildUpdHtml,     file: 'УПД' },
+  torg12: { title: 'Товарная накладная ТОРГ-12', build: buildTorg12Html, file: 'ТОРГ-12' },
+};
 
 /** Клавиатура набора позиций: частые позиции кнопками + управление. */
 function itemsKb(user, data) {
@@ -281,7 +292,7 @@ async function startItems(tg, chatId, user, type, cpId) {
   const tpl = bdb.listTemplates(user.id, 6).length
     ? '\n\nЧастые позиции — кнопками ниже, количество спрошу.' : '';
   await tg.sendMessage(chatId,
-    `Составляем <b>${esc(WHAT[type])} № ${esc(data.number)}</b> от ${ru(data.date)}.\n`
+    `Составляем <b>${esc(ITEM_DOCS[type].title)} № ${esc(data.number)}</b> от ${ru(data.date)}.\n`
     + 'Отправляйте позиции по одной:\n'
     + '<code>Наименование; количество; цена</code>\n'
     + 'Например: <code>Канапе ассорти; 20; 650</code>' + tpl,
@@ -296,7 +307,7 @@ async function showPreview(tg, chatId, user, state) {
   const lines = d.items.map((it, i) =>
     `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)} = <b>${formatRub(round2(it.qty * it.price))}</b>`);
   await tg.sendMessage(chatId,
-    `<b>${esc(WHAT[type])} № ${esc(d.number)}</b> от ${ru(d.date)}\n\n`
+    `<b>${esc(ITEM_DOCS[type].title)} № ${esc(d.number)}</b> от ${ru(d.date)}\n\n`
     + (lines.join('\n') || '— пусто —')
     + `\n\nИтого: <b>${formatRub(total)}</b>`,
     keyboard([
@@ -329,16 +340,15 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, seq }) {
   if (!doc.items.length) { await tg.sendMessage(chatId, 'Позиций нет — отменил.', mainMenu()); return false; }
 
   const total = round2(doc.items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0));
-  const isUsl = type === 'usl';
-  const html = isUsl ? buildAktUslugHtml({ org, cp, doc }) : buildSchetHtml({ org, cp, doc });
+  const kind = ITEM_DOCS[type];
   const q = bdb.quota(user.id);
   const tail = q.paid ? '' : `\n<i>Выписано в этом месяце: ${q.used + 1} из ${q.limit} бесплатных.</i>`;
   await sendGenerated(tg, chatId, {
-    html,
-    base: `${isUsl ? 'Акт_услуг' : 'Счет'}_${safeName(doc.number)}_${safeName(cp.name)}`,
-    caption: `${isUsl ? 'Акт об оказании услуг' : 'Счёт на оплату'} № ${esc(doc.number)}`
+    html: kind.build({ org, cp, doc }),
+    base: `${kind.file}_${safeName(doc.number)}_${safeName(cp.name)}`,
+    caption: `${esc(kind.title)} № ${esc(doc.number)}`
       + ` от ${ru(doc.date)} для <b>${esc(cp.name)}</b> на ${formatRub(total)}.`
-      + (isUsl ? '' : '\nВ счёте есть QR — клиент платит, наведя камеру банка.') + tail,
+      + (type === 'sch' ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.' : '') + tail,
   });
 
   bdb.rememberItems(user.id, doc.items);
@@ -365,7 +375,7 @@ async function finishItems(tg, chatId, user, state) {
 /** Повтор ранее выписанного документа: те же позиции, новый номер и дата. */
 async function repeatDoc(tg, chatId, user, docId) {
   const src = bdb.getDoc(user.id, docId);
-  if (!src || !['sch', 'usl'].includes(src.type)) {
+  if (!src || !ITEM_DOCS[src.type]) {
     await tg.sendMessage(chatId, 'Такой документ повторить нельзя.', mainMenu());
     return;
   }
@@ -410,8 +420,8 @@ async function showDoc(tg, chatId, user, docId) {
   const items = (d.payload.items || [])
     .map((it, i) => `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n');
   const rows = [];
-  if (['sch', 'usl', 'pp'].includes(d.type)) rows.push([{ text: '📄 Прислать файл заново', data: `doc.get:${d.id}` }]);
-  if (['sch', 'usl'].includes(d.type)) rows.push([{ text: '🔁 Повторить новым номером', data: `d.rep:${d.id}` }]);
+  if (d.type !== 'akt') rows.push([{ text: '📄 Прислать файл заново', data: `doc.get:${d.id}` }]);
+  if (ITEM_DOCS[d.type]) rows.push([{ text: '🔁 Повторить новым номером', data: `d.rep:${d.id}` }]);
   if (cp) rows.push([{ text: `👤 ${cp.name}`, data: `cp:${cp.id}` }]);
   rows.push([{ text: '🗑 Убрать из журнала', data: `doc.del:${d.id}` }]);
   rows.push([{ text: '⬅️ К документам', data: 'docs' }]);
@@ -431,12 +441,10 @@ async function resendDoc(tg, chatId, user, docId) {
   const cp = bdb.getCp(user.id, d.cp_id);
   if (!org || !cp) { await tg.sendMessage(chatId, 'Не хватает данных для сборки.', mainMenu()); return; }
   const doc = { number: d.number, date: d.date, ...d.payload };
-  const map = {
-    sch: [buildSchetHtml, 'Счет'],
-    usl: [buildAktUslugHtml, 'Акт_услуг'],
-    pp: [buildPlatyozhkaHtml, 'Платежка'],
-  };
-  const [build, base] = map[d.type] || [];
+  const kind = ITEM_DOCS[d.type]
+    || (d.type === 'pp' ? { build: buildPlatyozhkaHtml, file: 'Платежка' } : null)
+    || (d.type === 'dog' ? { build: buildDogovorHtml, file: 'Договор' } : null);
+  const build = kind && kind.build; const base = kind && kind.file;
   if (!build) { await tg.sendMessage(chatId, 'Этот документ пересобрать нельзя.', mainMenu()); return; }
   await sendGenerated(tg, chatId, {
     html: build({ org, cp, doc }),
@@ -446,6 +454,68 @@ async function resendDoc(tg, chatId, user, docId) {
 }
 
 // ---------- платёжка (сумма + назначение) ----------
+
+// ---------- договор (три вопроса, остальное из реквизитов) ----------
+
+const DOG_STEPS = [
+  { key: 'subject', q: 'Предмет договора — что оказываем? Напр.: «услуги по организации фуршетного обслуживания»:' },
+  { key: 'price', q: 'Фиксированная сумма договора, руб. Если платим по счетам — отправьте <code>0</code>:', num: true },
+  { key: 'term', q: 'До какой даты действует? Напр. «31.12.2026» или «-» = до конца года:', opt: true },
+];
+
+async function startDogovor(tg, chatId, user, cpId) {
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  const cp = bdb.getCp(user.id, cpId); if (!cp) return;
+  const seq = bdb.nextSeq(user.id, 'dog', new Date().getFullYear());
+  bdb.setState(user.id, `dog:${cpId}`, { i: 0, seq, number: String(seq), date: todayISO(), values: {} });
+  await tg.sendMessage(chatId,
+    `Договор № ${seq} с <b>${esc(cp.name)}</b>. Реквизиты обеих сторон подставлю сам — `
+    + 'нужно три ответа.');
+  await tg.sendMessage(chatId, esc(DOG_STEPS[0].q));
+}
+
+async function handleDogText(tg, chatId, user, state, text) {
+  const cpId = Number(state.state.split(':')[1]);
+  const d = state.data;
+  const step = DOG_STEPS[d.i];
+
+  if (step.num) {
+    const n = parseAmount(text);
+    if (n == null || n < 0) { await tg.sendMessage(chatId, 'Нужно число, напр. 150000 или 0:'); return; }
+    d.values[step.key] = n;
+  } else {
+    d.values[step.key] = clean(text);
+  }
+
+  d.i += 1;
+  if (d.i < DOG_STEPS.length) {
+    bdb.setState(user.id, state.state, d);
+    await tg.sendMessage(chatId, esc(DOG_STEPS[d.i].q));
+    return;
+  }
+
+  const org = bdb.getDefaultOrg(user.id);
+  const cp = bdb.getCp(user.id, cpId);
+  bdb.clearState(user.id);
+  if (!org || !cp) { await tg.sendMessage(chatId, 'Не хватает данных.', mainMenu()); return; }
+
+  const doc = {
+    number: d.number, date: d.date, subject: d.values.subject,
+    price: d.values.price, term: d.values.term,
+  };
+  await sendGenerated(tg, chatId, {
+    html: buildDogovorHtml({ org, cp, doc }),
+    base: `Договор_${safeName(doc.number)}_${safeName(cp.name)}`,
+    caption: `Договор № ${esc(doc.number)} от ${ru(doc.date)} с <b>${esc(cp.name)}</b>.`
+      + '\nШаблон общего назначения — под конкретную сделку покажите юристу.',
+  });
+  bdb.saveDoc(user.id, {
+    orgId: org.id, cpId, type: 'dog', number: doc.number, seq: d.seq, date: doc.date,
+    total: Number(doc.price) || 0, payload: { subject: doc.subject, price: doc.price, term: doc.term },
+  });
+  const { info, kb } = cpMenu(user.id, cp);
+  await tg.sendMessage(chatId, info, kb);
+}
 
 async function startPp(tg, chatId, user, cpId) {
   const org = await requireOrg(tg, chatId, user); if (!org) return;
@@ -570,6 +640,7 @@ async function handleMessage(tg, msg) {
     return;
   }
   if (state.state.startsWith('pp:')) { await handlePpText(tg, chatId, user, state, text); return; }
+  if (state.state.startsWith('dog:')) { await handleDogText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('op:')) {
     const cpId = Number(state.state.split(':')[1]);
     const op = parseOp(text);
@@ -643,6 +714,9 @@ async function handleCallback(tg, cq) {
     if (data.startsWith('d.akt:')) { await genAktSverki(tg, chatId, user, Number(data.slice(6))); return; }
     if (data.startsWith('d.usl:')) { await startItems(tg, chatId, user, 'usl', Number(data.slice(6))); return; }
     if (data.startsWith('d.sch:')) { await startItems(tg, chatId, user, 'sch', Number(data.slice(6))); return; }
+    if (data.startsWith('d.upd:')) { await startItems(tg, chatId, user, 'upd', Number(data.slice(6))); return; }
+    if (data.startsWith('d.torg12:')) { await startItems(tg, chatId, user, 'torg12', Number(data.slice(9))); return; }
+    if (data.startsWith('d.dog:')) { await startDogovor(tg, chatId, user, Number(data.slice(6))); return; }
     if (data.startsWith('d.pp:')) { await startPp(tg, chatId, user, Number(data.slice(5))); return; }
     if (data === 'items.done') {
       const state = bdb.getState(user.id);

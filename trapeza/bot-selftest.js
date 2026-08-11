@@ -134,7 +134,7 @@ function button(sub) {
   ok(files.length === 2, 'акт об оказании услуг сформирован', (files[1] || {}).filename);
 
   await tap(`d.sch:${cpId}`);
-  ok(last().includes('Счёт № 1') || last().includes('счёт № 1'), 'номер счёта присвоен сам', last().slice(0, 40));
+  ok(last().includes('Счёт на оплату № 1'), 'номер счёта присвоен сам', last().slice(0, 44));
   await say('Канапе ассорти; 20; 650');
   await say('Брускетты ассорти; 15; 780');
   await tap('items.undo');
@@ -192,6 +192,38 @@ function button(sub) {
   await say('26496,42');
   await say('Оплата по счёту № 1 от 10.08.2026');
   ok(files.length === 8, 'платёжное поручение сформировано', (files[7] || {}).filename);
+
+  console.log('\n── УПД, накладная, договор ──');
+  await tap(`d.upd:${cpId}`);
+  ok(last().includes('УПД № 1'), 'у УПД своя нумерация', last().slice(0, 40));
+  await say('Продукты для фуршета; 1; 24700');
+  await tap('items.done');
+  await tap('doc.make');
+  ok(files.length === 9 && files[8].filename.startsWith('УПД'), 'УПД сформирован', files[8].filename);
+
+  await tap(`d.torg12:${cpId}`);
+  await say('Пирожки с мясом; 100; 45');
+  await say('Морсы, 1 л; 10; 250');
+  await tap('items.done');
+  await tap('doc.make');
+  ok(files.length === 10 && files[9].filename.startsWith('ТОРГ-12'), 'накладная сформирована', files[9].filename);
+  // formatRub ставит неразрывный пробел — сравниваем по обычному
+  const cap9 = files[9].caption.replace(/\u00a0/g, ' ');
+  ok(cap9.includes('7 000,00'), 'сумма накладной посчитана', cap9.slice(0, 80));
+
+  await tap(`d.dog:${cpId}`);
+  await say('услуги по организации фуршетного обслуживания');
+  await say('150000');
+  await say('31.12.2026');
+  ok(files.length === 11 && files[10].filename.startsWith('Договор'), 'договор сформирован', files[10].filename);
+  ok(files[10].caption.includes('юристу'), 'в подписи есть оговорка про юриста');
+
+  // все три пересобираются из журнала
+  await tap('docs');
+  const updBtn = button('УПД № 1');
+  ok(Boolean(updBtn), 'УПД виден в журнале', updBtn);
+  await tap(`doc.get:${updBtn.split(':')[1]}`);
+  ok(files.length === 12 && files[11].filename.startsWith('УПД'), 'УПД пересобирается из журнала', files[11].filename);
 
   console.log('\n── изоляция пользователей ──');
   const OTHER = { id: 777002, first_name: 'Чужой', username: 'other' };
