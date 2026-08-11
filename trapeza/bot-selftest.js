@@ -352,6 +352,51 @@ function button(sub) {
   ok(last().includes('задолженность') && last().includes('Р/с'),
     'готовый текст напоминания с реквизитами', last().slice(0, 60));
 
+  console.log('\n── поддержка и правовые страницы ──');
+  const legal = require('./lib/legal');
+  ok(legal.missing().length > 0, 'сборка правовых страниц требует заполнить реквизиты',
+    legal.missing().join(', '));
+  const pol = legal.buildPolicyHtml({ ...legal.CONFIG, inn: '1', ogrnip: '2', address: 'a',
+    email: 'x@y.z', botLink: 'https://t.me/x' });
+  ok(pol.includes('152') || pol.includes('персональных данных'), 'политика собирается');
+  ok(pol.includes('удаляется целиком') && pol.includes('отозвать согласие'),
+    'в политике есть удаление и отзыв согласия');
+  const of = legal.buildOfertaHtml({ ...legal.CONFIG, inn: '1', ogrnip: '2', address: 'a',
+    email: 'x@y.z', botLink: 'https://t.me/x' });
+  ok(of.includes('не оказывает бухгалтерских'), 'оферта прямо говорит, что это не бухгалтерия');
+  ok(of.includes('Ответственность за содержание'), 'ответственность за документ на пользователе');
+
+  process.env.SUPPORT_CHAT_ID = '999';
+  process.env.LEGAL_OFERTA_URL = 'https://example.test/oferta.html';
+  await tap('support');
+  ok(last().includes('Поддержка'), 'экран поддержки открывается');
+  ok(last().includes('оферту'), 'на экране есть ссылка на оферту');
+  await tap('sup.write');
+  ok(last().includes('Опишите'), 'бот ждёт текст обращения');
+  const beforeSup = sent.length;
+  await say('Не приходит счёт, кнопка не реагирует');
+  const forwarded = sent.slice(beforeSup).find((m) => m.text.includes('Обращение в поддержку'));
+  ok(Boolean(forwarded), 'обращение ушло владельцу');
+  ok(forwarded && forwarded.text.includes('Не приходит счёт'), 'текст обращения передан целиком');
+  ok(last().includes('Отправил'), 'пользователю подтвердили отправку');
+  delete process.env.SUPPORT_CHAT_ID;
+  await tap('support');
+  ok(!last().includes('Написать в поддержку') || last().includes('не настроен')
+    || last().includes('Напишите нам'), 'без настройки бот не обещает того, чего не может');
+  delete process.env.LEGAL_OFERTA_URL;
+
+  console.log('\n── блокировка бота ──');
+  const blockErr = Object.assign(new Error('Forbidden: bot was blocked by the user'),
+    { code: 403, blocked: true });
+  const dead = { ...tg, sendMessage: async () => { throw blockErr; } };
+  await handleUpdate(dead, { message: { chat: CHAT, from: USER, text: '/start' } });
+  const bdb2 = require('./lib/bot-db');
+  const me = bdb2.getOrCreateUser(USER.id);
+  ok(bdb2.isBlocked(me.id), 'заблокировавший помечен в базе');
+  ok(!bdb2.reachableUsers().some((u) => u.tg_id === USER.id), 'в списке для рассылки его нет');
+  await say('/start');
+  ok(!bdb2.isBlocked(me.id), 'вернулся и написал — пометка снята');
+
   console.log('\n── оформление бота ──');
   const setup = require('./lib/bot-setup');
   ok(setup.checkSetup().length === 0, 'тексты и команды укладываются в лимиты Telegram',

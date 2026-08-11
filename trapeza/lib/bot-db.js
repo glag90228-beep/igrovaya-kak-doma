@@ -83,6 +83,10 @@ function migrate() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tpl_uniq ON item_templates(user_id, name);
   `);
 
+  // Заблокировавшие бота: рассылать им бессмысленно, а каждая попытка —
+  // ошибка в логе и лишний запрос.
+  addColumn('bot_users', 'blocked_at', "TEXT NOT NULL DEFAULT ''");
+
   // расширяем контрагентов: владелец + банковские реквизиты (для счёта/платёжки)
   addColumn('counterparties', 'user_id', 'INTEGER');
   addColumn('counterparties', 'address', "TEXT NOT NULL DEFAULT ''");
@@ -218,6 +222,24 @@ function balanceOf(userId, cpId) {
   if (!cp) return null;
   const ops = listOps(userId, cpId);
   return { cp, ops, ...computeBalance(cp, ops) };
+}
+
+// ---------- заблокировавшие бота ----------
+
+function markBlocked(userId) {
+  db.prepare('UPDATE bot_users SET blocked_at = ? WHERE id = ?')
+    .run(new Date().toISOString(), userId);
+}
+function markActive(userId) {
+  db.prepare("UPDATE bot_users SET blocked_at = '' WHERE id = ? AND blocked_at <> ''").run(userId);
+}
+function isBlocked(userId) {
+  const u = db.prepare('SELECT blocked_at FROM bot_users WHERE id = ?').get(userId);
+  return Boolean(u && u.blocked_at);
+}
+/** Кому имеет смысл писать: для будущих напоминаний и рассылок. */
+function reachableUsers() {
+  return db.prepare("SELECT * FROM bot_users WHERE blocked_at = ''").all();
 }
 
 // ---------- дебиторка ----------
@@ -381,6 +403,7 @@ module.exports = {
   createOrg, updateOrg, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp,
   addOp, listOps, deleteLastOp, balanceOf, debtors,
+  markBlocked, markActive, isBlocked, reachableUsers,
   nextSeq, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,
   quota, docsThisMonth, FREE_PER_MONTH,

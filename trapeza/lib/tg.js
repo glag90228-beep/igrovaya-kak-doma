@@ -10,15 +10,36 @@ class Telegram {
     this.base = `https://api.telegram.org/bot${token}`;
   }
 
-  async call(method, params = {}) {
+  /**
+   * Вызов метода API. Ошибку не глотаем, но приводим к разбираемому виду:
+   * вызывающему коду важно отличить «пользователь заблокировал бота» (403)
+   * от «слишком часто» (429) и от настоящей поломки.
+   *
+   * На 429 Telegram сам говорит, сколько ждать, — ждём и повторяем.
+   */
+  async call(method, params = {}, attempt = 0) {
     const res = await fetch(`${this.base}/${method}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
     });
-    const data = await res.json();
-    if (!data.ok) throw new Error(`TG ${method}: ${data.description || res.status}`);
-    return data.result;
+    const data = await res.json().catch(() => ({}));
+    if (data.ok) return data.result;
+
+    const code = data.error_code || res.status;
+    const retryAfter = ((data.parameters || {}).retry_after) || 0;
+    if (code === 429 && attempt < 3) {
+      await new Promise((r) => setTimeout(r, (retryAfter || 1) * 1000));
+      return this.call(method, params, attempt + 1);
+    }
+
+    const err = new Error(`TG ${method}: ${data.description || code}`);
+    err.code = code;
+    err.retryAfter = retryAfter;
+    // 403 — бот заблокирован или чат удалён; 400 «chat not found» по сути то же
+    err.blocked = code === 403
+      || /bot was blocked|user is deactivated|chat not found|bot was kicked/i.test(data.description || '');
+    throw err;
   }
 
   getUpdates(offset, timeout = 30) {
@@ -47,9 +68,13 @@ class Telegram {
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     form.append('document', new Blob([bytes]), filename);
     const res = await fetch(`${this.base}/sendDocument`, { method: 'POST', body: form });
-    const data = await res.json();
-    if (!data.ok) throw new Error(`TG sendDocument: ${data.description || res.status}`);
-    return data.result;
+    const data = await res.json().catch(() => ({}));
+    if (data.ok) return data.result;
+    const code = data.error_code || res.status;
+    const err = new Error(`TG sendDocument: ${data.description || code}`);
+    err.code = code;
+    err.blocked = code === 403 || /bot was blocked|chat not found/i.test(data.description || '');
+    throw err;
   }
 
   /** Показать/скрыть «печатает…» */
@@ -71,12 +96,17 @@ class Telegram {
 
 // ---- помощники для клавиатур ----
 
-/** Inline-клавиатура из массива рядов [[{text, data}], ...] */
+/**
+ * Inline-клавиатура из рядов [[{text, data}], ...].
+ * Кнопка со ссылкой задаётся полем url вместо data — Telegram не принимает
+ * оба поля сразу.
+ */
 function keyboard(rows) {
   return {
     reply_markup: {
-      inline_keyboard: rows.map((row) =>
-        row.map((b) => ({ text: b.text, callback_data: b.data }))),
+      inline_keyboard: rows.map((row) => row.map((b) => (b.url
+        ? { text: b.text, url: b.url }
+        : { text: b.text, callback_data: b.data }))),
     },
   };
 }

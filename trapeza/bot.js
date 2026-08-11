@@ -18,6 +18,7 @@ const { buildDogovorHtml } = require('./lib/dogovor');
 const { pdfAvailable, htmlToPdf } = require('./lib/pdf');
 const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
 const { applySetup } = require('./lib/bot-setup');
+const { supportScreen, forwardToSupport, legalLine } = require('./lib/bot-support');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -47,7 +48,7 @@ function mainMenu() {
     [{ text: '👥 Контрагенты', data: 'cps' }],
     [{ text: '💸 Кто должен', data: 'debts' }],
     [{ text: '📁 Мои документы', data: 'docs' }],
-    [{ text: '❓ Помощь', data: 'help' }],
+    [{ text: '❓ Помощь', data: 'help' }, { text: '💬 Поддержка', data: 'support' }],
   ]);
 }
 
@@ -57,6 +58,12 @@ const GREETING =
   + 'и получайте готовые документы файлом:\n'
   + '• Акт сверки\n• Акт об оказании услуг\n• Счёт на оплату\n• Платёжное поручение\n\n'
   + 'С чего начнём?';
+
+/** Приветствие с правовой строкой — она появляется, когда заданы адреса страниц. */
+function greeting() {
+  const legal = legalLine();
+  return GREETING + (legal ? `\n\n<i>${legal}</i>` : '');
+}
 
 function cpMenu(userId, cp) {
   const b = bdb.balanceOf(userId, cp.id);
@@ -464,6 +471,28 @@ async function resendDoc(tg, chatId, user, docId) {
 
 // ---------- платёжка (сумма + назначение) ----------
 
+// ---------- поддержка ----------
+
+async function showSupport(tg, chatId, user) {
+  bdb.clearState(user.id);
+  const { text, rows } = supportScreen();
+  await tg.sendMessage(chatId, text, keyboard(rows));
+}
+
+async function handleSupportText(tg, chatId, user, text) {
+  bdb.clearState(user.id);
+  let sentOk = false;
+  try {
+    sentOk = await forwardToSupport(tg, { user, chatId, text });
+  } catch (e) {
+    sentOk = false;
+  }
+  await tg.sendMessage(chatId, sentOk
+    ? '✅ Отправил. Ответим сюда же, в этот чат.'
+    : 'Не получилось отправить обращение. Напишите нам напрямую — контакт в разделе «Поддержка».',
+  mainMenu());
+}
+
 // ---------- УПД: статус и НДС ----------
 
 /**
@@ -836,12 +865,32 @@ async function showOrg(tg, chatId, user) {
 // ---------- главный обработчик апдейта ----------
 
 async function handleUpdate(tg, update) {
+  try {
+    return await route(tg, update);
+  } catch (e) {
+    // Пользователь заблокировал бота или удалил чат: писать ему больше некуда.
+    // Помечаем и молчим — иначе каждая попытка будет ошибкой в логе.
+    if (e && e.blocked) {
+      const from = (update.callback_query || update.message || {}).from || {};
+      if (from.id) {
+        const u = bdb.getOrCreateUser(from.id);
+        bdb.markBlocked(u.id);
+        console.log(`Пользователь ${from.id} заблокировал бота — помечен`);
+      }
+      return undefined;
+    }
+    throw e;
+  }
+}
+
+async function route(tg, update) {
   if (update.callback_query) return handleCallback(tg, update.callback_query);
   const msg = update.message;
   if (!msg) return undefined;
   if (msg.photo || (msg.document && /^image\//.test(msg.document.mime_type || ''))) {
     const from = msg.from || {};
     const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
+    bdb.markActive(user.id);
     return handlePhoto(tg, msg.chat.id, user, msg);
   }
   if (msg.text) return handleMessage(tg, msg);
@@ -852,13 +901,15 @@ async function handleMessage(tg, msg) {
   const chatId = msg.chat.id;
   const from = msg.from || {};
   const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
+  bdb.markActive(user.id); // писал — значит не заблокирован
   const text = msg.text.trim();
 
-  if (text === '/start') { bdb.clearState(user.id); await tg.sendMessage(chatId, GREETING, mainMenu()); return; }
+  if (text === '/start') { bdb.clearState(user.id); await tg.sendMessage(chatId, greeting(), mainMenu()); return; }
   if (text === '/menu' || text === '/cancel') { bdb.clearState(user.id); await tg.sendMessage(chatId, 'Главное меню:', mainMenu()); return; }
   // Команды из меню Telegram — те же экраны, что и кнопки. Если человек
   // выбрал команду в середине формы, шаг сбрасываем: он передумал.
-  const SLASH = { '/org': 'org', '/cps': 'cps', '/debts': 'debts', '/docs': 'docs', '/help': 'help' };
+  const SLASH = { '/org': 'org', '/cps': 'cps', '/debts': 'debts', '/docs': 'docs',
+    '/help': 'help', '/support': 'support' };
   if (SLASH[text]) {
     bdb.clearState(user.id);
     await handleCallback(tg, {
@@ -911,6 +962,7 @@ async function handleMessage(tg, msg) {
   }
   if (state.state.startsWith('pp:')) { await handlePpText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('dog:')) { await handleDogText(tg, chatId, user, state, text); return; }
+  if (state.state === 'support') { await handleSupportText(tg, chatId, user, text); return; }
   if (state.state.startsWith('op:')) {
     const cpId = Number(state.state.split(':')[1]);
     const op = parseOp(text);
@@ -930,8 +982,9 @@ async function handleCallback(tg, cq) {
   const chatId = cq.message.chat.id;
   const from = cq.from || {};
   const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
+  bdb.markActive(user.id);
   const data = cq.data || '';
-  await tg.answerCallbackQuery(cq.id);
+  await tg.answerCallbackQuery(cq.id).catch(() => {});
 
   try {
     if (data === 'menu') { bdb.clearState(user.id); await tg.sendMessage(chatId, 'Главное меню:', mainMenu()); return; }
@@ -1051,6 +1104,13 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('ph.cp:')) { await photoPickKind(tg, chatId, user, Number(data.slice(6))); return; }
     if (data.startsWith('ph.k:')) { await photoSaveOp(tg, chatId, user, data.slice(5)); return; }
+    if (data === 'support') { await showSupport(tg, chatId, user); return; }
+    if (data === 'sup.write') {
+      bdb.setState(user.id, 'support', {});
+      await tg.sendMessage(chatId, 'Опишите, что случилось. Одним сообщением — я передам целиком.',
+        keyboard([[{ text: '✖️ Отмена', data: 'menu' }]]));
+      return;
+    }
     if (data === 'debts') { await showDebts(tg, chatId, user); return; }
     if (data === 'debt.akts') { await sendDebtAkts(tg, chatId, user); return; }
     if (data === 'debt.remind') { await debtReminder(tg, chatId, user); return; }
@@ -1066,7 +1126,11 @@ async function handleCallback(tg, cq) {
     if (data.startsWith('doc:')) { await showDoc(tg, chatId, user, Number(data.slice(4))); return; }
     if (data.startsWith('d.rep:')) { await repeatDoc(tg, chatId, user, Number(data.slice(6))); return; }
   } catch (e) {
-    await tg.sendMessage(chatId, `⚠️ Ошибка: ${esc(e.message)}`, mainMenu());
+    if (e && e.blocked) throw e; // разберётся handleUpdate
+    console.error('Ошибка обработки:', e.message);
+    await tg.sendMessage(chatId,
+      '⚠️ Что-то пошло не так на этом шаге. Попробуйте ещё раз, а если повторится — '
+      + 'напишите в поддержку, я посмотрю.', mainMenu());
   }
 }
 
