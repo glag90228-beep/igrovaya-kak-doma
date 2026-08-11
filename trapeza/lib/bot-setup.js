@@ -34,6 +34,7 @@ const COMMANDS = [
   { command: 'debts', description: 'Кто сколько должен' },
   { command: 'docs', description: 'Выписанные документы' },
   { command: 'help', description: 'Как пользоваться' },
+  { command: 'subscription', description: 'Подписка и оплата' },
   { command: 'support', description: 'Написать в поддержку' },
   { command: 'cancel', description: 'Отменить текущий шаг' },
 ];

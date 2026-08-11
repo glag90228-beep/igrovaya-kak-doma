@@ -8,7 +8,8 @@
     "start": "node server.js",
     "seed": "node seed.js",
     "bot": "node bot.js",
-    "bot:setup": "node bot.js --setup"
+    "bot:setup": "node bot.js --setup",
+    "lava": "node lava-webhook.js"
   },
   "dependencies": {
     "exceljs": "^4.4.0"

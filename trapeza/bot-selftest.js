@@ -352,6 +352,92 @@ function button(sub) {
   ok(last().includes('задолженность') && last().includes('Р/с'),
     'готовый текст напоминания с реквизитами', last().slice(0, 60));
 
+  console.log('\n── разбор вебхука Lava ──');
+  const lava = require('./lib/lava');
+  const flat = lava.parseWebhook({ id: 'inv-1', status: 'paid', amount: '349,00',
+    currency: 'RUB', email: 'Ivan@Mail.RU', clientUtm: '777001' });
+  ok(flat.ok && flat.payment.amount === 349 && flat.payment.paid, 'плоское тело разобрано',
+    JSON.stringify(flat.payment && { a: flat.payment.amount, p: flat.payment.paid }));
+  ok(flat.payment.email === 'ivan@mail.ru', 'почта приведена к нижнему регистру');
+  ok(flat.payment.tgId === 777001, 'Telegram-id вытащен из параметра ссылки');
+
+  const nested = lava.parseWebhook({ event: 'payment.success',
+    data: { invoiceId: 'inv-2', sum: 3490, buyer: { email: 'a@b.ru' }, clientUtm: 'tg777002' } });
+  ok(nested.ok && nested.payment.externalId === 'inv-2' && nested.payment.tgId === 777002,
+    'вложенное тело и id внутри строки', nested.ok ? nested.payment.externalId : nested.reason);
+
+  const failed = lava.parseWebhook({ id: 'inv-3', status: 'failed', amount: 349 });
+  ok(failed.ok && !failed.payment.paid, 'неуспешный платёж помечен как неоплаченный');
+  const junk = lava.parseWebhook({ hello: 'world' });
+  ok(!junk.ok, 'непонятное тело не выдаёт доступ', junk.reason);
+
+  process.env.LAVA_PLAN_DAYS = '349:30,3490:365';
+  ok(lava.daysFor({ amount: 3490 }) === 365 && lava.daysFor({ amount: 349 }) === 30,
+    'дни подбираются по сумме');
+  ok(lava.daysFor({ amount: 111 }) === 30, 'незнакомая сумма — срок по умолчанию');
+
+  process.env.LAVA_WEBHOOK_SECRET = 'sekret';
+  ok(lava.secretOk('sekret') && !lava.secretOk('sekret1') && !lava.secretOk(''),
+    'секрет сверяется точно');
+  process.env.LAVA_OFFER_URL = 'https://lava.top/x?a=1';
+  ok(lava.payLink(777001).includes('clientUtm=777001'), 'ссылка на оплату несёт Telegram-id',
+    lava.payLink(777001));
+
+  console.log('\n── доступ и оплата ──');
+  const bill = require('./lib/billing');
+  const meUser = require('./lib/bot-db').getOrCreateUser(USER.id);
+  ok(!bill.accessInfo(meUser.id).active, 'по умолчанию доступ не оплачен');
+  const until1 = bill.grantDays(meUser.id, 30);
+  ok(bill.accessInfo(meUser.id).active && bill.accessInfo(meUser.id).left >= 29,
+    'доступ выдан на 30 дней', until1);
+  const until2 = bill.grantDays(meUser.id, 30);
+  ok(until2 > until1, 'продление добавляется к остатку, а не сгорает', `${until1} → ${until2}`);
+  bill.revokeAccess(meUser.id);
+
+  const { handlePayment } = require('./lava-webhook');
+  const pay = { externalId: 'inv-10', amount: 349, currency: 'RUB', status: 'paid',
+    email: 'k@l.ru', tgId: USER.id, paid: true, raw: {} };
+  await handlePayment(pay);
+  ok(bill.accessInfo(meUser.id).active, 'вебхук выдал доступ');
+  const untilOnce = bill.accessInfo(meUser.id).until;
+  await handlePayment(pay);
+  ok(bill.accessInfo(meUser.id).until === untilOnce, 'повторная доставка вебхука не продлевает дважды');
+
+  // платёж без Telegram-id забирается по почте
+  await handlePayment({ externalId: 'inv-11', amount: 349, currency: 'RUB', status: 'paid',
+    email: 'nobody@mail.ru', tgId: null, paid: true, raw: {} });
+  ok(bill.unclaimedByEmail('nobody@mail.ru').length === 1, 'ничей платёж ждёт владельца');
+  await tap('billing');
+  ok(last().includes('Подписка'), 'экран подписки открывается');
+  await tap('pay.claim');
+  await say('не-почта');
+  ok(last().includes('не похоже на почту'), 'кривой адрес отклоняется');
+  await tap('pay.claim');
+  await say('nobody@mail.ru');
+  ok(last().includes('Нашёл'), 'оплата по почте найдена и привязана', last().slice(0, 40));
+  ok(bill.unclaimedByEmail('nobody@mail.ru').length === 0, 'платёж больше не ничей');
+
+  console.log('\n── команды владельца ──');
+  process.env.SUPPORT_CHAT_ID = String(CHAT.id);
+  await say('/who');
+  ok(last().includes('оплаченным доступом') || last().includes('Оплаченных'), 'сводка по доступам');
+  const gBefore = sent.length;
+  await say(`/grant ${USER.id} 90`);
+  const gMsgs = sent.slice(gBefore).map((m) => m.text);
+  // владелец в тесте — тот же чат, поэтому приходят оба сообщения:
+  // отчёт владельцу и уведомление пользователю
+  ok(gMsgs.some((t) => t.includes('Выдал 90')), 'доступ выдаётся вручную', gMsgs.join(' | ').slice(0, 70));
+  ok(gMsgs.some((t) => t.includes('Доступ продлён')), 'пользователя уведомили о продлении');
+  delete process.env.SUPPORT_CHAT_ID;
+  const nBefore = sent.length;
+  await say('/grant 777002 90');
+  ok(sent[nBefore] && !sent[nBefore].text.includes('Выдал'),
+    'посторонний не может выдать доступ себе', (sent[nBefore] || {}).text?.slice(0, 40));
+
+  delete process.env.LAVA_OFFER_URL;
+  delete process.env.LAVA_WEBHOOK_SECRET;
+  delete process.env.LAVA_PLAN_DAYS;
+
   console.log('\n── поддержка и правовые страницы ──');
   const legal = require('./lib/legal');
   ok(legal.missing().length > 0, 'сборка правовых страниц требует заполнить реквизиты',

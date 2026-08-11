@@ -19,6 +19,8 @@ const { pdfAvailable, htmlToPdf } = require('./lib/pdf');
 const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
 const { applySetup } = require('./lib/bot-setup');
 const { supportScreen, forwardToSupport, legalLine } = require('./lib/bot-support');
+const billing = require('./lib/billing');
+const { payLink, daysFor } = require('./lib/lava');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -48,6 +50,7 @@ function mainMenu() {
     [{ text: '👥 Контрагенты', data: 'cps' }],
     [{ text: '💸 Кто должен', data: 'debts' }],
     [{ text: '📁 Мои документы', data: 'docs' }],
+    [{ text: '⭐ Подписка', data: 'billing' }],
     [{ text: '❓ Помощь', data: 'help' }, { text: '💬 Поддержка', data: 'support' }],
   ]);
 }
@@ -470,6 +473,101 @@ async function resendDoc(tg, chatId, user, docId) {
 }
 
 // ---------- платёжка (сумма + назначение) ----------
+
+// ---------- подписка ----------
+
+const isOwner = (chatId) => Boolean(process.env.SUPPORT_CHAT_ID)
+  && String(chatId) === String(process.env.SUPPORT_CHAT_ID);
+
+async function showBilling(tg, chatId, user) {
+  bdb.clearState(user.id);
+  const a = billing.accessInfo(user.id);
+  const q = bdb.quota(user.id);
+  const link = payLink(user.tg_id);
+
+  const lines = ['<b>Подписка</b>', ''];
+  if (a.active) {
+    lines.push(`Доступ оплачен до <b>${ru(a.until)}</b> — осталось ${a.left} ${plural(a.left, 'день', 'дня', 'дней')}.`);
+  } else {
+    lines.push(`Сейчас бесплатно: выписано ${q.used} из ${q.limit} документов в этом месяце.`);
+    lines.push('');
+    lines.push('Подписка снимает лимит и оставляет всё остальное как есть.');
+  }
+  if (!link) {
+    lines.push('');
+    lines.push('<i>Оплата пока не подключена. Напишите в поддержку — выдадим доступ вручную.</i>');
+  }
+
+  const rows = [];
+  if (link) rows.push([{ text: a.active ? '⭐ Продлить' : '⭐ Оформить подписку', url: link }]);
+  if (link) rows.push([{ text: '✅ Я оплатил', data: 'pay.claim' }]);
+  const history = billing.paymentsOf(user.id, 3);
+  if (history.length) {
+    lines.push('');
+    lines.push('Последние оплаты: ' + history
+      .map((h) => `${formatRub(h.amount)} · ${ru(String(h.created_at).slice(0, 10))}`).join(', '));
+  }
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId, lines.join('\n'), keyboard(rows));
+}
+
+/**
+ * «Я оплатил»: площадка не всегда возвращает наш параметр, и тогда платёж
+ * приходит ничей. Ищем его по почте, которую человек указал на кассе.
+ */
+async function claimByEmail(tg, chatId, user, email) {
+  bdb.clearState(user.id);
+  const clean = String(email).trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(clean)) {
+    await tg.sendMessage(chatId, 'Это не похоже на почту. Пришлите адрес, который указывали при оплате.',
+      keyboard([[{ text: '⬅️ Подписка', data: 'billing' }]]));
+    return;
+  }
+  const found = billing.unclaimedByEmail(clean);
+  if (!found.length) {
+    await tg.sendMessage(chatId,
+      'Оплату по этой почте не вижу. Деньги могли ещё не дойти — попробуйте через пару минут. '
+      + 'Если прошло больше получаса, напишите в поддержку, разберёмся вручную.',
+      keyboard([[{ text: '💬 Поддержка', data: 'support' }], [{ text: '⬅️ Подписка', data: 'billing' }]]));
+    return;
+  }
+  let until = '';
+  for (const p of found) {
+    billing.attachPayment(p.id, user.id);
+    until = billing.grantDays(user.id, p.days || 30);
+  }
+  await tg.sendMessage(chatId,
+    `✅ Нашёл ${found.length} ${plural(found.length, 'оплату', 'оплаты', 'оплат')}. `
+    + `Доступ до <b>${ru(until)}</b>.`, mainMenu());
+}
+
+/** Команды владельца: выдать доступ руками и посмотреть, у кого он есть. */
+async function ownerCommand(tg, chatId, text) {
+  const grant = /^\/grant\s+(\S+)\s+(\d+)/.exec(text);
+  if (grant) {
+    const who = grant[1].replace(/^@/, '');
+    const days = Number(grant[2]);
+    const target = /^\d+$/.test(who)
+      ? bdb.getOrCreateUser(Number(who))
+      : bdb.reachableUsers().find((u) => String(u.username).toLowerCase() === who.toLowerCase());
+    if (!target) { await tg.sendMessage(chatId, `Не нашёл пользователя ${esc(who)}.`); return true; }
+    const until = billing.grantDays(target.id, days);
+    await tg.sendMessage(chatId, `Выдал ${days} дн. пользователю ${esc(target.name || who)} — до ${ru(until)}.`);
+    try {
+      await tg.sendMessage(target.tg_id, `✅ Доступ продлён до <b>${ru(until)}</b>.`);
+    } catch (e) { if (e && e.blocked) bdb.markBlocked(target.id); }
+    return true;
+  }
+  if (text === '/who') {
+    const list = billing.paidUsers();
+    await tg.sendMessage(chatId, list.length
+      ? '<b>С оплаченным доступом:</b>\n' + list.map((u) =>
+        `• ${esc(u.name || u.tg_id)}${u.username ? ` @${esc(u.username)}` : ''} — до ${ru(u.access_until)}`).join('\n')
+      : 'Оплаченных доступов нет.');
+    return true;
+  }
+  return false;
+}
 
 // ---------- поддержка ----------
 
@@ -904,12 +1002,14 @@ async function handleMessage(tg, msg) {
   bdb.markActive(user.id); // писал — значит не заблокирован
   const text = msg.text.trim();
 
+  if (isOwner(chatId) && await ownerCommand(tg, chatId, text)) return;
+
   if (text === '/start') { bdb.clearState(user.id); await tg.sendMessage(chatId, greeting(), mainMenu()); return; }
   if (text === '/menu' || text === '/cancel') { bdb.clearState(user.id); await tg.sendMessage(chatId, 'Главное меню:', mainMenu()); return; }
   // Команды из меню Telegram — те же экраны, что и кнопки. Если человек
   // выбрал команду в середине формы, шаг сбрасываем: он передумал.
   const SLASH = { '/org': 'org', '/cps': 'cps', '/debts': 'debts', '/docs': 'docs',
-    '/help': 'help', '/support': 'support' };
+    '/help': 'help', '/support': 'support', '/subscription': 'billing' };
   if (SLASH[text]) {
     bdb.clearState(user.id);
     await handleCallback(tg, {
@@ -963,6 +1063,7 @@ async function handleMessage(tg, msg) {
   if (state.state.startsWith('pp:')) { await handlePpText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('dog:')) { await handleDogText(tg, chatId, user, state, text); return; }
   if (state.state === 'support') { await handleSupportText(tg, chatId, user, text); return; }
+  if (state.state === 'claim') { await claimByEmail(tg, chatId, user, text); return; }
   if (state.state.startsWith('op:')) {
     const cpId = Number(state.state.split(':')[1]);
     const op = parseOp(text);
@@ -1104,6 +1205,13 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('ph.cp:')) { await photoPickKind(tg, chatId, user, Number(data.slice(6))); return; }
     if (data.startsWith('ph.k:')) { await photoSaveOp(tg, chatId, user, data.slice(5)); return; }
+    if (data === 'billing') { await showBilling(tg, chatId, user); return; }
+    if (data === 'pay.claim') {
+      bdb.setState(user.id, 'claim', {});
+      await tg.sendMessage(chatId, 'Пришлите почту, которую указывали при оплате:',
+        keyboard([[{ text: '✖️ Отмена', data: 'billing' }]]));
+      return;
+    }
     if (data === 'support') { await showSupport(tg, chatId, user); return; }
     if (data === 'sup.write') {
       bdb.setState(user.id, 'support', {});
