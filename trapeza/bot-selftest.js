@@ -225,6 +225,37 @@ function button(sub) {
   await tap(`doc.get:${updBtn.split(':')[1]}`);
   ok(files.length === 12 && files[11].filename.startsWith('УПД'), 'УПД пересобирается из журнала', files[11].filename);
 
+  console.log('\n── дебиторка ──');
+  // второй контрагент-поставщик, которому должны мы
+  await tap('cp.new');
+  await say('ООО «Поставка»');
+  await say('-'); await say('1832055555'); await say('-');
+  await tap('fb:supplier');
+  await say('-'); await say('0'); await say('01.02.2026');
+  await say('-'); await say('-'); await say('-'); await say('-'); await say('-');
+  const supBtn = button('Внести операцию');
+  const supId = Number(String(supBtn).split(':')[1]);
+  await tap(`op:${supId}`);
+  await say('01.03 приход 30000');
+
+  await tap('debts');
+  ok(last().includes('Нам должны') && last().includes('Мы должны'),
+    'долги разделены на наши и чужие', last().slice(0, 60));
+  ok(last().includes('54 193') || last().replace(/ /g, ' ').includes('54 193,00'),
+    'сумма долга заказчика на месте');
+  ok(last().includes('без движения'), 'показано, сколько дней тишины');
+  ok(last().includes('⚠️'), 'застарелый долг помечен');
+
+  const before = files.length;
+  await tap('debt.akts');
+  ok(files.length === before + 1, 'акт сверки собран по каждому должнику', String(files.length - before));
+  ok(last().includes('не пишет вашим контрагентам'),
+    'честно сказано, что рассылку делает пользователь');
+
+  await tap('debt.remind');
+  ok(last().includes('задолженность') && last().includes('Р/с'),
+    'готовый текст напоминания с реквизитами', last().slice(0, 60));
+
   console.log('\n── изоляция пользователей ──');
   const OTHER = { id: 777002, first_name: 'Чужой', username: 'other' };
   await handleUpdate(tg, { message: { chat: { id: 777002 }, from: OTHER, text: '/start' } });

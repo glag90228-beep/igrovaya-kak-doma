@@ -43,6 +43,7 @@ function mainMenu() {
   return keyboard([
     [{ text: '🏢 Моя организация', data: 'org' }],
     [{ text: '👥 Контрагенты', data: 'cps' }],
+    [{ text: '💸 Кто должен', data: 'debts' }],
     [{ text: '📁 Мои документы', data: 'docs' }],
     [{ text: '❓ Помощь', data: 'help' }],
   ]);
@@ -455,6 +456,89 @@ async function resendDoc(tg, chatId, user, docId) {
 
 // ---------- платёжка (сумма + назначение) ----------
 
+// ---------- дебиторка ----------
+
+const plural = (n, one, few, many) => {
+  const a = Math.abs(n) % 100; const b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b > 1 && b < 5) return few;
+  if (b === 1) return one;
+  return many;
+};
+
+async function showDebts(tg, chatId, user) {
+  const rows = bdb.debtors(user.id);
+  if (!rows.length) {
+    await tg.sendMessage(chatId, 'Все рассчитались — незакрытых сальдо нет. 👌', mainMenu());
+    return;
+  }
+  const theyOwe = rows.filter((r) => r.theyOwe);
+  const weOwe = rows.filter((r) => !r.theyOwe);
+  const sum = (list) => round2(list.reduce((s, r) => s + r.amount, 0));
+
+  const line = (r) => {
+    const quiet = r.days == null ? '' : ` · без движения ${r.days} ${plural(r.days, 'день', 'дня', 'дней')}`;
+    const flag = r.days != null && r.days > 60 ? ' ⚠️' : '';
+    return `• <b>${esc(r.cp.name)}</b> — ${formatRub(r.amount)}${quiet}${flag}`;
+  };
+
+  let text = '';
+  if (theyOwe.length) {
+    text += `<b>Нам должны — ${formatRub(sum(theyOwe))}</b>\n${theyOwe.map(line).join('\n')}\n\n`;
+  }
+  if (weOwe.length) {
+    text += `<b>Мы должны — ${formatRub(sum(weOwe))}</b>\n${weOwe.map(line).join('\n')}\n\n`;
+  }
+  text += '⚠️ — больше двух месяцев без единой операции.';
+
+  const kb = [];
+  if (theyOwe.length) {
+    kb.push([{ text: `📄 Акты сверки всем должникам (${theyOwe.length})`, data: 'debt.akts' }]);
+    kb.push([{ text: '✉️ Текст напоминания', data: 'debt.remind' }]);
+  }
+  for (const r of rows.slice(0, 6)) {
+    kb.push([{ text: `${r.theyOwe ? '🧑‍💼' : '📦'} ${r.cp.name} · ${formatRub(r.amount)}`.slice(0, 60), data: `cp:${r.cp.id}` }]);
+  }
+  kb.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId, text, keyboard(kb));
+}
+
+/** Акты сверки по всем, кто нам должен, — одним нажатием. */
+async function sendDebtAkts(tg, chatId, user) {
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  const rows = bdb.debtors(user.id).filter((r) => r.theyOwe);
+  if (!rows.length) { await tg.sendMessage(chatId, 'Должников нет.', mainMenu()); return; }
+  await tg.sendMessage(chatId,
+    `Собираю ${rows.length} ${plural(rows.length, 'акт', 'акта', 'актов')} сверки — по одному на должника.`);
+  for (const r of rows) {
+    await genAktSverki(tg, chatId, user, r.cp.id);
+  }
+  await tg.sendMessage(chatId,
+    'Готово. Файлы перешлите должникам — бот не пишет вашим контрагентам сам, '
+    + 'у него нет их контактов.', mainMenu());
+}
+
+/** Готовый текст, который остаётся переслать должнику. */
+async function debtReminder(tg, chatId, user) {
+  const org = bdb.getDefaultOrg(user.id);
+  const rows = bdb.debtors(user.id).filter((r) => r.theyOwe);
+  if (!rows.length) { await tg.sendMessage(chatId, 'Должников нет.', mainMenu()); return; }
+  await tg.sendMessage(chatId, 'Тексты ниже — скопируйте и отправьте каждому. Один должник — одно сообщение:');
+  for (const r of rows.slice(0, 10)) {
+    const bank = org && org.acc
+      ? `\n\nРеквизиты для оплаты:\n${org.bank_name || ''}\nБИК ${org.bik || '—'}\nР/с ${org.acc}`
+      : '';
+    await tg.sendMessage(chatId,
+      `<code>Здравствуйте!\n\n`
+      + `По нашим данным на ${ru(todayISO())} за вами числится задолженность `
+      + `${formatRub(r.amount).replace(/ /g, ' ')}`
+      + `${r.cp.contract ? ` по ${r.cp.contract}` : ''}.\n\n`
+      + `Направляем акт сверки. Просим подтвердить сумму и сообщить срок оплаты. `
+      + `Если платёж уже прошёл — пришлите, пожалуйста, платёжное поручение.`
+      + `${bank}\n\nС уважением,\n${(org && (org.full_name || org.name)) || ''}</code>`);
+  }
+}
+
 // ---------- договор (три вопроса, остальное из реквизитов) ----------
 
 const DOG_STEPS = [
@@ -766,6 +850,9 @@ async function handleCallback(tg, cq) {
       await tg.sendMessage(chatId, `<b>${esc(t.name)}</b> по ${formatRub(t.price)} за ${esc(t.unit)}.\nСколько?`);
       return;
     }
+    if (data === 'debts') { await showDebts(tg, chatId, user); return; }
+    if (data === 'debt.akts') { await sendDebtAkts(tg, chatId, user); return; }
+    if (data === 'debt.remind') { await debtReminder(tg, chatId, user); return; }
     if (data === 'docs') { await showDocs(tg, chatId, user); return; }
     if (data.startsWith('docs.cp:')) { await showDocs(tg, chatId, user, Number(data.slice(8))); return; }
     if (data.startsWith('doc.get:')) { await resendDoc(tg, chatId, user, Number(data.slice(8))); return; }

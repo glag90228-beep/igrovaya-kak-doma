@@ -220,6 +220,43 @@ function balanceOf(userId, cpId) {
   return { cp, ops, ...computeBalance(cp, ops) };
 }
 
+// ---------- дебиторка ----------
+
+/**
+ * Кто сколько должен. Знак сальдо трактуем по типу контрагента:
+ * у заказчика положительное сальдо — долг нам, у поставщика — наш долг ему.
+ *
+ * «Без движения» считаем от даты последней операции, а не от срока оплаты:
+ * сроков мы не храним и придумывать их за пользователя не будем. Зато
+ * «полгода тишины при долге в 54 тысячи» — сигнал понятный и честный.
+ */
+function debtors(userId) {
+  const today = new Date();
+  const out = [];
+  for (const cp of listCps(userId)) {
+    const b = balanceOf(userId, cp.id);
+    if (!b) continue;
+    const closing = Math.round(b.closing * 100) / 100;
+    if (Math.abs(closing) < 0.005) continue;
+    const lastOp = b.ops.length ? b.ops[b.ops.length - 1].date : cp.opening_date;
+    const days = lastOp
+      ? Math.max(0, Math.floor((today - new Date(lastOp)) / 86400000))
+      : null;
+    out.push({
+      cp,
+      amount: Math.abs(closing),
+      // нам должны или мы должны
+      theyOwe: cp.kind === 'supplier' ? closing < 0 : closing > 0,
+      lastOp,
+      days,
+      ops: b.ops.length,
+    });
+  }
+  // сначала самые крупные долги в нашу пользу
+  out.sort((a, b) => (Number(b.theyOwe) - Number(a.theyOwe)) || (b.amount - a.amount));
+  return out;
+}
+
 // ---------- выписанные документы и сквозная нумерация ----------
 
 const DOC_TITLES = {
@@ -343,7 +380,7 @@ module.exports = {
   getOrCreateUser, setState, getState, clearState,
   createOrg, updateOrg, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp,
-  addOp, listOps, deleteLastOp, balanceOf,
+  addOp, listOps, deleteLastOp, balanceOf, debtors,
   nextSeq, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,
   quota, docsThisMonth, FREE_PER_MONTH,
