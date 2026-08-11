@@ -1,0 +1,23 @@
+[Unit]
+Description=Трапеза Документы — приёмник вебхуков Lava Top
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trapeza
+EnvironmentFile=/opt/trapeza/.env
+ExecStart=/usr/bin/node lava-webhook.js
+Restart=always
+RestartSec=5
+User=trapeza
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trapeza/data
+StandardOutput=append:/var/log/trapeza/lava.log
+StandardError=append:/var/log/trapeza/lava.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1250,6 +1250,26 @@ async function main() {
   const tg = new Telegram(token);
   const me = await tg.call('getMe');
 
+  if (process.argv.includes('--check')) {
+    console.log(`Токен рабочий: @${me.username} (${me.first_name}), id ${me.id}`);
+    const hook = await tg.call('getWebhookInfo').catch(() => null);
+    if (hook && hook.url) {
+      console.log(`⚠️  У бота настроен вебхук ${hook.url} — long polling работать не будет.`);
+      console.log('   Снять: node bot.js --drop-webhook');
+    } else {
+      console.log('Вебхук не задан — long polling свободен.');
+    }
+    const cmds = await tg.call('getMyCommands').catch(() => []);
+    console.log(`Команд в меню: ${cmds.length}`);
+    return;
+  }
+
+  if (process.argv.includes('--drop-webhook')) {
+    await tg.call('deleteWebhook', { drop_pending_updates: false });
+    console.log('Вебхук снят, long polling свободен.');
+    return;
+  }
+
   if (process.argv.includes('--setup')) {
     console.log(`Оформляю @${me.username}:`);
     await applySetup(tg);

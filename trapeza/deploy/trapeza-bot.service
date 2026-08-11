@@ -1,0 +1,24 @@
+[Unit]
+Description=Трапеза Документы — Telegram-бот
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trapeza
+EnvironmentFile=/opt/trapeza/.env
+ExecStart=/usr/bin/node bot.js
+Restart=always
+RestartSec=5
+User=trapeza
+# Бот пишет только в свою папку data
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trapeza/data
+StandardOutput=append:/var/log/trapeza/bot.log
+StandardError=append:/var/log/trapeza/bot.log
+
+[Install]
+WantedBy=multi-user.target

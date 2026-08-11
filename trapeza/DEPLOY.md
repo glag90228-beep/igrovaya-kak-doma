@@ -108,3 +108,65 @@
 - Домен/поддомен для конструктора (например, `menu.трапеза18.рф`).
 - Доступ к панели управления доменом — добавить A-запись.
 - Токен Telegram-бота от @BotFather — для документов и заявок в бот.
+
+---
+
+## Бот «Трапеза Документы»: установка одной командой
+
+На чистом Ubuntu 22.04/24.04 от root:
+
+```bash
+git clone <репозиторий> /root/trapeza-src
+cd /root/trapeza-src/trapeza
+bash deploy/install.sh          # первый запуск создаст /opt/trapeza/.env и остановится
+nano /opt/trapeza/.env          # вписать BOT_TOKEN и остальное
+bash deploy/install.sh          # второй запуск доводит до конца
+```
+
+Что делает скрипт: ставит Node 22, заводит системного пользователя `trapeza`,
+раскладывает файлы в `/opt/trapeza` (папку `data` не трогает — там боевая база),
+ставит зависимости и Chromium для PDF, проверяет токен, накатывает оформление
+бота и поднимает две службы systemd.
+
+### Проверка перед запуском
+
+```bash
+node bot.js --check          # токен рабочий? не занят ли вебхуком?
+node bot.js --drop-webhook   # снять чужой вебхук, если long polling занят
+node bot.js --setup          # имя, описания, команды, кнопка меню
+```
+
+`--check` отдельно смотрит `getWebhookInfo`: если у бота когда-то был настроен
+вебхук, long polling молча не получит ни одного сообщения, и это самая обидная
+причина «бот не отвечает».
+
+### Приёмник оплат наружу
+
+Служба слушает `127.0.0.1:8788`. Наружу — только через HTTPS:
+
+```nginx
+location /lava {
+    proxy_pass http://127.0.0.1:8788/lava;
+    proxy_set_header Host $host;
+    proxy_set_header X-Api-Key $http_x_api_key;
+}
+```
+
+В Lava Top указывается `https://ваш-домен/lava`, секрет — тот же, что в
+`LAVA_WEBHOOK_SECRET`.
+
+### Логи
+
+```bash
+journalctl -u trapeza-bot -f
+tail -f /var/log/trapeza/lava.log      # сюда падает тело нераспознанного вебхука
+```
+
+### Обновление
+
+```bash
+cd /root/trapeza-src && git pull && cd trapeza && bash deploy/install.sh
+systemctl restart trapeza-bot trapeza-lava
+```
+
+`.env` и `data/` при обновлении не перезаписываются.
