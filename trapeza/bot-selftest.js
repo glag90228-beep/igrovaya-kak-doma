@@ -197,35 +197,81 @@ function button(sub) {
 
   console.log('\n── УПД, накладная, договор ──');
   await tap(`d.upd:${cpId}`);
+  ok(last().includes('Статус 2') && last().includes('Статус 1'),
+    'бот спрашивает статус УПД и объясняет разницу');
+  await tap(`upd.s2:${cpId}`);
   ok(last().includes('УПД № 1'), 'у УПД своя нумерация', last().slice(0, 40));
   await say('Продукты для фуршета; 1; 24700');
   await tap('items.done');
   await tap('doc.make');
-  ok(files.length === 9 && files[8].filename.startsWith('УПД'), 'УПД сформирован', files[8].filename);
+  ok(files.length === 9 && files[8].filename.startsWith('УПД'), 'УПД статуса 2 сформирован', files[8].filename);
+
+  console.log('\n── УПД статус 1: счёт-фактура с НДС ──');
+  const { vatSplit, okei } = require('./lib/upd');
+  const g = vatSplit({ qty: 2, price: 600 }, 20, true);   // цены с НДС
+  ok(g.net === 1000 && g.vat === 200 && g.total === 1200,
+    'НДС выделен из суммы: 1200 = 1000 + 200', JSON.stringify(g));
+  const n = vatSplit({ qty: 2, price: 500 }, 20, false);  // НДС сверху
+  ok(n.net === 1000 && n.vat === 200 && n.total === 1200,
+    'НДС начислен сверху: 1000 + 200 = 1200', JSON.stringify(n));
+  const z = vatSplit({ qty: 3, price: 100 }, null, false);
+  ok(z.vat === null && z.total === 300, 'без НДС налог не считается');
+  ok(okei('шт.') === '796' && okei('кг') === '166' && okei('бочка') === '',
+    'коды ОКЕИ подставляются, неизвестные не выдумываются');
+
+  await tap(`d.upd:${cpId}`);
+  await tap(`upd.s1:${cpId}`);
+  ok(last().includes('Ставка НДС'), 'бот спросил ставку');
+  await tap(`upd.r:${cpId}:20`);
+  ok(last().includes('с налогом или без'), 'бот уточнил, включён ли налог в цену');
+  await tap(`upd.g:${cpId}:20:1`);
+  await say('Обслуживание банкета; 1; 120000');
+  await tap('items.done');
+  ok(last().includes('статус 1') && last().includes('НДС 20%') && last().includes('цены с НДС'),
+    'в сводке видно статус и режим НДС', last().slice(0, 90));
+  await tap('doc.make');
+  const updHtml = require('./lib/upd').buildUpdHtml({
+    org: { name: 'ИП', full_name: 'ИП Сарычева М. В.', inn: '183112345678', address: 'Ижевск' },
+    cp: { name: 'ООО «Заря»', full_name: 'ООО «Заря»', inn: '1832012345', kpp: '183201001' },
+    doc: { number: '1', date: '2026-08-11', status: 1, vatRate: 20, priceIncludesVat: true,
+      items: [{ name: 'Обслуживание банкета', qty: 1, unit: 'усл.', price: 120000 }] },
+  });
+  ok(updHtml.includes('Счёт-фактура №'), 'в статусе 1 есть строка счёта-фактуры');
+  ok(updHtml.includes('ИНН/КПП покупателя'), 'заполнены строки шапки счёта-фактуры');
+  ok(updHtml.includes('Главный бухгалтер'), 'подписи руководителя и бухгалтера на месте');
+  ok(norm(updHtml).includes('20 000,00'), 'НДС 20% из 120 000 выделен как 20 000',
+    (norm(updHtml).match(/20 000,00/g) || []).length + ' совпадений');
+  ok(norm(updHtml).includes('100 000,00'), 'стоимость без налога — 100 000');
+  const upd2 = require('./lib/upd').buildUpdHtml({
+    org: { name: 'ИП', full_name: 'ИП Сарычева М. В.' }, cp: { name: 'ООО «Заря»' },
+    doc: { number: '2', date: '2026-08-11', status: 2, items: [{ name: 'Услуга', qty: 1, price: 100 }] },
+  });
+  ok(!upd2.includes('Счёт-фактура №') && upd2.includes('не является'),
+    'в статусе 2 счёта-фактуры нет и указана упрощёнка');
 
   await tap(`d.torg12:${cpId}`);
   await say('Пирожки с мясом; 100; 45');
   await say('Морсы, 1 л; 10; 250');
   await tap('items.done');
   await tap('doc.make');
-  ok(files.length === 10 && files[9].filename.startsWith('ТОРГ-12'), 'накладная сформирована', files[9].filename);
+  ok(files.length === 11 && files[10].filename.startsWith('ТОРГ-12'), 'накладная сформирована', files[10].filename);
   // formatRub ставит неразрывный пробел — сравниваем по обычному
-  const cap9 = norm(files[9].caption);
+  const cap9 = norm(files[10].caption);
   ok(cap9.includes('7 000,00'), 'сумма накладной посчитана', cap9.slice(0, 80));
 
   await tap(`d.dog:${cpId}`);
   await say('услуги по организации фуршетного обслуживания');
   await say('150000');
   await say('31.12.2026');
-  ok(files.length === 11 && files[10].filename.startsWith('Договор'), 'договор сформирован', files[10].filename);
-  ok(files[10].caption.includes('юристу'), 'в подписи есть оговорка про юриста');
+  ok(files.length === 12 && files[11].filename.startsWith('Договор'), 'договор сформирован', files[11].filename);
+  ok(files[11].caption.includes('юристу'), 'в подписи есть оговорка про юриста');
 
   // все три пересобираются из журнала
   await tap('docs');
   const updBtn = button('УПД № 1');
   ok(Boolean(updBtn), 'УПД виден в журнале', updBtn);
   await tap(`doc.get:${updBtn.split(':')[1]}`);
-  ok(files.length === 12 && files[11].filename.startsWith('УПД'), 'УПД пересобирается из журнала', files[11].filename);
+  ok(files.length === 13 && files[12].filename.startsWith('УПД'), 'УПД пересобирается из журнала', files[12].filename);
 
   console.log('\n── разбор текста счёта ──');
   const { parseInvoiceText } = require('./lib/vision');

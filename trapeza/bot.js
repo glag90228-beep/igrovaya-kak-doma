@@ -286,10 +286,10 @@ function itemsKb(user, data) {
   return keyboard(rows);
 }
 
-async function startItems(tg, chatId, user, type, cpId) {
+async function startItems(tg, chatId, user, type, cpId, extra = {}) {
   const year = new Date().getFullYear();
   const seq = bdb.nextSeq(user.id, type, year);
-  const data = { seq, number: String(seq), date: todayISO(), items: [], ask: '' };
+  const data = { seq, number: String(seq), date: todayISO(), items: [], ask: '', doc: extra };
   bdb.setState(user.id, `items:${type}:${cpId}`, data);
   const tpl = bdb.listTemplates(user.id, 6).length
     ? '\n\nЧастые позиции — кнопками ниже, количество спрошу.' : '';
@@ -308,8 +308,14 @@ async function showPreview(tg, chatId, user, state) {
   const total = round2(d.items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0));
   const lines = d.items.map((it, i) =>
     `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)} = <b>${formatRub(round2(it.qty * it.price))}</b>`);
+  const extra = d.doc || {};
+  const head = extra.status
+    ? ` · статус ${extra.status}${extra.status === 1
+      ? `, НДС ${extra.vatRate == null ? 'не облагается' : `${extra.vatRate}%`}`
+      + `${extra.vatRate == null ? '' : (extra.priceIncludesVat ? ', цены с НДС' : ', НДС сверху')}` : ''}`
+    : '';
   await tg.sendMessage(chatId,
-    `<b>${esc(ITEM_DOCS[type].title)} № ${esc(d.number)}</b> от ${ru(d.date)}\n\n`
+    `<b>${esc(ITEM_DOCS[type].title)} № ${esc(d.number)}</b> от ${ru(d.date)}${head}\n\n`
     + (lines.join('\n') || '— пусто —')
     + `\n\nИтого: <b>${formatRub(total)}</b>`,
     keyboard([
@@ -336,7 +342,7 @@ function parseItemLine(text) {
  * Выпускает счёт или акт услуг: собирает файл, запоминает позиции
  * как шаблоны и кладёт документ в журнал — чтобы потом «повторить».
  */
-async function issueDoc(tg, chatId, user, { type, cpId, doc, seq }) {
+async function issueDoc(tg, chatId, user, { type, cpId, doc, seq, extra = {} }) {
   const org = await requireOrg(tg, chatId, user); if (!org) return false;
   const cp = bdb.getCp(user.id, cpId); if (!cp) return false;
   if (!doc.items.length) { await tg.sendMessage(chatId, 'Позиций нет — отменил.', mainMenu()); return false; }
@@ -356,7 +362,7 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, seq }) {
   bdb.rememberItems(user.id, doc.items);
   bdb.saveDoc(user.id, {
     orgId: org.id, cpId, type, number: doc.number, seq, date: doc.date, total,
-    payload: { items: doc.items },
+    payload: { items: doc.items, ...extra },
   });
   return true;
 }
@@ -365,9 +371,9 @@ async function finishItems(tg, chatId, user, state) {
   const [, type, cpIdStr] = state.state.split(':');
   const cpId = Number(cpIdStr);
   const d = state.data;
-  const doc = { number: d.number, date: d.date, items: d.items };
+  const doc = { number: d.number, date: d.date, items: d.items, ...(d.doc || {}) };
   bdb.clearState(user.id);
-  const done = await issueDoc(tg, chatId, user, { type, cpId, doc, seq: d.seq });
+  const done = await issueDoc(tg, chatId, user, { type, cpId, doc, seq: d.seq, extra: d.doc || {} });
   if (!done) return;
   const cp = bdb.getCp(user.id, cpId);
   const { info, kb } = cpMenu(user.id, cp);
@@ -381,10 +387,10 @@ async function repeatDoc(tg, chatId, user, docId) {
     await tg.sendMessage(chatId, 'Такой документ повторить нельзя.', mainMenu());
     return;
   }
-  const items = src.payload.items || [];
+  const { items = [], ...extra } = src.payload || {};
   const year = new Date().getFullYear();
   const seq = bdb.nextSeq(user.id, src.type, year);
-  const data = { seq, number: String(seq), date: todayISO(), items, ask: '' };
+  const data = { seq, number: String(seq), date: todayISO(), items, ask: '', doc: extra };
   bdb.setState(user.id, `items:${src.type}:${src.cp_id}`, data);
   await tg.sendMessage(chatId,
     `Повторяю <b>${esc(src.title.toLowerCase())} № ${esc(src.number)}</b>: ${items.length} поз., `
@@ -456,6 +462,53 @@ async function resendDoc(tg, chatId, user, docId) {
 }
 
 // ---------- платёжка (сумма + назначение) ----------
+
+// ---------- УПД: статус и НДС ----------
+
+/**
+ * У УПД два режима, и разница принципиальная: статус 1 — это счёт-фактура,
+ * его выставляет только плательщик НДС. Молча выбрать за пользователя нельзя,
+ * поэтому спрашиваем — и сразу подписываем, кому какой нужен.
+ */
+async function askUpdStatus(tg, chatId, user, cpId) {
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  await tg.sendMessage(chatId,
+    'Какой УПД нужен?\n\n'
+    + '<b>Статус 2</b> — только передаточный документ (акт). Для тех, кто на упрощёнке '
+    + 'и НДС не платит.\n'
+    + '<b>Статус 1</b> — счёт-фактура и акт в одном документе. Выставляют плательщики НДС; '
+    + 'спрошу ставку и посчитаю налог.',
+    keyboard([
+      [{ text: '📄 Статус 2 — без счёта-фактуры', data: `upd.s2:${cpId}` }],
+      [{ text: '🧾 Статус 1 — со счётом-фактурой', data: `upd.s1:${cpId}` }],
+      [{ text: '✖️ Отмена', data: `cp:${cpId}` }],
+    ]));
+}
+
+async function askUpdRate(tg, chatId, user, cpId) {
+  await tg.sendMessage(chatId, 'Ставка НДС:',
+    keyboard([
+      [{ text: '20%', data: `upd.r:${cpId}:20` }, { text: '10%', data: `upd.r:${cpId}:10` }],
+      [{ text: '0%', data: `upd.r:${cpId}:0` }],
+      [{ text: 'Без НДС (освобождение)', data: `upd.r:${cpId}:none` }],
+      [{ text: '✖️ Отмена', data: `cp:${cpId}` }],
+    ]));
+}
+
+async function askUpdGross(tg, chatId, user, cpId, rate) {
+  if (rate === 'none') {
+    await startItems(tg, chatId, user, 'upd', cpId, { status: 1, vatRate: null });
+    return;
+  }
+  await tg.sendMessage(chatId,
+    `Ставка ${rate}%. Цены, которые будете вводить, — с налогом или без?\n`
+    + '<i>От этого зависит, что попадёт в графу 4 и в сумму налога.</i>',
+    keyboard([
+      [{ text: 'Цены с НДС (выделить из суммы)', data: `upd.g:${cpId}:${rate}:1` }],
+      [{ text: 'Цены без НДС (начислить сверху)', data: `upd.g:${cpId}:${rate}:0` }],
+      [{ text: '✖️ Отмена', data: `cp:${cpId}` }],
+    ]));
+}
 
 // ---------- фотография счёта → операция ----------
 
@@ -920,7 +973,20 @@ async function handleCallback(tg, cq) {
     if (data.startsWith('d.akt:')) { await genAktSverki(tg, chatId, user, Number(data.slice(6))); return; }
     if (data.startsWith('d.usl:')) { await startItems(tg, chatId, user, 'usl', Number(data.slice(6))); return; }
     if (data.startsWith('d.sch:')) { await startItems(tg, chatId, user, 'sch', Number(data.slice(6))); return; }
-    if (data.startsWith('d.upd:')) { await startItems(tg, chatId, user, 'upd', Number(data.slice(6))); return; }
+    if (data.startsWith('d.upd:')) { await askUpdStatus(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('upd.s2:')) { await startItems(tg, chatId, user, 'upd', Number(data.slice(7)), { status: 2 }); return; }
+    if (data.startsWith('upd.s1:')) { await askUpdRate(tg, chatId, user, Number(data.slice(7))); return; }
+    if (data.startsWith('upd.r:')) {
+      const [cpIdStr, rate] = data.slice(6).split(':');
+      await askUpdGross(tg, chatId, user, Number(cpIdStr), rate);
+      return;
+    }
+    if (data.startsWith('upd.g:')) {
+      const [cpIdStr, rate, gross] = data.slice(6).split(':');
+      await startItems(tg, chatId, user, 'upd', Number(cpIdStr),
+        { status: 1, vatRate: Number(rate), priceIncludesVat: gross === '1' });
+      return;
+    }
     if (data.startsWith('d.torg12:')) { await startItems(tg, chatId, user, 'torg12', Number(data.slice(9))); return; }
     if (data.startsWith('d.dog:')) { await startDogovor(tg, chatId, user, Number(data.slice(6))); return; }
     if (data.startsWith('d.pp:')) { await startPp(tg, chatId, user, Number(data.slice(5))); return; }
