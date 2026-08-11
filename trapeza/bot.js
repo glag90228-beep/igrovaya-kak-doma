@@ -21,6 +21,7 @@ const { applySetup } = require('./lib/bot-setup');
 const { supportScreen, forwardToSupport, legalLine } = require('./lib/bot-support');
 const billing = require('./lib/billing');
 const { payLink, daysFor } = require('./lib/lava');
+const dadata = require('./lib/dadata');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -98,36 +99,50 @@ function esc(s) {
 
 // ---------- пошаговые формы (организация, контрагент) ----------
 
+// Шаги помечены: auto — по значению дозаполняет соседние поля из реестра;
+// skipIfFilled — пропускается, если значение уже подставлено автозаполнением.
+// Поэтому ИНН и БИК стоят первыми: с них подтягивается всё остальное.
+
 const ORG_STEPS = [
-  { key: 'name', q: 'Краткое название организации (напр. «ИП Иванов И. И.» или «ООО Ромашка»):' },
-  { key: 'full_name', q: 'Полное наименование для документов (или «-» = как краткое):', opt: true },
-  { key: 'inn', q: 'ИНН:' },
-  { key: 'kpp', q: 'КПП (для ООО; ИП отправьте «-»):', opt: true },
-  { key: 'signer', q: 'ФИО подписанта (напр. «И. И. Иванов»; или «-»):', opt: true },
-  { key: 'address', q: 'Адрес (или «-»):', opt: true },
-  { key: 'bank_name', q: 'Банк — наименование (или «-»):', opt: true },
-  { key: 'bik', q: 'БИК (или «-»):', opt: true },
-  { key: 'acc', q: 'Расчётный счёт р/с (или «-»):', opt: true },
-  { key: 'corr_acc', q: 'Корр. счёт к/с (или «-»):', opt: true },
+  {
+    key: 'inn', auto: 'party', opt: true,
+    q: 'ИНН вашей организации — подставлю название, адрес и остальное.\n'
+      + '<i>Если справочник не подключён или хотите ввести вручную — отправьте «-».</i>',
+  },
+  { key: 'name', skipIfFilled: true, q: 'Краткое название (напр. «ИП Иванов И. И.» или «ООО Ромашка»):' },
+  { key: 'full_name', skipIfFilled: true, opt: true, q: 'Полное наименование для документов (или «-»):' },
+  { key: 'kpp', skipIfFilled: true, opt: true, q: 'КПП (для ООО; ИП отправьте «-»):' },
+  { key: 'address', skipIfFilled: true, opt: true, q: 'Адрес (или «-»):' },
+  { key: 'signer', skipIfFilled: true, opt: true, q: 'ФИО подписанта (напр. «И. И. Иванов»; или «-»):' },
+  {
+    key: 'bik', auto: 'bank', opt: true,
+    q: 'БИК банка — подставлю название банка и корр. счёт (или «-»):',
+  },
+  { key: 'bank_name', skipIfFilled: true, opt: true, q: 'Банк — наименование (или «-»):' },
+  { key: 'corr_acc', skipIfFilled: true, opt: true, q: 'Корр. счёт к/с (или «-»):' },
+  { key: 'acc', opt: true, q: 'Расчётный счёт р/с — его подставить неоткуда, впишите (или «-»):' },
 ];
 
 const CP_STEPS = [
-  { key: 'name', q: 'Краткое имя контрагента (напр. «ООО Заря»):' },
-  { key: 'full_name', q: 'Полное наименование (или «-»):', opt: true },
-  { key: 'inn', q: 'ИНН контрагента (или «-»):', opt: true },
-  { key: 'kpp', q: 'КПП (или «-»):', opt: true },
+  {
+    key: 'inn', auto: 'party', opt: true,
+    q: 'ИНН контрагента — подставлю название и адрес.\n<i>Или «-», чтобы ввести вручную.</i>',
+  },
+  { key: 'name', skipIfFilled: true, q: 'Краткое имя контрагента (напр. «ООО Заря»):' },
+  { key: 'full_name', skipIfFilled: true, opt: true, q: 'Полное наименование (или «-»):' },
+  { key: 'kpp', skipIfFilled: true, opt: true, q: 'КПП (или «-»):' },
+  { key: 'address', skipIfFilled: true, opt: true, q: 'Адрес контрагента (или «-»):' },
   {
     key: 'kind', q: 'Тип контрагента:',
     buttons: [{ text: 'Заказчик (платит нам)', val: 'customer' }, { text: 'Поставщик (платим ему)', val: 'supplier' }],
   },
-  { key: 'contract', q: 'Договор (напр. «Договор № 5 от 01.02.2026»; или «-»):', opt: true },
-  { key: 'opening_balance', q: 'Начальное сальдо, руб. (0 — если с нуля):', num: true },
-  { key: 'opening_date', q: 'Дата начального сальдо (ДД.ММ.ГГГГ):', date: true },
-  { key: 'bank_name', q: 'Банк контрагента (или «-»):', opt: true },
-  { key: 'bik', q: 'БИК контрагента (или «-»):', opt: true },
-  { key: 'acc', q: 'Расчётный счёт контрагента (или «-»):', opt: true },
-  { key: 'corr_acc', q: 'Корр. счёт контрагента (или «-»):', opt: true },
-  { key: 'address', q: 'Адрес контрагента (или «-»):', opt: true },
+  { key: 'contract', opt: true, q: 'Договор (напр. «Договор № 5 от 01.02.2026»; или «-»):' },
+  { key: 'opening_balance', num: true, q: 'Начальное сальдо, руб. (0 — если с нуля):' },
+  { key: 'opening_date', date: true, q: 'Дата начального сальдо (ДД.ММ.ГГГГ):' },
+  { key: 'bik', auto: 'bank', opt: true, q: 'БИК банка контрагента — подставлю банк и корр. счёт (или «-»):' },
+  { key: 'bank_name', skipIfFilled: true, opt: true, q: 'Банк контрагента (или «-»):' },
+  { key: 'corr_acc', skipIfFilled: true, opt: true, q: 'Корр. счёт контрагента (или «-»):' },
+  { key: 'acc', opt: true, q: 'Расчётный счёт контрагента (или «-»):' },
 ];
 
 const FORMS = {
@@ -144,7 +159,46 @@ async function askStep(tg, chatId, formName, i) {
   const opts = step.buttons
     ? keyboard([step.buttons.map((b) => ({ text: b.text, data: `fb:${b.val}` }))])
     : {};
-  await tg.sendMessage(chatId, esc(step.q), opts);
+  await tg.sendMessage(chatId, step.q, opts);
+}
+
+/** Следующий незаполненный шаг: пропускаем то, что подставил справочник. */
+async function advanceForm(tg, chatId, user, formName, values, from) {
+  const form = FORMS[formName];
+  let next = from;
+  while (next < form.steps.length) {
+    const s = form.steps[next];
+    if (s.skipIfFilled && values[s.key]) { next += 1; continue; }
+    break;
+  }
+  if (next < form.steps.length) {
+    bdb.setState(user.id, `form:${formName}`, { i: next, values });
+    await askStep(tg, chatId, formName, next);
+  } else {
+    bdb.clearState(user.id);
+    await finishForm(tg, chatId, user, formName, values);
+  }
+}
+
+/** Автозаполнение по ИНН/БИК. Заполняет только пустые поля, вернёт отчёт. */
+async function runAuto(kind, rawValue, values) {
+  if (kind === 'party') {
+    const r = await dadata.partyByInn(rawValue);
+    if (!r.ok) return { note: '', warn: r.error };
+    for (const k of ['name', 'full_name', 'kpp', 'address', 'signer']) {
+      if (r.fields[k] && !values[k]) values[k] = r.fields[k];
+    }
+    return { note: `Нашёл: <b>${esc(r.fields.name)}</b>${r.fields.address ? `, ${esc(r.fields.address)}` : ''}.`, warn: r.warn };
+  }
+  if (kind === 'bank') {
+    const r = await dadata.bankByBik(rawValue);
+    if (!r.ok) return { note: '', warn: r.error };
+    for (const k of ['bank_name', 'corr_acc']) {
+      if (r.fields[k] && !values[k]) values[k] = r.fields[k];
+    }
+    return { note: `Банк: <b>${esc(r.fields.bank_name)}</b>.`, warn: '' };
+  }
+  return { note: '', warn: '' };
 }
 
 async function applyFormValue(tg, chatId, user, state, rawValue) {
@@ -168,14 +222,17 @@ async function applyFormValue(tg, chatId, user, state, rawValue) {
   }
 
   values[step.key] = value;
-  const next = i + 1;
-  if (next < form.steps.length) {
-    bdb.setState(user.id, `form:${formName}`, { i: next, values });
-    await askStep(tg, chatId, formName, next);
-  } else {
-    bdb.clearState(user.id);
-    await finishForm(tg, chatId, user, formName, values);
+
+  // Автозаполнение из реестра, если поле не пропущено прочерком.
+  if (step.auto && value && dadata.dadataAvailable()) {
+    await tg.sendChatAction(chatId, 'typing');
+    let res = { note: '', warn: '' };
+    try { res = await runAuto(step.auto, value, values); } catch (e) { res = { note: '', warn: e.message }; }
+    if (res.note) await tg.sendMessage(chatId, `✅ ${res.note}`);
+    if (res.warn) await tg.sendMessage(chatId, `⚠️ ${esc(res.warn)} Заполним вручную.`);
   }
+
+  await advanceForm(tg, chatId, user, formName, values, i + 1);
 }
 
 async function finishForm(tg, chatId, user, formName, values) {
@@ -1094,6 +1151,7 @@ async function handleCallback(tg, cq) {
       await tg.sendMessage(chatId,
         'Как пользоваться:\n'
         + '1) Заведите «Мою организацию» — с банком, иначе в счёте не будет QR.\n'
+        + '   Введите ИНН — название, адрес и реквизиты подставятся сами; по БИК — банк.\n'
         + '2) Добавьте контрагента.\n'
         + '3) Вносите операции текстом: <code>15.06 приход 94193</code>.\n'
         + '4) Жмите нужный документ — бот пришлёт файл.\n\n'

@@ -82,9 +82,13 @@ function button(sub) {
   await say('/start');
   ok(last().includes('Трапеза Документы'), 'бот поздоровался и показал меню');
   await tap('org.new');
-  const ORG = ['ИП Сарычева М. В.', 'Индивидуальный предприниматель Сарычева Мария Витальевна',
-    '183112345678', '-', 'М. В. Сарычева', 'г. Ижевск, ул. Пушкинская, 214',
-    'ПАО Сбербанк', '049401601', '40802810168000012345', '30101810400000000601'];
+  // Ручной путь: ИНН вводим (справочник в прогоне не подключён — автозаполнения
+  // нет), название и остальное набираем сами. Порядок шагов новый:
+  // инн → название → полное → КПП → адрес → подписант → БИК → банк → к/с → р/с.
+  const ORG = ['183112345678', 'ИП Сарычева М. В.',
+    'Индивидуальный предприниматель Сарычева Мария Витальевна', '-',
+    'г. Ижевск, ул. Пушкинская, 214', 'М. В. Сарычева',
+    '049401601', 'ПАО Сбербанк', '30101810400000000601', '40802810168000012345'];
   for (const v of ORG) await say(v);
   ok(last().includes('сохранена'), 'организация заведена', last().slice(0, 60));
   await tap('org');
@@ -93,19 +97,21 @@ function button(sub) {
   console.log('\n── контрагент ──');
   await tap('cps');
   await tap('cp.new');
+  // Порядок: инн → название → полное → КПП → адрес → тип → договор →
+  // сальдо → дата → БИК → банк → к/с → р/с.
+  await say('1832012345');                                   // инн (без автозаполнения в прогоне)
   await say('ООО «Заря»');
   await say('Общество с ограниченной ответственностью «Заря»');
-  await say('1832012345');
   await say('183201001');
+  await say('г. Ижевск, ул. Ленина, 1');
   await tap('fb:customer');
   await say('Договор № 5 от 01.02.2026');
   await say('0');
   await say('01.01.2026');
-  await say('ПАО Сбербанк');
   await say('049401601');
-  await say('40702810100000098765');
+  await say('ПАО Сбербанк');
   await say('30101810400000000601');
-  await say('г. Ижевск, ул. Ленина, 1');
+  await say('40702810100000098765');
   ok(last().includes('Заря'), 'контрагент создан и показана карточка');
 
   const cpBtn = button('Внести операцию');
@@ -320,14 +326,55 @@ function button(sub) {
     'в подтверждении сказано, что это с фотографии');
   delete process.env.VISION_PROVIDER;
 
+  console.log('\n── автозаполнение по ИНН и БИК ──');
+  process.env.DADATA_MOCK = JSON.stringify({
+    7707083893: {
+      type: 'LEGAL',
+      name: { short_with_opf: 'ООО «Ромашка»', full_with_opf: 'Общество с ограниченной ответственностью «Ромашка»' },
+      inn: '7707083893', kpp: '770701001',
+      address: { unrestricted_value: 'г. Москва, ул. Тверская, 1' },
+      management: { name: 'Иванов Иван Иванович' },
+      state: { status: 'ACTIVE' },
+    },
+    '044525225': { name: { payment: 'ПАО Сбербанк' }, correspondent_account: '30101810400000000225', bic: '044525225' },
+  });
+  const { partyByInn, bankByBik } = require('./lib/dadata');
+  const party = await partyByInn('7707083893');
+  ok(party.ok && party.fields.name === 'ООО «Ромашка»', 'по ИНН нашлось название', party.ok && party.fields.name);
+  ok(party.fields.signer === 'И. И. Иванов', 'директор сокращён в подписанта', party.fields.signer);
+  const bank = await bankByBik('044525225');
+  ok(bank.ok && bank.fields.corr_acc === '30101810400000000225', 'по БИК подставился корр. счёт');
+
+  await tap('cp.new');
+  await say('7707083893');   // ИНН — дальше название/адрес/КПП должны подставиться
+  ok(last().includes('Ромашка') || sent[sent.length - 2].text.includes('Ромашка'),
+    'бот показал найденную организацию');
+  ok(last().includes('Тип контрагента'), 'название, адрес и КПП пропущены — сразу спросил тип');
+  await tap('fb:customer');
+  await say('-');            // договор
+  await say('0');            // сальдо
+  await say('05.05.2026');   // дата
+  await say('044525225');    // БИК — банк и корр. счёт должны подставиться
+  ok(last().includes('счёт контрагента') || last().includes('Расчётный счёт'),
+    'банк и корр. счёт пропущены — сразу спросил расчётный счёт', last().slice(0, 50));
+  await say('40702810900000099999');
+  const roma = require('./lib/bot-db').listCps(require('./lib/bot-db').getOrCreateUser(USER.id).id)
+    .find((c) => c.name === 'ООО «Ромашка»');
+  ok(roma && roma.kpp === '770701001' && roma.address.includes('Тверская'),
+    'контрагент сохранён с подставленными реквизитами', roma && roma.kpp);
+  ok(roma && roma.bank_name === 'ПАО Сбербанк' && roma.corr_acc === '30101810400000000225',
+    'банк подставился по БИК');
+  delete process.env.DADATA_MOCK;
+
   console.log('\n── дебиторка ──');
   // второй контрагент-поставщик, которому должны мы
   await tap('cp.new');
+  await say('1832055555');   // инн
   await say('ООО «Поставка»');
-  await say('-'); await say('1832055555'); await say('-');
+  await say('-'); await say('-'); await say('-'); // полное, КПП, адрес
   await tap('fb:supplier');
-  await say('-'); await say('0'); await say('01.02.2026');
-  await say('-'); await say('-'); await say('-'); await say('-'); await say('-');
+  await say('-'); await say('0'); await say('01.02.2026'); // договор, сальдо, дата
+  await say('-'); await say('-'); await say('-'); await say('-'); // БИК, банк, к/с, р/с
   const supBtn = button('Внести операцию');
   const supId = Number(String(supBtn).split(':')[1]);
   await tap(`op:${supId}`);
