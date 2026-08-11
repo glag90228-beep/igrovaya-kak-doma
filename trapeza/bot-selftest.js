@@ -352,6 +352,34 @@ function button(sub) {
   ok(last().includes('задолженность') && last().includes('Р/с'),
     'готовый текст напоминания с реквизитами', last().slice(0, 60));
 
+  console.log('\n── оформление бота ──');
+  const setup = require('./lib/bot-setup');
+  ok(setup.checkSetup().length === 0, 'тексты и команды укладываются в лимиты Telegram',
+    setup.checkSetup().join('; '));
+  ok(setup.SHORT.length <= 120 && setup.DESCRIPTION.length <= 512,
+    `короткое ${setup.SHORT.length}/120, полное ${setup.DESCRIPTION.length}/512`);
+  const menuCmds = setup.COMMANDS.map((c) => c.command);
+  ok(menuCmds.includes('start') && menuCmds.includes('help'), 'в меню есть /start и /help');
+
+  // каждая команда из меню должна что-то открывать, а не молчать
+  for (const c of menuCmds) {
+    if (c === 'cancel') continue;
+    const before = sent.length;
+    await say('/' + c);
+    ok(sent.length > before, `команда /${c} отвечает`);
+  }
+  // применение оформления: собираем вызовы, живой сети не нужно
+  const calls = [];
+  await setup.applySetup({ call: async (m, p) => { calls.push({ m, p }); } }, { log: () => {} });
+  ok(calls.map((c) => c.m).join(',')
+    === 'setMyName,setMyShortDescription,setMyDescription,setMyCommands,setChatMenuButton',
+    'оформление накатывается пятью вызовами', calls.map((c) => c.m).join(','));
+  // один упавший шаг не должен ронять остальные
+  let tries = 0;
+  const flaky = { call: async () => { tries += 1; if (tries === 1) throw new Error('Too Many Requests'); } };
+  const r = await setup.applySetup(flaky, { log: () => {} });
+  ok(tries === 5 && r.failed.length === 1, 'сбой на одном шаге не отменяет остальные', `${tries} вызовов`);
+
   console.log('\n── изоляция пользователей ──');
   const OTHER = { id: 777002, first_name: 'Чужой', username: 'other' };
   await handleUpdate(tg, { message: { chat: { id: 777002 }, from: OTHER, text: '/start' } });

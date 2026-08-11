@@ -17,6 +17,7 @@ const { buildTorg12Html } = require('./lib/torg12');
 const { buildDogovorHtml } = require('./lib/dogovor');
 const { pdfAvailable, htmlToPdf } = require('./lib/pdf');
 const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
+const { applySetup } = require('./lib/bot-setup');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -855,6 +856,16 @@ async function handleMessage(tg, msg) {
 
   if (text === '/start') { bdb.clearState(user.id); await tg.sendMessage(chatId, GREETING, mainMenu()); return; }
   if (text === '/menu' || text === '/cancel') { bdb.clearState(user.id); await tg.sendMessage(chatId, 'Главное меню:', mainMenu()); return; }
+  // Команды из меню Telegram — те же экраны, что и кнопки. Если человек
+  // выбрал команду в середине формы, шаг сбрасываем: он передумал.
+  const SLASH = { '/org': 'org', '/cps': 'cps', '/debts': 'debts', '/docs': 'docs', '/help': 'help' };
+  if (SLASH[text]) {
+    bdb.clearState(user.id);
+    await handleCallback(tg, {
+      id: 'cmd', from: msg.from, data: SLASH[text], message: { chat: { id: chatId } },
+    });
+    return;
+  }
 
   const state = bdb.getState(user.id);
   if (state.state.startsWith('form:')) { await applyFormValue(tg, chatId, user, state, text); return; }
@@ -1066,6 +1077,13 @@ async function main() {
   if (!token) { console.error('Не задан BOT_TOKEN. Запуск: BOT_TOKEN=xxxxx node bot.js'); process.exit(1); }
   const tg = new Telegram(token);
   const me = await tg.call('getMe');
+
+  if (process.argv.includes('--setup')) {
+    console.log(`Оформляю @${me.username}:`);
+    await applySetup(tg);
+    return;
+  }
+
   console.log(`Бот запущен: @${me.username}`);
   let offset = 0;
   // eslint-disable-next-line no-constant-condition
