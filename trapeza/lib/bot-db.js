@@ -49,6 +49,40 @@ function migrate() {
     CREATE INDEX IF NOT EXISTS idx_orgs_user ON orgs(user_id);
   `);
 
+  db.exec(`
+    -- Выписанные документы. Храним не файл, а данные: файл пересобирается
+    -- по требованию, зато «повторить прошлый счёт» получается бесплатно.
+    CREATE TABLE IF NOT EXISTS documents (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+      org_id     INTEGER NOT NULL DEFAULT 0,
+      cp_id      INTEGER NOT NULL DEFAULT 0,
+      type       TEXT    NOT NULL,              -- sch | usl | pp | akt | upd | torg12 | dog
+      number     TEXT    NOT NULL DEFAULT '',
+      seq        INTEGER NOT NULL DEFAULT 0,    -- порядковый номер внутри года
+      year       INTEGER NOT NULL DEFAULT 0,
+      date       TEXT    NOT NULL DEFAULT '',
+      total      REAL    NOT NULL DEFAULT 0,
+      payload    TEXT    NOT NULL DEFAULT '',   -- JSON: позиции, сумма, назначение
+      created_at TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_doc_user ON documents(user_id, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_doc_seq  ON documents(user_id, type, year);
+
+    -- Часто повторяющиеся позиции: у малого бизнеса счёт — почти всегда
+    -- копия предыдущего, набирать «Канапе ассорти; 20; 650» каждый раз незачем.
+    CREATE TABLE IF NOT EXISTS item_templates (
+      id       INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id  INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+      name     TEXT    NOT NULL,
+      unit     TEXT    NOT NULL DEFAULT 'шт.',
+      price    REAL    NOT NULL DEFAULT 0,
+      uses     INTEGER NOT NULL DEFAULT 1,
+      used_at  TEXT    NOT NULL DEFAULT ''
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_tpl_uniq ON item_templates(user_id, name);
+  `);
+
   // расширяем контрагентов: владелец + банковские реквизиты (для счёта/платёжки)
   addColumn('counterparties', 'user_id', 'INTEGER');
   addColumn('counterparties', 'address', "TEXT NOT NULL DEFAULT ''");
@@ -186,10 +220,131 @@ function balanceOf(userId, cpId) {
   return { cp, ops, ...computeBalance(cp, ops) };
 }
 
+// ---------- выписанные документы и сквозная нумерация ----------
+
+const DOC_TITLES = {
+  sch: 'Счёт на оплату', usl: 'Акт об оказании услуг', pp: 'Платёжное поручение',
+  akt: 'Акт сверки', upd: 'УПД', torg12: 'Товарная накладная ТОРГ-12',
+  dog: 'Договор',
+};
+
+/**
+ * Следующий номер документа этого типа в этом году.
+ * Нумерация у каждого пользователя своя и не зависит от контрагента —
+ * так требует практика: сквозной ряд по журналу, а не по клиентам.
+ */
+function nextSeq(userId, type, year) {
+  const row = db.prepare(
+    'SELECT COALESCE(MAX(seq), 0) AS n FROM documents WHERE user_id = ? AND type = ? AND year = ?',
+  ).get(userId, type, year);
+  return row.n + 1;
+}
+
+/** Документ сохраняется данными; файл всегда пересобирается заново. */
+function saveDoc(userId, { orgId, cpId, type, number, seq, date, total, payload }) {
+  const year = Number(String(date).slice(0, 4)) || new Date().getFullYear();
+  const info = db.prepare(`
+    INSERT INTO documents(user_id, org_id, cp_id, type, number, seq, year, date, total, payload, created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(
+    userId, orgId || 0, cpId || 0, type, String(number), Number(seq) || 0, year,
+    date || '', Number(total) || 0, payload ? JSON.stringify(payload) : '', new Date().toISOString(),
+  );
+  return Number(info.lastInsertRowid);
+}
+
+function listDocs(userId, limit = 10, cpId = null) {
+  const sql = cpId
+    ? 'SELECT * FROM documents WHERE user_id = ? AND cp_id = ? ORDER BY id DESC LIMIT ?'
+    : 'SELECT * FROM documents WHERE user_id = ? ORDER BY id DESC LIMIT ?';
+  const rows = cpId
+    ? db.prepare(sql).all(userId, cpId, limit)
+    : db.prepare(sql).all(userId, limit);
+  return rows.map(withPayload);
+}
+
+function getDoc(userId, id) {
+  const row = db.prepare('SELECT * FROM documents WHERE id = ? AND user_id = ?').get(id, userId);
+  return row ? withPayload(row) : null;
+}
+
+function withPayload(row) {
+  let payload = {};
+  try { payload = row.payload ? JSON.parse(row.payload) : {}; } catch (_) { payload = {}; }
+  return { ...row, payload, title: DOC_TITLES[row.type] || row.type };
+}
+
+function deleteDoc(userId, id) {
+  const info = db.prepare('DELETE FROM documents WHERE id = ? AND user_id = ?').run(id, userId);
+  return info.changes > 0;
+}
+
+// ---------- шаблоны позиций ----------
+
+/** Запоминаем позицию: в следующий раз её можно поставить кнопкой. */
+function rememberItems(userId, items) {
+  const now = new Date().toISOString();
+  for (const it of items || []) {
+    const name = String(it.name || '').trim();
+    if (!name) continue;
+    const exists = db.prepare('SELECT id FROM item_templates WHERE user_id = ? AND name = ?')
+      .get(userId, name);
+    if (exists) {
+      db.prepare('UPDATE item_templates SET price = ?, unit = ?, uses = uses + 1, used_at = ? WHERE id = ?')
+        .run(Number(it.price) || 0, it.unit || 'шт.', now, exists.id);
+    } else {
+      db.prepare('INSERT INTO item_templates(user_id, name, unit, price, uses, used_at) VALUES(?,?,?,?,1,?)')
+        .run(userId, name, it.unit || 'шт.', Number(it.price) || 0, now);
+    }
+  }
+}
+
+function listTemplates(userId, limit = 8) {
+  return db.prepare(
+    'SELECT * FROM item_templates WHERE user_id = ? ORDER BY uses DESC, used_at DESC LIMIT ?',
+  ).all(userId, limit);
+}
+
+function getTemplate(userId, id) {
+  return db.prepare('SELECT * FROM item_templates WHERE id = ? AND user_id = ?').get(id, userId);
+}
+
+function forgetTemplate(userId, id) {
+  db.prepare('DELETE FROM item_templates WHERE id = ? AND user_id = ?').run(id, userId);
+}
+
+// ---------- доступ (место под подписку) ----------
+
+// Пока не берём денег: считаем документы и показываем остаток, но не
+// перекрываем. Включение — одним флагом, когда наберётся аудитория.
+const FREE_PER_MONTH = 20;
+const ENFORCE_LIMIT = false;
+
+function docsThisMonth(userId) {
+  const from = new Date().toISOString().slice(0, 7); // ГГГГ-ММ
+  return db.prepare(
+    "SELECT COUNT(*) AS n FROM documents WHERE user_id = ? AND substr(created_at,1,7) = ?",
+  ).get(userId, from).n;
+}
+
+/** @returns {{allowed:boolean, used:number, left:number, limit:number, paid:boolean}} */
+function quota(userId) {
+  const u = db.prepare('SELECT access_until FROM bot_users WHERE id = ?').get(userId) || {};
+  const paid = Boolean(u.access_until && u.access_until >= new Date().toISOString().slice(0, 10));
+  const used = docsThisMonth(userId);
+  const left = Math.max(0, FREE_PER_MONTH - used);
+  return {
+    allowed: paid || !ENFORCE_LIMIT || left > 0,
+    used, left, limit: FREE_PER_MONTH, paid,
+  };
+}
+
 module.exports = {
   migrate,
   getOrCreateUser, setState, getState, clearState,
   createOrg, updateOrg, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp,
   addOp, listOps, deleteLastOp, balanceOf,
+  nextSeq, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
+  rememberItems, listTemplates, getTemplate, forgetTemplate,
+  quota, docsThisMonth, FREE_PER_MONTH,
 };

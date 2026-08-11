@@ -129,18 +129,69 @@ function button(sub) {
   await tap(`d.usl:${cpId}`);
   await say('Фуршетное обслуживание, 30 персон; 1; 54193');
   await tap('items.done');
+  ok(last().includes('Итого'), 'перед выпуском показана сводка с итогом');
+  await tap('doc.make');
   ok(files.length === 2, 'акт об оказании услуг сформирован', (files[1] || {}).filename);
 
   await tap(`d.sch:${cpId}`);
+  ok(last().includes('Счёт № 1') || last().includes('счёт № 1'), 'номер счёта присвоен сам', last().slice(0, 40));
   await say('Канапе ассорти; 20; 650');
   await say('Брускетты ассорти; 15; 780');
+  await tap('items.undo');
+  ok(last().includes('Убрал'), 'последнюю позицию можно убрать');
+  await say('Брускетты ассорти; 15; 780');
   await tap('items.done');
+  await tap('doc.make');
   ok(files.length === 3, 'счёт на оплату сформирован', (files[2] || {}).filename);
+  ok(files[2].filename.includes('_1_'), 'номер попал в имя файла', files[2].filename);
+  ok(files[2].caption.includes('QR'), 'в подписи сказано про оплату по QR');
+
+  console.log('\n── нумерация, номер и дата вручную ──');
+  await tap(`d.sch:${cpId}`);
+  ok(last().includes('№ 2'), 'следующий счёт получил номер 2', last().slice(0, 40));
+  await say('Доставка; 1; 1000');
+  await tap('items.done');
+  await tap('doc.num');
+  await say('СЧ-2026/007');
+  ok(last().includes('СЧ-2026/007'), 'номер можно задать свой', last().slice(0, 40));
+  await tap('doc.date');
+  await say('05.08.2026');
+  ok(last().includes('05.08.2026'), 'дату можно поправить');
+  await tap('doc.make');
+  ok(files.length === 4 && String((files[3] || {}).filename).includes('СЧ-2026_007'),
+    'счёт вышел со своим номером', (files[3] || {}).filename || last().slice(0, 120));
+
+  console.log('\n── шаблоны позиций ──');
+  await tap(`d.sch:${cpId}`);
+  const tplBtn = button('Канапе ассорти');
+  ok(Boolean(tplBtn), 'частая позиция предложена кнопкой', tplBtn);
+  await tap(tplBtn);
+  ok(last().includes('Сколько'), 'бот спросил количество');
+  await say('30');
+  ok(last().includes('30'), 'позиция из шаблона добавлена', last().slice(0, 60));
+  await tap('items.done');
+  await tap('doc.make');
+  ok(files.length === 5, 'счёт из шаблона сформирован', files[4].filename);
+
+  console.log('\n── журнал и повтор ──');
+  await tap('docs');
+  ok(last().includes('Последние документы'), 'журнал открывается');
+  const docBtn = button('СЧ-2026/007');
+  ok(Boolean(docBtn), 'документ со своим номером виден в журнале', docBtn);
+  await tap(docBtn);
+  ok(last().includes('Доставка'), 'в карточке документа видны позиции');
+  await tap(`doc.get:${docBtn.split(':')[1]}`);
+  ok(files.length === 6 && files[5].caption.includes('копия'), 'файл высылается заново', files[5].filename);
+  await tap(`d.rep:${docBtn.split(':')[1]}`);
+  ok(last().includes('Итого'), 'повтор открыл сводку с теми же позициями');
+  await tap('doc.make');
+  ok(files.length === 7, 'повторный документ выписан', files[6].filename);
+  ok(!files[6].filename.includes('СЧ-2026'), 'у повтора новый номер, не старый', files[6].filename);
 
   await tap(`d.pp:${cpId}`);
   await say('26496,42');
   await say('Оплата по счёту № 1 от 10.08.2026');
-  ok(files.length === 4, 'платёжное поручение сформировано', (files[3] || {}).filename);
+  ok(files.length === 8, 'платёжное поручение сформировано', (files[7] || {}).filename);
 
   console.log('\n── изоляция пользователей ──');
   const OTHER = { id: 777002, first_name: 'Чужой', username: 'other' };
