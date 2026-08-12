@@ -326,6 +326,36 @@ function button(sub) {
     'в подтверждении сказано, что это с фотографии');
   delete process.env.VISION_PROVIDER;
 
+  console.log('\n── разбор вставленных реквизитов ──');
+  const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
+  ok(!looksLikeBlock('7707083893') && looksLikeBlock('ООО Х ИНН 7707083893 р/с 40702810900000012345 БИК 044525225'),
+    'блок реквизитов отличается от чистого ИНН');
+  const blob = 'ИНДИВИДУАЛЬНЫЙ ПРЕДПРИНИМАТЕЛЬ САРЫЧЕВА МАРИЯ ВИТАЛЬЕВНА ИНН: 183111485159 '
+    + 'ОГРНИП: 325180000069852 Расчётный счёт: 40802810468710003890 '
+    + 'Банк: БАШКИРСКОЕ ОТДЕЛЕНИЕ N8598 ПАО СБЕРБАНК БИК банка: 048073601 '
+    + 'Корсчёт: 30101810300000000601 ИНН банка: 7707083893 КПП банка: 183502001';
+  const pr = parseRequisites(blob);
+  ok(pr.inn === '183111485159', 'ИНН организации взят, а не ИНН банка', pr.inn);
+  ok(pr.kpp === '', 'КПП банка не подставлен как КПП организации', pr.kpp || 'пусто');
+  ok(pr.acc === '40802810468710003890', 'расчётный счёт разобран', pr.acc);
+  ok(pr.corr_acc === '30101810300000000601', 'корр. счёт разобран (по метке и префиксу 301)', pr.corr_acc);
+  ok(pr.bik === '048073601', 'БИК разобран', pr.bik);
+  ok(pr.bank_name.includes('СБЕРБАНК'), 'банк не перепутан с «к/с»', pr.bank_name);
+  ok(pr.name.startsWith('ИНДИВИДУАЛЬНЫЙ'), 'наименование отделено от реквизитов');
+
+  // вставка блока прямо в бота на шаге ИНН — поля должны разложиться, QR появиться
+  await tap('cp.new');
+  await say(blob);
+  ok(last().includes('Тип контрагента'), 'после вставки блока бот пропустил название/адрес/счета');
+  const notedBlock = sent.slice(-3).some((m) => m.text.includes('Разобрал реквизиты'));
+  ok(notedBlock, 'бот отчитался, что разобрал реквизиты');
+  await tap('fb:supplier');
+  await say('-'); await say('0'); await say('01.01.2026');
+  const pasted = require('./lib/bot-db').listCps(require('./lib/bot-db').getOrCreateUser(USER.id).id)
+    .find((c) => c.inn === '183111485159');
+  ok(pasted && pasted.acc === '40802810468710003890' && pasted.bik === '048073601',
+    'из блока сохранены р/с и БИК — теперь в счёте будет QR', pasted && pasted.acc);
+
   console.log('\n── автозаполнение по ИНН и БИК ──');
   process.env.DADATA_MOCK = JSON.stringify({
     7707083893: {

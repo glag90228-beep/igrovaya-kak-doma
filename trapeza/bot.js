@@ -22,6 +22,7 @@ const { supportScreen, forwardToSupport, legalLine } = require('./lib/bot-suppor
 const billing = require('./lib/billing');
 const { payLink, daysFor } = require('./lib/lava');
 const dadata = require('./lib/dadata');
+const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -106,8 +107,9 @@ function esc(s) {
 const ORG_STEPS = [
   {
     key: 'inn', auto: 'party', opt: true,
-    q: 'ИНН вашей организации — подставлю название, адрес и остальное.\n'
-      + '<i>Если справочник не подключён или хотите ввести вручную — отправьте «-».</i>',
+    q: '<b>Проще всего — вставьте реквизиты одним текстом</b> (скопируйте из письма или 1С), '
+      + 'я разберу их на поля.\n\nМожно и по ИНН — подставлю название и адрес из реестра.\n'
+      + '<i>Или «-», чтобы заполнять вручную по одному полю.</i>',
   },
   { key: 'name', skipIfFilled: true, q: 'Краткое название (напр. «ИП Иванов И. И.» или «ООО Ромашка»):' },
   { key: 'full_name', skipIfFilled: true, opt: true, q: 'Полное наименование для документов (или «-»):' },
@@ -115,18 +117,19 @@ const ORG_STEPS = [
   { key: 'address', skipIfFilled: true, opt: true, q: 'Адрес (или «-»):' },
   { key: 'signer', skipIfFilled: true, opt: true, q: 'ФИО подписанта (напр. «И. И. Иванов»; или «-»):' },
   {
-    key: 'bik', auto: 'bank', opt: true,
+    key: 'bik', auto: 'bank', skipIfFilled: true, opt: true,
     q: 'БИК банка — подставлю название банка и корр. счёт (или «-»):',
   },
   { key: 'bank_name', skipIfFilled: true, opt: true, q: 'Банк — наименование (или «-»):' },
   { key: 'corr_acc', skipIfFilled: true, opt: true, q: 'Корр. счёт к/с (или «-»):' },
-  { key: 'acc', opt: true, q: 'Расчётный счёт р/с — его подставить неоткуда, впишите (или «-»):' },
+  { key: 'acc', skipIfFilled: true, opt: true, q: 'Расчётный счёт р/с — нужен для QR в счёте (или «-»):' },
 ];
 
 const CP_STEPS = [
   {
     key: 'inn', auto: 'party', opt: true,
-    q: 'ИНН контрагента — подставлю название и адрес.\n<i>Или «-», чтобы ввести вручную.</i>',
+    q: '<b>Вставьте реквизиты контрагента одним текстом</b> — разберу на поля.\n\n'
+      + 'Или ИНН — подставлю название и адрес.\n<i>Или «-», чтобы ввести вручную.</i>',
   },
   { key: 'name', skipIfFilled: true, q: 'Краткое имя контрагента (напр. «ООО Заря»):' },
   { key: 'full_name', skipIfFilled: true, opt: true, q: 'Полное наименование (или «-»):' },
@@ -139,10 +142,10 @@ const CP_STEPS = [
   { key: 'contract', opt: true, q: 'Договор (напр. «Договор № 5 от 01.02.2026»; или «-»):' },
   { key: 'opening_balance', num: true, q: 'Начальное сальдо, руб. (0 — если с нуля):' },
   { key: 'opening_date', date: true, q: 'Дата начального сальдо (ДД.ММ.ГГГГ):' },
-  { key: 'bik', auto: 'bank', opt: true, q: 'БИК банка контрагента — подставлю банк и корр. счёт (или «-»):' },
+  { key: 'bik', auto: 'bank', skipIfFilled: true, opt: true, q: 'БИК банка контрагента — подставлю банк и корр. счёт (или «-»):' },
   { key: 'bank_name', skipIfFilled: true, opt: true, q: 'Банк контрагента (или «-»):' },
   { key: 'corr_acc', skipIfFilled: true, opt: true, q: 'Корр. счёт контрагента (или «-»):' },
-  { key: 'acc', opt: true, q: 'Расчётный счёт контрагента (или «-»):' },
+  { key: 'acc', skipIfFilled: true, opt: true, q: 'Расчётный счёт контрагента (или «-»):' },
 ];
 
 const FORMS = {
@@ -168,7 +171,11 @@ async function advanceForm(tg, chatId, user, formName, values, from) {
   let next = from;
   while (next < form.steps.length) {
     const s = form.steps[next];
-    if (s.skipIfFilled && values[s.key]) { next += 1; continue; }
+    // Пропускаем заполненное; после вставки блока — и пустые поля-реквизиты,
+    // кроме расчётного счёта: без него не будет QR, поэтому его переспросим.
+    const skip = s.skipIfFilled
+      && (values[s.key] || (values.__pasted && s.opt && s.key !== 'acc'));
+    if (skip) { next += 1; continue; }
     break;
   }
   if (next < form.steps.length) {
@@ -180,22 +187,62 @@ async function advanceForm(tg, chatId, user, formName, values, from) {
   }
 }
 
-/** Автозаполнение по ИНН/БИК. Заполняет только пустые поля, вернёт отчёт. */
+const fill = (values, src, keys) => {
+  let n = 0;
+  for (const k of keys) if (src[k] && !values[k]) { values[k] = src[k]; n += 1; }
+  return n;
+};
+
+/**
+ * Автозаполнение шага. Три источника, по убыванию удобства:
+ *  1) вставленный блок реквизитов — разбираем на поля сами;
+ *  2) ИНН — тянем из реестра (DaData);
+ *  3) БИК — банк и корр. счёт из реестра.
+ * Возвращает { value, note, warn }: value — что записать в само поле шага.
+ */
 async function runAuto(kind, rawValue, values) {
-  if (kind === 'party') {
-    const r = await dadata.partyByInn(rawValue);
-    if (!r.ok) return { note: '', warn: r.error };
-    for (const k of ['name', 'full_name', 'kpp', 'address', 'signer']) {
-      if (r.fields[k] && !values[k]) values[k] = r.fields[k];
+  const raw = String(rawValue);
+
+  // Вставили целый блок реквизитов (в шаг ИНН или БИК — не важно).
+  if (looksLikeBlock(raw)) {
+    const p = parseRequisites(raw);
+    fill(values, p, ['name', 'full_name', 'inn', 'kpp', 'address', 'bank_name', 'bik', 'acc', 'corr_acc']);
+    values.__pasted = true; // дальше пустые поля-реквизиты не переспрашиваем
+    // Чего в тексте не было — дозапросим из реестра: по ИНН адрес и директора,
+    // по БИК — точное название банка и корр. счёт.
+    if (p.inn && dadata.dadataAvailable() && (!values.address || !values.signer)) {
+      const r = await dadata.partyByInn(p.inn).catch(() => ({ ok: false }));
+      if (r.ok) fill(values, r.fields, ['name', 'full_name', 'kpp', 'address', 'signer']);
     }
+    if (values.bik && dadata.dadataAvailable()) {
+      const rb = await dadata.bankByBik(values.bik).catch(() => ({ ok: false }));
+      if (rb.ok) { values.bank_name = rb.fields.bank_name || values.bank_name; values.corr_acc = values.corr_acc || rb.fields.corr_acc; }
+    }
+    const got = [
+      values.name && `<b>${esc(values.name)}</b>`,
+      values.acc && `р/с …${esc(String(values.acc).slice(-4))}`,
+      values.bik && `БИК ${esc(values.bik)}`,
+    ].filter(Boolean).join(', ');
+    return {
+      value: kind === 'bank' ? (p.bik || '') : (p.inn || ''),
+      note: `Разобрал реквизиты: ${got || 'поля заполнены'}.`,
+      warn: (!values.acc && kind === 'party') ? 'Расчётный счёт в тексте не нашёл — впишите его, без него не будет QR.' : '',
+    };
+  }
+
+  if (kind === 'party') {
+    if (!dadata.dadataAvailable()) return { note: '', warn: '' }; // ключа нет — молча вручную
+    const r = await dadata.partyByInn(raw);
+    if (!r.ok) return { note: '', warn: r.error };
+    fill(values, r.fields, ['name', 'full_name', 'kpp', 'address', 'signer']);
     return { note: `Нашёл: <b>${esc(r.fields.name)}</b>${r.fields.address ? `, ${esc(r.fields.address)}` : ''}.`, warn: r.warn };
   }
+
   if (kind === 'bank') {
-    const r = await dadata.bankByBik(rawValue);
+    if (!dadata.dadataAvailable()) return { note: '', warn: '' };
+    const r = await dadata.bankByBik(raw);
     if (!r.ok) return { note: '', warn: r.error };
-    for (const k of ['bank_name', 'corr_acc']) {
-      if (r.fields[k] && !values[k]) values[k] = r.fields[k];
-    }
+    fill(values, r.fields, ['bank_name', 'corr_acc']);
     return { note: `Банк: <b>${esc(r.fields.bank_name)}</b>.`, warn: '' };
   }
   return { note: '', warn: '' };
@@ -223,13 +270,15 @@ async function applyFormValue(tg, chatId, user, state, rawValue) {
 
   values[step.key] = value;
 
-  // Автозаполнение из реестра, если поле не пропущено прочерком.
-  if (step.auto && value && dadata.dadataAvailable()) {
+  // Автозаполнение: вставленный блок реквизитов разбираем всегда,
+  // поиск по ИНН/БИК — если подключён справочник.
+  if (step.auto && value) {
     await tg.sendChatAction(chatId, 'typing');
-    let res = { note: '', warn: '' };
-    try { res = await runAuto(step.auto, value, values); } catch (e) { res = { note: '', warn: e.message }; }
+    let res = { value: null, note: '', warn: '' };
+    try { res = await runAuto(step.auto, rawValue, values); } catch (e) { res = { value: null, note: '', warn: e.message }; }
+    if (res.value != null && res.value !== '') values[step.key] = res.value; // в поле кладём разобранный ИНН/БИК
     if (res.note) await tg.sendMessage(chatId, `✅ ${res.note}`);
-    if (res.warn) await tg.sendMessage(chatId, `⚠️ ${esc(res.warn)} Заполним вручную.`);
+    if (res.warn) await tg.sendMessage(chatId, `⚠️ ${esc(res.warn)}`);
   }
 
   await advanceForm(tg, chatId, user, formName, values, i + 1);
