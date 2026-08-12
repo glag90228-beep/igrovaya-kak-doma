@@ -42,6 +42,16 @@ if [ ! -f .env ]; then
 fi
 chmod 600 .env
 
+# Дописываем переменные, появившиеся в шаблоне после создания .env
+# (например DADATA_TOKEN добавили позже) — иначе их правка ничего не находит.
+added=0
+while IFS= read -r line; do
+  case "$line" in ''|\#*) continue;; esac
+  key="${line%%=*}"
+  if ! grep -q "^${key}=" .env; then echo "$line" >> .env; added=$((added+1)); fi
+done < .env.example
+[ "$added" -gt 0 ] && echo "В .env добавлено новых настроек: $added (заполните при необходимости)."
+
 say "4/6 Зависимости"
 npm install --omit=dev
 # Chromium для PDF: если не ставится, бот будет слать HTML — не критично
