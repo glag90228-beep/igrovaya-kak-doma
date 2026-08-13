@@ -368,7 +368,24 @@ async function requireOrg(tg, chatId, user) {
   return org;
 }
 
+/**
+ * Проверка лимита перед выпуском нового документа. Если бесплатные
+ * закончились и подписки нет — показываем экран подписки и не пускаем дальше.
+ * Пересылку уже выписанного файла и просмотр журнала это не трогает.
+ */
+async function requireQuota(tg, chatId, user) {
+  const q = bdb.quota(user.id);
+  if (q.allowed) return true;
+  await tg.sendMessage(chatId,
+    `В этом месяце вы использовали все <b>${q.limit} бесплатных</b> документа.\n\n`
+    + 'Оформите подписку — лимит снимется, всё остальное работает как прежде. '
+    + 'Ранее выписанные документы по-прежнему можно переслать из «Мои документы».',
+    keyboard([[{ text: '⭐ Оформить подписку', data: 'billing' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+  return false;
+}
+
 async function genAktSverki(tg, chatId, user, cpId) {
+  if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
   const cp = bdb.getCp(user.id, cpId); if (!cp) return;
   if (!cp.period_end) { bdb.updateCp(user.id, cpId, { period_end: todayISO() }); cp.period_end = todayISO(); }
@@ -408,6 +425,7 @@ function itemsKb(user, data) {
 }
 
 async function startItems(tg, chatId, user, type, cpId, extra = {}) {
+  if (!(await requireQuota(tg, chatId, user))) return;
   const year = new Date().getFullYear();
   const seq = bdb.nextSeq(user.id, type, year);
   const data = { seq, number: String(seq), date: todayISO(), items: [], ask: '', doc: extra };
@@ -503,6 +521,7 @@ async function finishItems(tg, chatId, user, state) {
 
 /** Повтор ранее выписанного документа: те же позиции, новый номер и дата. */
 async function repeatDoc(tg, chatId, user, docId) {
+  if (!(await requireQuota(tg, chatId, user))) return;
   const src = bdb.getDoc(user.id, docId);
   if (!src || !ITEM_DOCS[src.type]) {
     await tg.sendMessage(chatId, 'Такой документ повторить нельзя.', mainMenu());
@@ -709,6 +728,7 @@ async function handleSupportText(tg, chatId, user, text) {
  * поэтому спрашиваем — и сразу подписываем, кому какой нужен.
  */
 async function askUpdStatus(tg, chatId, user, cpId) {
+  if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
   await tg.sendMessage(chatId,
     'Какой УПД нужен?\n\n'
@@ -953,6 +973,7 @@ const DOG_STEPS = [
 ];
 
 async function startDogovor(tg, chatId, user, cpId) {
+  if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
   const cp = bdb.getCp(user.id, cpId); if (!cp) return;
   const seq = bdb.nextSeq(user.id, 'dog', new Date().getFullYear());
@@ -1007,6 +1028,7 @@ async function handleDogText(tg, chatId, user, state, text) {
 }
 
 async function startPp(tg, chatId, user, cpId) {
+  if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
   const seq = bdb.nextSeq(user.id, 'pp', new Date().getFullYear());
   bdb.setState(user.id, `pp:${cpId}`, { step: 'amount', seq, number: String(seq), date: todayISO() });

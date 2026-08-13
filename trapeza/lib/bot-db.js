@@ -390,10 +390,12 @@ function forgetTemplate(userId, id) {
 
 // ---------- доступ (место под подписку) ----------
 
-// Пока не берём денег: считаем документы и показываем остаток, но не
-// перекрываем. Включение — одним флагом, когда наберётся аудитория.
-const FREE_PER_MONTH = 20;
-const ENFORCE_LIMIT = false;
+// Бесплатно 5 документов в месяц, дальше — подписка. Читаем из окружения
+// при каждом вызове, чтобы число/режим можно было менять без перезапуска
+// и переопределять в прогоне: FREE_DOCS — сколько бесплатных, ENFORCE_LIMIT=0
+// снова открывает всем.
+const freePerMonth = () => Number(process.env.FREE_DOCS || 5);
+const enforceLimit = () => String(process.env.ENFORCE_LIMIT || '1') !== '0';
 
 function docsThisMonth(userId) {
   const from = new Date().toISOString().slice(0, 7); // ГГГГ-ММ
@@ -404,13 +406,14 @@ function docsThisMonth(userId) {
 
 /** @returns {{allowed:boolean, used:number, left:number, limit:number, paid:boolean}} */
 function quota(userId) {
+  const limit = freePerMonth();
   const u = db.prepare('SELECT access_until FROM bot_users WHERE id = ?').get(userId) || {};
   const paid = Boolean(u.access_until && u.access_until >= new Date().toISOString().slice(0, 10));
   const used = docsThisMonth(userId);
-  const left = Math.max(0, FREE_PER_MONTH - used);
+  const left = Math.max(0, limit - used);
   return {
-    allowed: paid || !ENFORCE_LIMIT || left > 0,
-    used, left, limit: FREE_PER_MONTH, paid,
+    allowed: paid || !enforceLimit() || left > 0,
+    used, left, limit, paid,
   };
 }
 
@@ -423,5 +426,5 @@ module.exports = {
   markBlocked, markActive, isBlocked, reachableUsers,
   nextSeq, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,
-  quota, docsThisMonth, FREE_PER_MONTH,
+  quota, docsThisMonth, freePerMonth,
 };

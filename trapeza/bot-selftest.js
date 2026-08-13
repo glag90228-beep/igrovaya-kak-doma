@@ -15,6 +15,10 @@ const path = require('node:path');
 const OUT = path.resolve(process.argv[2] || path.join(__dirname, 'selftest-out'));
 fs.mkdirSync(OUT, { recursive: true });
 
+// Основной сценарий выписывает больше 5 документов — чтобы лимит не мешал,
+// в нём поднимаем порог; отдельный блок ниже проверяет саму блокировку.
+process.env.FREE_DOCS = process.env.FREE_DOCS || '1000';
+
 const { handleUpdate, parseOp, parseItemLine } = require('./bot');
 const { htmlToPng } = require('./lib/pdf');
 
@@ -429,6 +433,39 @@ function button(sub) {
   await tap('debt.remind');
   ok(last().includes('задолженность') && last().includes('Р/с'),
     'готовый текст напоминания с реквизитами', last().slice(0, 60));
+
+  console.log('\n── лимит бесплатных документов ──');
+  // отдельный пользователь и низкий лимит: 2 бесплатных, третий блокируется
+  const LIM = { id: 778001, first_name: 'Лимит', username: 'lim' };
+  const limChat = { id: 778001 };
+  const limSay = (t) => handleUpdate(tg, { message: { chat: limChat, from: LIM, text: t } });
+  const limTap = (d) => handleUpdate(tg, { callback_query: { id: 'l', from: LIM, data: d, message: { chat: limChat } } });
+  const limLast = () => {
+    for (let i = sent.length - 1; i >= 0; i--) return sent[i].text; return '';
+  };
+  process.env.FREE_DOCS = '2';
+  await limSay('/start');
+  await limTap('org.new');
+  await limSay('-'); await limSay('ИП Лимит'); await limSay('-'); await limSay('-'); await limSay('-'); await limSay('-');
+  await limSay('-'); await limSay('-'); await limSay('-'); await limSay('-'); // БИК, банк, к/с, р/с
+  await limTap('cps'); await limTap('cp.new');
+  await limSay('-'); await limSay('ООО Клиент'); await limSay('-'); await limSay('-'); await limSay('-');
+  await limTap('fb:customer');
+  await limSay('-'); await limSay('0'); await limSay('01.01.2026');
+  await limSay('-'); await limSay('-'); await limSay('-'); await limSay('-');
+  const limCp = Number(String(button('Внести операцию')).split(':')[1]);
+  const mk = async () => { await limTap(`d.sch:${limCp}`); await limSay('Услуга; 1; 100'); await limTap('items.done'); await limTap('doc.make'); };
+  await mk(); await mk(); // два бесплатных
+  const filesBefore = files.length;
+  await limTap(`d.sch:${limCp}`); // третий — должен упереться в лимит
+  ok(limLast().includes('бесплатных'), 'на третьем документе бот показал лимит', limLast().slice(0, 50));
+  ok(files.length === filesBefore, 'третий документ не выпущен без подписки');
+  // выдаём подписку — лимит снимается
+  require('./lib/billing').grantDays(require('./lib/bot-db').getOrCreateUser(LIM.id).id, 30);
+  await mk();
+  ok(files.length === filesBefore + 1, 'с подпиской документ выписывается сверх лимита');
+  delete process.env.FREE_DOCS;
+  process.env.FREE_DOCS = '1000'; // возвращаем высокий порог для остального прогона
 
   console.log('\n── разбор вебхука Lava ──');
   const lava = require('./lib/lava');

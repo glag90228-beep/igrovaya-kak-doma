@@ -354,7 +354,7 @@ LAVA_WEBHOOK_SECRET=… BOT_TOKEN=… node lava-webhook.js   # POST /lava
 ### Проверка без живого токена
 
 ```bash
-TRAPEZA_DB=/tmp/selftest.db node bot-selftest.js /tmp/docs   # 153 проверки сценария
+TRAPEZA_DB=/tmp/selftest.db node bot-selftest.js /tmp/docs   # 156 проверок сценария
 node check-qr.js                                             # генератор QR
 ```
 
