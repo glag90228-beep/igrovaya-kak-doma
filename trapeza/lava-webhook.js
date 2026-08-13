@@ -5,9 +5,11 @@
  *
  *   LAVA_WEBHOOK_SECRET=… BOT_TOKEN=… node lava-webhook.js
  *
- * Слушает POST на /lava. Секрет проверяется в заголовке X-Api-Key,
- * в Authorization или в параметре ?secret= — какой из них использует
- * площадка, выяснится на первом настоящем вызове.
+ * Слушает POST на /lava и /webhook. Lava Top шлёт вебхук с заголовком
+ * X-Api-Key, равным вашему API-ключу, — его и сверяем (secretOk). Тело
+ * плоское: eventType, contractId, buyer.email, amount, currency, product.
+ * Покупатель опознаётся по email (Telegram-id Lava не передаёт), поэтому
+ * рабочий путь привязки — «Я оплатил» в боте с вводом почты с кассы.
  *
  * Наружу выставлять только по HTTPS (nginx перед этим портом).
  */
@@ -81,7 +83,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/health') return done(200, 'ok');
   if (req.method !== 'POST') return done(405, 'only POST');
-  if (url.pathname !== '/lava') return done(404, 'not found');
+  if (url.pathname !== '/lava' && url.pathname !== '/webhook') return done(404, 'not found');
 
   const given = req.headers['x-api-key']
     || String(req.headers.authorization || '').replace(/^Bearer\s+/i, '')

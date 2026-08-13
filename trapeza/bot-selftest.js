@@ -481,6 +481,25 @@ function button(sub) {
   ok(nested.ok && nested.payment.externalId === 'inv-2' && nested.payment.tgId === 777002,
     'вложенное тело и id внутри строки', nested.ok ? nested.payment.externalId : nested.reason);
 
+  // Точный формат Lava Top (сверен по официальному SDK lava-top-sdk).
+  const real = lava.parseWebhook({
+    eventType: 'payment.success', contractId: 'c-42', status: 'completed',
+    amount: 390, currency: 'RUB', buyer: { email: 'Buyer@Mail.RU' },
+    product: { title: 'Трапеза Документы — месяц' },
+  });
+  ok(real.ok && real.payment.externalId === 'c-42' && real.payment.paid
+    && real.payment.email === 'buyer@mail.ru' && real.payment.amount === 390
+    && real.payment.product === 'Трапеза Документы — месяц',
+    'реальный формат Lava Top (eventType/contractId/buyer.email)',
+    real.ok ? `${real.payment.status} ${real.payment.amount}` : real.reason);
+  const recur = lava.parseWebhook({
+    eventType: 'subscription.recurring.payment.success', contractId: 'c-43',
+    amount: 2990, buyer: { email: 'x@y.ru' } });
+  ok(recur.ok && recur.payment.paid, 'автопродление подписки Lava — оплачено');
+  const declined = lava.parseWebhook({
+    eventType: 'payment.failed', contractId: 'c-44', amount: 390, buyer: { email: 'x@y.ru' } });
+  ok(declined.ok && !declined.payment.paid, 'событие payment.failed — доступ не выдан');
+
   const failed = lava.parseWebhook({ id: 'inv-3', status: 'failed', amount: 349 });
   ok(failed.ok && !failed.payment.paid, 'неуспешный платёж помечен как неоплаченный');
   const junk = lava.parseWebhook({ hello: 'world' });
@@ -637,14 +656,17 @@ function button(sub) {
   console.log('\n── общий браузер для PDF ──');
   const pdf = require('./lib/pdf');
   if (pdf.pdfAvailable()) {
+    // Замер честный: закрываем браузер, чтобы первый вызов включал холодный
+    // старт Chromium; тёплые повторные вызовы должны быть заметно быстрее.
+    await pdf.closePdf();
     const t0 = Date.now();
     await pdf.htmlToPdf('<h1>раз</h1>');
-    const first = Date.now() - t0;
+    const cold = Date.now() - t0;
     const t1 = Date.now();
     await Promise.all([pdf.htmlToPdf('<h1>два</h1>'), pdf.htmlToPdf('<h1>три</h1>')]);
-    const pair = Date.now() - t1;
-    ok(pair < first * 2, 'браузер переиспользуется, а не поднимается заново',
-      `первый ${first} мс, следующие два ${pair} мс`);
+    const warm = Date.now() - t1;
+    ok(warm < cold, 'браузер переиспользуется, а не поднимается заново',
+      `холодный старт ${cold} мс, тёплые два ${warm} мс`);
     await pdf.closePdf();
     const buf = await pdf.htmlToPdf('<h1>после закрытия</h1>');
     ok(buf && buf.length > 500, 'после закрытия браузер поднимается заново');

@@ -3,7 +3,9 @@
 /**
  * Приём оплат с Lava Top.
  *
- * ЧЕСТНО О ГЛАВНОМ: точный формат вебхука Lava здесь не зашит намертво.
+ * Формат сверен с официальным SDK lava-top-sdk (август 2026): тело плоское,
+ * ключевые поля — eventType, contractId, buyer.email, amount, currency,
+ * product.title. Разбор оставлен терпимым к именам на случай смены версии.
  * Разные площадки (и разные версии одной площадки) называют поля по-разному,
  * а гадать в коде, который выдаёт платный доступ, — плохая идея. Поэтому
  * разбор устроен так:
@@ -67,8 +69,20 @@ function tgIdFrom(value) {
   return m ? Number(m[1]) : null;
 }
 
-/** Статусы, при которых доступ выдаётся. Всё остальное — просто запись. */
-const PAID = /^(paid|success|successful|completed|complete|subscription-recurring-payment-success|payment\.success|payment_success)$/i;
+/**
+ * Оплачен ли платёж. У Lava Top решает eventType: «payment.success» и
+ * «subscription.recurring.payment.success» — доступ выдаём; «...failed»,
+ * «cancelled», «refund» — нет. Запасной вариант (мок, чужой формат) —
+ * по слову success/completed в статусе или, если статуса нет, по сумме.
+ */
+function isPaid(eventType, status, amount) {
+  const et = String(eventType || '');
+  const st = String(status || '');
+  if (/fail|cancel|refund|error|decline/i.test(et) || /fail|cancel|refund|decline/i.test(st)) return false;
+  if (/success|completed|paid|active/i.test(et)) return true;
+  if (!et && /success|completed|paid|active/i.test(st)) return true;
+  return !et && !st && Number(amount) > 0;
+}
 
 /**
  * Разбирает тело вебхука.
@@ -83,7 +97,9 @@ function parseWebhook(body) {
 
   const externalId = first(src, FIELDS.externalId);
   const amount = money(first(src, FIELDS.amount));
-  const status = String(first(src, FIELDS.status) || '').trim();
+  // eventType — главный признак у Lava; status держим отдельно для лога.
+  const eventType = String(first(src, ['eventType', 'event_type', 'event', 'type']) || '').trim();
+  const statusField = String(first(src, ['status', 'state']) || '').trim();
 
   if (!externalId) return { ok: false, reason: 'не нашёл идентификатор платежа' };
   if (amount == null) return { ok: false, reason: 'не нашёл сумму' };
@@ -96,10 +112,10 @@ function parseWebhook(body) {
       email: String(first(src, FIELDS.email) || '').trim().toLowerCase(),
       amount,
       currency: String(first(src, FIELDS.currency) || 'RUB').toUpperCase(),
-      status,
+      status: eventType || statusField,
       product: String(first(src, FIELDS.product) || ''),
       tgId: tgIdFrom(custom),
-      paid: PAID.test(status) || (!status && amount > 0),
+      paid: isPaid(eventType, statusField, amount),
       raw: body,
     },
   };
