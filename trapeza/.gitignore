@@ -4,3 +4,5 @@ data/
 .env
 site-kalkulyator/site/
 site-kalkulyator/site-new/
+# Файлы, которые генерирует самотест (пересобираются на каждом прогоне)
+selftest-out/
