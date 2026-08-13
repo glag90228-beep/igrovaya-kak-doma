@@ -162,6 +162,23 @@ function setDefaultOrg(userId, id) {
   db.prepare('UPDATE orgs SET is_default = 1 WHERE id = ? AND user_id = ?').run(id, userId);
 }
 
+/**
+ * «Ввести заново» должно ЗАМЕНЯТЬ мою организацию, а не плодить новые.
+ * Раньше каждая правка создавала ещё одну организацию, а бот продолжал
+ * брать самую первую — поэтому изменения будто не применялись. Теперь
+ * обновляем организацию по умолчанию на месте и убираем дубликаты.
+ */
+function saveMyOrg(userId, fields) {
+  const def = getDefaultOrg(userId);
+  if (def) {
+    updateOrg(userId, def.id, fields);
+    db.prepare('DELETE FROM orgs WHERE user_id = ? AND id <> ?').run(userId, def.id);
+    db.prepare('UPDATE orgs SET is_default = 1 WHERE id = ?').run(def.id);
+    return def.id;
+  }
+  return createOrg(userId, fields);
+}
+
 // ---------- контрагенты пользователя ----------
 
 function createCp(userId, fields) {
@@ -400,7 +417,7 @@ function quota(userId) {
 module.exports = {
   migrate,
   getOrCreateUser, setState, getState, clearState,
-  createOrg, updateOrg, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
+  createOrg, updateOrg, saveMyOrg, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp,
   addOp, listOps, deleteLastOp, balanceOf, debtors,
   markBlocked, markActive, isBlocked, reachableUsers,

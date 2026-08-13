@@ -287,8 +287,12 @@ async function applyFormValue(tg, chatId, user, state, rawValue) {
 async function finishForm(tg, chatId, user, formName, values) {
   if (formName === 'org') {
     if (!values.full_name) values.full_name = values.name;
-    bdb.createOrg(user.id, values);
-    await tg.sendMessage(chatId, `✅ Организация <b>${esc(values.name)}</b> сохранена.`, mainMenu());
+    bdb.saveMyOrg(user.id, values); // заменяем организацию, а не плодим новые
+    const hasBank = values.acc && values.bik && values.corr_acc;
+    await tg.sendMessage(chatId,
+      `✅ Организация <b>${esc(values.name)}</b> сохранена.`
+      + (hasBank ? '\nВ счёте будет платёжный QR.' : '\n<i>Расчётный счёт/БИК не заполнены — QR в счёте не появится.</i>'),
+      mainMenu());
   } else if (formName === 'cp') {
     if (!values.full_name) values.full_name = values.name;
     if (!values.period_end) values.period_end = todayISO();
