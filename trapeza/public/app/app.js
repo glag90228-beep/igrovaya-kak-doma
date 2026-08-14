@@ -243,6 +243,7 @@ screens.home = async function home() {
   // выбрать, а взгляд цепляется за форму раньше, чем прочтёт подпись.
   const types = [
     ['sch', 'receipt', 'Счёт на оплату', 'с QR для оплаты'],
+    ['schdog', 'doc-check', 'Счёт-договор', 'договор не нужен'],
     ['usl', 'doc-check', 'Акт услуг', 'закрывающий документ'],
     ['upd', 'docs2', 'УПД', 'счёт-фактура и акт'],
     ['torg12', 'box', 'ТОРГ-12', 'накладная на товар'],
@@ -806,7 +807,7 @@ function download(file) {
 
 screens.new = async function newDoc(params) {
   const TITLES = {
-    sch: 'Счёт на оплату', usl: 'Акт об оказании услуг',
+    sch: 'Счёт на оплату', schdog: 'Счёт-договор', usl: 'Акт об оказании услуг',
     upd: 'УПД', torg12: 'Товарная накладная ТОРГ-12',
   };
   const type = TITLES[params.type] ? params.type : 'sch';

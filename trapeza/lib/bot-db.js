@@ -278,7 +278,7 @@ function deleteLastOp(userId, cpId) {
  */
 const DEBT_DOCS = {
   closing: ['usl', 'upd', 'torg12'],
-  invoice: ['sch'],
+  invoice: ['sch', 'schdog'],
   manual: [],
 };
 
@@ -359,7 +359,8 @@ function docsBetween(userId, from, to, cpId = null) {
 function unpaidDocs(userId, limit = 50) {
   const rows = db.prepare(`
     SELECT * FROM documents
-     WHERE user_id = ? AND paid_at = '' AND total > 0 AND type IN ('sch','usl','upd','torg12')
+     WHERE user_id = ? AND paid_at = '' AND total > 0
+       AND type IN ('sch','schdog','usl','upd','torg12')
      ORDER BY date, id LIMIT ?`).all(userId, limit);
   return rows.map(withPayload);
 }
@@ -430,7 +431,8 @@ function debtors(userId) {
 // ---------- выписанные документы и сквозная нумерация ----------
 
 const DOC_TITLES = {
-  sch: 'Счёт на оплату', usl: 'Акт об оказании услуг', pp: 'Платёжное поручение',
+  sch: 'Счёт на оплату', schdog: 'Счёт-договор',
+  usl: 'Акт об оказании услуг', pp: 'Платёжное поручение',
   akt: 'Акт сверки', upd: 'УПД', torg12: 'Товарная накладная ТОРГ-12',
   dog: 'Договор',
 };

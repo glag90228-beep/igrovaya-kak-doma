@@ -106,6 +106,7 @@ function cpMenu(userId, cp) {
     [{ text: '➕ Внести операцию', data: `op:${cp.id}` }],
     [{ text: '📄 Акт сверки', data: `d.akt:${cp.id}` }, { text: '🧾 Акт услуг', data: `d.usl:${cp.id}` }],
     [{ text: '💰 Счёт на оплату', data: `d.sch:${cp.id}` }, { text: '🏦 Платёжка', data: `d.pp:${cp.id}` }],
+    [{ text: '🤝 Счёт-договор', data: `d.schdog:${cp.id}` }],
     [{ text: '📦 УПД', data: `d.upd:${cp.id}` }, { text: '🚚 ТОРГ-12', data: `d.torg12:${cp.id}` }],
     [{ text: '📝 Договор', data: `d.dog:${cp.id}` }],
   ];
@@ -493,7 +494,8 @@ async function showPreview(tg, chatId, user, state) {
     keyboard([
       [{ text: '📄 Сформировать документ', data: 'doc.make' }],
       [{ text: '✏️ Номер', data: 'doc.num' }, { text: '📅 Дата', data: 'doc.date' }],
-      ...(type === 'sch' ? [[{ text: `🧾 НДС: ${sums.vat == null ? 'нет' : `${extra.vatRate}%`}`, data: 'doc.vat' }]] : []),
+      ...(['sch', 'schdog'].includes(type)
+        ? [[{ text: `🧾 НДС: ${sums.vat == null ? 'нет' : `${extra.vatRate}%`}`, data: 'doc.vat' }]] : []),
       [{ text: '➕ Ещё позиция', data: 'items.more' }],
       [{ text: '✖️ Отмена', data: 'menu' }],
     ]));
@@ -1725,6 +1727,14 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('d.akt:')) { await genAktSverki(tg, chatId, user, Number(data.slice(6))); return; }
     if (data.startsWith('d.usl:')) { await startItems(tg, chatId, user, 'usl', Number(data.slice(6))); return; }
+    if (data.startsWith('d.schdog:')) {
+      // Счёт-договор — тот же счёт по сути, ставку НДС берём так же.
+      const org = bdb.getDefaultOrg(user.id);
+      const v = org ? bdb.vatOf(org) : { rate: null, gross: false };
+      await startItems(tg, chatId, user, 'schdog', Number(data.slice(9)),
+        v.rate == null ? {} : { vatRate: v.rate, priceIncludesVat: v.gross });
+      return;
+    }
     if (data.startsWith('d.sch:')) {
       // Ставку не спрашиваем — берём режим организации; у документа его
       // можно поменять кнопкой в сводке перед выпуском.

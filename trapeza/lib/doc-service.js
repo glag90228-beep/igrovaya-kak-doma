@@ -20,6 +20,7 @@ const facsimile = require('./facsimile');
 const { pdfAvailable, htmlToPdf } = require('./pdf');
 const { buildAktUslugHtml } = require('./akt-uslug');
 const { buildSchetHtml } = require('./schet');
+const { buildSchetDogovorHtml } = require('./schet-dogovor');
 const { buildPlatyozhkaHtml } = require('./platyozhka');
 const { buildUpdHtml } = require('./upd');
 const { buildTorg12Html } = require('./torg12');
@@ -28,6 +29,7 @@ const { buildDogovorHtml } = require('./dogovor');
 /** Документы, которые состоят из позиций «наименование × количество × цена». */
 const ITEM_DOCS = {
   sch: { title: 'Счёт на оплату', build: buildSchetHtml, file: 'Счет' },
+  schdog: { title: 'Счёт-договор', build: buildSchetDogovorHtml, file: 'Счет-договор' },
   usl: { title: 'Акт об оказании услуг', build: buildAktUslugHtml, file: 'Акт_услуг' },
   upd: { title: 'УПД', build: buildUpdHtml, file: 'УПД' },
   torg12: { title: 'Товарная накладная ТОРГ-12', build: buildTorg12Html, file: 'ТОРГ-12' },
@@ -145,7 +147,7 @@ async function issueDocument(userId, {
   // Явно переданный vatRate (в том числе null — «этот счёт без НДС»)
   // сильнее умолчания, поэтому проверяем наличие ключа, а не значение.
   let fields = extra;
-  if (type === 'sch' && !Object.prototype.hasOwnProperty.call(extra, 'vatRate')) {
+  if (['sch', 'schdog'].includes(type) && !Object.prototype.hasOwnProperty.call(extra, 'vatRate')) {
     const v = bdb.vatOf(org);
     if (v.rate != null) fields = { ...extra, vatRate: v.rate, priceIncludesVat: v.gross };
   }

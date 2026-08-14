@@ -697,6 +697,46 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     'без адреса приложения остаётся список команд', plainBtn && plainBtn.menu_button.type);
   if (keepUrl) process.env.WEBAPP_URL = keepUrl;
 
+  console.log('\n── счёт-договор ──');
+  {
+    const bdb5 = require('./lib/bot-db');
+    const uid5 = fxUserId();
+    await tap(`cp:${cpId}`);
+    const sdBtn = button('Счёт-договор');
+    ok(Boolean(sdBtn), 'в карточке контрагента есть счёт-договор', sdBtn);
+
+    const beforeSd = files.length;
+    await tap(sdBtn);
+    await say('Фуршет на 40 персон; 1; 78000');
+    await tap('items.done');
+    await tap('doc.make');
+    ok(files.length === beforeSd + 1, 'счёт-договор выписан');
+    const sdFile = files[files.length - 1];
+    ok(sdFile.filename.startsWith('Счет-договор_'), 'имя файла говорит, что это за документ',
+      sdFile.filename);
+
+    const saved = bdb5.listDocs(uid5, 1)[0];
+    ok(saved.type === 'schdog' && saved.title === 'Счёт-договор',
+      'в журнале записан отдельный тип', `${saved.type} / ${saved.title}`);
+
+    // Своя нумерация: счёт-договор № 1 и счёт № 1 — разные документы,
+    // их ряды путать нельзя.
+    ok(saved.number === '1', 'нумерация у счёта-договора своя, с единицы', saved.number);
+    const schCount = bdb5.listDocs(uid5, 99).filter((d) => d.type === 'sch').length;
+    ok(schCount > 1, 'при этом обычных счетов уже несколько', schCount);
+
+    const html = require('./lib/schet-dogovor').buildSchetDogovorHtml({
+      org: bdb5.getDefaultOrg(uid5), cp: bdb5.getCp(uid5, cpId),
+      doc: { number: '1', date: '2026-08-15', items: [{ name: 'Услуга', qty: 1, price: 1000 }] },
+    });
+    ok(html.includes('акцепт оферты') && html.includes('438'),
+      'в документе есть оговорка об акцепте — без неё оплата договором не станет');
+    ok((html.match(/<img class="fx fx-sign/g) || []).length <= 1,
+      'факсимиле стоит только за нас — за заказчика расписываться нельзя');
+    ok(html.includes('Заказчик') && html.includes('подпись / расшифровка'),
+      'место для подписи заказчика оставлено');
+  }
+
   console.log('\n── реестр документов ──');
   {
     const ExcelJS = require('exceljs');
