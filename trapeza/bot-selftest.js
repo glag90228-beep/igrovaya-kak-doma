@@ -84,7 +84,7 @@ function button(sub) {
 
   console.log('\n── старт и организация ──');
   await say('/start');
-  ok(last().includes('Трапеза Документы'), 'бот поздоровался и показал меню');
+  ok(last().includes('Первичка'), 'бот поздоровался и показал меню');
   await tap('org.new');
   // Ручной путь: ИНН вводим (справочник в прогоне не подключён — автозаполнения
   // нет), название и остальное набираем сами. Порядок шагов новый:
@@ -485,11 +485,11 @@ function button(sub) {
   const real = lava.parseWebhook({
     eventType: 'payment.success', contractId: 'c-42', status: 'completed',
     amount: 390, currency: 'RUB', buyer: { email: 'Buyer@Mail.RU' },
-    product: { title: 'Трапеза Документы — месяц' },
+    product: { title: 'Первичка — месяц' },
   });
   ok(real.ok && real.payment.externalId === 'c-42' && real.payment.paid
     && real.payment.email === 'buyer@mail.ru' && real.payment.amount === 390
-    && real.payment.product === 'Трапеза Документы — месяц',
+    && real.payment.product === 'Первичка — месяц',
     'реальный формат Lava Top (eventType/contractId/buyer.email)',
     real.ok ? `${real.payment.status} ${real.payment.amount}` : real.reason);
   const recur = lava.parseWebhook({

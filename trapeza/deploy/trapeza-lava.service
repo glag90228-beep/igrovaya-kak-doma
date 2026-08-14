@@ -1,5 +1,5 @@
 [Unit]
-Description=Трапеза Документы — приёмник вебхуков Lava Top
+Description=Первичка — приёмник вебхуков Lava Top
 After=network-online.target
 Wants=network-online.target
 

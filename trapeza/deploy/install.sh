@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Установка «Трапеза Документы» на чистый Ubuntu 22.04/24.04.
+# Установка «Первичка» на чистый Ubuntu 22.04/24.04.
 # Запускать от root:  bash deploy/install.sh
 set -euo pipefail
 

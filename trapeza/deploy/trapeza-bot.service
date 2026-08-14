@@ -1,5 +1,5 @@
 [Unit]
-Description=Трапеза Документы — Telegram-бот
+Description=Первичка — Telegram-бот
 After=network-online.target
 Wants=network-online.target
 
