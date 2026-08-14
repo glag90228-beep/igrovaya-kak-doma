@@ -56,7 +56,7 @@ server {
     listen 80;
     server_name $DOMAIN;
 
-    # Наружу открыт только приёмник вебхуков — больше ничего.
+    # Приёмник оплат Lava Top.
     location /lava {
         proxy_pass http://127.0.0.1:8788/lava;
         proxy_set_header Host \$host;
@@ -65,10 +65,17 @@ server {
         proxy_set_header Authorization \$http_authorization;
         client_max_body_size 256k;
     }
-    location /health {
-        proxy_pass http://127.0.0.1:8788/health;
+
+    # Мини-приложение Telegram: страница и его API.
+    # Заголовок Authorization несёт подпись Telegram — его нужно пропустить.
+    location / {
+        proxy_pass http://127.0.0.1:8790;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Authorization \$http_authorization;
+        client_max_body_size 1m;
     }
-    location / { return 404; }
 }
 NG
 ln -sf /etc/nginx/sites-available/trapeza-lava /etc/nginx/sites-enabled/trapeza-lava
@@ -82,6 +89,13 @@ else
 fi
 
 say "Готово"
-echo "Адрес для Lava Top:  https://$DOMAIN/lava"
-echo "Проверка:            curl https://$DOMAIN/health   → должно ответить ok"
+echo "Адрес для Lava Top:      https://$DOMAIN/lava"
+echo "Мини-приложение:         https://$DOMAIN"
+echo "Проверка:                curl https://$DOMAIN/health   → должно ответить ok"
+echo ""
+echo "Осталось вписать адрес приложения в .env и перезапустить бота:"
+echo "  sed -i 's|^WEBAPP_URL=.*|WEBAPP_URL=https://$DOMAIN|' /opt/trapeza/.env"
+echo "  systemctl restart trapeza-miniapp trapeza-bot"
+echo "  cd /opt/trapeza && sudo -u trapeza --preserve-env node bot.js --setup"
+echo ""
 echo "Сертификат продлевается сам (systemctl status certbot.timer)."

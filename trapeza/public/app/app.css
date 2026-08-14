@@ -1,0 +1,361 @@
+/*
+ * Оформление мини-приложения.
+ *
+ * Цвета берём у Telegram (--tg-theme-*), а не свои: приложение открывается
+ * внутри мессенджера, и человек мгновенно замечает чужой белый прямоугольник
+ * в тёмной теме. Все запасные значения — на случай, если приложение открыли
+ * в обычном браузере (например, при отладке), тогда работает своя пара
+ * светлой и тёмной темы.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* Системный шрифт — тот же, которым набран сам Telegram; ничего не грузим.
+     Держим его отдельным токеном: в сокращении «font:» семейство нельзя
+     задать словом inherit, браузер молча отбрасывает такое правило целиком. */
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+
+  --bg: var(--tg-theme-bg-color, #ffffff);
+  --surface: var(--tg-theme-section-bg-color, #ffffff);
+  --group: var(--tg-theme-secondary-bg-color, #f2f2f7);
+  --text: var(--tg-theme-text-color, #12171c);
+  --muted: var(--tg-theme-hint-color, #7d8b99);
+  --link: var(--tg-theme-link-color, #2b7fd4);
+  --primary: var(--tg-theme-button-color, #2b7fd4);
+  --on-primary: var(--tg-theme-button-text-color, #ffffff);
+  --danger: var(--tg-theme-destructive-text-color, #d1453b);
+  --section-title: var(--tg-theme-section-header-text-color, var(--tg-theme-hint-color, #7d8b99));
+  --success: #1f8b4c;
+  --border: color-mix(in srgb, var(--muted) 26%, transparent);
+
+  --r-card: 12px;
+  --r-btn: 10px;
+  --r-field: 8px;
+  --pad: 16px;
+  --tap: 44px;              /* минимальная цель нажатия */
+  --fast: 160ms;
+  --slow: 220ms;
+  --ease: cubic-bezier(.22,.61,.36,1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: var(--tg-theme-bg-color, #17212b);
+    --surface: var(--tg-theme-section-bg-color, #1d2733);
+    --group: var(--tg-theme-secondary-bg-color, #131c26);
+    --text: var(--tg-theme-text-color, #f1f4f7);
+    --muted: var(--tg-theme-hint-color, #8fa1b3);
+    --success: #4bbf73;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--group);
+  color: var(--text);
+}
+
+body {
+  font: 400 16px/1.5 var(--font);
+  min-height: 100dvh;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior-y: none;
+  touch-action: manipulation;         /* убирает задержку 300 мс */
+}
+
+#app {
+  padding: 8px 0 calc(72px + env(safe-area-inset-bottom));
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+/* ---------- типографика ---------- */
+
+h1 { font: 600 22px/1.3 var(--font); margin: 4px var(--pad) 12px; }
+h2 { font: 600 17px/1.35 var(--font); margin: 0 0 2px; }
+
+.section-title {
+  font: 500 13px/1.4 var(--font);
+  color: var(--section-title);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  margin: 20px var(--pad) 7px;
+}
+
+.muted { color: var(--muted); }
+.small { font-size: 14px; }
+.money { font-variant-numeric: tabular-nums; }
+.nowrap { white-space: nowrap; }
+
+/* ---------- секции-карточки (идиома Telegram/iOS) ---------- */
+
+.card {
+  background: var(--surface);
+  border-radius: var(--r-card);
+  margin: 0 12px 12px;
+  overflow: hidden;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: var(--tap);
+  padding: 11px var(--pad);
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+.row + .row { border-top: 1px solid var(--border); }
+button.row, a.row { cursor: pointer; }
+
+button.row:active, a.row:active, .tile:active, .btn:active {
+  transform: scale(.985);
+  transition: transform 90ms var(--ease);
+}
+
+.row .grow { flex: 1; min-width: 0; }
+.row .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.icon { width: 22px; height: 22px; flex: none; }
+svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+.icon-box {
+  width: 30px; height: 30px; border-radius: 8px; flex: none;
+  display: grid; place-items: center;
+  background: color-mix(in srgb, var(--primary) 14%, transparent);
+  color: var(--primary);
+}
+.icon-box.warn { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); }
+.icon-box.ok { background: color-mix(in srgb, var(--success) 16%, transparent); color: var(--success); }
+.chev { color: var(--muted); width: 18px; height: 18px; flex: none; }
+
+/* ---------- шапка со сводкой ---------- */
+
+.hero { padding: 4px var(--pad) 0; }
+.hero .greet { color: var(--muted); font-size: 14px; }
+.hero .sum { font: 600 28px/1.2 var(--font); font-variant-numeric: tabular-nums; margin-top: 2px; }
+.hero .sub { color: var(--muted); font-size: 14px; margin-top: 2px; }
+
+.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 14px 12px; }
+.tile {
+  background: var(--surface);
+  border: 0;
+  border-radius: var(--r-card);
+  padding: 14px;
+  min-height: 84px;
+  display: flex; flex-direction: column; gap: 8px;
+  color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.tile .t-title { font-weight: 500; }
+.tile .t-sub { color: var(--muted); font-size: 13px; }
+
+/* ---------- кнопки ---------- */
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: var(--tap);
+  padding: 0 18px;
+  border: 0; border-radius: var(--r-btn);
+  background: var(--primary); color: var(--on-primary);
+  font: 500 16px/1 var(--font); cursor: pointer;
+  width: 100%;
+}
+.btn[disabled] { opacity: .55; cursor: default; }
+/* Фон страницы — это и есть secondary_bg_color темы, поэтому серая кнопка
+   на нём растворяется в обеих темах. Вторичной даём лёгкую заливку цветом
+   действия: она читается как кнопка и не спорит с главной. */
+.btn.secondary {
+  background: color-mix(in srgb, var(--primary) 13%, transparent);
+  color: var(--link);
+}
+.btn.ghost { background: none; color: var(--link); }
+.btn.danger { background: none; color: var(--danger); }
+.btn-wrap { padding: 4px 12px 12px; }
+
+.spinner {
+  width: 16px; height: 16px; flex: none;
+  border: 2px solid currentColor; border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- поля ввода ---------- */
+
+.field { padding: 10px var(--pad); }
+.field + .field { border-top: 1px solid var(--border); }
+.field label {
+  display: block;
+  font: 500 13px/1.4 var(--font);
+  color: var(--muted);
+  margin-bottom: 3px;
+}
+.field .req { color: var(--danger); }
+.field input, .field textarea, .field select {
+  width: 100%;
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-field);
+  background: none;
+  color: var(--text);
+  font: 400 16px/1.4 var(--font);   /* 16px — иначе iOS увеличивает страницу */
+}
+.field textarea { min-height: 92px; padding: 6px 0; resize: vertical; }
+.field input:focus, .field textarea:focus { outline: none; }
+.field.invalid input { color: var(--danger); }
+.field .err {
+  display: flex; gap: 6px; align-items: center;
+  color: var(--danger); font-size: 13px; margin-top: 4px;
+}
+.field .hint { color: var(--muted); font-size: 13px; margin-top: 4px; }
+
+.field:focus-within { box-shadow: inset 3px 0 0 var(--primary); }
+
+/* Видимая обводка фокуса обязательна: ей пользуются с клавиатуры. */
+:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; border-radius: 4px; }
+
+/* ---------- позиции документа ---------- */
+
+.item { padding: 10px var(--pad); display: grid; gap: 8px; }
+.item + .item { border-top: 1px solid var(--border); }
+.item .top { display: flex; gap: 10px; align-items: start; }
+.item .name { flex: 1; border: 0; background: none; color: inherit; font: 500 16px/1.4 var(--font); min-width: 0; }
+.item .nums { display: flex; align-items: center; gap: 8px; }
+.item .nums input {
+  width: 74px; text-align: right;
+  border: 1px solid var(--border); border-radius: var(--r-field);
+  background: var(--group); color: inherit;
+  font: 400 16px/1 var(--font); font-variant-numeric: tabular-nums;
+  min-height: 36px; padding: 0 8px;
+}
+.item .nums .x { color: var(--muted); }
+.item .line-total { margin-left: auto; font-weight: 500; font-variant-numeric: tabular-nums; }
+
+.iconbtn {
+  width: var(--tap); height: var(--tap);
+  display: grid; place-items: center;
+  border: 0; background: none; color: var(--muted);
+  border-radius: var(--r-btn); cursor: pointer; flex: none;
+}
+.iconbtn.danger { color: var(--danger); }
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px var(--pad); }
+.chip {
+  min-height: 36px; padding: 0 12px;
+  border: 1px solid var(--border); border-radius: 18px;
+  background: none; color: var(--text); font: 400 14px/1 var(--font);
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+}
+
+.total-row {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 14px var(--pad); border-top: 1px solid var(--border);
+  font-weight: 600; font-size: 18px;
+}
+.total-row .money { font-size: 20px; }
+
+/* ---------- служебные состояния ---------- */
+
+.boot, .empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 12px; text-align: center;
+  padding: 56px 32px; color: var(--muted);
+}
+.boot { flex-direction: row; }
+.empty .icon-box { width: 46px; height: 46px; border-radius: 14px; }
+.empty .icon-box .icon { width: 26px; height: 26px; }
+.empty h2 { color: var(--text); }
+
+.skeleton {
+  background: var(--surface);
+  border-radius: var(--r-card);
+  margin: 0 12px 12px;
+  overflow: hidden;
+}
+.skeleton .line {
+  height: 14px; margin: 16px;
+  border-radius: 7px;
+  background: linear-gradient(90deg, var(--group) 25%, color-mix(in srgb, var(--muted) 18%, var(--group)) 37%, var(--group) 63%);
+  background-size: 400% 100%;
+  animation: shimmer 1.3s ease-in-out infinite;
+}
+@keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+
+.banner {
+  display: flex; gap: 10px; align-items: flex-start;
+  margin: 0 12px 12px; padding: 12px 14px;
+  border-radius: var(--r-card);
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+  color: var(--text); font-size: 14px;
+}
+.banner.info { background: color-mix(in srgb, var(--primary) 12%, var(--surface)); }
+.banner .icon { color: var(--danger); }
+.banner.info .icon { color: var(--primary); }
+
+.badge {
+  font-size: 12px; font-weight: 500;
+  padding: 3px 8px; border-radius: 999px;
+  background: var(--group); color: var(--muted);
+}
+.badge.ok { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success); }
+.badge.warn { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
+
+/* ---------- нижняя навигация ---------- */
+
+.tabs {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+  display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid var(--border);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.tab {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+  min-height: 56px; padding: 6px 4px;
+  border: 0; background: none; color: var(--muted);
+  font: 500 11px/1.2 var(--font); cursor: pointer;
+}
+.tab[aria-current="page"] { color: var(--primary); }
+.tab .icon { width: 24px; height: 24px; }
+
+/* ---------- всплывающее сообщение ---------- */
+
+.toast {
+  position: fixed; left: 50%; bottom: calc(76px + env(safe-area-inset-bottom));
+  transform: translate(-50%, 8px);
+  z-index: 100;
+  max-width: min(92vw, 420px);
+  padding: 11px 16px;
+  border-radius: var(--r-btn);
+  background: #23262b; color: #fff;
+  font-size: 14px; text-align: center;
+  opacity: 0;
+  transition: opacity var(--fast) var(--ease), transform var(--fast) var(--ease);
+}
+.toast[hidden] { display: none; }
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+.toast.err { background: #8c2b23; }
+
+/* ---------- появление экрана ---------- */
+
+.screen { animation: enter var(--slow) var(--ease); }
+@keyframes enter { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+}

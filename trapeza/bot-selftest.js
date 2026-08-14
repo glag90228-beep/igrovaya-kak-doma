@@ -645,6 +645,39 @@ function button(sub) {
   const r = await setup.applySetup(flaky, { log: () => {} });
   ok(tries === 5 && r.failed.length === 1, 'сбой на одном шаге не отменяет остальные', `${tries} вызовов`);
 
+  console.log('\n── вход в мини-приложение ──');
+  const { keyboard: kb } = require('./lib/tg');
+  const wa = kb([[{ text: 'Открыть', webApp: 'https://app.example.ru' }]]).reply_markup.inline_keyboard[0][0];
+  ok(wa.web_app && wa.web_app.url === 'https://app.example.ru' && !wa.callback_data,
+    'кнопка мини-приложения собирается как web_app', JSON.stringify(wa));
+
+  const keepUrl = process.env.WEBAPP_URL;
+  // Telegram открывает мини-приложения только по https: http-адрес не должен
+  // превращаться в кнопку, иначе она у всех выдаёт ошибку.
+  process.env.WEBAPP_URL = 'http://app.example.ru';
+  await say('/start');
+  ok(!JSON.stringify(sent[sent.length - 1].kb).includes('web_app'),
+    'по http кнопка приложения не появляется');
+
+  process.env.WEBAPP_URL = 'https://app.example.ru';
+  await say('/start');
+  ok(JSON.stringify(sent[sent.length - 1].kb).includes('https://app.example.ru'),
+    'по https кнопка приложения появляется в меню');
+
+  const menuCalls = [];
+  await setup.applySetup({ call: async (m, p) => { menuCalls.push({ m, p }); } }, { log: () => {} });
+  const btn = (menuCalls.find((c) => c.m === 'setChatMenuButton') || {}).p;
+  ok(btn && btn.menu_button.type === 'web_app' && btn.menu_button.web_app.url === 'https://app.example.ru',
+    'кнопка возле поля ввода ведёт в приложение', btn && btn.menu_button.type);
+
+  delete process.env.WEBAPP_URL;
+  const plainCalls = [];
+  await setup.applySetup({ call: async (m, p) => { plainCalls.push({ m, p }); } }, { log: () => {} });
+  const plainBtn = (plainCalls.find((c) => c.m === 'setChatMenuButton') || {}).p;
+  ok(plainBtn && plainBtn.menu_button.type === 'commands',
+    'без адреса приложения остаётся список команд', plainBtn && plainBtn.menu_button.type);
+  if (keepUrl) process.env.WEBAPP_URL = keepUrl;
+
   console.log('\n── изоляция пользователей ──');
   const OTHER = { id: 777002, first_name: 'Чужой', username: 'other' };
   await handleUpdate(tg, { message: { chat: { id: 777002 }, from: OTHER, text: '/start' } });

@@ -133,4 +133,4 @@ async function closePdf() {
   }
 }
 
-module.exports = { pdfAvailable, htmlToPdf, htmlToPng, closePdf };
+module.exports = { pdfAvailable, htmlToPdf, htmlToPng, closePdf, loadChromium };

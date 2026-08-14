@@ -70,12 +70,19 @@ async function applySetup(tg, { log = console.log } = {}) {
   const problems = checkSetup();
   if (problems.length) throw new Error(`Оформление не проходит проверку:\n- ${problems.join('\n- ')}`);
 
+  // Кнопка слева от поля ввода: если поднято мини-приложение, ей место
+  // там — это самый заметный вход. Без него оставляем список команд.
+  const app = String(process.env.WEBAPP_URL || '').trim();
+  const menuButton = /^https:\/\/.+/i.test(app)
+    ? { type: 'web_app', text: 'Документы', web_app: { url: app } }
+    : { type: 'commands' };
+
   const steps = [
     ['имя', () => tg.call('setMyName', { name: NAME })],
     ['короткое описание', () => tg.call('setMyShortDescription', { short_description: SHORT })],
     ['описание', () => tg.call('setMyDescription', { description: DESCRIPTION })],
     ['команды', () => tg.call('setMyCommands', { commands: COMMANDS })],
-    ['кнопка меню', () => tg.call('setChatMenuButton', { menu_button: { type: 'commands' } })],
+    ['кнопка меню', () => tg.call('setChatMenuButton', { menu_button: menuButton })],
   ];
 
   const failed = [];

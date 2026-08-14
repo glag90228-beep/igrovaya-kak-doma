@@ -10,7 +10,9 @@
     "bot": "node bot.js",
     "bot:setup": "node bot.js --setup",
     "lava": "node lava-webhook.js",
-    "bot:check": "node bot.js --check"
+    "miniapp": "node miniapp.js",
+    "bot:check": "node bot.js --check",
+    "test": "node bot-selftest.js && node miniapp-selftest.js"
   },
   "dependencies": {
     "exceljs": "^4.4.0"

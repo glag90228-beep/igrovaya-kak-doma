@@ -23,6 +23,7 @@ const billing = require('./lib/billing');
 const { payLink, daysFor } = require('./lib/lava');
 const dadata = require('./lib/dadata');
 const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
+const docService = require('./lib/doc-service');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -46,8 +47,20 @@ const clean = (s) => (String(s).trim() === '-' ? '' : String(s).trim());
 
 // ---------- меню ----------
 
+/**
+ * Адрес мини-приложения. Telegram открывает их только по https, поэтому
+ * http-адрес молча игнорируем: лучше остаться без кнопки, чем показать
+ * кнопку, которая у всех выдаёт ошибку.
+ */
+function webAppUrl() {
+  const url = String(process.env.WEBAPP_URL || '').trim();
+  return /^https:\/\/.+/i.test(url) ? url : '';
+}
+
 function mainMenu() {
+  const app = webAppUrl();
   return keyboard([
+    ...(app ? [[{ text: '📱 Открыть приложение', webApp: app }]] : []),
     [{ text: '🏢 Моя организация', data: 'org' }],
     [{ text: '👥 Контрагенты', data: 'cps' }],
     [{ text: '💸 Кто должен', data: 'debts' }],
@@ -346,16 +359,13 @@ async function sendGenerated(tg, chatId, { html, xlsxBuffer, base, caption }) {
     await tg.sendDocument(chatId, { filename: `${base}.xlsx`, buffer: xlsxBuffer, caption });
     return;
   }
-  if (pdfAvailable()) {
-    try {
-      const pdf = await htmlToPdf(html);
-      await tg.sendDocument(chatId, { filename: `${base}.pdf`, buffer: pdf, caption });
-      return;
-    } catch (e) { /* упадём на HTML ниже */ }
-  }
+  const file = await docService.renderFile(html, base);
   await tg.sendDocument(chatId, {
-    filename: `${base}.html`, buffer: Buffer.from(html, 'utf8'),
-    caption: `${caption}\n\n(PDF недоступен — откройте файл в браузере и распечатайте / сохраните в PDF.)`,
+    filename: file.filename,
+    buffer: file.buffer,
+    caption: file.pdf
+      ? caption
+      : `${caption}\n\n(PDF недоступен — откройте файл в браузере и распечатайте / сохраните в PDF.)`,
   });
 }
 
@@ -406,12 +416,9 @@ async function genAktSverki(tg, chatId, user, cpId) {
 // ---------- сбор позиций (для акта услуг и счёта) ----------
 
 // Документы, которые набираются позициями: заголовок, сборщик и имя файла.
-const ITEM_DOCS = {
-  sch:    { title: 'Счёт на оплату',            build: buildSchetHtml,   file: 'Счет' },
-  usl:    { title: 'Акт об оказании услуг',     build: buildAktUslugHtml, file: 'Акт_услуг' },
-  upd:    { title: 'УПД',                       build: buildUpdHtml,     file: 'УПД' },
-  torg12: { title: 'Товарная накладная ТОРГ-12', build: buildTorg12Html, file: 'ТОРГ-12' },
-};
+// Список общий с мини-приложением — лежит в lib/doc-service.js, чтобы форма
+// документа правилась в одном месте, а не в двух расходящихся копиях.
+const { ITEM_DOCS } = docService;
 
 /** Клавиатура набора позиций: частые позиции кнопками + управление. */
 function itemsKb(user, data) {

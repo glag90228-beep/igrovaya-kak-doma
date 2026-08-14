@@ -98,17 +98,18 @@ class Telegram {
 
 /**
  * Inline-клавиатура из рядов [[{text, data}], ...].
- * Кнопка со ссылкой задаётся полем url вместо data — Telegram не принимает
- * оба поля сразу.
+ * У кнопки ровно один вид действия — Telegram не принимает два сразу:
+ *   data   — вернуть нажатие боту (обычный случай);
+ *   url    — открыть ссылку;
+ *   webApp — открыть мини-приложение поверх чата.
  */
 function keyboard(rows) {
-  return {
-    reply_markup: {
-      inline_keyboard: rows.map((row) => row.map((b) => (b.url
-        ? { text: b.text, url: b.url }
-        : { text: b.text, callback_data: b.data }))),
-    },
+  const button = (b) => {
+    if (b.webApp) return { text: b.text, web_app: { url: b.webApp } };
+    if (b.url) return { text: b.text, url: b.url };
+    return { text: b.text, callback_data: b.data };
   };
+  return { reply_markup: { inline_keyboard: rows.map((row) => row.map(button)) } };
 }
 
 module.exports = { Telegram, keyboard };

@@ -66,14 +66,20 @@ sudo -u trapeza --preserve-env node bot.js --check
 sudo -u trapeza --preserve-env node bot.js --setup
 
 say "6/6 Службы"
-cp deploy/trapeza-bot.service deploy/trapeza-lava.service /etc/systemd/system/
+cp deploy/trapeza-bot.service deploy/trapeza-lava.service deploy/trapeza-miniapp.service \
+   /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now trapeza-bot
 if grep -q '^LAVA_WEBHOOK_SECRET=.\+' .env; then
   systemctl enable --now trapeza-lava
+  systemctl restart trapeza-lava
 else
   echo "LAVA_WEBHOOK_SECRET пуст — приёмник оплат не запускаю."
 fi
+# Мини-приложение полезно и до того, как задан WEBAPP_URL: без адреса оно
+# просто никому не показывается, зато уже поднято и готово к https.
+systemctl enable --now trapeza-miniapp
+systemctl restart trapeza-miniapp
 
 say "Готово"
 systemctl --no-pager --lines=5 status trapeza-bot || true
@@ -81,6 +87,10 @@ cat <<'TXT'
 
 Дальше:
   • аватар — @BotFather → /setuserpic
-  • приёмник оплат наружу только по HTTPS: nginx на /lava → 127.0.0.1:8788
-  • логи:  journalctl -u trapeza-bot -f   и   tail -f /var/log/trapeza/lava.log
+  • HTTPS одной командой:  bash deploy/https.sh ваш-домен вашапочта@mail.ru
+    после него «/» отдаёт мини-приложение, «/lava» — вебхуки оплат
+  • адрес приложения впишите в WEBAPP_URL и повторите  node bot.js --setup
+  • логи:  journalctl -u trapeza-bot -f
+           tail -f /var/log/trapeza/lava.log
+           tail -f /var/log/trapeza/miniapp.log
 TXT
