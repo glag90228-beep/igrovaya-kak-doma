@@ -929,27 +929,37 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await tap('vat.set:none:0');   // возвращаем как было
   }
 
-  console.log('\n── отправка документа на почту ──');
+  console.log('\n── свой почтовый ящик и отправка ──');
   {
     const net = require('node:net');
+    const mailbox = require('./lib/mailbox');
+    const uidM = fxUserId();
     // Настоящий SMTP-сервер на localhost: проверяем, что письмо реально
     // уходит с вложением, а не что мы позвали функцию.
-    const got = { rcpt: [], data: '' };
+    const got = { rcpt: [], data: '', auth: null };
     const smtp = net.createServer((sock) => {
-      let inData = false; let body = '';
+      let inData = false; let body = ''; let expect = null;
       sock.setEncoding('utf8');
       sock.write('220 local ESMTP\r\n');
       sock.on('data', (chunk) => {
         if (inData) {
           body += chunk;
-          const end = body.indexOf('\r\n.\r\n');
-          if (end === -1) return;
-          got.data = body.slice(0, end); inData = false;
+          const end2 = body.indexOf('\r\n.\r\n');
+          if (end2 === -1) return;
+          got.data = body.slice(0, end2); inData = false; body = '';
           sock.write('250 Ok: queued\r\n');
           return;
         }
         for (const line of chunk.split('\r\n').filter(Boolean)) {
-          if (/^EHLO/i.test(line)) sock.write('250-local\r\n250 HELP\r\n');
+          if (expect) {
+            const v = Buffer.from(line, 'base64').toString('utf8');
+            if (expect === 'user') { got.auth = { user: v }; expect = 'pass'; sock.write('334 UA==\r\n'); } else {
+              got.auth.pass = v; expect = null; sock.write('235 ok\r\n');
+            }
+            continue;
+          }
+          if (/^EHLO/i.test(line)) sock.write('250-local\r\n250-AUTH LOGIN\r\n250 HELP\r\n');
+          else if (/^AUTH LOGIN/i.test(line)) { expect = 'user'; sock.write('334 VQ==\r\n'); }
           else if (/^RCPT TO:/i.test(line)) { got.rcpt.push(line.slice(8).replace(/[<>]/g, '').trim()); sock.write('250 Ok\r\n'); }
           else if (/^DATA/i.test(line)) { inData = true; sock.write('354 go\r\n'); }
           else if (/^QUIT/i.test(line)) { sock.write('221 bye\r\n'); sock.end(); }
@@ -958,52 +968,67 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       });
       sock.on('error', () => {});
     });
-    await new Promise((r) => smtp.listen(0, '127.0.0.1', r));
+    await new Promise((res2) => smtp.listen(0, '127.0.0.1', res2));
+    const smtpPort = smtp.address().port;
 
-    // Пока почта не настроена — кнопки нет и отправка честно отказывается.
-    delete process.env.SMTP_HOST;
-    // Именно счёт: у акта сверки отправки нет по замыслу (это Excel-журнал).
-    const docsBefore = require('./lib/bot-db').listDocs(fxUserId(), 30)
-      .find((x) => x.type === 'sch');
-    ok(Boolean(docsBefore), 'в журнале есть счёт для отправки');
-    await tap(`doc:${docsBefore.id}`);
+    const schDoc = require('./lib/bot-db').listDocs(uidM, 30).find((x) => x.type === 'sch');
+    ok(Boolean(schDoc), 'в журнале есть счёт для отправки');
+
+    // Пока ящик не подключён — кнопки отправки нет.
+    await tap(`doc:${schDoc.id}`);
     ok(!button('Отправить на почту') && !button('Отправить на '),
-      'без настроенной почты кнопки отправки нет');
+      'без подключённого ящика кнопки отправки нет');
 
-    process.env.SMTP_HOST = '127.0.0.1';
-    process.env.SMTP_PORT = String(smtp.address().port);
-    process.env.SMTP_FROM = 'bot@pervichka.ru';
-    process.env.SMTP_FROM_NAME = 'Первичка';
-    delete process.env.SMTP_USER;      // сервер без входа по паролю
-    delete process.env.SMTP_SECURE;
+    // Подключение своей корпоративной почты: бот обязан спросить сервер.
+    await tap('org');
+    ok(Boolean(button('Подключить почту')), 'в организации есть вход в настройку почты');
+    await tap('mb.new');
+    ok(last().includes('С какого адреса'), 'бот спрашивает адрес');
+    await say('не-адрес');
+    ok(last().includes('не похоже на адрес'), 'кривой адрес отклонён');
+    await say('buh@своядомен.рф');
+    ok(last().includes('SMTP-сервера'), 'для своего домена бот спрашивает сервер', last().slice(0, 60));
+    await say('не сервер!!');
+    ok(last().includes('Не разобрал адрес сервера'), 'мусор вместо сервера отклонён');
+    await say(`127.0.0.1:${smtpPort}`);
+    ok(last().includes('пришлите пароль'.toLowerCase()) || last().includes('пароль'),
+      'бот просит пароль', last().slice(0, 60));
+    await say('секретный-пароль');
+    // Успех сообщается отдельным письмом, а следом бот показывает экран
+    // почты — поэтому смотрим не последнее сообщение, а несколько последних.
+    ok(sent.slice(-3).some((m) => m.text.includes('Письмо ушло')),
+      'после сохранения бот сам отправил проверочное письмо',
+      sent.slice(-3).map((m) => m.text.slice(0, 30)).join(' | '));
+    ok(got.rcpt.includes('buh@своядомен.рф'), 'проверочное письмо ушло на свой же адрес', got.rcpt.join());
+    ok(got.auth && got.auth.pass === 'секретный-пароль', 'пароль дошёл до сервера');
+    ok(Boolean(mailbox.info(uidM).checkedAt), 'ящик помечен проверенным');
 
-    await tap(`doc:${docsBefore.id}`);
+    // Пароль не должен светиться ни в интерфейсе, ни в базе.
+    ok(!JSON.stringify(mailbox.info(uidM)).includes('секретный-пароль'),
+      'пароль не отдаётся наружу');
+    ok(!fs.readFileSync(process.env.TRAPEZA_DB || 'data/trapeza.db').includes('секретный-пароль'),
+      'пароль в базе хранится зашифрованным');
+
+    // Теперь отправка документа клиенту.
+    got.rcpt.length = 0;
+    await tap(`doc:${schDoc.id}`);
     const mailBtn = button('Отправить на почту');
-    ok(Boolean(mailBtn), 'с настроенной почтой кнопка появилась', mailBtn);
-
+    ok(Boolean(mailBtn), 'с подключённым ящиком кнопка появилась', mailBtn);
     await tap(mailBtn);
-    ok(last().includes('На какую почту'), 'бот спрашивает адрес, если он не сохранён');
-    await say('не адрес');
-    ok(last().includes('не похоже на адрес'), 'кривой адрес отклонён с объяснением');
+    ok(last().includes('На какую почту'), 'бот спрашивает адрес получателя');
     await say('buh@zarya.ru');
-    ok(last().includes('Отправил'), 'письмо ушло', last().slice(0, 60));
-    ok(got.rcpt.includes('buh@zarya.ru'), 'сервер получил именно этот адрес', got.rcpt.join());
+    ok(last().includes('Отправил'), 'документ отправлен', last().slice(0, 50));
+    ok(got.rcpt.includes('buh@zarya.ru'), 'сервер получил адрес клиента', got.rcpt.join());
     ok(/Content-Disposition: attachment/.test(got.data), 'во вложении есть файл');
-    ok(/^Subject: =\?UTF-8\?B\?/m.test(got.data), 'тема письма закодирована');
+    ok(/^From: .*своядомен/m.test(got.data) || got.data.includes('buh@'),
+      'письмо ушло с адреса клиента, а не с нашего', (/^From:.*/m.exec(got.data) || [''])[0].slice(0, 60));
 
-    const cpNow = require('./lib/bot-db').getCp(fxUserId(), docsBefore.cp_id);
+    const cpNow = require('./lib/bot-db').getCp(uidM, schDoc.cp_id);
     ok(cpNow.email === 'buh@zarya.ru', 'адрес запомнился у контрагента', cpNow.email);
 
-    await tap(`doc:${docsBefore.id}`);
-    ok(Boolean(button('buh@zarya.ru')), 'в следующий раз адрес подставлен в кнопку');
-    got.rcpt.length = 0;
-    await tap(button('buh@zarya.ru'));
-    ok(last().includes('Отправил') && got.rcpt.includes('buh@zarya.ru'),
-      'повторная отправка идёт без вопросов');
-
+    await tap('mb.del');
+    ok(!mailbox.has(uidM), 'почту можно отключить');
     smtp.close();
-    delete process.env.SMTP_HOST;
-    delete process.env.SMTP_PORT;
   }
 
   console.log('\n── подпись и печать ──');

@@ -29,6 +29,7 @@ const docService = require('./lib/doc-service');
 const dadata = require('./lib/dadata');
 const facsimile = require('./lib/facsimile');
 const mailer = require('./lib/mail');
+const mailbox = require('./lib/mailbox');
 const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
 const { round2 } = require('./lib/money');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
@@ -126,7 +127,8 @@ function stateFor(user) {
     payUrl: payLink(user.tg_id),
     facsimile: fxState(user.id),
     debtBasis: bdb.basisOf(org || {}),
-    features: { dadata: dadata.dadataAvailable(), pdf: true, mail: mailer.mailAvailable() },
+    features: { dadata: dadata.dadataAvailable(), pdf: true, mail: mailbox.resolve(user.id).ok },
+    mailbox: mailbox.info(user.id),
   };
 }
 
@@ -296,7 +298,10 @@ const api = {
    * Адрес запоминается: со второго раза спрашивать уже нечего.
    */
   async 'POST /api/doc/mail'({ user, body }) {
-    if (!mailer.mailAvailable()) return { error: `Отправка почты не настроена. ${mailer.mailHint()}` };
+    // Письмо уходит из ящика пользователя: с общего адреса оно попадало бы
+    // в спам, и отправителем чужих документов оказывались бы мы.
+    const box = mailbox.resolve(user.id);
+    if (!box.ok) return { error: box.reason };
 
     const doc = bdb.getDoc(user.id, Number(body.id));
     if (!doc) return { error: 'Документ не найден.' };
@@ -325,7 +330,7 @@ const api = {
       attachments: [{
         filename: built.file.filename, content: built.file.buffer, contentType: built.file.mime,
       }],
-    });
+    }, box.options);
     if (!res.ok) return { error: `Не отправилось: ${res.error}` };
 
     if (to !== cp.email) bdb.updateCp(user.id, cp.id, { email: to });
@@ -352,6 +357,46 @@ const api = {
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     bdb.updateOrg(user.id, org.id, { debt_basis: basis });
     return { basis };
+  },
+
+  /** Подключить свой ящик. Пароль сразу проверяется письмом самому себе. */
+  async 'POST /api/mailbox'({ user, body }) {
+    const email = str(body.email, 254).toLowerCase();
+    if (!mailer.validEmail(email)) return { error: 'Адрес почты выглядит неправильно.' };
+    const preset = mailbox.PRESETS[str(body.preset, 12)] ? str(body.preset, 12) : mailbox.guessPreset(email);
+    const saved = mailbox.save(user.id, {
+      preset,
+      login: email,
+      from: email,
+      pass: String(body.pass || ''),
+      fromName: str(body.fromName, 120),
+      host: str(body.host, 200),
+      port: Number(body.port) || 0,
+      secure: body.secure == null ? null : Boolean(body.secure),
+    });
+    if (!saved.ok) return { error: saved.error };
+
+    // Проверяем сразу: иначе о неверном пароле человек узнает в тот момент,
+    // когда счёт не уйдёт клиенту.
+    const box = mailbox.resolve(user.id);
+    const res = await mailer.sendMail({
+      to: email,
+      subject: 'Проверка почты — Первичка',
+      text: 'Это проверочное письмо. Если вы его видите, отправка документов настроена верно.',
+    }, box.options);
+    if (!res.ok) {
+      return {
+        error: `Пароль не принят: ${res.error}. У Яндекса и Mail.ru нужен «пароль приложения», а не обычный.`,
+        saved: true,
+      };
+    }
+    mailbox.markChecked(user.id);
+    return { mailbox: mailbox.info(user.id) };
+  },
+
+  async 'POST /api/mailbox/delete'({ user }) {
+    mailbox.remove(user.id);
+    return { mailbox: null };
   },
 
   async 'GET /api/unpaid'({ user }) {

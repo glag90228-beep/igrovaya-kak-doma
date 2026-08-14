@@ -28,6 +28,7 @@ const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
 const docService = require('./lib/doc-service');
 const facsimile = require('./lib/facsimile');
 const mailer = require('./lib/mail');
+const mailbox = require('./lib/mailbox');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -688,7 +689,7 @@ async function showDoc(tg, chatId, user, docId) {
       ? { text: `↩️ Снять отметку об оплате (${ru(d.paid_at)})`, data: `doc.unpaid:${d.id}` }
       : { text: '✅ Отметить оплаченным', data: `doc.paid:${d.id}` }]);
   }
-  if (mailer.mailAvailable() && d.type !== 'akt') {
+  if (mailbox.resolve(user.id).ok && d.type !== 'akt') {
     rows.push([{
       text: cp && cp.email ? `✉️ Отправить на ${cp.email}`.slice(0, 60) : '✉️ Отправить на почту',
       data: `doc.mail:${d.id}`,
@@ -928,9 +929,12 @@ function letterFor(doc, org, cp) {
  * Если почта не сохранена — спрашиваем её и запоминаем на будущее.
  */
 async function mailDoc(tg, chatId, user, docId, emailOverride = null) {
-  if (!mailer.mailAvailable()) {
-    await tg.sendMessage(chatId,
-      `Отправка почты не настроена.\n<i>${esc(mailer.mailHint())}</i>`, mainMenu());
+  // Письмо уходит из ящика самого пользователя: с нашего адреса оно
+  // попадало бы в спам и юридически отправителем были бы мы.
+  const box = mailbox.resolve(user.id);
+  if (!box.ok) {
+    await tg.sendMessage(chatId, esc(box.reason),
+      keyboard([[{ text: '✉️ Подключить почту', data: 'mb' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
     return;
   }
   const d = bdb.getDoc(user.id, docId);
@@ -966,7 +970,7 @@ async function mailDoc(tg, chatId, user, docId, emailOverride = null) {
       content: built.file.buffer,
       contentType: built.file.mime,
     }],
-  });
+  }, box.options);
 
   bdb.clearState(user.id);
   if (!res.ok) {
@@ -981,6 +985,58 @@ async function mailDoc(tg, chatId, user, docId, emailOverride = null) {
     `✉️ Отправил <b>${esc(d.title)} № ${esc(d.number)}</b> на <b>${esc(to)}</b>.`
     + (to !== cp.email ? '\nАдрес запомнил — в следующий раз спрашивать не буду.' : ''),
     keyboard([[{ text: '↩️ К документу', data: `doc:${docId}` }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+}
+
+// ---------- почтовый ящик пользователя ----------
+
+/** Экран «Почта для отправки»: что подключено и как это поменять. */
+async function showMailbox(tg, chatId, user) {
+  const box = mailbox.info(user.id);
+  const rows = [];
+  let txt = '<b>Почта для отправки</b>\n\n';
+  if (box) {
+    txt += `Подключён ящик <b>${esc(box.from)}</b>\n`
+      + `Сервер: ${esc(box.host)}:${box.port}\n`
+      + `Проверен: ${box.checkedAt ? 'да' : '<b>ещё нет</b>'}\n\n`
+      + 'Счета и акты уходят клиентам с этого адреса — как будто вы отправили их сами.';
+    rows.push([{ text: '🔁 Подключить другой ящик', data: 'mb.new' }]);
+    rows.push([{ text: '📨 Отправить проверочное письмо', data: 'mb.test' }]);
+    rows.push([{ text: '🗑 Отключить почту', data: 'mb.del' }]);
+  } else {
+    txt += 'Ящик не подключён. Подключите свой — и документы будут уходить '
+      + 'клиентам <b>с вашего адреса</b>.\n\n'
+      + '<i>Почему со своего: письмо с чужого адреса почтовые службы кладут '
+      + 'в спам, а получатель видит незнакомого отправителя и не открывает его.</i>';
+    rows.push([{ text: '✉️ Подключить ящик', data: 'mb.new' }]);
+  }
+  rows.push([{ text: '⬅️ К организации', data: 'org' }]);
+  await tg.sendMessage(chatId, txt, keyboard(rows));
+}
+
+/** Проверочное письмо самому себе: убедиться, что пароль принят. */
+async function testMailbox(tg, chatId, user) {
+  const box = mailbox.resolve(user.id);
+  if (!box.ok) { await tg.sendMessage(chatId, esc(box.reason)); return; }
+  await tg.sendChatAction(chatId, 'typing');
+  const res = await mailer.sendMail({
+    to: box.options.from,
+    subject: 'Проверка почты — Первичка',
+    text: 'Это проверочное письмо от бота «Первичка».\n\n'
+      + 'Если вы его видите, отправка документов клиентам настроена верно.',
+  }, box.options);
+  if (!res.ok) {
+    await tg.sendMessage(chatId,
+      `Не получилось: ${esc(res.error)}\n\n`
+      + '<i>Чаще всего дело в пароле: у Яндекса и Mail.ru нужен не обычный '
+      + 'пароль от почты, а отдельный «пароль приложения».</i>',
+      keyboard([[{ text: '🔁 Ввести заново', data: 'mb.new' }], [{ text: '⬅️ Назад', data: 'mb' }]]));
+    return;
+  }
+  mailbox.markChecked(user.id);
+  await tg.sendMessage(chatId,
+    `✅ Письмо ушло на <b>${esc(box.options.from)}</b> — проверьте ящик.\n`
+    + 'Почта настроена, документы можно отправлять клиентам.');
+  await showMailbox(tg, chatId, user);
 }
 
 // ---------- подпись и печать (факсимиле) ----------
@@ -1441,6 +1497,7 @@ async function showOrg(tg, chatId, user) {
     [{ text: fxLabel, data: 'fx' }],
     [{ text: `🧾 НДС: ${vatLabel(org)}`.slice(0, 60), data: 'vat' }],
     [{ text: `📊 Долг: ${BASIS_LABEL[bdb.basisOf(org)]}`.slice(0, 60), data: 'basis' }],
+    [{ text: mailbox.has(user.id) ? '✉️ Почта: подключена' : '✉️ Подключить почту', data: 'mb' }],
     [{ text: '⬅️ Меню', data: 'menu' }],
   ]));
 }
@@ -1549,6 +1606,63 @@ async function handleMessage(tg, msg) {
   if (state.state.startsWith('dog:')) { await handleDogText(tg, chatId, user, state, text); return; }
   if (state.state === 'support') { await handleSupportText(tg, chatId, user, text); return; }
   if (state.state === 'claim') { await claimByEmail(tg, chatId, user, text); return; }
+  if (state.state === 'mb:email') {
+    const addr = text.trim().toLowerCase();
+    if (!mailer.validEmail(addr)) {
+      await tg.sendMessage(chatId, 'Это не похоже на адрес почты. Напишите ещё раз:');
+      return;
+    }
+    const preset = mailbox.guessPreset(addr);
+    const p = mailbox.PRESETS[preset];
+    // У своего домена сервер известен только клиенту — без этого шага
+    // подключить корпоративную почту было бы нельзя вовсе.
+    if (preset === 'custom') {
+      bdb.setState(user.id, 'mb:host', { email: addr, preset });
+      await tg.sendMessage(chatId,
+        `Почта <b>${esc(addr)}</b> — сервис незнакомый, нужен адрес его SMTP-сервера.\n\n`
+        + 'Пришлите его в виде <code>smtp.вашдомен.ру</code> или '
+        + '<code>smtp.вашдомен.ру:587</code>, если порт нестандартный.\n'
+        + '<i>Адрес есть в справке вашего почтового провайдера, раздел «настройка почтовых программ».</i>',
+        keyboard([[{ text: '✖️ Отмена', data: 'mb' }]]));
+      return;
+    }
+    bdb.setState(user.id, 'mb:pass', { email: addr, preset });
+    await tg.sendMessage(chatId,
+      `Почта <b>${esc(addr)}</b> — похоже на <b>${esc(p.title)}</b>.\n\n`
+      + `${esc(p.hint)}\n\n`
+      + 'Пришлите пароль. Он хранится в зашифрованном виде и нигде не показывается; '
+      + 'сразу после сохранения удалите своё сообщение с паролем из чата.',
+      keyboard([[{ text: '✖️ Отмена', data: 'mb' }]]));
+    return;
+  }
+  if (state.state === 'mb:host') {
+    const m = /^([a-z0-9.-]+)(?::(\d{2,5}))?$/i.exec(text.trim());
+    if (!m) {
+      await tg.sendMessage(chatId, 'Не разобрал адрес сервера. Пример: <code>smtp.вашдомен.ру:465</code>');
+      return;
+    }
+    const port = Number(m[2] || 465);
+    bdb.setState(user.id, 'mb:pass', {
+      ...state.data, host: m[1], port, secure: port === 465,
+    });
+    await tg.sendMessage(chatId,
+      `Сервер <b>${esc(m[1])}:${port}</b>. Теперь пришлите пароль от ящика.\n\n`
+      + 'Он хранится в зашифрованном виде и нигде не показывается; '
+      + 'сразу после сохранения удалите своё сообщение с паролем из чата.',
+      keyboard([[{ text: '✖️ Отмена', data: 'mb' }]]));
+    return;
+  }
+  if (state.state === 'mb:pass') {
+    const { email, preset, host, port, secure } = state.data;
+    const saved = mailbox.save(user.id, {
+      preset, login: email, pass: text, from: email, host, port, secure,
+    });
+    bdb.clearState(user.id);
+    if (!saved.ok) { await tg.sendMessage(chatId, esc(saved.error)); return; }
+    await tg.sendMessage(chatId, 'Сохранил. Проверяю — отправлю письмо вам же…');
+    await testMailbox(tg, chatId, user);
+    return;
+  }
   if (state.state.startsWith('mail:')) {
     await mailDoc(tg, chatId, user, Number(state.state.split(':')[1]), text.trim());
     return;
@@ -1671,6 +1785,21 @@ async function handleCallback(tg, cq) {
         });
       }
       await showVat(tg, chatId, user);
+      return;
+    }
+    if (data === 'mb') { await showMailbox(tg, chatId, user); return; }
+    if (data === 'mb.new') {
+      bdb.setState(user.id, 'mb:email');
+      await tg.sendMessage(chatId,
+        'С какого адреса отправлять документы?\n\nНапишите почту, например <code>buh@yandex.ru</code>.',
+        keyboard([[{ text: '✖️ Отмена', data: 'mb' }]]));
+      return;
+    }
+    if (data === 'mb.test') { await testMailbox(tg, chatId, user); return; }
+    if (data === 'mb.del') {
+      mailbox.remove(user.id);
+      await tg.sendMessage(chatId, 'Почту отключил. Документы можно по-прежнему скачивать и пересылать вручную.');
+      await showMailbox(tg, chatId, user);
       return;
     }
     if (data === 'fx') { await showFacsimile(tg, chatId, user); return; }

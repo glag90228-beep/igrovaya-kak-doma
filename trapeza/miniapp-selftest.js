@@ -19,6 +19,7 @@ process.env.ENFORCE_LIMIT = '1';
 // DADATA_MOCK — это карта «значение → ответ справочника», а не флаг:
 // так прогон проверяет и разбор ответа, а не только факт вызова.
 // Данные выдуманные: настоящих организаций и людей в тестах не держим.
+process.env.MAIL_KEY = 'test-mail-key';
 process.env.DADATA_MOCK = JSON.stringify({
   7712345678: {
     name: { short_with_opf: 'ООО «Ромашка»', full_with_opf: 'Общество с ограниченной ответственностью «Ромашка»' },
@@ -288,25 +289,33 @@ async function main() {
     await call('POST', '/api/basis', { user: masha, body: { basis: 'closing' } });
   }
 
-  console.log('\n── отправка на почту ──');
+  console.log('\n── свой ящик и отправка на почту ──');
   {
     const net = require('node:net');
-    const got = { rcpt: [], data: '' };
+    const got = { rcpt: [], data: '', auth: null };
     const smtp = net.createServer((sock) => {
-      let inData = false; let body = '';
+      let inData = false; let body = ''; let expect = null;
       sock.setEncoding('utf8');
       sock.write('220 local ESMTP\r\n');
       sock.on('data', (chunk) => {
         if (inData) {
           body += chunk;
-          const end = body.indexOf('\r\n.\r\n');
-          if (end === -1) return;
-          got.data = body.slice(0, end); inData = false;
+          const e2 = body.indexOf('\r\n.\r\n');
+          if (e2 === -1) return;
+          got.data = body.slice(0, e2); inData = false; body = '';
           sock.write('250 Ok: queued\r\n');
           return;
         }
         for (const line of chunk.split('\r\n').filter(Boolean)) {
-          if (/^EHLO/i.test(line)) sock.write('250-local\r\n250 HELP\r\n');
+          if (expect) {
+            const v = Buffer.from(line, 'base64').toString('utf8');
+            if (expect === 'user') { got.auth = { user: v }; expect = 'pass'; sock.write('334 UA==\r\n'); } else {
+              got.auth.pass = v; expect = null; sock.write('235 ok\r\n');
+            }
+            continue;
+          }
+          if (/^EHLO/i.test(line)) sock.write('250-local\r\n250-AUTH LOGIN\r\n250 HELP\r\n');
+          else if (/^AUTH LOGIN/i.test(line)) { expect = 'user'; sock.write('334 VQ==\r\n'); }
           else if (/^RCPT TO:/i.test(line)) { got.rcpt.push(line.slice(8).replace(/[<>]/g, '').trim()); sock.write('250 Ok\r\n'); }
           else if (/^DATA/i.test(line)) { inData = true; sock.write('354 go\r\n'); }
           else if (/^QUIT/i.test(line)) { sock.write('221 bye\r\n'); sock.end(); }
@@ -315,38 +324,45 @@ async function main() {
       });
       sock.on('error', () => {});
     });
-    await new Promise((res2) => smtp.listen(0, '127.0.0.1', res2));
+    await new Promise((r2) => smtp.listen(0, '127.0.0.1', r2));
+    const port = smtp.address().port;
 
     const someDoc = (await call('GET', '/api/docs', { user: masha })).json.docs
       .find((x) => x.type === 'sch');
 
-    delete process.env.SMTP_HOST;
     r = await call('GET', '/api/state', { user: masha });
-    ok(r.json.features.mail === false, 'без настроек почта помечена как недоступная');
+    ok(r.json.features.mail === false && r.json.mailbox === null,
+      'без своего ящика почта недоступна');
     r = await call('POST', '/api/doc/mail', { user: masha, body: { id: someDoc.id, email: 'a@b.ru' } });
-    ok(r.status === 400 && /не настроена/.test(r.json.error), 'отправка без настроек отклоняется');
+    ok(r.status === 400 && /не подключена/.test(r.json.error), 'отправка без ящика отклоняется',
+      (r.json || {}).error);
 
-    process.env.SMTP_HOST = '127.0.0.1';
-    process.env.SMTP_PORT = String(smtp.address().port);
-    process.env.SMTP_FROM = 'bot@pervichka.ru';
-    delete process.env.SMTP_USER;
-    delete process.env.SMTP_SECURE;
+    r = await call('POST', '/api/mailbox', { user: masha, body: { email: 'не-адрес', pass: 'x' } });
+    ok(r.status === 400, 'кривой адрес ящика отклонён');
 
-    r = await call('GET', '/api/state', { user: masha });
-    ok(r.json.features.mail === true, 'с настройками почта доступна');
+    r = await call('POST', '/api/mailbox', {
+      user: masha,
+      body: { email: 'buh@mycompany.ru', pass: 'секрет-приложения', host: '127.0.0.1', port, secure: false },
+    });
+    ok(r.status === 200 && r.json.mailbox && r.json.mailbox.from === 'buh@mycompany.ru',
+      'ящик подключён и сразу проверен письмом', (r.json || {}).error);
+    ok(got.rcpt.includes('buh@mycompany.ru'), 'проверочное письмо ушло на свой адрес', got.rcpt.join());
+    ok(got.auth && got.auth.pass === 'секрет-приложения', 'пароль дошёл до сервера');
+    ok(!JSON.stringify(r.json).includes('секрет-приложения'), 'пароль наружу не отдаётся');
 
-    r = await call('POST', '/api/doc/mail', { user: masha, body: { id: someDoc.id, email: 'кривой' } });
-    ok(r.status === 400, 'кривой адрес отклонён');
+    r = await call('GET', '/api/state', { user: petya });
+    ok(r.json.mailbox === null && r.json.features.mail === false,
+      'чужой ящик другому пользователю не виден');
 
+    got.rcpt.length = 0;
     r = await call('POST', '/api/doc/mail', { user: masha, body: { id: someDoc.id, email: 'buh@zarya.ru' } });
-    ok(r.status === 200 && r.json.sent === 'buh@zarya.ru', 'документ отправлен на почту',
+    ok(r.status === 200 && r.json.sent === 'buh@zarya.ru', 'документ отправлен клиенту',
       r.status === 200 ? r.json.sent : (r.json || {}).error);
-    ok(got.rcpt.includes('buh@zarya.ru'), 'сервер получил адрес', got.rcpt.join());
+    ok(got.rcpt.includes('buh@zarya.ru'), 'сервер получил адрес клиента', got.rcpt.join());
     ok(/Content-Disposition: attachment/.test(got.data), 'вложение на месте');
-    ok(r.json.remembered === true, 'адрес запомнен у контрагента');
+    ok(/^From:.*mycompany\.ru/m.test(got.data),
+      'письмо ушло с адреса клиента, а не с нашего', (/^From:.*/m.exec(got.data) || [''])[0]);
 
-    // Смотрим именно того контрагента, чей счёт отправляли: список
-    // контрагентов к этому моменту уже не из одного человека.
     r = await call('GET', '/api/cps', { user: masha });
     const owner = r.json.cps.find((c) => c.id === someDoc.cpId);
     ok(owner && owner.email === 'buh@zarya.ru', 'почта запомнилась у контрагента из документа',
@@ -360,9 +376,12 @@ async function main() {
     r = await call('POST', '/api/doc/mail', { user: petya, body: { id: someDoc.id, email: 'a@b.ru' } });
     ok(r.status === 400, 'чужой документ по почте не отправить', (r.json || {}).error);
 
+    r = await call('POST', '/api/mailbox/delete', { user: masha });
+    ok(r.status === 200, 'ящик можно отключить');
+    r = await call('GET', '/api/state', { user: masha });
+    ok(r.json.mailbox === null, 'после отключения ящика нет');
+
     smtp.close();
-    delete process.env.SMTP_HOST;
-    delete process.env.SMTP_PORT;
   }
 
   console.log('\n── подпись и печать ──');
