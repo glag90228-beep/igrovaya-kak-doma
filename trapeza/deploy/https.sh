@@ -15,12 +15,39 @@ apt-get update -qq
 apt-get install -y nginx certbot python3-certbot-nginx
 
 say "2/4 Проверяю, что домен смотрит сюда"
-MY_IP=$(curl -s https://api.ipify.org || true)
-DNS_IP=$(getent hosts "$DOMAIN" | awk '{print $1}' | head -1 || true)
-if [ -n "$MY_IP" ] && [ -n "$DNS_IP" ] && [ "$MY_IP" != "$DNS_IP" ]; then
-  echo "⚠️  $DOMAIN указывает на $DNS_IP, а сервер — $MY_IP."
-  echo "   Поправьте A-запись и подождите обновления DNS, иначе сертификат не выпустится."
+# Сверяем адреса одного семейства: getent hosts отдаёт сначала IPv6, и сравнение
+# его с IPv4 сервера всегда ложно «не совпадает».
+MY_V4=$(curl -s -4 --max-time 10 https://api.ipify.org || true)
+MY_V6=$(curl -s -6 --max-time 10 https://api64.ipify.org || true)
+DNS_V4=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}' || true)
+DNS_V6=$(getent ahostsv6 "$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}' || true)
+echo "  сервер: IPv4 ${MY_V4:-—}, IPv6 ${MY_V6:-нет}"
+echo "  домен:  A ${DNS_V4:-нет}, AAAA ${DNS_V6:-нет}"
+
+problems=''
+add() { problems="$problems
+  • $1"; }
+if [ -z "$DNS_V4" ] && [ -z "$DNS_V6" ]; then
+  add "у домена нет ни A, ни AAAA — проверьте DNS"
+fi
+if [ -n "$MY_V4" ] && [ -n "$DNS_V4" ] && [ "$MY_V4" != "$DNS_V4" ]; then
+  add "A-запись ведёт на $DNS_V4, а сервер — $MY_V4"
+fi
+# Let's Encrypt предпочитает IPv6: неработающая AAAA роняет выпуск даже при верной A.
+if [ -n "$DNS_V6" ] && [ -z "$MY_V6" ]; then
+  add "есть AAAA ($DNS_V6), но IPv6 на сервере не отвечает — Let's Encrypt пойдёт по IPv6 и не достучится"
+fi
+if [ -n "$DNS_V6" ] && [ -n "$MY_V6" ] && [ "$DNS_V6" != "$MY_V6" ]; then
+  add "AAAA ведёт на $DNS_V6, а IPv6 сервера — $MY_V6"
+fi
+
+if [ -n "$problems" ]; then
+  echo ""
+  echo "⚠️  Сертификат, скорее всего, не выпустится:$problems"
+  echo "   Поправьте DNS и подождите обновления записей."
   read -rp "Продолжить всё равно? [y/N] " a; [ "$a" = "y" ] || exit 1
+else
+  echo "  ✅ домен смотрит на этот сервер"
 fi
 
 say "3/4 Конфиг nginx"
