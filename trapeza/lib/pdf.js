@@ -11,6 +11,7 @@
  */
 
 let _chromium; // undefined = не пробовали, null = недоступен
+let launches = 0; // сколько раз поднимали браузер
 
 function loadChromium() {
   if (_chromium !== undefined) return _chromium;
@@ -61,6 +62,7 @@ async function getBrowser() {
   };
   if (process.env.CHROMIUM_PATH) launch.executablePath = process.env.CHROMIUM_PATH;
 
+  launches += 1;   // счётчик запусков: по нему проверяют переиспользование
   starting = chromium.launch(launch).then((b) => {
     browser = b;
     starting = null;
@@ -133,4 +135,8 @@ async function closePdf() {
   }
 }
 
-module.exports = { pdfAvailable, htmlToPdf, htmlToPng, closePdf, loadChromium };
+module.exports = {
+  pdfAvailable, htmlToPdf, htmlToPng, closePdf, loadChromium,
+  /** Сколько раз поднимался браузер — для проверки переиспользования. */
+  launches: () => launches,
+};

@@ -9,6 +9,7 @@ const { Telegram, keyboard } = require('./lib/tg');
 const bdb = require('./lib/bot-db');
 const { formatRub, amountInWords, round2, vatTotals } = require('./lib/money');
 const { buildAkt } = require('./lib/xlsx-akt');
+const { buildRegistry } = require('./lib/xlsx-registry');
 const { buildAktUslugHtml } = require('./lib/akt-uslug');
 const { buildSchetHtml } = require('./lib/schet');
 const { buildPlatyozhkaHtml } = require('./lib/platyozhka');
@@ -581,6 +582,47 @@ async function repeatDoc(tg, chatId, user, docId) {
   await showPreview(tg, chatId, user, bdb.getState(user.id));
 }
 
+/** Границы периода по короткому имени. */
+function periodOf(name) {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const iso = (d) => d.toISOString().slice(0, 10);
+  if (name === 'prev') {
+    return { from: iso(new Date(Date.UTC(y, m - 1, 1))), to: iso(new Date(Date.UTC(y, m, 0))), title: 'прошлый месяц' };
+  }
+  if (name === 'quarter') {
+    const q = Math.floor(m / 3) * 3;
+    return { from: iso(new Date(Date.UTC(y, q, 1))), to: iso(new Date(Date.UTC(y, q + 3, 0))), title: 'текущий квартал' };
+  }
+  if (name === 'year') {
+    return { from: `${y}-01-01`, to: `${y}-12-31`, title: `${y} год` };
+  }
+  return { from: iso(new Date(Date.UTC(y, m, 1))), to: iso(new Date(Date.UTC(y, m + 1, 0))), title: 'текущий месяц' };
+}
+
+/** Реестр выписанного за период — то, чем закрывают месяц. */
+async function sendRegistry(tg, chatId, user, periodName) {
+  const org = bdb.getDefaultOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  const { from, to, title } = periodOf(periodName);
+  const docs = bdb.docsBetween(user.id, from, to);
+
+  await tg.sendChatAction(chatId, 'upload_document');
+  const buf = await buildRegistry({ org, docs, from, to });
+  const sum = round2(docs.reduce((a2, d) => a2 + (Number(d.total) || 0), 0));
+  const unpaid = docs.filter((d) => !d.paid_at);
+  const unpaidSum = round2(unpaid.reduce((a2, d) => a2 + (Number(d.total) || 0), 0));
+
+  await tg.sendDocument(chatId, {
+    filename: `Реестр_${from}_${to}.xlsx`,
+    buffer: buf,
+    caption: `Реестр за ${esc(title)} (${ru(from)}—${ru(to)}).\n`
+      + `Документов: <b>${docs.length}</b> на <b>${formatRub(sum)}</b>.`
+      + (unpaid.length ? `\nНе оплачено: <b>${unpaid.length}</b> на <b>${formatRub(unpaidSum)}</b>.` : '\nВсё оплачено.'),
+  });
+}
+
 /** Что ещё не оплачено — то, за чем следят каждый день. */
 async function showUnpaid(tg, chatId, user) {
   const list = bdb.unpaidDocs(user.id);
@@ -622,6 +664,7 @@ async function showDocs(tg, chatId, user, cpId = null) {
       data: `doc:${d.id}`,
     }];
   });
+  rows.push([{ text: '📊 Реестр за период (Excel)', data: 'reg' }]);
   rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
   await tg.sendMessage(chatId,
     `Последние документы (в этом месяце ${q.used}${q.paid ? '' : ` из ${q.limit} бесплатных`}):`,
@@ -1574,7 +1617,9 @@ async function handleCallback(tg, cq) {
       const [rate, gross] = data.slice(12).split(':');
       const dd = st2.data;
       dd.doc = dd.doc || {};
-      if (rate === 'none') { delete dd.doc.vatRate; delete dd.doc.priceIncludesVat; } else {
+      // Именно null, а не удаление ключа: «без НДС» для этого счёта должно
+      // перебивать настройку организации, а пустое место она заполнит сама.
+      if (rate === 'none') { dd.doc.vatRate = null; dd.doc.priceIncludesVat = false; } else {
         dd.doc.vatRate = Number(rate);
         dd.doc.priceIncludesVat = gross === '1';
       }
@@ -1604,6 +1649,15 @@ async function handleCallback(tg, cq) {
       return;
     }
     if (data === 'unpaid') { await showUnpaid(tg, chatId, user); return; }
+    if (data === 'reg') {
+      await tg.sendMessage(chatId, 'Реестр за какой период?', keyboard([
+        [{ text: 'Текущий месяц', data: 'reg.p:month' }, { text: 'Прошлый месяц', data: 'reg.p:prev' }],
+        [{ text: 'Квартал', data: 'reg.p:quarter' }, { text: 'Год', data: 'reg.p:year' }],
+        [{ text: '⬅️ К документам', data: 'docs' }],
+      ]));
+      return;
+    }
+    if (data.startsWith('reg.p:')) { await sendRegistry(tg, chatId, user, data.slice(6)); return; }
     if (data === 'vat') { await showVat(tg, chatId, user); return; }
     if (data.startsWith('vat.set:')) {
       const [rate, gross] = data.slice(8).split(':');

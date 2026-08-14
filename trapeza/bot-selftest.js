@@ -697,6 +697,49 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     'без адреса приложения остаётся список команд', plainBtn && plainBtn.menu_button.type);
   if (keepUrl) process.env.WEBAPP_URL = keepUrl;
 
+  console.log('\n── реестр документов ──');
+  {
+    const ExcelJS = require('exceljs');
+    const bdb4 = require('./lib/bot-db');
+    const uid4 = fxUserId();
+
+    await tap('docs');
+    ok(Boolean(button('Реестр за период')), 'в журнале есть кнопка реестра');
+    await tap('reg');
+    ok(last().includes('за какой период'), 'бот спрашивает период');
+
+    const beforeReg = files.length;
+    await tap('reg.p:year');
+    ok(files.length === beforeReg + 1, 'реестр пришёл файлом');
+    const regFile = files[files.length - 1];
+    ok(regFile.filename.startsWith('Реестр_') && regFile.filename.endsWith('.xlsx'),
+      'это Excel с говорящим именем', regFile.filename);
+    ok(regFile.caption.includes('Документов:'), 'в подписи есть количество и сумма',
+      regFile.caption.slice(0, 60));
+
+    // Читаем файл обратно: важно, что суммы — числа, а не текст,
+    // иначе реестр не складывается и им нельзя пользоваться.
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(path.join(OUT, regFile.filename));
+    const sheet = wb.getWorksheet('Реестр');
+    ok(Boolean(sheet), 'лист «Реестр» на месте');
+    ok(sheet.getCell('A5').value === 'Дата' && sheet.getCell('G5').value === 'Всего',
+      'шапка таблицы на месте');
+    ok(typeof sheet.getCell('G6').value === 'number', 'суммы записаны числами, а не строками',
+      typeof sheet.getCell('G6').value);
+    const totalCell = sheet.getCell(`G${sheet.rowCount}`).value;
+    ok(totalCell && totalCell.formula && totalCell.formula.startsWith('SUM('),
+      'итог — живая формула, пересчитается после фильтрации',
+      totalCell && totalCell.formula);
+    ok(Boolean(sheet.autoFilter), 'включён автофильтр для сортировки');
+
+    const yearDocs = bdb4.docsBetween(uid4, '2026-01-01', '2026-12-31');
+    ok(yearDocs.length > 0 && yearDocs.every((d) => 'cpName' in d),
+      'в выборку попали документы с именами контрагентов', yearDocs.length);
+    const other = bdb4.docsBetween(uid4, '2020-01-01', '2020-12-31');
+    ok(other.length === 0, 'за пустой период документов нет');
+  }
+
   console.log('\n── защита от второго экземпляра ──');
   {
     const { acquire, alive } = require('./lib/lock');
@@ -977,8 +1020,15 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   console.log('\n── общий браузер для PDF ──');
   const pdf = require('./lib/pdf');
   if (pdf.pdfAvailable()) {
-    // Замер честный: закрываем браузер, чтобы первый вызов включал холодный
-    // старт Chromium; тёплые повторные вызовы должны быть заметно быстрее.
+    // Проверяем сам факт переиспользования, а не скорость: сравнение
+    // времени на общей машине то проходит, то нет, и ничего не доказывает.
+    await pdf.closePdf();
+    const launchesBefore = pdf.launches();
+    await pdf.htmlToPdf('<h1>раз</h1>');
+    await Promise.all([pdf.htmlToPdf('<h1>два</h1>'), pdf.htmlToPdf('<h1>три</h1>')]);
+    ok(pdf.launches() === launchesBefore + 1,
+      'три документа собраны на одном браузере, а не на трёх',
+      `запусков: ${pdf.launches() - launchesBefore}`);
     await pdf.closePdf();
     const t0 = Date.now();
     await pdf.htmlToPdf('<h1>раз</h1>');

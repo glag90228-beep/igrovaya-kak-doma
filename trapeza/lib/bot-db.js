@@ -338,6 +338,23 @@ function unmarkPaid(userId, docId) {
   return true;
 }
 
+/** Документы за период — для реестра. Имя контрагента подставляем сразу. */
+function docsBetween(userId, from, to, cpId = null) {
+  const rows = cpId
+    ? db.prepare(`SELECT * FROM documents WHERE user_id = ? AND date >= ? AND date <= ?
+                    AND cp_id = ? ORDER BY date, id`).all(userId, from, to, cpId)
+    : db.prepare(`SELECT * FROM documents WHERE user_id = ? AND date >= ? AND date <= ?
+                    ORDER BY date, id`).all(userId, from, to);
+  const names = new Map();
+  return rows.map(withPayload).map((d) => {
+    if (d.cp_id && !names.has(d.cp_id)) {
+      const cp = getCp(userId, d.cp_id);
+      names.set(d.cp_id, cp ? cp.name : '');
+    }
+    return { ...d, cpName: d.cp_id ? names.get(d.cp_id) : '' };
+  });
+}
+
 /** Неоплаченные документы с суммой — то, за чем следят каждый день. */
 function unpaidDocs(userId, limit = 50) {
   const rows = db.prepare(`
@@ -538,7 +555,7 @@ module.exports = {
   createCp, updateCp, listCps, getCp,
   addOp, listOps, deleteLastOp, balanceOf, debtors,
   DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
-  markPaid, unmarkPaid, unpaidDocs,
+  markPaid, unmarkPaid, unpaidDocs, docsBetween,
   markBlocked, markActive, isBlocked, reachableUsers,
   nextSeq, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,

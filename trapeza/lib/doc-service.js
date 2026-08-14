@@ -140,6 +140,16 @@ async function issueDocument(userId, {
   const clean = cleanItems(items);
   if (!clean.length) return fail('items', 'Добавьте хотя бы одну позицию.');
 
+  // Режим НДС организации применяем здесь, а не в боте: иначе мини-приложение
+  // выписывало бы счета всегда без налога, игнорируя настройку.
+  // Явно переданный vatRate (в том числе null — «этот счёт без НДС»)
+  // сильнее умолчания, поэтому проверяем наличие ключа, а не значение.
+  let fields = extra;
+  if (type === 'sch' && !Object.prototype.hasOwnProperty.call(extra, 'vatRate')) {
+    const v = bdb.vatOf(org);
+    if (v.rate != null) fields = { ...extra, vatRate: v.rate, priceIncludesVat: v.gross };
+  }
+
   const quota = bdb.quota(userId);
   if (!skipQuota && !quota.allowed) {
     return { ...fail('quota', `Бесплатные документы на этот месяц закончились (${quota.limit}).`), quota };
@@ -149,9 +159,9 @@ async function issueDocument(userId, {
   const year = Number(when.slice(0, 4));
   const seq = bdb.nextSeq(userId, type, year);
   const num = String(number == null || number === '' ? seq : number).slice(0, 40);
-  const total = totalOf(clean, extra);
+  const total = totalOf(clean, fields);
 
-  const doc = { number: num, date: when, items: clean, ...extra };
+  const doc = { number: num, date: when, items: clean, ...fields };
   const file = await renderFile(
     kind.build({ org: withFx(userId, org, type), cp, doc }),
     `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
@@ -160,7 +170,7 @@ async function issueDocument(userId, {
   bdb.rememberItems(userId, clean);
   const id = bdb.saveDoc(userId, {
     orgId: org.id, cpId: cp.id, type, number: num, seq, date: when, total,
-    payload: { items: clean, ...extra },
+    payload: { items: clean, ...fields },
   });
 
   // Долг в журнал — если этот тип документа его создаёт при выбранном
