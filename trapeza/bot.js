@@ -254,7 +254,11 @@ async function runAuto(kind, rawValue, values) {
   }
 
   if (kind === 'party') {
-    if (!dadata.dadataAvailable()) return { note: '', warn: '' }; // ключа нет — молча вручную
+    // Молчать нельзя: человек вводит ИНН, ничего не подставляется, и он
+    // решает, что бот сломался. Говорим, что справочник просто не подключён.
+    if (!dadata.dadataAvailable()) {
+      return { note: '', warn: 'Справочник не подключён — заполним поля вручную.' };
+    }
     const r = await dadata.partyByInn(raw);
     if (!r.ok) return { note: '', warn: r.error };
     fill(values, r.fields, ['name', 'full_name', 'kpp', 'address', 'signer']);
@@ -262,7 +266,9 @@ async function runAuto(kind, rawValue, values) {
   }
 
   if (kind === 'bank') {
-    if (!dadata.dadataAvailable()) return { note: '', warn: '' };
+    if (!dadata.dadataAvailable()) {
+      return { note: '', warn: 'Справочник не подключён — название банка и к/с впишите сами.' };
+    }
     const r = await dadata.bankByBik(raw);
     if (!r.ok) return { note: '', warn: r.error };
     fill(values, r.fields, ['bank_name', 'corr_acc']);
@@ -1607,6 +1613,36 @@ async function handleCallback(tg, cq) {
 async function main() {
   const token = process.env.BOT_TOKEN;
   if (!token) { console.error('Не задан BOT_TOKEN. Запуск: BOT_TOKEN=xxxxx node bot.js'); process.exit(1); }
+  // Диагностика справочника — до обращения к Telegram: она про DaData,
+  // и не должна падать из-за токена бота.
+  if (process.argv.includes('--dadata')) {
+    const value = process.argv[process.argv.indexOf('--dadata') + 1] || '';
+    console.log(`Ключ DaData: ${process.env.DADATA_TOKEN
+      ? `задан, ${process.env.DADATA_TOKEN.length} символов, начинается на ${process.env.DADATA_TOKEN.slice(0, 6)}…`
+      : 'НЕ ЗАДАН — автозаполнение выключено, поля придётся вводить руками'}`);
+    if (!value) {
+      console.log('\nЧто проверить:  node bot.js --dadata 044525974   (БИК)');
+      console.log('                node bot.js --dadata 7707083893  (ИНН)');
+      return;
+    }
+    const digits = value.replace(/\D/g, '');
+    const isBik = digits.length === 9;
+    console.log(`Проверяю ${isBik ? 'БИК' : 'ИНН'} ${digits}…`);
+    const r = isBik ? await dadata.bankByBik(digits) : await dadata.partyByInn(digits);
+    if (r.ok) {
+      console.log('✅ Справочник ответил:');
+      for (const [k, v] of Object.entries(r.fields)) if (v) console.log(`   ${k}: ${v}`);
+    } else {
+      console.log(`❌ Не получилось: ${r.error}`);
+      console.log('\nЧастые причины:');
+      console.log('  • DADATA_TOKEN пуст или это «секретный ключ» вместо «API-ключа»');
+      console.log('  • в кабинете dadata.ru стоит ограничение по IP — добавьте адрес сервера');
+      console.log('  • закончился дневной лимит бесплатного тарифа');
+      console.log('  • сервер не выпускает наружу https — проверьте: curl -sI https://dadata.ru');
+    }
+    return;
+  }
+
   const tg = new Telegram(token);
   const me = await tg.call('getMe');
 

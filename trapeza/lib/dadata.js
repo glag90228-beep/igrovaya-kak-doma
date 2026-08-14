@@ -50,7 +50,22 @@ async function query(url, value) {
     },
     body: JSON.stringify({ query: digits(value), count: 1 }),
   });
-  if (!res.ok) throw new Error(`DaData ${res.status}`);
+  if (!res.ok) {
+    // «DaData 403» ничего не объясняет ни пользователю, ни владельцу бота.
+    // Причины у кодов разные, и лечатся они по-разному, поэтому говорим прямо.
+    const body = await res.text().catch(() => '');
+    const why = {
+      401: 'ключ DaData не принят — проверьте DADATA_TOKEN (нужен «API-ключ», а не «секретный ключ»)',
+      403: 'DaData отказала в доступе — ключ заблокирован, исчерпан дневной лимит '
+        + 'или в кабинете стоит ограничение по IP',
+      429: 'слишком много запросов к DaData — лимит на сегодня исчерпан',
+      500: 'DaData временно недоступна, попробуйте позже',
+    }[res.status] || `DaData ответила ошибкой ${res.status}`;
+    const err = new Error(why);
+    err.status = res.status;
+    err.body = String(body).slice(0, 300);
+    throw err;
+  }
   return res.json();
 }
 
