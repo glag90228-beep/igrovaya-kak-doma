@@ -38,20 +38,33 @@ db.exec(`
   );
 `);
 
+// Чтение входящих добавили позже — дописываем колонки к существующим ящикам.
+for (const [name, def] of [['imap_host', "TEXT NOT NULL DEFAULT ''"],
+  ['imap_port', 'INTEGER NOT NULL DEFAULT 993'],
+  ['last_uid', 'INTEGER NOT NULL DEFAULT 0']]) {
+  const cols = db.prepare('PRAGMA table_info(mailboxes)').all().map((c) => c.name);
+  if (!cols.includes(name)) db.exec(`ALTER TABLE mailboxes ADD COLUMN ${name} ${def}`);
+}
+
 /**
  * Готовые настройки популярных почт: человеку остаётся ввести адрес и
  * пароль приложения, а не разбираться, что такое STARTTLS.
  */
 const PRESETS = {
   yandex: { title: 'Яндекс', host: 'smtp.yandex.ru', port: 465, secure: true,
+    imapHost: 'imap.yandex.ru', imapPort: 993,
     hint: 'Нужен пароль приложения: id.yandex.ru → Безопасность → Пароли приложений → Почта.' },
   mailru: { title: 'Mail.ru', host: 'smtp.mail.ru', port: 465, secure: true,
+    imapHost: 'imap.mail.ru', imapPort: 993,
     hint: 'Нужен пароль для внешнего приложения: id.mail.ru → Безопасность → Пароли для внешних приложений.' },
   gmail: { title: 'Gmail', host: 'smtp.gmail.com', port: 587, secure: false,
+    imapHost: 'imap.gmail.com', imapPort: 993,
     hint: 'Нужен пароль приложения и включённая двухфакторная защита в аккаунте Google.' },
   rambler: { title: 'Рамблер', host: 'smtp.rambler.ru', port: 465, secure: true,
+    imapHost: 'imap.rambler.ru', imapPort: 993,
     hint: 'Пароль обычный, от почты.' },
   custom: { title: 'Другой', host: '', port: 465, secure: true,
+    imapHost: '', imapPort: 993,
     hint: 'Понадобятся адрес SMTP-сервера и порт — их даёт ваш почтовый провайдер.' },
 };
 
@@ -85,12 +98,15 @@ function info(userId) {
     from: m.from_addr,
     fromName: m.from_name,
     checkedAt: m.checked_at,
+    imapHost: m.imap_host,
+    imapPort: m.imap_port,
+    canRead: Boolean(m.imap_host),
   };
 }
 
 /** @returns {{ok:true}|{ok:false, error:string}} */
 function save(userId, {
-  preset, host, port, secure, login, pass, from, fromName,
+  preset, host, port, secure, login, pass, from, fromName, imapHost, imapPort,
 }) {
   if (!canEncrypt()) {
     return { ok: false, error: 'на сервере нечем шифровать пароль — не задан MAIL_KEY.' };
@@ -103,15 +119,20 @@ function save(userId, {
   if (!String(pass || '')) return { ok: false, error: 'Не указан пароль.' };
 
   db.prepare(`
-    INSERT INTO mailboxes(user_id, host, port, secure, login, pass_enc, from_addr, from_name, created_at)
-    VALUES(?,?,?,?,?,?,?,?,?)
+    INSERT INTO mailboxes(user_id, host, port, secure, login, pass_enc, from_addr,
+                          from_name, imap_host, imap_port, created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(user_id) DO UPDATE SET host=excluded.host, port=excluded.port,
       secure=excluded.secure, login=excluded.login, pass_enc=excluded.pass_enc,
-      from_addr=excluded.from_addr, from_name=excluded.from_name, checked_at=''
+      from_addr=excluded.from_addr, from_name=excluded.from_name,
+      imap_host=excluded.imap_host, imap_port=excluded.imap_port, checked_at=''
   `).run(userId, useHost, Number(port || p.port) || 465,
     (secure == null ? p.secure : Boolean(secure)) ? 1 : 0,
     String(login || addr).trim(), seal(String(pass)), addr,
-    String(fromName || '').trim(), new Date().toISOString());
+    String(fromName || '').trim(),
+    String(imapHost || p.imapHost || '').trim(),
+    Number(imapPort || p.imapPort) || 993,
+    new Date().toISOString());
   return { ok: true };
 }
 
@@ -160,4 +181,31 @@ function resolve(userId) {
   return { ok: false, reason: 'Почта не подключена — подключите свой ящик в разделе «Моя организация».' };
 }
 
-module.exports = { PRESETS, guessPreset, get, has, info, save, remove, markChecked, resolve };
+/**
+ * Настройки для чтения входящих. Отдельно от отправки: сервер другой,
+ * и у своего домена IMAP может быть не поднят вовсе.
+ */
+function resolveImap(userId) {
+  const m = get(userId);
+  if (!m) return { ok: false, reason: 'Почта не подключена.' };
+  if (!m.imap_host) {
+    return { ok: false, reason: 'Для этого ящика не задан сервер входящей почты (IMAP).' };
+  }
+  const pass = open(m.pass_enc);
+  if (pass == null) return { ok: false, reason: 'Пароль от ящика не читается — подключите почту заново.' };
+  return {
+    ok: true,
+    config: { host: m.imap_host, port: m.imap_port || 993, secure: true, user: m.login, pass },
+    lastUid: m.last_uid || 0,
+  };
+}
+
+function setLastUid(userId, uid) {
+  db.prepare('UPDATE mailboxes SET last_uid = ? WHERE user_id = ? AND last_uid < ?')
+    .run(Number(uid) || 0, userId, Number(uid) || 0);
+}
+
+module.exports = {
+  PRESETS, guessPreset, get, has, info, save, remove, markChecked, resolve,
+  resolveImap, setLastUid,
+};

@@ -29,6 +29,8 @@ const docService = require('./lib/doc-service');
 const facsimile = require('./lib/facsimile');
 const mailer = require('./lib/mail');
 const mailbox = require('./lib/mailbox');
+const { fetchNew } = require('./lib/imap');
+const mime = require('./lib/mime');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -62,14 +64,17 @@ function webAppUrl() {
   return /^https:\/\/.+/i.test(url) ? url : '';
 }
 
-function mainMenu() {
+function mainMenu(user = null) {
   const app = webAppUrl();
+  const canRead = user && mailbox.has(user.id)
+    && (mailbox.info(user.id) || {}).canRead;
   return keyboard([
     ...(app ? [[{ text: '📱 Открыть приложение', webApp: app }]] : []),
     [{ text: '🏢 Моя организация', data: 'org' }],
     [{ text: '👥 Контрагенты', data: 'cps' }],
     [{ text: '💸 Кто должен', data: 'debts' }, { text: '⏳ Не оплачено', data: 'unpaid' }],
     [{ text: '📁 Мои документы', data: 'docs' }],
+    ...(canRead ? [[{ text: '📥 Проверить почту', data: 'inbox' }]] : []),
     [{ text: '⭐ Подписка', data: 'billing' }],
     [{ text: '❓ Помощь', data: 'help' }, { text: '💬 Поддержка', data: 'support' }],
   ]);
@@ -1001,6 +1006,7 @@ async function showMailbox(tg, chatId, user) {
       + 'Счета и акты уходят клиентам с этого адреса — как будто вы отправили их сами.';
     rows.push([{ text: '🔁 Подключить другой ящик', data: 'mb.new' }]);
     rows.push([{ text: '📨 Отправить проверочное письмо', data: 'mb.test' }]);
+    if (box.canRead) rows.push([{ text: '📥 Проверить входящие', data: 'inbox' }]);
     rows.push([{ text: '🗑 Отключить почту', data: 'mb.del' }]);
   } else {
     txt += 'Ящик не подключён. Подключите свой — и документы будут уходить '
@@ -1037,6 +1043,92 @@ async function testMailbox(tg, chatId, user) {
     `✅ Письмо ушло на <b>${esc(box.options.from)}</b> — проверьте ящик.\n`
     + 'Почта настроена, документы можно отправлять клиентам.');
   await showMailbox(tg, chatId, user);
+}
+
+/**
+ * Проверка входящей почты: забираем новые письма и показываем те, в которых
+ * есть вложения похожие на документы.
+ *
+ * Письма не помечаем прочитанными и ничего не удаляем — человек по-прежнему
+ * ведёт свою почту сам, а бот только подсматривает. Помечать чужие письма
+ * своими действиями значит ломать чужой рабочий процесс.
+ */
+async function checkInbox(tg, chatId, user) {
+  const conf = mailbox.resolveImap(user.id);
+  if (!conf.ok) {
+    await tg.sendMessage(chatId, `${esc(conf.reason)}`,
+      keyboard([[{ text: '✉️ Настроить почту', data: 'mb' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+
+  await tg.sendChatAction(chatId, 'typing');
+  const res = await fetchNew(conf.config, { limit: 15, unseenOnly: false, sinceDays: 14 });
+  if (!res.ok) {
+    await tg.sendMessage(chatId,
+      `Не смог прочитать почту: ${esc(res.error)}\n\n`
+      + '<i>Если пароль подошёл для отправки, но не подходит здесь — у некоторых '
+      + 'провайдеров доступ по IMAP включается отдельно в настройках почты.</i>',
+      keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+
+  // Оставляем только письма с вложениями-документами и только новые.
+  const found = [];
+  for (const m of res.messages) {
+    if (m.uid <= conf.lastUid) continue;
+    const parsed = mime.parseMessage(m.raw);
+    const docs = parsed.attachments.filter(mime.looksLikeDocument);
+    if (docs.length) found.push({ uid: m.uid, ...parsed, docs });
+  }
+
+  if (!found.length) {
+    await tg.sendMessage(chatId,
+      `Просмотрел ${res.messages.length} ${plural(res.messages.length, 'письмо', 'письма', 'писем')} `
+      + 'за две недели — новых счетов не нашёл.',
+      keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+
+  inboxCache.set(user.id, found);
+  const maxUid = Math.max(...found.map((f) => f.uid));
+  mailbox.setLastUid(user.id, maxUid);
+
+  await tg.sendMessage(chatId,
+    `Нашёл ${found.length} ${plural(found.length, 'письмо', 'письма', 'писем')} с документами:`,
+    keyboard([
+      ...found.map((f, i) => [{
+        text: `${f.fromName || f.from} · ${f.subject || 'без темы'}`.slice(0, 60),
+        data: `in.m:${i}`,
+      }]),
+      [{ text: '⬅️ Меню', data: 'menu' }],
+    ]));
+}
+
+/** Разобранные письма держим в памяти до следующей проверки. */
+const inboxCache = new Map();
+
+/** Карточка письма: от кого, что во вложении, что с этим делать. */
+async function showInboxMessage(tg, chatId, user, index) {
+  const list = inboxCache.get(user.id) || [];
+  const m = list[index];
+  if (!m) { await tg.sendMessage(chatId, 'Письмо уже неактуально — проверьте почту заново.', mainMenu()); return; }
+
+  const files = m.docs.map((d, i) => `${i + 1}. ${esc(d.filename)} (${Math.round(d.size / 1024)} КБ)`).join('\n');
+  const cps = bdb.listCps(user.id);
+  // Пытаемся угадать контрагента по адресу отправителя или по имени.
+  const guess = cps.find((c) => c.email && c.email.toLowerCase() === m.from)
+    || cps.find((c) => m.fromName && c.name && m.fromName.toLowerCase().includes(c.name.toLowerCase().slice(0, 8)));
+
+  await tg.sendMessage(chatId,
+    `<b>${esc(m.fromName || m.from)}</b>\n${esc(m.from)}\n\n`
+    + `<b>${esc(m.subject || 'Без темы')}</b>\n\n`
+    + `Вложения:\n${files}\n\n`
+    + (guess ? `Похоже на контрагента <b>${esc(guess.name)}</b>.` : 'Контрагент не опознан.'),
+    keyboard([
+      [{ text: '📎 Прислать вложение сюда', data: `in.f:${index}` }],
+      ...(guess ? [[{ text: `💸 Внести долг перед ${guess.name}`.slice(0, 60), data: `in.op:${index}:${guess.id}` }]] : []),
+      [{ text: '⬅️ К письмам', data: 'inbox' }],
+    ]));
 }
 
 // ---------- подпись и печать (факсимиле) ----------
@@ -1785,6 +1877,31 @@ async function handleCallback(tg, cq) {
         });
       }
       await showVat(tg, chatId, user);
+      return;
+    }
+    if (data === 'inbox') { await checkInbox(tg, chatId, user); return; }
+    if (data.startsWith('in.m:')) { await showInboxMessage(tg, chatId, user, Number(data.slice(5))); return; }
+    if (data.startsWith('in.f:')) {
+      const m = (inboxCache.get(user.id) || [])[Number(data.slice(5))];
+      if (!m) { await tg.sendMessage(chatId, 'Письмо уже неактуально.', mainMenu()); return; }
+      for (const d of m.docs) {
+        // eslint-disable-next-line no-await-in-loop
+        await tg.sendDocument(chatId, {
+          filename: d.filename, buffer: d.content,
+          caption: `Из письма «${esc(m.subject || 'без темы')}» от ${esc(m.fromName || m.from)}.`,
+        });
+      }
+      return;
+    }
+    if (data.startsWith('in.op:')) {
+      const [idx, cpIdStr] = data.slice(6).split(':');
+      const m = (inboxCache.get(user.id) || [])[Number(idx)];
+      if (!m) { await tg.sendMessage(chatId, 'Письмо уже неактуально.', mainMenu()); return; }
+      bdb.setState(user.id, `op:${Number(cpIdStr)}`);
+      await tg.sendMessage(chatId,
+        `Внесу операцию по контрагенту. Напишите сумму и вид, например:\n`
+        + `<code>${ru(todayISO())} приход 60000</code>\n\n`
+        + `<i>Счёт из письма: ${esc(m.subject || 'без темы')}</i>`);
       return;
     }
     if (data === 'mb') { await showMailbox(tg, chatId, user); return; }
