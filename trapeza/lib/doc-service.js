@@ -163,9 +163,20 @@ async function issueDocument(userId, {
     payload: { items: clean, ...extra },
   });
 
+  // Долг в журнал — если этот тип документа его создаёт при выбранном
+  // основании. Проводка привязана к документу: её видно, можно отменить,
+  // и повторный выпуск того же документа её не задвоит.
+  const debt = bdb.makesDebt(org, type) && total > 0
+    ? bdb.addOpForDoc(userId, cp.id, {
+      date: when, kind: 'Реализация', doc: `${kind.title} № ${num}`, credit: total,
+    }, id)
+    : false;
+
   return {
     ok: true,
     total,
+    debt,
+    basis: bdb.basisOf(org),
     title: kind.title,
     file,
     doc: {

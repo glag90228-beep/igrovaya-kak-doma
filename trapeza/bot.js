@@ -65,7 +65,7 @@ function mainMenu() {
     ...(app ? [[{ text: '📱 Открыть приложение', webApp: app }]] : []),
     [{ text: '🏢 Моя организация', data: 'org' }],
     [{ text: '👥 Контрагенты', data: 'cps' }],
-    [{ text: '💸 Кто должен', data: 'debts' }],
+    [{ text: '💸 Кто должен', data: 'debts' }, { text: '⏳ Не оплачено', data: 'unpaid' }],
     [{ text: '📁 Мои документы', data: 'docs' }],
     [{ text: '⭐ Подписка', data: 'billing' }],
     [{ text: '❓ Помощь', data: 'help' }, { text: '💬 Поддержка', data: 'support' }],
@@ -531,6 +531,11 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
   const cp = bdb.getCp(user.id, cpId);
   const q = res.quota;
   const tail = q.paid ? '' : `\n<i>Выписано в этом месяце: ${q.used} из ${q.limit} бесплатных.</i>`;
+  // Проводка в журнал — вещь неочевидная, о ней надо сказать прямо,
+  // иначе человек не поймёт, откуда взялся долг в разделе «Кто должен».
+  const ledger = res.debt
+    ? `\n<i>Долг ${formatRub(res.total)} внесён в журнал. Отметить оплату — в карточке документа.</i>`
+    : '';
   await tg.sendDocument(chatId, {
     filename: res.file.filename,
     buffer: res.file.buffer,
@@ -538,7 +543,7 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
       + ` от ${ru(res.doc.date)} для <b>${esc(cp.name)}</b> на ${formatRub(res.total)}.`
       + (type === 'sch' ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.' : '')
       + (res.file.pdf ? '' : '\n\n(PDF недоступен — откройте файл в браузере и распечатайте / сохраните в PDF.)')
-      + tail,
+      + ledger + tail,
   });
   return true;
 }
@@ -575,6 +580,31 @@ async function repeatDoc(tg, chatId, user, docId) {
   await showPreview(tg, chatId, user, bdb.getState(user.id));
 }
 
+/** Что ещё не оплачено — то, за чем следят каждый день. */
+async function showUnpaid(tg, chatId, user) {
+  const list = bdb.unpaidDocs(user.id);
+  if (!list.length) {
+    await tg.sendMessage(chatId, 'Неоплаченных документов нет — все закрыты.',
+      keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+  const today = todayISO();
+  const sum = round2(list.reduce((a2, d) => a2 + (Number(d.total) || 0), 0));
+  const rows = list.map((d) => {
+    const cp = d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
+    const days = Math.floor((new Date(today) - new Date(d.date)) / 86400000);
+    return [{
+      text: `${d.title} № ${d.number} · ${cp ? cp.name : '—'} · ${formatRub(d.total).replace(/<[^>]+>/g, '')}`
+        + (days > 0 ? ` · ${days} дн.` : ''),
+      data: `doc:${d.id}`,
+    }];
+  }).map((r) => [{ ...r[0], text: r[0].text.slice(0, 60) }]);
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId,
+    `<b>Не оплачено: ${formatRub(sum)}</b> — ${list.length} ${plural(list.length, 'документ', 'документа', 'документов')}.`,
+    keyboard(rows));
+}
+
 /** Журнал выписанного. */
 async function showDocs(tg, chatId, user, cpId = null) {
   const docs = bdb.listDocs(user.id, 10, cpId);
@@ -606,6 +636,12 @@ async function showDoc(tg, chatId, user, docId) {
     .map((it, i) => `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n');
   const rows = [];
   if (d.type !== 'akt') rows.push([{ text: '📄 Прислать файл заново', data: `doc.get:${d.id}` }]);
+  const payable = ['sch', 'usl', 'upd', 'torg12'].includes(d.type) && d.total > 0;
+  if (payable) {
+    rows.push([d.paid_at
+      ? { text: `↩️ Снять отметку об оплате (${ru(d.paid_at)})`, data: `doc.unpaid:${d.id}` }
+      : { text: '✅ Отметить оплаченным', data: `doc.paid:${d.id}` }]);
+  }
   if (mailer.mailAvailable() && d.type !== 'akt') {
     rows.push([{
       text: cp && cp.email ? `✉️ Отправить на ${cp.email}`.slice(0, 60) : '✉️ Отправить на почту',
@@ -620,6 +656,7 @@ async function showDoc(tg, chatId, user, docId) {
     `<b>${esc(d.title)} № ${esc(d.number)}</b> от ${ru(d.date)}\n`
     + (cp ? `Контрагент: ${esc(cp.name)}\n` : '')
     + (d.total ? `Сумма: <b>${formatRub(d.total)}</b>\n` : '')
+    + (payable ? `Оплата: <b>${d.paid_at ? `получена ${ru(d.paid_at)}` : 'не отмечена'}</b>\n` : '')
     + (items ? `\n${items}` : ''),
     keyboard(rows));
 }
@@ -909,6 +946,36 @@ function vatLabel(org) {
   const v = bdb.vatOf(org);
   if (v.rate == null) return 'без НДС';
   return `${v.rate}%${v.rate === 0 ? '' : (v.gross ? ', цены с НДС' : ', НДС сверху')}`;
+}
+
+const BASIS_LABEL = {
+  closing: 'по акту, УПД или накладной',
+  invoice: 'по выставленному счёту',
+  manual: 'не считать — веду журнал сам',
+};
+
+/**
+ * Из чего возникает долг. Развилка не техническая, а про устройство бизнеса,
+ * поэтому объясняем на примерах, а не терминами.
+ */
+async function showBasis(tg, chatId, user) {
+  const org = bdb.getDefaultOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  const now = bdb.basisOf(org);
+  await tg.sendMessage(chatId,
+    `<b>Когда контрагент становится должен</b>\n\nСейчас: <b>${esc(BASIS_LABEL[now])}</b>\n\n`
+    + '<b>По акту</b> — обычный подряд и торговля: счёт это просьба заплатить, '
+    + 'а долг появляется, когда работа сдана или товар отгружен.\n\n'
+    + '<b>По счёту</b> — аренда и субаренда, абонентское обслуживание: акт '
+    + 'каждый месяц не составляют, счёт и есть основание.\n\n'
+    + '<i>Выбор один на организацию — иначе долг задвоится: сначала по счёту, '
+    + 'потом по акту на ту же сделку.</i>',
+    keyboard([
+      [{ text: 'Долг по акту / УПД / накладной', data: 'basis.set:closing' }],
+      [{ text: 'Долг по счёту (аренда)', data: 'basis.set:invoice' }],
+      [{ text: 'Не считать автоматически', data: 'basis.set:manual' }],
+      [{ text: '⬅️ К организации', data: 'org' }],
+    ]));
 }
 
 /**
@@ -1327,6 +1394,7 @@ async function showOrg(tg, chatId, user) {
     [{ text: '✏️ Изменить (ввести заново)', data: 'org.new' }],
     [{ text: fxLabel, data: 'fx' }],
     [{ text: `🧾 НДС: ${vatLabel(org)}`.slice(0, 60), data: 'vat' }],
+    [{ text: `📊 Долг: ${BASIS_LABEL[bdb.basisOf(org)]}`.slice(0, 60), data: 'basis' }],
     [{ text: '⬅️ Меню', data: 'menu' }],
   ]));
 }
@@ -1513,6 +1581,28 @@ async function handleCallback(tg, cq) {
       await showPreview(tg, chatId, user, bdb.getState(user.id));
       return;
     }
+    if (data === 'basis') { await showBasis(tg, chatId, user); return; }
+    if (data.startsWith('basis.set:')) {
+      const org = bdb.getDefaultOrg(user.id);
+      if (org) bdb.updateOrg(user.id, org.id, { debt_basis: data.slice(10) });
+      await showBasis(tg, chatId, user);
+      return;
+    }
+    if (data.startsWith('doc.paid:')) {
+      const id = Number(data.slice(9));
+      const when = bdb.markPaid(user.id, id);
+      if (when) await tg.sendMessage(chatId, `✅ Отметил оплату ${ru(when)} — долг закрыт.`);
+      await showDoc(tg, chatId, user, id);
+      return;
+    }
+    if (data.startsWith('doc.unpaid:')) {
+      const id = Number(data.slice(11));
+      bdb.unmarkPaid(user.id, id);
+      await tg.sendMessage(chatId, 'Отметку об оплате снял, долг вернул в журнал.');
+      await showDoc(tg, chatId, user, id);
+      return;
+    }
+    if (data === 'unpaid') { await showUnpaid(tg, chatId, user); return; }
     if (data === 'vat') { await showVat(tg, chatId, user); return; }
     if (data.startsWith('vat.set:')) {
       const [rate, gross] = data.slice(8).split(':');

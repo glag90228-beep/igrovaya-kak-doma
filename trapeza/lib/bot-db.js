@@ -104,6 +104,26 @@ function migrate() {
   addColumn('orgs', 'vat_gross', 'INTEGER NOT NULL DEFAULT 0'); // 1 — цены уже с НДС
   // ОГРНИП: в УПД есть графа, а поля не было — печаталось пусто.
   addColumn('orgs', 'ogrnip', "TEXT NOT NULL DEFAULT ''");
+
+  /*
+   * Из чего возникает долг контрагента — свойство бизнеса, а не общее правило.
+   *
+   *   closing — из акта, УПД или накладной. Так у подрядчика и в торговле:
+   *             счёт лишь просьба заплатить, задолженность даёт реализация.
+   *   invoice — из счёта. Так в аренде и субаренде: акт по ГК не обязателен,
+   *             его часто не составляют вовсе, а счёт выставляют ежемесячно.
+   *   manual  — ничего не создавать, журнал ведётся руками.
+   *
+   * Выбор один на организацию: смешивать нельзя, иначе долг задвоится —
+   * сначала по счёту, потом по акту на ту же сделку.
+   */
+  addColumn('orgs', 'debt_basis', "TEXT NOT NULL DEFAULT 'closing'");
+
+  // Отметка оплаты документа и связь операции с документом: по ней
+  // отменяют проводку и не создают её дважды.
+  addColumn('documents', 'paid_at', "TEXT NOT NULL DEFAULT ''");
+  addColumn('operations', 'doc_id', 'INTEGER NOT NULL DEFAULT 0');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ops_doc ON operations(doc_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_cp_user ON counterparties(user_id)');
 }
 
@@ -158,7 +178,7 @@ function vatOf(org) {
 
 function updateOrg(userId, id, fields) {
   const allowed = ['name', 'full_name', 'inn', 'kpp', 'signer', 'address',
-    'bank_name', 'bik', 'acc', 'corr_acc', 'ogrnip', 'vat_rate', 'vat_gross'];
+    'bank_name', 'bik', 'acc', 'corr_acc', 'ogrnip', 'vat_rate', 'vat_gross', 'debt_basis'];
   const sets = [], vals = [];
   for (const k of allowed) if (k in fields) { sets.push(`${k} = ?`); vals.push(fields[k]); }
   if (!sets.length) return;
@@ -248,6 +268,83 @@ function deleteLastOp(userId, cpId) {
   if (!row) return false;
   db.prepare('DELETE FROM operations WHERE id = ?').run(row.id);
   return true;
+}
+
+// ---------- связь документов с журналом ----------
+
+/**
+ * Какие документы создают задолженность при таком основании.
+ * Пустой список — режим «вручную»: бот в журнал не лезет.
+ */
+const DEBT_DOCS = {
+  closing: ['usl', 'upd', 'torg12'],
+  invoice: ['sch'],
+  manual: [],
+};
+
+const basisOf = (org) => (DEBT_DOCS[org && org.debt_basis] ? org.debt_basis : 'closing');
+const makesDebt = (org, type) => DEBT_DOCS[basisOf(org)].includes(type);
+
+/** Операция, привязанная к документу: по ней можно отменить и не задвоить. */
+function addOpForDoc(userId, cpId, op, docId) {
+  const cp = getCp(userId, cpId);
+  if (!cp) return false;
+  const exists = db.prepare(
+    'SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = ?',
+  ).get(docId, op.kind).n;
+  if (exists) return false;                    // повторный вызов ничего не портит
+  const sort = db.prepare('SELECT COALESCE(MAX(sort),-1)+1 AS s FROM operations WHERE cp_id = ?').get(cpId).s;
+  db.prepare(`INSERT INTO operations(cp_id, date, kind, doc, debit, credit, note, sort, doc_id)
+              VALUES(?,?,?,?,?,?,?,?,?)`)
+    .run(cpId, op.date, op.kind || '', op.doc || '', Number(op.debit) || 0,
+      Number(op.credit) || 0, op.note || '', sort, docId);
+  return true;
+}
+
+function opsOfDoc(userId, docId) {
+  const d = getDoc(userId, docId);
+  if (!d) return [];
+  return db.prepare('SELECT * FROM operations WHERE doc_id = ? ORDER BY id').all(docId);
+}
+
+function deleteOpsOfDoc(userId, docId, kind = null) {
+  const d = getDoc(userId, docId);
+  if (!d) return 0;
+  const info = kind
+    ? db.prepare('DELETE FROM operations WHERE doc_id = ? AND kind = ?').run(docId, kind)
+    : db.prepare('DELETE FROM operations WHERE doc_id = ?').run(docId);
+  return info.changes;
+}
+
+/** Отметка оплаты документа + поступление денег в журнал. */
+function markPaid(userId, docId, date) {
+  const d = getDoc(userId, docId);
+  if (!d) return null;
+  const when = /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? date : new Date().toISOString().slice(0, 10);
+  db.prepare('UPDATE documents SET paid_at = ? WHERE id = ? AND user_id = ?').run(when, docId, userId);
+  if (d.cp_id && d.total) {
+    addOpForDoc(userId, d.cp_id, {
+      date: when, kind: 'Оплата', doc: `${d.title} № ${d.number}`, debit: d.total,
+    }, docId);
+  }
+  return when;
+}
+
+function unmarkPaid(userId, docId) {
+  const d = getDoc(userId, docId);
+  if (!d) return false;
+  db.prepare("UPDATE documents SET paid_at = '' WHERE id = ? AND user_id = ?").run(docId, userId);
+  deleteOpsOfDoc(userId, docId, 'Оплата');
+  return true;
+}
+
+/** Неоплаченные документы с суммой — то, за чем следят каждый день. */
+function unpaidDocs(userId, limit = 50) {
+  const rows = db.prepare(`
+    SELECT * FROM documents
+     WHERE user_id = ? AND paid_at = '' AND total > 0 AND type IN ('sch','usl','upd','torg12')
+     ORDER BY date, id LIMIT ?`).all(userId, limit);
+  return rows.map(withPayload);
 }
 
 /** Сальдо по контрагенту (переиспользует computeBalance из db.js) */
@@ -440,6 +537,8 @@ module.exports = {
   createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp,
   addOp, listOps, deleteLastOp, balanceOf, debtors,
+  DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
+  markPaid, unmarkPaid, unpaidDocs,
   markBlocked, markActive, isBlocked, reachableUsers,
   nextSeq, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,

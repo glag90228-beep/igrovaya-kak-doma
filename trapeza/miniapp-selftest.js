@@ -246,6 +246,48 @@ async function main() {
   ok(r.status === 200 && r.json.fields.inn === '7707083893' && r.json.fields.bik === '044525187',
     'вставленный блок реквизитов разобран', r.json.fields && r.json.fields.bik);
 
+  console.log('\n── долг и оплата ──');
+  {
+    r = await call('GET', '/api/state', { user: masha });
+    ok(r.json.debtBasis === 'closing', 'по умолчанию долг возникает по акту', r.json.debtBasis);
+
+    r = await call('POST', '/api/basis', { user: masha, body: { basis: 'выдумка' } });
+    ok(r.status === 400, 'неизвестное основание отклонено');
+    r = await call('POST', '/api/basis', { user: masha, body: { basis: 'invoice' } });
+    ok(r.status === 200 && r.json.basis === 'invoice', 'основание переключается на счёт');
+
+    const cp2 = (await call('POST', '/api/cp', {
+      user: masha, body: { name: 'Арендатор ООО «Луч»', kind: 'customer' },
+    })).json.cp.id;
+    r = await call('POST', '/api/doc', {
+      user: masha,
+      body: { type: 'sch', cpId: cp2, items: [{ name: 'Аренда, август', qty: 1, price: 60000 }] },
+    });
+    ok(r.status === 200, 'счёт арендатору выписан', (r.json || {}).error);
+    r = await call('GET', '/api/cps', { user: masha });
+    const luch = r.json.cps.find((c) => c.id === cp2);
+    ok(luch.balance === 60000, 'счёт создал долг арендатора', luch.balance);
+
+    r = await call('GET', '/api/unpaid', { user: masha });
+    const unpaidDoc = r.json.docs.find((d) => d.cpId === cp2);
+    ok(Boolean(unpaidDoc), 'счёт попал в список неоплаченных');
+
+    r = await call('POST', '/api/doc/paid', { user: masha, body: { id: unpaidDoc.id } });
+    ok(r.status === 200 && r.json.paidAt, 'оплата отмечена', (r.json || {}).paidAt);
+    r = await call('GET', '/api/cps', { user: masha });
+    ok(r.json.cps.find((c) => c.id === cp2).balance === 0, 'после оплаты долг закрыт');
+
+    r = await call('POST', '/api/doc/paid', { user: masha, body: { id: unpaidDoc.id, paid: false } });
+    ok(r.status === 200, 'отметку можно снять');
+    r = await call('GET', '/api/cps', { user: masha });
+    ok(r.json.cps.find((c) => c.id === cp2).balance === 60000, 'долг вернулся');
+
+    r = await call('POST', '/api/doc/paid', { user: petya, body: { id: unpaidDoc.id } });
+    ok(r.status === 400, 'чужой документ оплаченным не отметить');
+
+    await call('POST', '/api/basis', { user: masha, body: { basis: 'closing' } });
+  }
+
   console.log('\n── отправка на почту ──');
   {
     const net = require('node:net');
@@ -303,8 +345,12 @@ async function main() {
     ok(/Content-Disposition: attachment/.test(got.data), 'вложение на месте');
     ok(r.json.remembered === true, 'адрес запомнен у контрагента');
 
+    // Смотрим именно того контрагента, чей счёт отправляли: список
+    // контрагентов к этому моменту уже не из одного человека.
     r = await call('GET', '/api/cps', { user: masha });
-    ok(r.json.cps[0].email === 'buh@zarya.ru', 'почта видна в карточке контрагента', r.json.cps[0].email);
+    const owner = r.json.cps.find((c) => c.id === someDoc.cpId);
+    ok(owner && owner.email === 'buh@zarya.ru', 'почта запомнилась у контрагента из документа',
+      owner && owner.email);
 
     got.rcpt.length = 0;
     r = await call('POST', '/api/doc/mail', { user: masha, body: { id: someDoc.id } });

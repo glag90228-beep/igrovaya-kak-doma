@@ -125,6 +125,7 @@ function stateFor(user) {
     docs: bdb.listDocs(user.id, 5).map(docBrief),
     payUrl: payLink(user.tg_id),
     facsimile: fxState(user.id),
+    debtBasis: bdb.basisOf(org || {}),
     features: { dadata: dadata.dadataAvailable(), pdf: true, mail: mailer.mailAvailable() },
   };
 }
@@ -148,7 +149,7 @@ function fxState(userId) {
 function docBrief(d) {
   return {
     id: d.id, type: d.type, title: d.title, number: d.number, date: d.date,
-    total: d.total, cpId: d.cp_id,
+    total: d.total, cpId: d.cp_id, paidAt: d.paid_at || '',
     items: (d.payload && d.payload.items) || [],
   };
 }
@@ -329,6 +330,32 @@ const api = {
 
     if (to !== cp.email) bdb.updateCp(user.id, cp.id, { email: to });
     return { sent: to, remembered: to !== cp.email };
+  },
+
+  /** Отметить документ оплаченным или снять отметку. */
+  async 'POST /api/doc/paid'({ user, body }) {
+    const id = Number(body.id);
+    if (!bdb.getDoc(user.id, id)) return { error: 'Документ не найден.' };
+    if (body.paid === false) {
+      bdb.unmarkPaid(user.id, id);
+      return { doc: docBrief(bdb.getDoc(user.id, id)) };
+    }
+    const when = bdb.markPaid(user.id, id, str(body.date, 10));
+    return { paidAt: when, doc: docBrief(bdb.getDoc(user.id, id)) };
+  },
+
+  /** Из чего возникает долг: по акту, по счёту или вручную. */
+  async 'POST /api/basis'({ user, body }) {
+    const basis = str(body.basis, 10);
+    if (!bdb.DEBT_DOCS[basis]) return { error: 'Неизвестное основание.' };
+    const org = bdb.getDefaultOrg(user.id);
+    if (!org) return { error: 'Сначала заполните реквизиты организации.' };
+    bdb.updateOrg(user.id, org.id, { debt_basis: basis });
+    return { basis };
+  },
+
+  async 'GET /api/unpaid'({ user }) {
+    return { docs: bdb.unpaidDocs(user.id).map(docBrief) };
   },
 
   async 'GET /api/debtors'({ user }) {

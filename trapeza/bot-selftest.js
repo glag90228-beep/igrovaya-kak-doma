@@ -428,8 +428,17 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await tap('debts');
   ok(last().includes('Нам должны') && last().includes('Мы должны'),
     'долги разделены на наши и чужие', last().slice(0, 60));
-  // 94 193 − 40 000 + 6 250 со снимка = 60 443
-  ok(norm(last()).includes('60 443,00'), 'долг заказчика посчитан с учётом операции со снимка',
+  // Теперь долг складывается из внесённых руками операций И из выписанных
+  // закрывающих документов: акт, УПД и накладная создают его сами.
+  // 94 193 − 40 000 + 6 250 со снимка = 60 443 руками, остальное — документы.
+  const zaryaDebt = require('./lib/bot-db').balanceOf(fxUserId(), cpId).closing;
+  const byDocs = require('./lib/bot-db').listDocs(fxUserId(), 50)
+    .filter((d) => ['usl', 'upd', 'torg12'].includes(d.type) && d.cp_id === cpId)
+    .reduce((a2, d) => a2 + d.total, 0);
+  ok(Math.abs(zaryaDebt - (60443 + byDocs)) < 0.01,
+    'долг = операции руками плюс выписанные закрывающие документы',
+    `${zaryaDebt} = 60443 + ${byDocs}`);
+  ok(norm(last()).includes('Нам должны'), 'заказчик показан в должниках',
     norm(last()).slice(0, 90));
   ok(last().includes('без движения'), 'показано, сколько дней тишины');
   ok(last().includes('⚠️'), 'застарелый долг помечен');
@@ -687,6 +696,82 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   ok(plainBtn && plainBtn.menu_button.type === 'commands',
     'без адреса приложения остаётся список команд', plainBtn && plainBtn.menu_button.type);
   if (keepUrl) process.env.WEBAPP_URL = keepUrl;
+
+  console.log('\n── счёт, долг и оплата ──');
+  {
+    const bdb3 = require('./lib/bot-db');
+    const uid = fxUserId();
+    const org3 = bdb3.getDefaultOrg(uid);
+    ok(bdb3.basisOf(org3) === 'closing', 'по умолчанию долг возникает по акту', bdb3.basisOf(org3));
+
+    await tap('org');
+    ok(Boolean(button('Долг:')), 'в карточке организации есть настройка основания долга');
+    await tap('basis');
+    ok(last().includes('становится должен'), 'экран основания долга открывается');
+
+    // Заводим отдельного контрагента, чтобы не мешать прежним подсчётам.
+    const before = bdb3.listCps(uid).length;
+    const rentId = bdb3.createCp(uid, { name: 'Арендатор ООО «Луч»', kind: 'customer', opening_date: '2026-01-01' });
+    ok(bdb3.listCps(uid).length === before + 1, 'контрагент для проверки аренды заведён');
+
+    // Режим «по акту»: счёт долг не создаёт.
+    await tap(`d.sch:${rentId}`);
+    await say('Аренда, август; 1; 60000');
+    await tap('items.done');
+    await tap('doc.make');
+    ok(bdb3.balanceOf(uid, rentId).closing === 0,
+      'в режиме «по акту» счёт долг не создаёт', bdb3.balanceOf(uid, rentId).closing);
+
+    // Режим «по счёту» — субаренда.
+    await tap('basis.set:invoice');
+    ok(bdb3.basisOf(bdb3.getDefaultOrg(uid)) === 'invoice', 'режим «долг по счёту» сохранён');
+    await tap(`d.sch:${rentId}`);
+    await say('Аренда, сентябрь; 1; 60000');
+    await tap('items.done');
+    await tap('doc.make');
+    ok(bdb3.balanceOf(uid, rentId).closing === 60000,
+      'в режиме «по счёту» счёт создал долг 60 000', bdb3.balanceOf(uid, rentId).closing);
+    // Сообщение о проводке уходит подписью к файлу, а не отдельным письмом.
+    ok(String((files[files.length - 1] || {}).caption || '').includes('внесён в журнал'),
+      'бот сказал, что внёс долг в журнал',
+      String((files[files.length - 1] || {}).caption || '').slice(-70));
+
+    const rentDoc = bdb3.listDocs(uid, 1)[0];
+    await tap(`doc:${rentDoc.id}`);
+    ok(last().includes('не отмечена'), 'в карточке видно, что оплата не отмечена');
+    const payBtn = button('Отметить оплаченным');
+    ok(Boolean(payBtn), 'есть кнопка отметки оплаты', payBtn);
+
+    await tap(payBtn);
+    ok(bdb3.balanceOf(uid, rentId).closing === 0, 'после отметки оплаты долг закрыт',
+      bdb3.balanceOf(uid, rentId).closing);
+    ok(bdb3.getDoc(uid, rentDoc.id).paid_at, 'дата оплаты записана', bdb3.getDoc(uid, rentDoc.id).paid_at);
+
+    await tap(`doc.unpaid:${rentDoc.id}`);
+    ok(bdb3.balanceOf(uid, rentId).closing === 60000, 'отмена оплаты вернула долг');
+
+    // Повторная отметка не должна задваивать проводку.
+    await tap(`doc.paid:${rentDoc.id}`);
+    await tap(`doc.paid:${rentDoc.id}`);
+    ok(bdb3.balanceOf(uid, rentId).closing === 0, 'повторная отметка оплаты не задваивает проводку',
+      bdb3.balanceOf(uid, rentId).closing);
+
+    await tap('unpaid');
+    ok(last().includes('Не оплачено') || last().includes('Неоплаченных'),
+      'экран неоплаченных открывается', last().slice(0, 40));
+
+    // Режим «вручную» — бот в журнал не лезет.
+    await tap('basis.set:manual');
+    const manId = bdb3.createCp(uid, { name: 'ООО «Ручной учёт»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.usl:${manId}`);
+    await say('Услуга; 1; 5000');
+    await tap('items.done');
+    await tap('doc.make');
+    ok(bdb3.balanceOf(uid, manId).closing === 0, 'в режиме «вручную» проводок не появляется',
+      bdb3.balanceOf(uid, manId).closing);
+
+    await tap('basis.set:closing');   // возвращаем как было
+  }
 
   console.log('\n── НДС в счёте ──');
   {
