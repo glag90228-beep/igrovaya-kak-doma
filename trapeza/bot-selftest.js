@@ -780,6 +780,53 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(other.length === 0, 'за пустой период документов нет');
   }
 
+  console.log('\n── резервные копии ──');
+  {
+    const os = require('node:os');
+    const dir = path.join(os.tmpdir(), `bk-${process.pid}`);
+    process.env.BACKUP_DIR = dir;
+    delete require.cache[require.resolve('./backup')];
+    const backup = require('./backup');
+
+    const r1 = await backup.makeBackup();
+    ok(fs.existsSync(r1.file) && r1.size > 0, 'копия создана', `${Math.round(r1.size / 1024)} КБ`);
+    ok(r1.file.endsWith('.db.gz'), 'копия сжата', path.basename(r1.file));
+
+    // Главное: из копии должна открываться рабочая база с теми же данными.
+    const { execSync } = require('node:child_process');
+    const restored = path.join(dir, 'restored.db');
+    execSync(`gunzip -c '${r1.file}' > '${restored}'`);
+    const { DatabaseSync } = require('node:sqlite');
+    const d = new DatabaseSync(restored);
+    ok(d.prepare('PRAGMA integrity_check').get().integrity_check === 'ok',
+      'восстановленная база цела');
+    const docsIn = d.prepare('SELECT COUNT(*) AS n FROM documents').get().n;
+    const cpsIn = d.prepare('SELECT COUNT(*) AS n FROM counterparties').get().n;
+    ok(docsIn > 0 && cpsIn > 0, 'в копии есть документы и контрагенты', `${docsIn} и ${cpsIn}`);
+    ok(d.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table'").get().n > 5,
+      'схема перенеслась целиком');
+
+    ok(backup.list().length === 1, 'копия видна в списке');
+
+    // Старые копии удаляются, но последние три остаются при любой настройке:
+    // если бот молчал месяц, они — единственное, что есть.
+    process.env.BACKUP_KEEP = '0';
+    for (let i = 0; i < 4; i += 1) {
+      const f = path.join(dir, `trapeza-2020-01-0${i + 1}-1200.db.gz`);
+      fs.writeFileSync(f, 'старьё');
+      fs.utimesSync(f, new Date('2020-01-01'), new Date('2020-01-01'));
+    }
+    const before = backup.list().length;
+    const removed = backup.prune();
+    ok(removed.length > 0, 'старые копии удаляются', `убрано ${removed.length} из ${before}`);
+    ok(backup.list().length === 3, 'последние три копии сохраняются всегда',
+      backup.list().length);
+
+    fs.rmSync(dir, { recursive: true, force: true });
+    delete process.env.BACKUP_DIR;
+    delete process.env.BACKUP_KEEP;
+  }
+
   console.log('\n── защита от второго экземпляра ──');
   {
     const { acquire, alive } = require('./lib/lock');

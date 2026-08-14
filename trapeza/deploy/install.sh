@@ -72,8 +72,10 @@ sudo -u trapeza --preserve-env node bot.js --setup || \
   echo "⚠️  Оформление не применилось (сеть или ограничение частоты) — повторите: node bot.js --setup"
 
 say "6/6 Службы"
+mkdir -p /var/backups/trapeza
+chown trapeza:trapeza /var/backups/trapeza
 cp deploy/trapeza-bot.service deploy/trapeza-lava.service deploy/trapeza-miniapp.service \
-   /etc/systemd/system/
+   deploy/trapeza-backup.service deploy/trapeza-backup.timer /etc/systemd/system/
 systemctl daemon-reload
 # Именно restart, а не «enable --now»: у запущенной службы --now ничего не
 # делает, и после обновления файлов в памяти остаётся прежний код.
@@ -89,9 +91,13 @@ fi
 # просто никому не показывается, зато уже поднято и готово к https.
 systemctl enable trapeza-miniapp
 systemctl restart trapeza-miniapp
+# Ежедневная резервная копия базы. Первую снимаем сразу: без неё до ночи
+# данные клиентов существуют в единственном экземпляре.
+systemctl enable --now trapeza-backup.timer
+systemctl start trapeza-backup.service || echo "⚠️  Первая копия не снялась — проверьте /var/log/trapeza/backup.log" 
 
 say "Готово"
-for u in trapeza-bot trapeza-lava trapeza-miniapp; do
+for u in trapeza-bot trapeza-lava trapeza-miniapp trapeza-backup.timer; do
   printf '  %-18s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || echo 'не запущена')"
 done
 echo ""
@@ -103,6 +109,11 @@ cat <<'TXT'
   • HTTPS одной командой:  bash deploy/https.sh ваш-домен вашапочта@mail.ru
     после него «/» отдаёт мини-приложение, «/lava» — вебхуки оплат
   • адрес приложения впишите в WEBAPP_URL и повторите  node bot.js --setup
+  • резервные копии:  node backup.js --list   (лежат в /var/backups/trapeza)
+    восстановление:   systemctl stop trapeza-bot trapeza-miniapp
+                      gunzip -c /var/backups/trapeza/ИМЯ.db.gz > /opt/trapeza/data/trapeza.db
+                      chown trapeza:trapeza /opt/trapeza/data/trapeza.db
+                      systemctl start trapeza-bot trapeza-miniapp
   • логи:  journalctl -u trapeza-bot -f
            tail -f /var/log/trapeza/lava.log
            tail -f /var/log/trapeza/miniapp.log

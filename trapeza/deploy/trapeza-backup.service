@@ -1,0 +1,17 @@
+[Unit]
+Description=Первичка — резервная копия базы
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/trapeza
+EnvironmentFile=/opt/trapeza/.env
+ExecStart=/usr/bin/node backup.js
+User=trapeza
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trapeza/data /var/backups/trapeza
+StandardOutput=append:/var/log/trapeza/backup.log
+StandardError=append:/var/log/trapeza/backup.log
