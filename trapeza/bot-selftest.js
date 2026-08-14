@@ -697,6 +697,30 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     'без адреса приложения остаётся список команд', plainBtn && plainBtn.menu_button.type);
   if (keepUrl) process.env.WEBAPP_URL = keepUrl;
 
+  console.log('\n── защита от второго экземпляра ──');
+  {
+    const { acquire, alive } = require('./lib/lock');
+    const dir = require('node:path').join(require('node:os').tmpdir(), `lock-${process.pid}`);
+    const first = acquire('bot-test', dir);
+    ok(first.ok, 'первый экземпляр занимает замок');
+    const second = acquire('bot-test', dir);
+    ok(!second.ok && second.pid === process.pid,
+      'второй экземпляр не запускается и знает, кто занял место', second.pid);
+    first.release();
+    const third = acquire('bot-test', dir);
+    ok(third.ok, 'после остановки первого замок свободен');
+    third.release();
+
+    // Замок от процесса, которого больше нет, не должен блокировать запуск:
+    // иначе после падения бот не поднимется без ручного вмешательства.
+    require('node:fs').writeFileSync(require('node:path').join(dir, 'bot-test.lock'), '999999');
+    const fourth = acquire('bot-test', dir);
+    ok(fourth.ok, 'замок упавшего процесса перехватывается сам');
+    fourth.release();
+    ok(alive(process.pid) && !alive(999999), 'живой и мёртвый процессы различаются');
+    require('node:fs').rmSync(dir, { recursive: true, force: true });
+  }
+
   console.log('\n── счёт, долг и оплата ──');
   {
     const bdb3 = require('./lib/bot-db');

@@ -18,6 +18,7 @@ const { buildDogovorHtml } = require('./lib/dogovor');
 const { pdfAvailable, htmlToPdf } = require('./lib/pdf');
 const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
 const { applySetup } = require('./lib/bot-setup');
+const { acquire: acquireLock } = require('./lib/lock');
 const { supportScreen, forwardToSupport, legalLine } = require('./lib/bot-support');
 const billing = require('./lib/billing');
 const { payLink, daysFor } = require('./lib/lava');
@@ -1848,12 +1849,50 @@ async function main() {
     return;
   }
 
+  // Второй экземпляр на этой машине не запускаем: два читателя одного
+  // токена отбирают обновления друг у друга, и бот отвечает через раз.
+  const lock = acquireLock(`bot-${String(token).split(':')[0]}`);
+  if (!lock.ok) {
+    console.error(`Бот уже запущен на этой машине (процесс ${lock.pid}).`);
+    console.error('Два экземпляра на одном токене мешают друг другу: Telegram отдаёт');
+    console.error('входящие только одному, и сообщения будут теряться.');
+    console.error('');
+    console.error(`  что это за процесс:  ps -p ${lock.pid} -o pid,cmd`);
+    console.error('  остановить службу:   systemctl stop trapeza-bot');
+    console.error(`  снять замок вручную: rm ${lock.file}   (только если процесс мёртв)`);
+    process.exit(1);
+  }
+
   console.log(`Бот запущен: @${me.username}`);
   let offset = 0;
+  let conflicts = 0;
+  let quietUntil = 0;
   // eslint-disable-next-line no-constant-condition
   while (true) {
     let updates = [];
-    try { updates = await tg.getUpdates(offset, 30); } catch (e) { console.error('getUpdates:', e.message); await new Promise((r) => setTimeout(r, 3000)); continue; }
+    try {
+      updates = await tg.getUpdates(offset, 30);
+      conflicts = 0;
+    } catch (e) {
+      // 409 — тот же токен читает кто-то ещё. Сыпать в лог по строке каждые
+      // три секунды бессмысленно и опасно: журнал вырастет на гигабайты и
+      // забьёт диск. Говорим один раз подробно, дальше — раз в минуту.
+      const clash = e.code === 409 || /Conflict/i.test(e.message || '');
+      if (clash) {
+        conflicts += 1;
+        if (Date.now() > quietUntil) {
+          console.error(`Тот же токен читает другой процесс (${conflicts} попыток подряд).`);
+          console.error('Скорее всего где-то запущена вторая копия бота — на этом сервере');
+          console.error('или на другом. Пока их две, сообщения будут теряться.');
+          quietUntil = Date.now() + 60000;
+        }
+        await new Promise((r) => setTimeout(r, 15000));
+        continue;
+      }
+      console.error('getUpdates:', e.message);
+      await new Promise((r) => setTimeout(r, 3000));
+      continue;
+    }
     for (const u of updates) {
       offset = u.update_id + 1;
       try { await handleUpdate(tg, u); } catch (e) { console.error('handleUpdate:', e.message); }
