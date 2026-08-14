@@ -9,7 +9,7 @@
  * Отпуск разрешил / отпустил / груз принял оформлены как в бланке.
  */
 
-const { esc, ru, page, formatMoney, amountInWords } = require('./doc-html');
+const { esc, ru, page, fxHtml, formatMoney, amountInWords } = require('./doc-html');
 const { round2 } = require('./money');
 
 const LAND = `
@@ -106,7 +106,7 @@ function buildTorg12Html({ org, cp, doc }) {
     <div class="foot">
       <div>
         <div class="row"><b>Отпуск груза разрешил</b>
-          <div class="line">${esc(org.signer || '')}</div></div>
+          <div class="line">${fxHtml(org.fx, { stamp: true, tight: true })}${esc(org.signer || '')}</div></div>
         <div class="row"><b>Отпуск груза произвёл</b>
           <div class="line">должность, подпись, расшифровка</div></div>
         <div class="small">Дата отпуска: <b>${ru(doc.date)}</b></div>

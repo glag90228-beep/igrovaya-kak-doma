@@ -107,6 +107,33 @@ async function seed() {
     // eslint-disable-next-line no-await-in-loop
     await docService.issueDocument(user.id, { ...d, skipQuota: true });
   }
+  // Подпись и печать: без них экран реквизитов на снимке выглядит пустым,
+  // а это заметная часть работы. Рисуем их тут же, чтобы не тащить файлы.
+  const fx = require('./lib/facsimile');
+  const chromiumForArt = require('./lib/pdf').loadChromium();
+  if (chromiumForArt) {
+    const br = await chromiumForArt.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+    const pg = await br.newPage();
+    await pg.setViewportSize({ width: 600, height: 260 });
+    await pg.setContent(`<body style="margin:0;background:#fff"><svg width="600" height="260"
+      xmlns="http://www.w3.org/2000/svg"><rect width="600" height="260" fill="#fdfdfb"/>
+      <path d="M40 175 C 90 70, 130 225, 180 120 S 260 45, 300 160 C 330 225, 360 100, 420 130 L 470 100"
+        stroke="#1b2a6b" stroke-width="7" fill="none" stroke-linecap="round"/>
+      <path d="M180 190 L 430 182" stroke="#1b2a6b" stroke-width="4" fill="none"/></svg></body>`);
+    fx.save(user.id, 'sign', await pg.screenshot({ type: 'png' }), 'image/png');
+    await pg.setViewportSize({ width: 420, height: 420 });
+    await pg.setContent(`<body style="margin:0;background:#fff"><svg width="420" height="420"
+      xmlns="http://www.w3.org/2000/svg"><rect width="420" height="420" fill="#fefefe"/>
+      <g fill="none" stroke="#2b3ea8" stroke-width="6"><circle cx="210" cy="210" r="195"/>
+      <circle cx="210" cy="210" r="150"/><circle cx="210" cy="210" r="120"/></g>
+      <text x="210" y="196" font-family="Arial" font-size="30" font-weight="bold" fill="#2b3ea8"
+        text-anchor="middle">ИП</text>
+      <text x="210" y="232" font-family="Arial" font-size="21" fill="#2b3ea8"
+        text-anchor="middle">САРЫЧЕВА</text></svg></body>`);
+    fx.save(user.id, 'stamp', await pg.screenshot({ type: 'png' }), 'image/png');
+    await br.close();
+  }
+
   // Пара позиций про запас, чтобы было видно «частые позиции».
   bdb.rememberItems(user.id, [
     { name: 'Кофе-брейк', unit: 'шт.', price: 480 },
@@ -133,6 +160,9 @@ const SHOTS = [
   { name: 'dolgi', title: 'Долги', go: ['debts', {}] },
   { name: 'organizaciya', title: 'Моя организация', go: ['org', {}] },
   { name: 'podpiska', title: 'Подписка', go: ['billing', {}] },
+  // Карточка подписи и печати живёт в конце экрана реквизитов — без
+  // прокрутки она в кадр не попадает.
+  { name: 'faksimile', title: 'Подпись и печать', go: ['org', {}], scroll: 'bottom' },
 ];
 
 async function main() {
@@ -243,6 +273,10 @@ async function main() {
       if (shot.go) {
         await page.evaluate(([name, params]) => window.__go(name, params), shot.go);
         await page.waitForTimeout(400);
+      }
+      if (shot.scroll === 'bottom') {
+        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+        await page.waitForTimeout(250);
       }
       await page.waitForTimeout(200);
       const file = path.join(OUT, `${shot.name}-${themeName}.png`);

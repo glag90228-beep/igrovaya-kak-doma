@@ -27,6 +27,7 @@ const bdb = require('./lib/bot-db');
 const billing = require('./lib/billing');
 const docService = require('./lib/doc-service');
 const dadata = require('./lib/dadata');
+const facsimile = require('./lib/facsimile');
 const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
 const { round2 } = require('./lib/money');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
@@ -35,7 +36,9 @@ const { Telegram } = require('./lib/tg');
 
 const PORT = Number(process.env.MINIAPP_PORT || 8790);
 const ROOT = path.join(__dirname, 'public', 'app');
-const MAX_BODY = 512 * 1024;
+// Тело до 2 МБ: картинка факсимиле весит до 1 МБ, а в base64 распухает на
+// треть — при меньшем пороге загрузка обрывалась бы без внятной причины.
+const MAX_BODY = 2 * 1024 * 1024;
 
 let tg = process.env.BOT_TOKEN ? new Telegram(process.env.BOT_TOKEN) : null;
 
@@ -81,13 +84,17 @@ function tooOften(userId, limit = 120) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
-    let stop = false;
+    let over = false;
     req.on('data', (chunk) => {
-      if (stop) return;
+      if (over) return;            // дочитываем и выбрасываем, но не копим
       body += chunk;
-      if (body.length > MAX_BODY) { stop = true; req.destroy(); reject(new Error('слишком большое тело')); }
+      if (body.length > MAX_BODY) { over = true; body = ''; }
     });
-    req.on('end', () => { if (!stop) resolve(body); });
+    // Рвать соединение нельзя: браузер покажет «сетевая ошибка» вместо
+    // объяснения. Дочитываем до конца и отвечаем понятным отказом.
+    req.on('end', () => {
+      if (over) { const e = new Error('слишком большое тело'); e.tooBig = true; reject(e); } else resolve(body);
+    });
     req.on('error', reject);
   });
 }
@@ -114,7 +121,24 @@ function stateFor(user) {
     debts: { owedToUs, owedByUs },
     docs: bdb.listDocs(user.id, 5).map(docBrief),
     payUrl: payLink(user.tg_id),
+    facsimile: fxState(user.id),
     features: { dadata: dadata.dadataAvailable(), pdf: true },
+  };
+}
+
+/**
+ * Что показать на экране реквизитов: загружены ли картинки и куда ставим.
+ * Сами картинки наружу отдаём предпросмотром — они маленькие, а видеть,
+ * что именно загружено, важнее лишней экономии трафика.
+ */
+function fxState(userId) {
+  const sign = facsimile.get(userId, 'sign');
+  const stamp = facsimile.get(userId, 'stamp');
+  return {
+    scope: facsimile.scopeOf(userId),
+    scopes: facsimile.SCOPES,
+    sign: sign ? { preview: facsimile.dataUri(sign), size: sign.bytes.length } : null,
+    stamp: stamp ? { preview: facsimile.dataUri(stamp), size: stamp.bytes.length } : null,
   };
 }
 
@@ -223,6 +247,38 @@ const api = {
     if (!text) return { error: 'Пустой текст.' };
     if (!looksLikeBlock(text)) return { error: 'Не похоже на блок реквизитов.' };
     return { fields: parseRequisites(text) };
+  },
+
+  /**
+   * Загрузка подписи или печати. Из браузера картинка приходит как
+   * data-URI, но верить его заголовку нельзя — тип определяется по самим
+   * байтам внутри facsimile.save().
+   */
+  async 'POST /api/facsimile'({ user, body }) {
+    const kind = str(body.kind, 10);
+    if (!facsimile.KINDS.includes(kind)) return { error: 'Неизвестный вид изображения.' };
+    const m = /^data:([^;,]*);base64,(.+)$/s.exec(String(body.dataUrl || ''));
+    if (!m) return { error: 'Не разобрал картинку — пришлите PNG, JPEG или WebP.' };
+    // Base64 раздувает данные на треть: считаем до раскодирования, чтобы
+    // не собирать в памяти буфер, который всё равно не примем.
+    if (m[2].length > (facsimile.MAX_BYTES * 4) / 3 + 64) {
+      return { error: `Файл больше ${Math.round(facsimile.MAX_BYTES / 1024)} КБ.` };
+    }
+    const res = facsimile.save(user.id, kind, Buffer.from(m[2], 'base64'), m[1]);
+    if (!res.ok) return { error: res.error };
+    return { facsimile: fxState(user.id) };
+  },
+
+  async 'POST /api/facsimile/delete'({ user, body }) {
+    const kind = str(body.kind, 10);
+    if (!facsimile.KINDS.includes(kind)) return { error: 'Неизвестный вид изображения.' };
+    facsimile.remove(user.id, kind);
+    return { facsimile: fxState(user.id) };
+  },
+
+  async 'POST /api/facsimile/scope'({ user, body }) {
+    if (!facsimile.setScope(user.id, str(body.scope, 10))) return { error: 'Неизвестный режим.' };
+    return { facsimile: fxState(user.id) };
   },
 
   async 'GET /api/docs'({ user, url }) {
@@ -382,7 +438,11 @@ const server = http.createServer(async (req, res) => {
     try {
       const raw = await readBody(req);
       body = raw ? JSON.parse(raw) : {};
-    } catch (_) { return sendJson(res, 400, { error: 'Тело запроса не разобралось.' }); }
+    } catch (e) {
+      return e && e.tooBig
+        ? sendJson(res, 413, { error: 'Слишком большой запрос — уменьшите картинку.' })
+        : sendJson(res, 400, { error: 'Тело запроса не разобралось.' });
+    }
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
       return sendJson(res, 400, { error: 'Ожидался объект.' });
     }

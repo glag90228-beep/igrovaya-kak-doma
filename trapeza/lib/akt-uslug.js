@@ -4,7 +4,7 @@
 // Заказчик слева, Исполнитель справа, наименование ИП прописью CAPS, без М.П.,
 // таблица услуг, сумма прописью, при необходимости — признание задолженности.
 
-const { esc, ru, page, formatMoney, amountInWords } = require('./doc-html');
+const { esc, ru, page, fxHtml, formatMoney, amountInWords } = require('./doc-html');
 const { round2 } = require('./money');
 
 function party(org) {
@@ -82,7 +82,7 @@ function buildAktUslugHtml({ org, cp, doc }) {
       <div>
         <div class="b">Исполнитель</div>
         <div class="small muted">${ispoln.title}</div>
-        <div class="sign"><div style="flex:1"><div class="line">${esc(org.signer || '')} </div></div></div>
+        <div class="sign"><div style="flex:1"><div class="line">${fxHtml(org.fx, { stamp: true })}${esc(org.signer || '')} </div></div></div>
       </div>
     </div>`;
 

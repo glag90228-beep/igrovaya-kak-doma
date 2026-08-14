@@ -19,7 +19,7 @@
  * применением сверьтесь с действующей редакцией постановления № 1137.
  */
 
-const { esc, ru, page, formatMoney, amountInWords } = require('./doc-html');
+const { esc, ru, page, fxHtml, formatMoney, amountInWords } = require('./doc-html');
 const { round2 } = require('./money');
 
 /** Коды единиц измерения по ОКЕИ — самые ходовые. */
@@ -231,9 +231,9 @@ function buildUpdHtml({ org, cp, doc }) {
   const sfSign = status === 1 ? `
     <div class="sfsign">
       <div>Руководитель организации или иное уполномоченное лицо
-        <div class="line">${esc(org.signer || '')}</div></div>
+        <div class="line">${fxHtml(org.fx, { stamp: true })}${esc(org.signer || '')}</div></div>
       <div>Главный бухгалтер или иное уполномоченное лицо
-        <div class="line">${esc(org.signer || '')}</div></div>
+        <div class="line">${fxHtml(org.fx)}${esc(org.signer || '')}</div></div>
       <div>Индивидуальный предприниматель или иное уполномоченное лицо
         <div class="line">${esc(org.ogrnip ? `${org.signer || ''} · ОГРНИП ${org.ogrnip}` : (org.signer || ''))}</div></div>
     </div>` : '';
@@ -286,7 +286,7 @@ function buildUpdHtml({ org, cp, doc }) {
       <div>
         <h3>Товар (груз) передал / услуги, результаты работ сдал <span class="n">[10]</span></h3>
         <div class="small muted">${esc(org.full_name || org.name)}</div>
-        <div class="sign"><div style="flex:1"><div class="line">${esc(org.signer || '')}</div></div></div>
+        <div class="sign"><div style="flex:1"><div class="line">${fxHtml(org.fx, { stamp: status !== 1, tight: true })}${esc(org.signer || '')}</div></div></div>
         <div class="fld">Дата отгрузки, передачи <i>[11]</i>: <b>${ru(doc.transferDate || doc.date)}</b></div>
         <div class="fld">Иные сведения <i>[12]</i>: <span class="ln"></span></div>
         <div class="fld">Ответственный за оформление <i>[13]</i>: ${esc(org.signer || '')}</div>

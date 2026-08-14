@@ -52,7 +52,48 @@ const CSS = `
   .pay__qr svg { display: block; width: 100%; height: auto; }
   .pay__cap { font-size: 10px; margin-top: 4px; font-weight: bold; line-height: 1.25; }
   .pay__cap .muted { font-weight: normal; }
+
+  /* Факсимиле: подпись и печать над линией подписи.
+     Блок нулевой высоты — картинки висят поверх и не двигают вёрстку.
+     mix-blend-mode: multiply убирает белый фон снимка: подпись почти
+     всегда сфотографирована с листа, вырезать фон в проекте нечем, а
+     умножение делает белое невидимым и оставляет тёмные штрихи. */
+  .fx-box { position: relative; display: block; height: 0; }
+  .fx { position: absolute; mix-blend-mode: multiply; pointer-events: none; }
+  .fx-sign { left: 10px; bottom: -10px; height: 54px; width: auto;
+             filter: contrast(1.35) saturate(.85); }
+  /* Печать — у правого конца линии подписи и большей частью ниже неё.
+     Это единственное место, свободное во всех наших бланках: слева на
+     линии стоит подпись, сверху название графы, снизу расшифровка — а
+     правый конец линии пуст везде. 108px ≈ 28 мм, как печать ИП. */
+  .fx-stamp { right: 12px; bottom: -62px; height: 108px; width: auto;
+              opacity: .85; filter: contrast(1.1); }
+  /* ТОРГ-12 и блок передачи УПД плотнее: там под линией сразу следующая
+     графа, поэтому печать меньше и прижата ближе к линии. */
+  .fx-stamp--tight { height: 78px; bottom: -46px; right: 8px; }
+  @media print { .fx { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
 `;
+
+/**
+ * Разметка факсимиле над линией подписи. Живёт здесь, а не в facsimile.js,
+ * чтобы шаблоны документов оставались чистыми: они получают готовые
+ * картинки в org.fx и ничего не знают про базу.
+ *
+ * @param {{sign?:string, stamp?:string}} fx data-URI картинок
+ * @param {{stamp?:boolean, tight?:boolean}} opts печать ставим один раз на
+ *        документ — у подписи руководителя, а не в каждой строке подписей;
+ *        tight — для бланков, где над линией подписи почти нет места
+ */
+function fxHtml(fx, opts = {}) {
+  if (!fx || (!fx.sign && !fx.stamp)) return '';
+  const parts = [];
+  if (fx.sign) parts.push(`<img class="fx fx-sign" src="${fx.sign}" alt="">`);
+  if (fx.stamp && opts.stamp) {
+    const cls = `fx fx-stamp${opts.tight ? ' fx-stamp--tight' : ''}`;
+    parts.push(`<img class="${cls}" src="${fx.stamp}" alt="">`);
+  }
+  return parts.length ? `<span class="fx-box">${parts.join('')}</span>` : '';
+}
 
 function page(title, body) {
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8">`
@@ -60,4 +101,4 @@ function page(title, body) {
     + `<body><div class="doc">${body}</div></body></html>`;
 }
 
-module.exports = { esc, ru, page, formatMoney, formatRub, amountInWords };
+module.exports = { esc, ru, page, fxHtml, formatMoney, formatRub, amountInWords };

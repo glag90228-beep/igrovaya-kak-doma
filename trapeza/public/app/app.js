@@ -549,8 +549,136 @@ screens.org = async function orgScreen() {
       back();
     }),
   }, 'Сохранить')));
+
+  box.append(h('div', { class: 'section-title', text: 'Подпись и печать' }));
+  box.append(facsimileCard(s.facsimile));
   return box;
 };
+
+/**
+ * Уменьшает выбранное фото перед отправкой.
+ *
+ * Снимок подписи с телефона весит 3–5 МБ, а на документе она занимает
+ * полтора сантиметра — гнать мегабайты незачем, да и сервер такое не примет.
+ * Ужимаем по длинной стороне до 1400 px прямо в браузере: и загрузка
+ * быстрее, и человеку не приходится ничего готовить заранее.
+ */
+function shrinkImage(file, maxSide = 1400) {
+  return new Promise((done, fail) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const w = Math.max(1, Math.round(img.width * scale));
+      const h = Math.max(1, Math.round(img.height * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      // Белый фон под прозрачностью: PNG с альфой на документе даст
+      // серый прямоугольник, а нам нужно, чтобы сработало умножение.
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+      try {
+        done(canvas.toDataURL('image/png'));
+      } catch (e) { fail(new Error('Не смог обработать картинку')); }
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); fail(new Error('Это не картинка')); };
+    img.src = url;
+  });
+}
+
+/**
+ * Подпись и печать: загрузка картинкой, предпросмотр и выбор, куда ставить.
+ * Файл читаем прямо в браузере и шлём как data-URI — так не нужен ни
+ * multipart на сервере, ни отдельное хранилище на диске.
+ */
+function facsimileCard(state) {
+  const card = h('div', { class: 'card' });
+
+  const redraw = (fresh) => {
+    const fx = fresh || state;
+    card.replaceChildren();
+
+    for (const [kind, label] of [['sign', 'Подпись'], ['stamp', 'Печать']]) {
+      const has = fx[kind];
+      const file = h('input', {
+        type: 'file', accept: 'image/png,image/jpeg,image/webp',
+        id: `fx-${kind}`, style: 'display:none',
+      });
+      file.addEventListener('change', async () => {
+        const chosen = file.files && file.files[0];
+        if (!chosen) return;
+        try {
+          const dataUrl = await shrinkImage(chosen);
+          const r = await api('POST', '/api/facsimile', { kind, dataUrl });
+          toast(`${label} загружена`);
+          haptic('medium');
+          cache = {};
+          redraw(r.facsimile);
+        } catch (e) { toast(e.message, true); }
+      });
+
+      // Текст ужимается многоточием, а не переносится: иначе строка
+      // распухает на две и наезжает на предпросмотр.
+      card.append(h('div', { class: 'row' },
+        h('span', { class: `icon-box ${has ? 'ok' : ''}` }, icon(has ? 'check' : 'plus')),
+        h('span', { class: 'grow' },
+          h('div', { class: 'ellipsis', text: label }),
+          h('div', {
+            class: 'small muted ellipsis',
+            text: has ? `${Math.round(has.size / 1024)} КБ` : 'не загружена',
+          })),
+        // Миниатюра всегда на белом: умножение на тёмном фоне съело бы
+        // картинку, а показать надо ровно то, что ляжет на бумагу.
+        has && h('img', {
+          src: has.preview, alt: `${label} — предпросмотр`,
+          style: 'height:34px;width:auto;max-width:58px;flex:none;object-fit:contain;'
+            + 'background:#fff;border-radius:6px;padding:2px',
+        }),
+        file,
+        h('button', {
+          class: 'btn ghost', style: 'width:auto;flex:none;min-height:44px;padding:0 8px',
+          onclick: () => { haptic(); file.click(); },
+        }, has ? 'Заменить' : 'Загрузить'),
+        has && h('button', {
+          class: 'iconbtn danger', style: 'width:38px', 'aria-label': `Убрать: ${label}`,
+          onclick: async (e) => {
+            e.stopPropagation();
+            const r = await api('POST', '/api/facsimile/delete', { kind });
+            toast(`${label} убрана`);
+            cache = {};
+            redraw(r.facsimile);
+          },
+        }, icon('trash'))));
+    }
+
+    const sel = h('select', { id: 'fx-scope' },
+      Object.entries(fx.scopes).map(([key, label]) => h('option', {
+        value: key, selected: key === fx.scope,
+      }, label)));
+    sel.addEventListener('change', async () => {
+      try {
+        const r = await api('POST', '/api/facsimile/scope', { scope: sel.value });
+        toast('Сохранил');
+        cache = {};
+        redraw(r.facsimile);
+      } catch (e) { toast(e.message, true); }
+    });
+    card.append(h('div', { class: 'field' },
+      h('label', { for: 'fx-scope', text: 'Ставить' }), sel,
+      h('div', {
+        class: 'hint',
+        text: 'Снимите подпись на белом листе — фон бот уберёт сам. На платёжное '
+          + 'поручение и договор факсимиле не ставится: там нужна живая подпись.',
+      })));
+  };
+
+  redraw();
+  return card;
+}
 
 screens.debts = async function debts() {
   const { debtors } = await api('GET', '/api/debtors');

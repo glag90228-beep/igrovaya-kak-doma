@@ -246,6 +246,88 @@ async function main() {
   ok(r.status === 200 && r.json.fields.inn === '7707083893' && r.json.fields.bik === '044525187',
     'вставленный блок реквизитов разобран', r.json.fields && r.json.fields.bik);
 
+  console.log('\n── подпись и печать ──');
+  // Настоящий PNG 1×1: важно, что тип определится по байтам, а не по заголовку.
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  r = await call('GET', '/api/state', { user: masha });
+  ok(r.json.facsimile && r.json.facsimile.sign === null && r.json.facsimile.scope === 'all',
+    'по умолчанию факсимиле нет, режим «на все документы»', r.json.facsimile && r.json.facsimile.scope);
+
+  r = await call('POST', '/api/facsimile', { user: masha, body: { kind: 'sign', dataUrl: `data:image/png;base64,${PNG}` } });
+  ok(r.status === 200 && r.json.facsimile.sign && /^data:image\/png/.test(r.json.facsimile.sign.preview),
+    'подпись загружена и вернулась предпросмотром');
+
+  r = await call('POST', '/api/facsimile', { user: masha, body: { kind: 'sign', dataUrl: 'привет' } });
+  ok(r.status === 400, 'не-картинка отклонена', (r.json || {}).error);
+  r = await call('POST', '/api/facsimile', { user: masha, body: { kind: 'подпись', dataUrl: `data:image/png;base64,${PNG}` } });
+  ok(r.status === 400, 'неизвестный вид изображения отклонён');
+  // Больше допустимого, но в тело запроса ещё влезает: должен прийти
+  // понятный отказ, а не оборванное соединение.
+  r = await call('POST', '/api/facsimile', {
+    user: masha,
+    body: { kind: 'stamp', dataUrl: `data:image/png;base64,${'A'.repeat(1_500_000)}` },
+  });
+  ok(r.status === 400 && /КБ/.test(r.json.error || ''), 'слишком большая картинка отклонена с объяснением',
+    (r.json || {}).error);
+
+  // И совсем огромное тело: сервер отвечает, а не рвёт соединение.
+  r = await call('POST', '/api/facsimile', {
+    user: masha,
+    body: { kind: 'stamp', dataUrl: `data:image/png;base64,${'A'.repeat(3 * 1024 * 1024)}` },
+  });
+  ok(r.status === 413 && /уменьшите/i.test((r.json || {}).error || ''),
+    'запрос сверх лимита получает 413, а не обрыв связи', `${r.status} ${(r.json || {}).error || ''}`);
+
+  // Подделка заголовка: внутри GIF, заявлен PNG — тип берётся из байтов.
+  const GIF = Buffer.from('GIF89a').toString('base64');
+  r = await call('POST', '/api/facsimile', { user: masha, body: { kind: 'stamp', dataUrl: `data:image/png;base64,${GIF}` } });
+  ok(r.status === 400, 'GIF под видом PNG не принимается', (r.json || {}).error);
+
+  r = await call('GET', '/api/state', { user: petya });
+  ok(r.json.facsimile.sign === null, 'чужая подпись не видна другому пользователю');
+
+  r = await call('POST', '/api/facsimile/scope', { user: masha, body: { scope: 'closing' } });
+  ok(r.status === 200 && r.json.facsimile.scope === 'closing', 'режим переключается');
+  r = await call('POST', '/api/facsimile/scope', { user: masha, body: { scope: 'выдумка' } });
+  ok(r.status === 400, 'неизвестный режим отклонён');
+
+  // Главное: попадает ли подпись в сам документ.
+  const fx = require('./lib/facsimile');
+  const mashaId = bdb.getOrCreateUser(MASHA.id).id;
+  const buildSchet = require('./lib/schet').buildSchetHtml;
+  const org = bdb.getDefaultOrg(mashaId);
+  const cpRow = bdb.getCp(mashaId, cpId);
+  const docArgs = { number: '1', date: '2026-08-14', items: [{ name: 'Услуга', qty: 1, price: 100 }] };
+
+  fx.setScope(mashaId, 'all');
+  let html = buildSchet({ org: { ...org, fx: fx.forDocument(mashaId, 'sch') }, cp: cpRow, doc: docArgs });
+  const hasFx = (t) => t.includes('<img class="fx fx-sign');
+  ok(hasFx(html), 'подпись попадает в счёт при режиме «на все»');
+
+  fx.setScope(mashaId, 'closing');
+  html = buildSchet({ org: { ...org, fx: fx.forDocument(mashaId, 'sch') }, cp: cpRow, doc: docArgs });
+  ok(!hasFx(html), 'в режиме «только закрывающие» на счёте подписи нет');
+  const aktHtml = require('./lib/akt-uslug').buildAktUslugHtml({
+    org: { ...org, fx: fx.forDocument(mashaId, 'usl') }, cp: cpRow, doc: docArgs,
+  });
+  ok(hasFx(aktHtml), 'а на акте — есть');
+
+  fx.setScope(mashaId, 'off');
+  html = buildSchet({ org: { ...org, fx: fx.forDocument(mashaId, 'sch') }, cp: cpRow, doc: docArgs });
+  ok(!hasFx(html) && !html.includes('<img class="fx fx-stamp'),
+    'в режиме «выключено» факсимиле нет нигде');
+  fx.setScope(mashaId, 'all');
+
+  const ppHtml = require('./lib/platyozhka').buildPlatyozhkaHtml({
+    org: { ...org, fx: fx.forDocument(mashaId, 'pp') }, cp: cpRow,
+    doc: { number: '1', date: '2026-08-14', amount: 100, purpose: 'Оплата' },
+    p: { signer: org.signer },
+  });
+  ok(!hasFx(ppHtml), 'на платёжное поручение факсимиле не ставится никогда');
+
+  r = await call('POST', '/api/facsimile/delete', { user: masha, body: { kind: 'sign' } });
+  ok(r.status === 200 && r.json.facsimile.sign === null, 'подпись убирается');
+
   console.log('\n── статика и защита ──');
   r = await call('GET', '/');
   ok(r.status === 200 && /Первичка/.test(r.text), 'главная страница отдаётся');

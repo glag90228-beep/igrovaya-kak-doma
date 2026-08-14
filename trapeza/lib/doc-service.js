@@ -16,6 +16,7 @@
 
 const bdb = require('./bot-db');
 const { round2 } = require('./money');
+const facsimile = require('./facsimile');
 const { pdfAvailable, htmlToPdf } = require('./pdf');
 const { buildAktUslugHtml } = require('./akt-uslug');
 const { buildSchetHtml } = require('./schet');
@@ -102,6 +103,18 @@ function fail(reason, message) {
 }
 
 /**
+ * Добавляет к организации подпись и печать для этого типа документа.
+ * Шаблоны про базу ничего не знают — получают готовые картинки в org.fx.
+ *
+ * Платёжное поручение и договор сюда не попадают намеренно: платёжку
+ * подписывают в банке живой подписью, а факсимиле на договоре по статье
+ * 160 ГК допустимо только если стороны об этом заранее договорились.
+ */
+function withFx(userId, org, docType) {
+  return { ...org, fx: facsimile.forDocument(userId, docType) };
+}
+
+/**
  * Выпускает документ: собирает файл и кладёт запись в журнал.
  *
  * @returns {{ok:true, doc:object, file:object, total:number, title:string}
@@ -135,7 +148,7 @@ async function issueDocument(userId, {
 
   const doc = { number: num, date: when, items: clean, ...extra };
   const file = await renderFile(
-    kind.build({ org, cp, doc }),
+    kind.build({ org: withFx(userId, org, type), cp, doc }),
     `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
   );
 
@@ -176,7 +189,7 @@ async function rebuildDocument(userId, docId) {
 
   const doc = { number: saved.number, date: saved.date, ...saved.payload };
   const file = await renderFile(
-    kind.build({ org, cp, doc }),
+    kind.build({ org: withFx(userId, org, saved.type), cp, doc }),
     `${kind.file}_${safeName(saved.number)}_${safeName(cp.name)}`,
   );
   return { ok: true, file, title: saved.title || kind.title, doc: saved, total: saved.total };

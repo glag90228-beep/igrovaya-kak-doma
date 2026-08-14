@@ -24,6 +24,7 @@ const { payLink, daysFor } = require('./lib/lava');
 const dadata = require('./lib/dadata');
 const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
 const docService = require('./lib/doc-service');
+const facsimile = require('./lib/facsimile');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -496,27 +497,32 @@ function parseItemLine(text) {
  * Выпускает счёт или акт услуг: собирает файл, запоминает позиции
  * как шаблоны и кладёт документ в журнал — чтобы потом «повторить».
  */
-async function issueDoc(tg, chatId, user, { type, cpId, doc, seq, extra = {} }) {
-  const org = await requireOrg(tg, chatId, user); if (!org) return false;
-  const cp = bdb.getCp(user.id, cpId); if (!cp) return false;
-  if (!doc.items.length) { await tg.sendMessage(chatId, 'Позиций нет — отменил.', mainMenu()); return false; }
-
-  const total = round2(doc.items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0));
-  const kind = ITEM_DOCS[type];
-  const q = bdb.quota(user.id);
-  const tail = q.paid ? '' : `\n<i>Выписано в этом месяце: ${q.used + 1} из ${q.limit} бесплатных.</i>`;
-  await sendGenerated(tg, chatId, {
-    html: kind.build({ org, cp, doc }),
-    base: `${kind.file}_${safeName(doc.number)}_${safeName(cp.name)}`,
-    caption: `${esc(kind.title)} № ${esc(doc.number)}`
-      + ` от ${ru(doc.date)} для <b>${esc(cp.name)}</b> на ${formatRub(total)}.`
-      + (type === 'sch' ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.' : '') + tail,
+async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
+  // Сборка, факсимиле, нумерация и запись в журнал — в общем сервисе:
+  // мини-приложение делает ровно то же самое, и расходиться им нельзя.
+  await tg.sendChatAction(chatId, 'upload_document');
+  const res = await docService.issueDocument(user.id, {
+    type, cpId, items: doc.items, date: doc.date, number: doc.number, extra,
   });
+  if (!res.ok) {
+    const kb = res.reason === 'quota'
+      ? keyboard([[{ text: '⭐ Оформить подписку', data: 'billing' }], [{ text: '⬅️ Меню', data: 'menu' }]])
+      : mainMenu();
+    await tg.sendMessage(chatId, esc(res.message), kb);
+    return false;
+  }
 
-  bdb.rememberItems(user.id, doc.items);
-  bdb.saveDoc(user.id, {
-    orgId: org.id, cpId, type, number: doc.number, seq, date: doc.date, total,
-    payload: { items: doc.items, ...extra },
+  const cp = bdb.getCp(user.id, cpId);
+  const q = res.quota;
+  const tail = q.paid ? '' : `\n<i>Выписано в этом месяце: ${q.used} из ${q.limit} бесплатных.</i>`;
+  await tg.sendDocument(chatId, {
+    filename: res.file.filename,
+    buffer: res.file.buffer,
+    caption: `${esc(res.title)} № ${esc(res.doc.number)}`
+      + ` от ${ru(res.doc.date)} для <b>${esc(cp.name)}</b> на ${formatRub(res.total)}.`
+      + (type === 'sch' ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.' : '')
+      + (res.file.pdf ? '' : '\n\n(PDF недоступен — откройте файл в браузере и распечатайте / сохраните в PDF.)')
+      + tail,
   });
   return true;
 }
@@ -790,7 +796,80 @@ async function askUpdGross(tg, chatId, user, cpId, rate) {
  * Ничего не сохраняем молча: пользователь видит, что прочиталось,
  * и подтверждает. Ошибиться в сумме тут стоит дороже, чем переспросить.
  */
+// ---------- подпись и печать (факсимиле) ----------
+
+const FX_NAMES = { sign: 'подпись', stamp: 'печать' };
+
+/** Экран «Подпись и печать»: что загружено, куда ставится, как поменять. */
+async function showFacsimile(tg, chatId, user) {
+  const sign = facsimile.get(user.id, 'sign');
+  const stamp = facsimile.get(user.id, 'stamp');
+  const scope = facsimile.scopeOf(user.id);
+  const kb = (v) => Math.round(v / 1024);
+
+  const txt = '<b>Подпись и печать</b>\n\n'
+    + 'Загрузите снимок подписи и печати — они лягут на счета и акты, '
+    + 'и документ можно будет сразу отправлять клиенту.\n\n'
+    + `Подпись: ${sign ? `<b>загружена</b> (${kb(sign.bytes.length)} КБ)` : '—'}\n`
+    + `Печать: ${stamp ? `<b>загружена</b> (${kb(stamp.bytes.length)} КБ)` : '—'}\n`
+    + `Ставим: <b>${esc(facsimile.SCOPES[scope])}</b>\n\n`
+    + '<i>Как снять: распишитесь на белом листе чёрной ручкой и сфотографируйте '
+    + 'сверху при дневном свете. Фон убирать не нужно — бот сам сделает белое '
+    + 'прозрачным. Факсимиле не ставится на платёжное поручение и договор: '
+    + 'там нужна живая подпись.</i>';
+
+  const rows = [
+    [{ text: sign ? '🖊 Заменить подпись' : '🖊 Загрузить подпись', data: 'fx.add:sign' }],
+    [{ text: stamp ? '⭕ Заменить печать' : '⭕ Загрузить печать', data: 'fx.add:stamp' }],
+  ];
+  if (sign) rows.push([{ text: '🗑 Убрать подпись', data: 'fx.del:sign' }]);
+  if (stamp) rows.push([{ text: '🗑 Убрать печать', data: 'fx.del:stamp' }]);
+  for (const [key, label] of Object.entries(facsimile.SCOPES)) {
+    if (key !== scope) rows.push([{ text: `Ставить ${label}`, data: `fx.scope:${key}` }]);
+  }
+  rows.push([{ text: '⬅️ К организации', data: 'org' }]);
+  await tg.sendMessage(chatId, txt, keyboard(rows));
+}
+
+/** Принимает присланный снимок подписи или печати. */
+async function acceptFacsimile(tg, chatId, user, msg, kind) {
+  let fileId = null; let mime = 'image/jpeg';
+  if (msg.photo && msg.photo.length) {
+    fileId = msg.photo[msg.photo.length - 1].file_id;
+  } else if (msg.document && /^image\//.test(msg.document.mime_type || '')) {
+    fileId = msg.document.file_id;
+    mime = msg.document.mime_type;
+  }
+  if (!fileId) return;
+
+  await tg.sendChatAction(chatId, 'typing');
+  let buf;
+  try {
+    buf = await tg.downloadFile(fileId, facsimile.MAX_BYTES);
+  } catch (e) {
+    await tg.sendMessage(chatId, `Не смог забрать файл: ${esc(e.message)}`);
+    return;
+  }
+
+  const res = facsimile.save(user.id, kind, buf, mime);
+  if (!res.ok) {
+    await tg.sendMessage(chatId, `${esc(res.error)}\nПришлите другой файл.`);
+    return;
+  }
+  bdb.clearState(user.id);
+  await tg.sendMessage(chatId,
+    `Сохранил ${FX_NAMES[kind]}. Проверьте на документе: выпишите счёт — `
+    + 'если легло криво или бледно, пришлите снимок получше.');
+  await showFacsimile(tg, chatId, user);
+}
+
 async function handlePhoto(tg, chatId, user, msg) {
+  // Ждём снимок подписи или печати — тогда это не счёт для распознавания.
+  const st = bdb.getState(user.id);
+  if (st && /^fx:(sign|stamp)$/.test(st.state)) {
+    return acceptFacsimile(tg, chatId, user, msg, st.state.split(':')[1]);
+  }
+
   if (!visionAvailable()) {
     await tg.sendMessage(chatId,
       'Распознавание фото пока не подключено — нужен внешний сервис.\n'
@@ -1104,7 +1183,16 @@ async function showOrg(tg, chatId, user) {
     + `Подписант: ${esc(org.signer || '—')}\n`
     + `Банк: ${esc(org.bank_name || '—')}${org.bik ? ` · БИК ${esc(org.bik)}` : ''}\n`
     + `Р/с: ${esc(org.acc || '—')}`;
-  await tg.sendMessage(chatId, txt, keyboard([[{ text: '✏️ Изменить (ввести заново)', data: 'org.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+  const fxSign = facsimile.get(user.id, 'sign');
+  const fxStamp = facsimile.get(user.id, 'stamp');
+  const fxLabel = fxSign || fxStamp
+    ? `🖊 Подпись и печать · ${[fxSign && 'подпись', fxStamp && 'печать'].filter(Boolean).join(' и ')}`
+    : '🖊 Подпись и печать';
+  await tg.sendMessage(chatId, txt, keyboard([
+    [{ text: '✏️ Изменить (ввести заново)', data: 'org.new' }],
+    [{ text: fxLabel, data: 'fx' }],
+    [{ text: '⬅️ Меню', data: 'menu' }],
+  ]));
 }
 
 // ---------- главный обработчик апдейта ----------
@@ -1211,6 +1299,13 @@ async function handleMessage(tg, msg) {
   if (state.state.startsWith('dog:')) { await handleDogText(tg, chatId, user, state, text); return; }
   if (state.state === 'support') { await handleSupportText(tg, chatId, user, text); return; }
   if (state.state === 'claim') { await claimByEmail(tg, chatId, user, text); return; }
+  if (state.state.startsWith('fx:')) {
+    await tg.sendMessage(chatId,
+      `Жду картинку: <b>${FX_NAMES[state.state.split(':')[1]] || 'изображение'}</b>. `
+      + 'Пришлите фото или файл — или отмените.',
+      keyboard([[{ text: '✖️ Отмена', data: 'fx' }]]));
+    return;
+  }
   if (state.state.startsWith('op:')) {
     const cpId = Number(state.state.split(':')[1]);
     const op = parseOp(text);
@@ -1254,6 +1349,29 @@ async function handleCallback(tg, cq) {
       return;
     }
     if (data === 'org') { await showOrg(tg, chatId, user); return; }
+    if (data === 'fx') { await showFacsimile(tg, chatId, user); return; }
+    if (data.startsWith('fx.add:')) {
+      const kind = data.split(':')[1];
+      bdb.setState(user.id, `fx:${kind}`);
+      await tg.sendMessage(chatId,
+        `Пришлите снимок: <b>${FX_NAMES[kind]}</b>.\n\n`
+        + 'Фотографией или файлом — PNG, JPEG или WebP, до 1 МБ. '
+        + 'Лучше всего: белый лист, дневной свет, снимок строго сверху.',
+        keyboard([[{ text: '✖️ Отмена', data: 'fx' }]]));
+      return;
+    }
+    if (data.startsWith('fx.del:')) {
+      const kind = data.split(':')[1];
+      facsimile.remove(user.id, kind);
+      await tg.sendMessage(chatId, `Убрал ${FX_NAMES[kind]}.`);
+      await showFacsimile(tg, chatId, user);
+      return;
+    }
+    if (data.startsWith('fx.scope:')) {
+      facsimile.setScope(user.id, data.split(':')[1]);
+      await showFacsimile(tg, chatId, user);
+      return;
+    }
     if (data === 'org.new') { await startForm(tg, chatId, user, 'org'); return; }
     if (data === 'cps') { await showCps(tg, chatId, user); return; }
     if (data === 'cp.new') { await startForm(tg, chatId, user, 'cp'); return; }

@@ -45,6 +45,13 @@ const tg = {
   },
   async sendChatAction() {},
   async answerCallbackQuery() {},
+  // Настоящий PNG 1×1: приём подписи проверяет байты, а не заявленный тип.
+  async downloadFile() {
+    return Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+  },
   async editMessageText() {},
   async call() { return {}; },
 };
@@ -677,6 +684,49 @@ function button(sub) {
   ok(plainBtn && plainBtn.menu_button.type === 'commands',
     'без адреса приложения остаётся список команд', plainBtn && plainBtn.menu_button.type);
   if (keepUrl) process.env.WEBAPP_URL = keepUrl;
+
+  console.log('\n── подпись и печать ──');
+  const fxLib = require('./lib/facsimile');
+  const fxUser = require('./lib/bot-db').getOrCreateUser(USER.id);
+  await tap('org');
+  ok(Boolean(button('Подпись и печать')), 'в карточке организации есть вход в факсимиле');
+
+  await tap('fx');
+  ok(last().includes('Подпись и печать'), 'экран факсимиле открывается');
+  ok(last().includes('Ставим'), 'на экране написано, куда ставится факсимиле');
+
+  await tap('fx.add:sign');
+  ok(last().includes('Пришлите снимок'), 'бот просит прислать снимок', last().slice(0, 40));
+  await say('вот подпись словами');
+  ok(last().includes('Жду картинку'), 'на текст вместо картинки бот напоминает, чего ждёт');
+
+  // Блок распознавания счёта выше подменил загрузку на мусорные байты —
+  // возвращаем настоящую картинку, иначе проверять нечего.
+  tg.downloadFile = async () => Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64',
+  );
+  await handleUpdate(tg, { message: { chat: CHAT, from: USER, photo: [{ file_id: 'sign-1' }] } });
+  ok(Boolean(fxLib.get(fxUser.id, 'sign')), 'подпись сохранилась после фото');
+  ok(last().includes('Подпись и печать'), 'после загрузки снова показан экран факсимиле');
+
+  const st = require('./lib/bot-db').getState(fxUser.id);
+  ok(!st || !st.state, 'состояние ожидания снято — следующее фото пойдёт на распознавание');
+
+  await tap('fx.scope:closing');
+  ok(fxLib.scopeOf(fxUser.id) === 'closing', 'режим переключается кнопкой', fxLib.scopeOf(fxUser.id));
+  await tap('fx.scope:all');
+
+  // Подпись должна дойти до документа, который выписывает именно бот.
+  const beforeFiles = files.length;
+  await tap(`d.sch:${cpId}`);
+  await say('Проверка факсимиле; 1; 100');
+  await tap('items.done');
+  await tap('doc.make');
+  ok(files.length === beforeFiles + 1, 'счёт с факсимиле выписан', files.length - beforeFiles);
+
+  await tap('fx.del:sign');
+  ok(!fxLib.get(fxUser.id, 'sign'), 'подпись убирается кнопкой');
 
   console.log('\n── изоляция пользователей ──');
   const OTHER = { id: 777002, first_name: 'Чужой', username: 'other' };
