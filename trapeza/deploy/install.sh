@@ -62,27 +62,40 @@ chown -R trapeza:trapeza "$APP" "$LOGS"
 
 say "5/6 Проверка токена и оформление бота"
 set -a; . ./.env; set +a
-sudo -u trapeza --preserve-env node bot.js --check
-sudo -u trapeza --preserve-env node bot.js --setup
+# Разовый сбой сети до Telegram не должен обрывать установку: из-за set -e
+# скрипт падал здесь и не доходил до перезапуска служб, а на сервере
+# продолжал работать старый код — и было непонятно, почему обновление
+# «не приехало».
+sudo -u trapeza --preserve-env node bot.js --check || \
+  echo "⚠️  Не достучался до Telegram — проверю позже, установку продолжаю."
+sudo -u trapeza --preserve-env node bot.js --setup || \
+  echo "⚠️  Оформление не применилось (сеть или ограничение частоты) — повторите: node bot.js --setup"
 
 say "6/6 Службы"
 cp deploy/trapeza-bot.service deploy/trapeza-lava.service deploy/trapeza-miniapp.service \
    /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now trapeza-bot
+# Именно restart, а не «enable --now»: у запущенной службы --now ничего не
+# делает, и после обновления файлов в памяти остаётся прежний код.
+systemctl enable trapeza-bot
+systemctl restart trapeza-bot
 if grep -q '^LAVA_WEBHOOK_SECRET=.\+' .env; then
-  systemctl enable --now trapeza-lava
+  systemctl enable trapeza-lava
   systemctl restart trapeza-lava
 else
   echo "LAVA_WEBHOOK_SECRET пуст — приёмник оплат не запускаю."
 fi
 # Мини-приложение полезно и до того, как задан WEBAPP_URL: без адреса оно
 # просто никому не показывается, зато уже поднято и готово к https.
-systemctl enable --now trapeza-miniapp
+systemctl enable trapeza-miniapp
 systemctl restart trapeza-miniapp
 
 say "Готово"
-systemctl --no-pager --lines=5 status trapeza-bot || true
+for u in trapeza-bot trapeza-lava trapeza-miniapp; do
+  printf '  %-18s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || echo 'не запущена')"
+done
+echo ""
+echo "Свежий лог бота:  tail -n 5 /var/log/trapeza/bot.log"
 cat <<'TXT'
 
 Дальше:
