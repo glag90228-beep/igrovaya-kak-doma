@@ -7,7 +7,7 @@
 
 const { Telegram, keyboard } = require('./lib/tg');
 const bdb = require('./lib/bot-db');
-const { formatRub, amountInWords, round2 } = require('./lib/money');
+const { formatRub, amountInWords, round2, vatTotals } = require('./lib/money');
 const { buildAkt } = require('./lib/xlsx-akt');
 const { buildAktUslugHtml } = require('./lib/akt-uslug');
 const { buildSchetHtml } = require('./lib/schet');
@@ -467,10 +467,14 @@ async function startItems(tg, chatId, user, type, cpId, extra = {}) {
 async function showPreview(tg, chatId, user, state) {
   const [, type] = state.state.split(':');
   const d = state.data;
-  const total = round2(d.items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0));
+  const extra = d.doc || {};
+  // Итог считаем тем же кодом, что и сам документ: иначе сводка покажет
+  // одно, а в PDF попадёт другое — на НДС «сверху» разница заметная.
+  const sums = vatTotals(d.items, extra.vatRate == null ? null : Number(extra.vatRate),
+    Boolean(extra.priceIncludesVat));
+  const total = sums.total;
   const lines = d.items.map((it, i) =>
     `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)} = <b>${formatRub(round2(it.qty * it.price))}</b>`);
-  const extra = d.doc || {};
   const head = extra.status
     ? ` · статус ${extra.status}${extra.status === 1
       ? `, НДС ${extra.vatRate == null ? 'не облагается' : `${extra.vatRate}%`}`
@@ -479,10 +483,15 @@ async function showPreview(tg, chatId, user, state) {
   await tg.sendMessage(chatId,
     `<b>${esc(ITEM_DOCS[type].title)} № ${esc(d.number)}</b> от ${ru(d.date)}${head}\n\n`
     + (lines.join('\n') || '— пусто —')
-    + `\n\nИтого: <b>${formatRub(total)}</b>`,
+    + (sums.vat == null
+      ? `\n\nИтого: <b>${formatRub(total)}</b> (без НДС)`
+      : `\n\nБез налога: ${formatRub(sums.net)}`
+        + `\nНДС ${extra.vatRate}%: ${formatRub(sums.vat)}`
+        + `\n<b>Всего к оплате: ${formatRub(total)}</b>`),
     keyboard([
       [{ text: '📄 Сформировать документ', data: 'doc.make' }],
       [{ text: '✏️ Номер', data: 'doc.num' }, { text: '📅 Дата', data: 'doc.date' }],
+      ...(type === 'sch' ? [[{ text: `🧾 НДС: ${sums.vat == null ? 'нет' : `${extra.vatRate}%`}`, data: 'doc.vat' }]] : []),
       [{ text: '➕ Ещё позиция', data: 'items.more' }],
       [{ text: '✖️ Отмена', data: 'menu' }],
     ]));
@@ -895,6 +904,37 @@ async function mailDoc(tg, chatId, user, docId, emailOverride = null) {
 
 const FX_NAMES = { sign: 'подпись', stamp: 'печать' };
 
+/** Человеческое название режима НДС организации. */
+function vatLabel(org) {
+  const v = bdb.vatOf(org);
+  if (v.rate == null) return 'без НДС';
+  return `${v.rate}%${v.rate === 0 ? '' : (v.gross ? ', цены с НДС' : ', НДС сверху')}`;
+}
+
+/**
+ * Экран выбора системы налогообложения. Спрашиваем один раз у организации,
+ * а не у каждого счёта: бухгалтер выписывает их десятками, а режим меняется
+ * раз в год. У конкретного документа его всё равно можно переопределить.
+ */
+async function showVat(tg, chatId, user) {
+  const org = bdb.getDefaultOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  await tg.sendMessage(chatId,
+    `<b>НДС в счетах</b>\n\nСейчас: <b>${esc(vatLabel(org))}</b>\n\n`
+    + 'На упрощёнке — «без НДС». Плательщикам НДС важно выбрать, как указаны '
+    + 'ваши цены: «с НДС» значит налог уже внутри цены, «сверху» — что он '
+    + 'прибавится к сумме счёта.',
+    keyboard([
+      [{ text: 'Без НДС (упрощёнка)', data: 'vat.set:none:0' }],
+      [{ text: '20%, цены с НДС', data: 'vat.set:20:1' },
+        { text: '20% сверху', data: 'vat.set:20:0' }],
+      [{ text: '10%, цены с НДС', data: 'vat.set:10:1' },
+        { text: '10% сверху', data: 'vat.set:10:0' }],
+      [{ text: '0% (экспорт)', data: 'vat.set:0:0' }],
+      [{ text: '⬅️ К организации', data: 'org' }],
+    ]));
+}
+
 /** Экран «Подпись и печать»: что загружено, куда ставится, как поменять. */
 async function showFacsimile(tg, chatId, user) {
   const sign = facsimile.get(user.id, 'sign');
@@ -1286,6 +1326,7 @@ async function showOrg(tg, chatId, user) {
   await tg.sendMessage(chatId, txt, keyboard([
     [{ text: '✏️ Изменить (ввести заново)', data: 'org.new' }],
     [{ text: fxLabel, data: 'fx' }],
+    [{ text: `🧾 НДС: ${vatLabel(org)}`.slice(0, 60), data: 'vat' }],
     [{ text: '⬅️ Меню', data: 'menu' }],
   ]));
 }
@@ -1448,6 +1489,43 @@ async function handleCallback(tg, cq) {
       return;
     }
     if (data === 'org') { await showOrg(tg, chatId, user); return; }
+    if (data === 'doc.vat') {
+      await tg.sendMessage(chatId, 'НДС для этого счёта:', keyboard([
+        [{ text: 'Без НДС', data: 'doc.vat.set:none:0' }],
+        [{ text: '20%, цены с НДС', data: 'doc.vat.set:20:1' },
+          { text: '20% сверху', data: 'doc.vat.set:20:0' }],
+        [{ text: '10%, цены с НДС', data: 'doc.vat.set:10:1' },
+          { text: '10% сверху', data: 'doc.vat.set:10:0' }],
+      ]));
+      return;
+    }
+    if (data.startsWith('doc.vat.set:')) {
+      const st2 = bdb.getState(user.id);
+      if (!st2 || !st2.state.startsWith('items:')) return;
+      const [rate, gross] = data.slice(12).split(':');
+      const dd = st2.data;
+      dd.doc = dd.doc || {};
+      if (rate === 'none') { delete dd.doc.vatRate; delete dd.doc.priceIncludesVat; } else {
+        dd.doc.vatRate = Number(rate);
+        dd.doc.priceIncludesVat = gross === '1';
+      }
+      bdb.setState(user.id, st2.state, dd);
+      await showPreview(tg, chatId, user, bdb.getState(user.id));
+      return;
+    }
+    if (data === 'vat') { await showVat(tg, chatId, user); return; }
+    if (data.startsWith('vat.set:')) {
+      const [rate, gross] = data.slice(8).split(':');
+      const org = bdb.getDefaultOrg(user.id);
+      if (org) {
+        bdb.updateOrg(user.id, org.id, {
+          vat_rate: rate === 'none' ? '' : rate,
+          vat_gross: gross === '1' ? 1 : 0,
+        });
+      }
+      await showVat(tg, chatId, user);
+      return;
+    }
     if (data === 'fx') { await showFacsimile(tg, chatId, user); return; }
     if (data.startsWith('fx.add:')) {
       const kind = data.split(':')[1];
@@ -1502,7 +1580,15 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('d.akt:')) { await genAktSverki(tg, chatId, user, Number(data.slice(6))); return; }
     if (data.startsWith('d.usl:')) { await startItems(tg, chatId, user, 'usl', Number(data.slice(6))); return; }
-    if (data.startsWith('d.sch:')) { await startItems(tg, chatId, user, 'sch', Number(data.slice(6))); return; }
+    if (data.startsWith('d.sch:')) {
+      // Ставку не спрашиваем — берём режим организации; у документа его
+      // можно поменять кнопкой в сводке перед выпуском.
+      const org = bdb.getDefaultOrg(user.id);
+      const v = org ? bdb.vatOf(org) : { rate: null, gross: false };
+      await startItems(tg, chatId, user, 'sch', Number(data.slice(6)),
+        v.rate == null ? {} : { vatRate: v.rate, priceIncludesVat: v.gross });
+      return;
+    }
     if (data.startsWith('d.upd:')) { await askUpdStatus(tg, chatId, user, Number(data.slice(6))); return; }
     if (data.startsWith('upd.s2:')) { await startItems(tg, chatId, user, 'upd', Number(data.slice(7)), { status: 2 }); return; }
     if (data.startsWith('upd.s1:')) { await askUpdRate(tg, chatId, user, Number(data.slice(7))); return; }

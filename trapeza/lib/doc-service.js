@@ -15,7 +15,7 @@
  */
 
 const bdb = require('./bot-db');
-const { round2 } = require('./money');
+const { round2, vatTotals } = require('./money');
 const facsimile = require('./facsimile');
 const { pdfAvailable, htmlToPdf } = require('./pdf');
 const { buildAktUslugHtml } = require('./akt-uslug');
@@ -69,11 +69,16 @@ async function renderFile(html, base) {
   };
 }
 
-/** Сумма по позициям — единственный источник итога, руками её не передают. */
-function totalOf(items) {
-  return round2((items || []).reduce(
-    (sum, it) => sum + (Number(it.qty) || 0) * (Number(it.price) || 0), 0,
-  ));
+/**
+ * Сумма документа — единственный источник итога, руками её не передают.
+ *
+ * С НДС «сверху» сумма к оплате больше произведения количества на цену:
+ * 100 руб. + 20% это 120. Если считать без налога, в журнале и в подписи
+ * к файлу окажется заниженная сумма, а долг контрагента — неверный.
+ */
+function totalOf(items, extra = {}) {
+  const rate = extra.vatRate == null ? null : Number(extra.vatRate);
+  return vatTotals(items || [], rate, Boolean(extra.priceIncludesVat)).total;
 }
 
 /**
@@ -144,7 +149,7 @@ async function issueDocument(userId, {
   const year = Number(when.slice(0, 4));
   const seq = bdb.nextSeq(userId, type, year);
   const num = String(number == null || number === '' ? seq : number).slice(0, 40);
-  const total = totalOf(clean);
+  const total = totalOf(clean, extra);
 
   const doc = { number: num, date: when, items: clean, ...extra };
   const file = await renderFile(

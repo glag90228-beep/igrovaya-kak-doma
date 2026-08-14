@@ -105,4 +105,53 @@ function rubWithWords(amount) {
   return `${formatRub(amount)} (${amountInWords(amount)})`;
 }
 
-module.exports = { round2, formatMoney, formatRub, amountInWords, rubWithWords, plural };
+
+/**
+ * Раскладка позиции по НДС — общая для счёта и УПД.
+ *
+ * gross — цена уже включает налог («в том числе»), иначе он начисляется
+ * сверху. Разница принципиальная: 100 руб. с НДС 20% это 83,33 + 16,67,
+ * а 100 руб. без НДС — это 100 + 20. Ошибка здесь превращается в спор
+ * с контрагентом на сумму налога.
+ *
+ * @param {{qty:number, price:number}} it позиция
+ * @param {number|null} rate ставка в процентах; null — без НДС
+ * @param {boolean} gross цена включает налог
+ */
+function vatSplit(it, rate, gross) {
+  const qty = Number(it.qty) || 0;
+  const price = Number(it.price) || 0;
+  if (rate == null) {
+    const sum = round2(qty * price);
+    return { unitNet: price, net: sum, vat: null, total: sum };
+  }
+  const r = Number(rate) / 100;
+  if (gross) {
+    const total = round2(qty * price);
+    const net = round2(total / (1 + r));
+    return { unitNet: round2(price / (1 + r)), net, vat: round2(total - net), total };
+  }
+  const net = round2(qty * price);
+  const vat = round2(net * r);
+  return { unitNet: price, net, vat, total: round2(net + vat) };
+}
+
+/** Итоги по списку позиций с учётом НДС. */
+function vatTotals(items, rate, gross) {
+  let net = 0; let vat = 0; let total = 0;
+  for (const it of items || []) {
+    const s = vatSplit(it, rate, gross);
+    net += s.net; total += s.total;
+    if (s.vat != null) vat += s.vat;
+  }
+  return {
+    net: round2(net),
+    vat: rate == null ? null : round2(vat),
+    total: round2(total),
+  };
+}
+
+const rateLabel = (rate) => (rate == null ? 'Без НДС' : `${rate}%`);
+
+module.exports = {
+  vatSplit, vatTotals, rateLabel, round2, formatMoney, formatRub, amountInWords, rubWithWords, plural };

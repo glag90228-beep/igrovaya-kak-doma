@@ -5,13 +5,25 @@
 // «Без НДС», всего к оплате прописью, подписи Руководитель / Бухгалтер.
 
 const { esc, ru, page, fxHtml, formatMoney, amountInWords } = require('./doc-html');
-const { round2 } = require('./money');
+const { round2, vatTotals, rateLabel } = require('./money');
 const { payQrSvg } = require('./qr-pay');
 
-/** doc: { number, date, items:[{name,qty,unit,price}], vat? (false=без НДС) } */
+/**
+ * doc: { number, date, items:[{name,qty,unit,price}],
+ *        vatRate (20|10|0|null — null значит «без НДС»),
+ *        priceIncludesVat (цены уже с налогом) }
+ */
 function buildSchetHtml({ org, cp, doc }) {
   const items = doc.items || [];
-  const total = round2(items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0));
+  const rate = doc.vatRate == null ? null : Number(doc.vatRate);
+  const gross = Boolean(doc.priceIncludesVat);
+  // net — без налога, total — к оплате. При «НДС сверху» они различаются,
+  // и в счёте платить надо именно total, иначе контрагент недоплатит.
+  // «Итого» обязано совпадать с суммой колонки «Сумма», иначе бухгалтер
+  // получателя первым делом спросит, почему столбец не сходится:
+  //   цены с НДС → в колонке уже полная сумма, Итого = всего к оплате;
+  //   НДС сверху → в колонке сумма без налога, Итого = без налога.
+  const { net, vat, total } = vatTotals(items, rate, gross);
   const n = items.length;
 
   const rows = items.map((it, i) => {
@@ -30,7 +42,7 @@ function buildSchetHtml({ org, cp, doc }) {
   const svg = doc.qr === false ? null : payQrSvg({
     org, sum: total, payer: cp.full_name || cp.name,
     purpose: `Оплата по счёту № ${doc.number || '1'} от ${ru(doc.date)}`
-      + (doc.vat ? '' : ', без НДС'),
+      + (rate == null ? ', без НДС' : `, в т.ч. НДС ${rate}% — ${formatMoney(vat)} руб.`),
   }, { size: 150 });
   const qrBlock = svg
     ? `<div class="pay__qr">${svg}<div class="pay__cap">Оплата по QR<br>
@@ -79,9 +91,12 @@ function buildSchetHtml({ org, cp, doc }) {
       </tr></thead>
       <tbody>
         ${rows || '<tr><td colspan="6" class="c muted">— нет позиций —</td></tr>'}
-        <tr class="total"><td colspan="5" class="r">Итого:</td><td class="r">${formatMoney(total)}</td></tr>
-        <tr><td colspan="5" class="r">${doc.vat ? 'В том числе НДС:' : 'Без налога (НДС):'}</td>
-            <td class="r">${doc.vat ? formatMoney(round2(total - total / 1.2)) : '—'}</td></tr>
+        <tr class="total"><td colspan="5" class="r">Итого:</td>
+            <td class="r">${formatMoney(gross ? total : net)}</td></tr>
+        <tr><td colspan="5" class="r">${rate == null
+    ? 'Без налога (НДС):'
+    : `${gross ? 'В том числе НДС' : 'НДС'} (${rateLabel(rate)}):`}</td>
+            <td class="r">${rate == null ? '—' : formatMoney(vat)}</td></tr>
         <tr class="total"><td colspan="5" class="r b">Всего к оплате:</td><td class="r b">${formatMoney(total)}</td></tr>
       </tbody>
     </table>

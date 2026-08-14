@@ -688,6 +688,55 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     'без адреса приложения остаётся список команд', plainBtn && plainBtn.menu_button.type);
   if (keepUrl) process.env.WEBAPP_URL = keepUrl;
 
+  console.log('\n── НДС в счёте ──');
+  {
+    const { vatTotals } = require('./lib/money');
+    const bdb2 = require('./lib/bot-db');
+    ok(vatTotals([{ qty: 1, price: 100 }], 20, false).total === 120,
+      'НДС сверху: 100 + 20% = 120', vatTotals([{ qty: 1, price: 100 }], 20, false).total);
+    const inc = vatTotals([{ qty: 1, price: 100 }], 20, true);
+    ok(inc.total === 100 && inc.net === 83.33 && inc.vat === 16.67,
+      'НДС в том числе: 100 = 83,33 + 16,67', JSON.stringify(inc));
+    ok(vatTotals([{ qty: 2, price: 50 }], null, false).vat === null, 'без НДС налог не считается');
+
+    await tap('org');
+    const vatBtn = button('НДС:');
+    ok(Boolean(vatBtn), 'в карточке организации есть настройка НДС', vatBtn);
+    await tap('vat');
+    ok(last().includes('НДС в счетах'), 'экран НДС открывается');
+
+    await tap('vat.set:20:0');
+    const orgNow = bdb2.getDefaultOrg(fxUserId());
+    ok(bdb2.vatOf(orgNow).rate === 20 && bdb2.vatOf(orgNow).gross === false,
+      'режим «20% сверху» сохранён', JSON.stringify(bdb2.vatOf(orgNow)));
+
+    // Счёт должен взять ставку сам и посчитать итог с налогом.
+    await tap(`d.sch:${cpId}`);
+    await say('Услуга с НДС; 1; 1000');
+    await tap('items.done');
+    ok(norm(last()).includes('НДС 20%: 200,00'), 'в сводке показан налог', norm(last()).slice(-120));
+    ok(norm(last()).includes('Всего к оплате: 1 200,00'), 'итог посчитан с налогом сверху');
+
+    const beforeVat = files.length;
+    await tap('doc.make');
+    ok(files.length === beforeVat + 1, 'счёт с НДС выписан');
+    const savedVat = bdb2.listDocs(fxUserId(), 1)[0];
+    ok(savedVat.total === 1200, 'в журнал записана сумма с налогом, а не без', savedVat.total);
+
+    // Переопределение ставки для одного документа.
+    await tap(`d.sch:${cpId}`);
+    await say('Разовая услуга; 1; 500');
+    await tap('items.done');
+    await tap('doc.vat');
+    ok(last().includes('НДС для этого счёта'), 'ставку можно поменять для одного счёта');
+    await tap('doc.vat.set:none:0');
+    ok(norm(last()).includes('(без НДС)') && norm(last()).includes('500,00'),
+      'переопределение сработало — налога в сводке больше нет', norm(last()).slice(-60));
+    await tap('doc.make');
+
+    await tap('vat.set:none:0');   // возвращаем как было
+  }
+
   console.log('\n── отправка документа на почту ──');
   {
     const net = require('node:net');

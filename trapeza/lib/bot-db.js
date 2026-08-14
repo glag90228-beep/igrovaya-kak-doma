@@ -96,6 +96,14 @@ function migrate() {
   addColumn('counterparties', 'corr_acc', "TEXT NOT NULL DEFAULT ''");
   // Почта контрагента: чтобы отправлять счёт сразу, не спрашивая каждый раз.
   addColumn('counterparties', 'email', "TEXT NOT NULL DEFAULT ''");
+
+  // Режим НДС организации: спрашивать ставку у каждого счёта — мучение,
+  // бухгалтер выписывает их десятками, а система налогообложения меняется
+  // раз в год. Храним у организации, у документа можно переопределить.
+  addColumn('orgs', 'vat_rate', "TEXT NOT NULL DEFAULT ''");   // '' | '0' | '10' | '20'
+  addColumn('orgs', 'vat_gross', 'INTEGER NOT NULL DEFAULT 0'); // 1 — цены уже с НДС
+  // ОГРНИП: в УПД есть графа, а поля не было — печаталось пусто.
+  addColumn('orgs', 'ogrnip', "TEXT NOT NULL DEFAULT ''");
   db.exec('CREATE INDEX IF NOT EXISTS idx_cp_user ON counterparties(user_id)');
 }
 
@@ -132,7 +140,7 @@ function clearState(userId) { setState(userId, '', null); }
 
 function createOrg(userId, fields) {
   const cols = ['name', 'full_name', 'inn', 'kpp', 'signer', 'address',
-    'bank_name', 'bik', 'acc', 'corr_acc'];
+    'bank_name', 'bik', 'acc', 'corr_acc', 'ogrnip'];
   const vals = cols.map((c) => fields[c] || '');
   const anyDefault = db.prepare('SELECT COUNT(*) AS n FROM orgs WHERE user_id = ?').get(userId).n;
   const info = db.prepare(`
@@ -141,9 +149,16 @@ function createOrg(userId, fields) {
     .run(userId, ...vals, anyDefault === 0 ? 1 : 0, new Date().toISOString());
   return Number(info.lastInsertRowid);
 }
+/** Режим НДС организации в удобном виде: {rate: number|null, gross: boolean}. */
+function vatOf(org) {
+  const raw = org && org.vat_rate;
+  const rate = raw === '' || raw == null ? null : Number(raw);
+  return { rate: Number.isFinite(rate) ? rate : null, gross: Boolean(org && org.vat_gross) };
+}
+
 function updateOrg(userId, id, fields) {
   const allowed = ['name', 'full_name', 'inn', 'kpp', 'signer', 'address',
-    'bank_name', 'bik', 'acc', 'corr_acc'];
+    'bank_name', 'bik', 'acc', 'corr_acc', 'ogrnip', 'vat_rate', 'vat_gross'];
   const sets = [], vals = [];
   for (const k of allowed) if (k in fields) { sets.push(`${k} = ?`); vals.push(fields[k]); }
   if (!sets.length) return;
@@ -422,7 +437,7 @@ function quota(userId) {
 module.exports = {
   migrate,
   getOrCreateUser, setState, getState, clearState,
-  createOrg, updateOrg, saveMyOrg, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
+  createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp,
   addOp, listOps, deleteLastOp, balanceOf, debtors,
   markBlocked, markActive, isBlocked, reachableUsers,
