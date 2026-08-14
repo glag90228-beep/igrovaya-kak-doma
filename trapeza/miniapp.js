@@ -28,6 +28,7 @@ const billing = require('./lib/billing');
 const docService = require('./lib/doc-service');
 const dadata = require('./lib/dadata');
 const facsimile = require('./lib/facsimile');
+const mailer = require('./lib/mail');
 const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
 const { round2 } = require('./lib/money');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
@@ -100,6 +101,8 @@ function readBody(req) {
 }
 
 const str = (v, max = 300) => String(v == null ? '' : v).trim().slice(0, max);
+const ruDate = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(iso || '')
+  ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : (iso || ''));
 
 // ---------- сборка данных для экранов ----------
 
@@ -122,7 +125,7 @@ function stateFor(user) {
     docs: bdb.listDocs(user.id, 5).map(docBrief),
     payUrl: payLink(user.tg_id),
     facsimile: fxState(user.id),
-    features: { dadata: dadata.dadataAvailable(), pdf: true },
+    features: { dadata: dadata.dadataAvailable(), pdf: true, mail: mailer.mailAvailable() },
   };
 }
 
@@ -155,7 +158,7 @@ function cpBrief(userId, cp) {
   return {
     id: cp.id, name: cp.name, full_name: cp.full_name, inn: cp.inn, kpp: cp.kpp,
     kind: cp.kind, address: cp.address, bank_name: cp.bank_name, bik: cp.bik,
-    acc: cp.acc, corr_acc: cp.corr_acc, contract: cp.contract,
+    acc: cp.acc, corr_acc: cp.corr_acc, contract: cp.contract, email: cp.email,
     balance: b ? round2(b.closing) : 0,
   };
 }
@@ -184,6 +187,7 @@ const api = {
       acc: str(body.acc, 20),
       corr_acc: str(body.corr_acc, 20),
       contract: str(body.contract, 200),
+      email: str(body.email, 254),
     };
     const id = Number(body.id) || 0;
     if (id) {
@@ -284,6 +288,47 @@ const api = {
   async 'GET /api/docs'({ user, url }) {
     const cpId = Number(url.searchParams.get('cp')) || null;
     return { docs: bdb.listDocs(user.id, 30, cpId).map(docBrief) };
+  },
+
+  /**
+   * Отправляет ранее выписанный документ на почту контрагента.
+   * Адрес запоминается: со второго раза спрашивать уже нечего.
+   */
+  async 'POST /api/doc/mail'({ user, body }) {
+    if (!mailer.mailAvailable()) return { error: `Отправка почты не настроена. ${mailer.mailHint()}` };
+
+    const doc = bdb.getDoc(user.id, Number(body.id));
+    if (!doc) return { error: 'Документ не найден.' };
+    const cp = bdb.getCp(user.id, doc.cp_id);
+    if (!cp) return { error: 'Контрагент не найден.' };
+
+    const to = str(body.email, 254) || cp.email;
+    if (!mailer.validEmail(to)) return { error: 'Укажите правильный адрес почты.' };
+
+    const built = await docService.rebuildDocument(user.id, doc.id);
+    if (!built.ok) return { error: built.message };
+
+    const org = bdb.getOrg(user.id, doc.org_id) || bdb.getDefaultOrg(user.id) || {};
+    const money = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2 }).format(doc.total || 0);
+    const res = await mailer.sendMail({
+      to,
+      subject: `${doc.title} № ${doc.number} от ${ruDate(doc.date)}`,
+      text: [
+        'Здравствуйте!', '',
+        `Во вложении ${String(doc.title).toLowerCase()} № ${doc.number}`
+          + ` от ${ruDate(doc.date)}${doc.total ? ` на сумму ${money} руб.` : ''}.`,
+        ...(doc.type === 'sch'
+          ? ['', 'В счёте есть QR-код: оплатить можно, наведя камеру в приложении банка.'] : []),
+        '', 'С уважением,', org.name || org.full_name || '',
+      ].join('\n'),
+      attachments: [{
+        filename: built.file.filename, content: built.file.buffer, contentType: built.file.mime,
+      }],
+    });
+    if (!res.ok) return { error: `Не отправилось: ${res.error}` };
+
+    if (to !== cp.email) bdb.updateCp(user.id, cp.id, { email: to });
+    return { sent: to, remembered: to !== cp.email };
   },
 
   async 'GET /api/debtors'({ user }) {

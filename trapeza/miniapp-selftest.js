@@ -246,6 +246,79 @@ async function main() {
   ok(r.status === 200 && r.json.fields.inn === '7707083893' && r.json.fields.bik === '044525187',
     'вставленный блок реквизитов разобран', r.json.fields && r.json.fields.bik);
 
+  console.log('\n── отправка на почту ──');
+  {
+    const net = require('node:net');
+    const got = { rcpt: [], data: '' };
+    const smtp = net.createServer((sock) => {
+      let inData = false; let body = '';
+      sock.setEncoding('utf8');
+      sock.write('220 local ESMTP\r\n');
+      sock.on('data', (chunk) => {
+        if (inData) {
+          body += chunk;
+          const end = body.indexOf('\r\n.\r\n');
+          if (end === -1) return;
+          got.data = body.slice(0, end); inData = false;
+          sock.write('250 Ok: queued\r\n');
+          return;
+        }
+        for (const line of chunk.split('\r\n').filter(Boolean)) {
+          if (/^EHLO/i.test(line)) sock.write('250-local\r\n250 HELP\r\n');
+          else if (/^RCPT TO:/i.test(line)) { got.rcpt.push(line.slice(8).replace(/[<>]/g, '').trim()); sock.write('250 Ok\r\n'); }
+          else if (/^DATA/i.test(line)) { inData = true; sock.write('354 go\r\n'); }
+          else if (/^QUIT/i.test(line)) { sock.write('221 bye\r\n'); sock.end(); }
+          else sock.write('250 Ok\r\n');
+        }
+      });
+      sock.on('error', () => {});
+    });
+    await new Promise((res2) => smtp.listen(0, '127.0.0.1', res2));
+
+    const someDoc = (await call('GET', '/api/docs', { user: masha })).json.docs
+      .find((x) => x.type === 'sch');
+
+    delete process.env.SMTP_HOST;
+    r = await call('GET', '/api/state', { user: masha });
+    ok(r.json.features.mail === false, 'без настроек почта помечена как недоступная');
+    r = await call('POST', '/api/doc/mail', { user: masha, body: { id: someDoc.id, email: 'a@b.ru' } });
+    ok(r.status === 400 && /не настроена/.test(r.json.error), 'отправка без настроек отклоняется');
+
+    process.env.SMTP_HOST = '127.0.0.1';
+    process.env.SMTP_PORT = String(smtp.address().port);
+    process.env.SMTP_FROM = 'bot@pervichka.ru';
+    delete process.env.SMTP_USER;
+    delete process.env.SMTP_SECURE;
+
+    r = await call('GET', '/api/state', { user: masha });
+    ok(r.json.features.mail === true, 'с настройками почта доступна');
+
+    r = await call('POST', '/api/doc/mail', { user: masha, body: { id: someDoc.id, email: 'кривой' } });
+    ok(r.status === 400, 'кривой адрес отклонён');
+
+    r = await call('POST', '/api/doc/mail', { user: masha, body: { id: someDoc.id, email: 'buh@zarya.ru' } });
+    ok(r.status === 200 && r.json.sent === 'buh@zarya.ru', 'документ отправлен на почту',
+      r.status === 200 ? r.json.sent : (r.json || {}).error);
+    ok(got.rcpt.includes('buh@zarya.ru'), 'сервер получил адрес', got.rcpt.join());
+    ok(/Content-Disposition: attachment/.test(got.data), 'вложение на месте');
+    ok(r.json.remembered === true, 'адрес запомнен у контрагента');
+
+    r = await call('GET', '/api/cps', { user: masha });
+    ok(r.json.cps[0].email === 'buh@zarya.ru', 'почта видна в карточке контрагента', r.json.cps[0].email);
+
+    got.rcpt.length = 0;
+    r = await call('POST', '/api/doc/mail', { user: masha, body: { id: someDoc.id } });
+    ok(r.status === 200 && got.rcpt.includes('buh@zarya.ru'),
+      'повторная отправка идёт по сохранённому адресу');
+
+    r = await call('POST', '/api/doc/mail', { user: petya, body: { id: someDoc.id, email: 'a@b.ru' } });
+    ok(r.status === 400, 'чужой документ по почте не отправить', (r.json || {}).error);
+
+    smtp.close();
+    delete process.env.SMTP_HOST;
+    delete process.env.SMTP_PORT;
+  }
+
   console.log('\n── подпись и печать ──');
   // Настоящий PNG 1×1: важно, что тип определится по байтам, а не по заголовку.
   const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';

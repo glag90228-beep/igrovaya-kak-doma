@@ -25,6 +25,7 @@ const dadata = require('./lib/dadata');
 const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
 const docService = require('./lib/doc-service');
 const facsimile = require('./lib/facsimile');
+const mailer = require('./lib/mail');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -590,6 +591,12 @@ async function showDoc(tg, chatId, user, docId) {
     .map((it, i) => `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n');
   const rows = [];
   if (d.type !== 'akt') rows.push([{ text: '📄 Прислать файл заново', data: `doc.get:${d.id}` }]);
+  if (mailer.mailAvailable() && d.type !== 'akt') {
+    rows.push([{
+      text: cp && cp.email ? `✉️ Отправить на ${cp.email}`.slice(0, 60) : '✉️ Отправить на почту',
+      data: `doc.mail:${d.id}`,
+    }]);
+  }
   if (ITEM_DOCS[d.type]) rows.push([{ text: '🔁 Повторить новым номером', data: `d.rep:${d.id}` }]);
   if (cp) rows.push([{ text: `👤 ${cp.name}`, data: `cp:${cp.id}` }]);
   rows.push([{ text: '🗑 Убрать из журнала', data: `doc.del:${d.id}` }]);
@@ -796,6 +803,88 @@ async function askUpdGross(tg, chatId, user, cpId, rate) {
  * Ничего не сохраняем молча: пользователь видит, что прочиталось,
  * и подтверждает. Ошибиться в сумме тут стоит дороже, чем переспросить.
  */
+// ---------- отправка документа на почту ----------
+
+/**
+ * Текст письма. Нарочно короткий и деловой: длинные автоприветствия
+ * в деловой переписке читаются как спам, а получателю нужно понять за
+ * две секунды, что пришло и что с этим делать.
+ */
+function letterFor(doc, org, cp) {
+  const kind = (doc.title || 'Документ').toLowerCase();
+  const money = doc.total ? ` на сумму ${formatRub(doc.total)}` : '';
+  const lines = [
+    `Здравствуйте${cp.signer ? `, ${cp.signer}` : ''}!`,
+    '',
+    `Во вложении ${kind} № ${doc.number} от ${ru(doc.date)}${money}.`,
+  ];
+  if (doc.type === 'sch') {
+    lines.push('', 'В счёте есть QR-код: оплатить можно, наведя камеру в приложении банка.');
+  }
+  lines.push('', 'С уважением,', org.name || org.full_name || '');
+  return lines.join('\n');
+}
+
+/**
+ * Отправляет ранее выписанный документ на почту контрагента.
+ * Если почта не сохранена — спрашиваем её и запоминаем на будущее.
+ */
+async function mailDoc(tg, chatId, user, docId, emailOverride = null) {
+  if (!mailer.mailAvailable()) {
+    await tg.sendMessage(chatId,
+      `Отправка почты не настроена.\n<i>${esc(mailer.mailHint())}</i>`, mainMenu());
+    return;
+  }
+  const d = bdb.getDoc(user.id, docId);
+  if (!d) { await tg.sendMessage(chatId, 'Документ не найден.', mainMenu()); return; }
+  const cp = bdb.getCp(user.id, d.cp_id);
+  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+
+  const to = String(emailOverride || cp.email || '').trim();
+  if (!to) {
+    bdb.setState(user.id, `mail:${docId}`);
+    await tg.sendMessage(chatId,
+      `На какую почту отправить <b>${esc(d.title)} № ${esc(d.number)}</b>?\n`
+      + 'Напишите адрес — я запомню его для этого контрагента.',
+      keyboard([[{ text: '✖️ Отмена', data: `doc:${docId}` }]]));
+    return;
+  }
+  if (!mailer.validEmail(to)) {
+    await tg.sendMessage(chatId, `«${esc(to)}» не похоже на адрес. Напишите ещё раз.`);
+    return;
+  }
+
+  await tg.sendChatAction(chatId, 'typing');
+  const built = await docService.rebuildDocument(user.id, docId);
+  if (!built.ok) { await tg.sendMessage(chatId, esc(built.message), mainMenu()); return; }
+
+  const org = bdb.getOrg(user.id, d.org_id) || bdb.getDefaultOrg(user.id) || {};
+  const res = await mailer.sendMail({
+    to,
+    subject: `${d.title} № ${d.number} от ${ru(d.date)}`,
+    text: letterFor(d, org, cp),
+    attachments: [{
+      filename: built.file.filename,
+      content: built.file.buffer,
+      contentType: built.file.mime,
+    }],
+  });
+
+  bdb.clearState(user.id);
+  if (!res.ok) {
+    await tg.sendMessage(chatId,
+      `Не отправилось: ${esc(res.error)}\n\nПопробуйте ещё раз или пришлите файл вручную.`,
+      keyboard([[{ text: '↩️ К документу', data: `doc:${docId}` }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+
+  if (to !== cp.email) bdb.updateCp(user.id, cp.id, { email: to });
+  await tg.sendMessage(chatId,
+    `✉️ Отправил <b>${esc(d.title)} № ${esc(d.number)}</b> на <b>${esc(to)}</b>.`
+    + (to !== cp.email ? '\nАдрес запомнил — в следующий раз спрашивать не буду.' : ''),
+    keyboard([[{ text: '↩️ К документу', data: `doc:${docId}` }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+}
+
 // ---------- подпись и печать (факсимиле) ----------
 
 const FX_NAMES = { sign: 'подпись', stamp: 'печать' };
@@ -1299,6 +1388,10 @@ async function handleMessage(tg, msg) {
   if (state.state.startsWith('dog:')) { await handleDogText(tg, chatId, user, state, text); return; }
   if (state.state === 'support') { await handleSupportText(tg, chatId, user, text); return; }
   if (state.state === 'claim') { await claimByEmail(tg, chatId, user, text); return; }
+  if (state.state.startsWith('mail:')) {
+    await mailDoc(tg, chatId, user, Number(state.state.split(':')[1]), text.trim());
+    return;
+  }
   if (state.state.startsWith('fx:')) {
     await tg.sendMessage(chatId,
       `Жду картинку: <b>${FX_NAMES[state.state.split(':')[1]] || 'изображение'}</b>. `
@@ -1491,6 +1584,7 @@ async function handleCallback(tg, cq) {
     if (data === 'docs') { await showDocs(tg, chatId, user); return; }
     if (data.startsWith('docs.cp:')) { await showDocs(tg, chatId, user, Number(data.slice(8))); return; }
     if (data.startsWith('doc.get:')) { await resendDoc(tg, chatId, user, Number(data.slice(8))); return; }
+    if (data.startsWith('doc.mail:')) { await mailDoc(tg, chatId, user, Number(data.slice(9))); return; }
     if (data.startsWith('doc.del:')) {
       bdb.deleteDoc(user.id, Number(data.slice(8)));
       await tg.sendMessage(chatId, 'Убрал из журнала. Сам файл у вас остаётся в переписке.');

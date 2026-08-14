@@ -94,6 +94,8 @@ function migrate() {
   addColumn('counterparties', 'bik', "TEXT NOT NULL DEFAULT ''");
   addColumn('counterparties', 'acc', "TEXT NOT NULL DEFAULT ''");
   addColumn('counterparties', 'corr_acc', "TEXT NOT NULL DEFAULT ''");
+  // Почта контрагента: чтобы отправлять счёт сразу, не спрашивая каждый раз.
+  addColumn('counterparties', 'email', "TEXT NOT NULL DEFAULT ''");
   db.exec('CREATE INDEX IF NOT EXISTS idx_cp_user ON counterparties(user_id)');
 }
 
@@ -184,7 +186,7 @@ function saveMyOrg(userId, fields) {
 function createCp(userId, fields) {
   const cols = ['name', 'full_name', 'inn', 'kpp', 'extra', 'kind', 'contract',
     'opening_balance', 'opening_date', 'period_end', 'signer',
-    'address', 'bank_name', 'bik', 'acc', 'corr_acc'];
+    'address', 'bank_name', 'bik', 'acc', 'corr_acc', 'email'];
   const vals = cols.map((c) => (c === 'opening_balance' ? (Number(fields[c]) || 0) : (fields[c] || '')));
   const info = db.prepare(`
     INSERT INTO counterparties(user_id, ${cols.join(',')})
@@ -194,7 +196,7 @@ function createCp(userId, fields) {
 function updateCp(userId, id, fields) {
   const allowed = ['name', 'full_name', 'inn', 'kpp', 'extra', 'kind', 'contract',
     'opening_balance', 'opening_date', 'period_end', 'signer',
-    'address', 'bank_name', 'bik', 'acc', 'corr_acc'];
+    'address', 'bank_name', 'bik', 'acc', 'corr_acc', 'email'];
   const sets = [], vals = [];
   for (const k of allowed) if (k in fields) { sets.push(`${k} = ?`); vals.push(fields[k]); }
   if (!sets.length) return;

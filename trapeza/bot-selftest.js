@@ -76,6 +76,9 @@ function button(sub) {
   return null;
 }
 
+/** id пользователя прогона в базе (а не его Telegram-id). */
+const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
+
 // ---------- сценарий ----------
 
 (async () => {
@@ -684,6 +687,83 @@ function button(sub) {
   ok(plainBtn && plainBtn.menu_button.type === 'commands',
     'без адреса приложения остаётся список команд', plainBtn && plainBtn.menu_button.type);
   if (keepUrl) process.env.WEBAPP_URL = keepUrl;
+
+  console.log('\n── отправка документа на почту ──');
+  {
+    const net = require('node:net');
+    // Настоящий SMTP-сервер на localhost: проверяем, что письмо реально
+    // уходит с вложением, а не что мы позвали функцию.
+    const got = { rcpt: [], data: '' };
+    const smtp = net.createServer((sock) => {
+      let inData = false; let body = '';
+      sock.setEncoding('utf8');
+      sock.write('220 local ESMTP\r\n');
+      sock.on('data', (chunk) => {
+        if (inData) {
+          body += chunk;
+          const end = body.indexOf('\r\n.\r\n');
+          if (end === -1) return;
+          got.data = body.slice(0, end); inData = false;
+          sock.write('250 Ok: queued\r\n');
+          return;
+        }
+        for (const line of chunk.split('\r\n').filter(Boolean)) {
+          if (/^EHLO/i.test(line)) sock.write('250-local\r\n250 HELP\r\n');
+          else if (/^RCPT TO:/i.test(line)) { got.rcpt.push(line.slice(8).replace(/[<>]/g, '').trim()); sock.write('250 Ok\r\n'); }
+          else if (/^DATA/i.test(line)) { inData = true; sock.write('354 go\r\n'); }
+          else if (/^QUIT/i.test(line)) { sock.write('221 bye\r\n'); sock.end(); }
+          else sock.write('250 Ok\r\n');
+        }
+      });
+      sock.on('error', () => {});
+    });
+    await new Promise((r) => smtp.listen(0, '127.0.0.1', r));
+
+    // Пока почта не настроена — кнопки нет и отправка честно отказывается.
+    delete process.env.SMTP_HOST;
+    // Именно счёт: у акта сверки отправки нет по замыслу (это Excel-журнал).
+    const docsBefore = require('./lib/bot-db').listDocs(fxUserId(), 30)
+      .find((x) => x.type === 'sch');
+    ok(Boolean(docsBefore), 'в журнале есть счёт для отправки');
+    await tap(`doc:${docsBefore.id}`);
+    ok(!button('Отправить на почту') && !button('Отправить на '),
+      'без настроенной почты кнопки отправки нет');
+
+    process.env.SMTP_HOST = '127.0.0.1';
+    process.env.SMTP_PORT = String(smtp.address().port);
+    process.env.SMTP_FROM = 'bot@pervichka.ru';
+    process.env.SMTP_FROM_NAME = 'Первичка';
+    delete process.env.SMTP_USER;      // сервер без входа по паролю
+    delete process.env.SMTP_SECURE;
+
+    await tap(`doc:${docsBefore.id}`);
+    const mailBtn = button('Отправить на почту');
+    ok(Boolean(mailBtn), 'с настроенной почтой кнопка появилась', mailBtn);
+
+    await tap(mailBtn);
+    ok(last().includes('На какую почту'), 'бот спрашивает адрес, если он не сохранён');
+    await say('не адрес');
+    ok(last().includes('не похоже на адрес'), 'кривой адрес отклонён с объяснением');
+    await say('buh@zarya.ru');
+    ok(last().includes('Отправил'), 'письмо ушло', last().slice(0, 60));
+    ok(got.rcpt.includes('buh@zarya.ru'), 'сервер получил именно этот адрес', got.rcpt.join());
+    ok(/Content-Disposition: attachment/.test(got.data), 'во вложении есть файл');
+    ok(/^Subject: =\?UTF-8\?B\?/m.test(got.data), 'тема письма закодирована');
+
+    const cpNow = require('./lib/bot-db').getCp(fxUserId(), docsBefore.cp_id);
+    ok(cpNow.email === 'buh@zarya.ru', 'адрес запомнился у контрагента', cpNow.email);
+
+    await tap(`doc:${docsBefore.id}`);
+    ok(Boolean(button('buh@zarya.ru')), 'в следующий раз адрес подставлен в кнопку');
+    got.rcpt.length = 0;
+    await tap(button('buh@zarya.ru'));
+    ok(last().includes('Отправил') && got.rcpt.includes('buh@zarya.ru'),
+      'повторная отправка идёт без вопросов');
+
+    smtp.close();
+    delete process.env.SMTP_HOST;
+    delete process.env.SMTP_PORT;
+  }
 
   console.log('\n── подпись и печать ──');
   const fxLib = require('./lib/facsimile');

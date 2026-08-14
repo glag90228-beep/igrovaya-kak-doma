@@ -12,7 +12,8 @@
     "lava": "node lava-webhook.js",
     "miniapp": "node miniapp.js",
     "bot:check": "node bot.js --check",
-    "test": "node bot-selftest.js && node miniapp-selftest.js"
+    "test": "node bot-selftest.js && node miniapp-selftest.js && node mail-selftest.js",
+    "mail": "node mail-selftest.js"
   },
   "dependencies": {
     "exceljs": "^4.4.0"

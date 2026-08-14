@@ -333,6 +333,30 @@ screens.doc = async function docScreen({ id }) {
       }),
     }, 'Прислать файл заново')));
 
+  // Отправка клиенту на почту — только если она настроена на сервере.
+  const st = cache.features ? cache : await api('GET', '/api/state');
+  if (st.features && st.features.mail && d.type !== 'akt') {
+    const cps = (await api('GET', '/api/cps')).cps;
+    const cp = cps.find((x) => x.id === d.cpId) || {};
+    const mailField = field('email', 'Почта получателя', cp.email, {
+      type: 'email', placeholder: 'buh@company.ru',
+      hint: cp.email ? 'Сохранена у контрагента' : 'Запомню её для этого контрагента',
+    });
+    box.append(h('div', { class: 'section-title', text: 'Отправить клиенту' }));
+    box.append(h('div', { class: 'card' }, mailField));
+    box.append(h('div', { class: 'btn-wrap' }, h('button', {
+      class: 'btn secondary',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        clearErrors({ mailField });
+        const to = mailField.input.value.trim();
+        if (!to) { showError(mailField, 'Без адреса отправить некуда'); return; }
+        const r = await api('POST', '/api/doc/mail', { id: d.id, email: to });
+        toast(`Отправлено на ${r.sent}`);
+        haptic('medium');
+      }),
+    }, 'Отправить на почту')));
+  }
+
   if (d.items && d.items.length) {
     box.append(h('div', { class: 'btn-wrap' },
       h('button', {
@@ -412,6 +436,10 @@ screens.cp = async function cpScreen({ id }) {
     inn: field('inn', 'ИНН', cp.inn, { inputmode: 'numeric', hint: 'Заполним остальное из реестра' }),
     kpp: field('kpp', 'КПП', cp.kpp, { inputmode: 'numeric' }),
     address: field('address', 'Адрес', cp.address),
+    email: field('email', 'Почта', cp.email, {
+      type: 'email', placeholder: 'buh@company.ru',
+      hint: 'Туда уйдут счета и акты, если отправлять из приложения',
+    }),
     bank_name: field('bank_name', 'Банк', cp.bank_name),
     bik: field('bik', 'БИК', cp.bik, { inputmode: 'numeric' }),
     acc: field('acc', 'Расчётный счёт', cp.acc, { inputmode: 'numeric' }),
@@ -447,7 +475,7 @@ screens.cp = async function cpScreen({ id }) {
   box.append(h('div', { class: 'card' }, f.name, f.full_name,
     h('div', { class: 'field' }, h('label', { for: 'f-kind', text: 'Кто это' }), kindSel)));
   box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
-  box.append(h('div', { class: 'card' }, f.inn, f.kpp, f.address));
+  box.append(h('div', { class: 'card' }, f.inn, f.kpp, f.address, f.email));
   box.append(h('div', { class: 'btn-wrap' }, lookup));
   box.append(h('div', { class: 'section-title', text: 'Банк' }));
   box.append(h('div', { class: 'card' }, f.bank_name, f.bik, f.acc, f.corr_acc));
