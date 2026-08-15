@@ -351,11 +351,43 @@ screens.doc = async function docScreen({ id }) {
   const d = list.find((x) => x.id === Number(id));
   if (!d) return empty('warn', 'Документ не найден', 'Возможно, он был убран из журнала.');
 
+  // Кому выписан — первое, что ищут в карточке. Раньше здесь были только
+  // дата и сумма, и понять, чей это документ, было нельзя.
+  const cpsList = (await api('GET', '/api/cps')).cps;
+  const cpOf = cpsList.find((x) => x.id === d.cpId) || null;
+
   const box = h('div', {}, h('h1', { text: `${d.title} № ${d.number}` }));
   box.append(h('div', { class: 'card' },
+    cpOf ? h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Кому' }),
+      h('span', { class: 'ellipsis', text: cpOf.name })) : null,
     h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Дата' }), h('span', { text: ru(d.date) })),
     d.total ? h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Сумма' }),
       h('span', { class: 'money', text: money(d.total) })) : null));
+
+  /*
+   * Оплата. В боте отметить её было можно, а в приложении — нет: обработчик
+   * на сервере есть, кнопки не было. Для счёта это половина смысла карточки:
+   * отметка закрывает долг в журнале и убирает документ из «не оплачено».
+   */
+  if (['sch', 'schdog'].includes(d.type) && d.total) {
+    const paid = Boolean(d.paidAt);
+    box.append(h('div', { class: 'section-title', text: 'Оплата' }));
+    box.append(h('div', { class: 'card' },
+      h('div', { class: 'row' },
+        h('span', { class: `icon-box ${paid ? 'ok' : ''}` }, icon(paid ? 'check' : 'clock')),
+        h('span', { class: 'grow' },
+          h('div', { text: paid ? 'Оплачен' : 'Ждёт оплаты' }),
+          h('div', { class: 'small muted', text: paid ? `отмечено ${ru(d.paidAt)}` : 'долг числится за клиентом' })))));
+    box.append(h('div', { class: 'btn-wrap' }, h('button', {
+      class: paid ? 'btn ghost' : 'btn',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        await api('POST', '/api/doc/paid', { id: d.id, paid: !paid });
+        haptic('medium');
+        toast(paid ? 'Отметка снята' : 'Отмечено как оплаченный');
+        render();
+      }),
+    }, paid ? 'Снять отметку об оплате' : 'Отметить оплату')));
+  }
 
   if (d.items && d.items.length) {
     box.append(h('div', { class: 'section-title', text: 'Позиции' }));
@@ -366,9 +398,11 @@ screens.doc = async function docScreen({ id }) {
       h('span', { class: 'money nowrap', text: money((Number(it.qty) || 0) * (Number(it.price) || 0)) })))));
   }
 
+  // Главное действие на экране одно. Если у счёта не отмечена оплата —
+  // главное это она; пересылка файла тогда вторична.
   box.append(h('div', { class: 'btn-wrap' },
     h('button', {
-      class: 'btn',
+      class: ['sch', 'schdog'].includes(d.type) && d.total && !d.paidAt ? 'btn secondary' : 'btn',
       onclick: (e) => withBusy(e.currentTarget, async () => {
         const r = await api('POST', '/api/doc/resend', { id: d.id });
         toast('Файл отправлен в чат с ботом');
@@ -380,8 +414,7 @@ screens.doc = async function docScreen({ id }) {
   // Отправка клиенту на почту — только если она настроена на сервере.
   const st = cache.features ? cache : await api('GET', '/api/state');
   if (st.features && st.features.mail && d.type !== 'akt') {
-    const cps = (await api('GET', '/api/cps')).cps;
-    const cp = cps.find((x) => x.id === d.cpId) || {};
+    const cp = cpOf || {};
     const mailField = field('email', 'Почта получателя', cp.email, {
       type: 'email', placeholder: 'buh@company.ru',
       hint: cp.email ? 'Сохранена у контрагента' : 'Запомню её для этого контрагента',

@@ -167,6 +167,19 @@ const SHOTS = [
 
 async function main() {
   await seed();
+  /*
+   * Карточка документа и карточка клиента открываются по id, а он появляется
+   * только после посева. Раньше эти экраны в снимки не попадали вовсе — и
+   * именно на них живут отправка почтой, отметка оплаты и повтор документа.
+   */
+  {
+    const me = bdb.getOrCreateUser(USER.id);
+    const lastDoc = bdb.listDocs(me.id, 10).find((d) => d.type === 'sch') || bdb.listDocs(me.id, 1)[0];
+    const firstCp = bdb.listCps(me.id)[0];
+    if (lastDoc) SHOTS.push({ name: 'kartochka-dokumenta', title: 'Карточка документа', go: ['doc', { id: lastDoc.id }] });
+    if (firstCp) SHOTS.push({ name: 'kartochka-klienta', title: 'Карточка клиента', go: ['cp', { id: firstCp.id }] });
+    SHOTS.push({ name: 'eshchyo', title: 'Ещё', go: ['more', {}] });
+  }
   setTelegram({ async sendDocument() { return {}; } });
   await new Promise((r) => server.listen(0, r));
   const base = `http://127.0.0.1:${server.address().port}`;
