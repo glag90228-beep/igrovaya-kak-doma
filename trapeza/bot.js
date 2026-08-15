@@ -474,9 +474,11 @@ async function startItems(tg, chatId, user, type, cpId, extra = {}) {
     ? '\n\nЧастые позиции — кнопками ниже, количество спрошу.' : '';
   await tg.sendMessage(chatId,
     `Составляем <b>${esc(ITEM_DOCS[type].title)} № ${esc(data.number)}</b> от ${ru(data.date)}.\n`
-    + 'Отправляйте позиции по одной:\n'
-    + '<code>Наименование; количество; цена</code>\n'
-    + 'Например: <code>Канапе ассорти; 20; 650</code>' + tpl,
+    + 'Отправляйте позиции по одной — как удобно:\n'
+    + '<code>Аренда помещения 1 30000</code>\n'
+    + '<code>Канапе ассорти 20 650</code>\n'
+    + '<code>Бумага 10 пачек по 300</code>\n\n'
+    + '<i>Если чего-то не хватит — спрошу.</i>' + tpl,
     itemsKb(user, data));
 }
 
@@ -515,16 +517,122 @@ async function showPreview(tg, chatId, user, state) {
     ]));
 }
 
-function parseItemLine(text) {
-  const parts = String(text).split(/[;|]/).map((s) => s.trim());
-  if (parts.length >= 3) {
-    const qty = parseAmount(parts[1]); const price = parseAmount(parts[parts.length - 1]);
-    if (qty != null && price != null) return { name: parts[0], qty, unit: 'шт.', price };
+/**
+ * Единицы измерения, которые встречаются в счетах. Ключ — как пишут люди,
+ * значение — как печатаем в документе.
+ *
+ * Нужны они не для красоты: в строке «Аренда 30 м²» число 30 относится к
+ * названию, а не к количеству, и отличить это можно только по единице,
+ * стоящей сразу за числом.
+ */
+const UNITS = {
+  шт: 'шт.', штук: 'шт.', штука: 'шт.', штуки: 'шт.',
+  уп: 'уп.', упак: 'уп.', упаковка: 'уп.', упаковок: 'уп.', пачка: 'уп.', пачек: 'уп.',
+  компл: 'компл.', комплект: 'компл.', комплектов: 'компл.', набор: 'набор', наборов: 'набор',
+  кг: 'кг', г: 'г', грамм: 'г', т: 'т', тонн: 'т', л: 'л', литр: 'л', литров: 'л',
+  м: 'м', метр: 'м', метров: 'м', км: 'км', см: 'см',
+  'м2': 'м²', 'м²': 'м²', кв: 'м²', квм: 'м²', 'кв.м': 'м²', 'м3': 'м³', 'м³': 'м³',
+  ч: 'ч', час: 'ч', часа: 'ч', часов: 'ч', мин: 'мин',
+  сут: 'сут.', сутки: 'сут.', суток: 'сут.', день: 'дн.', дня: 'дн.', дней: 'дн.', дн: 'дн.',
+  мес: 'мес.', месяц: 'мес.', месяца: 'мес.', месяцев: 'мес.', год: 'год', лет: 'год',
+  усл: 'усл.', услуга: 'усл.', услуг: 'усл.', раз: 'раз', рейс: 'рейс', смена: 'смена', смен: 'смена',
+  квт: 'кВт', 'квт·ч': 'кВт·ч', квтч: 'кВт·ч',
+};
+
+const unitOf = (word) => UNITS[String(word || '').toLowerCase().replace(/\.$/, '')] || null;
+
+/**
+ * Числа из строки — вместе с тем, где они стояли.
+ *
+ * Разделители разрядов пишут кто как: «30 000», «30.000», «30 000,50».
+ * Три цифры после точки — это тысячи, а не копейки: копеек всегда две,
+ * и «30.000» человек пишет, имея в виду тридцать тысяч.
+ */
+function numbersIn(text) {
+  // Хвостовой (?!\d) обязателен: без него «Фуршет 10 1500» читается как
+  // «10 150» плюс «0» — разделитель разрядов съедает пробел между
+  // количеством и ценой, и в счёт уходит десять тысяч штук по нулю.
+  const re = /\d{1,3}(?:[\s ]\d{3})+(?:[.,]\d{1,2})?(?!\d)|\d+(?:[.,]\d+)?/g;
+  const out = [];
+  let m = re.exec(text);
+  while (m) {
+    const raw = m[0];
+    let value;
+    if (/^\d+\.\d{3}$/.test(raw)) value = Number(raw.replace('.', ''));
+    else value = Number(raw.replace(/[\s ]/g, '').replace(',', '.'));
+    if (Number.isFinite(value)) out.push({ value, start: m.index, end: m.index + raw.length });
+    m = re.exec(text);
   }
-  // фолбэк: «Название 20 650»
-  const m = /^(.+?)\s+(\d+(?:[.,]\d+)?)\s+(\d+(?:[.,]\d+)?)$/.exec(text.trim());
-  if (m) return { name: m[1].trim(), qty: parseAmount(m[2]), unit: 'шт.', price: parseAmount(m[3]) };
-  return null;
+  return out;
+}
+
+/** Слово сразу после числа — если это единица измерения, вернём её. */
+function unitAfter(text, pos) {
+  const rest = text.slice(pos).replace(/^[\s.,]+/, '');
+  return unitOf((/^[a-zA-Zа-яА-ЯёЁ²³.]+/.exec(rest) || [''])[0]);
+}
+
+/**
+ * Разбор строки позиции.
+ *
+ * Формат «Наименование; количество; цена» остаётся, но требовать его нельзя:
+ * предприниматель пишет так, как говорит — «Аренда 30 м² 1 30.000»,
+ * «Бумага 10 пачек по 300», «Консультация 5000». Поэтому если точек с
+ * запятой нет, ищем числа с конца: последние два — количество и цена.
+ * Числа внутри названия («30 м²») в счёт не идут, их выдаёт единица следом.
+ *
+ * @returns {{name,qty,unit,price}|{name,partial:true}|null}
+ *   partial — поняли только название; количество и цену спросим отдельно.
+ */
+function readItemLine(text) {
+  const line = String(text || '').replace(/[ ]/g, ' ').trim();
+  if (!line) return null;
+
+  const parts = line.split(/[;|]/).map((s) => s.trim()).filter(Boolean);
+  if (parts.length >= 3) {
+    const qty = parseAmount(parts[1].replace(/[^\d.,]/g, ''));
+    const price = parseAmount(parts[parts.length - 1].replace(/[^\d.,]/g, ''));
+    if (qty != null && price != null) {
+      return { name: parts[0], qty, unit: unitOf(parts[1].replace(/[\d\s.,]/g, '')) || 'шт.', price };
+    }
+  }
+
+  // «х», «*» и «по» между числами — разделители, а не часть названия.
+  const plain = line.replace(/\s*[x×хX*]\s*(?=\d)/g, ' ').replace(/\s+по\s+(?=\d)/gi, ' ');
+  const nums = numbersIn(plain);
+
+  // Хвостовые слова вроде «руб.» отбрасываем, чтобы они не липли к названию.
+  const tail = (from) => plain.slice(from).replace(/^[\s.,]*(?:руб\.?|р\.|₽|рублей)?[\s.,]*$/i, '');
+
+  if (nums.length >= 2) {
+    const [q, p] = nums.slice(-2);
+    if (tail(p.end) === '') {
+      const name = plain.slice(0, q.start).replace(/[\s.,;:—-]+$/, '').trim();
+      if (name) {
+        return { name, qty: q.value, unit: unitAfter(plain, q.end) || 'шт.', price: p.value };
+      }
+    }
+  }
+
+  if (nums.length === 1) {
+    const n = nums[0];
+    const name = plain.slice(0, n.start).replace(/[\s.,;:—-]+$/, '').trim();
+    // «Аренда 30 м²» — число с единицей это описание, а не цена.
+    if (name && !unitAfter(plain, n.end) && tail(n.end) === '') {
+      return { name, qty: 1, unit: 'шт.', price: n.value };
+    }
+  }
+
+  // Названием считаем всё, что написали: цену и количество доспросим.
+  // Но из одних цифр названия не выйдет — тут действительно нечего понять.
+  if (!/[a-zA-Zа-яА-ЯёЁ]/.test(line)) return null;
+  return { name: line.slice(0, 200), partial: true };
+}
+
+/** Строгий разбор — только полностью понятая позиция. Используется в прогоне. */
+function parseItemLine(text) {
+  const r = readItemLine(text);
+  return r && !r.partial ? r : null;
 }
 
 /**
@@ -1830,17 +1938,55 @@ async function handleMessage(tg, msg) {
       if (t) d.items.push({ name: t.name, qty, unit: t.unit || 'шт.', price: t.price });
       bdb.setState(user.id, state.state, d);
       await tg.sendMessage(chatId,
-        t ? `Добавлено: ${esc(t.name)} — ${qty} × ${formatRub(t.price)}.` : 'Шаблон не найден.',
+        t ? `Добавлено: ${esc(t.name)} — ${qty} ${esc(t.unit || 'шт.')} × ${formatRub(t.price)}` : 'Шаблон не найден.',
         itemsKb(user, d));
       return;
     }
 
-    const item = parseItemLine(text);
-    if (!item) { await tg.sendMessage(chatId, 'Не разобрал. Формат: <code>Наименование; кол-во; цена</code>'); return; }
+    // Дозапрос по начатой позиции: название уже знаем, ждём количество и цену.
+    if (d.ask === 'np') {
+      const p = d.pending || {};
+      const nums = numbersIn(text.replace(/\s*[x×хX*]\s*(?=\d)/g, ' ').replace(/\s+по\s+(?=\d)/gi, ' '));
+      const unit = unitAfter(text, (nums[0] || {}).end || 0);
+      if (unit) p.unit = unit;
+      if (p.qty == null && nums.length >= 2) { [p.qty, p.price] = [nums[0].value, nums[1].value]; } else if (p.qty == null && nums.length === 1) { p.qty = nums[0].value; } else if (nums.length >= 1) { p.price = nums[0].value; }
+
+      if (p.qty == null || p.qty <= 0) {
+        d.pending = p; bdb.setState(user.id, state.state, d);
+        await tg.sendMessage(chatId, 'Нужно количество числом. Например: <code>1</code> или <code>20 шт</code>');
+        return;
+      }
+      if (p.price == null) {
+        d.pending = p; bdb.setState(user.id, state.state, d);
+        await tg.sendMessage(chatId,
+          `<b>${esc(p.name)}</b> — ${p.qty} ${esc(p.unit || 'шт.')}\nПо какой цене за единицу?`);
+        return;
+      }
+      d.items.push({ name: p.name, qty: p.qty, unit: p.unit || 'шт.', price: p.price });
+      d.ask = ''; d.pending = null;
+      bdb.setState(user.id, state.state, d);
+      await tg.sendMessage(chatId,
+        `Добавлено: ${esc(p.name)} — ${p.qty} ${esc(p.unit || 'шт.')} × ${formatRub(p.price)}\nЕщё позицию или «Готово».`,
+        itemsKb(user, d));
+      return;
+    }
+
+    const item = readItemLine(text);
+    // Не поняли количество и цену — не отказываем, а спрашиваем. Человек
+    // пишет позицию так, как говорит; подстраиваться должны мы.
+    if (!item || item.partial) {
+      if (!item) { await tg.sendMessage(chatId, 'Не разобрал — напишите наименование позиции.'); return; }
+      d.ask = 'np'; d.pending = { name: item.name, qty: null, price: null, unit: null };
+      bdb.setState(user.id, state.state, d);
+      await tg.sendMessage(chatId,
+        `<b>${esc(item.name)}</b>\nСколько и по какой цене?\n\n`
+        + '<i>Можно одним сообщением: <code>1 30000</code>. Или сначала количество.</i>');
+      return;
+    }
     d.items.push(item);
     bdb.setState(user.id, state.state, d);
     await tg.sendMessage(chatId,
-      `Добавлено: ${esc(item.name)} — ${item.qty} × ${formatRub(item.price)}. Ещё позицию или «Готово».`,
+      `Добавлено: ${esc(item.name)} — ${item.qty} ${esc(item.unit)} × ${formatRub(item.price)}\nЕщё позицию или «Готово».`,
       itemsKb(user, d));
     return;
   }
@@ -2371,4 +2517,4 @@ async function main() {
 
 if (require.main === module) main();
 
-module.exports = { handleUpdate, parseOp, parseDate, parseItemLine, parseAmount };
+module.exports = { handleUpdate, parseOp, parseDate, parseItemLine, readItemLine, parseAmount };
