@@ -60,18 +60,9 @@ npm install playwright >/dev/null 2>&1 && npx playwright install --with-deps chr
 
 chown -R trapeza:trapeza "$APP" "$LOGS"
 
-say "5/6 Проверка токена и оформление бота"
 set -a; . ./.env; set +a
-# Разовый сбой сети до Telegram не должен обрывать установку: из-за set -e
-# скрипт падал здесь и не доходил до перезапуска служб, а на сервере
-# продолжал работать старый код — и было непонятно, почему обновление
-# «не приехало».
-sudo -u trapeza --preserve-env node bot.js --check || \
-  echo "⚠️  Не достучался до Telegram — проверю позже, установку продолжаю."
-sudo -u trapeza --preserve-env node bot.js --setup || \
-  echo "⚠️  Оформление не применилось (сеть или ограничение частоты) — повторите: node bot.js --setup"
 
-say "6/6 Службы"
+say "5/6 Службы"
 mkdir -p /var/backups/trapeza
 chown trapeza:trapeza /var/backups/trapeza
 cp deploy/trapeza-bot.service deploy/trapeza-lava.service deploy/trapeza-miniapp.service \
@@ -94,7 +85,21 @@ systemctl restart trapeza-miniapp
 # Ежедневная резервная копия базы. Первую снимаем сразу: без неё до ночи
 # данные клиентов существуют в единственном экземпляре.
 systemctl enable --now trapeza-backup.timer
-systemctl start trapeza-backup.service || echo "⚠️  Первая копия не снялась — проверьте /var/log/trapeza/backup.log" 
+systemctl start trapeza-backup.service || echo "⚠️  Первая копия не снялась — проверьте /var/log/trapeza/backup.log"
+
+# Оформление идёт последним и под таймером — намеренно.
+#
+# Имя, описание и список команд это косметика, а перезапуск служб — суть
+# обновления. Когда оформление шло раньше, установка однажды встала на нём
+# на пять минут (Telegram ограничивает смену имени бота и просит подождать
+# часами), и до перезапуска дело не дошло: на сервере остался старый код.
+# Теперь наоборот — сначала работающий бот, потом красота, и в любом
+# случае не дольше двух минут на шаг.
+say "6/6 Проверка токена и оформление бота"
+timeout 60 sudo -u trapeza --preserve-env node bot.js --check || \
+  echo "⚠️  Не достучался до Telegram — бот уже перезапущен, проверьте лог."
+timeout 120 sudo -u trapeza --preserve-env node bot.js --setup || \
+  echo "⚠️  Оформление не применилось (сеть или ограничение частоты) — повторите позже: node bot.js --setup"
 
 say "Готово"
 for u in trapeza-bot trapeza-lava trapeza-miniapp trapeza-backup.timer; do

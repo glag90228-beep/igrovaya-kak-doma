@@ -949,6 +949,40 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     delete process.env.BACKUP_KEEP;
   }
 
+  console.log('\n── клиент Telegram не вешается ──');
+  {
+    // Поднимаем свой «Telegram»: настоящий отвечает по-разному, а нам нужно
+    // проверить именно поведение клиента на 429 и на молчание.
+    const http = require('node:http');
+    const { Telegram } = require('./lib/tg');
+    let mode = 'slow';
+    const fake = http.createServer((req, res) => {
+      if (mode === 'silent') return;                       // не отвечаем вовсе
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error_code: 429,
+        description: 'Too Many Requests', parameters: { retry_after: mode === 'slow' ? 3600 : 1 } }));
+    });
+    await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+    const tgc = new Telegram('test-token');
+    tgc.base = `http://127.0.0.1:${fake.address().port}/bot`;
+
+    // Смена имени бота ограничена сутками: Telegram отвечает «подождите час».
+    // Раньше клиент честно засыпал — и установка вставала намертво.
+    const started = Date.now();
+    const err = await tgc.call('setMyName', { name: 'X' }).then(() => null, (e) => e);
+    ok(err && err.code === 429 && Date.now() - started < 2000,
+      'на «подождите час» клиент не засыпает, а сдаётся сразу', `${Date.now() - started} мс`);
+    ok(err && /подождать 60 мин/.test(err.message), 'в ошибке видно, сколько ждать', err.message);
+
+    // Молчащий сервер: без таймаута вызов висел бы вечно.
+    mode = 'silent';
+    const t0 = Date.now();
+    const hung = await tgc.call('getMe', { timeout: 0 }, 3).then(() => null, (e) => e);
+    fake.close();
+    ok(hung && hung.network, 'молчание сервера — ошибка, а не бесконечное ожидание', hung && hung.message);
+    ok(Date.now() - t0 < 60000, 'ожидание ограничено', `${Math.round((Date.now() - t0) / 1000)} с`);
+  }
+
   console.log('\n── защита от второго экземпляра ──');
   {
     const { acquire, alive } = require('./lib/lock');

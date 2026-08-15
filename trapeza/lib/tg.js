@@ -3,6 +3,23 @@
 // Минимальный клиент Telegram Bot API на встроенном fetch (Node 22).
 // Без сторонних библиотек. Умеет long polling и отправку файлов (sendDocument).
 
+/**
+ * Сколько готовы ждать по просьбе Telegram, прежде чем сдаться.
+ *
+ * У 429 бывает очень разный retry_after: на отправке сообщений это секунды,
+ * а на смене имени бота Telegram отвечает часами — там жёсткий суточный
+ * лимит. Спать столько нельзя: установка вставала намертво на «Оформляю»,
+ * без единой строчки в выводе, и выглядело это как зависший сервер.
+ */
+const MAX_RETRY_WAIT = 20;
+
+/** Ни один запрос не должен висеть вечно: молчащее соединение — не ответ. */
+function timeoutFor(params) {
+  // Long polling сам ждёт params.timeout секунд — это нормально, добавляем запас.
+  const poll = Number(params && params.timeout) || 0;
+  return (poll ? poll + 20 : 45) * 1000;
+}
+
 class Telegram {
   constructor(token) {
     if (!token) throw new Error('BOT_TOKEN не задан');
@@ -15,22 +32,40 @@ class Telegram {
    * вызывающему коду важно отличить «пользователь заблокировал бота» (403)
    * от «слишком часто» (429) и от настоящей поломки.
    *
-   * На 429 Telegram сам говорит, сколько ждать, — ждём и повторяем.
+   * На 429 Telegram сам говорит, сколько ждать, — ждём, если просят
+   * по-божески, и честно сдаёмся, если речь о часах.
    */
   async call(method, params = {}, attempt = 0) {
-    const res = await fetch(`${this.base}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    });
+    let res;
+    try {
+      res = await fetch(`${this.base}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+        signal: AbortSignal.timeout(timeoutFor(params)),
+      });
+    } catch (e) {
+      const err = new Error(e.name === 'TimeoutError'
+        ? `TG ${method}: Telegram не ответил вовремя`
+        : `TG ${method}: ${e.message}`);
+      err.network = true;
+      throw err;
+    }
     const data = await res.json().catch(() => ({}));
     if (data.ok) return data.result;
 
     const code = data.error_code || res.status;
     const retryAfter = ((data.parameters || {}).retry_after) || 0;
-    if (code === 429 && attempt < 3) {
+    if (code === 429 && attempt < 3 && retryAfter <= MAX_RETRY_WAIT) {
       await new Promise((r) => setTimeout(r, (retryAfter || 1) * 1000));
       return this.call(method, params, attempt + 1);
+    }
+    if (code === 429 && retryAfter > MAX_RETRY_WAIT) {
+      const err = new Error(`TG ${method}: слишком часто, Telegram просит подождать `
+        + `${Math.ceil(retryAfter / 60)} мин.`);
+      err.code = 429;
+      err.retryAfter = retryAfter;
+      throw err;
     }
 
     const err = new Error(`TG ${method}: ${data.description || code}`);
@@ -67,7 +102,10 @@ class Telegram {
     if (caption) { form.append('caption', caption); form.append('parse_mode', 'HTML'); }
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     form.append('document', new Blob([bytes]), filename);
-    const res = await fetch(`${this.base}/sendDocument`, { method: 'POST', body: form });
+    // Документ бывает на несколько мегабайт — даём больше времени, чем
+    // обычному вызову, но не бесконечность.
+    const res = await fetch(`${this.base}/sendDocument`,
+      { method: 'POST', body: form, signal: AbortSignal.timeout(120000) });
     const data = await res.json().catch(() => ({}));
     if (data.ok) return data.result;
     const code = data.error_code || res.status;
@@ -88,7 +126,8 @@ class Telegram {
     if (info.file_size && info.file_size > maxBytes) {
       throw new Error('Файл слишком большой');
     }
-    const res = await fetch(`https://api.telegram.org/file/bot${this.token}/${info.file_path}`);
+    const res = await fetch(`https://api.telegram.org/file/bot${this.token}/${info.file_path}`,
+      { signal: AbortSignal.timeout(120000) });
     if (!res.ok) throw new Error(`Не удалось скачать файл: ${res.status}`);
     return Buffer.from(await res.arrayBuffer());
   }
