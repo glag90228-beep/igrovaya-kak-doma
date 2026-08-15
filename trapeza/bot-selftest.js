@@ -578,7 +578,9 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   console.log('\n── команды владельца ──');
   process.env.SUPPORT_CHAT_ID = String(CHAT.id);
   await say('/who');
-  ok(last().includes('оплаченным доступом') || last().includes('Оплаченных'), 'сводка по доступам');
+  ok(last().includes('С доступом') || last().includes('Доступов нет'), 'сводка по доступам');
+  await say('/admin');
+  ok(last().includes('/grant') && last().includes('/code'), 'подсказка по командам владельца');
   const gBefore = sent.length;
   await say(`/grant ${USER.id} 90`);
   const gMsgs = sent.slice(gBefore).map((m) => m.text);
@@ -591,6 +593,110 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await say('/grant 777002 90');
   ok(sent[nBefore] && !sent[nBefore].text.includes('Выдал'),
     'посторонний не может выдать доступ себе', (sent[nBefore] || {}).text?.slice(0, 40));
+
+  console.log('\n── коды доступа (выдать подписку бесплатно) ──');
+  {
+    const OWNER = { id: 999001, first_name: 'Владелец', username: 'owner' };
+    process.env.SUPPORT_CHAT_ID = String(OWNER.id);
+    const ownerSay = (t) => handleUpdate(tg,
+      { message: { chat: { id: OWNER.id }, from: OWNER, text: t } });
+    /** Отдельный тестировщик: как раз тот случай, ради которого всё это. */
+    const person = (id, username) => {
+      const who = { id, first_name: `Тестер ${id}`, username };
+      return {
+        say: (t) => handleUpdate(tg, { message: { chat: { id }, from: who, text: t } }),
+        tap: (d) => handleUpdate(tg,
+          { callback_query: { id: 'cb', from: who, data: d, message: { chat: { id } } } }),
+        row: () => require('./lib/bot-db').getOrCreateUser(id),
+      };
+    };
+    const CODE_RE = /PRV-[A-Z0-9]{4}-[A-Z0-9]{4}/g;
+
+    await ownerSay('/code 30 2 бета-тест');
+    const codes = last().match(CODE_RE) || [];
+    ok(codes.length === 2, 'владелец получил сразу два кода', codes.join(' '));
+    ok(last().includes('бета-тест'), 'пометка видна в ответе');
+
+    const t1 = person(999002, 'tester_one');
+    await t1.say('/start');
+    ok(!bill.accessInfo(t1.row().id).active, 'у тестировщика доступа ещё нет');
+
+    // Код прислан как есть — в нижнем регистре и с пробелами вместо дефисов.
+    await t1.say(codes[0].toLowerCase().replace(/-/g, ' '));
+    const a1 = bill.accessInfo(t1.row().id);
+    ok(a1.active && a1.left >= 29, 'код открыл доступ на месяц', `до ${a1.until}`);
+    ok(require('./lib/bot-db').quota(t1.row().id).paid, 'лимит бесплатных документов снят');
+    ok(last().includes('Код принят'), 'бот подтвердил активацию', last().slice(0, 40));
+
+    await t1.say(codes[0]);
+    ok(last().includes('уже активировали'), 'повторно тот же код не проходит', last().slice(0, 40));
+
+    const t2 = person(999003, 'tester_two');
+    await t2.say('/start');
+    await t2.say(codes[0]);
+    ok(last().includes('уже использован'), 'одноразовый код не работает у второго',
+      last().slice(0, 40));
+    ok(!bill.accessInfo(t2.row().id).active, 'доступ второму не выдан');
+
+    // Кнопка в меню подписки — для тех, кто не станет присылать код текстом.
+    await t2.tap('billing');
+    ok(Boolean(button('У меня есть код')), 'на экране подписки есть кнопка кода');
+    await t2.tap('promo');
+    ok(last().includes('PRV-'), 'бот показал, как выглядит код');
+    await t2.say('PRV-ZZZZ-ZZZZ');
+    ok(last().includes('Такого кода нет'), 'выдуманный код отклонён');
+    await t2.tap('promo');
+    await t2.say(codes[1]);
+    ok(bill.accessInfo(t2.row().id).active, 'второй код открыл доступ второму человеку');
+
+    // Один код на несколько активаций — для вебинара или чата с клиентами.
+    await ownerSay('/code 7 1x2 общий');
+    const shared = (last().match(CODE_RE) || [])[0];
+    ok(Boolean(shared) && last().includes('до 2 активаций'), 'создан код на две активации',
+      last().slice(0, 60));
+    const t3 = person(999004, 'tester_three');
+    const t4 = person(999005, 'tester_four');
+    await t3.say('/start'); await t3.say(shared);
+    await t4.say('/start'); await t4.say(shared);
+    ok(bill.accessInfo(t3.row().id).active && bill.accessInfo(t4.row().id).active,
+      'общий код сработал у обоих');
+    const t5 = person(999006, 'tester_five');
+    await t5.say('/start'); await t5.say(shared);
+    ok(!bill.accessInfo(t5.row().id).active, 'третьему общего кода не хватило');
+    ok(bill.accessInfo(t3.row().id).left <= 7, 'срок именно тот, что задали', bill.accessInfo(t3.row().id).left);
+
+    // Отключение кода: уже выданный доступ при этом не трогаем.
+    await ownerSay('/code 30 1 на отзыв');
+    const doomed = (last().match(CODE_RE) || [])[0];
+    await ownerSay(`/revoke ${doomed}`);
+    ok(last().includes('отключён'), 'код отключается');
+    const t6 = person(999007, 'tester_six');
+    await t6.say('/start'); await t6.say(doomed);
+    ok(last().includes('отключён') && !bill.accessInfo(t6.row().id).active,
+      'отключённый код не работает');
+
+    await ownerSay('/codes');
+    ok(last().includes('Коды доступа') && last().includes('tester_one'),
+      'в списке видно, кто активировал код', last().slice(0, 60));
+
+    // Снятие доступа — чтобы посмотреть на бота глазами неоплатившего.
+    await ownerSay(`/ungrant ${999002}`);
+    ok(!bill.accessInfo(t1.row().id).active, 'доступ снимается по номеру');
+    await ownerSay('/ungrant @tester_two');
+    ok(!bill.accessInfo(t2.row().id).active, 'доступ снимается по @имени');
+    await ownerSay('/ungrant @никого_нет');
+    ok(last().includes('Не нашёл'), 'неизвестное имя — понятный ответ');
+
+    // Свой номер человек узнаёт сам: без него владельцу нечего вводить.
+    await t1.say('/id');
+    ok(last().includes('999002'), 'команда /id показывает номер', last().slice(0, 30));
+
+    // Посторонний кодов не печатает.
+    delete process.env.SUPPORT_CHAT_ID;
+    const madeBefore = bill.listCodes(100).length;
+    await t1.say('/code 3650 50');
+    ok(bill.listCodes(100).length === madeBefore, 'посторонний не может выпустить себе коды');
+  }
 
   delete process.env.LAVA_OFFER_URL;
   delete process.env.LAVA_WEBHOOK_SECRET;

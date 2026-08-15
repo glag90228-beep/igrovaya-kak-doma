@@ -201,6 +201,34 @@ async function main() {
   });
   ok(r.status === 200 && r.json.total === 600, 'с подпиской лимит не мешает', r.json && r.json.total);
 
+  console.log('\n── код доступа ──');
+  {
+    const billing = require('./lib/billing');
+    const petyaUser = bdb.getOrCreateUser(PETYA.id);
+    const [code] = billing.createCodes({ days: 14, count: 1, note: 'мини-апп' });
+
+    r = await call('POST', '/api/promo', { user: petya, body: { code: '' } });
+    ok(r.json.error === 'Введите код.', 'пустой код не проходит');
+    r = await call('POST', '/api/promo', { user: petya, body: { code: 'PRV-QQQQ-QQQQ' } });
+    ok(r.json.error.includes('Такого кода нет'), 'выдуманный код отклонён', r.json.error);
+    ok(!billing.accessInfo(petyaUser.id).active, 'доступа всё ещё нет');
+
+    // Регистр и разделители неважны: код часто переписывают руками.
+    r = await call('POST', '/api/promo', { user: petya, body: { code: code.pretty.toLowerCase() } });
+    ok(r.status === 200 && r.json.days === 14, 'код активирован', r.json && r.json.days);
+    ok(r.json.quota.paid && r.json.access.active, 'экран сразу получил новое состояние');
+    ok(billing.accessInfo(petyaUser.id).active, 'доступ выдан');
+
+    r = await call('POST', '/api/promo', { user: petya, body: { code: code.pretty } });
+    ok(r.json.error.includes('уже активировали'), 'повторно тот же код не проходит', r.json.error);
+
+    // Чужой код нельзя активировать дважды одним и тем же человеком, но
+    // главное — что он вообще одноразовый.
+    r = await call('POST', '/api/promo', { user: masha, body: { code: code.pretty } });
+    ok(r.json.error.includes('уже использован'), 'одноразовый код у второго не работает',
+      r.json.error);
+  }
+
   console.log('\n── журнал и копии ──');
   r = await call('GET', '/api/docs', { user: masha });
   const docs = r.json.docs;

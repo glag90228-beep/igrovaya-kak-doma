@@ -288,6 +288,19 @@ const api = {
     return { facsimile: fxState(user.id) };
   },
 
+  /**
+   * Активация кода доступа. Та же проверка, что и в боте: код может быть
+   * отключён, просрочен, разобран другими или уже использован этим же
+   * человеком — причину показываем словами, а не «неверный код».
+   */
+  async 'POST /api/promo'({ user, body }) {
+    const code = str(body.code, 40);
+    if (!code) return { error: 'Введите код.' };
+    const res = billing.redeemCode(user.id, code);
+    if (!res.ok) return { error: res.error };
+    return { days: res.days, quota: bdb.quota(user.id), access: billing.accessInfo(user.id) };
+  },
+
   async 'GET /api/docs'({ user, url }) {
     const cpId = Number(url.searchParams.get('cp')) || null;
     return { docs: bdb.listDocs(user.id, 30, cpId).map(docBrief) };

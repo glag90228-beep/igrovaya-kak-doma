@@ -762,6 +762,9 @@ async function showBilling(tg, chatId, user) {
   const rows = [];
   if (link) rows.push([{ text: a.active ? '⭐ Продлить' : '⭐ Оформить подписку', url: link }]);
   if (link) rows.push([{ text: '✅ Я оплатил', data: 'pay.claim' }]);
+  // Код доступа показываем всегда: им пользуются и до подключения оплаты,
+  // и когда доступ дают за отзыв, тест или взамен сорвавшегося платежа.
+  rows.push([{ text: '🎟 У меня есть код', data: 'promo' }]);
   const history = billing.paymentsOf(user.id, 3);
   if (history.length) {
     lines.push('');
@@ -802,32 +805,157 @@ async function claimByEmail(tg, chatId, user, email) {
     + `Доступ до <b>${ru(until)}</b>.`, mainMenu());
 }
 
-/** Команды владельца: выдать доступ руками и посмотреть, у кого он есть. */
+/** Кого имел в виду владелец: номер, @имя или пересланное сообщение. */
+function findTarget(who) {
+  const clean = String(who || '').replace(/^@/, '').trim();
+  if (!clean) return null;
+  // По номеру заводим карточку сразу: доступ можно выдать заранее, ещё до
+  // того как человек нажал «Старт», — при первом заходе он его уже увидит.
+  if (/^\d+$/.test(clean)) return bdb.getOrCreateUser(Number(clean));
+  return bdb.findUserByUsername(clean);
+}
+
+const OWNER_HELP = [
+  '<b>Команды владельца</b>',
+  '',
+  '<b>Доступ конкретному человеку</b>',
+  '<code>/grant 123456789 30</code> — выдать 30 дней по номеру',
+  '<code>/grant @ivanov 30</code> — то же по имени (если он уже запускал бота)',
+  '<code>/ungrant @ivanov</code> — снять доступ (пригодится, чтобы посмотреть, как выглядит бесплатный режим)',
+  '<code>/who</code> — у кого сейчас есть доступ',
+  '',
+  '<b>Коды доступа</b> — когда номера человека нет',
+  '<code>/code</code> — один код на 30 дней',
+  '<code>/code 90</code> — на 90 дней',
+  '<code>/code 30 5</code> — сразу пять кодов по 30 дней',
+  '<code>/code 30 5 бета-тест</code> — с пометкой, чтобы потом вспомнить',
+  '<code>/code 30 1x20 вебинар</code> — один код на 20 активаций',
+  '<code>/codes</code> — список кодов и кто их активировал',
+  '<code>/revoke PRV-XXXX-XXXX</code> — отключить код',
+  '',
+  '<b>Разное</b>',
+  '<code>/id</code> — узнать свой номер (эту команду можно дать клиенту)',
+].join('\n');
+
+/** Команды владельца: выдать доступ руками, кодами и посмотреть, у кого он есть. */
 async function ownerCommand(tg, chatId, text) {
+  if (text === '/admin' || text === '/owner') {
+    await tg.sendMessage(chatId, OWNER_HELP);
+    return true;
+  }
+
   const grant = /^\/grant\s+(\S+)\s+(\d+)/.exec(text);
   if (grant) {
     const who = grant[1].replace(/^@/, '');
     const days = Number(grant[2]);
-    const target = /^\d+$/.test(who)
-      ? bdb.getOrCreateUser(Number(who))
-      : bdb.reachableUsers().find((u) => String(u.username).toLowerCase() === who.toLowerCase());
-    if (!target) { await tg.sendMessage(chatId, `Не нашёл пользователя ${esc(who)}.`); return true; }
+    const target = findTarget(who);
+    if (!target) {
+      await tg.sendMessage(chatId,
+        `Не нашёл пользователя ${esc(who)}.\n\nПо имени получится только если человек уже запускал бота. `
+        + 'Иначе выдайте по номеру (<code>/grant 123456789 30</code>) — номер он узнает командой <code>/id</code> — '
+        + 'или пришлите ему код: <code>/code</code>.');
+      return true;
+    }
     const until = billing.grantDays(target.id, days);
-    await tg.sendMessage(chatId, `Выдал ${days} дн. пользователю ${esc(target.name || who)} — до ${ru(until)}.`);
+    await tg.sendMessage(chatId, `Выдал ${days} ${plural(days, 'день', 'дня', 'дней')} пользователю ${esc(target.name || who)} — до ${ru(until)}.`);
     try {
       await tg.sendMessage(target.tg_id, `✅ Доступ продлён до <b>${ru(until)}</b>.`);
     } catch (e) { if (e && e.blocked) bdb.markBlocked(target.id); }
     return true;
   }
+
+  const ungrant = /^\/ungrant\s+(\S+)/.exec(text);
+  if (ungrant) {
+    const target = findTarget(ungrant[1]);
+    if (!target) { await tg.sendMessage(chatId, `Не нашёл пользователя ${esc(ungrant[1])}.`); return true; }
+    billing.revokeAccess(target.id);
+    await tg.sendMessage(chatId, `Доступ снят: ${esc(target.name || target.tg_id)}. Остался бесплатный лимит.`);
+    return true;
+  }
+
   if (text === '/who') {
     const list = billing.paidUsers();
     await tg.sendMessage(chatId, list.length
-      ? '<b>С оплаченным доступом:</b>\n' + list.map((u) =>
-        `• ${esc(u.name || u.tg_id)}${u.username ? ` @${esc(u.username)}` : ''} — до ${ru(u.access_until)}`).join('\n')
-      : 'Оплаченных доступов нет.');
+      ? '<b>С доступом:</b>\n' + list.map((u) => {
+        const how = billing.usedCodes(u.id).length ? ' · по коду' : '';
+        return `• ${esc(u.name || u.tg_id)}${u.username ? ` @${esc(u.username)}` : ''}`
+          + ` — до ${ru(u.access_until)}${how}\n  <code>${u.tg_id}</code>`;
+      }).join('\n')
+      : 'Доступов нет. Выдать: <code>/grant номер 30</code> или <code>/code</code>.');
     return true;
   }
+
+  // /code [дней] [сколько кодов | 1x20 активаций] [пометка]
+  // Список разбираем раньше выдачи: «/codes» тоже начинается с «/code».
+  const code = text === '/codes' ? null : /^\/code\b\s*(.*)$/.exec(text);
+  if (code) {
+    const rest = code[1].trim();
+    const m = /^(\d+)?\s*(?:(\d+)(?:x(\d+))?)?\s*(.*)$/i.exec(rest) || [];
+    const days = Number(m[1]) || 30;
+    const count = Number(m[2]) || 1;
+    const maxUses = Number(m[3]) || 1;
+    const note = (m[4] || '').trim();
+    const made = billing.createCodes({ days, count, maxUses, note });
+    const many = maxUses > 1 ? ` · до ${maxUses} активаций каждый` : '';
+    await tg.sendMessage(chatId,
+      `Готово: ${made.length} ${plural(made.length, 'код', 'кода', 'кодов')} на ${days} `
+      + `${plural(days, 'день', 'дня', 'дней')}${many}${note ? ` · ${esc(note)}` : ''}\n\n`
+      + made.map((c) => `<code>${c.pretty}</code>`).join('\n')
+      + '\n\nОтдайте код человеку: в боте «⭐ Подписка» → «🎟 У меня есть код». '
+      + 'Или пусть просто пришлёт код сообщением — бот поймёт.');
+    return true;
+  }
+
+  if (text === '/codes') {
+    const list = billing.listCodes(20);
+    if (!list.length) {
+      await tg.sendMessage(chatId, 'Кодов нет. Создать: <code>/code 30</code>.');
+      return true;
+    }
+    const lines = list.map((c) => {
+      const who = billing.codeUsers(c.code)
+        .map((u) => (u.username ? `@${u.username}` : (u.name || u.tg_id))).join(', ');
+      const state = c.revoked_at ? 'отключён'
+        : (c.uses >= c.max_uses ? 'использован' : `свободен ${c.max_uses - c.uses} из ${c.max_uses}`);
+      return `${c.live ? '🟢' : '⚪️'} <code>${c.pretty}</code> — ${c.days} дн. · ${state}`
+        + `${c.note ? ` · ${esc(c.note)}` : ''}${who ? `\n   ${esc(who)}` : ''}`;
+    });
+    await tg.sendMessage(chatId, `<b>Коды доступа</b>\n\n${lines.join('\n')}`);
+    return true;
+  }
+
+  const revoke = /^\/revoke\s+(\S+)/.exec(text);
+  if (revoke) {
+    const target = billing.getCode(revoke[1]);
+    if (!target) { await tg.sendMessage(chatId, 'Такого кода нет.'); return true; }
+    const done = billing.revokeCode(revoke[1]);
+    await tg.sendMessage(chatId, done
+      ? `Код <code>${target.pretty}</code> отключён. Уже выданный по нему доступ остаётся — снять: <code>/ungrant номер</code>.`
+      : `Код <code>${target.pretty}</code> и так был отключён.`);
+    return true;
+  }
+
   return false;
+}
+
+/**
+ * Активация кода доступа. Работает и из формы, и когда человек просто
+ * прислал код сообщением — узнать его по виду несложно, а лишний шаг
+ * «сначала нажмите кнопку» раздражает.
+ */
+async function redeemPromo(tg, chatId, user, text) {
+  bdb.clearState(user.id);
+  const res = billing.redeemCode(user.id, text);
+  if (!res.ok) {
+    await tg.sendMessage(chatId, `${esc(res.error)}`, keyboard([
+      [{ text: '🎟 Ввести ещё раз', data: 'promo' }],
+      [{ text: '💬 Поддержка', data: 'support' }, { text: '⬅️ Подписка', data: 'billing' }],
+    ]));
+    return;
+  }
+  await tg.sendMessage(chatId,
+    `✅ Код принят: ${res.days} ${plural(res.days, 'день', 'дня', 'дней')} без ограничений.\n`
+    + `Доступ до <b>${ru(res.until)}</b>.`, mainMenu());
 }
 
 // ---------- поддержка ----------
@@ -1639,6 +1767,13 @@ async function handleMessage(tg, msg) {
   if (isOwner(chatId) && await ownerCommand(tg, chatId, text)) return;
 
   if (text === '/start') { bdb.clearState(user.id); await tg.sendMessage(chatId, greeting(), mainMenu()); return; }
+  // Свой номер нужен, чтобы владелец выдал доступ: имя в Telegram есть не у
+  // всех и меняется, номер — нет.
+  if (text === '/id') {
+    await tg.sendMessage(chatId, `Ваш номер: <code>${user.tg_id}</code>\n\n`
+      + '<i>Нажмите на номер, чтобы скопировать, и пришлите его в поддержку.</i>');
+    return;
+  }
   if (text === '/menu' || text === '/cancel') { bdb.clearState(user.id); await tg.sendMessage(chatId, 'Главное меню:', mainMenu()); return; }
   // Команды из меню Telegram — те же экраны, что и кнопки. Если человек
   // выбрал команду в середине формы, шаг сбрасываем: он передумал.
@@ -1653,6 +1788,12 @@ async function handleMessage(tg, msg) {
   }
 
   const state = bdb.getState(user.id);
+  // Код можно просто прислать сообщением, без захода в меню, — но только
+  // когда человек не заполняет форму: там «PRV-…» может оказаться названием.
+  if (!state.state && billing.looksLikeCode(text)) {
+    await redeemPromo(tg, chatId, user, text);
+    return;
+  }
   if (state.state.startsWith('form:')) { await applyFormValue(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('items:')) {
     const d = state.data;
@@ -1698,6 +1839,7 @@ async function handleMessage(tg, msg) {
   if (state.state.startsWith('dog:')) { await handleDogText(tg, chatId, user, state, text); return; }
   if (state.state === 'support') { await handleSupportText(tg, chatId, user, text); return; }
   if (state.state === 'claim') { await claimByEmail(tg, chatId, user, text); return; }
+  if (state.state === 'promo') { await redeemPromo(tg, chatId, user, text); return; }
   if (state.state === 'mb:email') {
     const addr = text.trim().toLowerCase();
     if (!mailer.validEmail(addr)) {
@@ -2061,6 +2203,14 @@ async function handleCallback(tg, cq) {
     if (data === 'pay.claim') {
       bdb.setState(user.id, 'claim', {});
       await tg.sendMessage(chatId, 'Пришлите почту, которую указывали при оплате:',
+        keyboard([[{ text: '✖️ Отмена', data: 'billing' }]]));
+      return;
+    }
+    if (data === 'promo') {
+      bdb.setState(user.id, 'promo', {});
+      await tg.sendMessage(chatId,
+        'Пришлите код доступа — он выглядит так: <code>PRV-A3KD-9MQX</code>.\n\n'
+        + '<i>Регистр и дефисы неважны.</i>',
         keyboard([[{ text: '✖️ Отмена', data: 'billing' }]]));
       return;
     }

@@ -791,6 +791,37 @@ screens.billing = async function billing() {
       box.append(h('p', { class: 'small muted', style: 'margin:0 16px 12px', text: 'После оплаты вернитесь в чат с ботом и нажмите «Я оплатил».' }));
     }
   }
+
+  // Код доступа виден всегда: по нему и открывают доступ до подключения
+  // оплаты, и продлевают уже действующую подписку.
+  box.append(h('div', { class: 'section-title', text: 'Код доступа' }));
+  const code = field('promo', 'Код', '', { placeholder: 'PRV-A3KD-9MQX' });
+  code.input.autocapitalize = 'characters';
+  box.append(h('div', { class: 'card' }, code));
+  const apply = h('button', { class: 'btn secondary' }, 'Активировать');
+  apply.onclick = async () => {
+    const value = code.input.value.trim();
+    if (!value) { showError(code, 'Введите код.'); return; }
+    apply.disabled = true;
+    try {
+      const r = await api('POST', '/api/promo', { code: value });
+      haptic('medium');
+      toast(`Код принят: ${r.days} ${plural(r.days, 'день', 'дня', 'дней')} без ограничений`);
+      go('billing');
+    } catch (e) {
+      showError(code, e.message);
+    } finally {
+      apply.disabled = false;
+    }
+  };
+  box.append(h('div', { class: 'btn-wrap' }, apply));
+  box.append(h('p', {
+    class: 'small muted',
+    style: 'margin:0 16px 12px',
+    text: q.paid
+      ? 'Если есть ещё один код, дни прибавятся к оплаченным — ничего не сгорит.'
+      : 'Код выдаёт поддержка — например, на время знакомства с сервисом.',
+  }));
   return box;
 };
 

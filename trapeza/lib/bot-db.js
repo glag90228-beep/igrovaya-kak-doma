@@ -386,6 +386,17 @@ function isBlocked(userId) {
   const u = db.prepare('SELECT blocked_at FROM bot_users WHERE id = ?').get(userId);
   return Boolean(u && u.blocked_at);
 }
+/**
+ * Поиск по @имени. Только для команд владельца: имя в Telegram меняется
+ * когда угодно, поэтому оно годится, чтобы найти человека глазами, но не
+ * чтобы что-то к нему привязывать — для этого есть tg_id.
+ */
+function findUserByUsername(username) {
+  const clean = String(username || '').replace(/^@/, '').trim().toLowerCase();
+  if (!clean) return null;
+  return db.prepare('SELECT * FROM bot_users WHERE lower(username) = ?').get(clean) || null;
+}
+
 /** Кому имеет смысл писать: для будущих напоминаний и рассылок. */
 function reachableUsers() {
   return db.prepare("SELECT * FROM bot_users WHERE blocked_at = ''").all();
@@ -558,7 +569,7 @@ module.exports = {
   addOp, listOps, deleteLastOp, balanceOf, debtors,
   DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
   markPaid, unmarkPaid, unpaidDocs, docsBetween,
-  markBlocked, markActive, isBlocked, reachableUsers,
+  markBlocked, markActive, isBlocked, reachableUsers, findUserByUsername,
   nextSeq, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,
   quota, docsThisMonth, freePerMonth,
