@@ -1140,6 +1140,14 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await new Promise((res2) => smtp.listen(0, '127.0.0.1', res2));
     const smtpPort = smtp.address().port;
 
+    // Почта должна быть видна из главного меню. Раньше эта кнопка зависела
+    // от аргумента, который не передавал ни один вызов, — и не показывалась
+    // никогда и никому, хотя вся почта была написана и работала.
+    await say('/menu');
+    ok(button('Почта') === 'mb', 'почта есть в главном меню', button('Почта'));
+    await tap('mb');
+    ok(last().includes('Почта для отправки'), 'кнопка открывает экран почты', last().slice(0, 40));
+
     const schDoc = require('./lib/bot-db').listDocs(uidM, 30).find((x) => x.type === 'sch');
     ok(Boolean(schDoc), 'в журнале есть счёт для отправки');
 
