@@ -20,7 +20,7 @@
  */
 
 const { esc, ru, page, fxHtml, formatMoney, amountInWords } = require('./doc-html');
-const { round2 } = require('./money');
+const { round2, vatSplit, rateLabel } = require('./money');
 
 /** Коды единиц измерения по ОКЕИ — самые ходовые. */
 const OKEI = {
@@ -53,29 +53,9 @@ const LAND = `
   .sfsign .line { border-top: 1px solid #333; margin-top: 22px; padding-top: 2px; font-size: 9.5px; }
 `;
 
-/**
- * Раскладка позиции по НДС.
- * gross — цена уже с налогом; иначе налог начисляется сверху.
- */
-function vatSplit(it, rate, gross) {
-  const qty = Number(it.qty) || 0;
-  const price = Number(it.price) || 0;
-  if (rate == null) {                       // без НДС
-    const sum = round2(qty * price);
-    return { unitNet: price, net: sum, vat: null, total: sum };
-  }
-  const r = rate / 100;
-  if (gross) {
-    const total = round2(qty * price);
-    const net = round2(total / (1 + r));
-    return { unitNet: round2(price / (1 + r)), net, vat: round2(total - net), total };
-  }
-  const net = round2(qty * price);
-  const vat = round2(net * r);
-  return { unitNet: price, net, vat, total: round2(net + vat) };
-}
-
-const rateLabel = (rate) => (rate == null ? 'Без НДС' : `${rate}%`);
+// Расчёт НДС — общий с счётом (lib/money.js). Своя копия здесь уже была
+// и разошлась бы при первой правке: налог в счёте и в УПД по одной сделке
+// обязан совпадать до копейки.
 
 /**
  * @param doc {

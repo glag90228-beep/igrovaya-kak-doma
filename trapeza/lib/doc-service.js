@@ -159,21 +159,38 @@ async function issueDocument(userId, {
 
   const when = /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? String(date) : todayISO();
   const year = Number(when.slice(0, 4));
-  const seq = bdb.nextSeq(userId, type, year);
-  const num = String(number == null || number === '' ? seq : number).slice(0, 40);
   const total = totalOf(clean, fields);
 
-  const doc = { number: num, date: when, items: clean, ...fields };
-  const file = await renderFile(
-    kind.build({ org: withFx(userId, org, type), cp, doc }),
-    `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
-  );
+  /*
+   * Номер берётся до сборки файла — он в нём напечатан, — а сборка PDF идёт
+   * около секунды. За это время тот же номер может занять другой документ:
+   * из мини-приложения, со второго нажатия, из повторной попытки. База такую
+   * запись не пропустит, и тогда мы берём следующий номер и пересобираем
+   * файл. Три попытки: больше одновременных выписок у одного человека не
+   * бывает, а бесконечный цикл в проде хуже отказа.
+   */
+  let num; let file; let id;
+  for (let attempt = 0; ; attempt += 1) {
+    const seq = bdb.nextSeq(userId, type, year);
+    num = String(number == null || number === '' ? seq : number).slice(0, 40);
+    const doc = { number: num, date: when, items: clean, ...fields };
+    // eslint-disable-next-line no-await-in-loop
+    file = await renderFile(
+      kind.build({ org: withFx(userId, org, type), cp, doc }),
+      `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
+    );
+    try {
+      id = bdb.saveDoc(userId, {
+        orgId: org.id, cpId: cp.id, type, number: num, seq, date: when, total,
+        payload: { items: clean, ...fields },
+      });
+      break;
+    } catch (e) {
+      if (!bdb.isSeqTaken(e) || attempt >= 2) throw e;
+    }
+  }
 
   bdb.rememberItems(userId, clean);
-  const id = bdb.saveDoc(userId, {
-    orgId: org.id, cpId: cp.id, type, number: num, seq, date: when, total,
-    payload: { items: clean, ...fields },
-  });
 
   // Долг в журнал — если этот тип документа его создаёт при выбранном
   // основании. Проводка привязана к документу: её видно, можно отменить,

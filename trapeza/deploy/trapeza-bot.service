@@ -8,6 +8,10 @@ Type=simple
 WorkingDirectory=/opt/trapeza
 EnvironmentFile=/opt/trapeza/.env
 ExecStart=/usr/bin/node bot.js
+# Chromium для PDF лежит в общем каталоге, а не в домашней папке того,
+# кто запускал установку: служба работает от trapeza и с ProtectHome=true
+# в /root не заглянет — документы молча уходили бы клиентам в HTML.
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
 Restart=always
 RestartSec=5
 User=trapeza

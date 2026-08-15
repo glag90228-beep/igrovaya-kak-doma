@@ -25,6 +25,7 @@ const billing = require('./lib/billing');
 const { payLink, daysFor } = require('./lib/lava');
 const dadata = require('./lib/dadata');
 const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
+const reqCheck = require('./lib/requisites-check');
 const docService = require('./lib/doc-service');
 const facsimile = require('./lib/facsimile');
 const mailer = require('./lib/mail');
@@ -327,6 +328,33 @@ async function applyFormValue(tg, chatId, user, state, rawValue) {
     if (res.warn) await tg.sendMessage(chatId, `⚠️ ${esc(res.warn)}`);
   }
 
+  /*
+   * Контрольные суммы реквизитов — на шаге ввода, но уже после разбора:
+   * на шаге ИНН человек часто вставляет весь блок реквизитов целиком, и
+   * проверять надо разобранное значение, а не вставленный текст.
+   *
+   * Проверка тут не ради строгости. Опечатка в расчётном счёте — это
+   * платёж, который не пройдёт, а опечатка в ИНН — документ, который
+   * вернёт бухгалтер контрагента. И то и другое ловится арифметикой, но
+   * только пока человек ещё смотрит на это поле: через неделю в выписанном
+   * счёте он ошибку не найдёт.
+   */
+  const checked = values[step.key];
+  if (checked && ['inn', 'kpp', 'bik', 'acc', 'corr_acc'].includes(step.key)) {
+    const bik = step.key === 'bik' ? checked : values.bik;
+    const r = step.key === 'inn' ? reqCheck.checkInn(checked)
+      : step.key === 'kpp' ? reqCheck.checkKpp(checked)
+        : step.key === 'bik' ? reqCheck.checkBik(checked)
+          : reqCheck.checkAccount(checked, bik, step.key === 'corr_acc');
+    if (!r.ok) {
+      values[step.key] = '';
+      bdb.setState(user.id, `form:${formName}`, { i, values });
+      await tg.sendMessage(chatId,
+        `⚠️ ${esc(r.error)}\n\nПришлите ещё раз${step.opt ? ' или «-», если поля нет' : ''}:`);
+      return;
+    }
+  }
+
   await advanceForm(tg, chatId, user, formName, values, i + 1);
 }
 
@@ -544,22 +572,27 @@ const unitOf = (word) => UNITS[String(word || '').toLowerCase().replace(/\.$/, '
 /**
  * Числа из строки — вместе с тем, где они стояли.
  *
- * Разделители разрядов пишут кто как: «30 000», «30.000», «30 000,50».
- * Три цифры после точки — это тысячи, а не копейки: копеек всегда две,
- * и «30.000» человек пишет, имея в виду тридцать тысяч.
+ * mergeThousands включает склейку разрядов через пробел: «30 000» это одно
+ * число. Она нужна, но она же и опасна — «30 450» с тем же успехом читается
+ * как «30 штук по 450». Поэтому разбор идёт в два прохода, а решает
+ * readItemLine.
+ *
+ * Точка перед ровно тремя цифрами это всегда разряды, а не копейки: копеек
+ * ровно две, и «30.000» человек пишет, имея в виду тридцать тысяч.
  */
-function numbersIn(text) {
+function numbersIn(text, mergeThousands = false) {
   // Хвостовой (?!\d) обязателен: без него «Фуршет 10 1500» читается как
-  // «10 150» плюс «0» — разделитель разрядов съедает пробел между
-  // количеством и ценой, и в счёт уходит десять тысяч штук по нулю.
-  const re = /\d{1,3}(?:[\s ]\d{3})+(?:[.,]\d{1,2})?(?!\d)|\d+(?:[.,]\d+)?/g;
+  // «10 150» плюс «0» — разряды съедают пробел между количеством и ценой.
+  const re = mergeThousands
+    ? /\d{1,3}(?:[\s\u00a0]\d{3})+(?:[.,]\d{1,2})?(?!\d)|\d+(?:[.,]\d+)?/g
+    : /\d+(?:[.,]\d+)?/g;
   const out = [];
   let m = re.exec(text);
   while (m) {
     const raw = m[0];
-    let value;
-    if (/^\d+\.\d{3}$/.test(raw)) value = Number(raw.replace('.', ''));
-    else value = Number(raw.replace(/[\s ]/g, '').replace(',', '.'));
+    const value = /^\d+\.\d{3}$/.test(raw)
+      ? Number(raw.replace('.', ''))
+      : Number(raw.replace(/[\s\u00a0]/g, '').replace(',', '.'));
     if (Number.isFinite(value)) out.push({ value, start: m.index, end: m.index + raw.length });
     m = re.exec(text);
   }
@@ -577,15 +610,20 @@ function unitAfter(text, pos) {
  *
  * Формат «Наименование; количество; цена» остаётся, но требовать его нельзя:
  * предприниматель пишет так, как говорит — «Аренда 30 м² 1 30.000»,
- * «Бумага 10 пачек по 300», «Консультация 5000». Поэтому если точек с
- * запятой нет, ищем числа с конца: последние два — количество и цена.
- * Числа внутри названия («30 м²») в счёт не идут, их выдаёт единица следом.
+ * «Услуги питания 30 по 450», «Консультация 5000».
+ *
+ * Главная сложность — пробел. В «30 000» он разделяет разряды, в «30 450»
+ * (услуги питания, тридцать порций по 450) он разделяет количество и цену.
+ * Одним выражением это не различить, поэтому пробуем сначала без склейки
+ * разрядов: если так выходит осмысленная пара «количество × цена» — берём
+ * её, потому что это и есть основной формат. И только если не вышло
+ * (цена оказалась нулём или число всего одно), пробуем со склейкой.
  *
  * @returns {{name,qty,unit,price}|{name,partial:true}|null}
  *   partial — поняли только название; количество и цену спросим отдельно.
  */
 function readItemLine(text) {
-  const line = String(text || '').replace(/[ ]/g, ' ').trim();
+  const line = String(text || '').replace(/\u00a0/g, ' ').trim();
   if (!line) return null;
 
   const parts = line.split(/[;|]/).map((s) => s.trim()).filter(Boolean);
@@ -597,28 +635,33 @@ function readItemLine(text) {
     }
   }
 
-  // «х», «*» и «по» между числами — разделители, а не часть названия.
-  const plain = line.replace(/\s*[x×хX*]\s*(?=\d)/g, ' ').replace(/\s+по\s+(?=\d)/gi, ' ');
-  const nums = numbersIn(plain);
-
+  // «х», «*» и «по» между числами — разделители, а не часть названия. Меняем
+  // их на «;», а не на пробел: пробел склеил бы «30 по 450» в 30 450.
+  const plain = line.replace(/\s*[x×хX*]\s*(?=\d)/g, ';').replace(/\s+по\s+(?=\d)/gi, ';');
   // Хвостовые слова вроде «руб.» отбрасываем, чтобы они не липли к названию.
   const tail = (from) => plain.slice(from).replace(/^[\s.,]*(?:руб\.?|р\.|₽|рублей)?[\s.,]*$/i, '');
 
-  if (nums.length >= 2) {
+  const pick = (nums) => {
+    if (nums.length < 2) return null;
     const [q, p] = nums.slice(-2);
-    if (tail(p.end) === '') {
-      const name = plain.slice(0, q.start).replace(/[\s.,;:—-]+$/, '').trim();
-      if (name) {
-        return { name, qty: q.value, unit: unitAfter(plain, q.end) || 'шт.', price: p.value };
-      }
-    }
-  }
+    if (tail(p.end) !== '') return null;
+    const name = plain.slice(0, q.start).replace(/[\s.,;:—-]+$/, '').trim();
+    if (!name || !(p.value > 0) || !(q.value > 0)) return null;
+    return { name, qty: q.value, unit: unitAfter(plain, q.end) || 'шт.', price: p.value };
+  };
 
-  if (nums.length === 1) {
-    const n = nums[0];
+  // Пара «количество × цена» важнее разрядов — это основной формат ввода.
+  const asPair = pick(numbersIn(plain, false));
+  if (asPair) return asPair;
+  const merged = pick(numbersIn(plain, true));
+  if (merged) return merged;
+
+  const one = numbersIn(plain, true);
+  if (one.length === 1) {
+    const n = one[0];
     const name = plain.slice(0, n.start).replace(/[\s.,;:—-]+$/, '').trim();
     // «Аренда 30 м²» — число с единицей это описание, а не цена.
-    if (name && !unitAfter(plain, n.end) && tail(n.end) === '') {
+    if (name && n.value > 0 && !unitAfter(plain, n.end) && tail(n.end) === '') {
       return { name, qty: 1, unit: 'шт.', price: n.value };
     }
   }
@@ -666,7 +709,7 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
     filename: res.file.filename,
     buffer: res.file.buffer,
     caption: `${esc(res.title)} № ${esc(res.doc.number)}`
-      + ` от ${ru(res.doc.date)} для <b>${esc(cp.name)}</b> на ${formatRub(res.total)}.`
+      + ` от ${ru(res.doc.date)} для <b>${esc(cp.name)}</b> на ${formatRub(res.total)}`
       + (type === 'sch' ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.' : '')
       + (res.file.pdf ? '' : '\n\n(PDF недоступен — откройте файл в браузере и распечатайте / сохраните в PDF.)')
       + ledger + tail,
@@ -702,7 +745,7 @@ async function repeatDoc(tg, chatId, user, docId) {
   bdb.setState(user.id, `items:${src.type}:${src.cp_id}`, data);
   await tg.sendMessage(chatId,
     `Повторяю <b>${esc(src.title.toLowerCase())} № ${esc(src.number)}</b>: ${items.length} поз., `
-    + `${formatRub(src.total)}.\nНовый номер — ${esc(data.number)}, дата — ${ru(data.date)}.`);
+    + `${formatRub(src.total)}\nНовый номер — ${esc(data.number)}, дата — ${ru(data.date)}.`);
   await showPreview(tg, chatId, user, bdb.getState(user.id));
 }
 
@@ -742,8 +785,8 @@ async function sendRegistry(tg, chatId, user, periodName) {
     filename: `Реестр_${from}_${to}.xlsx`,
     buffer: buf,
     caption: `Реестр за ${esc(title)} (${ru(from)}—${ru(to)}).\n`
-      + `Документов: <b>${docs.length}</b> на <b>${formatRub(sum)}</b>.`
-      + (unpaid.length ? `\nНе оплачено: <b>${unpaid.length}</b> на <b>${formatRub(unpaidSum)}</b>.` : '\nВсё оплачено.'),
+      + `Документов: <b>${docs.length}</b> на <b>${formatRub(sum)}</b>`
+      + (unpaid.length ? `\nНе оплачено: <b>${unpaid.length}</b> на <b>${formatRub(unpaidSum)}</b>` : '\nВсё оплачено.'),
   });
 }
 
@@ -1786,7 +1829,7 @@ async function handlePpText(tg, chatId, user, state, text) {
   const html = buildPlatyozhkaHtml({ org, cp, doc });
   await sendGenerated(tg, chatId, {
     html, base: `Платежка_${safeName(doc.number)}_${safeName(cp.name)}`,
-    caption: `Платёжное поручение № ${esc(doc.number)} получателю <b>${esc(cp.name)}</b> на ${formatRub(doc.amount)}.`,
+    caption: `Платёжное поручение № ${esc(doc.number)} получателю <b>${esc(cp.name)}</b> на ${formatRub(doc.amount)}`,
   });
   bdb.saveDoc(user.id, {
     orgId: org.id, cpId, type: 'pp', number: doc.number, seq: state.data.seq,
@@ -1946,10 +1989,21 @@ async function handleMessage(tg, msg) {
     // Дозапрос по начатой позиции: название уже знаем, ждём количество и цену.
     if (d.ask === 'np') {
       const p = d.pending || {};
-      const nums = numbersIn(text.replace(/\s*[x×хX*]\s*(?=\d)/g, ' ').replace(/\s+по\s+(?=\d)/gi, ' '));
-      const unit = unitAfter(text, (nums[0] || {}).end || 0);
+      const reply = text.replace(/\s*[x×хX*]\s*(?=\d)/g, ';').replace(/\s+по\s+(?=\d)/gi, ';');
+      const loose = numbersIn(reply, false);   // «2 4500» — два числа
+      const tight = numbersIn(reply, true);    // «30 000» — одно число
+      const unit = unitAfter(reply, ((loose[0] || {}).end) || 0);
       if (unit) p.unit = unit;
-      if (p.qty == null && nums.length >= 2) { [p.qty, p.price] = [nums[0].value, nums[1].value]; } else if (p.qty == null && nums.length === 1) { p.qty = nums[0].value; } else if (nums.length >= 1) { p.price = nums[0].value; }
+
+      if (p.qty != null) {
+        // Количество уже знаем — значит это цена, и «30 000» здесь тридцать
+        // тысяч, а не тридцать и ноль.
+        if (tight.length) p.price = tight[tight.length - 1].value;
+      } else if (loose.length >= 2 && loose[loose.length - 1].value > 0) {
+        [p.qty, p.price] = [loose[0].value, loose[loose.length - 1].value];
+      } else if (tight.length === 1) {
+        p.qty = tight[0].value;
+      }
 
       if (p.qty == null || p.qty <= 0) {
         d.pending = p; bdb.setState(user.id, state.state, d);
@@ -2349,7 +2403,7 @@ async function handleCallback(tg, cq) {
       if (!t) { await tg.sendMessage(chatId, 'Шаблон не найден.'); return; }
       state.data.ask = 'qty'; state.data.tplId = t.id;
       bdb.setState(user.id, state.state, state.data);
-      await tg.sendMessage(chatId, `<b>${esc(t.name)}</b> по ${formatRub(t.price)} за ${esc(t.unit)}.\nСколько?`);
+      await tg.sendMessage(chatId, `<b>${esc(t.name)}</b> по ${formatRub(t.price)} за ${esc(t.unit)}\nСколько?`);
       return;
     }
     if (data.startsWith('ph.cp:')) { await photoPickKind(tg, chatId, user, Number(data.slice(6))); return; }

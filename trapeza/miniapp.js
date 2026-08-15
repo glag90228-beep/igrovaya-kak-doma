@@ -31,12 +31,18 @@ const facsimile = require('./lib/facsimile');
 const mailer = require('./lib/mail');
 const mailbox = require('./lib/mailbox');
 const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
+const reqCheck = require('./lib/requisites-check');
 const { round2 } = require('./lib/money');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
 const { payLink } = require('./lib/lava');
 const { Telegram } = require('./lib/tg');
 
 const PORT = Number(process.env.MINIAPP_PORT || 8790);
+// Слушаем только петлю: снаружи приложение отдаёт nginx по HTTPS, а открытый
+// порт 8790 — это то же приложение по обычному HTTP, где initData (ключ от
+// аккаунта на сутки) идёт открытым текстом мимо шифрования. Для запуска без
+// nginx есть MINIAPP_HOST=0.0.0.0.
+const HOST = process.env.MINIAPP_HOST || '127.0.0.1';
 const ROOT = path.join(__dirname, 'public', 'app');
 // Тело до 2 МБ: картинка факсимиле весит до 1 МБ, а в base64 распухает на
 // треть — при меньшем пороге загрузка обрывалась бы без внятной причины.
@@ -192,6 +198,8 @@ const api = {
       contract: str(body.contract, 200),
       email: str(body.email, 254),
     };
+    const wrong = reqCheck.checkRequisites(body);
+    if (wrong.length) return { error: wrong[0].error, field: wrong[0].field };
     const id = Number(body.id) || 0;
     if (id) {
       if (!bdb.getCp(user.id, id)) return { error: 'Контрагент не найден.' };
@@ -205,6 +213,10 @@ const api = {
   async 'POST /api/org'({ user, body }) {
     const name = str(body.name, 200);
     if (!name) return { error: 'Укажите название организации.' };
+    // Контрольные суммы: счёт с опечаткой в реквизитах бесполезен, а
+    // проверяется это арифметикой за миллисекунду.
+    const bad = reqCheck.checkRequisites(body);
+    if (bad.length) return { error: bad[0].error, field: bad[0].field };
     bdb.saveMyOrg(user.id, {
       name,
       full_name: str(body.full_name, 400),
@@ -595,7 +607,7 @@ if (require.main === module) {
     console.error('Не задан BOT_TOKEN — без него подпись Telegram не проверить.');
     process.exit(1);
   }
-  server.listen(PORT, () => console.log(`Мини-приложение слушает :${PORT}`));
+  server.listen(PORT, HOST, () => console.log(`Мини-приложение слушает ${HOST}:${PORT}`));
 }
 
 module.exports = { server, api, stateFor, setTelegram };

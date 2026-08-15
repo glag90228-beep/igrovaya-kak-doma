@@ -322,6 +322,12 @@ function markPaid(userId, docId, date) {
   if (!d) return null;
   const when = /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? date : new Date().toISOString().slice(0, 10);
   db.prepare('UPDATE documents SET paid_at = ? WHERE id = ? AND user_id = ?').run(when, docId, userId);
+  // В ручном режиме журнал ведёт человек, и лезть туда нельзя: проводка
+  // оплаты без встречной реализации увела бы сальдо в минус — вышло бы,
+  // что это мы должны контрагенту. Отметку об оплате при этом сохраняем:
+  // она нужна списку «Не оплачено» и живёт отдельно от журнала.
+  const org = getDefaultOrg(userId);
+  if (basisOf(org || {}) === 'manual') return when;
   if (d.cp_id && d.total) {
     addOpForDoc(userId, d.cp_id, {
       date: when, kind: 'Оплата', doc: `${d.title} № ${d.number}`, debit: d.total,
@@ -460,6 +466,31 @@ function nextSeq(userId, type, year) {
   return row.n + 1;
 }
 
+/**
+ * Уникальность номера внутри года — на уровне базы, а не надежды.
+ *
+ * Номер берётся до сборки файла (он в нём напечатан), а сборка PDF занимает
+ * секунду. За эту секунду второй документ — из мини-приложения или второго
+ * нажатия — успевает взять тот же номер. Два счёта с одним номером бухгалтеру
+ * не объяснишь, поэтому пусть лучше вторая запись честно не пройдёт: код
+ * возьмёт следующий номер и пересоберёт файл.
+ *
+ * В старых базах дубли уже могли появиться — тогда индекс не создастся, и это
+ * не повод падать при запуске: остальное продолжает работать.
+ */
+function guardSeq() {
+  try {
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_seq_uniq ON documents(user_id, type, year, seq)');
+    return true;
+  } catch (_) {
+    return false;                       // в базе уже есть повторы номеров
+  }
+}
+guardSeq();
+
+/** Не прошла ли запись именно из-за занятого номера. */
+const isSeqTaken = (e) => /idx_doc_seq_uniq|UNIQUE constraint failed: documents/i.test(String(e && e.message));
+
 /** Документ сохраняется данными; файл всегда пересобирается заново. */
 function saveDoc(userId, { orgId, cpId, type, number, seq, date, total, payload }) {
   const year = Number(String(date).slice(0, 4)) || new Date().getFullYear();
@@ -493,9 +524,19 @@ function withPayload(row) {
   return { ...row, payload, title: DOC_TITLES[row.type] || row.type };
 }
 
+/**
+ * Удаление документа вместе с его проводками.
+ *
+ * Без этого удалённый счёт оставлял долг в журнале навсегда: карточки, через
+ * которую проводку отменяют, больше нет, а сальдо у контрагента висит. Долг,
+ * которого никто не может убрать, — худшее, что может быть в акте сверки.
+ */
 function deleteDoc(userId, id) {
-  const info = db.prepare('DELETE FROM documents WHERE id = ? AND user_id = ?').run(id, userId);
-  return info.changes > 0;
+  // Проводки убираем первыми: deleteOpsOfDoc сверяется с документом, и после
+  // его удаления она уже ничего не найдёт.
+  if (!getDoc(userId, id)) return false;
+  deleteOpsOfDoc(userId, id);
+  return db.prepare('DELETE FROM documents WHERE id = ? AND user_id = ?').run(id, userId).changes > 0;
 }
 
 // ---------- шаблоны позиций ----------
@@ -570,6 +611,7 @@ module.exports = {
   DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
   markPaid, unmarkPaid, unpaidDocs, docsBetween,
   markBlocked, markActive, isBlocked, reachableUsers, findUserByUsername,
+  isSeqTaken, guardSeq,
   nextSeq, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,
   quota, docsThisMonth, freePerMonth,

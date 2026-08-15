@@ -54,11 +54,29 @@ done < .env.example
 
 say "4/6 Зависимости"
 npm install --omit=dev
-# Chromium для PDF: если не ставится, бот будет слать HTML — не критично
+# Chromium для PDF.
+#
+# Каталог задаём явно. По умолчанию Playwright кладёт браузер в домашнюю
+# папку того, кто запускал установку (обычно /root), а службы работают от
+# пользователя trapeza и с ProtectHome=true туда не попадут. Браузер вроде
+# бы стоит, а документы уходят клиентам в HTML — и понять это можно только
+# по жалобе.
+export PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
 npm install playwright >/dev/null 2>&1 && npx playwright install --with-deps chromium || \
   echo "Playwright не встал — документы пойдут в HTML. Можно указать CHROMIUM_PATH в .env."
+chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH"
 
 chown -R trapeza:trapeza "$APP" "$LOGS"
+
+# Проверяем не наличие файлов, а сам рендер: только он отвечает на вопрос,
+# получит ли клиент PDF.
+if PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers sudo -u trapeza --preserve-env=PLAYWRIGHT_BROWSERS_PATH \
+     node -e "require('./lib/pdf').htmlToPdf('<b>тест</b>').then(b=>{if(b.length<1000)throw new Error('пусто');process.exit(0)}).catch(e=>{console.error(e.message);process.exit(1)})" 2>/dev/null; then
+  echo "PDF работает ✅"
+else
+  echo "⚠️  PDF не собирается — документы пойдут в HTML. Проверьте: PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers node -e \"require('./lib/pdf').htmlToPdf('<b>x</b>')\""
+fi
 
 set -a; . ./.env; set +a
 

@@ -130,10 +130,10 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   // Ручной путь: ИНН вводим (справочник в прогоне не подключён — автозаполнения
   // нет), название и остальное набираем сами. Порядок шагов новый:
   // инн → название → полное → КПП → адрес → подписант → БИК → банк → к/с → р/с.
-  const ORG = ['183112345678', 'ИП Сарычева М. В.',
+  const ORG = ['183112345637', 'ИП Сарычева М. В.',
     'Индивидуальный предприниматель Сарычева Мария Витальевна', '-',
     'г. Ижевск, ул. Пушкинская, 214', 'М. В. Сарычева',
-    '049401601', 'ПАО Сбербанк', '30101810400000000601', '40802810168000012345'];
+    '049401601', 'ПАО Сбербанк', '30101810400000000601', '40802810168000012341'];
   for (const v of ORG) await say(v);
   ok(last().includes('сохранена'), 'организация заведена', last().slice(0, 60));
   await tap('org');
@@ -156,7 +156,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await say('049401601');
   await say('ПАО Сбербанк');
   await say('30101810400000000601');
-  await say('40702810100000098765');
+  await say('40702810100000098766');
   ok(last().includes('Заря'), 'контрагент создан и показана карточка');
 
   const cpBtn = button('Внести операцию');
@@ -296,7 +296,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     'в сводке видно статус и режим НДС', last().slice(0, 90));
   await tap('doc.make');
   const updHtml = require('./lib/upd').buildUpdHtml({
-    org: { name: 'ИП', full_name: 'ИП Сарычева М. В.', inn: '183112345678', address: 'Ижевск' },
+    org: { name: 'ИП', full_name: 'ИП Сарычева М. В.', inn: '183112345637', address: 'Ижевск' },
     cp: { name: 'ООО «Заря»', full_name: 'ООО «Заря»', inn: '1832012345', kpp: '183201001' },
     doc: { number: '1', date: '2026-08-11', status: 1, vatRate: 20, priceIncludesVat: true,
       items: [{ name: 'Обслуживание банкета', qty: 1, unit: 'усл.', price: 120000 }] },
@@ -447,7 +447,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await say('044525225');    // БИК — банк и корр. счёт должны подставиться
   ok(last().includes('счёт контрагента') || last().includes('Расчётный счёт'),
     'банк и корр. счёт пропущены — сразу спросил расчётный счёт', last().slice(0, 50));
-  await say('40702810900000099999');
+  await say('40702810900000099998');
   const roma = require('./lib/bot-db').listCps(require('./lib/bot-db').getOrCreateUser(USER.id).id)
     .find((c) => c.name === 'ООО «Ромашка»');
   ok(roma && roma.kpp === '770701001' && roma.address.includes('Тверская'),
@@ -459,7 +459,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   console.log('\n── дебиторка ──');
   // второй контрагент-поставщик, которому должны мы
   await tap('cp.new');
-  await say('1832055555');   // инн
+  await say('1832055557');   // инн (контрольная цифра сходится — бот проверяет)
   await say('ООО «Поставка»');
   await say('-'); await say('-'); await say('-'); // полное, КПП, адрес
   await tap('fb:supplier');
@@ -929,6 +929,79 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'в выборку попали документы с именами контрагентов', yearDocs.length);
     const other = bdb4.docsBetween(uid4, '2020-01-01', '2020-12-31');
     ok(other.length === 0, 'за пустой период документов нет');
+  }
+
+  console.log('\n── контрольные суммы реквизитов ──');
+  {
+    const rc = require('./lib/requisites-check');
+    // Настоящие открытые реквизиты: если алгоритм врёт, это видно сразу.
+    ok(rc.checkInn('7707083893').ok, 'ИНН из десяти цифр сходится');
+    ok(!rc.checkInn('7707083894').ok, 'одна изменённая цифра в ИНН ловится');
+    ok(rc.checkInn('500100732259').ok, 'ИНН предпринимателя из двенадцати цифр сходится');
+    ok(!rc.checkInn('500100732250').ok, 'опечатка в ИНН предпринимателя ловится');
+    ok(!rc.checkInn('12345').ok, 'ИНН неправильной длины отклонён', rc.checkInn('12345').error);
+    ok(rc.checkInn('').ok, 'пустой ИНН — не ошибка: у иностранца его нет');
+
+    ok(rc.checkBik('044525225').ok, 'БИК сходится');
+    ok(!rc.checkBik('123456789').ok, 'не российский БИК отклонён');
+
+    // Корр. счёт Сбербанка — проверяется вместе с его же БИК.
+    ok(rc.checkAccount('30101810400000000225', '044525225', true).ok, 'корр. счёт сходится с БИК');
+    ok(!rc.checkAccount('30101810400000000255', '044525225', true).ok,
+      'переставленные цифры в корр. счёте ловятся');
+    ok(!rc.checkAccount('40702810900000012345', '044525225').ok,
+      'расчётный счёт с опечаткой не пройдёт — по нему бы не заплатили');
+    ok(rc.checkAccount('40702810900000012344', '044525225').ok, 'верный расчётный счёт принимается');
+    ok(rc.checkAccount('40702810900000012345', '').ok, 'без БИК счёт не проверяем — нечем');
+
+    // И то же самое живьём: бот обязан переспросить, а не записать мусор.
+    await tap('cps'); await tap('cp.new');
+    await say('7707083894');
+    ok(last().includes('контрольной цифре'), 'бот переспрашивает кривой ИНН', last().slice(0, 40));
+    await say('7707083893');
+    ok(!last().includes('контрольной'), 'верный ИНН принят');
+    await say('ООО Проверка'); await say('-'); await say('-'); await say('-');
+    await tap('fb:customer');
+    await say('-'); await say('0'); await say('01.01.2026');
+    await say('044525225');
+    await say('-'); await say('-');
+    await say('40702810900000012345');
+    ok(last().includes('не сходится с БИК'), 'бот не принял счёт, не сходящийся с банком',
+      last().slice(0, 45));
+    await say('40702810900000012344');
+    ok(!last().includes('не сходится'), 'верный счёт принят');
+  }
+
+  console.log('\n── номера документов не задваиваются ──');
+  {
+    const dbx = require('./db').db;
+    const bdb = require('./lib/bot-db');
+    const uidN = fxUserId();
+    const doc = (seq) => dbx.prepare(`
+      INSERT INTO documents(user_id, org_id, cp_id, type, number, seq, year, date, total, payload, created_at)
+      VALUES(?,0,0,'sch',?,?,2031,'2031-03-01',100,'','2031-03-01')`).run(uidN, String(seq), seq);
+
+    doc(1);
+    let blocked = false;
+    try { doc(1); } catch (e) { blocked = require('./lib/bot-db').isSeqTaken(e); }
+    ok(blocked, 'второй документ с тем же номером база не принимает');
+    doc(2);
+    ok(bdb.nextSeq(uidN, 'sch', 2031) === 3, 'следующий номер считается от занятых',
+      bdb.nextSeq(uidN, 'sch', 2031));
+
+    // Выписка двух документов одновременно: номер берётся до сборки файла,
+    // и раньше оба получали одинаковый. Теперь второй пересобирается.
+    const ds = require('./lib/doc-service');
+    const cpN = bdb.listCps(uidN)[0];
+    const two = await Promise.all([
+      ds.issueDocument(uidN, { type: 'sch', cpId: cpN.id, items: [{ name: 'Раз', qty: 1, price: 10 }], skipQuota: true }),
+      ds.issueDocument(uidN, { type: 'sch', cpId: cpN.id, items: [{ name: 'Два', qty: 1, price: 20 }], skipQuota: true }),
+    ]);
+    ok(two.every((r) => r.ok), 'оба документа выписались', two.map((r) => r.ok).join());
+    const nums = two.map((r) => (r.doc || {}).number);
+    ok(nums[0] !== nums[1], 'и номера у них разные', nums.join(' и '));
+
+    dbx.prepare("DELETE FROM documents WHERE user_id = ? AND year = 2031").run(uidN);
   }
 
   console.log('\n── резервные копии ──');

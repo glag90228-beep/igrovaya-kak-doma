@@ -13,6 +13,12 @@ fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
 const db = new DatabaseSync(DB_FILE);
 db.exec('PRAGMA journal_mode = WAL');
 db.exec('PRAGMA foreign_keys = ON');
+// В базу пишут два процесса сразу — бот и мини-приложение. WAL разводит
+// чтение с записью, но две записи всё равно встречаются, и без таймаута
+// вторая падает мгновенно: «database is locked», а человек видит потерянный
+// документ. Пять секунд ожидания снимают это полностью — запись занимает
+// миллисекунды.
+db.exec('PRAGMA busy_timeout = 5000');
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS settings (
