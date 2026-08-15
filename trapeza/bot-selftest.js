@@ -931,6 +931,62 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(other.length === 0, 'за пустой период документов нет');
   }
 
+  console.log('\n── путь новичка: от «Старт» до файла ──');
+  {
+    // Человек, который ничего не знает и ничего не заполнял заранее. Он
+    // должен получить документ, ни разу не догадавшись, где что лежит.
+    const N = { id: 979001, first_name: 'Новичок' };
+    const nSay = (t) => handleUpdate(tg, { message: { chat: { id: N.id }, from: N, text: t } });
+    const nTap = (d) => handleUpdate(tg,
+      { callback_query: { id: 'c', from: N, data: d, message: { chat: { id: N.id } } } });
+    const nLast = () => (sent[sent.length - 1] || {}).text || '';
+    /** Кнопка ищется только в последнем сообщении — как её видит человек. */
+    const nBtn = (sub) => {
+      const m = sent[sent.length - 1] || { kb: [] };
+      for (const row of m.kb) for (const b of row) if (b.text.includes(sub)) return b.callback_data;
+      return null;
+    };
+    const filesWas = files.length;
+
+    await nSay('/start');
+    ok(nBtn('Выписать счёт') === 'go.sch', 'на первом экране есть кнопка «Выписать счёт»');
+
+    await nTap('go.sch');
+    ok(nLast().includes('Как называется') && nLast().includes('Шаг 1 из 4'),
+      'проводник спрашивает название и показывает, сколько шагов', nLast().slice(0, 40));
+    ok(nBtn('Отмена'), 'из формы есть выход');
+
+    await nSay('ИП Петров П. П.');
+    ok(Boolean(nBtn('Пропустить')), 'необязательное поле можно пропустить кнопкой');
+    // Каждый раз читаем кнопку заново — как человек, который жмёт последнюю.
+    const nSkip = async () => { const b = nBtn('Пропустить'); if (b) await nTap(b); return b; };
+    await nSkip(); await nSkip(); await nSkip();
+    ok(nLast().includes('ИНН клиента'), 'дошли до анкеты клиента', nLast().slice(0, 30));
+
+    // Сообщения в чате остаются, и кнопка из прошлого вопроса живёт вечно.
+    // Нажатие на неё не должно пропускать текущее — тем более обязательное.
+    const stale = await nSkip();                       // пропустили ИНН клиента
+    ok(nLast().includes('Как называется клиент'), 'спросили имя клиента');
+    await nTap(stale);
+    ok(nLast().includes('Как называется клиент'),
+      'старой кнопкой обязательное поле не пропускается', nLast().slice(0, 30));
+
+    await nSay('ООО Ромашка');
+    await nTap('fb:customer');
+    ok(nLast().includes('Счёт на оплату'), 'сразу перешли к позициям счёта', nLast().slice(0, 30));
+
+    await nSay('Ремонт компьютера 1 3500');
+    await nTap('items.done');
+    await nTap('doc.make');
+    ok(files.length === filesWas + 1, 'новичок получил файл', files.length - filesWas);
+    const caption = (files[files.length - 1] || {}).caption || '';
+    ok(caption.includes('нет реквизитов для оплаты'),
+      'бот честно предупредил, что платить некуда', caption.slice(-60));
+    ok(!caption.includes('есть QR'), 'и не обещал QR, которого нет');
+    ok(nLast().includes('Что дальше'), 'после файла показан короткий выбор, а не стена кнопок',
+      nLast().slice(0, 30));
+  }
+
   console.log('\n── контрольные суммы реквизитов ──');
   {
     const rc = require('./lib/requisites-check');

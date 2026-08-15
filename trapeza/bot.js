@@ -78,8 +78,14 @@ function mainMenu() {
   const app = webAppUrl();
   return keyboard([
     ...(app ? [[{ text: '📱 Открыть приложение', webApp: app }]] : []),
+    // Первой строкой — то, зачем человек пришёл. Без неё меню предлагает
+    // восемь разделов и ни одного действия: новичок не понимает, что
+    // документы живут внутри карточки контрагента, и уходит.
+    [{ text: '🧾 Выписать счёт', data: 'go.sch' }],
+    [{ text: '📄 Другой документ', data: 'go.any' }],
     [{ text: '🏢 Моя организация', data: 'org' }],
-    [{ text: '👥 Контрагенты', data: 'cps' }],
+    // «Контрагенты» — слово из 1С. Кто в ней не работал, его не знает.
+    [{ text: '👥 Клиенты и поставщики', data: 'cps' }],
     [{ text: '💸 Кто должен', data: 'debts' }, { text: '⏳ Не оплачено', data: 'unpaid' }],
     // Почта — ежедневная работа, а не настройка: пока она пряталась внутри
     // реквизитов организации, её просто не находили.
@@ -91,17 +97,12 @@ function mainMenu() {
 
 const GREETING =
   '<b>Первичка</b> — счета, акты и платёжки за минуту.\n\n'
-  + 'Реквизиты вводятся один раз, дальше документ собирается в пару нажатий:\n'
-  + '• Счёт на оплату с QR — клиент платит, наведя камеру банка\n'
-  + '• Акт об оказании услуг, УПД, накладная ТОРГ-12, договор\n'
-  + '• Акт сверки в Excel и подсказка, кто сколько должен\n\n'
-  + 'Первые 5 документов в месяц — бесплатно.\n\n'
-  + 'С чего начнём?';
+  + 'Нажмите <b>«Выписать счёт»</b> — я задам пару вопросов и пришлю готовый '
+  + 'файл, который можно сразу отправить клиенту.\n\n'
+  + '<i>Ещё умею: акт, УПД, накладную, договор, акт сверки в Excel, '
+  + 'счёт с QR для оплаты камерой, отправку с вашей почты и учёт долгов. '
+  + 'Первые 5 документов в месяц — бесплатно.</i>';
 
-/**
- * Приветствие: правовая строка появляется, когда заданы адреса страниц,
- * а строка про приложение — когда оно поднято.
- */
 function greeting() {
   const legal = legalLine();
   const app = webAppUrl()
@@ -189,21 +190,85 @@ const CP_STEPS = [
   { key: 'acc', skipIfFilled: true, opt: true, q: 'Расчётный счёт контрагента (или «-»):' },
 ];
 
+/*
+ * Короткие анкеты для проводника.
+ *
+ * Полные анкеты нужны — в них есть всё, что печатается в документах. Но
+ * показывать новому человеку десять вопросов подряд нельзя: он видит «Шаг 1
+ * из 13» и закрывает бота, ещё ничего не получив. Поэтому у проводника свой
+ * набор — только то, без чего документ не выписать: как называетесь, ИНН и
+ * куда платить. Остальное дозаполняется в разделе организации, когда человек
+ * уже увидел результат и понял, зачем всё это.
+ */
+const ORG_QUICK = [
+  {
+    key: 'name',
+    q: '<b>Как называется ваша фирма или ИП?</b>\n\n'
+      + '<i>Так, как должно печататься в счёте: «ИП Иванов И. И.» или «ООО Ромашка».</i>',
+  },
+  {
+    key: 'inn', auto: 'party', opt: true,
+    q: '<b>Ваш ИНН</b> — подставлю остальные реквизиты из реестра.\n\n'
+      + '<i>Можно вставить блок реквизитов целиком или пропустить.</i>',
+  },
+  {
+    key: 'bik', auto: 'bank', skipIfFilled: true, opt: true,
+    q: '<b>БИК вашего банка</b> — по нему подставлю название банка и корр. счёт.\n\n'
+      + '<i>Он есть в реквизитах счёта в банковском приложении.</i>',
+  },
+  {
+    key: 'acc', skipIfFilled: true, opt: true,
+    q: '<b>Ваш расчётный счёт</b> — 20 цифр.\n\n'
+      + '<i>Без него в счёте не будет QR-кода, и клиенту придётся вбивать реквизиты руками.</i>',
+  },
+];
+
+const CP_QUICK = [
+  {
+    key: 'inn', auto: 'party', opt: true,
+    q: '<b>ИНН клиента</b> — подставлю название и адрес из реестра.\n\n'
+      + '<i>Можно вставить его реквизиты текстом или пропустить и написать название сами.</i>',
+  },
+  { key: 'name', skipIfFilled: true, q: '<b>Как называется клиент?</b>' },
+  {
+    key: 'kind', q: 'Он вам платит или вы ему?',
+    buttons: [{ text: 'Платит нам', val: 'customer' }, { text: 'Платим ему', val: 'supplier' }],
+  },
+];
+
 const FORMS = {
   org: { steps: ORG_STEPS, title: 'организации' },
   cp: { steps: CP_STEPS, title: 'контрагента' },
+  orgq: { steps: ORG_QUICK, title: 'организации', saveAs: 'org' },
+  cpq: { steps: CP_QUICK, title: 'клиента', saveAs: 'cp' },
 };
 
 async function startForm(tg, chatId, user, formName) {
   bdb.setState(user.id, `form:${formName}`, { i: 0, values: {} });
   await askStep(tg, chatId, formName, 0);
 }
+/**
+ * Вопрос очередного шага.
+ *
+ * Три вещи, без которых человек уходит из формы: он не знает, сколько ещё
+ * терпеть, он не знает, как пропустить лишнее (ответ «-» боту в голову не
+ * приходит), и он не знает, как выйти. Поэтому у каждого шага есть номер,
+ * кнопка «пропустить» на необязательных полях и кнопка отмены.
+ */
 async function askStep(tg, chatId, formName, i) {
-  const step = FORMS[formName].steps[i];
-  const opts = step.buttons
-    ? keyboard([step.buttons.map((b) => ({ text: b.text, data: `fb:${b.val}` }))])
-    : {};
-  await tg.sendMessage(chatId, step.q, opts);
+  const form = FORMS[formName];
+  const step = form.steps[i];
+  const rows = [];
+  if (step.buttons) rows.push(step.buttons.map((b) => ({ text: b.text, data: `fb:${b.val}` })));
+  const tail = [];
+  // Номер шага в кнопке обязателен: сообщения в чате остаются, и кнопка из
+  // прошлого вопроса живёт вечно. Без сверки нажатие на неё пропустило бы
+  // текущее поле — в том числе обязательное.
+  if (step.opt && !step.buttons) tail.push({ text: '⏭ Пропустить', data: `form.skip:${i}` });
+  tail.push({ text: '✖️ Отмена', data: 'menu' });
+  rows.push(tail);
+  const head = `<i>Шаг ${i + 1} из ${form.steps.length}</i>\n`;
+  await tg.sendMessage(chatId, head + step.q, keyboard(rows));
 }
 
 /** Следующий незаполненный шаг: пропускаем то, что подставил справочник. */
@@ -358,7 +423,11 @@ async function applyFormValue(tg, chatId, user, state, rawValue) {
   await advanceForm(tg, chatId, user, formName, values, i + 1);
 }
 
-async function finishForm(tg, chatId, user, formName, values) {
+async function finishForm(tg, chatId, user, rawForm, values) {
+  const formName = (FORMS[rawForm] || {}).saveAs || rawForm;
+  // Форму могли открыть по дороге к документу: тогда после сохранения не
+  // высаживаем человека в меню, а возвращаем к тому, что он начал.
+  const then = values.__then;
   if (formName === 'org') {
     if (!values.full_name) values.full_name = values.name;
     bdb.saveMyOrg(user.id, values); // заменяем организацию, а не плодим новые
@@ -366,11 +435,17 @@ async function finishForm(tg, chatId, user, formName, values) {
     await tg.sendMessage(chatId,
       `✅ Организация <b>${esc(values.name)}</b> сохранена.`
       + (hasBank ? '\nВ счёте будет платёжный QR.' : '\n<i>Расчётный счёт/БИК не заполнены — QR в счёте не появится.</i>'),
-      mainMenu());
+      then ? undefined : mainMenu());
+    if (then) { await startDoc(tg, chatId, user, then); return; }
   } else if (formName === 'cp') {
     if (!values.full_name) values.full_name = values.name;
     if (!values.period_end) values.period_end = todayISO();
     const id = bdb.createCp(user.id, values);
+    if (then && ITEM_DOCS[then]) {
+      await tg.sendMessage(chatId, `✅ ${esc(values.name)} добавлен.`);
+      await startItems(tg, chatId, user, then, id);
+      return;
+    }
     const { info, kb } = cpMenu(user.id, bdb.getCp(user.id, id));
     await tg.sendMessage(chatId, `✅ Контрагент добавлен.\n\n${info}`, kb);
   }
@@ -698,6 +773,7 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
   }
 
   const cp = bdb.getCp(user.id, cpId);
+  const org = bdb.getDefaultOrg(user.id);
   const q = res.quota;
   const tail = q.paid ? '' : `\n<i>Выписано в этом месяце: ${q.used} из ${q.limit} бесплатных.</i>`;
   // Проводка в журнал — вещь неочевидная, о ней надо сказать прямо,
@@ -710,11 +786,43 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
     buffer: res.file.buffer,
     caption: `${esc(res.title)} № ${esc(res.doc.number)}`
       + ` от ${ru(res.doc.date)} для <b>${esc(cp.name)}</b> на ${formatRub(res.total)}`
-      + (type === 'sch' ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.' : '')
+      + (type === 'sch' ? (payable(org)
+        ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.'
+        : '\n\n⚠️ В счёте нет реквизитов для оплаты: не заполнены банк и расчётный счёт. '
+          + 'Клиенту некуда платить — добавьте их в «Моей организации».') : '')
       + (res.file.pdf ? '' : '\n\n(PDF недоступен — откройте файл в браузере и распечатайте / сохраните в PDF.)')
       + ledger + tail,
   });
   return true;
+}
+
+/** Есть ли куда платить: без банка счёт остаётся просьбой без реквизитов. */
+const payable = (org) => Boolean(org && org.acc && org.bik && org.corr_acc);
+
+/**
+ * Экран после выданного документа.
+ *
+ * Раньше здесь открывалась карточка контрагента — двенадцать кнопок, среди
+ * которых человек ищет, что делать дальше. А дальше он хочет одного из трёх:
+ * отправить документ клиенту, выписать следующий или уйти. Плюс если платить
+ * по счёту некуда, самое полезное сейчас — дозаполнить банк.
+ */
+async function afterDoc(tg, chatId, user, cpId) {
+  const org = bdb.getDefaultOrg(user.id);
+  const last = bdb.listDocs(user.id, 1)[0];
+  const rows = [];
+  if (last) {
+    rows.push([{
+      text: mailbox.has(user.id) ? '✉️ Отправить клиенту на почту' : '✉️ Отправить почтой',
+      data: mailbox.has(user.id) ? `doc.mail:${last.id}` : 'mb',
+    }]);
+  }
+  if (!payable(org)) rows.push([{ text: '🏦 Добавить банк и счёт', data: 'org.new' }]);
+  rows.push([{ text: '🧾 Выписать ещё', data: 'go.sch' },
+    { text: '📄 Другой документ', data: 'go.any' }]);
+  rows.push([{ text: '👤 Карточка клиента', data: `cp:${cpId}` }]);
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId, '<b>Готово.</b> Что дальше?', keyboard(rows));
 }
 
 async function finishItems(tg, chatId, user, state) {
@@ -725,9 +833,7 @@ async function finishItems(tg, chatId, user, state) {
   bdb.clearState(user.id);
   const done = await issueDoc(tg, chatId, user, { type, cpId, doc, seq: d.seq, extra: d.doc || {} });
   if (!done) return;
-  const cp = bdb.getCp(user.id, cpId);
-  const { info, kb } = cpMenu(user.id, cp);
-  await tg.sendMessage(chatId, info, kb);
+  await afterDoc(tg, chatId, user, cpId);
 }
 
 /** Повтор ранее выписанного документа: те же позиции, новый номер и дата. */
@@ -1843,6 +1949,62 @@ const ru = (iso) => (iso && /^\d{4}-\d{2}-\d{2}$/.test(iso) ? `${iso.slice(8, 10
 
 // ---------- контрагенты: список и вход ----------
 
+/**
+ * Проводник «выписать документ».
+ *
+ * Главный экран продукта. Человек приходит выставить счёт, а не изучать
+ * разделы: до этой кнопки, чтобы добраться до счёта, нужно было догадаться,
+ * что документы живут внутри карточки контрагента — сначала завести
+ * организацию, потом контрагента, потом найти его в списке. Кто не работал
+ * в 1С, не догадывался и уходил.
+ *
+ * Здесь наоборот: жмём «Выписать счёт», а недостающее спрашиваем по дороге
+ * и сразу возвращаемся к начатому делу.
+ */
+async function startDoc(tg, chatId, user, type) {
+  const org = bdb.getDefaultOrg(user.id);
+  if (!org || !org.name) {
+    // Реквизиты нужны не «для порядка», а чтобы клиенту было куда платить, —
+    // так и объясняем, иначе форма выглядит бюрократией на ровном месте.
+    bdb.setState(user.id, 'form:orgq', { i: 0, values: { __then: type } });
+    await tg.sendMessage(chatId,
+      'Сначала пара слов о вас — это один раз, дальше не спрошу.\n\n'
+      + '<i>Ваше название и счёт печатаются в документе: без них клиенту некуда платить.</i>');
+    await askStep(tg, chatId, 'orgq', 0);
+    return;
+  }
+
+  const cps = bdb.listCps(user.id);
+  if (!cps.length) {
+    bdb.setState(user.id, 'form:cpq', { i: 0, values: { __then: type } });
+    await tg.sendMessage(chatId, 'Кому выставляем? Добавим первого клиента.');
+    await askStep(tg, chatId, 'cpq', 0);
+    return;
+  }
+
+  const rows = cps.slice(0, 12).map((c) => [{ text: `${c.kind === 'supplier' ? '📦' : '🧑‍💼'} ${c.name}`, data: `d.${type}:${c.id}` }]);
+  rows.push([{ text: '➕ Новый клиент', data: `cp.new.${type}` }]);
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId,
+    `<b>${esc((ITEM_DOCS[type] || {}).title || 'Документ')}</b>\nКому выписываем?`, keyboard(rows));
+}
+
+/** Выбор вида документа, когда нужен не счёт. */
+async function chooseDoc(tg, chatId, user) {
+  bdb.clearState(user.id);
+  const rows = [
+    [{ text: '🧾 Счёт на оплату', data: 'go.sch' }, { text: '📝 Счёт-договор', data: 'go.schdog' }],
+    [{ text: '🧾 Акт услуг', data: 'go.usl' }, { text: '📦 УПД', data: 'go.upd' }],
+    [{ text: '🚚 ТОРГ-12', data: 'go.torg12' }],
+    [{ text: '⬅️ Меню', data: 'menu' }],
+  ];
+  await tg.sendMessage(chatId,
+    '<b>Какой документ нужен?</b>\n\n'
+    + '<i>Счёт — попросить оплату. Акт — подтвердить, что услуга оказана. '
+    + 'УПД и ТОРГ-12 — передать товар. Счёт-договор — счёт, который заменяет договор.</i>',
+    keyboard(rows));
+}
+
 async function showCps(tg, chatId, user) {
   const cps = bdb.listCps(user.id);
   if (!cps.length) {
@@ -2296,6 +2458,32 @@ async function handleCallback(tg, cq) {
     if (data === 'org.new') { await startForm(tg, chatId, user, 'org'); return; }
     if (data === 'cps') { await showCps(tg, chatId, user); return; }
     if (data === 'cp.new') { await startForm(tg, chatId, user, 'cp'); return; }
+    // Проводник: «выписать счёт» с любого места, недостающее спросим по пути.
+    if (data === 'go.any') { await chooseDoc(tg, chatId, user); return; }
+    if (data.startsWith('go.')) { await startDoc(tg, chatId, user, data.slice(3)); return; }
+    if (data.startsWith('cp.new.')) {
+      bdb.setState(user.id, 'form:cpq', { i: 0, values: { __then: data.slice(7) } });
+      await askStep(tg, chatId, 'cpq', 0);
+      return;
+    }
+    /*
+     * «Пропустить» — то же, что прислать «-», только руками этого никто не
+     * делает. Для числа и даты «-» не годится: форма встанет и будет
+     * бесконечно повторять «нужно число». Подставляем разумное умолчание —
+     * ноль и сегодня.
+     */
+    if (data.startsWith('form.skip')) {
+      const st = bdb.getState(user.id);
+      if (!st.state.startsWith('form:')) return;
+      const at = Number(data.split(':')[1]);
+      if (Number.isFinite(at) && at !== st.data.i) return;   // кнопка из прошлого вопроса
+      const form = FORMS[st.state.slice(5)];
+      const step = form && form.steps[st.data.i];
+      if (!step || !step.opt) return;                        // обязательное не пропускаем
+      const value = step.num ? '0' : (step.date ? ru(docService.todayISO()) : '-');
+      await applyFormValue(tg, chatId, user, st, value);
+      return;
+    }
     if (data.startsWith('fb:')) {
       const state = bdb.getState(user.id);
       if (state.state.startsWith('form:')) { await applyFormValue(tg, chatId, user, state, data.slice(3)); }
