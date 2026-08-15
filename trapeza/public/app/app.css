@@ -6,6 +6,20 @@
  * в тёмной теме. Все запасные значения — на случай, если приложение открыли
  * в обычном браузере (например, при отладке), тогда работает своя пара
  * светлой и тёмной темы.
+ *
+ * Визуальный язык взят у денежных приложений — Cash App, SoFi, Wabi — и он
+ * держится на трёх вещах, а не на украшениях:
+ *
+ *   1. Сумма — самое крупное на экране. Человек открывает приложение,
+ *      чтобы узнать цифру, и должен прочитать её раньше, чем сфокусирует
+ *      взгляд. Отсюда 44 пикселя, плотный трекинг и табличные цифры.
+ *   2. Одно главное действие. Не восемь равных плиток, а одна большая
+ *      кнопка и всё остальное тише её.
+ *   3. Воздух вместо линий. Крупный радиус, мягкая тень и щедрые отступы
+ *      читаются спокойнее, чем сетка из рамок, — и не спорят с темой.
+ *
+ * Своего у нас только зелёный и красный для денег: «должны нам» и «должны
+ * мы» обязаны различаться мгновенно, а тема Telegram таких цветов не даёт.
  */
 
 :root {
@@ -19,7 +33,7 @@
 
   --bg: var(--tg-theme-bg-color, #ffffff);
   --surface: var(--tg-theme-section-bg-color, #ffffff);
-  --group: var(--tg-theme-secondary-bg-color, #f2f2f7);
+  --group: var(--tg-theme-secondary-bg-color, #f4f4f7);
   --text: var(--tg-theme-text-color, #12171c);
   --muted: var(--tg-theme-hint-color, #7d8b99);
   --link: var(--tg-theme-link-color, #2b7fd4);
@@ -27,14 +41,33 @@
   --on-primary: var(--tg-theme-button-text-color, #ffffff);
   --danger: var(--tg-theme-destructive-text-color, #d1453b);
   --section-title: var(--tg-theme-section-header-text-color, var(--tg-theme-hint-color, #7d8b99));
-  --success: #1f8b4c;
-  --border: color-mix(in srgb, var(--muted) 26%, transparent);
 
-  --r-card: 12px;
-  --r-btn: 10px;
-  --r-field: 8px;
-  --pad: 16px;
+  /* Деньги. Тема Telegram даёт только цвет действия и цвет опасности —
+     этого мало: «нам должны» и «мы должны» человек должен различать
+     боковым зрением, не читая подписи. */
+  --money-in: #0f9d58;
+  --money-out: #e5484d;
+  --success: #0f9d58;
+
+  --border: color-mix(in srgb, var(--muted) 20%, transparent);
+  --hairline: color-mix(in srgb, var(--muted) 14%, transparent);
+
+  /* Радиусы крупнее прежних: 18 у карточек и 14 у кнопок — то, что делает
+     интерфейс «мягким», не добавляя ни одной лишней детали. */
+  --r-card: 18px;
+  --r-btn: 14px;
+  --r-field: 12px;
+  --r-pill: 999px;
+
+  --pad: 18px;
+  --gap: 14px;
   --tap: 44px;              /* минимальная цель нажатия */
+
+  /* Одна шкала высоты вместо случайных теней. В тёмной теме тень не видна,
+     поэтому там глубину даёт сама подложка карточки. */
+  --shadow-1: 0 1px 2px rgba(16, 24, 40, .04), 0 1px 3px rgba(16, 24, 40, .06);
+  --shadow-2: 0 4px 12px rgba(16, 24, 40, .07), 0 2px 4px rgba(16, 24, 40, .04);
+
   --fast: 160ms;
   --slow: 220ms;
   --ease: cubic-bezier(.22,.61,.36,1);
@@ -47,7 +80,11 @@
     --group: var(--tg-theme-secondary-bg-color, #131c26);
     --text: var(--tg-theme-text-color, #f1f4f7);
     --muted: var(--tg-theme-hint-color, #8fa1b3);
-    --success: #4bbf73;
+    --money-in: #35d07f;
+    --money-out: #ff6369;
+    --success: #35d07f;
+    --shadow-1: none;
+    --shadow-2: none;
   }
 }
 
@@ -69,45 +106,54 @@ body {
 }
 
 #app {
-  padding: 8px 0 calc(72px + env(safe-area-inset-bottom));
+  padding: 8px 0 calc(96px + env(safe-area-inset-bottom));
   max-width: 720px;
   margin: 0 auto;
 }
 
 /* ---------- типографика ---------- */
 
-h1 { font: 600 22px/1.3 var(--font); margin: 4px var(--pad) 12px; }
+h1 { font: 700 26px/1.2 var(--font); letter-spacing: -.02em; margin: 6px var(--pad) 14px; }
 h2 { font: 600 17px/1.35 var(--font); margin: 0 0 2px; }
 
+/* Заголовок раздела — служебная подпись, а не элемент композиции:
+   он должен читаться, когда его ищут, и не мешать, когда не ищут. */
 .section-title {
-  font: 500 13px/1.4 var(--font);
+  font: 600 12px/1.4 var(--font);
   color: var(--section-title);
   text-transform: uppercase;
-  letter-spacing: .04em;
-  margin: 20px var(--pad) 7px;
+  letter-spacing: .06em;
+  margin: 24px var(--pad) 8px;
 }
 
 .muted { color: var(--muted); }
 .small { font-size: 14px; }
-.money { font-variant-numeric: tabular-nums; }
+/* Табличные цифры обязательны везде, где есть деньги: без них колонка сумм
+   пляшет, а «1 111» выглядит уже «11 11». */
+.money { font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
 .nowrap { white-space: nowrap; }
+/* Знак денег в списках: зелёное — нам, красное — мы. Те же два цвета, что
+   в сводке на главной, иначе пришлось бы каждый раз читать заголовок. */
+.money.in { color: var(--money-in); font-weight: 600; }
+.money.out { color: var(--money-out); font-weight: 600; }
 
 /* ---------- секции-карточки (идиома Telegram/iOS) ---------- */
 
 .card {
   background: var(--surface);
   border-radius: var(--r-card);
-  margin: 0 12px 12px;
+  margin: 0 12px var(--gap);
   overflow: hidden;
+  box-shadow: var(--shadow-1);
 }
 
 .row {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 14px;
   width: 100%;
-  min-height: var(--tap);
-  padding: 11px var(--pad);
+  min-height: 56px;
+  padding: 13px var(--pad);
   background: none;
   border: 0;
   color: inherit;
@@ -115,7 +161,9 @@ h2 { font: 600 17px/1.35 var(--font); margin: 0 0 2px; }
   text-align: left;
 }
 
-.row + .row { border-top: 1px solid var(--border); }
+/* Разделитель начинается после иконки, а не от края: так список читается
+   как один блок, а не как таблица из отдельных ячеек. */
+.row + .row { border-top: 1px solid var(--hairline); }
 button.row, a.row { cursor: pointer; }
 
 button.row:active, a.row:active, .tile:active, .btn:active {
@@ -125,61 +173,118 @@ button.row:active, a.row:active, .tile:active, .btn:active {
 
 .row .grow { flex: 1; min-width: 0; }
 .row .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Вторая строка: метка состояния и пояснение в одну линию. */
+.sub-line { display: flex; align-items: center; gap: 8px; margin-top: 3px; min-width: 0; }
+/* Дату не режем: она короткая и всегда нужна целиком. Ужимается метка —
+   её смысл понятен и по первому слову. */
+.sub-line .badge { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
 .icon { width: 22px; height: 22px; flex: none; }
 svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
 .icon-box {
-  width: 30px; height: 30px; border-radius: 8px; flex: none;
+  width: 36px; height: 36px; border-radius: 11px; flex: none;
   display: grid; place-items: center;
-  background: color-mix(in srgb, var(--primary) 14%, transparent);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
   color: var(--primary);
 }
-.icon-box.warn { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); }
-.icon-box.ok { background: color-mix(in srgb, var(--success) 16%, transparent); color: var(--success); }
-.chev { color: var(--muted); width: 18px; height: 18px; flex: none; }
+.icon-box.warn { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
+.icon-box.ok { background: color-mix(in srgb, var(--success) 14%, transparent); color: var(--success); }
+.chev { color: var(--muted); width: 18px; height: 18px; flex: none; opacity: .6; }
 
-/* ---------- шапка со сводкой ---------- */
+/* ---------- шапка: сумма крупнее всего на экране ---------- */
 
-.hero { padding: 4px var(--pad) 0; }
-.hero .greet { color: var(--muted); font-size: 14px; }
-.hero .sum { font: 600 28px/1.2 var(--font); font-variant-numeric: tabular-nums; margin-top: 2px; }
-.hero .sub { color: var(--muted); font-size: 14px; margin-top: 2px; }
+.hero { padding: 10px var(--pad) 2px; }
+.hero .greet { color: var(--muted); font-size: 15px; }
+.hero .sum {
+  font: 700 clamp(34px, 11.5vw, 46px)/1.05 var(--font);
+  letter-spacing: -.035em;
+  font-variant-numeric: tabular-nums;
+  margin: 6px 0 0;
+}
+.hero .sub { color: var(--muted); font-size: 15px; margin-top: 6px; }
 
-.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 14px 12px; }
+/* Пара «нам должны / мы должны» — один взгляд вместо двух экранов. */
+.stats { display: flex; margin: var(--gap) 12px; background: var(--surface);
+  border-radius: var(--r-card); box-shadow: var(--shadow-1); overflow: hidden; }
+.stat { flex: 1; padding: 14px var(--pad); border: 0; background: none;
+  color: inherit; font: inherit; text-align: left; cursor: pointer; min-height: 76px; }
+.stat + .stat { border-left: 1px solid var(--hairline); }
+.stat .k { font: 500 13px/1.3 var(--font); color: var(--muted); }
+.stat .v { font: 700 20px/1.25 var(--font); font-variant-numeric: tabular-nums;
+  letter-spacing: -.02em; margin-top: 5px; }
+.stat .v.in { color: var(--money-in); }
+.stat .v.out { color: var(--money-out); }
+.stat:active { transform: scale(.985); transition: transform 90ms var(--ease); }
+
+/* Плитки документов. Иконка сверху, подпись снизу — форма считывается
+   раньше текста, а четыре одинаковых листа бумаги выбрать не помогают. */
+.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: var(--gap) 12px; }
 .tile {
   background: var(--surface);
   border: 0;
   border-radius: var(--r-card);
-  padding: 14px;
-  min-height: 84px;
-  display: flex; flex-direction: column; gap: 8px;
+  box-shadow: var(--shadow-1);
+  padding: 16px;
+  min-height: 108px;
+  display: flex; flex-direction: column; gap: 10px;
   color: inherit; font: inherit; text-align: left; cursor: pointer;
 }
-.tile .t-title { font-weight: 500; }
-.tile .t-sub { color: var(--muted); font-size: 13px; }
+.tile .t-title { font-weight: 600; letter-spacing: -.01em; }
+.tile .t-sub { color: var(--muted); font-size: 13px; line-height: 1.35; }
 
 /* ---------- кнопки ---------- */
 
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 8px;
-  min-height: var(--tap);
-  padding: 0 18px;
+  min-height: 52px;
+  padding: 0 20px;
   border: 0; border-radius: var(--r-btn);
   background: var(--primary); color: var(--on-primary);
-  font: 500 16px/1 var(--font); cursor: pointer;
+  font: 600 17px/1 var(--font); letter-spacing: -.01em;
+  cursor: pointer;
   width: 100%;
+  box-shadow: var(--shadow-2);
 }
-.btn[disabled] { opacity: .55; cursor: default; }
+.btn[disabled] { opacity: .55; cursor: default; box-shadow: none; }
 /* Фон страницы — это и есть secondary_bg_color темы, поэтому серая кнопка
    на нём растворяется в обеих темах. Вторичной даём лёгкую заливку цветом
    действия: она читается как кнопка и не спорит с главной. */
 .btn.secondary {
-  background: color-mix(in srgb, var(--primary) 13%, transparent);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
   color: var(--link);
+  box-shadow: none;
 }
-.btn.ghost { background: none; color: var(--link); }
-.btn.danger { background: none; color: var(--danger); }
+.btn.ghost { background: none; color: var(--link); box-shadow: none; min-height: var(--tap); }
+.btn.danger { background: none; color: var(--danger); box-shadow: none; }
 .btn-wrap { padding: 4px 12px 12px; }
+
+/*
+ * Главное действие экрана.
+ *
+ * Ровно одно на экран и заметно крупнее всего остального: человек приходит
+ * выписать счёт, а не изучать разделы. Стрелка справа показывает, что это
+ * начало пути, а не переключатель.
+ */
+.cta {
+  display: flex; align-items: center; gap: 14px;
+  width: calc(100% - 24px);
+  margin: 2px 12px var(--gap);
+  min-height: 64px;
+  padding: 0 18px;
+  border: 0; border-radius: var(--r-card);
+  background: var(--primary); color: var(--on-primary);
+  font: inherit; text-align: left; cursor: pointer;
+  box-shadow: var(--shadow-2);
+}
+.cta:active { transform: scale(.99); transition: transform 90ms var(--ease); }
+.cta .cta-ico {
+  width: 40px; height: 40px; border-radius: 12px; flex: none;
+  display: grid; place-items: center;
+  background: color-mix(in srgb, #ffffff 20%, transparent);
+}
+.cta .cta-t { font: 600 17px/1.25 var(--font); letter-spacing: -.01em; }
+.cta .cta-s { font-size: 13px; opacity: .85; margin-top: 2px; }
+.cta .chev { color: currentColor; opacity: .7; margin-left: auto; }
 
 .spinner {
   width: 16px; height: 16px; flex: none;
@@ -191,13 +296,13 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 
 /* ---------- поля ввода ---------- */
 
-.field { padding: 10px var(--pad); }
-.field + .field { border-top: 1px solid var(--border); }
+.field { padding: 12px var(--pad); }
+.field + .field { border-top: 1px solid var(--hairline); }
 .field label {
   display: block;
   font: 500 13px/1.4 var(--font);
   color: var(--muted);
-  margin-bottom: 3px;
+  margin-bottom: 4px;
 }
 .field .req { color: var(--danger); }
 .field input, .field textarea, .field select {
@@ -208,7 +313,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   border-radius: var(--r-field);
   background: none;
   color: var(--text);
-  font: 400 16px/1.4 var(--font);   /* 16px — иначе iOS увеличивает страницу */
+  font: 500 17px/1.4 var(--font);   /* 16px и больше — иначе iOS увеличивает страницу */
 }
 .field textarea { min-height: 92px; padding: 6px 0; resize: vertical; }
 .field input:focus, .field textarea:focus { outline: none; }
@@ -247,7 +352,10 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   border: 0; background: none; color: var(--muted);
   border-radius: var(--r-btn); cursor: pointer; flex: none;
 }
-.iconbtn.danger { color: var(--danger); }
+.iconbtn.danger { color: var(--muted); }
+/* Красной корзина становится в момент нажатия: до этого она не важнее
+   названия позиции, рядом с которым стоит. */
+.iconbtn.danger:active { color: var(--danger); }
 
 .chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px var(--pad); }
 .chip {
@@ -259,10 +367,10 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 
 .total-row {
   display: flex; justify-content: space-between; align-items: baseline;
-  padding: 14px var(--pad); border-top: 1px solid var(--border);
+  padding: 16px var(--pad); border-top: 1px solid var(--hairline);
   font-weight: 600; font-size: 18px;
 }
-.total-row .money { font-size: 20px; }
+.total-row .money { font: 700 22px/1.2 var(--font); letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
 
 /* ---------- служебные состояния ---------- */
 
@@ -272,14 +380,15 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   padding: 56px 32px; color: var(--muted);
 }
 .boot { flex-direction: row; }
-.empty .icon-box { width: 46px; height: 46px; border-radius: 14px; }
-.empty .icon-box .icon { width: 26px; height: 26px; }
+.empty .icon-box { width: 56px; height: 56px; border-radius: 18px; }
+.empty .icon-box .icon { width: 30px; height: 30px; }
 .empty h2 { color: var(--text); }
 
 .skeleton {
   background: var(--surface);
   border-radius: var(--r-card);
-  margin: 0 12px 12px;
+  box-shadow: var(--shadow-1);
+  margin: 0 12px var(--gap);
   overflow: hidden;
 }
 .skeleton .line {
@@ -293,7 +402,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 
 .banner {
   display: flex; gap: 10px; align-items: flex-start;
-  margin: 0 12px 12px; padding: 12px 14px;
+  margin: 0 12px var(--gap); padding: 14px 16px;
   border-radius: var(--r-card);
   background: color-mix(in srgb, var(--danger) 12%, var(--surface));
   color: var(--text); font-size: 14px;
@@ -304,8 +413,9 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 
 .badge {
   font-size: 12px; font-weight: 500;
-  padding: 3px 8px; border-radius: 999px;
+  padding: 3px 9px; border-radius: var(--r-pill);
   background: var(--group); color: var(--muted);
+  white-space: nowrap;
 }
 .badge.ok { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success); }
 .badge.warn { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
@@ -327,7 +437,14 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   font: 500 11px/1.2 var(--font); cursor: pointer;
 }
 .tab[aria-current="page"] { color: var(--primary); }
+/* Активная вкладка помечена и цветом, и точкой: только цветом нельзя —
+   его не различают при дальтонизме и на выцветшем экране. */
+.tab[aria-current="page"]::after {
+  content: ''; width: 4px; height: 4px; border-radius: 50%;
+  background: currentColor; margin-top: 1px;
+}
 .tab .icon { width: 24px; height: 24px; }
+.tab { letter-spacing: .01em; }
 
 /* ---------- всплывающее сообщение ---------- */
 
@@ -339,6 +456,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   padding: 11px 16px;
   border-radius: var(--r-btn);
   background: #23262b; color: #fff;
+  box-shadow: 0 8px 24px rgba(0,0,0,.22);
   font-size: 14px; text-align: center;
   opacity: 0;
   transition: opacity var(--fast) var(--ease), transform var(--fast) var(--ease);

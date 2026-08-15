@@ -49,6 +49,10 @@ function icon(name, cls = 'icon') {
 
 const rub = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const money = (n) => `${rub.format(Number(n) || 0)} ₽`;
+/* В сводке копейки только мешают: там важен порядок суммы, а точность
+   до копейки нужна в документе, и там она есть. */
+const rub0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
+const money0 = (n) => `${rub0.format(Math.round(Number(n) || 0))} ₽`;
 const ru = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(iso || '')
   ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : (iso || ''));
 const todayISO = () => new Date().toISOString().slice(0, 10);
@@ -130,7 +134,7 @@ const tabsBox = document.getElementById('tabs');
 const TABS = [
   { name: 'home', label: 'Главная', icon: 'home' },
   { name: 'docs', label: 'Документы', icon: 'doc' },
-  { name: 'cps', label: 'Контрагенты', icon: 'users' },
+  { name: 'cps', label: 'Клиенты', icon: 'users' },
   { name: 'debts', label: 'Долги', icon: 'wallet' },
   { name: 'more', label: 'Ещё', icon: 'more' },
 ];
@@ -212,8 +216,10 @@ function navRow(opts) {
     opts.icon && h('span', { class: `icon-box ${opts.tone || ''}` }, icon(opts.icon)),
     h('span', { class: 'grow' },
       h('div', { class: 'ellipsis', text: opts.title }),
-      opts.sub && h('div', { class: 'small muted ellipsis', text: opts.sub })),
-    opts.right && h('span', { class: 'money nowrap', text: opts.right }),
+      (opts.sub || opts.badge) && h('div', { class: 'sub-line' },
+        opts.sub && h('span', { class: 'small muted nowrap', text: opts.sub }),
+        opts.badge && h('span', { class: `badge ${opts.badgeTone || ''}`, text: opts.badge }))),
+    opts.right && h('span', { class: `money nowrap ${opts.rightTone || ''}`, text: opts.right }),
     icon('chev', 'chev'));
 }
 
@@ -224,10 +230,41 @@ screens.home = async function home() {
   const s = cache;
   const box = h('div', {});
 
+  /*
+   * Шапка. Сумма — крупнейшее на экране, и это не украшение: человек
+   * открывает приложение, чтобы узнать цифру, а не чтобы прочитать меню.
+   */
   box.append(h('div', { class: 'hero' },
     h('div', { class: 'greet', text: s.user.name ? `Здравствуйте, ${s.user.name.split(' ')[0]}` : 'Здравствуйте' }),
-    h('div', { class: 'sum money', text: money(s.debts.owedToUs) }),
-    h('div', { class: 'sub', text: s.debts.owedToUs ? 'должны вам по журналу' : 'все рассчитались' })));
+    h('div', { class: 'sum money', text: money0(s.debts.owedToUs) }),
+    h('div', {
+      class: 'sub',
+      text: s.debts.owedToUs
+        ? `должны вам · ${s.counts.debtors} ${plural(s.counts.debtors, 'контрагент', 'контрагента', 'контрагентов')}`
+        : 'все рассчитались',
+    })));
+
+  // Одно главное действие, крупнее всего остального.
+  const cta = h('button', { class: 'cta' },
+    h('span', { class: 'cta-ico' }, icon('receipt')),
+    h('span', { class: 'grow' },
+      h('div', { class: 'cta-t', text: 'Выписать счёт' }),
+      h('div', { class: 'cta-s', text: 'с QR — клиент платит камерой банка' })),
+    icon('chev', 'chev'));
+  cta.onclick = () => { haptic('medium'); go('new', { type: 'sch' }); };
+  box.append(cta);
+
+  // Пара «должны нам / должны мы» — одна строка вместо двух экранов.
+  // В паре показываем то, чего нет в шапке: свой долг и неоплаченные счета.
+  // Повторять крупную цифру мелким шрифтом рядом с ней самой бессмысленно.
+  const unpaid = s.unpaid || { count: 0, sum: 0 };
+  box.append(h('div', { class: 'stats' },
+    h('button', { class: 'stat', onclick: () => { haptic(); go('debts'); } },
+      h('div', { class: 'k', text: 'Должны мы' }),
+      h('div', { class: `v money ${s.debts.owedByUs ? 'out' : ''}`, text: money0(s.debts.owedByUs) })),
+    h('button', { class: 'stat', onclick: () => { haptic(); go('docs'); } },
+      h('div', { class: 'k', text: 'Счета не оплачены' }),
+      h('div', { class: 'v money', text: money0(unpaid.sum) }))));
 
   if (!s.orgReady) {
     box.append(h('div', { class: 'banner' }, icon('warn'),
@@ -241,14 +278,15 @@ screens.home = async function home() {
 
   // У каждого типа своя иконка: четыре одинаковых листа бумаги не помогают
   // выбрать, а взгляд цепляется за форму раньше, чем прочтёт подпись.
+  // Счёт уехал в главное действие наверху — в плитках он был бы вторым
+  // приглашением к тому же и размывал бы выбор.
   const types = [
-    ['sch', 'receipt', 'Счёт на оплату', 'с QR для оплаты'],
-    ['schdog', 'doc-check', 'Счёт-договор', 'договор не нужен'],
     ['usl', 'doc-check', 'Акт услуг', 'закрывающий документ'],
+    ['schdog', 'pen', 'Счёт-договор', 'заменяет договор'],
     ['upd', 'docs2', 'УПД', 'счёт-фактура и акт'],
     ['torg12', 'box', 'ТОРГ-12', 'накладная на товар'],
   ];
-  box.append(h('div', { class: 'section-title', text: 'Выписать' }));
+  box.append(h('div', { class: 'section-title', text: 'Другие документы' }));
   box.append(h('div', { class: 'tiles' }, types.map(([type, ico, title, sub]) => h('button', {
     class: 'tile', onclick: () => { haptic(); go('new', { type }); },
   },
@@ -265,7 +303,7 @@ screens.home = async function home() {
       title: q.paid ? 'Подписка активна' : `Осталось ${q.left} ${plural(q.left, 'документ', 'документа', 'документов')}`,
       sub: q.paid
         ? (s.access.until ? `действует до ${ru(s.access.until)}` : 'без ограничений')
-        : `в этом месяце выписано ${q.used} из ${q.limit} бесплатных`,
+        : `${q.used} из ${q.limit} в этом месяце`,
       onclick: () => go('billing'),
     })));
 
@@ -293,11 +331,16 @@ screens.docs = async function docs() {
       h('div', { class: 'btn-wrap' }, h('button', { class: 'btn', onclick: () => go('new', { type: 'sch' }) }, 'Выписать счёт'))));
     return box;
   }
+  // Оплачен или нет — то, ради чего в журнал и заходят. Без метки строки
+  // отличаются только суммой, и статус приходится помнить в голове.
+  const paidBadge = (d) => (d.paidAt ? { badge: 'Оплачен', badgeTone: 'ok' }
+    : (['sch', 'schdog'].includes(d.type) ? { badge: 'Ждёт оплаты' } : {}));
   box.append(h('div', { class: 'card' }, list.map((d) => navRow({
     icon: 'doc',
     title: `${d.title} № ${d.number}`,
     sub: ru(d.date),
-    right: d.total ? money(d.total) : '',
+    ...paidBadge(d),
+    right: d.total ? money0(d.total) : '',
     onclick: () => go('doc', { id: d.id }),
   }))));
   return box;
@@ -718,19 +761,22 @@ screens.debts = async function debts() {
   }
   const them = debtors.filter((d) => d.theyOwe);
   const us = debtors.filter((d) => !d.theyOwe);
-  const block = (title, list) => (list.length ? [
+  // Цвет суммы тот же, что на главной: зелёная — нам, красная — мы.
+  // Одинаково окрашенные столбцы цифр заставляют читать заголовок раздела.
+  const block = (title, list, tone) => (list.length ? [
     h('div', { class: 'section-title', text: title }),
     h('div', { class: 'card' }, list.map((d) => navRow({
       icon: 'users',
       title: d.name,
       sub: d.days == null ? '' : `без движения ${d.days} ${plural(d.days, 'день', 'дня', 'дней')}`,
       right: money(d.amount),
+      rightTone: tone,
       tone: d.days > 30 ? 'warn' : '',
       onclick: () => go('cp', { id: d.cpId }),
     }))),
   ] : []);
   // append массив не разворачивает — он бы превратился в строку.
-  box.append(...block('Должны нам', them), ...block('Должны мы', us));
+  box.append(...block('Должны нам', them, 'in'), ...block('Должны мы', us, 'out'));
   return box;
 };
 

@@ -121,6 +121,7 @@ function stateFor(user) {
   const debts = bdb.debtors(user.id);
   const owedToUs = round2(debts.filter((d) => d.theyOwe).reduce((s, d) => s + d.amount, 0));
   const owedByUs = round2(debts.filter((d) => !d.theyOwe).reduce((s, d) => s + d.amount, 0));
+  const unpaidDocs = bdb.unpaidDocs(user.id);
   return {
     user: { id: user.id, tgId: user.tg_id, name: user.name },
     org: org || null,
@@ -129,6 +130,10 @@ function stateFor(user) {
     access,
     counts: { cps: bdb.listCps(user.id).length, debtors: debts.length },
     debts: { owedToUs, owedByUs },
+    unpaid: {
+      count: unpaidDocs.length,
+      sum: round2(unpaidDocs.reduce((acc, d) => acc + (Number(d.total) || 0), 0)),
+    },
     docs: bdb.listDocs(user.id, 5).map(docBrief),
     payUrl: payLink(user.tg_id),
     facsimile: fxState(user.id),
