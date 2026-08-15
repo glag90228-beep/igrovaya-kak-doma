@@ -2694,7 +2694,23 @@ async function main() {
   }
 
   const tg = new Telegram(token);
-  const me = await tg.call('getMe');
+
+  /*
+   * Кто мы. Пробуем несколько раз: у российского хостинга связь с
+   * api.telegram.org иногда моргает, и падать из-за этого при старте нельзя —
+   * systemd поднимет заново, но в журнал ляжет трассировка, а бот всё равно
+   * будет ждать сети. Лучше подождать сами и написать понятно.
+   */
+  let me = null;
+  for (let attempt = 1; attempt <= 5 && !me; attempt += 1) {
+    try {
+      me = await tg.call('getMe');                    // eslint-disable-line no-await-in-loop
+    } catch (e) {
+      if (attempt === 5) throw e;
+      console.error(`Telegram не отвечает (${e.message}), попытка ${attempt} из 5…`);
+      await new Promise((r) => setTimeout(r, attempt * 3000));   // eslint-disable-line no-await-in-loop
+    }
+  }
 
   if (process.argv.includes('--check')) {
     console.log(`Токен рабочий: @${me.username} (${me.first_name}), id ${me.id}`);
@@ -2740,12 +2756,17 @@ async function main() {
   let offset = 0;
   let conflicts = 0;
   let quietUntil = 0;
+  let netFails = 0;
+  let netQuiet = 0;
   // eslint-disable-next-line no-constant-condition
   while (true) {
     let updates = [];
     try {
       updates = await tg.getUpdates(offset, 30);
-      conflicts = 0;
+      // Связь восстановилась — молчание про сбои снимаем, чтобы следующий
+      // обрыв был виден сразу, а не через минуту.
+      if (netFails) { console.log(`Связь с Telegram восстановлена (сбоев было ${netFails}).`); }
+      conflicts = 0; netFails = 0; netQuiet = 0;
     } catch (e) {
       // 409 — тот же токен читает кто-то ещё. Сыпать в лог по строке каждые
       // три секунды бессмысленно и опасно: журнал вырастет на гигабайты и
@@ -2762,8 +2783,18 @@ async function main() {
         await new Promise((r) => setTimeout(r, 15000));
         continue;
       }
-      console.error('getUpdates:', e.message);
-      await new Promise((r) => setTimeout(r, 3000));
+      /*
+       * Обрыв связи. Та же беда, что с конфликтом: при долгом сбое строка
+       * каждые три секунды за ночь превращается в гигабайты и забивает диск,
+       * а полезного в ней ничего. Говорим раз в минуту и с числом попыток,
+       * между попытками ждём всё дольше — до полминуты.
+       */
+      netFails += 1;
+      if (Date.now() > netQuiet) {
+        console.error(`getUpdates: ${e.message} (сбоев подряд: ${netFails})`);
+        netQuiet = Date.now() + 60000;
+      }
+      await new Promise((r) => setTimeout(r, Math.min(3000 * netFails, 30000)));
       continue;
     }
     for (const u of updates) {
