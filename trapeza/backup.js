@@ -39,13 +39,21 @@ function stamp(d = new Date()) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
 }
 
+/**
+ * Список копий, свежие сверху.
+ *
+ * Поля переписываем руками, а не через «...fs.statSync(full)»: у объекта
+ * fs.Stats время это вычисляемое свойство прототипа, и при раскладывании
+ * оно теряется — остаются только size и mtimeMs. Один раз уже наступили.
+ */
 function list() {
   if (!fs.existsSync(DIR)) return [];
   return fs.readdirSync(DIR)
     .filter((f) => NAME.test(f))
     .map((f) => {
       const full = path.join(DIR, f);
-      return { name: f, full, ...fs.statSync(full) };
+      const st = fs.statSync(full);
+      return { name: f, full, size: st.size, mtimeMs: st.mtimeMs, mtime: st.mtime };
     })
     .sort((a, b) => b.mtimeMs - a.mtimeMs);
 }
@@ -103,15 +111,28 @@ async function sendToOwner(file) {
   }
 }
 
+/** Строка списка: «имя  размер  когда снята». */
+function listLine(f) {
+  const when = f.mtime instanceof Date ? f.mtime.toLocaleString('ru-RU') : '';
+  return `  ${f.name}  ${human(f.size).padStart(8)}  ${when}`;
+}
+
+function showList() {
+  const all = list();
+  if (!all.length) { console.log(`Копий нет (${DIR}).`); return; }
+  console.log(`Копии в ${DIR}:`);
+  for (const f of all) console.log(listLine(f));
+  console.log(`\nВсего: ${all.length}, места занято ${human(all.reduce((s, f) => s + f.size, 0))}`);
+}
+
 async function main() {
+  // Сообщение об ошибке должно называть то, что не получилось: «копия не
+  // снялась» при простом просмотре списка отправляет искать поломку не там.
   if (process.argv.includes('--list')) {
-    const all = list();
-    if (!all.length) { console.log(`Копий нет (${DIR}).`); return; }
-    console.log(`Копии в ${DIR}:`);
-    for (const f of all) {
-      console.log(`  ${f.name}  ${human(f.size).padStart(8)}  ${f.mtime.toLocaleString('ru-RU')}`);
+    try { showList(); } catch (e) {
+      console.error('Список копий не читается:', e.message);
+      process.exitCode = 1;
     }
-    console.log(`\nВсего: ${all.length}, места занято ${human(all.reduce((s, f) => s + f.size, 0))}`);
     return;
   }
 
@@ -133,4 +154,4 @@ if (require.main === module) {
   main().catch((e) => { console.error('Копия не снялась:', e.message); process.exit(1); });
 }
 
-module.exports = { makeBackup, prune, list, DIR };
+module.exports = { makeBackup, prune, list, listLine, DIR };

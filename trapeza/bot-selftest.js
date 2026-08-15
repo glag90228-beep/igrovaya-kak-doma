@@ -19,6 +19,11 @@ fs.mkdirSync(OUT, { recursive: true });
 // в нём поднимаем порог; отдельный блок ниже проверяет саму блокировку.
 process.env.FREE_DOCS = process.env.FREE_DOCS || '1000';
 
+// Пароли от почты хранятся зашифрованными, и без ключа блок про ящик
+// падает не по своей вине. Задаём тестовый ключ, чтобы прогон не зависел
+// от того, что оказалось в окружении запускающего.
+process.env.MAIL_KEY = process.env.MAIL_KEY || 'selftest-mail-key';
+
 const { handleUpdate, parseOp, parseItemLine } = require('./bot');
 const { htmlToPng } = require('./lib/pdf');
 
@@ -807,6 +812,17 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'схема перенеслась целиком');
 
     ok(backup.list().length === 1, 'копия видна в списке');
+
+    // Проверяем не только количество: «node backup.js --list» печатает дату,
+    // и однажды она потерялась по дороге — список падал на живом сервере,
+    // хотя сами копии снимались нормально.
+    const row = backup.list()[0];
+    ok(row.mtime instanceof Date && Number.isFinite(row.mtime.getTime()),
+      'у копии в списке есть дата', row.mtime && row.mtime.toISOString());
+    ok(row.size > 0 && Number.isFinite(row.mtimeMs), 'размер и время читаются');
+    const line = backup.listLine(row);
+    ok(line.includes(row.name) && /\d{2}\.\d{2}\.\d{4}/.test(line),
+      'строка списка печатается целиком', line.trim());
 
     // Старые копии удаляются, но последние три остаются при любой настройке:
     // если бот молчал месяц, они — единственное, что есть.
