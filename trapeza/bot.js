@@ -1472,13 +1472,18 @@ async function checkInbox(tg, chatId, user) {
     if (m.uid <= conf.lastUid) continue;
     const parsed = mime.parseMessage(m.raw);
     const docs = parsed.attachments.filter(mime.looksLikeDocument);
-    if (docs.length) found.push({ uid: m.uid, ...parsed, docs });
+    if (!docs.length) continue;
+    const kinds = [...new Set(docs
+      .map((d) => mime.documentKind(d.filename, parsed.subject))
+      .filter(Boolean))].join(', ');
+    found.push({ uid: m.uid, ...parsed, docs, kinds });
   }
 
   if (!found.length) {
     await tg.sendMessage(chatId,
       `Просмотрел ${res.messages.length} ${plural(res.messages.length, 'письмо', 'письма', 'писем')} `
-      + 'за две недели — новых счетов не нашёл.',
+      + 'за две недели — новых писем с документами не нашёл.\n\n'
+      + '<i>Смотрю вложения: счета, акты, УПД, накладные, договоры — PDF, Word, Excel и сканы.</i>',
       keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
     return;
   }
@@ -1490,8 +1495,10 @@ async function checkInbox(tg, chatId, user) {
   await tg.sendMessage(chatId,
     `Нашёл ${found.length} ${plural(found.length, 'письмо', 'письма', 'писем')} с документами:`,
     keyboard([
+      // В строке письма — вид документа, а не только тема: человек ищет
+      // глазами «где акт», и открывать каждое письмо ради этого незачем.
       ...found.map((f, i) => [{
-        text: `${f.fromName || f.from} · ${f.subject || 'без темы'}`.slice(0, 60),
+        text: `${f.kinds || '📎'} · ${f.fromName || f.from}`.slice(0, 60),
         data: `in.m:${i}`,
       }]),
       [{ text: '⬅️ Меню', data: 'menu' }],
@@ -1507,7 +1514,11 @@ async function showInboxMessage(tg, chatId, user, index) {
   const m = list[index];
   if (!m) { await tg.sendMessage(chatId, 'Письмо уже неактуально — проверьте почту заново.', mainMenu()); return; }
 
-  const files = m.docs.map((d, i) => `${i + 1}. ${esc(d.filename)} (${Math.round(d.size / 1024)} КБ)`).join('\n');
+  const files = m.docs.map((d, i) => {
+    const kind = mime.documentKind(d.filename, m.subject);
+    return `${i + 1}. ${kind ? `<b>${esc(kind)}</b> — ` : ''}${esc(d.filename)}`
+      + ` (${Math.round(d.size / 1024)} КБ)`;
+  }).join('\n');
   const cps = bdb.listCps(user.id);
   // Пытаемся угадать контрагента по адресу отправителя или по имени.
   const guess = cps.find((c) => c.email && c.email.toLowerCase() === m.from)
@@ -2419,7 +2430,7 @@ async function handleCallback(tg, cq) {
       await tg.sendMessage(chatId,
         `Внесу операцию по контрагенту. Напишите сумму и вид, например:\n`
         + `<code>${ru(todayISO())} приход 60000</code>\n\n`
-        + `<i>Счёт из письма: ${esc(m.subject || 'без темы')}</i>`);
+        + `<i>Из письма: ${esc(m.subject || 'без темы')}</i>`);
       return;
     }
     if (data === 'mb') { await showMailbox(tg, chatId, user); return; }

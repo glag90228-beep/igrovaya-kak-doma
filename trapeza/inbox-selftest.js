@@ -25,7 +25,7 @@ const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
 const PDF = Buffer.from('%PDF-1.4 счёт поставщика, 60000 руб.');
 
 /** Настоящее письмо: вложенный multipart, кириллица, вложение. */
-function letter({ subject, from, fromName, attName = 'Счет_148.pdf' }) {
+function letter({ subject, from, fromName, attName = 'Счет_148.pdf', mime: ctype = 'application/pdf' }) {
   return [
     `From: =?UTF-8?B?${b64(fromName)}?= <${from}>`,
     'To: buh@mycompany.ru',
@@ -48,7 +48,7 @@ function letter({ subject, from, fromName, attName = 'Счет_148.pdf' }) {
     '<b>hi</b>',
     '--IN--',
     '--OUT',
-    'Content-Type: application/pdf',
+    `Content-Type: ${ctype}`,
     'Content-Transfer-Encoding: base64',
     `Content-Disposition: attachment; filename*=UTF-8''${encodeURIComponent(attName)}`,
     '',
@@ -126,8 +126,13 @@ async function main() {
   ok(mime.looksLikeDocument(msg.attachments[0]), 'PDF признан документом');
   ok(!mime.looksLikeDocument({ filename: 'логотип.svg', contentType: 'image/svg+xml' })
     || true, 'картинки допускаются как возможные сканы');
-  ok(!mime.looksLikeDocument({ filename: 'договор.docx', contentType: 'application/vnd.ms-word' }),
-    'Word не предлагаем — распознать его нечем');
+  // Word и Excel берём, хотя содержимое прочитать нечем: акты присылают в
+  // них едва ли не чаще, чем в PDF, а потерять документ хуже, чем показать
+  // тот, который мы не разберём, — переслать и разнести можно и вслепую.
+  ok(mime.looksLikeDocument({ filename: 'договор.docx', contentType: 'application/vnd.ms-word' }),
+    'Word тоже документ');
+  ok(mime.looksLikeDocument({ filename: 'акт.xlsx', contentType: 'application/vnd.ms-excel' }),
+    'Excel тоже документ');
 
   console.log('\n── кодировки ──');
   const cp1251 = Buffer.from([0xd1, 0xf7, 0xe5, 0xf2, 0x20, 0xb9, 0x20, 0x31]);
@@ -145,6 +150,11 @@ async function main() {
   const letters = [
     letter({ subject: 'Счёт № 148', from: 'a@postavshik.ru', fromName: 'ООО «Поставщик»' }),
     letter({ subject: 'Счёт № 149', from: 'b@arenda.ru', fromName: 'ИП Волков', attName: 'Аренда.pdf' }),
+    // Акты присылают в Word едва ли не чаще, чем в PDF. Такие письма бот
+    // раньше пропускал молча — человек видел «ничего не нашёл».
+    letter({ subject: 'Закрывающие за август', from: 'c@uslugi.ru', fromName: 'ООО «Услуги»',
+      attName: 'Акт №14 от 31.08.docx',
+      mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }),
   ];
   const { server, log } = fakeImap(letters);
   const port = await listen(server);
@@ -152,7 +162,7 @@ async function main() {
 
   const res = await fetchNew(cfg, { limit: 10 });
   ok(res.ok, 'соединение и вход прошли', res.ok ? '' : res.error);
-  ok(res.messages.length === 2, 'получены оба письма', res.messages && res.messages.length);
+  ok(res.messages.length === 3, 'получены все письма', res.messages && res.messages.length);
   // Литерал — главная ловушка IMAP: письмо приходит по длине, а не по строкам.
   const parsed = res.messages.map((m) => mime.parseMessage(m.raw));
   ok(parsed.every((p) => p.attachments.length === 1
@@ -237,12 +247,24 @@ async function main() {
 
     // Читаем напрямую тем же кодом, что и бот: TLS на localhost нет.
     const pulled = await fetchNew({ ...conf.config, secure: false }, { unseenOnly: false, limit: 10 });
-    ok(pulled.ok && pulled.messages.length === 2, 'письма забраны', pulled.ok ? pulled.messages.length : pulled.error);
+    ok(pulled.ok && pulled.messages.length === 3, 'письма забраны', pulled.ok ? pulled.messages.length : pulled.error);
     const docs = pulled.messages
       .map((m) => mime.parseMessage(m.raw))
       .filter((m) => m.attachments.some(mime.looksLikeDocument));
-    ok(docs.length === 2, 'оба письма распознаны как письма с документами');
+    ok(docs.length === 3, 'все письма распознаны как письма с документами', docs.length);
     ok(docs[0].attachments[0].content.equals(PDF), 'вложение дошло до бота целым');
+
+    // Акт в Word — раньше такое письмо не показывалось вовсе, и человек
+    // видел «новых документов не нашёл», хотя документ пришёл.
+    const word = docs.find((d) => d.attachments.some((a) => /\.docx$/i.test(a.filename)));
+    ok(Boolean(word), 'письмо с актом в Word не потерялось');
+    ok(mime.documentKind(word.attachments[0].filename, word.subject) === 'Акт',
+      'бот понял, что это акт, а не счёт',
+      mime.documentKind(word.attachments[0].filename, word.subject));
+    ok(mime.documentKind('Счет_148.pdf') === 'Счёт', 'счёт остаётся счётом');
+    ok(mime.documentKind('Актуальный прайс.xlsx') === '', 'прайс не выдаётся за акт');
+    ok(!mime.looksLikeDocument({ filename: 'logo.png', contentType: 'image/png', size: 4000 }),
+      'логотип из подписи письма документом не считается');
 
     // Метка последнего прочитанного: второй раз те же письма не предлагаются.
     mailbox.setLastUid(user.id, 101);

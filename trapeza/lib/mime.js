@@ -221,17 +221,68 @@ function parseMessage(raw) {
 }
 
 /** Похоже ли вложение на счёт или акт — по типу и имени файла. */
+/*
+ * Что считать документом во вложении.
+ *
+ * Раньше брали только PDF и картинки: их содержимое хоть как-то поддаётся
+ * распознаванию. Но акты и счета сплошь и рядом присылают в Word и Excel, а
+ * бот про такие письма молчал — человек видел «новых документов не нашёл» и
+ * решал, что почта не работает. Потерять документ хуже, чем показать тот,
+ * содержимое которого мы не прочитаем: переслать, сохранить и разнести по
+ * контрагенту можно и вслепую.
+ *
+ * Отсекаем только явный мусор: подписи-картинки в футере писем, служебные
+ * файлы и всё, что не похоже на вложенный документ.
+ */
+const DOC_EXT = /\.(pdf|jpe?g|png|webp|heic|docx?|xlsx?|xlsm|odt|ods|rtf|csv|xml|zip|rar|7z|p7s|sig)$/;
+
 function looksLikeDocument(att) {
   const name = String(att.filename || '').toLowerCase();
   const type = String(att.contentType || '').toLowerCase();
-  if (/^image\//.test(type)) return true;
-  if (type === 'application/pdf' || /\.pdf$/.test(name)) return true;
-  if (/\.(jpe?g|png|webp|heic)$/.test(name)) return true;
-  // Excel и Word тоже присылают, но распознать их нечем — не предлагаем.
-  return false;
+  // Мелкие картинки — это логотипы и подписи в футере, а не документы.
+  if (/^image\//.test(type)) return Number(att.size) > 20000;
+  if (type === 'application/pdf' || DOC_EXT.test(name)) return true;
+  return /officedocument|msword|ms-excel|opendocument/.test(type);
+}
+
+/**
+ * Что за документ — по имени файла и теме письма.
+ *
+ * Читать содержимое для этого не нужно: отправитель почти всегда называет
+ * файл по делу. Человеку в списке важно с одного взгляда отличить счёт от
+ * акта, а не открывать каждое вложение.
+ */
+/*
+ * Границы слова здесь свои, а не \b.
+ *
+ * В JavaScript \b считает «буквой» только латиницу с цифрами, поэтому
+ * выражение \bакт\b не находит слово «Акт» никогда — кириллица для него не
+ * буква. Ошибка тихая: список просто не узнаёт русские названия. Поэтому
+ * границы задаём явно через любые буквы Unicode.
+ */
+const edge = (body) => new RegExp(`(?<![\\p{L}\\d])(?:${body})(?![\\p{L}])`, 'iu');
+
+const DOC_KINDS = [
+  [edge('сч[её]т[-\\s]*фактур(?:а|ы|у|е|ой|ам|ами)?|счф|сф'), 'Счёт-фактура'],
+  [edge('сч[её]т[-\\s]*договор(?:а|ы|у|е)?'), 'Счёт-договор'],
+  [/сверк/iu, 'Акт сверки'],
+  [edge('сч[её]т(?:а|ы|у|е|ов|ам|ами)?|schet|invoice|inv'), 'Счёт'],
+  [edge('акт(?:а|ы|у|е|ов|ам|ами)?|akt|act'), 'Акт'],
+  [edge('упд|upd'), 'УПД'],
+  [/торг[-\s]?12|накладн|\bttn\b/iu, 'Накладная'],
+  [/договор|контракт|dogovor|contract/iu, 'Договор'],
+  [/платеж|платёж|поручен|\bpp\b/iu, 'Платёжка'],
+  [/квитанц|\bчек\b/iu, 'Квитанция'],
+];
+
+function documentKind(filename, subject = '') {
+  const text = `${filename || ''} ${subject || ''}`;
+  for (const [re, title] of DOC_KINDS) if (re.test(text)) return title;
+  return '';
 }
 
 module.exports = {
   parseMessage, decodeHeader, parseHeaders, parseTyped,
   fileNameFrom, decodeBody, fromQuotedPrintable, decodeText, looksLikeDocument,
+  documentKind,
 };

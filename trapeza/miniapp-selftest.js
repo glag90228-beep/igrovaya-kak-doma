@@ -132,7 +132,7 @@ async function main() {
 
   r = await call('POST', '/api/cp', {
     user: masha,
-    body: { name: 'ООО «Заря»', inn: '1831234567', kind: 'customer', address: 'г. Ижевск, ул. Ленина, 1' },
+    body: { name: 'ООО «Заря»', inn: '1831234560', kind: 'customer', address: 'г. Ижевск, ул. Ленина, 1' },
   });
   const cpId = r.json.cp.id;
   ok(r.status === 200 && cpId > 0, 'контрагент создан', cpId);
