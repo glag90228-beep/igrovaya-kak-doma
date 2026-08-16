@@ -229,6 +229,49 @@ async function main() {
       r.json.error);
   }
 
+  console.log('\n── Excel: акт сверки и реестр ──');
+  {
+    // Обе кнопки в приложении не работали: файл собирался, но уходил в
+    // ссылку, которую Telegram скачать не даёт. Теперь он ещё и в чат.
+    sentToChat.length = 0;
+    r = await call('GET', `/api/akt?cp=${cpId}`, { user: masha });
+    ok(r.status === 200 && r.json.file && /\.xlsx$/.test(r.json.file.name),
+      'акт сверки собирается', r.status === 200 ? r.json.file.name : (r.json || {}).error);
+    ok(sentToChat.length === 1, 'акт сверки уходит в чат с ботом', sentToChat.length);
+    const aktFile = await fetch(base + r.json.file.url);
+    ok(aktFile.status === 200 && Number(aktFile.headers.get('content-length')) > 3000,
+      'файл акта скачивается и не пустой', aktFile.headers.get('content-length'));
+
+    sentToChat.length = 0;
+    r = await call('GET', '/api/registry?from=2026-01-01&to=2026-12-31', { user: masha });
+    ok(r.status === 200 && r.json.count > 0, 'реестр собирается',
+      r.status === 200 ? `${r.json.count} шт. на ${r.json.total}` : (r.json || {}).error);
+    ok(sentToChat.length === 1, 'реестр уходит в чат с ботом');
+
+    r = await call('GET', '/api/registry?from=2020-01-01&to=2020-12-31', { user: masha });
+    ok(r.status === 200 && r.json.count === 0, 'за пустой период реестр пуст, а не ошибка');
+
+    r = await call('GET', `/api/akt?cp=${cpId}`, { user: petya });
+    ok(r.status === 400, 'чужой акт сверки не собрать', (r.json || {}).error);
+  }
+
+  console.log('\n── удаление документа ──');
+  {
+    const before = (await call('GET', '/api/docs', { user: masha })).json.docs.length;
+    const victim = (await call('POST', '/api/doc', {
+      user: masha,
+      body: { type: 'sch', cpId, items: [{ name: 'На удаление', qty: 1, price: 100 }] },
+    })).json.doc;
+    r = await call('POST', '/api/doc/delete', { user: petya, body: { id: victim.id } });
+    ok(r.status === 400, 'чужой документ удалить нельзя', (r.json || {}).error);
+    r = await call('POST', '/api/doc/delete', { user: masha, body: { id: victim.id } });
+    ok(r.status === 200 && r.json.deleted, 'свой документ удаляется', (r.json || {}).error);
+    const after = (await call('GET', '/api/docs', { user: masha })).json.docs.length;
+    ok(after === before, 'журнал вернулся к прежней длине', `${before} → ${after}`);
+    r = await call('POST', '/api/doc/delete', { user: masha, body: { id: victim.id } });
+    ok(r.status === 400, 'повторное удаление отвечает понятно', (r.json || {}).error);
+  }
+
   console.log('\n── журнал и копии ──');
   r = await call('GET', '/api/docs', { user: masha });
   const docs = r.json.docs;
@@ -403,6 +446,14 @@ async function main() {
 
     r = await call('POST', '/api/doc/mail', { user: petya, body: { id: someDoc.id, email: 'a@b.ru' } });
     ok(r.status === 400, 'чужой документ по почте не отправить', (r.json || {}).error);
+
+    // Отдельная кнопка «отправить проверочное письмо» — её добавили позже
+    // экрана почты, и она никем не проверялась.
+    got.rcpt.length = 0;
+    r = await call('POST', '/api/mailbox/test', { user: masha });
+    ok(r.status === 200 && r.json.sent === 'buh@mycompany.ru',
+      'проверочное письмо уходит по кнопке', r.status === 200 ? r.json.sent : (r.json || {}).error);
+    ok(got.rcpt.includes('buh@mycompany.ru'), 'и приходит на свой же адрес', got.rcpt.join());
 
     r = await call('POST', '/api/mailbox/delete', { user: masha });
     ok(r.status === 200, 'ящик можно отключить');

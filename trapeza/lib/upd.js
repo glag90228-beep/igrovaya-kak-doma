@@ -33,20 +33,20 @@ const okei = (unit) => OKEI[String(unit || '').toLowerCase().trim()] || '';
 const LAND = `
   @page { size: A4 landscape; margin: 8mm; }
   .upd-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
-  .upd-status { border: 2px solid #7a5230; padding: 6px 10px; text-align: center; min-width: 174px; }
-  .upd-status b { display: block; font-size: 15px; color: #7a5230; }
+  .upd-status { border: 2px solid #2e3a8c; padding: 6px 10px; text-align: center; min-width: 174px; }
+  .upd-status b { display: block; font-size: 15px; color: #2e3a8c; }
   .upd-status .small { line-height: 1.25; }
-  .sf td { border: 1px solid #cbb9a5; padding: 4px 6px; vertical-align: top; font-size: 10.5px; }
-  .sf .k { background: #faf6f1; width: 22%; }
-  .sf .n { color: #8a7563; font-size: 9px; }
+  .sf td { border: 1px solid #c3c9dc; padding: 4px 6px; vertical-align: top; font-size: 10.5px; }
+  .sf .k { background: #f4f6fc; width: 22%; }
+  .sf .n { color: #6b7285; font-size: 9px; }
   .items.upd th, .items.upd td { padding: 3px 4px; font-size: 9.5px; }
   .items.upd th { line-height: 1.15; }
-  .items.upd .gr { background: #6a4726; font-size: 8.5px; font-weight: normal; }
+  .items.upd .gr { background: #2e3a8c; font-size: 8.5px; font-weight: normal; }
   .transfer { display: flex; gap: 18px; margin-top: 10px; }
-  .transfer > div { flex: 1; border: 1px solid #cbb9a5; padding: 7px 9px; }
-  .transfer h3 { margin: 0 0 5px; font-size: 11.5px; color: #5e3f27; }
+  .transfer > div { flex: 1; border: 1px solid #c3c9dc; padding: 7px 9px; }
+  .transfer h3 { margin: 0 0 5px; font-size: 11.5px; color: #1f2760; }
   .transfer .fld { margin: 5px 0; font-size: 10px; }
-  .transfer .fld i { color: #8a7563; font-style: normal; }
+  .transfer .fld i { color: #6b7285; font-style: normal; }
   .transfer .ln { border-bottom: 1px solid #333; display: inline-block; min-width: 150px; }
   .sfsign { display: flex; gap: 26px; margin-top: 10px; }
   .sfsign > div { flex: 1; font-size: 10.5px; }

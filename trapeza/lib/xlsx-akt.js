@@ -7,10 +7,10 @@
 const ExcelJS = require('exceljs');
 const { formatRub, amountInWords, round2 } = require('./money');
 
-const BROWN = 'FF7A5230';
-const DARK = 'FF5E3F27';
-const CREAM = 'FFFAF6F1';
-const SAND = 'FFEFE3D2';
+const BROWN = 'FF2E3A8C';
+const DARK = 'FF1F2760';
+const CREAM = 'FFF4F6FC';
+const SAND = 'FFE3E8F8';
 const MONEY_FMT = '#,##0.00';
 
 /** ISO yyyy-mm-dd → dd.mm.yyyy */
@@ -31,10 +31,10 @@ function fill(cell, argb) {
 }
 function box(cell) {
   cell.border = {
-    top: { style: 'thin', color: { argb: 'FFBBAB99' } },
-    left: { style: 'thin', color: { argb: 'FFBBAB99' } },
-    bottom: { style: 'thin', color: { argb: 'FFBBAB99' } },
-    right: { style: 'thin', color: { argb: 'FFBBAB99' } },
+    top: { style: 'thin', color: { argb: 'FFC3C9DC' } },
+    left: { style: 'thin', color: { argb: 'FFC3C9DC' } },
+    bottom: { style: 'thin', color: { argb: 'FFC3C9DC' } },
+    right: { style: 'thin', color: { argb: 'FFC3C9DC' } },
   };
 }
 
@@ -198,7 +198,7 @@ async function buildAkt({ org, cp, ops }) {
       + 'уменьшают долг. Сальдо = сколько мы должны поставщику = нач. + Кредит − Дебет.'
     : `«Кредит» — услуги, которые мы (${orgShort}) оказали контрагенту. «Дебет» — оплаты, `
       + 'полученные от контрагента. Сальдо в нашу пользу = нач. + Кредит − Дебет.';
-  j.getCell(`A${noteRow}`).font = { italic: true, size: 9, color: { argb: 'FF6B5B4B' } };
+  j.getCell(`A${noteRow}`).font = { italic: true, size: 9, color: { argb: 'FF5A6172' } };
   j.getCell(`A${noteRow}`).alignment = { wrapText: true };
   j.getColumn(9).hidden = true;
 

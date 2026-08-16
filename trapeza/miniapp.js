@@ -491,6 +491,10 @@ const api = {
       buffer: Buffer.from(buf),
       mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     };
+    // В чат — обязательно: внутри Telegram скачивание по ссылке блокируется,
+    // и файл в переписке остаётся единственным надёжным способом его забрать.
+    await sendFileToChat(user, file,
+      `Акт сверки с <b>${cp.name}</b> за период ${ruDate(cp.opening_date)}—${ruDate(cp.period_end)}.`);
     return { file: { url: `/api/file/${keepFile(user.id, file)}`, name: file.filename } };
   },
 
@@ -510,6 +514,8 @@ const api = {
       buffer: Buffer.from(buf),
       mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     };
+    await sendFileToChat(user, file,
+      `Реестр документов за ${ruDate(from)}—${ruDate(to)}: ${docs.length} шт.`);
     return {
       count: docs.length,
       total: round2(docs.reduce((a, d) => a + (Number(d.total) || 0), 0)),
@@ -628,6 +634,20 @@ const api = {
     return { fields: f, cp: guess ? { id: guess.id, name: guess.name } : null };
   },
 
+  /**
+   * Удаление документа из журнала.
+   *
+   * Вместе с ним уходят его проводки: иначе долг остаётся висеть у
+   * контрагента, а отменить его больше неоткуда — карточки-то нет.
+   */
+  async 'POST /api/doc/delete'({ user, body }) {
+    const id = Number(body.id);
+    const d = bdb.getDoc(user.id, id);
+    if (!d) return { error: 'Документ не найден.' };
+    bdb.deleteDoc(user.id, id);
+    return { deleted: true, title: `${d.title} № ${d.number}` };
+  },
+
   /** Из чего возникает долг: по акту, по счёту или вручную. */
   async 'POST /api/basis'({ user, body }) {
     const basis = str(body.basis, 10);
@@ -652,6 +672,9 @@ const api = {
       host: str(body.host, 200),
       port: Number(body.port) || 0,
       secure: body.secure == null ? null : Boolean(body.secure),
+      // Для своего домена сервер входящей почты знает только клиент.
+      // У известных сервисов подставится из готовых настроек.
+      imapHost: str(body.imapHost, 200),
     });
     if (!saved.ok) return { error: saved.error };
 
@@ -670,7 +693,9 @@ const api = {
       };
     }
     mailbox.markChecked(user.id);
-    return { mailbox: mailbox.info(user.id) };
+    // Возвращаем адрес: экран говорит «письмо ушло на …», и это должно быть
+    // правдой, а не общей фразой «почта подключена».
+    return { sent: email, mailbox: mailbox.info(user.id) };
   },
 
   async 'POST /api/mailbox/delete'({ user }) {
@@ -745,6 +770,16 @@ function keepFile(userId, file) {
   files.set(token, { userId, file, until: Date.now() + 5 * 60 * 1000 });
   for (const [k, v] of files) if (v.until < Date.now()) files.delete(k);
   return token;
+}
+
+/** Любой файл — в чат с ботом. Там он останется и его удобно переслать. */
+async function sendFileToChat(user, file, caption) {
+  if (!tg) return;
+  try {
+    await tg.sendDocument(user.tg_id, { filename: file.filename, buffer: file.buffer, caption });
+  } catch (e) {
+    if (e && e.blocked) bdb.markBlocked(user.id);
+  }
 }
 
 async function sendToChat(user, res) {

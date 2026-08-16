@@ -41,7 +41,7 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>]/g, (c) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
 const CSS = `
-  :root { --ink:#241F1A; --muted:#6b5b4b; --accent:#8A6038; --line:#e3d8c9; --bg:#FBF7F1; }
+  :root { --ink:#14171F; --muted:#5A6172; --accent:#2E3A8C; --line:#DDE1EE; --bg:#FBFBFD; }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--ink);
          font:16px/1.6 -apple-system,Segoe UI,Roboto,Arial,sans-serif; }

@@ -13,7 +13,7 @@
 const { esc, ru, page, formatMoney, amountInWords } = require('./doc-html');
 
 const CSS = `
-  .dg h2 { font-size: 13px; color: #5e3f27; margin: 14px 0 5px; }
+  .dg h2 { font-size: 13px; color: #1f2760; margin: 14px 0 5px; }
   .dg p { margin: 5px 0; text-align: justify; }
   .dg ol { margin: 4px 0 4px 18px; padding: 0; }
   .dg li { margin: 3px 0; text-align: justify; }

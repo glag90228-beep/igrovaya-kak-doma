@@ -27,9 +27,9 @@ const { payQrSvg } = require('./qr-pay');
 
 const EXTRA_CSS = `
   .terms { margin-top: 12px; font-size: 10.5px; line-height: 1.45; }
-  .terms h2 { font-size: 12px; color: #5e3f27; margin: 10px 0 3px; }
+  .terms h2 { font-size: 12px; color: #1f2760; margin: 10px 0 3px; }
   .terms p { margin: 3px 0; }
-  .accept { border: 1.5px solid #7a5230; background: #faf6f1; border-radius: 4px;
+  .accept { border: 1.5px solid #2e3a8c; background: #f4f6fc; border-radius: 4px;
             padding: 8px 10px; margin: 10px 0 4px; font-size: 11px; }
 `;
 

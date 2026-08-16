@@ -16,8 +16,8 @@ const LAND = `
   @page { size: A4 landscape; }
   .t12 th, .t12 td { padding: 4px 5px; font-size: 10.5px; }
   .t12 .nm { min-width: 190px; }
-  .who td { border: 1px solid #cbb9a5; padding: 5px 7px; vertical-align: top; }
-  .who .k { background: #faf6f1; font-weight: bold; width: 22%; }
+  .who td { border: 1px solid #c3c9dc; padding: 5px 7px; vertical-align: top; }
+  .who .k { background: #f4f6fc; font-weight: bold; width: 22%; }
   .foot { display: flex; gap: 22px; margin-top: 14px; }
   .foot > div { flex: 1; }
   .foot .row { margin-bottom: 14px; }

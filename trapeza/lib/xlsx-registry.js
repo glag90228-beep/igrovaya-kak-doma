@@ -17,9 +17,9 @@
 const ExcelJS = require('exceljs');
 const { round2, vatTotals } = require('./money');
 
-const BROWN = 'FF7A5230';
-const CREAM = 'FFFAF6F1';
-const SAND = 'FFEFE3D2';
+const BROWN = 'FF2E3A8C';
+const CREAM = 'FFF4F6FC';
+const SAND = 'FFE3E8F8';
 const MONEY = '#,##0.00';
 
 const ru = (iso) => {
@@ -29,10 +29,10 @@ const ru = (iso) => {
 
 function box(cell) {
   cell.border = {
-    top: { style: 'thin', color: { argb: 'FFBBAB99' } },
-    left: { style: 'thin', color: { argb: 'FFBBAB99' } },
-    bottom: { style: 'thin', color: { argb: 'FFBBAB99' } },
-    right: { style: 'thin', color: { argb: 'FFBBAB99' } },
+    top: { style: 'thin', color: { argb: 'FFC3C9DC' } },
+    left: { style: 'thin', color: { argb: 'FFC3C9DC' } },
+    bottom: { style: 'thin', color: { argb: 'FFC3C9DC' } },
+    right: { style: 'thin', color: { argb: 'FFC3C9DC' } },
   };
 }
 
@@ -67,7 +67,7 @@ async function buildRegistry({ org, docs, from, to }) {
   s.mergeCells('A1:I1');
   const title = s.getCell('A1');
   title.value = `Реестр документов за период ${ru(from)} — ${ru(to)}`;
-  title.font = { bold: true, size: 14, color: { argb: 'FF5E3F27' } };
+  title.font = { bold: true, size: 14, color: { argb: 'FF1F2760' } };
 
   s.mergeCells('A2:I2');
   s.getCell('A2').value = org.full_name || org.name || '';
@@ -75,7 +75,7 @@ async function buildRegistry({ org, docs, from, to }) {
 
   s.mergeCells('A3:I3');
   s.getCell('A3').value = `Всего документов: ${docs.length}`;
-  s.getCell('A3').font = { size: 10, color: { argb: 'FF6B5B4B' } };
+  s.getCell('A3').font = { size: 10, color: { argb: 'FF5A6172' } };
 
   const HEAD = ['Дата', 'Документ', 'Номер', 'Контрагент',
     'Без НДС', 'НДС', 'Всего', 'Оплата', 'Дата оплаты'];
@@ -131,7 +131,7 @@ async function buildRegistry({ org, docs, from, to }) {
     s.mergeCells(`A6:I6`);
     s.getCell('A6').value = 'За этот период документов нет';
     s.getCell('A6').alignment = { horizontal: 'center' };
-    s.getCell('A6').font = { italic: true, color: { argb: 'FF6B5B4B' } };
+    s.getCell('A6').font = { italic: true, color: { argb: 'FF5A6172' } };
     r = 7;
   }
 

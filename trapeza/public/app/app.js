@@ -341,6 +341,9 @@ screens.docs = async function docs({ cp } = {}) {
   // отличаются только суммой, и статус приходится помнить в голове.
   const paidBadge = (d) => (d.paidAt ? { badge: 'Оплачен', badgeTone: 'ok' }
     : (['sch', 'schdog'].includes(d.type) ? { badge: 'Ждёт оплаты' } : {}));
+  box.append(h('div', { class: 'btn-wrap' },
+    h('button', { class: 'btn', onclick: () => { haptic('medium'); go('new', { type: 'sch' }); } },
+      'Выписать документ')));
   box.append(h('div', { class: 'card' }, list.map((d) => navRow({
     icon: 'doc',
     title: `${d.title} № ${d.number}`,
@@ -447,6 +450,29 @@ screens.doc = async function docScreen({ id }) {
         onclick: () => go('new', { type: d.type, cpId: d.cpId, items: d.items }),
       }, 'Повторить новым номером')));
   }
+
+  /*
+   * Удаление — с подтверждением в две ступени, без модального окна.
+   * Документ уходит вместе со своей проводкой, и вернуть его нельзя:
+   * спрашиваем прямо, а не прячем предупреждение мелким шрифтом.
+   */
+  const del = h('button', { class: 'btn danger' }, 'Удалить документ');
+  del.onclick = () => {
+    const sure = h('button', { class: 'btn danger' }, 'Да, удалить безвозвратно');
+    sure.onclick = () => withBusy(sure, async () => {
+      await api('POST', '/api/doc/delete', { id: d.id });
+      haptic('medium');
+      toast('Документ удалён');
+      reset('docs');
+    });
+    del.replaceWith(h('div', {},
+      h('p', { class: 'small muted', style: 'margin:0 6px 10px',
+        text: d.total
+          ? 'Документ исчезнет из журнала вместе со своей проводкой — долг по нему тоже снимется.'
+          : 'Документ исчезнет из журнала.' }),
+      sure));
+  };
+  box.append(h('div', { class: 'btn-wrap' }, del));
   return box;
 };
 
@@ -1014,6 +1040,8 @@ screens['mail.new'] = async function mailNew() {
     hint: 'У Яндекса и Mail.ru нужен пароль приложения, а не обычный от почты' });
   const host = field('host', 'Сервер SMTP', '', { placeholder: 'smtp.вашдомен.ру',
     hint: 'Только для своего домена — у известных сервисов подставлю сам' });
+  const imap = field('imapHost', 'Сервер IMAP', '', { placeholder: 'imap.вашдомен.ру',
+    hint: 'Нужен, чтобы читать входящие. Можно оставить пустым' });
   const fromName = field('fromName', 'Имя отправителя', '', { placeholder: 'ООО «Ромашка»' });
 
   // Ссылка на страницу пароля появляется, как только понятен сервис:
@@ -1038,11 +1066,13 @@ screens['mail.new'] = async function mailNew() {
   email.input.addEventListener('input', () => {
     const p = guess(email.input.value);
     host.style.display = p === 'custom' ? '' : 'none';
+    imap.style.display = p === 'custom' ? '' : 'none';
     if (PASS_URL[p]) { link.href = PASS_URL[p]; linkBox.style.display = ''; } else { linkBox.style.display = 'none'; }
   });
   host.style.display = 'none';
+  imap.style.display = 'none';
 
-  box.append(h('div', { class: 'card' }, email, pass, host, fromName));
+  box.append(h('div', { class: 'card' }, email, pass, host, imap, fromName));
   box.append(linkBox);
   box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
     text: 'Пароль хранится в зашифрованном виде и нигде не показывается. '
@@ -1053,12 +1083,25 @@ screens['mail.new'] = async function mailNew() {
     clearErrors({ email, pass });
     if (!email.input.value.trim()) { showError(email, 'Без адреса не обойтись'); return; }
     if (!pass.input.value) { showError(pass, 'Нужен пароль'); return; }
-    const r = await api('POST', '/api/mailbox', {
-      email: email.input.value.trim(),
-      pass: pass.input.value,
-      host: host.input.value.trim(),
-      fromName: fromName.input.value.trim(),
-    });
+    let r;
+    try {
+      r = await api('POST', '/api/mailbox', {
+        email: email.input.value.trim(),
+        pass: pass.input.value,
+        host: host.input.value.trim(),
+        imapHost: imap.input.value.trim(),
+        fromName: fromName.input.value.trim(),
+      });
+    } catch (e) {
+      // Ящик сохранён, но письмо не ушло — почти всегда это пароль.
+      // Показываем ошибку у поля пароля, а не общим красным всплытием:
+      // так видно, что исправлять.
+      if (e.payload && e.payload.saved) {
+        showError(pass, e.message);
+        return;
+      }
+      throw e;
+    }
     haptic('medium');
     toast(r.sent ? `Письмо ушло на ${r.sent} — проверьте ящик` : 'Почта подключена');
     reset('mail');
@@ -1555,9 +1598,24 @@ screens.billing = async function billing() {
 // ---------- выписка документа ----------
 
 /** Скачивание готового файла: ссылка одноразовая, живёт пять минут. */
+/*
+ * Отдать файл человеку.
+ *
+ * Обычная ссылка с download внутри Telegram не работает: встроенный браузер
+ * блокирует скачивания, которые страница начинает сама. Нажатие выглядело
+ * как «кнопка не работает» — так и было с реестром и актом сверки.
+ *
+ * Поэтому по порядку: родное окно загрузки Telegram, если оно есть; иначе
+ * открыть ссылку во внешнем браузере; и только в обычном вебе — ссылка.
+ */
 function download(file) {
   if (!file || !file.url) return;
-  const a = h('a', { href: file.url, download: file.name });
+  const url = file.url.startsWith('http') ? file.url : window.location.origin + file.url;
+  if (tg && typeof tg.downloadFile === 'function') {
+    try { tg.downloadFile({ url, file_name: file.name }); return; } catch (_) { /* ниже */ }
+  }
+  if (tg && typeof tg.openLink === 'function') { tg.openLink(url); return; }
+  const a = h('a', { href: url, download: file.name });
   document.body.append(a);
   a.click();
   a.remove();
