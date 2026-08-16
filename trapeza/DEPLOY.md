@@ -133,6 +133,8 @@ bash deploy/install.sh          # второй запуск доводит до 
 ```bash
 node bot.js --check          # токен рабочий? не занят ли вебхуком?
 node bot.js --drop-webhook   # снять чужой вебхук, если long polling занят
+# .env читают только службы — при запуске руками загружаем его сами
+set -a && . ./.env && set +a
 node bot.js --setup          # имя, описания, команды, кнопка меню
 ```
 

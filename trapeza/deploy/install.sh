@@ -117,7 +117,8 @@ say "6/6 Проверка токена и оформление бота"
 timeout 60 sudo -u trapeza --preserve-env node bot.js --check || \
   echo "⚠️  Не достучался до Telegram — бот уже перезапущен, проверьте лог."
 timeout 120 sudo -u trapeza --preserve-env node bot.js --setup || \
-  echo "⚠️  Оформление не применилось (сеть или ограничение частоты) — повторите позже: node bot.js --setup"
+  echo "⚠️  Оформление не применилось (сеть или ограничение частоты). Повторить:"
+  echo "     cd /opt/trapeza && set -a && . ./.env && set +a && node bot.js --setup"
 
 say "Готово"
 for u in trapeza-bot trapeza-lava trapeza-miniapp trapeza-backup.timer; do
@@ -131,7 +132,8 @@ cat <<'TXT'
   • аватар — @BotFather → /setuserpic
   • HTTPS одной командой:  bash deploy/https.sh ваш-домен вашапочта@mail.ru
     после него «/» отдаёт мини-приложение, «/lava» — вебхуки оплат
-  • адрес приложения впишите в WEBAPP_URL и повторите  node bot.js --setup
+  • адрес приложения впишите в WEBAPP_URL и повторите оформление:
+    cd /opt/trapeza && set -a && . ./.env && set +a && node bot.js --setup
   • резервные копии:  node backup.js --list   (лежат в /var/backups/trapeza)
     восстановление:   systemctl stop trapeza-bot trapeza-miniapp
                       gunzip -c /var/backups/trapeza/ИМЯ.db.gz > /opt/trapeza/data/trapeza.db

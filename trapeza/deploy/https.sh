@@ -99,6 +99,9 @@ echo ""
 echo "Осталось вписать адрес приложения в .env и перезапустить бота:"
 echo "  sed -i 's|^WEBAPP_URL=.*|WEBAPP_URL=https://$DOMAIN|' /opt/trapeza/.env"
 echo "  systemctl restart trapeza-miniapp trapeza-bot"
-echo "  cd /opt/trapeza && sudo -u trapeza --preserve-env node bot.js --setup"
+# Настройки читают только службы через EnvironmentFile: при запуске руками
+# .env надо загрузить самому, иначе команда ответит «Не задан BOT_TOKEN»
+# и человек решит, что токен потерялся.
+echo "  cd /opt/trapeza && set -a && . ./.env && set +a && node bot.js --setup"
 echo ""
 echo "Сертификат продлевается сам (systemctl status certbot.timer)."
