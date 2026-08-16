@@ -30,8 +30,19 @@ id -u trapeza >/dev/null 2>&1 || useradd --system --home "$APP" --shell /usr/sbi
 mkdir -p "$APP" "$APP/data" "$LOGS"
 
 say "3/6 Файлы"
-# data не трогаем: там боевая база
-rsync -a --exclude node_modules --exclude data --exclude .env "$SRC"/ "$APP"/
+command -v rsync >/dev/null 2>&1 || apt-get install -y rsync
+
+# --delete нужен, чтобы папка на сервере в точности совпадала с репозиторием.
+# Без него удалённые и посторонние файлы остаются навсегда: именно так на
+# сервере оказался чужой код, которого нет в git, и понять по папке, что
+# именно работает, стало нельзя.
+#
+# data, node_modules и .env защищены дважды. Исключение из передачи по правилам
+# rsync и так спасает файл от удаления, но цена ошибки здесь — боевая база
+# с данными клиентов, поэтому то же самое сказано ещё и явным protect.
+rsync -a --delete \
+  --filter='protect data' --filter='protect node_modules' --filter='protect .env' \
+  --exclude node_modules --exclude data --exclude .env "$SRC"/ "$APP"/
 cd "$APP"
 
 if [ ! -f .env ]; then
