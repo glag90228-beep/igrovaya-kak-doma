@@ -179,6 +179,13 @@ async function main() {
     if (lastDoc) SHOTS.push({ name: 'kartochka-dokumenta', title: 'Карточка документа', go: ['doc', { id: lastDoc.id }] });
     if (firstCp) SHOTS.push({ name: 'kartochka-klienta', title: 'Карточка клиента', go: ['cp', { id: firstCp.id }] });
     SHOTS.push({ name: 'eshchyo', title: 'Ещё', go: ['more', {}] });
+    SHOTS.push({ name: 'pochta', title: 'Почта', go: ['mail', {}] });
+    SHOTS.push({ name: 'pochta-nastroyka', title: 'Подключить почту', go: ['mail.new', {}] });
+    SHOTS.push({ name: 'nds', title: 'НДС', go: ['vat', {}] });
+    SHOTS.push({ name: 'osnovanie-dolga', title: 'Откуда долг', go: ['basis', {}] });
+    SHOTS.push({ name: 'zhdut-oplaty', title: 'Ждут оплаты', go: ['unpaid', {}] });
+    SHOTS.push({ name: 'reestr', title: 'Реестр', go: ['registry', {}] });
+    if (firstCp) SHOTS.push({ name: 'operaciya', title: 'Операция', go: ['op', { cpId: firstCp.id }] });
   }
   setTelegram({ async sendDocument() { return {}; } });
   await new Promise((r) => server.listen(0, r));

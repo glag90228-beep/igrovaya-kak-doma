@@ -322,8 +322,10 @@ screens.home = async function home() {
   return box;
 };
 
-screens.docs = async function docs() {
-  const { docs: list } = await api('GET', '/api/docs');
+screens.docs = async function docs({ cp } = {}) {
+  // Сервер умеет отдавать журнал по одному клиенту — в приложении этим
+  // никто не пользовался, хотя из его карточки это первое, что нужно.
+  const { docs: list } = await api('GET', `/api/docs${cp ? `?cp=${cp}` : ''}`);
   const box = h('div', {}, h('h1', { text: 'Документы' }));
   if (!list.length) {
     box.append(empty('doc', 'Журнал пуст',
@@ -548,10 +550,38 @@ screens.cp = async function cpScreen({ id }) {
     }),
   }, 'Заполнить по ИНН и БИК');
 
-  const box = h('div', {}, h('h1', { text: id ? 'Контрагент' : 'Новый контрагент' }));
+  const box = h('div', {}, h('h1', { text: id ? cp.name || 'Клиент' : 'Новый клиент' }));
+
+  /*
+   * Действия по клиенту — сверху, перед полями. В карточку заходят, чтобы
+   * выписать счёт, внести оплату или собрать акт сверки, а реквизиты правят
+   * раз в жизни. Раньше здесь были только поля, и всё это жило в боте.
+   */
+  if (id) {
+    box.append(h('div', { class: 'card' },
+      h('div', { class: 'row' },
+        h('span', { class: 'grow muted', text: 'Сальдо' }),
+        h('span', {
+          class: `money ${cp.balance > 0 ? 'in' : (cp.balance < 0 ? 'out' : '')}`,
+          text: money(Math.abs(cp.balance || 0)),
+        })),
+      navRow({ icon: 'receipt', title: 'Выписать счёт', onclick: () => go('new', { type: 'sch', cpId: id }) }),
+      navRow({ icon: 'wallet', title: 'Внести оплату или приход', onclick: () => go('op', { cpId: id }) }),
+      navRow({ icon: 'doc', title: 'Акт сверки', sub: 'таблица операций в Excel',
+        onclick: async () => {
+          try {
+            const r = await api('GET', `/api/akt?cp=${id}`);
+            toast('Акт сверки готов');
+            download(r.file);
+          } catch (e) { toast(e.message, true); }
+        } }),
+      navRow({ icon: 'docs2', title: 'Документы клиента', onclick: () => go('docs', { cp: id }) })));
+    box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
+  }
+
   box.append(h('div', { class: 'card' }, f.name, f.full_name,
     h('div', { class: 'field' }, h('label', { for: 'f-kind', text: 'Кто это' }), kindSel)));
-  box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
+  if (!id) box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
   box.append(h('div', { class: 'card' }, f.inn, f.kpp, f.address, f.email));
   box.append(h('div', { class: 'btn-wrap' }, lookup));
   box.append(h('div', { class: 'section-title', text: 'Банк' }));
@@ -825,6 +855,45 @@ screens.more = async function more() {
       sub: s.quota.paid ? `до ${ru(s.access.until)}` : `${s.quota.left} из ${s.quota.limit} бесплатных`,
       onclick: () => go('billing'),
     })));
+  box.append(h('div', { class: 'section-title', text: 'Работа' }));
+  box.append(h('div', { class: 'card' },
+    navRow({
+      icon: 'mail',
+      tone: s.mailbox ? 'ok' : '',
+      title: 'Почта',
+      sub: s.mailbox ? s.mailbox.from : 'ящик не подключён',
+      onclick: () => go('mail'),
+    }),
+    navRow({
+      icon: 'clock',
+      title: 'Ждут оплаты',
+      sub: s.unpaid && s.unpaid.count
+        ? `${s.unpaid.count} ${plural(s.unpaid.count, 'счёт', 'счёта', 'счетов')} на ${money0(s.unpaid.sum)}`
+        : 'всё оплачено',
+      onclick: () => go('unpaid'),
+    }),
+    navRow({
+      icon: 'docs2',
+      title: 'Реестр документов',
+      sub: 'выгрузка за период в Excel',
+      onclick: () => go('registry'),
+    })));
+
+  box.append(h('div', { class: 'section-title', text: 'Настройки учёта' }));
+  box.append(h('div', { class: 'card' },
+    navRow({
+      icon: 'receipt',
+      title: 'НДС',
+      sub: vatLabel(s.org),
+      onclick: () => go('vat'),
+    }),
+    navRow({
+      icon: 'wallet',
+      title: 'Откуда берётся долг',
+      sub: BASIS_LABEL[s.debtBasis] || '',
+      onclick: () => go('basis'),
+    })));
+
   box.append(h('div', { class: 'section-title', text: 'Помощь' }));
   box.append(h('div', { class: 'card' },
     navRow({
@@ -832,7 +901,368 @@ screens.more = async function more() {
       title: 'Как пользоваться',
       sub: 'короткая инструкция в чате',
       onclick: () => { if (tg) tg.close(); },
+    }),
+    navRow({
+      icon: 'send',
+      title: 'Написать в поддержку',
+      sub: 'ответим в чате с ботом',
+      onclick: () => { if (tg) tg.close(); },
     })));
+  return box;
+};
+
+/** Человеческое название режима НДС — то же, что в боте. */
+function vatLabel(org) {
+  if (!org || !org.vat_rate) return 'без НДС';
+  return `${org.vat_rate}%${org.vat_rate === '0' ? '' : (org.vat_gross ? ', цены с НДС' : ', сверху')}`;
+}
+
+const BASIS_LABEL = {
+  closing: 'по акту, УПД или накладной',
+  invoice: 'по выставленному счёту',
+  manual: 'не считать — журнал веду сам',
+};
+
+/* ---------- почта ---------- */
+
+/**
+ * Почта клиента: с какого адреса уходят документы.
+ *
+ * Экрана долго не было вовсе — обработчики на сервере есть с самого начала,
+ * а в приложении подключить ящик было нельзя. Половина ежедневной работы
+ * бухгалтера это почта, и держать её только в боте неправильно.
+ */
+screens.mail = async function mail() {
+  const s = await api('GET', '/api/state');
+  const box = h('div', {}, h('h1', { text: 'Почта' }));
+  const mb = s.mailbox;
+
+  if (mb) {
+    box.append(h('div', { class: 'card' },
+      h('div', { class: 'row' },
+        h('span', { class: `icon-box ${mb.checkedAt ? 'ok' : ''}` }, icon(mb.checkedAt ? 'check' : 'clock')),
+        h('span', { class: 'grow' },
+          h('div', { class: 'ellipsis', text: mb.from }),
+          h('div', { class: 'small muted', text: mb.checkedAt ? 'проверена, письма уходят' : 'ещё не проверена' }))),
+      h('div', { class: 'row' },
+        h('span', { class: 'grow muted', text: 'Сервер' }),
+        h('span', { class: 'small', text: `${mb.host}:${mb.port}` }))));
+
+    if (mb.canRead) {
+      box.append(h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn', onclick: () => { haptic('medium'); go('inbox'); },
+      }, 'Посмотреть входящие')));
+    }
+
+    box.append(h('div', { class: 'btn-wrap' }, h('button', {
+      class: 'btn secondary',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        const r = await api('POST', '/api/mailbox/test');
+        toast(`Письмо ушло на ${r.sent} — проверьте ящик`);
+        render();
+      }),
+    }, 'Отправить проверочное письмо')));
+
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn ghost', onclick: () => go('mail.new') }, 'Подключить другой ящик'),
+      h('button', {
+        class: 'btn danger',
+        onclick: (e) => withBusy(e.currentTarget, async () => {
+          await api('POST', '/api/mailbox/delete');
+          toast('Почта отключена');
+          render();
+        }),
+      }, 'Отключить почту')));
+    return box;
+  }
+
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'row' },
+      h('span', { class: 'icon-box' }, icon('mail')),
+      h('span', { class: 'grow' },
+        h('div', { text: 'Ящик не подключён' }),
+        h('div', { class: 'small muted', text: 'документы придётся пересылать вручную' })))));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Подключите свой ящик — и счета будут уходить клиентам с вашего адреса. '
+      + 'С чужого адреса письма попадают в спам, а получатель видит незнакомого отправителя.' }));
+  box.append(h('div', { class: 'btn-wrap' },
+    h('button', { class: 'btn', onclick: () => go('mail.new') }, 'Подключить ящик')));
+  return box;
+};
+
+/** Подключение ящика: адрес, пароль и — для своего домена — сервер. */
+screens['mail.new'] = async function mailNew() {
+  const box = h('div', {}, h('h1', { text: 'Подключить почту' }));
+
+  const email = field('email', 'Адрес почты', '', { type: 'email', placeholder: 'buh@yandex.ru', required: true });
+  const pass = field('pass', 'Пароль', '', { type: 'password', required: true,
+    hint: 'У Яндекса и Mail.ru нужен пароль приложения, а не обычный от почты' });
+  const host = field('host', 'Сервер SMTP', '', { placeholder: 'smtp.вашдомен.ру',
+    hint: 'Только для своего домена — у известных сервисов подставлю сам' });
+  const fromName = field('fromName', 'Имя отправителя', '', { placeholder: 'ООО «Ромашка»' });
+
+  // Ссылка на страницу пароля появляется, как только понятен сервис:
+  // описание пути по меню устаревает раньше, чем мы выпускаем обновление.
+  const linkBox = h('div', { class: 'btn-wrap', style: 'display:none' });
+  const link = h('a', { class: 'btn secondary', target: '_blank', rel: 'noopener' }, 'Где взять пароль');
+  linkBox.append(link);
+  const PASS_URL = {
+    yandex: 'https://id.yandex.ru/security/app-passwords',
+    mailru: 'https://account.mail.ru/user/2-step-auth/passwords',
+    gmail: 'https://myaccount.google.com/apppasswords',
+    rambler: 'https://mail.rambler.ru/settings/mailapps',
+  };
+  const guess = (addr) => {
+    const d = String(addr).split('@')[1] || '';
+    if (/yandex|ya\.ru|narod/i.test(d)) return 'yandex';
+    if (/mail\.ru|inbox\.ru|list\.ru|bk\.ru|internet\.ru/i.test(d)) return 'mailru';
+    if (/gmail|googlemail/i.test(d)) return 'gmail';
+    if (/rambler|lenta\.ru/i.test(d)) return 'rambler';
+    return 'custom';
+  };
+  email.input.addEventListener('input', () => {
+    const p = guess(email.input.value);
+    host.style.display = p === 'custom' ? '' : 'none';
+    if (PASS_URL[p]) { link.href = PASS_URL[p]; linkBox.style.display = ''; } else { linkBox.style.display = 'none'; }
+  });
+  host.style.display = 'none';
+
+  box.append(h('div', { class: 'card' }, email, pass, host, fromName));
+  box.append(linkBox);
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Пароль хранится в зашифрованном виде и нигде не показывается. '
+      + 'Сразу после сохранения я отправлю проверочное письмо вам же.' }));
+
+  const save = h('button', { class: 'btn' }, 'Подключить и проверить');
+  save.onclick = () => withBusy(save, async () => {
+    clearErrors({ email, pass });
+    if (!email.input.value.trim()) { showError(email, 'Без адреса не обойтись'); return; }
+    if (!pass.input.value) { showError(pass, 'Нужен пароль'); return; }
+    const r = await api('POST', '/api/mailbox', {
+      email: email.input.value.trim(),
+      pass: pass.input.value,
+      host: host.input.value.trim(),
+      fromName: fromName.input.value.trim(),
+    });
+    haptic('medium');
+    toast(r.sent ? `Письмо ушло на ${r.sent} — проверьте ящик` : 'Почта подключена');
+    reset('mail');
+  });
+  box.append(h('div', { class: 'btn-wrap' }, save));
+  return box;
+};
+
+/** Входящие письма с документами. */
+screens.inbox = async function inbox() {
+  const box = h('div', {}, h('h1', { text: 'Входящие' }));
+  let r;
+  try {
+    r = await api('GET', '/api/inbox');
+  } catch (e) {
+    box.append(empty('warn', 'Не смог прочитать почту', e.message,
+      h('div', { class: 'btn-wrap' }, h('button', { class: 'btn secondary', onclick: () => go('mail') }, 'Настройки почты'))));
+    return box;
+  }
+  if (!r.letters.length) {
+    box.append(empty('mail', 'Новых документов нет',
+      `Просмотрел ${r.looked} ${plural(r.looked, 'письмо', 'письма', 'писем')} за две недели. `
+      + 'Ищу вложения: счета, акты, УПД, накладные — PDF, Word, Excel и сканы.'));
+    return box;
+  }
+  box.append(h('div', { class: 'card' }, r.letters.map((l) => navRow({
+    icon: 'mail',
+    title: l.files.map((f) => f.kind).filter(Boolean).join(', ') || 'Документ',
+    sub: l.fromName || l.from,
+    badge: l.cp ? l.cp.name : '',
+    onclick: () => go('letter', { uid: l.uid, data: l }),
+  }))));
+  return box;
+};
+
+/** Карточка письма: что внутри и что с этим сделать. */
+screens.letter = async function letter({ data }) {
+  const l = data || {};
+  const box = h('div', {}, h('h1', { text: l.subject || 'Письмо' }));
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'От кого' }),
+      h('span', { class: 'ellipsis', text: l.fromName || l.from })),
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Адрес' }),
+      h('span', { class: 'small ellipsis', text: l.from }))));
+
+  box.append(h('div', { class: 'section-title', text: 'Вложения' }));
+  box.append(h('div', { class: 'card' }, (l.files || []).map((f) => h('div', { class: 'row' },
+    h('span', { class: 'icon-box' }, icon('doc')),
+    h('span', { class: 'grow' },
+      h('div', { class: 'ellipsis', text: f.name }),
+      h('div', { class: 'small muted', text: `${f.kind || 'документ'} · ${Math.round(f.size / 1024)} КБ` }))))));
+
+  if (l.cp) {
+    box.append(h('div', { class: 'btn-wrap' }, h('button', {
+      class: 'btn', onclick: () => go('op', { cpId: l.cp.id, doc: l.subject }),
+    }, `Внести операцию по ${l.cp.name}`)));
+  }
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Сам файл лежит у вас в почте — бот его не хранит. Здесь видно, что пришло, '
+      + 'и можно сразу занести сумму в журнал.' }));
+  return box;
+};
+
+/* ---------- НДС и основание долга ---------- */
+
+/** Ставка НДС организации. */
+screens.vat = async function vat() {
+  const s = await api('GET', '/api/state');
+  const org = s.org || {};
+  const cur = org.vat_rate === '' || org.vat_rate == null ? null : String(org.vat_rate);
+  const gross = Boolean(org.vat_gross);
+  const box = h('div', {}, h('h1', { text: 'НДС' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Ставка подставляется во все счета. У отдельного счёта её можно поменять.' }));
+
+  const pick = async (rate, isGross) => {
+    await api('POST', '/api/vat', { rate, gross: isGross });
+    haptic('medium');
+    toast('Сохранено');
+    back();
+  };
+  const opt = (title, sub, active, onclick) => h('button', { class: 'row', onclick },
+    h('span', { class: `icon-box ${active ? 'ok' : ''}` }, icon(active ? 'check' : 'receipt')),
+    h('span', { class: 'grow' },
+      h('div', { text: title }),
+      h('div', { class: 'small muted', text: sub })));
+
+  box.append(h('div', { class: 'card' },
+    opt('Без НДС', 'упрощёнка, патент, самозанятость', cur === null, () => pick(null, false)),
+    opt('20% сверху', 'цены указываю без налога', cur === '20' && !gross, () => pick(20, false)),
+    opt('20% в том числе', 'цены уже с налогом', cur === '20' && gross, () => pick(20, true)),
+    opt('10% сверху', 'льготная ставка', cur === '10' && !gross, () => pick(10, false)),
+    opt('10% в том числе', 'льготная, цены с налогом', cur === '10' && gross, () => pick(10, true)),
+    opt('0%', 'экспорт и особые случаи', cur === '0', () => pick(0, false))));
+  return box;
+};
+
+/** Из чего возникает долг контрагента. */
+screens.basis = async function basis() {
+  const s = await api('GET', '/api/state');
+  const box = h('div', {}, h('h1', { text: 'Откуда берётся долг' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Это про устройство вашего дела, а не про настройку. Выбор один на организацию: '
+      + 'иначе долг задвоится — сначала по счёту, потом по акту на ту же сделку.' }));
+
+  const pick = async (value) => {
+    await api('POST', '/api/basis', { basis: value });
+    haptic('medium');
+    toast('Сохранено');
+    back();
+  };
+  const opt = (value, title, sub) => h('button', { class: 'row', onclick: () => pick(value) },
+    h('span', { class: `icon-box ${s.debtBasis === value ? 'ok' : ''}` },
+      icon(s.debtBasis === value ? 'check' : 'wallet')),
+    h('span', { class: 'grow' },
+      h('div', { text: title }),
+      h('div', { class: 'small muted', text: sub })));
+
+  box.append(h('div', { class: 'card' },
+    opt('closing', 'По акту, УПД или накладной', 'подряд, услуги, торговля: счёт лишь просьба заплатить'),
+    opt('invoice', 'По выставленному счёту', 'аренда и субаренда: акта по закону может не быть'),
+    opt('manual', 'Не считать', 'журнал веду сам')));
+  return box;
+};
+
+/* ---------- операции и неоплаченные ---------- */
+
+/** Внести приход или оплату в журнал контрагента. */
+screens.op = async function op({ cpId, doc }) {
+  const { cps } = await api('GET', '/api/cps');
+  const cp = cps.find((c) => c.id === Number(cpId));
+  if (!cp) return empty('warn', 'Клиент не найден');
+
+  const box = h('div', {}, h('h1', { text: 'Операция' }));
+  let kind = 'payment';
+  const amount = field('amount', 'Сумма, ₽', '', { inputmode: 'decimal', required: true });
+  const date = field('date', 'Дата', todayISO(), { type: 'date' });
+  const docF = field('doc', 'Основание', doc || '', { placeholder: 'Счёт № 12 или Оплата' });
+
+  const btn = (val, text) => {
+    const b = h('button', { class: `btn ${kind === val ? '' : 'secondary'}`, style: 'flex:1' }, text);
+    b.onclick = () => {
+      kind = val;
+      for (const x of picker.children) x.className = 'btn secondary';
+      b.className = 'btn';
+      haptic();
+    };
+    return b;
+  };
+  const picker = h('div', { class: 'btn-wrap', style: 'display:flex;gap:10px' });
+  picker.append(btn('payment', 'Оплата'), btn('income', 'Приход'));
+
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Клиент' }),
+      h('span', { class: 'ellipsis', text: cp.name }))));
+  box.append(picker);
+  box.append(h('div', { class: 'card' }, amount, date, docF));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Оплата уменьшает долг клиента, приход — увеличивает.' }));
+
+  const save = h('button', { class: 'btn' }, 'Внести в журнал');
+  save.onclick = () => withBusy(save, async () => {
+    clearErrors({ amount });
+    const sum = Number(String(amount.input.value).replace(/\s/g, '').replace(',', '.'));
+    if (!sum) { showError(amount, 'Укажите сумму'); return; }
+    await api('POST', '/api/op', {
+      cpId: cp.id, amount: sum, kind, date: date.input.value, doc: docF.input.value.trim(),
+    });
+    haptic('medium');
+    toast('Записано в журнал');
+    reset('cp', { id: cp.id });
+  });
+  box.append(h('div', { class: 'btn-wrap' }, save));
+  return box;
+};
+
+/** Счета, по которым не отметили оплату. */
+screens.unpaid = async function unpaid() {
+  const { docs: list } = await api('GET', '/api/unpaid');
+  const box = h('div', {}, h('h1', { text: 'Ждут оплаты' }));
+  if (!list.length) {
+    box.append(empty('check', 'Всё оплачено', 'Здесь появятся счета, по которым не отмечена оплата.'));
+    return box;
+  }
+  const sum = list.reduce((a, d) => a + (Number(d.total) || 0), 0);
+  box.append(h('div', { class: 'hero' },
+    h('div', { class: 'sum money', text: money0(sum) }),
+    h('div', { class: 'sub', text: `${list.length} ${plural(list.length, 'счёт', 'счёта', 'счетов')} без отметки об оплате` })));
+  box.append(h('div', { class: 'card' }, list.map((d) => navRow({
+    icon: 'clock',
+    title: `${d.title} № ${d.number}`,
+    sub: ru(d.date),
+    right: money0(d.total),
+    onclick: () => go('doc', { id: d.id }),
+  }))));
+  return box;
+};
+
+/** Реестр всех документов за период — файлом в Excel. */
+screens.registry = async function registry() {
+  const now = new Date();
+  const first = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+  const box = h('div', {}, h('h1', { text: 'Реестр документов' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Таблица всех выписанных документов за период — с суммами, контрагентами и итогом. '
+      + 'Открывается в Excel, годится для сдачи бухгалтеру.' }));
+  const from = field('from', 'С какого числа', first, { type: 'date' });
+  const to = field('to', 'По какое', todayISO(), { type: 'date' });
+  box.append(h('div', { class: 'card' }, from, to));
+
+  const make = h('button', { class: 'btn' }, 'Собрать реестр');
+  make.onclick = () => withBusy(make, async () => {
+    const r = await api('GET', `/api/registry?from=${from.input.value}&to=${to.input.value}`);
+    if (!r.count) { toast('За этот период документов нет', true); return; }
+    haptic('medium');
+    toast(`${r.count} ${plural(r.count, 'документ', 'документа', 'документов')} на ${money0(r.total)}`);
+    download(r.file);
+  });
+  box.append(h('div', { class: 'btn-wrap' }, make));
   return box;
 };
 

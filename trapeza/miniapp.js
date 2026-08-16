@@ -31,6 +31,10 @@ const facsimile = require('./lib/facsimile');
 const mailer = require('./lib/mail');
 const mailbox = require('./lib/mailbox');
 const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
+const { buildAkt } = require('./lib/xlsx-akt');
+const { buildRegistry } = require('./lib/xlsx-registry');
+const { fetchNew } = require('./lib/imap');
+const mime = require('./lib/mime');
 const reqCheck = require('./lib/requisites-check');
 const { round2 } = require('./lib/money');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
@@ -377,6 +381,137 @@ const api = {
     }
     const when = bdb.markPaid(user.id, id, str(body.date, 10));
     return { paidAt: when, doc: docBrief(bdb.getDoc(user.id, id)) };
+  },
+
+  /*
+   * НДС организации. В боте это было, в приложении — нет, и счета из
+   * приложения молча уходили без налога у тех, кто на общей системе.
+   */
+  async 'POST /api/vat'({ user, body }) {
+    const org = bdb.getDefaultOrg(user.id);
+    if (!org) return { error: 'Сначала заполните реквизиты организации.' };
+    const raw = body.rate;
+    const rate = raw === null || raw === '' || raw === undefined ? '' : String(Number(raw));
+    if (!['', '0', '10', '20'].includes(rate)) return { error: 'Ставка бывает 0, 10 или 20 процентов.' };
+    bdb.updateOrg(user.id, org.id, { vat_rate: rate, vat_gross: body.gross ? 1 : 0 });
+    return { vat: bdb.vatOf(bdb.getDefaultOrg(user.id)) };
+  },
+
+  /** Проверочное письмо самому себе: убедиться, что пароль принят. */
+  async 'POST /api/mailbox/test'({ user }) {
+    const box = mailbox.resolve(user.id);
+    if (!box.ok) return { error: box.reason };
+    const res = await mailer.sendMail({
+      to: box.options.from,
+      subject: 'Проверка почты — Первичка',
+      text: 'Это проверочное письмо от «Первички». Если вы его видите, '
+        + 'отправка документов клиентам настроена верно.',
+    }, box.options);
+    if (!res.ok) return { error: res.error };
+    mailbox.markChecked(user.id);
+    return { sent: box.options.from, mailbox: mailbox.info(user.id) };
+  },
+
+  /**
+   * Входящие письма с документами. Возвращаем разбор, а не сами файлы:
+   * вложения бывают на мегабайты, а на экране нужны отправитель, тема и
+   * вид документа.
+   */
+  async 'GET /api/inbox'({ user }) {
+    const conf = mailbox.resolveImap(user.id);
+    if (!conf.ok) return { error: conf.reason };
+    const res = await fetchNew(conf.config, { limit: 15, unseenOnly: false, sinceDays: 14 });
+    if (!res.ok) return { error: res.error };
+
+    const cps = bdb.listCps(user.id);
+    const letters = [];
+    for (const m of res.messages) {
+      const parsed = mime.parseMessage(m.raw);
+      const docs = parsed.attachments.filter(mime.looksLikeDocument);
+      if (!docs.length) continue;
+      const guess = cps.find((c) => c.email && c.email.toLowerCase() === parsed.from)
+        || cps.find((c) => parsed.fromName && c.name
+          && parsed.fromName.toLowerCase().includes(c.name.toLowerCase().slice(0, 8)));
+      letters.push({
+        uid: m.uid,
+        from: parsed.from,
+        fromName: parsed.fromName || '',
+        subject: parsed.subject || '',
+        cp: guess ? { id: guess.id, name: guess.name } : null,
+        files: docs.map((d) => ({
+          name: d.filename,
+          size: d.size,
+          kind: mime.documentKind(d.filename, parsed.subject),
+        })),
+      });
+    }
+    return { letters, looked: res.messages.length };
+  },
+
+  /** Операция в журнал контрагента: приход или оплата. */
+  async 'POST /api/op'({ user, body }) {
+    const cp = bdb.getCp(user.id, Number(body.cpId));
+    if (!cp) return { error: 'Контрагент не найден.' };
+    const amount = Math.abs(Number(body.amount) || 0);
+    if (!amount) return { error: 'Укажите сумму.' };
+    const paid = body.kind === 'payment';
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(body.date)) ? String(body.date) : docService.todayISO();
+    bdb.addOp(user.id, cp.id, {
+      date,
+      kind: paid ? 'Оплата' : 'Приход',
+      doc: str(body.doc, 120) || (paid ? 'Оплата' : 'Приход'),
+      debit: paid ? amount : 0,
+      credit: paid ? 0 : amount,
+    });
+    return { cp: cpBrief(user.id, bdb.getCp(user.id, cp.id)) };
+  },
+
+  /** Акт сверки в Excel — по журналу операций контрагента. */
+  async 'GET /api/akt'({ user, url }) {
+    const org = bdb.getDefaultOrg(user.id);
+    if (!org) return { error: 'Сначала заполните реквизиты организации.' };
+    const cp = bdb.getCp(user.id, Number(url.searchParams.get('cp')));
+    if (!cp) return { error: 'Контрагент не найден.' };
+    if (!cp.period_end) {
+      bdb.updateCp(user.id, cp.id, { period_end: docService.todayISO() });
+      cp.period_end = docService.todayISO();
+    }
+    const ops = bdb.listOps(user.id, cp.id);
+    const buf = await buildAkt({
+      org: { brand: org.name, org_short: org.name, org_full: org.full_name || org.name,
+        org_inn: org.inn, signer: org.signer },
+      cp,
+      ops,
+    });
+    const file = {
+      filename: `Акт_сверки_${docService.safeName(cp.name)}.xlsx`,
+      buffer: Buffer.from(buf),
+      mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    };
+    return { file: { url: `/api/file/${keepFile(user.id, file)}`, name: file.filename } };
+  },
+
+  /** Реестр всех документов за период — тоже Excel. */
+  async 'GET /api/registry'({ user, url }) {
+    const org = bdb.getDefaultOrg(user.id);
+    if (!org) return { error: 'Сначала заполните реквизиты организации.' };
+    const iso = (v, fallback) => (/^\d{4}-\d{2}-\d{2}$/.test(v || '') ? v : fallback);
+    const now = new Date();
+    const first = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+    const from = iso(url.searchParams.get('from'), first);
+    const to = iso(url.searchParams.get('to'), docService.todayISO());
+    const docs = bdb.docsBetween(user.id, from, to);
+    const buf = await buildRegistry({ org, docs, from, to });
+    const file = {
+      filename: `Реестр_${from}_${to}.xlsx`,
+      buffer: Buffer.from(buf),
+      mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    };
+    return {
+      count: docs.length,
+      total: round2(docs.reduce((a, d) => a + (Number(d.total) || 0), 0)),
+      file: { url: `/api/file/${keepFile(user.id, file)}`, name: file.filename },
+    };
   },
 
   /** Из чего возникает долг: по акту, по счёту или вручную. */
