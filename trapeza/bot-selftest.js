@@ -1474,15 +1474,13 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(pdf.launches() === launchesBefore + 1,
       'три документа собраны на одном браузере, а не на трёх',
       `запусков: ${pdf.launches() - launchesBefore}`);
-    await pdf.closePdf();
-    const t0 = Date.now();
-    await pdf.htmlToPdf('<h1>раз</h1>');
-    const cold = Date.now() - t0;
-    const t1 = Date.now();
-    await Promise.all([pdf.htmlToPdf('<h1>два</h1>'), pdf.htmlToPdf('<h1>три</h1>')]);
-    const warm = Date.now() - t1;
-    ok(warm < cold, 'браузер переиспользуется, а не поднимается заново',
-      `холодный старт ${cold} мс, тёплые два ${warm} мс`);
+    /*
+     * Замер времени отсюда убран намеренно. Он сравнивал «холодный» старт с
+     * «тёплым» и падал на ровном месте: на быстрой машине оба выходят по
+     * 130 мс, и разницы нет. Переиспользование браузера проверяет счётчик
+     * запусков выше — он отвечает на тот же вопрос и не зависит от того,
+     * чем ещё занят сервер в эту секунду.
+     */
     await pdf.closePdf();
     const buf = await pdf.htmlToPdf('<h1>после закрытия</h1>');
     ok(buf && buf.length > 500, 'после закрытия браузер поднимается заново');

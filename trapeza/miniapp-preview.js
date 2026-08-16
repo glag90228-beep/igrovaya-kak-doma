@@ -186,6 +186,11 @@ async function main() {
     SHOTS.push({ name: 'zhdut-oplaty', title: 'Ждут оплаты', go: ['unpaid', {}] });
     SHOTS.push({ name: 'reestr', title: 'Реестр', go: ['registry', {}] });
     if (firstCp) SHOTS.push({ name: 'operaciya', title: 'Операция', go: ['op', { cpId: firstCp.id }] });
+    SHOTS.push({ name: 'platezhka', title: 'Платёжка', go: ['other', { type: 'pp' }] });
+    SHOTS.push({ name: 'dogovor', title: 'Договор', go: ['other', { type: 'dog' }] });
+    SHOTS.push({ name: 'napominaniya', title: 'Напоминания', go: ['reminders', {}] });
+    SHOTS.push({ name: 'podderzhka', title: 'Поддержка', go: ['support', {}] });
+    SHOTS.push({ name: 'snimok', title: 'Снимок счёта', go: ['scan', {}] });
   }
   setTelegram({ async sendDocument() { return {}; } });
   await new Promise((r) => server.listen(0, r));

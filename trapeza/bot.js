@@ -1851,7 +1851,7 @@ async function debtReminder(tg, chatId, user) {
     await tg.sendMessage(chatId,
       `<code>Здравствуйте!\n\n`
       + `По нашим данным на ${ru(todayISO())} за вами числится задолженность `
-      + `${formatRub(r.amount).replace(/ /g, ' ')}`
+      + `${formatRub(r.amount).replace(/ /g, ' ').replace(/\sруб\.$/, ' руб')}`
       + `${r.cp.contract ? ` по ${r.cp.contract}` : ''}.\n\n`
       + `Направляем акт сверки. Просим подтвердить сумму и сообщить срок оплаты. `
       + `Если платёж уже прошёл — пришлите, пожалуйста, платёжное поручение.`

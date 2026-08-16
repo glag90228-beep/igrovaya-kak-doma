@@ -34,6 +34,9 @@ const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
 const { buildAkt } = require('./lib/xlsx-akt');
 const { buildRegistry } = require('./lib/xlsx-registry');
 const { fetchNew } = require('./lib/imap');
+const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
+const { forwardToSupport } = require('./lib/bot-support');
+const { formatRub } = require('./lib/money');
 const mime = require('./lib/mime');
 const reqCheck = require('./lib/requisites-check');
 const { round2 } = require('./lib/money');
@@ -512,6 +515,117 @@ const api = {
       total: round2(docs.reduce((a, d) => a + (Number(d.total) || 0), 0)),
       file: { url: `/api/file/${keepFile(user.id, file)}`, name: file.filename },
     };
+  },
+
+  /*
+   * Платёжка и договор. Они набираются не позициями, а парой полей, поэтому
+   * общий обработчик /api/doc им не подходит — у него на входе список
+   * позиций. В боте они были с самого начала, в приложении их не было.
+   */
+  async 'POST /api/doc/other'({ user, body }) {
+    const type = str(body.type, 10);
+    const kind = docService.OTHER_DOCS[type];
+    if (!kind) return { error: 'Такой документ выписать нельзя.' };
+
+    const org = bdb.getDefaultOrg(user.id);
+    if (!org) return { error: 'Сначала заполните реквизиты организации.' };
+    const cp = bdb.getCp(user.id, Number(body.cpId));
+    if (!cp) return { error: 'Контрагент не найден.' };
+
+    const quota = bdb.quota(user.id);
+    if (!quota.allowed) {
+      return { error: `Бесплатные документы на этот месяц закончились (${quota.limit}).`, reason: 'quota', quota };
+    }
+
+    const when = /^\d{4}-\d{2}-\d{2}$/.test(String(body.date)) ? String(body.date) : docService.todayISO();
+    const year = Number(when.slice(0, 4));
+    const amount = Math.abs(Number(body.amount) || 0);
+    const seq = bdb.nextSeq(user.id, type, year);
+    const number = str(body.number, 40) || String(seq);
+
+    const doc = type === 'pp'
+      ? { number, date: when, amount, purpose: str(body.purpose, 400) }
+      : { number, date: when, subject: str(body.subject, 500), price: amount, term: str(body.term, 60) };
+    if (type === 'pp' && !amount) return { error: 'Укажите сумму платежа.' };
+    if (type === 'pp' && !doc.purpose) return { error: 'Укажите назначение платежа.' };
+    if (type === 'dog' && !doc.subject) return { error: 'Укажите предмет договора.' };
+
+    const file = await docService.renderFile(
+      kind.build({ org, cp, doc }),
+      `${kind.file}_${docService.safeName(number)}_${docService.safeName(cp.name)}`,
+    );
+    const id = bdb.saveDoc(user.id, {
+      orgId: org.id, cpId: cp.id, type, number, seq, date: when, total: amount, payload: doc,
+    });
+
+    const res = {
+      ok: true, total: amount, title: kind.title, file,
+      doc: { ...docBrief(bdb.getDoc(user.id, id)), cp: { name: cp.name } },
+    };
+    const token = keepFile(user.id, file);
+    await sendToChat(user, res).catch(() => {});
+    return {
+      total: amount,
+      doc: docBrief(bdb.getDoc(user.id, id)),
+      file: { url: `/api/file/${token}`, name: file.filename, pdf: file.pdf },
+      quota: bdb.quota(user.id),
+    };
+  },
+
+  /**
+   * Готовый текст напоминания должникам.
+   *
+   * Писать контрагентам сами мы не можем и не должны: их согласия на это
+   * никто не давал, а адресов у нас нет. Поэтому отдаём текст — человек
+   * отправит его сам, от своего имени.
+   */
+  async 'GET /api/reminders'({ user }) {
+    const org = bdb.getDefaultOrg(user.id) || {};
+    const rows = bdb.debtors(user.id).filter((r) => r.theyOwe);
+    const bank = org.acc
+      ? `\n\nРеквизиты для оплаты:\n${org.bank_name || ''}\nБИК ${org.bik || '—'}\nР/с ${org.acc}`
+      : '';
+    return {
+      reminders: rows.slice(0, 20).map((r) => ({
+        cpId: r.cp.id,
+        name: r.cp.name,
+        amount: r.amount,
+        text: 'Здравствуйте!\n\n'
+          + `По нашим данным на ${ruDate(docService.todayISO())} за вами числится задолженность `
+          + `${formatRub(r.amount).replace(/\sруб\.$/, ' руб')}`
+          + `${r.cp.contract ? ` по ${r.cp.contract}` : ''}.\n\n`
+          + 'Направляем акт сверки. Просим подтвердить сумму и сообщить срок оплаты. '
+          + 'Если платёж уже прошёл — пришлите, пожалуйста, платёжное поручение.'
+          + `${bank}\n\nС уважением,\n${org.full_name || org.name || ''}`,
+      })),
+    };
+  },
+
+  /** Обращение в поддержку прямо из приложения. */
+  async 'POST /api/support'({ user, body }) {
+    const text = str(body.text, 2000);
+    if (text.length < 5) return { error: 'Опишите, что случилось, — пары слов мало.' };
+    const sent = await forwardToSupport(tg, { user, chatId: user.tg_id, text }).catch(() => false);
+    return { sent: Boolean(sent) };
+  },
+
+  /**
+   * Распознавание снимка счёта. Отвечает честно, когда сервис не подключён:
+   * молчаливый отказ выглядел бы как поломка.
+   */
+  async 'POST /api/scan'({ user, body }) {
+    if (!visionAvailable()) return { error: `Распознавание не подключено. ${visionHint()}` };
+    const m = /^data:([^;,]*);base64,(.+)$/s.exec(String(body.dataUrl || ''));
+    if (!m) return { error: 'Не разобрал картинку — пришлите фото или скан.' };
+    if (m[2].length > (6 * 1024 * 1024 * 4) / 3) return { error: 'Снимок больше 6 МБ.' };
+    const res = await readInvoice(Buffer.from(m[2], 'base64'), m[1]);
+    if (!res.ok) return { error: res.error };
+    const f = res.fields || {};
+    // Ищем, кому это относится: по ИНН из снимка, иначе по названию.
+    const cps = bdb.listCps(user.id);
+    const guess = (f.inn && cps.find((c) => c.inn === f.inn))
+      || (f.name && cps.find((c) => c.name.toLowerCase().includes(String(f.name).toLowerCase().slice(0, 8))));
+    return { fields: f, cp: guess ? { id: guess.id, name: guess.name } : null };
   },
 
   /** Из чего возникает долг: по акту, по счёту или вручную. */

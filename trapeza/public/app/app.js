@@ -285,10 +285,14 @@ screens.home = async function home() {
     ['schdog', 'pen', 'Счёт-договор', 'заменяет договор'],
     ['upd', 'docs2', 'УПД', 'счёт-фактура и акт'],
     ['torg12', 'box', 'ТОРГ-12', 'накладная на товар'],
+    ['pp', 'wallet', 'Платёжка', 'форма 0401060 для банка'],
+    ['dog', 'pen', 'Договор', 'условия на бумаге'],
   ];
   box.append(h('div', { class: 'section-title', text: 'Другие документы' }));
+  const OTHER = ['pp', 'dog'];   // набираются полями, а не позициями
   box.append(h('div', { class: 'tiles' }, types.map(([type, ico, title, sub]) => h('button', {
-    class: 'tile', onclick: () => { haptic(); go('new', { type }); },
+    class: 'tile',
+    onclick: () => { haptic(); go(OTHER.includes(type) ? 'other' : 'new', { type }); },
   },
   h('span', { class: 'icon-box' }, icon(ico)),
   h('span', { class: 't-title', text: title }),
@@ -840,6 +844,11 @@ screens.debts = async function debts() {
   ] : []);
   // append массив не разворачивает — он бы превратился в строку.
   box.append(...block('Должны нам', them, 'in'), ...block('Должны мы', us, 'out'));
+  if (them.length) {
+    box.append(h('div', { class: 'btn-wrap' }, h('button', {
+      class: 'btn secondary', onclick: () => go('reminders'),
+    }, 'Текст напоминания должникам')));
+  }
   return box;
 };
 
@@ -877,6 +886,12 @@ screens.more = async function more() {
       title: 'Реестр документов',
       sub: 'выгрузка за период в Excel',
       onclick: () => go('registry'),
+    }),
+    navRow({
+      icon: 'search',
+      title: 'Снимок счёта',
+      sub: 'сфотографировать и разобрать',
+      onclick: () => go('scan'),
     })));
 
   box.append(h('div', { class: 'section-title', text: 'Настройки учёта' }));
@@ -906,7 +921,7 @@ screens.more = async function more() {
       icon: 'send',
       title: 'Написать в поддержку',
       sub: 'ответим в чате с ботом',
-      onclick: () => { if (tg) tg.close(); },
+      onclick: () => go('support'),
     })));
   return box;
 };
@@ -1263,6 +1278,209 @@ screens.registry = async function registry() {
     download(r.file);
   });
   box.append(h('div', { class: 'btn-wrap' }, make));
+  return box;
+};
+
+/* ---------- платёжка и договор ---------- */
+
+/**
+ * Документы, которые набираются не позициями, а парой полей.
+ *
+ * Платёжку выписывают поставщику, чтобы отдать в банк; договор — чтобы
+ * закрепить условия. В боте это было с самого начала, в приложении не было
+ * вовсе, и половина типов документов оставалась недоступна.
+ */
+screens.other = async function other({ type, cpId }) {
+  const isPp = type === 'pp';
+  const { cps } = await api('GET', '/api/cps');
+  if (!cps.length) {
+    return empty('users', 'Сначала добавьте клиента',
+      'Документ выписывается на кого-то — без второй стороны его не собрать.',
+      h('div', { class: 'btn-wrap' }, h('button', { class: 'btn', onclick: () => go('cp', {}) }, 'Добавить клиента')));
+  }
+
+  const box = h('div', {}, h('h1', { text: isPp ? 'Платёжное поручение' : 'Договор' }));
+  const who = h('select', { id: 'f-cp' }, cps.map((c) => h('option', {
+    value: c.id, selected: Number(cpId) === c.id,
+  }, c.name)));
+  const date = field('date', 'Дата', todayISO(), { type: 'date' });
+  const num = field('number', 'Номер', '', { placeholder: 'подставлю сам' });
+
+  const fields = isPp
+    ? {
+      amount: field('amount', 'Сумма, ₽', '', { inputmode: 'decimal', required: true }),
+      purpose: field('purpose', 'Назначение платежа', '', {
+        multiline: true, required: true,
+        placeholder: 'Оплата по счёту № 12 от 01.08.2026, в том числе НДС 20%',
+      }),
+    }
+    : {
+      subject: field('subject', 'Предмет договора', '', {
+        multiline: true, required: true,
+        placeholder: 'услуги по организации фуршетного обслуживания',
+      }),
+      amount: field('amount', 'Сумма договора, ₽', '', {
+        inputmode: 'decimal', hint: 'Ноль — если платим по счетам',
+      }),
+      term: field('term', 'Действует до', '', { placeholder: '31.12.2026' }),
+    };
+
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'field' },
+      h('label', { for: 'f-cp', text: isPp ? 'Получатель платежа' : 'Вторая сторона' }), who),
+    date, num));
+  box.append(h('div', { class: 'card' }, Object.values(fields)));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: isPp
+      ? 'Форма 0401060 — та, что принимает банк. Ваши реквизиты и реквизиты получателя подставятся сами.'
+      : 'Простой договор на услуги: реквизиты обеих сторон, предмет, сумма и срок. Подпись и печать не ставятся — договор подписывают живой рукой.' }));
+
+  const make = h('button', { class: 'btn' }, 'Выписать');
+  make.onclick = () => withBusy(make, async () => {
+    clearErrors(fields);
+    const amount = Number(String((fields.amount.input.value) || '').replace(/\s/g, '').replace(',', '.')) || 0;
+    if (isPp && !amount) { showError(fields.amount, 'Укажите сумму'); return; }
+    if (isPp && !fields.purpose.input.value.trim()) { showError(fields.purpose, 'Банк не примет платёж без назначения'); return; }
+    if (!isPp && !fields.subject.input.value.trim()) { showError(fields.subject, 'Без предмета договор не собрать'); return; }
+    const r = await api('POST', '/api/doc/other', {
+      type,
+      cpId: Number(who.value),
+      date: date.input.value,
+      number: num.input.value.trim(),
+      amount,
+      purpose: isPp ? fields.purpose.input.value.trim() : '',
+      subject: isPp ? '' : fields.subject.input.value.trim(),
+      term: isPp ? '' : fields.term.input.value.trim(),
+    });
+    haptic('medium');
+    toast('Готово — файл в чате с ботом');
+    download(r.file);
+    reset('docs');
+  });
+  box.append(h('div', { class: 'btn-wrap' }, make));
+  return box;
+};
+
+/* ---------- напоминания должникам ---------- */
+
+/**
+ * Готовый текст для каждого должника.
+ *
+ * Писать контрагентам сами мы не будем: согласия на это они не давали, а
+ * адресов у нас нет. Отдаём текст — человек отправит его от своего имени.
+ */
+screens.reminders = async function reminders() {
+  const { reminders: list } = await api('GET', '/api/reminders');
+  const box = h('div', {}, h('h1', { text: 'Напомнить о долге' }));
+  if (!list.length) {
+    box.append(empty('check', 'Должников нет', 'Некому напоминать — все рассчитались.'));
+    return box;
+  }
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Нажмите на текст — он скопируется. Отправьте его должнику сами, от своего имени: '
+      + 'бот вашим контрагентам не пишет.' }));
+
+  for (const r of list) {
+    const card = h('div', { class: 'card' });
+    card.append(h('div', { class: 'row' },
+      h('span', { class: 'icon-box' }, icon('users')),
+      h('span', { class: 'grow' },
+        h('div', { class: 'ellipsis', text: r.name }),
+        h('div', { class: 'small muted', text: 'должен нам' })),
+      h('span', { class: 'money in nowrap', text: money0(r.amount) })));
+    const pre = h('div', {
+      class: 'small',
+      style: 'padding:12px 18px;white-space:pre-wrap;border-top:1px solid var(--hairline);color:var(--muted)',
+      text: r.text,
+    });
+    card.append(pre);
+    const copy = h('button', { class: 'btn secondary' }, 'Скопировать текст');
+    copy.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(r.text);
+        haptic('medium');
+        toast('Текст скопирован');
+      } catch (_) {
+        toast('Скопируйте вручную — браузер не дал доступ к буферу', true);
+      }
+    };
+    box.append(card, h('div', { class: 'btn-wrap' }, copy));
+  }
+  return box;
+};
+
+/* ---------- поддержка ---------- */
+
+screens.support = async function support() {
+  const box = h('div', {}, h('h1', { text: 'Поддержка' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Опишите, что случилось. Ответим в чате с ботом — там же, где приходят документы.' }));
+  const text = field('text', 'Сообщение', '', {
+    multiline: true, required: true,
+    placeholder: 'Например: счёт выписался без QR-кода, хотя банк заполнен',
+  });
+  box.append(h('div', { class: 'card' }, text));
+  const send = h('button', { class: 'btn' }, 'Отправить');
+  send.onclick = () => withBusy(send, async () => {
+    clearErrors({ text });
+    if (text.input.value.trim().length < 5) { showError(text, 'Пары слов мало — опишите подробнее'); return; }
+    const r = await api('POST', '/api/support', { text: text.input.value.trim() });
+    haptic('medium');
+    toast(r.sent ? 'Отправлено — ответим в чате' : 'Поддержка сейчас недоступна, напишите боту');
+    back();
+  });
+  box.append(h('div', { class: 'btn-wrap' }, send));
+  return box;
+};
+
+/* ---------- снимок счёта ---------- */
+
+/**
+ * Фотография счёта от поставщика: распознаём сумму и дату, чтобы не
+ * перебивать их руками. Работает, только если подключён внешний сервис —
+ * и об этом говорим прямо, а не молчим.
+ */
+screens.scan = async function scan() {
+  const box = h('div', {}, h('h1', { text: 'Снимок счёта' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Сфотографируйте счёт от поставщика — вытащу сумму, дату и номер и предложу '
+      + 'внести операцию. Сам файл никуда не сохраняется.' }));
+
+  const input = h('input', { type: 'file', accept: 'image/*', capture: 'environment', style: 'display:none' });
+  const pick = h('button', { class: 'btn' }, 'Выбрать снимок');
+  const result = h('div', {});
+  pick.onclick = () => input.click();
+
+  input.addEventListener('change', async () => {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    result.replaceChildren(h('div', { class: 'boot' }, h('span', { class: 'spinner' }), 'Распознаю…'));
+    try {
+      const dataUrl = await shrinkImage(file, 1600);
+      const r = await api('POST', '/api/scan', { dataUrl });
+      const f = r.fields || {};
+      result.replaceChildren(h('div', { class: 'card' },
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Сумма' }),
+          h('span', { class: 'money', text: f.amount ? money(f.amount) : 'не разобрал' })),
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Дата' }),
+          h('span', { text: f.date ? ru(f.date) : 'не разобрал' })),
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Номер' }),
+          h('span', { text: f.docNo || '—' })),
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Кто' }),
+          h('span', { class: 'ellipsis', text: (r.cp && r.cp.name) || f.name || 'не опознан' }))));
+      if (r.cp && f.amount) {
+        result.append(h('div', { class: 'btn-wrap' }, h('button', {
+          class: 'btn',
+          onclick: () => go('op', { cpId: r.cp.id, doc: f.docNo ? `Счёт № ${f.docNo}` : 'Счёт' }),
+        }, 'Внести операцию')));
+      }
+      haptic('medium');
+    } catch (e) {
+      result.replaceChildren(h('div', { class: 'banner' }, icon('warn'), h('div', { text: e.message })));
+    }
+  });
+
+  box.append(h('div', { class: 'btn-wrap' }, pick), input, result);
   return box;
 };
 
