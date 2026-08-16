@@ -1454,6 +1454,98 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await tap('fx.del:sign');
   ok(!fxLib.get(fxUser.id, 'sign'), 'подпись убирается кнопкой');
 
+  console.log('\n── свободный ввод ──');
+  {
+    const ai = require('./lib/ai-agent');
+    const bdbA = require('./lib/bot-db');
+    const uid = fxUserId();
+
+    // По умолчанию модуль выключен: ключ в .env лежит ради распознавания
+    // счетов и сам по себе не должен запускать расходы.
+    delete process.env.AI_ENABLED;
+    process.env.AI_PROVIDER = 'mock';
+    ok(ai.aiAvailable() === false, 'без AI_ENABLED модуль выключен');
+    ok(ai.aiHint().includes('AI_ENABLED'), 'подсказка объясняет, чего не хватает', ai.aiHint());
+
+    // Местный разбор работает всегда и бесплатно.
+    ok(ai.quickParse('кто мне должен').action === 'debts', 'долги узнаются без модели');
+    ok(ai.quickParse('выставь счёт Заре').docType === 'sch', 'счёт узнаётся без модели');
+    ok(ai.quickParse('оформи акт для ООО Ромашка').who === 'ООО Ромашка', 'имя клиента вырезано',
+      ai.quickParse('оформи акт для ООО Ромашка').who);
+    ok(ai.quickParse('привет как дела') === null, 'болтовня местным разбором не ловится');
+
+    let intent = await ai.understand('привет как дела', uid);
+    ok(intent.action === 'unknown' && intent.source === 'off',
+      'выключенный модуль к модели не ходит', intent.source);
+
+    // Включаем с заглушкой вместо сети.
+    process.env.AI_ENABLED = '1';
+    ok(ai.aiAvailable() === true, 'с AI_ENABLED и провайдером модуль готов');
+
+    process.env.AI_MOCK = JSON.stringify({
+      action: 'draft', docType: 'sch', who: 'Заря',
+      items: [{ name: 'Аренда', qty: 1, price: 30000 }],
+    });
+    intent = await ai.understand('надо бы выставить Заре за аренду тридцать тысяч', uid);
+    ok(intent.action === 'draft' && intent.items[0].price === 30000, 'ответ модели разобран',
+      JSON.stringify(intent).slice(0, 80));
+
+    // Всё, что пришло от модели, — данные из ненадёжного источника.
+    ok(ai.sanitize({ action: 'delete_everything' }).action === 'unknown', 'чужое действие отброшено');
+    ok(ai.sanitize({ action: 'draft', docType: 'вирус' }).action === 'unknown', 'чужой тип документа отброшен');
+    const dirty = ai.sanitize({
+      action: 'draft', docType: 'sch', who: 'x',
+      items: [{ name: 'Товар', qty: -5, price: -100 }, { name: '', qty: 1, price: 1 }],
+    });
+    ok(dirty.items.length === 1 && dirty.items[0].qty === 1 && dirty.items[0].price === 0,
+      'отрицательные количество и цена обезврежены', JSON.stringify(dirty.items));
+
+    // Контрагент — только однозначный.
+    const cps = [{ id: 1, name: 'ООО «Заря»' }, { id: 2, name: 'Заря-Строй' }, { id: 3, name: 'Ромашка' }];
+    ok(ai.matchCp(cps, 'Ромашка').cp.id === 3, 'однозначное имя найдено');
+    ok(ai.matchCp(cps, 'Заря').cp.id === 1, 'точное совпадение сильнее частичного',
+      JSON.stringify(ai.matchCp(cps, 'Заря')));
+    ok((ai.matchCp(cps, 'Зар').choices || []).length === 2, 'двусмысленное имя — это вопрос, а не выбор',
+      JSON.stringify(ai.matchCp(cps, 'Зар').choices || []));
+    ok(!ai.matchCp(cps, 'Никого').cp, 'незнакомое имя не подставляется');
+
+    // Деньги: счётчик и предел.
+    const before = ai.budget(uid);
+    await ai.understand('какая-то фраза для модели', uid);
+    ok(ai.budget(uid).mine === before.mine + 1, 'обращение к модели посчитано', ai.budget(uid).mine);
+    ok(ai.quickParse('кто должен') && (await ai.understand('кто должен', uid)).source === 'local',
+      'местный разбор расход не тратит');
+    const afterLocal = ai.budget(uid).mine;
+    ok(afterLocal === before.mine + 1, 'счётчик не вырос от местного разбора', afterLocal);
+
+    process.env.AI_USER_LIMIT = String(afterLocal);
+    intent = await ai.understand('ещё одна фраза для модели', uid);
+    ok(intent.source === 'limit', 'личный предел останавливает расход', intent.source);
+    delete process.env.AI_USER_LIMIT;
+
+    // Через бота: фраза открывает мастер, но документ не выписывается.
+    const cpA = bdbA.createCp(uid, { name: 'ООО «Тюльпан»', kind: 'customer', opening_date: '2026-01-01' });
+    process.env.AI_MOCK = JSON.stringify({
+      action: 'draft', docType: 'sch', who: 'Тюльпан',
+      items: [{ name: 'Обслуживание', qty: 1, price: 12000 }],
+    });
+    const docsBefore = bdbA.listDocs(uid, 99).length;
+    await say('надо выписать Тюльпану за обслуживание');
+    ok(bdbA.listDocs(uid, 99).length === docsBefore, 'документ сам не выписался',
+      bdbA.listDocs(uid, 99).length - docsBefore);
+    const st = bdbA.getState(uid);
+    ok(st.state === `items:sch:${cpA}`, 'открыт обычный мастер с этим клиентом', st.state);
+    ok(st.data.items.length === 1 && st.data.items[0].price === 12000, 'позиции подставлены',
+      JSON.stringify(st.data.items));
+    ok(norm(last()).includes('Проверьте'), 'бот просит проверить, а не отчитывается о выписке',
+      norm(last()).slice(0, 60));
+    await tap('menu');
+
+    delete process.env.AI_ENABLED;
+    delete process.env.AI_PROVIDER;
+    delete process.env.AI_MOCK;
+  }
+
   console.log('\n── регулярные документы ──');
   {
     const rec = require('./lib/recurring');

@@ -35,6 +35,7 @@ const mime = require('./lib/mime');
 const bank = require('./lib/bank-statement');
 const recurring = require('./lib/recurring');
 const bizTypes = require('./lib/biz-types');
+const ai = require('./lib/ai-agent');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -1588,6 +1589,70 @@ async function showBasis(tg, chatId, user) {
     ]));
 }
 
+// ---------- свободный ввод ----------
+
+/**
+ * Последняя попытка понять фразу, когда ни один разбор не сработал.
+ *
+ * Документ отсюда не выписывается никогда: в лучшем случае открывается
+ * обычный мастер с заполненными позициями, и человек нажимает ту же кнопку,
+ * что и всегда. Номера документов идут сквозным рядом — лишний счёт нельзя
+ * тихо удалить, дыру в нумерации придётся объяснять при проверке.
+ *
+ * @returns {Promise<boolean>} true — ответили, меню показывать не надо
+ */
+async function handleFreeText(tg, chatId, user, text) {
+  const intent = await ai.understand(text, user.id);
+
+  if (intent.action === 'debts') { await showDebts(tg, chatId, user); return true; }
+  if (intent.action === 'unpaid') { await showUnpaid(tg, chatId, user); return true; }
+  if (intent.action === 'help') return false;      // помощь и так в меню
+
+  if (intent.action === 'draft') {
+    const cps = bdb.listCps(user.id);
+    if (!cps.length) {
+      await tg.sendMessage(chatId, 'Сначала добавьте клиента — потом выпишем документ.',
+        keyboard([[{ text: '👤 Добавить клиента', data: 'cp.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return true;
+    }
+    const found = ai.matchCp(cps, intent.who);
+    if (found.choices) {
+      await tg.sendMessage(chatId, `Кого именно вы имели в виду — «${esc(intent.who)}»?`,
+        keyboard([...found.choices.map((c) => ([{ text: c.name.slice(0, 60), data: `d.${intent.docType}:${c.id}` }])),
+          [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return true;
+    }
+    if (!found.cp) {
+      // Имя не опознано — не угадываем, а показываем список: выписать
+      // документ не тому клиенту хуже, чем лишнее нажатие.
+      await startDoc(tg, chatId, user, intent.docType);
+      return true;
+    }
+
+    await startItems(tg, chatId, user, intent.docType, found.cp.id);
+    const items = docService.cleanItems(intent.items || []);
+    if (items.length) {
+      const st = bdb.getState(user.id);
+      if (st.state.startsWith('items:')) {
+        st.data.items = items;
+        bdb.setState(user.id, st.state, st.data);
+        await tg.sendMessage(chatId,
+          `Записал со слов:\n${items.map((it) => `• ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n')}`
+          + '\n\n<i>Проверьте: добавьте ещё позиции или нажмите «Готово».</i>');
+      }
+    }
+    return true;
+  }
+
+  if (intent.source === 'limit') {
+    await tg.sendMessage(chatId,
+      'Разбор фраз на этот месяц исчерпан — понимаю пока только команды и кнопки.\n\n'
+      + '<i>Операция вносится текстом: <code>15.06 приход 94193</code>.</i>');
+    return true;
+  }
+  return false;
+}
+
 // ---------- регулярные документы ----------
 
 /**
@@ -2506,7 +2571,11 @@ async function handleMessage(tg, msg) {
     return;
   }
 
-  // нет активного шага — показать меню
+  // Активного шага нет и ни один разбор не сработал — последняя попытка
+  // понять фразу. Стоит она либо ничего (местные шаблоны), либо одного
+  // обращения к модели в пределах месячного бюджета.
+  if (await handleFreeText(tg, chatId, user, text)) return;
+
   await tg.sendMessage(chatId, 'Выберите действие:', mainMenu());
 }
 
