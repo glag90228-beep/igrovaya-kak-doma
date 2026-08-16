@@ -95,14 +95,41 @@ for (const box of boxes) {
 }
 
 const working = candidates.filter((c) => boxes.some((b) => open(b.pass_enc, c.key) != null));
+const lines = valuesOf('MAIL_KEY');
 console.log('');
+
 if (!working.length) {
-  console.log('Ни один ключ не подошёл. Значит, тот, которым шифровали, из .env уже пропал —');
-  console.log('пароли придётся ввести заново: в боте «Почта» → подключить ящик.');
-} else if (working.length === 1 && !working[0].value) {
-  console.log('Работает запасной вариант из BOT_TOKEN — значит, шифровали при пустом MAIL_KEY.');
-  console.log('Оставьте в .env одну строку: MAIL_KEY= (пустую).');
+  console.log('❌ Ни один ключ не подошёл: тот, которым шифровали, из .env уже пропал.');
+  console.log('   Пароли придётся ввести заново — в боте «Почта» → подключить ящик.');
+  process.exit(1);
+}
+
+/*
+ * Главный вопрос — работает ли почта сейчас, а не «подходит ли хоть какой-то
+ * ключ». Действующий ключ тот же, что возьмёт приложение: последняя непустая
+ * строка MAIL_KEY, иначе запасной вариант из BOT_TOKEN.
+ */
+const effectiveValue = lines.filter(Boolean).pop() || '';
+const effective = candidates.find((c) => c.value === effectiveValue);
+const worksNow = effective && working.includes(effective);
+
+if (!worksNow) {
+  console.log('❌ Действующий ключ не тот: почта не работает прямо сейчас.');
+  console.log('   Оставьте в .env одну строку — рабочую:');
+  for (const w of working) console.log(`     MAIL_KEY=${w.value}`);
+  process.exit(1);
+}
+
+// Советовать уже сделанное нельзя: инструмент, который так делает,
+// перестают читать — и настоящую подсказку тоже пропустят.
+if (lines.length > 1) {
+  console.log(`Строк MAIL_KEY в .env: ${lines.length}, читается последняя, и она рабочая.`);
+  console.log('Почта работает; лишние строки можно убрать для порядка, оставив:');
+  console.log(`  MAIL_KEY=${effectiveValue}`);
+} else if (!effectiveValue) {
+  console.log('✅ Почта работает. Ключ отдельно не задан — он выведен из BOT_TOKEN.');
+  console.log('   Учтите: при смене токена бота пароли ящиков перестанут читаться.');
+  console.log('   Чтобы отвязаться, задайте свой MAIL_KEY и подключите ящик заново.');
 } else {
-  console.log('Оставьте в .env одну строку с рабочим ключом, остальные MAIL_KEY удалите:');
-  for (const w of working) console.log(`  MAIL_KEY=${w.value}`);
+  console.log('✅ Почта работает, в .env один MAIL_KEY — чистить нечего.');
 }
