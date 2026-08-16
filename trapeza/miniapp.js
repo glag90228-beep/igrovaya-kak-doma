@@ -38,6 +38,7 @@ const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
 const { forwardToSupport } = require('./lib/bot-support');
 const { formatRub } = require('./lib/money');
 const mime = require('./lib/mime');
+const bank = require('./lib/bank-statement');
 const reqCheck = require('./lib/requisites-check');
 const { round2 } = require('./lib/money');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
@@ -632,6 +633,74 @@ const api = {
     const guess = (f.inn && cps.find((c) => c.inn === f.inn))
       || (f.name && cps.find((c) => c.name.toLowerCase().includes(String(f.name).toLowerCase().slice(0, 8))));
     return { fields: f, cp: guess ? { id: guess.id, name: guess.name } : null };
+  },
+
+  /**
+   * Разбор банковской выписки.
+   *
+   * Ничего не заносим: только показываем, что нашли и кому это, по нашему
+   * мнению, относится. Решение остаётся за человеком — ошибочно закрытый
+   * долг всплывёт через месяц, когда клиент не заплатит.
+   */
+  async 'POST /api/bank/parse'({ user, body }) {
+    const m = /^data:([^;,]*);base64,(.+)$/s.exec(String(body.dataUrl || ''));
+    const raw = m ? m[2] : String(body.base64 || '');
+    if (!raw) return { error: 'Пришлите файл выписки: CSV, TXT из Клиент-Банка или OFX.' };
+
+    const org = bdb.getDefaultOrg(user.id);
+    const { format, rows } = bank.parseStatement(Buffer.from(raw, 'base64'), {
+      ownAccounts: [org && org.acc].filter(Boolean),
+    });
+    if (!rows.length) {
+      return {
+        error: 'В файле не нашлось операций. Подойдёт выгрузка «1С Клиент-Банк», '
+          + 'OFX или CSV, где есть колонки с датой и суммой.',
+      };
+    }
+
+    // Сальдо считаем по разу на контрагента: сведение сравнивает каждую
+    // строку с каждым, и пересчёт журнала внутри этого цикла означал бы
+    // тысячи лишних проходов по операциям.
+    const cps = bdb.listCps(user.id);
+    const debt = new Map();
+    for (const cp of cps) {
+      const b = bdb.balanceOf(user.id, cp.id);
+      debt.set(cp.id, b ? b.closing : 0);
+    }
+    const matched = bank.matchToCounterparties(rows, cps, (id) => debt.get(id) || 0);
+    const known = bdb.knownBankKeys(user.id, matched.map((t) => t.key));
+
+    return {
+      format,
+      total: rows.length,
+      outgoing: rows.filter((t) => !t.incoming).length,
+      rows: matched.map((t) => ({
+        key: t.key,
+        date: t.date,
+        amount: t.amount,
+        name: t.name,
+        inn: t.inn,
+        purpose: t.purpose,
+        doc: t.doc,
+        cp: t.cp,
+        confidence: t.confidence,
+        known: known.has(t.key),      // уже заносили — по умолчанию не отмечаем
+      })),
+    };
+  },
+
+  /** Занести подтверждённые строки выписки как оплаты. */
+  async 'POST /api/bank/import'({ user, body }) {
+    const rows = Array.isArray(body.rows) ? body.rows.slice(0, 500) : [];
+    if (!rows.length) return { error: 'Не выбрано ни одной строки.' };
+    const res = bdb.importBankRows(user.id, rows.map((r) => ({
+      key: str(r.key, 200),
+      cpId: Number(r.cpId),
+      amount: Number(r.amount),
+      date: str(r.date, 10),
+      doc: str(r.doc, 120),
+    })));
+    return { ...res, unpaid: bdb.debtors(user.id).length };
   },
 
   /**

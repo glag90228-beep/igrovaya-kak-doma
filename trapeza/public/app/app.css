@@ -420,6 +420,31 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .badge.ok { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success); }
 .badge.warn { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
 
+/* ---------- строка банковской выписки ---------- */
+
+/* Сумма и дата сверху, назначение платежа под ними, выбор клиента снизу:
+   человек сначала узнаёт платёж, а потом решает, чей он. Обратный порядок
+   заставлял бы выбирать клиента, ещё не прочитав, за что деньги. */
+.pay + .pay { border-top: 1px solid var(--hairline); }
+.pay .row { padding-bottom: 4px; }
+.pay-note {
+  padding: 0 var(--pad) 8px;
+  /* Назначение платежа длинное, но обрезать его нельзя: как раз в нём
+     стоит номер счёта, по которому платёж и опознают. */
+  overflow-wrap: anywhere;
+}
+.pay-pick { padding: 0 var(--pad) 12px; }
+.pay-pick select {
+  width: 100%;
+  min-height: var(--tap);
+  padding: 0 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-field);
+  background: var(--group);
+  color: var(--text);
+  font: 500 16px/1.4 var(--font);   /* меньше 16px — и iOS увеличит страницу */
+}
+
 /* ---------- нижняя навигация ---------- */
 
 .tabs {

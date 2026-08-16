@@ -360,6 +360,67 @@ async function main() {
     await call('POST', '/api/basis', { user: masha, body: { basis: 'closing' } });
   }
 
+  console.log('\n── банковская выписка ──');
+  {
+    // Контрагент с долгом: ровно та ситуация, ради которой выписку и грузят.
+    const cpId = (await call('POST', '/api/cp', {
+      user: masha, body: { name: 'ООО «Заря»', inn: '7701234560', kind: 'customer' },
+    })).json.cp.id;
+    await call('POST', '/api/op', {
+      user: masha, body: { cpId, kind: 'income', amount: 45000, date: '2026-08-01', doc: 'Акт № 5' },
+    });
+
+    const csv = [
+      'Дата;ИНН плательщика;Плательщик;Приход;Назначение платежа',
+      '05.08.2026;7701234560;ООО "Заря";45 000,00;Оплата по акту 5',
+      '06.08.2026;9999999999;ООО "Незнакомец";1 200,00;Оплата по счету 99',
+    ].join('\n');
+    const dataUrl = `data:text/csv;base64,${Buffer.from(csv, 'utf8').toString('base64')}`;
+
+    r = await call('POST', '/api/bank/parse', { user: masha, body: { dataUrl } });
+    ok(r.status === 200 && r.json.rows && r.json.rows.length === 2,
+      'выписка разобрана', JSON.stringify(r.json).slice(0, 120));
+    const zarya = r.json.rows[0];
+    const stranger = r.json.rows[1];
+    ok(zarya.cp && zarya.cp.id === cpId, 'плательщик сведён с контрагентом по ИНН');
+    ok(zarya.confidence >= 60, 'совпадение уверенное — строка будет отмечена', zarya.confidence);
+    ok(stranger.cp === null, 'незнакомый плательщик остался без контрагента');
+    ok(zarya.known === false, 'строка ещё не загружалась');
+
+    r = await call('POST', '/api/bank/import', {
+      user: masha,
+      body: { rows: [{ key: zarya.key, cpId, amount: zarya.amount, date: zarya.date, doc: 'Оплата' }] },
+    });
+    ok(r.status === 200 && r.json.added === 1, 'оплата занесена', JSON.stringify(r.json));
+    r = await call('GET', '/api/cps', { user: masha });
+    ok(r.json.cps.find((c) => c.id === cpId).balance === 0, 'долг закрылся оплатой из выписки');
+
+    // Главное свойство: тот же файл, загруженный второй раз, ничего не меняет.
+    r = await call('POST', '/api/bank/parse', { user: masha, body: { dataUrl } });
+    ok(r.json.rows[0].known === true, 'при повторном разборе строка помечена как загруженная');
+    r = await call('POST', '/api/bank/import', {
+      user: masha,
+      body: { rows: [{ key: zarya.key, cpId, amount: zarya.amount, date: zarya.date, doc: 'Оплата' }] },
+    });
+    ok(r.json.added === 0 && r.json.skipped === 1, 'повторная загрузка не задваивает оплату',
+      JSON.stringify(r.json));
+    r = await call('GET', '/api/cps', { user: masha });
+    ok(r.json.cps.find((c) => c.id === cpId).balance === 0, 'сальдо не ушло в минус');
+
+    // Чужой контрагент недоступен даже при подделанном cpId.
+    r = await call('POST', '/api/bank/import', {
+      user: petya,
+      body: { rows: [{ key: 'чужой|in|100.00|тест', cpId, amount: 100, date: '2026-08-05' }] },
+    });
+    ok(r.json.added === 0, 'в чужого контрагента оплату не занести', JSON.stringify(r.json));
+
+    r = await call('POST', '/api/bank/parse', {
+      user: masha, body: { dataUrl: 'data:text/csv;base64,0LrQsNC60LDRjy3RgtC+' },
+    });
+    ok(r.status === 400 && /не нашлось операций/.test(r.json.error || ''),
+      'файл без операций объясняет, что не так', (r.json || {}).error);
+  }
+
   console.log('\n── свой ящик и отправка на почту ──');
   {
     const net = require('node:net');

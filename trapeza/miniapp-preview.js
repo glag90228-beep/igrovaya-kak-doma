@@ -191,6 +191,28 @@ async function main() {
     SHOTS.push({ name: 'napominaniya', title: 'Напоминания', go: ['reminders', {}] });
     SHOTS.push({ name: 'podderzhka', title: 'Поддержка', go: ['support', {}] });
     SHOTS.push({ name: 'snimok', title: 'Снимок счёта', go: ['scan', {}] });
+    SHOTS.push({
+      name: 'vypiska',
+      title: 'Выписка из банка',
+      go: ['bank', {}],
+      // Показываем разобранную выписку: один платёж узнан по ИНН, второй
+      // только похож по названию, третий неизвестен — ровно те три случая,
+      // ради которых экран и сделан.
+      async act(page) {
+        await page.setInputFiles('input[type=file]', {
+          name: 'vypiska.csv',
+          mimeType: 'text/csv',
+          buffer: Buffer.from([
+            'Дата;ИНН плательщика;Плательщик;Приход;Назначение платежа',
+            '12.08.2026;1831234567;ООО "Заря";66 693,00;Оплата по счету 4 от 12.07.2026',
+            '13.08.2026;;Пирамида;34 193,00;Оплата по акту от 06.08.2026',
+            '14.08.2026;;ООО "Северный ветер";12 000,00;Оплата по счету 118',
+          ].join('\n'), 'utf8'),
+        });
+        await page.waitForSelector('.pay', { timeout: 10000 });
+        await page.waitForTimeout(300);
+      },
+    });
   }
   setTelegram({ async sendDocument() { return {}; } });
   await new Promise((r) => server.listen(0, r));
@@ -298,6 +320,12 @@ async function main() {
       if (shot.go) {
         await page.evaluate(([name, params]) => window.__go(name, params), shot.go);
         await page.waitForTimeout(400);
+      }
+      // Экран может показывать главное только после действия — например,
+      // выписка пуста, пока не загружен файл. Пустая витрина бесполезна.
+      if (shot.act) {
+        // eslint-disable-next-line no-await-in-loop
+        await shot.act(page);
       }
       if (shot.scroll === 'bottom') {
         await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));

@@ -1,0 +1,272 @@
+'use strict';
+
+/**
+ * Проверка разбора банковских выписок.
+ *
+ * Файлы собираем такими, какими их отдают банки: windows-1251, разделитель
+ * «точка с запятой», приход и расход в разных колонках, «ИНН получателя»
+ * рядом с «Получателем», суммы с неразрывными пробелами. Именно на этих
+ * мелочах разбор и ломается, поэтому проверяем на байтах, а не на удобных
+ * строках.
+ *
+ *   node bank-selftest.js
+ */
+
+const bank = require('./lib/bank-statement');
+
+let bad = 0;
+const ok = (cond, msg, extra) => {
+  console.log((cond ? '  ✅ ' : '  ❌ ') + msg + (cond || extra === undefined ? '' : ' → ' + extra));
+  if (!cond) bad += 1;
+};
+
+/** Текст → байты windows-1251: так выглядит настоящая выгрузка. */
+function cp1251(text) {
+  const map = new Map();
+  for (let b = 0; b < 256; b += 1) {
+    map.set(new TextDecoder('windows-1251').decode(Buffer.from([b])), b);
+  }
+  return Buffer.from([...text].map((ch) => (map.has(ch) ? map.get(ch) : 0x3F)));
+}
+
+console.log('\n=== Кодировка и мелочи ===');
+{
+  const utf8 = Buffer.from('Оплата по счёту', 'utf8');
+  ok(bank.decodeBytes(utf8) === 'Оплата по счёту', 'UTF-8 читается как есть');
+  ok(bank.decodeBytes(Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), utf8])) === 'Оплата по счёту', 'BOM отрезается');
+  ok(bank.decodeBytes(cp1251('Оплата по счету')) === 'Оплата по счету', 'windows-1251 распознаётся');
+}
+
+console.log('\n=== Даты ===');
+{
+  const cases = [
+    ['05.08.2026', '2026-08-05'],
+    ['2026-08-05', '2026-08-05'],
+    ['05/08/2026', '2026-08-05'],
+    ['05.08.26', '2026-08-05'],
+    ['20260805120000[+3:MSK]', '2026-08-05'],   // OFX
+    ['не дата', null],
+    ['', null],
+  ];
+  for (const [raw, want] of cases) {
+    ok(bank.parseDate(raw) === want, `дата «${raw}»`, String(bank.parseDate(raw)));
+  }
+}
+
+console.log('\n=== Суммы ===');
+{
+  const cases = [
+    ['1 234,56', 1234.56],
+    ['1234.56', 1234.56],
+    ['1,234.56', 1234.56],
+    ['-1 234,56 RUB', -1234.56],
+    ['1 000 000,00', 1000000],
+    ['45000.00', 45000],
+    ['1.500', 1500],            // точка разделяет разряды, а не копейки
+    ['100,5', 100.5],
+    ['', null],
+    ['—', null],
+  ];
+  for (const [raw, want] of cases) {
+    ok(bank.parseMoney(raw) === want, `сумма «${raw}»`, String(bank.parseMoney(raw)));
+  }
+}
+
+console.log('\n=== CSV: приход и расход в разных колонках (Сбер) ===');
+{
+  const csv = [
+    'Выписка по счёту 40702810900000012345 за период с 01.08.2026 по 16.08.2026',
+    '',
+    'Дата;ИНН плательщика;Плательщик;ИНН получателя;Получатель;Сумма по дебету;Сумма по кредиту;Назначение платежа',
+    '05.08.2026;7701234567;ООО "Заря";771112345678;ИП Петров П.П.;0,00;45 000,00;Оплата по счету № 12 от 01.08.2026. Без НДС',
+    '06.08.2026;771112345678;ИП Петров П.П.;7809876543;ООО "Аренда";12 500,00;0,00;Аренда за август',
+    '07.08.2026;5027123456;ООО "Восход";771112345678;ИП Петров П.П.;0,00;8 350,50;Оплата по договору 7 ИНН 5027123456',
+  ].join('\r\n');
+  const { format, rows } = bank.parseStatement(cp1251(csv));
+
+  ok(format === 'CSV', 'формат определён как CSV', format);
+  ok(rows.length === 3, 'разобрано 3 операции', rows.length);
+
+  const [a, b, c] = rows;
+  ok(a && a.date === '2026-08-05' && a.amount === 45000 && a.incoming === true,
+    'поступление 45 000 от 05.08', a && `${a.date} ${a.amount} in=${a.incoming}`);
+  ok(a && a.name === 'ООО "Заря"', 'контрагент прихода — плательщик', a && a.name);
+  ok(a && a.inn === '7701234567', 'ИНН прихода — плательщика', a && a.inn);
+  ok(b && b.incoming === false && b.amount === 12500, 'списание 12 500', b && `${b.amount} in=${b.incoming}`);
+  ok(b && b.name === 'ООО "Аренда"', 'контрагент расхода — получатель', b && b.name);
+  ok(b && b.inn === '7809876543', 'ИНН расхода — получателя', b && b.inn);
+  ok(c && c.amount === 8350.5, 'копейки не потерялись', c && c.amount);
+  ok(c && c.purpose.includes('Оплата по договору 7'), 'назначение сохранено', c && c.purpose);
+
+  // Заголовок «ИНН получателя» не должен утащить у себя колонку «Получатель».
+  ok(rows.every((r) => !/^\d+$/.test(r.name)), 'название контрагента — не число');
+}
+
+console.log('\n=== CSV: одна колонка суммы со знаком ===');
+{
+  const csv = [
+    'Дата операции,Тип операции,Контрагент,ИНН,Сумма операции,Назначение платежа',
+    '10.08.2026,Приход,"ООО ""Заря""",7701234567,"45000,00","Оплата по счету 12"',
+    '11.08.2026,Расход,ООО Аренда,7809876543,"-12500,00",Аренда',
+  ].join('\n');
+  const { rows } = bank.parseStatement(Buffer.from(csv, 'utf8'));
+  ok(rows.length === 2, 'разобрано 2 операции', rows.length);
+  ok(rows[0] && rows[0].incoming === true && rows[0].amount === 45000, 'приход по типу операции');
+  ok(rows[0] && rows[0].name === 'ООО "Заря"', 'удвоенные кавычки развёрнуты', rows[0] && rows[0].name);
+  ok(rows[1] && rows[1].incoming === false && rows[1].amount === 12500,
+    'расход: знак снят, направление сохранено', rows[1] && `${rows[1].amount} in=${rows[1].incoming}`);
+}
+
+console.log('\n=== OFX ===');
+{
+  const ofx = `<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><BANKTRANLIST>
+<STMTTRN><TRNTYPE>CREDIT<DTPOSTED>20260805120000[+3:MSK]<TRNAMT>45000.00
+<FITID>1<NAME>OOO Zarya<MEMO>Oplata po schetu 12, INN 7701234567</STMTTRN>
+<STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20260806000000<TRNAMT>-12500.00
+<FITID>2<NAME>Arenda<MEMO>Arenda za avgust</STMTTRN>
+</BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>`;
+  const { format, rows } = bank.parseStatement(Buffer.from(ofx, 'utf8'));
+  ok(format === 'OFX', 'формат определён как OFX', format);
+  ok(rows.length === 2, 'обе операции на месте (дата с хвостом разобрана)', rows.length);
+  ok(rows[0] && rows[0].date === '2026-08-05' && rows[0].incoming === true && rows[0].amount === 45000,
+    'поступление из OFX', rows[0] && `${rows[0].date} ${rows[0].amount}`);
+  ok(rows[0] && rows[0].inn === '7701234567', 'ИНН вытащен из назначения', rows[0] && rows[0].inn);
+  ok(rows[1] && rows[1].incoming === false, 'минус в TRNAMT — это списание');
+}
+
+console.log('\n=== 1CClientBankExchange ===');
+{
+  const txt = [
+    '1CClientBankExchange',
+    'ВерсияФормата=1.03',
+    'Кодировка=Windows',
+    'ДатаНачала=01.08.2026',
+    'ДатаКонца=16.08.2026',
+    'РасчСчет=40702810900000012345',
+    'СекцияРасчСчет',
+    'РасчСчет=40702810900000012345',
+    'НачальныйОстаток=10000.00',
+    'КонецРасчСчет',
+    'СекцияДокумент=Платежное поручение',
+    'Номер=155',
+    'Дата=05.08.2026',
+    'Сумма=45000.00',
+    'ПлательщикСчет=40702810100000099999',
+    'Плательщик=ООО "Заря"',
+    'ПлательщикИНН=7701234567',
+    'ПолучательСчет=40702810900000012345',
+    'Получатель=ИП Петров Пётр Петрович',
+    'ПолучательИНН=771112345678',
+    'НазначениеПлатежа=Оплата по счету № 12 от 01.08.2026. Без НДС',
+    'КонецДокумента',
+    'СекцияДокумент=Платежное поручение',
+    'Номер=156',
+    'Дата=06.08.2026',
+    'Сумма=12500.00',
+    'ПлательщикСчет=40702810900000012345',
+    'Плательщик=ИП Петров Пётр Петрович',
+    'ПлательщикИНН=771112345678',
+    'ПолучательСчет=40702810700000088888',
+    'Получатель=ООО "Аренда"',
+    'ПолучательИНН=7809876543',
+    'НазначениеПлатежа=Аренда за август',
+    'КонецДокумента',
+    'КонецФайла',
+    '',
+  ].join('\r\n');
+  const { format, rows } = bank.parseStatement(cp1251(txt));
+
+  ok(format === '1C', 'формат определён как 1C', format);
+  ok(rows.length === 2, 'оба документа разобраны', rows.length);
+  ok(rows[0] && rows[0].incoming === true, 'наш счёт в получателях → это приход');
+  ok(rows[0] && rows[0].name === 'ООО "Заря"' && rows[0].inn === '7701234567',
+    'контрагент прихода — плательщик', rows[0] && `${rows[0].name} / ${rows[0].inn}`);
+  ok(rows[0] && rows[0].doc === '155', 'номер платёжного поручения сохранён', rows[0] && rows[0].doc);
+  ok(rows[1] && rows[1].incoming === false && rows[1].name === 'ООО "Аренда"',
+    'наш счёт в плательщиках → это расход', rows[1] && `${rows[1].name} in=${rows[1].incoming}`);
+
+  // Свой счёт из карточки организации важнее того, что объявлено в файле.
+  const other = bank.parseStatement(cp1251(txt), { ownAccounts: ['40702810700000088888'] });
+  ok(other.rows[1] && other.rows[1].incoming === true,
+    'свой счёт задан снаружи — направление пересчитано');
+}
+
+console.log('\n=== Повторная загрузка ===');
+{
+  const csv = [
+    'Дата;Плательщик;ИНН плательщика;Приход;Назначение платежа',
+    '05.08.2026;ООО "Заря";7701234567;45 000,00;Оплата по счету 12',
+    '05.08.2026;ООО "Заря";7701234567;45 000,00;Оплата по счету 12',
+    '06.08.2026;ООО "Восход";5027123456;8 350,50;Оплата по счету 13',
+  ].join('\n');
+  const first = bank.parseStatement(cp1251(csv)).rows;
+  const again = bank.parseStatement(cp1251(csv)).rows;
+
+  ok(first.length === 3, 'два одинаковых платежа за день не склеились', first.length);
+  ok(new Set(first.map((r) => r.key)).size === 3, 'ключи внутри файла различны');
+  ok(first.map((r) => r.key).join('|') === again.map((r) => r.key).join('|'),
+    'повторная загрузка даёт те же ключи — задвоения не будет');
+
+  // Так это работает при импорте: уже загруженные ключи просто пропускаем.
+  const imported = new Set(first.map((r) => r.key));
+  ok(again.filter((r) => !imported.has(r.key)).length === 0, 'при втором импорте новых строк нет');
+}
+
+console.log('\n=== Сведение с контрагентами ===');
+{
+  const cps = [
+    { id: 1, name: 'Заря', inn: '7701234567' },
+    { id: 2, name: 'ООО «Восход»', inn: '5027123456' },
+    { id: 3, name: 'Ромашка', inn: '' },
+  ];
+  const debts = { 1: 45000, 2: 100000, 3: 3000 };
+  const rows = [
+    { date: '2026-08-05', amount: 45000, incoming: true, name: 'ООО "Заря"', inn: '7701234567', purpose: 'Оплата по счету 12' },
+    { date: '2026-08-06', amount: 8350.5, incoming: true, name: 'Восход, ООО', inn: '', purpose: 'Оплата по счету 13' },
+    { date: '2026-08-07', amount: 1000, incoming: true, name: 'Иванов И.И.', inn: '', purpose: 'Возврат' },
+    { date: '2026-08-08', amount: 5000, incoming: false, name: 'ООО "Заря"', inn: '7701234567', purpose: 'Возврат аванса' },
+  ];
+  const matched = bank.matchToCounterparties(rows, cps, (id) => debts[id] || 0);
+
+  ok(matched.length === 3, 'списания в сведение не идут', matched.length);
+  ok(matched[0].cp && matched[0].cp.id === 1, 'ИНН + сумма долга → контрагент найден');
+  ok(matched[0].confidence >= 85, 'уверенность высокая', matched[0].confidence);
+  ok(matched[1].cp && matched[1].cp.id === 2, '«Восход, ООО» = «ООО «Восход»» по названию');
+  ok(matched[1].confidence < 60,
+    'название без ИНН и без совпадения суммы — только подсказка, не отметка', matched[1].confidence);
+  ok(matched[2].cp === null, 'незнакомый плательщик остался без контрагента',
+    matched[2].cp && matched[2].cp.name);
+
+  // Точное название плюс сумма ровно в размер долга: ИНН в выписке нет, но
+  // сомневаться уже не в чем — такую строку приложение отмечает само.
+  const exact = bank.matchToCounterparties(
+    [{ date: '2026-08-09', amount: 3000, incoming: true, name: 'Ромашка', inn: '', purpose: 'Оплата' }],
+    cps, (id) => debts[id] || 0,
+  );
+  ok(exact[0].cp && exact[0].cp.id === 3 && exact[0].confidence >= 60,
+    'точное имя и точная сумма долга — уверенное совпадение', exact[0].confidence);
+
+  // А одна лишь совпавшая сумма без узнаваемого имени — не повод.
+  const amountOnly = bank.matchToCounterparties(
+    [{ date: '2026-08-09', amount: 3000, incoming: true, name: 'Кто-то', inn: '', purpose: '' }],
+    cps, (id) => debts[id] || 0,
+  );
+  ok(!amountOnly[0].cp || amountOnly[0].confidence < 60,
+    'совпадение только по сумме отметку не ставит', amountOnly[0].confidence);
+
+  ok(bank.similarity('ООО "Заря"', 'Заря') === 1, 'форма собственности не мешает сравнению',
+    bank.similarity('ООО "Заря"', 'Заря'));
+  ok(bank.similarity('ИП Петров', 'ООО Петров') === 1, 'ИП и ООО с одним именем неотличимы по названию');
+  ok(bank.similarity('Заря', 'Восход') === 0, 'разные названия не похожи');
+}
+
+console.log('\n=== Мусор на входе ===');
+{
+  ok(bank.parseStatement(Buffer.from('', 'utf8')).rows.length === 0, 'пустой файл');
+  ok(bank.parseStatement(Buffer.from('просто текст без таблицы', 'utf8')).rows.length === 0, 'не выписка');
+  ok(bank.parseStatement(Buffer.from('a;b;c\n1;2;3', 'utf8')).rows.length === 0, 'таблица без даты и суммы');
+  ok(bank.parseStatement(cp1251('Дата;Сумма\n05.08.2026;0,00')).rows.length === 0, 'нулевая строка пропущена');
+}
+
+console.log(bad === 0 ? '\n✅ Разбор выписок: все проверки прошли\n' : `\n❌ Ошибок: ${bad}\n`);
+process.exit(bad === 0 ? 0 : 1);

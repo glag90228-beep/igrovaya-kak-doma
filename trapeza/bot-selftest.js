@@ -1454,6 +1454,54 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await tap('fx.del:sign');
   ok(!fxLib.get(fxUser.id, 'sign'), 'подпись убирается кнопкой');
 
+  console.log('\n── выписка файлом в чат ──');
+  {
+    const bdbB = require('./lib/bot-db');
+    const uid = fxUserId();
+    const cpB = bdbB.createCp(uid, {
+      name: 'ООО «Ветер»', inn: '7701234560', kind: 'customer', opening_date: '2026-01-01',
+    });
+    bdbB.addOp(uid, cpB, { date: '2026-08-01', kind: 'Приход', doc: 'Акт 9', credit: 31000 });
+
+    const csv = [
+      'Дата;ИНН плательщика;Плательщик;Приход;Назначение платежа',
+      '05.08.2026;7701234560;ООО "Ветер";31 000,00;Оплата по акту 9',
+      '06.08.2026;;Неизвестный;700,00;Возврат',
+    ].join('\n');
+    tg.downloadFile = async () => Buffer.from(csv, 'utf8');
+    const statement = (name) => handleUpdate(tg, {
+      message: { chat: CHAT, from: USER, document: { file_id: 'st-1', file_name: name, file_size: csv.length } },
+    });
+
+    // Кнопки ищем только в последнем сообщении: button() смотрит всю
+    // переписку и нашёл бы кнопку из прошлого разбора.
+    const lastButtons = () => ((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.text).join(' | ');
+
+    await statement('vypiska.csv');
+    ok(norm(last()).includes('Узнал уверенно (1)'), 'бот разобрал выписку и узнал плательщика',
+      norm(last()).slice(0, 80));
+    ok(norm(last()).includes('ООО «Ветер»') && norm(last()).includes('31 000,00'),
+      'в сводке видно кто и сколько', norm(last()).slice(-60));
+    ok(norm(last()).includes('Ещё 1 поступление'), 'про непривязанные строки сказано отдельно');
+    ok(lastButtons().includes('Занести 1 оплату'), 'есть кнопка занести уверенные', lastButtons());
+
+    await tap('bank:take');
+    ok(last().includes('Занёс 1 оплату'), 'оплата занесена по кнопке', last().slice(0, 60));
+    ok(bdbB.balanceOf(uid, cpB).closing === 0, 'долг закрылся',
+      bdbB.balanceOf(uid, cpB).closing);
+
+    // Тот же файл второй раз: в учёте задвоенная оплата хуже ненайденной.
+    await statement('vypiska.csv');
+    ok(norm(last()).includes('Уже занесено раньше: 1'), 'повтор узнан', norm(last()).slice(0, 80));
+    ok(!lastButtons().includes('Занести'), 'кнопки занести уже занесённое нет', lastButtons());
+    ok(bdbB.balanceOf(uid, cpB).closing === 0, 'сальдо после повтора не изменилось',
+      bdbB.balanceOf(uid, cpB).closing);
+
+    tg.downloadFile = async () => Buffer.from('это не выписка, а записка', 'utf8');
+    await statement('zametki.txt');
+    ok(last().includes('ни одной операции'), 'на посторонний файл понятный ответ', last().slice(0, 60));
+  }
+
   console.log('\n── изоляция пользователей ──');
   const OTHER = { id: 777002, first_name: 'Чужой', username: 'other' };
   await handleUpdate(tg, { message: { chat: { id: 777002 }, from: OTHER, text: '/start' } });

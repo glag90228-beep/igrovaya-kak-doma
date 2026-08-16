@@ -914,6 +914,12 @@ screens.more = async function more() {
       onclick: () => go('registry'),
     }),
     navRow({
+      icon: 'box',
+      title: 'Выписка из банка',
+      sub: 'отметить оплаты по выгрузке',
+      onclick: () => go('bank'),
+    }),
+    navRow({
       icon: 'search',
       title: 'Снимок счёта',
       sub: 'сфотографировать и разобрать',
@@ -1483,6 +1489,152 @@ screens.support = async function support() {
  * перебивать их руками. Работает, только если подключён внешний сервис —
  * и об этом говорим прямо, а не молчим.
  */
+/**
+ * Загрузка банковской выписки.
+ *
+ * Экран показывает найденные поступления и то, кому они, по нашему мнению,
+ * относятся, — но ничего не заносит сам. Галочки проставлены только там, где
+ * клиент угадан уверенно; остальное человек либо выбирает руками, либо
+ * оставляет как есть. Автоматически закрытый не тот долг обнаруживается
+ * через месяц и стоит дороже, чем минута на проверку.
+ */
+screens.bank = async function bankScreen() {
+  const box = h('div', {}, h('h1', { text: 'Выписка из банка' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Выгрузите выписку в интернет-банке и пришлите файл: 1С «Клиент-Банк», OFX '
+      + 'или CSV. Найду поступления, покажу, от кого они, — отметите нужные, и они '
+      + 'попадут в журнал как оплаты.' }));
+
+  const cps = (await api('GET', '/api/cps')).cps || [];
+  const input = h('input', {
+    type: 'file',
+    accept: '.csv,.txt,.ofx,.qfx,text/csv,text/plain',
+    style: 'display:none',
+  });
+  const pick = h('button', { class: 'btn' }, 'Выбрать файл выписки');
+  const result = h('div', {});
+  pick.onclick = () => input.click();
+
+  input.addEventListener('change', async () => {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    if (file.size > 1.4 * 1024 * 1024) {
+      result.replaceChildren(h('div', { class: 'banner' }, icon('warn'),
+        h('div', { text: 'Файл больше 1,4 МБ. Выгрузите выписку за месяц, а не за год.' })));
+      return;
+    }
+    result.replaceChildren(h('div', { class: 'boot' }, h('span', { class: 'spinner' }), 'Читаю выписку…'));
+    try {
+      const dataUrl = await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onload = () => resolve(String(fr.result));
+        fr.onerror = () => reject(new Error('Не удалось прочитать файл.'));
+        fr.readAsDataURL(file);        // байты как есть: кодировку разберёт сервер
+      });
+      const r = await api('POST', '/api/bank/parse', { dataUrl });
+      result.replaceChildren(bankRows(r, cps));
+      haptic('medium');
+    } catch (e) {
+      result.replaceChildren(h('div', { class: 'banner' }, icon('warn'), h('div', { text: e.message })));
+    }
+  });
+
+  box.append(h('div', { class: 'btn-wrap' }, pick), input, result);
+  return box;
+};
+
+/** Разобранная выписка: список поступлений с выбором клиента. */
+function bankRows(r, cps) {
+  const box = h('div', {});
+  const fresh = r.rows.filter((t) => !t.known);
+
+  const sum = fresh.reduce((a, t) => a + t.amount, 0);
+  box.append(h('div', { class: 'hero' },
+    h('div', { class: 'sum money in', text: money0(sum) }),
+    // «Найдено», а не «занесено»: крупная зелёная сумма иначе читается как
+    // итог операции, хотя в журнал попадёт только отмеченное ниже.
+    h('div', { class: 'sub',
+      text: `найдено ${fresh.length} ${plural(fresh.length, 'поступление', 'поступления', 'поступлений')}`
+        + ` · разобрано строк ${r.total}`
+        + (r.outgoing ? `, списаний ${r.outgoing}` : '')
+        + (r.rows.length - fresh.length ? `, уже загружено ${r.rows.length - fresh.length}` : '') })));
+
+  if (!fresh.length) {
+    box.append(empty('check', 'Новых поступлений нет',
+      'Все строки этой выписки уже занесены в журнал — повторно они не пройдут.'));
+    return box;
+  }
+
+  const chosen = new Map();          // key → cpId
+  const card = h('div', { class: 'card' });
+  const save = h('button', { class: 'btn' }, 'Занести оплаты');
+  const relabel = () => {
+    const n = chosen.size;
+    save.textContent = n
+      ? `Занести ${n} ${plural(n, 'оплату', 'оплаты', 'оплат')}`
+      : 'Выберите клиентов';
+    save.disabled = !n;
+  };
+
+  for (const t of fresh) {
+    // Предполагаемого клиента ставим первым в списке и подписываем: строка
+    // сама его не выберет, но искать его среди полусотни имён не придётся.
+    const order = t.cp
+      ? [...cps.filter((c) => c.id === t.cp.id), ...cps.filter((c) => c.id !== t.cp.id)]
+      : cps;
+    const sel = h('select', {},
+      h('option', { value: '', text: '— не заносить —' }),
+      order.map((c) => h('option', {
+        value: String(c.id),
+        text: t.cp && c.id === t.cp.id && t.confidence < 60 ? `${c.name} — похоже` : c.name,
+      })));
+    // Уверенное совпадение отмечаем сразу, сомнительное показываем, но не
+    // выбираем: молча угаданный клиент — это и есть ошибочная проводка.
+    if (t.cp && t.confidence >= 60) {
+      sel.value = String(t.cp.id);
+      chosen.set(t.key, t.cp.id);
+    }
+    sel.onchange = () => {
+      if (sel.value) chosen.set(t.key, Number(sel.value));
+      else chosen.delete(t.key);
+      relabel();
+      haptic();
+    };
+
+    card.append(h('div', { class: 'pay' },
+      h('div', { class: 'row' },
+        h('span', { class: 'grow' },
+          h('div', { class: 'ellipsis', text: t.name || 'без названия' }),
+          h('div', { class: 'sub-line' },
+            h('span', { class: 'small muted nowrap', text: ru(t.date) }),
+            // Кого именно предлагаем — видно в списке ниже, поэтому здесь
+            // только повод присмотреться, без имени: оно всё равно не
+            // помещается в строку и обрывается многоточием.
+            t.cp && t.confidence < 60 && h('span', { class: 'badge', text: 'проверьте клиента' }),
+            !t.cp && h('span', { class: 'badge', text: 'клиент не найден' }))),
+        h('span', { class: 'money in nowrap', text: money(t.amount) })),
+      t.purpose && h('div', { class: 'pay-note small muted', text: t.purpose }),
+      h('div', { class: 'pay-pick' }, sel)));
+  }
+  relabel();
+
+  save.onclick = () => withBusy(save, async () => {
+    const rows = fresh.filter((t) => chosen.has(t.key)).map((t) => ({
+      key: t.key, cpId: chosen.get(t.key), amount: t.amount, date: t.date,
+      doc: t.doc ? `Оплата, п/п № ${t.doc}` : 'Оплата по выписке',
+    }));
+    if (!rows.length) { toast('Не выбран ни один клиент', true); return; }
+    const res = await api('POST', '/api/bank/import', { rows });
+    haptic('medium');
+    toast(res.added
+      ? `Занесено ${res.added} ${plural(res.added, 'оплата', 'оплаты', 'оплат')}`
+      : 'Ничего не занесено');
+    reset('debts');
+  });
+  box.append(card, h('div', { class: 'btn-wrap' }, save));
+  return box;
+}
+
 screens.scan = async function scan() {
   const box = h('div', {}, h('h1', { text: 'Снимок счёта' }));
   box.append(h('p', { class: 'small muted', style: 'margin:0 18px',

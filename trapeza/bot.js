@@ -32,6 +32,7 @@ const mailer = require('./lib/mail');
 const mailbox = require('./lib/mailbox');
 const { fetchNew } = require('./lib/imap');
 const mime = require('./lib/mime');
+const bank = require('./lib/bank-statement');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -1664,6 +1665,91 @@ async function acceptFacsimile(tg, chatId, user, msg, kind) {
   await showFacsimile(tg, chatId, user);
 }
 
+// ---------- банковская выписка, присланная файлом ----------
+
+/**
+ * Похоже ли вложение на выписку.
+ *
+ * Смотрим на имя, а не на mime: Telegram отдаёт для выгрузок из банка то
+ * text/plain, то application/octet-stream, то вовсе ничего.
+ */
+const STATEMENT_FILE = /\.(csv|txt|ofx|qfx)$/i;
+
+/**
+ * Разбор выписки прямо в чате.
+ *
+ * В чате занести можно только уверенные совпадения — те, где сошёлся ИНН
+ * или точное название вместе с точной суммой долга. Остальное отправляем в
+ * приложение: перебирать десяток платежей кнопками мучительно, а угадывать
+ * за человека нельзя.
+ */
+async function handleStatement(tg, chatId, user, msg) {
+  const doc = msg.document;
+  if (doc.file_size > 2 * 1024 * 1024) {
+    await tg.sendMessage(chatId, 'Файл больше 2 МБ — выгрузите выписку за месяц, а не за год.');
+    return;
+  }
+  await tg.sendChatAction(chatId, 'typing');
+
+  const buf = await tg.downloadFile(doc.file_id, 2 * 1024 * 1024);
+  const org = bdb.getDefaultOrg(user.id);
+  const { format, rows } = bank.parseStatement(buf, { ownAccounts: [org && org.acc].filter(Boolean) });
+  if (!rows.length) {
+    await tg.sendMessage(chatId,
+      'Не нашёл в файле ни одной операции.\n\n'
+      + 'Подойдёт выгрузка «1С Клиент-Банк», OFX или CSV, где есть колонки с датой и суммой. '
+      + 'В интернет-банке это обычно «Экспорт» → «1С».', mainMenu());
+    return;
+  }
+
+  const cps = bdb.listCps(user.id);
+  const debt = new Map();
+  for (const cp of cps) {
+    const b = bdb.balanceOf(user.id, cp.id);
+    debt.set(cp.id, b ? b.closing : 0);
+  }
+  const matched = bank.matchToCounterparties(rows, cps, (id) => debt.get(id) || 0);
+  const known = bdb.knownBankKeys(user.id, matched.map((t) => t.key));
+  const fresh = matched.filter((t) => !known.has(t.key));
+  const sure = fresh.filter((t) => t.cp && t.confidence >= 60);
+
+  const lines = [`Выписка ${format}: строк ${rows.length}, поступлений ${matched.length}.`];
+  if (matched.length !== fresh.length) {
+    lines.push(`Уже занесено раньше: ${matched.length - fresh.length}.`);
+  }
+  if (!fresh.length) {
+    lines.push('', 'Новых поступлений нет — повторно они не пройдут.');
+    await tg.sendMessage(chatId, lines.join('\n'), mainMenu());
+    return;
+  }
+
+  if (sure.length) {
+    lines.push('', `<b>Узнал уверенно (${sure.length}):</b>`);
+    for (const t of sure.slice(0, 15)) {
+      lines.push(`• ${ru(t.date)} — ${esc(t.cp.name)} — <b>${formatRub(t.amount)}</b>`);
+    }
+    if (sure.length > 15) lines.push(`…и ещё ${sure.length - 15}`);
+  }
+  const rest = fresh.length - sure.length;
+  if (rest) {
+    lines.push('', `Ещё ${rest} ${plural(rest, 'поступление', 'поступления', 'поступлений')} `
+      + 'не удалось привязать к клиенту наверняка — это видно в приложении.');
+  }
+
+  // Строки кладём в состояние: кнопка нажимается позже, а файла к тому
+  // времени уже нет.
+  bdb.setState(user.id, 'bank', {
+    rows: sure.map((t) => ({ key: t.key, cpId: t.cp.id, amount: t.amount, date: t.date, doc: t.doc })),
+  });
+
+  const app = webAppUrl();
+  await tg.sendMessage(chatId, lines.join('\n'), keyboard([
+    ...(sure.length ? [[{ text: `✅ Занести ${sure.length} ${plural(sure.length, 'оплату', 'оплаты', 'оплат')}`, data: 'bank:take' }]] : []),
+    ...(app ? [[{ text: '📱 Разобрать в приложении', webApp: app }]] : []),
+    [{ text: '⬅️ Меню', data: 'menu' }],
+  ]));
+}
+
 async function handlePhoto(tg, chatId, user, msg) {
   // Ждём снимок подписи или печати — тогда это не счёт для распознавания.
   const st = bdb.getState(user.id);
@@ -2086,6 +2172,12 @@ async function route(tg, update) {
     bdb.markActive(user.id);
     return handlePhoto(tg, msg.chat.id, user, msg);
   }
+  if (msg.document && STATEMENT_FILE.test(msg.document.file_name || '')) {
+    const from = msg.from || {};
+    const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
+    bdb.markActive(user.id);
+    return handleStatement(tg, msg.chat.id, user, msg);
+  }
   if (msg.text) return handleMessage(tg, msg);
   return undefined;
 }
@@ -2320,6 +2412,22 @@ async function handleCallback(tg, cq) {
 
   try {
     if (data === 'menu') { bdb.clearState(user.id); await tg.sendMessage(chatId, 'Главное меню:', mainMenu()); return; }
+    if (data === 'bank:take') {
+      const st = bdb.getState(user.id);
+      const rows = st.state === 'bank' && Array.isArray(st.data.rows) ? st.data.rows : [];
+      bdb.clearState(user.id);
+      if (!rows.length) {
+        await tg.sendMessage(chatId, 'Выписка уже не в работе — пришлите файл заново.', mainMenu());
+        return;
+      }
+      const res = bdb.importBankRows(user.id, rows);
+      await tg.sendMessage(chatId,
+        res.added
+          ? `✅ Занёс ${res.added} ${plural(res.added, 'оплату', 'оплаты', 'оплат')} в журнал.`
+            + (res.skipped ? `\nПропущено (уже были): ${res.skipped}.` : '')
+          : 'Ничего не занёс — эти оплаты уже есть в журнале.', mainMenu());
+      return;
+    }
     if (data === 'help') {
       const q = bdb.quota(user.id);
       await tg.sendMessage(chatId,

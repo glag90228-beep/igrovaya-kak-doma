@@ -81,6 +81,24 @@ function migrate() {
       used_at  TEXT    NOT NULL DEFAULT ''
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tpl_uniq ON item_templates(user_id, name);
+
+    -- Строки банковской выписки, уже занесённые в журнал.
+    --
+    -- Хранить приходится не сами строки, а их ключи: выписку за месяц
+    -- выгружают повторно ради последних дней, и без такой памяти каждая
+    -- загрузка задваивала бы все прошлые оплаты. Уникальный индекс — не
+    -- перестраховка: он держит правило даже тогда, когда приложение
+    -- пришлёт одну и ту же строку дважды.
+    CREATE TABLE IF NOT EXISTS bank_imports (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+      key        TEXT    NOT NULL,             -- дата|направление|сумма|назначение
+      op_id      INTEGER NOT NULL DEFAULT 0,
+      cp_id      INTEGER NOT NULL DEFAULT 0,
+      amount     REAL    NOT NULL DEFAULT 0,
+      created_at TEXT    NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_bank_uniq ON bank_imports(user_id, key);
   `);
 
   // Заблокировавшие бота: рассылать им бессмысленно, а каждая попытка —
@@ -247,14 +265,16 @@ function getCp(userId, id) {
 
 // ---------- операции контрагента (с проверкой владельца) ----------
 
+/** @returns {number} id созданной операции — нужен импорту выписки. */
 function addOp(userId, cpId, op) {
   const cp = getCp(userId, cpId);
   if (!cp) throw new Error('Контрагент не найден');
   const sort = db.prepare('SELECT COALESCE(MAX(sort),-1)+1 AS s FROM operations WHERE cp_id = ?').get(cpId).s;
-  db.prepare(`INSERT INTO operations(cp_id, date, kind, doc, debit, credit, note, sort)
+  const info = db.prepare(`INSERT INTO operations(cp_id, date, kind, doc, debit, credit, note, sort)
               VALUES(?,?,?,?,?,?,?,?)`)
     .run(cpId, op.date, op.kind || '', op.doc || '', Number(op.debit) || 0, Number(op.credit) || 0,
       op.note || '', sort);
+  return Number(info.lastInsertRowid);
 }
 function listOps(userId, cpId) {
   const cp = getCp(userId, cpId);
@@ -267,7 +287,71 @@ function deleteLastOp(userId, cpId) {
   const row = db.prepare('SELECT id FROM operations WHERE cp_id = ? ORDER BY date DESC, sort DESC, id DESC LIMIT 1').get(cpId);
   if (!row) return false;
   db.prepare('DELETE FROM operations WHERE id = ?').run(row.id);
+  // Если операция пришла из выписки, забываем и отметку о загрузке: иначе
+  // отменённую по ошибке оплату больше не загрузить — строка навсегда
+  // числится импортированной.
+  db.prepare('DELETE FROM bank_imports WHERE user_id = ? AND op_id = ?').run(userId, row.id);
   return true;
+}
+
+// ---------- банковская выписка ----------
+
+/** Какие строки выписки уже заносили: их показываем как загруженные. */
+function knownBankKeys(userId, keys) {
+  const out = new Set();
+  if (!keys || !keys.length) return out;
+  const stmt = db.prepare('SELECT 1 AS y FROM bank_imports WHERE user_id = ? AND key = ?');
+  for (const k of keys) {
+    if (k && stmt.get(userId, String(k))) out.add(String(k));
+  }
+  return out;
+}
+
+/**
+ * Занести подтверждённые человеком строки выписки в журнал.
+ *
+ * Отметка о загрузке ставится первой и в той же транзакции, что и проводка:
+ * если строку уже заносили, уникальный индекс не даст вставить отметку, и
+ * оплаты не будет. Порядок именно такой, потому что при обратном между
+ * двумя запросами помещается второй такой же запрос — и платёж задваивается.
+ *
+ * @returns {{added: number, skipped: number}}
+ */
+function importBankRows(userId, rows) {
+  const now = new Date().toISOString();
+  const remember = db.prepare(
+    'INSERT OR IGNORE INTO bank_imports(user_id, key, op_id, cp_id, amount, created_at) VALUES(?,?,?,?,?,?)',
+  );
+  const link = db.prepare('UPDATE bank_imports SET op_id = ? WHERE user_id = ? AND key = ?');
+  let added = 0;
+  let skipped = 0;
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const r of rows || []) {
+      const key = String(r && r.key ? r.key : '');
+      const cp = key ? getCp(userId, Number(r.cpId)) : null;
+      const amount = Math.round(Math.abs(Number(r && r.amount) || 0) * 100) / 100;
+      if (!cp || !amount) { skipped += 1; continue; }
+
+      if (!remember.run(userId, key, 0, cp.id, amount, now).changes) { skipped += 1; continue; }
+      const opId = addOp(userId, cp.id, {
+        date: /^\d{4}-\d{2}-\d{2}$/.test(r.date || '') ? r.date : now.slice(0, 10),
+        kind: 'Оплата',
+        doc: String(r.doc || 'Оплата по выписке').slice(0, 120),
+        debit: amount,
+        credit: 0,
+        note: 'банковская выписка',
+      });
+      link.run(opId, userId, key);
+      added += 1;
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return { added, skipped };
 }
 
 // ---------- связь документов с журналом ----------
@@ -608,6 +692,7 @@ module.exports = {
   createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp,
   addOp, listOps, deleteLastOp, balanceOf, debtors,
+  knownBankKeys, importBankRows,
   DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
   markPaid, unmarkPaid, unpaidDocs, docsBetween,
   markBlocked, markActive, isBlocked, reachableUsers, findUserByUsername,
