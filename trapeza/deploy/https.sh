@@ -20,7 +20,10 @@ say "2/4 Проверяю, что домен смотрит сюда"
 MY_V4=$(curl -s -4 --max-time 10 https://api.ipify.org || true)
 MY_V6=$(curl -s -6 --max-time 10 https://api64.ipify.org || true)
 DNS_V4=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}' || true)
-DNS_V6=$(getent ahostsv6 "$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}' || true)
+# ::ffff:1.2.3.4 — это не AAAA, а обычный IPv4 в обёртке IPv6: так getent
+# отвечает, когда настоящей AAAA у домена нет. Без фильтра проверка видит
+# «AAAA ведёт не туда» на ровном месте и пугает на пустом домене.
+DNS_V6=$(getent ahostsv6 "$DOMAIN" 2>/dev/null | awk '$1 !~ /^::ffff:/ {print $1; exit}' || true)
 echo "  сервер: IPv4 ${MY_V4:-—}, IPv6 ${MY_V6:-нет}"
 echo "  домен:  A ${DNS_V4:-нет}, AAAA ${DNS_V6:-нет}"
 
