@@ -449,6 +449,28 @@ screens.doc = async function docScreen({ id }) {
         class: 'btn secondary',
         onclick: () => go('new', { type: d.type, cpId: d.cpId, items: d.items }),
       }, 'Повторить новым номером')));
+
+    // Повторение заводится отсюда: позиции уже проверены человеком, остаётся
+    // выбрать день. 29–31 в списке нет — таких чисел нет в каждом месяце.
+    const days = h('div', { class: 'card', hidden: true },
+      [1, 5, 10, 15, 20, 25, 0].map((day) => h('button', {
+        class: 'row',
+        onclick: (e) => withBusy(e.currentTarget, async () => {
+          const r = await api('POST', '/api/recurring', { docId: d.id, day });
+          haptic('medium');
+          toast(`Буду напоминать ${r.dayText}`);
+          go('recurring');
+        }),
+      },
+      h('span', { class: 'icon-box' }, icon('clock')),
+      h('span', { class: 'grow', text: day ? `${day}-го числа` : 'В последний день месяца' }))));
+
+    const repeat = h('button', { class: 'btn ghost' }, 'Повторять каждый месяц');
+    repeat.onclick = () => {
+      days.hidden = !days.hidden;
+      haptic();
+    };
+    box.append(h('div', { class: 'btn-wrap' }, repeat), days);
   }
 
   /*
@@ -920,6 +942,14 @@ screens.more = async function more() {
       onclick: () => go('bank'),
     }),
     navRow({
+      icon: 'repeat',
+      title: 'Каждый месяц',
+      sub: s.recurring
+        ? `${s.recurring} ${plural(s.recurring, 'документ', 'документа', 'документов')} на повторе`
+        : 'счета и акты по расписанию',
+      onclick: () => go('recurring'),
+    }),
+    navRow({
       icon: 'search',
       title: 'Снимок счёта',
       sub: 'сфотографировать и разобрать',
@@ -1230,6 +1260,68 @@ screens.basis = async function basis() {
     opt('closing', 'По акту, УПД или накладной', 'подряд, услуги, торговля: счёт лишь просьба заплатить'),
     opt('invoice', 'По выставленному счёту', 'аренда и субаренда: акта по закону может не быть'),
     opt('manual', 'Не считать', 'журнал веду сам')));
+
+  // Выход для того, кто не знает ответа. Это единственная настройка, где
+  // человек может застрять: вопрос бухгалтерский, а пришёл он выставить счёт.
+  box.append(h('div', { class: 'section-title', text: 'Не знаете, что выбрать?' }));
+  box.append(h('div', { class: 'card' }, (s.bizTypes || []).map((t) => h('button', {
+    class: 'row',
+    onclick: (e) => withBusy(e.currentTarget, async () => {
+      const r = await api('POST', '/api/biztype', { key: t.key });
+      haptic('medium');
+      toast(r.why || 'Сохранено');
+      back();
+    }),
+  },
+  h('span', { class: `icon-box ${s.bizType === t.key ? 'ok' : ''}` },
+    icon(s.bizType === t.key ? 'check' : 'office')),
+  h('span', { class: 'grow' },
+    h('div', { text: t.name }),
+    h('div', { class: 'small muted', text: t.hint }))))));
+  return box;
+};
+
+/**
+ * Регулярные документы.
+ *
+ * Только список и выключение: заводятся они на карточке уже выписанного
+ * документа, где позиции проверены человеком. Ничего не выписывается само —
+ * бот приносит предложение с кнопкой.
+ */
+screens.recurring = async function recurringScreen() {
+  const { items } = await api('GET', '/api/recurring');
+  const box = h('div', {}, h('h1', { text: 'Каждый месяц' }));
+  if (!items.length) {
+    box.append(empty('repeat', 'Пока ничего не повторяется',
+      'Откройте выписанный счёт или акт и нажмите «Повторять каждый месяц» — '
+      + 'в нужный день бот напомнит и предложит выписать такой же.'));
+    return box;
+  }
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Ничего не выписывается само: в нужный день придёт предложение с кнопкой.' }));
+
+  // Заголовок строки — имя клиента: по нему её и узнают. Название документа
+  // уходит вниз, иначе оно съедает ширину и обрывает как раз имя.
+  box.append(h('div', { class: 'card' }, items.map((r) => h('div', { class: 'row' },
+    h('span', { class: 'icon-box' }, icon('repeat')),
+    h('span', { class: 'grow' },
+      h('div', { class: 'ellipsis', text: r.cpName }),
+      // День — впереди: это то, ради чего экран открывают. Обрезаться при
+      // нехватке ширины должно название документа, а не срок.
+      h('div', { class: 'small muted ellipsis', text: `${r.dayText} · ${r.title}` })),
+    // Без копеек: сумма здесь для узнавания, а не для сверки, и лишние
+    // четыре знака отнимают ширину у срока.
+    h('span', { class: 'money nowrap', text: money0(r.total) }),
+    h('button', {
+      class: 'row-act',
+      'aria-label': `Перестать напоминать: ${r.title} для ${r.cpName}`,
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        await api('POST', '/api/recurring/off', { id: r.id });
+        haptic('medium');
+        toast('Больше напоминать не буду');
+        render();
+      }),
+    }, icon('trash'))))));
   return box;
 };
 

@@ -1454,6 +1454,109 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await tap('fx.del:sign');
   ok(!fxLib.get(fxUser.id, 'sign'), 'подпись убирается кнопкой');
 
+  console.log('\n── регулярные документы ──');
+  {
+    const rec = require('./lib/recurring');
+    const bdbR = require('./lib/bot-db');
+    const uid = fxUserId();
+
+    // Правила дней проверяем отдельно от бота: ошибка здесь незаметна до
+    // конца месяца, а потом счёт уходит не тем числом.
+    ok(rec.normalizeDay(31) === 28, '31-е сводится к 28-му: такого дня нет в феврале', rec.normalizeDay(31));
+    ok(rec.normalizeDay(0) === 0, '0 — это «последний день месяца», а не ошибка');
+    ok(rec.normalizeDay('пятое') === 1, 'мусор превращается в 1-е, а не в NaN', rec.normalizeDay('пятое'));
+    const on = (day, iso2, lastOffer = '') => rec.isDue(
+      { active: 1, day, last_offer: lastOffer }, new Date(`${iso2}T12:00:00Z`),
+    );
+    ok(on(5, '2026-08-05') === true, 'в свой день предложение положено');
+    ok(on(5, '2026-08-04') === false, 'накануне — рано');
+    ok(on(5, '2026-08-09') === true, 'бот молчал четыре дня — предложение всё равно придёт');
+    ok(on(5, '2026-08-09', '2026-08') === false, 'за этот месяц уже предлагали');
+    ok(on(5, '2026-09-01', '2026-08') === false, 'первого сентября пятое ещё не наступило');
+    ok(on(0, '2026-08-31') === true, 'последний день августа');
+    ok(on(0, '2026-08-30') === false, 'предпоследний — ещё нет');
+    ok(on(0, '2026-02-28') === true, 'в невисокосном феврале последний день — 28-е');
+
+    // Заводим повторение из настоящего выписанного документа.
+    const cpR = bdbR.createCp(uid, { name: 'Арендатор ООО «Тихий»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.sch:${cpR}`);
+    await say('Аренда, сентябрь; 1; 45000');
+    await tap('items.done');
+    await tap('doc.make');
+    ok(Boolean(button('Повторять каждый месяц')), 'после выписки предложено повторять');
+
+    await tap(button('Повторять каждый месяц'));
+    ok(last().includes('Какого числа'), 'бот спрашивает день', last().slice(0, 40));
+    await tap(button('5-го'));
+    ok(last().includes('Буду напоминать 5-го числа'), 'повторение заведено', last().slice(0, 60));
+    ok(last().includes('первое напоминание придёт в следующем'),
+      'сказано, что в этом месяце документ уже выписан');
+
+    const mine = rec.list(uid);
+    const one = mine.find((r) => r.cp_id === cpR);
+    ok(Boolean(one), 'повторение в списке');
+    ok(one.items.length === 1 && one.items[0].price === 45000, 'позиции сохранены', JSON.stringify(one.items));
+    ok(one.last_offer === rec.monthKey(), 'текущий месяц сразу отмечен как отработанный', one.last_offer);
+    ok(rec.isDue(one, new Date()) === false, 'сегодня повторение не сработает');
+
+    // Наступил следующий месяц — предложение должно прийти.
+    const nextMonth = new Date();
+    nextMonth.setMonth(nextMonth.getMonth() + 1);
+    nextMonth.setDate(6);
+    ok(rec.isDue(one, nextMonth) === true, 'в следующем месяце предложение положено');
+
+    // Предложение и выписка по кнопке.
+    const before = bdbR.listDocs(uid, 50).length;
+    await tap(`rec.go:${one.id}`);
+    ok(bdbR.listDocs(uid, 50).length === before + 1, 'по кнопке документ выписан',
+      bdbR.listDocs(uid, 50).length - before);
+    const madeDoc = bdbR.listDocs(uid, 1)[0];
+    ok(madeDoc.total === 45000 && madeDoc.cp_id === cpR, 'тот же клиент и та же сумма',
+      `${madeDoc.total} / ${madeDoc.cp_id}`);
+
+    await tap(`rec.skip:${one.id}`);
+    ok(last().includes('Пропустил'), 'месяц можно пропустить');
+
+    await tap(`rec.off:${one.id}`);
+    ok(!rec.list(uid).some((r) => r.id === one.id), 'повторение выключается');
+    ok(rec.due(nextMonth).every((r) => r.id !== one.id), 'выключенное больше не предлагается');
+
+    // Чужое повторение недоступно по прямому id.
+    const other = bdbR.getOrCreateUser(880042, 'Чужой', 'alien');
+    const otherCp = bdbR.createCp(other.id, { name: 'Их клиент', kind: 'customer', opening_date: '2026-01-01' });
+    const alien = rec.add(other.id, { cpId: otherCp, type: 'sch', items: [{ name: 'x', qty: 1, price: 1 }] });
+    rec.off(uid, alien);
+    ok(Boolean(require('./db').db.prepare('SELECT active FROM recurring WHERE id = ?').get(alien).active),
+      'чужое повторение выключить нельзя');
+    ok(rec.get(uid, alien) === null, 'чужое повторение не отдаётся по прямому id');
+    ok(!rec.list(uid).some((r) => r.id === alien), 'чужого нет в своём списке');
+  }
+
+  console.log('\n── чем занимается бизнес ──');
+  {
+    const bdbZ = require('./lib/bot-db');
+    const biz = require('./lib/biz-types');
+    const uid = fxUserId();
+
+    await tap('basis');
+    ok(Boolean(button('Не знаю')), 'на экране основания долга есть выход для новичка');
+    await tap('biz');
+    ok(last().includes('Чем занимаетесь'), 'бот спрашивает про дело, а не про бухгалтерию');
+
+    await tap('biz.set:rent');
+    ok(bdbZ.getDefaultOrg(uid).biz_type === 'rent', 'тип бизнеса сохранён',
+      bdbZ.getDefaultOrg(uid).biz_type);
+    ok(bdbZ.basisOf(bdbZ.getDefaultOrg(uid)) === 'invoice', 'аренда → долг по счёту',
+      bdbZ.basisOf(bdbZ.getDefaultOrg(uid)));
+
+    await tap('biz.set:trade');
+    ok(bdbZ.basisOf(bdbZ.getDefaultOrg(uid)) === 'closing', 'торговля → долг по отгрузке');
+    ok(biz.list().every((t) => ['closing', 'invoice', 'manual'].includes(t.basis)),
+      'каждый вид бизнеса ведёт к существующему основанию долга');
+
+    await tap('basis.set:closing');
+  }
+
   console.log('\n── выписка файлом в чат ──');
   {
     const bdbB = require('./lib/bot-db');

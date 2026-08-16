@@ -107,6 +107,16 @@ async function seed() {
     // eslint-disable-next-line no-await-in-loop
     await docService.issueDocument(user.id, { ...d, skipQuota: true });
   }
+
+  // Пара повторений — иначе экран «Каждый месяц» на снимке пустой.
+  require('./lib/recurring').add(user.id, {
+    cpId: ids[0], type: 'sch', day: 5,
+    items: [{ name: 'Абонентское обслуживание', unit: 'мес.', qty: 1, price: 18000 }],
+  });
+  require('./lib/recurring').add(user.id, {
+    cpId: ids[1], type: 'usl', day: 0,
+    items: [{ name: 'Кофе-брейк по договору', unit: 'усл.', qty: 1, price: 12000 }],
+  });
   // Подпись и печать: без них экран реквизитов на снимке выглядит пустым,
   // а это заметная часть работы. Рисуем их тут же, чтобы не тащить файлы.
   const fx = require('./lib/facsimile');
@@ -183,6 +193,8 @@ async function main() {
     SHOTS.push({ name: 'pochta-nastroyka', title: 'Подключить почту', go: ['mail.new', {}] });
     SHOTS.push({ name: 'nds', title: 'НДС', go: ['vat', {}] });
     SHOTS.push({ name: 'osnovanie-dolga', title: 'Откуда долг', go: ['basis', {}] });
+    SHOTS.push({ name: 'osnovanie-dolga-nizhe', title: 'Откуда долг: вид дела', go: ['basis', {}], scroll: 'bottom' });
+    SHOTS.push({ name: 'kazhdyy-mesyac', title: 'Каждый месяц', go: ['recurring', {}] });
     SHOTS.push({ name: 'zhdut-oplaty', title: 'Ждут оплаты', go: ['unpaid', {}] });
     SHOTS.push({ name: 'reestr', title: 'Реестр', go: ['registry', {}] });
     if (firstCp) SHOTS.push({ name: 'operaciya', title: 'Операция', go: ['op', { cpId: firstCp.id }] });

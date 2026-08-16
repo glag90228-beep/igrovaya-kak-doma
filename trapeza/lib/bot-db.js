@@ -99,7 +99,36 @@ function migrate() {
       created_at TEXT    NOT NULL
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_bank_uniq ON bank_imports(user_id, key);
+
+    -- Регулярные документы: «каждый месяц счёт за аренду этому клиенту».
+    -- Хранится договорённость, а не документ: в нужный день бот приходит
+    -- с предложением, а выписывает человек. Подробности — в lib/recurring.js.
+    CREATE TABLE IF NOT EXISTS recurring (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+      cp_id      INTEGER NOT NULL,
+      type       TEXT    NOT NULL,              -- sch | schdog | usl | upd | torg12
+      day        INTEGER NOT NULL DEFAULT 1,    -- 1..28, либо 0 — последнее число
+      items      TEXT    NOT NULL DEFAULT '[]', -- JSON позиций
+      extra      TEXT    NOT NULL DEFAULT '{}', -- остальные поля документа: НДС, статус УПД
+      note       TEXT    NOT NULL DEFAULT '',
+      active     INTEGER NOT NULL DEFAULT 1,
+      last_offer TEXT    NOT NULL DEFAULT '',   -- YYYY-MM: за какой месяц предлагали
+      created_at TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_rec_user ON recurring(user_id, active);
   `);
+
+  /*
+   * Чем занимается бизнес. Нужен ровно для одного: подсказать, откуда у
+   * этого бизнеса берётся долг, и не заставлять новичка выбирать между
+   * «по акту» и «по счёту», не понимая вопроса.
+   *
+   * На боевом сервере колонку добавляли скриптом поверх файлов, минуя
+   * миграции, — поэтому в репозитории её не было, и обновление кода снесло
+   * бы правку. Место колонки — здесь.
+   */
+  addColumn('orgs', 'biz_type', "TEXT NOT NULL DEFAULT ''");
 
   // Заблокировавшие бота: рассылать им бессмысленно, а каждая попытка —
   // ошибка в логе и лишний запрос.
@@ -196,7 +225,8 @@ function vatOf(org) {
 
 function updateOrg(userId, id, fields) {
   const allowed = ['name', 'full_name', 'inn', 'kpp', 'signer', 'address',
-    'bank_name', 'bik', 'acc', 'corr_acc', 'ogrnip', 'vat_rate', 'vat_gross', 'debt_basis'];
+    'bank_name', 'bik', 'acc', 'corr_acc', 'ogrnip', 'vat_rate', 'vat_gross', 'debt_basis',
+    'biz_type'];
   const sets = [], vals = [];
   for (const k of allowed) if (k in fields) { sets.push(`${k} = ?`); vals.push(fields[k]); }
   if (!sets.length) return;
@@ -492,6 +522,11 @@ function reachableUsers() {
   return db.prepare("SELECT * FROM bot_users WHERE blocked_at = ''").all();
 }
 
+/** Пользователь по внутреннему id — нужен рассылкам, где есть только user_id. */
+function userById(id) {
+  return db.prepare('SELECT * FROM bot_users WHERE id = ?').get(Number(id));
+}
+
 // ---------- дебиторка ----------
 
 /**
@@ -695,7 +730,7 @@ module.exports = {
   knownBankKeys, importBankRows,
   DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
   markPaid, unmarkPaid, unpaidDocs, docsBetween,
-  markBlocked, markActive, isBlocked, reachableUsers, findUserByUsername,
+  markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
   isSeqTaken, guardSeq,
   nextSeq, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,

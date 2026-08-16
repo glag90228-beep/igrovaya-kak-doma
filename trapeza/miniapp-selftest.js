@@ -360,6 +360,44 @@ async function main() {
     await call('POST', '/api/basis', { user: masha, body: { basis: 'closing' } });
   }
 
+  console.log('\n── вид деятельности и повторения ──');
+  {
+    r = await call('POST', '/api/biztype', { user: masha, body: { key: 'выдумка' } });
+    ok(r.status === 400, 'неизвестный вид деятельности отклонён');
+
+    r = await call('POST', '/api/biztype', { user: masha, body: { key: 'rent' } });
+    ok(r.status === 200 && r.json.basis === 'invoice', 'аренда переключает долг на счёт',
+      (r.json || {}).basis);
+    r = await call('GET', '/api/state', { user: masha });
+    ok(r.json.bizType === 'rent' && r.json.debtBasis === 'invoice', 'выбор виден в состоянии',
+      `${r.json.bizType} / ${r.json.debtBasis}`);
+    ok(r.json.bizTypes.length >= 5, 'список видов деятельности отдаётся приложению',
+      r.json.bizTypes.length);
+
+    // Повторение заводится из уже выписанного документа.
+    const lastDoc = (await call('GET', '/api/docs', { user: masha })).json.docs
+      .find((d) => d.items && d.items.length);
+    r = await call('POST', '/api/recurring', { user: masha, body: { docId: lastDoc.id, day: 31 } });
+    ok(r.status === 200 && r.json.day === 28, '31-е число сведено к 28-му', (r.json || {}).day);
+    const recId = r.json.id;
+
+    r = await call('GET', '/api/recurring', { user: masha });
+    const mine = r.json.items.find((x) => x.id === recId);
+    ok(Boolean(mine) && mine.total > 0, 'повторение в списке с суммой', mine && mine.total);
+
+    r = await call('GET', '/api/recurring', { user: petya });
+    ok(r.json.items.length === 0, 'чужие повторения не видны');
+    r = await call('POST', '/api/recurring/off', { user: petya, body: { id: recId } });
+    ok(r.status === 400, 'чужое повторение не выключить');
+
+    r = await call('POST', '/api/recurring/off', { user: masha, body: { id: recId } });
+    ok(r.status === 200, 'своё выключается');
+    r = await call('GET', '/api/recurring', { user: masha });
+    ok(!r.json.items.some((x) => x.id === recId), 'после выключения его нет в списке');
+
+    await call('POST', '/api/basis', { user: masha, body: { basis: 'closing' } });
+  }
+
   console.log('\n── банковская выписка ──');
   {
     // Контрагент с долгом: ровно та ситуация, ради которой выписку и грузят.

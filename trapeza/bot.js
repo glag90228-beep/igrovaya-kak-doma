@@ -33,6 +33,8 @@ const mailbox = require('./lib/mailbox');
 const { fetchNew } = require('./lib/imap');
 const mime = require('./lib/mime');
 const bank = require('./lib/bank-statement');
+const recurring = require('./lib/recurring');
+const bizTypes = require('./lib/biz-types');
 
 // ---------- утилиты дат/чисел ----------
 
@@ -819,6 +821,11 @@ async function afterDoc(tg, chatId, user, cpId) {
     }]);
   }
   if (!payable(org)) rows.push([{ text: '🏦 Добавить банк и счёт', data: 'org.new' }]);
+  // Повторение заводится здесь, а не отдельным мастером: позиции уже
+  // набраны и проверены человеком, повторять нечего — только выбрать день.
+  if (last && docService.ITEM_DOCS[last.type]) {
+    rows.push([{ text: '🔁 Повторять каждый месяц', data: `rec.new:${last.id}` }]);
+  }
   rows.push([{ text: '🧾 Выписать ещё', data: 'go.sch' },
     { text: '📄 Другой документ', data: 'go.any' }]);
   rows.push([{ text: '👤 Карточка клиента', data: `cp:${cpId}` }]);
@@ -939,6 +946,8 @@ async function showDocs(tg, chatId, user, cpId = null) {
     }];
   });
   rows.push([{ text: '📊 Реестр за период (Excel)', data: 'reg' }]);
+  const repeats = recurring.list(user.id).length;
+  rows.push([{ text: `🔁 Регулярные документы${repeats ? ` (${repeats})` : ''}`, data: 'rec' }]);
   rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
   await tg.sendMessage(chatId,
     `Последние документы (в этом месяце ${q.used}${q.paid ? '' : ` из ${q.limit} бесплатных`}):`,
@@ -1574,6 +1583,105 @@ async function showBasis(tg, chatId, user) {
       [{ text: 'Долг по акту / УПД / накладной', data: 'basis.set:closing' }],
       [{ text: 'Долг по счёту (аренда)', data: 'basis.set:invoice' }],
       [{ text: 'Не считать автоматически', data: 'basis.set:manual' }],
+      [{ text: '🤔 Не знаю — подберите по моему делу', data: 'biz' }],
+      [{ text: '⬅️ К организации', data: 'org' }],
+    ]));
+}
+
+// ---------- регулярные документы ----------
+
+/**
+ * Список повторений. Здесь их можно только посмотреть и выключить:
+ * заводятся они сразу после выписанного документа, где позиции уже готовы.
+ */
+async function showRecurring(tg, chatId, user) {
+  const list = recurring.list(user.id);
+  if (!list.length) {
+    await tg.sendMessage(chatId,
+      '<b>Регулярные документы</b>\n\n'
+      + 'Пока ничего не повторяется.\n\n'
+      + 'Выпишите счёт или акт и нажмите «🔁 Повторять каждый месяц» — '
+      + 'в нужный день я напомню и предложу выписать такой же.', mainMenu());
+    return;
+  }
+  const rows = list.map((r) => ([{
+    text: `✖️ ${docService.ITEM_DOCS[r.type] ? docService.ITEM_DOCS[r.type].title : r.type} · ${r.cp_name}`.slice(0, 60),
+    data: `rec.off:${r.id}`,
+  }]));
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId,
+    '<b>Регулярные документы</b>\n\n'
+    + list.map((r) => {
+      const title = docService.ITEM_DOCS[r.type] ? docService.ITEM_DOCS[r.type].title : r.type;
+      const sum = r.items.reduce((a, it) => a + round2((Number(it.qty) || 0) * (Number(it.price) || 0)), 0);
+      return `• <b>${esc(title)}</b> для ${esc(r.cp_name)} — ${formatRub(sum)}, ${r.dayText}`;
+    }).join('\n')
+    + '\n\n<i>Ничего не выписывается само: в нужный день я пришлю предложение '
+    + 'с кнопкой. Нажмите на строку ниже, чтобы перестать напоминать.</i>',
+    keyboard(rows));
+}
+
+/** Предложение выписать очередной документ. Отправляется раз в месяц. */
+async function offerRecurring(tg, rec) {
+  const user = bdb.userById(rec.user_id);
+  if (!user || user.blocked_at) return false;
+  const kind = docService.ITEM_DOCS[rec.type];
+  if (!kind) return false;
+  const sum = rec.items.reduce((a, it) => a + round2((Number(it.qty) || 0) * (Number(it.price) || 0)), 0);
+
+  await tg.sendMessage(user.tg_id,
+    `🔁 <b>Пора выставить: ${esc(kind.title)}</b>\n\n`
+    + `Клиент: <b>${esc(rec.cp_name)}</b>\n`
+    + `Сумма: <b>${formatRub(sum)}</b>\n`
+    + `${rec.items.slice(0, 5).map((it) => `• ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n')}`
+    + (rec.items.length > 5 ? `\n…и ещё ${rec.items.length - 5}` : ''),
+    keyboard([
+      [{ text: '✅ Выписать', data: `rec.go:${rec.id}` }],
+      [{ text: '⏭ Пропустить месяц', data: `rec.skip:${rec.id}` }],
+      [{ text: '✖️ Больше не напоминать', data: `rec.off:${rec.id}` }],
+    ]));
+  return true;
+}
+
+/**
+ * Ежедневная проверка повторений.
+ *
+ * Отметку «предложено» ставим сразу после отправки, а не после ответа:
+ * иначе бот пришёл бы с тем же предложением и завтра, и послезавтра, пока
+ * человек не нажмёт кнопку.
+ */
+async function runDaily(tg) {
+  let sent = 0;
+  for (const rec of recurring.due()) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      if (await offerRecurring(tg, rec)) sent += 1;
+      recurring.markOffered(rec.id);
+    } catch (e) {
+      console.error('регулярные документы:', e.message);
+    }
+  }
+  if (sent) console.log(`Регулярные документы: отправлено предложений — ${sent}`);
+  return sent;
+}
+
+/**
+ * «Чем занимаетесь» вместо «откуда берётся долг».
+ *
+ * Из всех настроек основание долга — единственная, в которой новичок
+ * гарантированно теряется: вопрос бухгалтерский, а человек пришёл выставить
+ * счёт. На вопрос о своём деле он отвечает не задумываясь, а правило
+ * выводится само.
+ */
+async function showBizType(tg, chatId, user) {
+  const org = bdb.getDefaultOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  await tg.sendMessage(chatId,
+    '<b>Чем занимаетесь?</b>\n\n'
+    + '<i>По ответу подберу, когда клиент становится должен, — этот вопрос '
+    + 'больше задавать не буду.</i>',
+    keyboard([
+      ...bizTypes.list().map((t) => ([{ text: `${t.name} — ${t.hint}`, data: `biz.set:${t.key}` }])),
       [{ text: '⬅️ К организации', data: 'org' }],
     ]));
 }
@@ -2479,6 +2587,81 @@ async function handleCallback(tg, cq) {
       await showBasis(tg, chatId, user);
       return;
     }
+    if (data === 'biz') { await showBizType(tg, chatId, user); return; }
+    if (data.startsWith('biz.set:')) {
+      const t = bizTypes.get(data.slice(8));
+      const org = bdb.getDefaultOrg(user.id);
+      if (t && org) {
+        bdb.updateOrg(user.id, org.id, { biz_type: data.slice(8), debt_basis: t.basis });
+        await tg.sendMessage(chatId, `<b>${esc(t.name)}</b>\n\n${esc(t.why)}`);
+      }
+      await showBasis(tg, chatId, user);
+      return;
+    }
+
+    // --- регулярные документы ---
+    if (data === 'rec') { await showRecurring(tg, chatId, user); return; }
+    if (data.startsWith('rec.new:')) {
+      const src = bdb.getDoc(user.id, Number(data.slice(8)));
+      if (!src || !docService.ITEM_DOCS[src.type]) {
+        await tg.sendMessage(chatId, 'Такой документ повторять нельзя.', mainMenu());
+        return;
+      }
+      await tg.sendMessage(chatId,
+        `<b>Повторять «${esc(docService.ITEM_DOCS[src.type].title)}» каждый месяц</b>\n\n`
+        + 'Какого числа напоминать?\n\n'
+        + '<i>29, 30 и 31 наступают не в каждом месяце — если нужен конец месяца, '
+        + 'выберите «в последний день».</i>',
+        keyboard([
+          [{ text: '1-го', data: `rec.add:${src.id}:1` }, { text: '5-го', data: `rec.add:${src.id}:5` },
+            { text: '10-го', data: `rec.add:${src.id}:10` }],
+          [{ text: '15-го', data: `rec.add:${src.id}:15` }, { text: '20-го', data: `rec.add:${src.id}:20` },
+            { text: '25-го', data: `rec.add:${src.id}:25` }],
+          [{ text: 'В последний день месяца', data: `rec.add:${src.id}:0` }],
+          [{ text: '⬅️ Меню', data: 'menu' }],
+        ]));
+      return;
+    }
+    if (data.startsWith('rec.add:')) {
+      const [, idStr, dayStr] = data.split(':');
+      const src = bdb.getDoc(user.id, Number(idStr));
+      if (!src || !docService.ITEM_DOCS[src.type]) return;
+      const { items = [], ...extra } = src.payload || {};
+      const id = recurring.add(user.id, {
+        cpId: src.cp_id, type: src.type, items, extra, day: Number(dayStr),
+      });
+      const rec = recurring.get(user.id, id);
+      await tg.sendMessage(chatId,
+        `✅ Буду напоминать ${rec.dayText}: «${esc(docService.ITEM_DOCS[src.type].title)}» `
+        + `для <b>${esc(rec.cp_name)}</b>.\n\n`
+        + '<i>Сам ничего не выпишу — пришлю предложение с кнопкой. За этот месяц '
+        + 'документ уже выписан, так что первое напоминание придёт в следующем.</i>',
+        mainMenu());
+      return;
+    }
+    if (data.startsWith('rec.go:')) {
+      const rec = recurring.get(user.id, Number(data.slice(7)));
+      if (!rec) { await tg.sendMessage(chatId, 'Это повторение уже удалено.', mainMenu()); return; }
+      const done = await issueDoc(tg, chatId, user, {
+        type: rec.type,
+        cpId: rec.cp_id,
+        doc: { items: rec.items, date: todayISO(), number: '' },
+        extra: rec.extra,
+      });
+      if (done) await afterDoc(tg, chatId, user, rec.cp_id);
+      return;
+    }
+    if (data.startsWith('rec.skip:')) {
+      recurring.markOffered(Number(data.slice(9)));
+      await tg.sendMessage(chatId, 'Пропустил. Напомню в следующем месяце.', mainMenu());
+      return;
+    }
+    if (data.startsWith('rec.off:')) {
+      recurring.off(user.id, Number(data.slice(8)));
+      await tg.sendMessage(chatId, 'Больше напоминать не буду.');
+      await showRecurring(tg, chatId, user);
+      return;
+    }
     if (data.startsWith('doc.paid:')) {
       const id = Number(data.slice(9));
       const when = bdb.markPaid(user.id, id);
@@ -2866,8 +3049,22 @@ async function main() {
   let quietUntil = 0;
   let netFails = 0;
   let netQuiet = 0;
+  /*
+   * Ежедневные дела делаем внутри того же цикла, а не отдельной службой:
+   * второй процесс с той же базой — это второй источник ошибок и ещё один
+   * unit, который надо не забыть перезапустить. Цикл и так просыпается не
+   * реже чем раз в полминуты, а метка дня не даёт повториться.
+   *
+   * Первое пробуждение после запуска пропускаем намеренно: перезапуск бота
+   * не должен превращаться в рассылку предложений.
+   */
+  let dailyDone = todayISO();
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    if (dailyDone !== todayISO()) {
+      dailyDone = todayISO();
+      try { await runDaily(tg); } catch (e) { console.error('ежедневные дела:', e.message); }
+    }
     let updates = [];
     try {
       updates = await tg.getUpdates(offset, 30);

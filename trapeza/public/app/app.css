@@ -420,6 +420,20 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .badge.ok { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success); }
 .badge.warn { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
 
+/* Второе действие в строке — например, «перестать напоминать». Отдельная
+   цель нажатия шириной в палец: рядом с ней обычно есть первая, и промах
+   стоит удалённой записи. */
+.row-act {
+  flex: none;
+  width: var(--tap); height: var(--tap);
+  display: grid; place-items: center;
+  border: 0; border-radius: 50%;
+  background: none; color: var(--danger);
+  cursor: pointer;
+}
+.row-act:active { background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.row-act[disabled] { opacity: .5; }
+
 /* ---------- строка банковской выписки ---------- */
 
 /* Сумма и дата сверху, назначение платежа под ними, выбор клиента снизу:

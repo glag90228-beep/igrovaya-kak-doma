@@ -39,6 +39,8 @@ const { forwardToSupport } = require('./lib/bot-support');
 const { formatRub } = require('./lib/money');
 const mime = require('./lib/mime');
 const bank = require('./lib/bank-statement');
+const recurring = require('./lib/recurring');
+const bizTypes = require('./lib/biz-types');
 const reqCheck = require('./lib/requisites-check');
 const { round2 } = require('./lib/money');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
@@ -146,6 +148,9 @@ function stateFor(user) {
     payUrl: payLink(user.tg_id),
     facsimile: fxState(user.id),
     debtBasis: bdb.basisOf(org || {}),
+    bizType: (org && org.biz_type) || '',
+    bizTypes: bizTypes.list(),
+    recurring: recurring.list(user.id).length,
     features: { dadata: dadata.dadataAvailable(), pdf: true, mail: mailbox.resolve(user.id).ok },
     mailbox: mailbox.info(user.id),
   };
@@ -725,6 +730,62 @@ const api = {
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     bdb.updateOrg(user.id, org.id, { debt_basis: basis });
     return { basis };
+  },
+
+  /**
+   * Вид деятельности. Спрашиваем его вместо основания долга: на вопрос
+   * «чем занимаетесь» человек отвечает не задумываясь, а правило учёта
+   * выводится само.
+   */
+  async 'POST /api/biztype'({ user, body }) {
+    const key = str(body.key, 20);
+    const t = bizTypes.get(key);
+    if (!t) return { error: 'Неизвестный вид деятельности.' };
+    const org = bdb.getDefaultOrg(user.id);
+    if (!org) return { error: 'Сначала заполните реквизиты организации.' };
+    bdb.updateOrg(user.id, org.id, { biz_type: key, debt_basis: t.basis });
+    return { key, basis: t.basis, why: t.why };
+  },
+
+  /** Что повторяется каждый месяц. */
+  async 'GET /api/recurring'({ user }) {
+    return {
+      items: recurring.list(user.id).map((r) => ({
+        id: r.id,
+        cpId: r.cp_id,
+        cpName: r.cp_name,
+        type: r.type,
+        title: (docService.ITEM_DOCS[r.type] || {}).title || r.type,
+        day: r.day,
+        dayText: r.dayText,
+        total: round2(r.items.reduce((a, it) => a + (Number(it.qty) || 0) * (Number(it.price) || 0), 0)),
+      })),
+    };
+  },
+
+  /**
+   * Повторять уже выписанный документ каждый месяц.
+   *
+   * Берём готовый документ, а не отдельно набранные позиции: они уже
+   * проверены человеком, а НДС и статус УПД поедут вместе с ними.
+   */
+  async 'POST /api/recurring'({ user, body }) {
+    const src = bdb.getDoc(user.id, Number(body.docId));
+    if (!src || !docService.ITEM_DOCS[src.type]) return { error: 'Такой документ повторять нельзя.' };
+    const { items = [], ...extra } = src.payload || {};
+    if (!items.length) return { error: 'В документе нет позиций.' };
+    const id = recurring.add(user.id, {
+      cpId: src.cp_id, type: src.type, items, extra, day: Number(body.day),
+    });
+    const rec = recurring.get(user.id, id);
+    return { id, day: rec.day, dayText: rec.dayText };
+  },
+
+  /** Перестать напоминать. */
+  async 'POST /api/recurring/off'({ user, body }) {
+    if (!recurring.get(user.id, Number(body.id))) return { error: 'Повторение не найдено.' };
+    recurring.off(user.id, Number(body.id));
+    return { off: true };
   },
 
   /** Подключить свой ящик. Пароль сразу проверяется письмом самому себе. */
