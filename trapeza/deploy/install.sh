@@ -116,9 +116,12 @@ systemctl start trapeza-backup.service || echo "⚠️  Первая копия 
 say "6/6 Проверка токена и оформление бота"
 timeout 60 sudo -u trapeza --preserve-env node bot.js --check || \
   echo "⚠️  Не достучался до Telegram — бот уже перезапущен, проверьте лог."
-timeout 120 sudo -u trapeza --preserve-env node bot.js --setup || \
+# Фигурные скобки обязательны: без них вторая строка — отдельная команда,
+# и подсказка «повторите» печаталась бы даже после успешного оформления.
+timeout 120 sudo -u trapeza --preserve-env node bot.js --setup || {
   echo "⚠️  Оформление не применилось (сеть или ограничение частоты). Повторить:"
   echo "     cd /opt/trapeza && set -a && . ./.env && set +a && node bot.js --setup"
+}
 
 say "Готово"
 for u in trapeza-bot trapeza-lava trapeza-miniapp trapeza-backup.timer; do
