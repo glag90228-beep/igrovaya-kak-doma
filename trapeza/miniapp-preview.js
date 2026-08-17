@@ -110,7 +110,7 @@ async function seed() {
 
   // Пара повторений — иначе экран «Каждый месяц» на снимке пустой.
   require('./lib/recurring').add(user.id, {
-    cpId: ids[0], type: 'sch', day: 5,
+    cpId: ids[0], type: 'sch', payDay: 5, leadDays: 3,
     items: [{ name: 'Абонентское обслуживание', unit: 'мес.', qty: 1, price: 18000 }],
   });
   require('./lib/recurring').add(user.id, {

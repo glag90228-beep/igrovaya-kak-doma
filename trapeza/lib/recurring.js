@@ -54,6 +54,29 @@ function dayLabel(day) {
 }
 
 /**
+ * В какое число предлагать выписать документ.
+ *
+ * Обычно это просто day. У аренды иначе: платёж привязан к числу договора
+ * (pay_day), а счёт нужен заранее — за lead_days до него. Считаем день
+ * здесь, а не при заведении, потому что «за 3 дня до 5-го» — это 2-е, и
+ * запомнить готовое число значило бы потерять связь с договором: изменится
+ * срок — придётся пересчитывать руками.
+ */
+function offerDay(rec) {
+  if (!rec.pay_day) return rec.day;
+  const d = rec.pay_day - (rec.lead_days || 0);
+  // Ушли за начало месяца — предлагаем первого: выставить счёт раньше, чем
+  // начался месяц, всё равно нельзя, а пропускать платёж нельзя тем более.
+  return d < 1 ? 1 : d;
+}
+
+/** Срок оплаты этого месяца, ISO. Пусто — если срок не задан. */
+function dueDate(rec, date = new Date()) {
+  if (!rec.pay_day) return '';
+  return `${monthKey(date)}-${String(rec.pay_day).padStart(2, '0')}`;
+}
+
+/**
  * Пора ли предлагать.
  *
  * Условие «не раньше дня X», а не «ровно в день X»: если бот был выключен
@@ -62,8 +85,22 @@ function dayLabel(day) {
 function isDue(rec, date = new Date()) {
   if (!rec.active) return false;
   if (rec.last_offer === monthKey(date)) return false;
-  if (rec.day === LAST_DAY) return isLastDayOfMonth(date);
-  return date.getDate() >= rec.day;
+  const day = offerDay(rec);
+  if (day === LAST_DAY) return isLastDayOfMonth(date);
+  return date.getDate() >= day;
+}
+
+/**
+ * Наступила ли просрочка: срок оплаты прошёл, а этот месяц ещё не отмечен.
+ *
+ * Сообщаем со следующего дня после срока — «в первый же день неоплаты»,
+ * как это и делают вручную. Оплачен ли счёт на самом деле, здесь не видно:
+ * это проверяет вызывающий по журналу документов.
+ */
+function isOverdue(rec, date = new Date()) {
+  if (!rec.active || !rec.pay_day) return false;
+  if (rec.last_due === monthKey(date)) return false;
+  return date.getDate() > rec.pay_day;
 }
 
 /**
@@ -73,10 +110,14 @@ function isDue(rec, date = new Date()) {
  * только что выписанным документом, и предлагать его второй раз в том же
  * месяце — это ровно то задвоение, от которого мы бережём.
  */
-function add(userId, { cpId, type, items, extra = {}, note = '', day = 1 }) {
-  const info = db.prepare(`INSERT INTO recurring(user_id, cp_id, type, day, items, extra, note,
-      active, last_offer, created_at) VALUES(?,?,?,?,?,?,?,1,?,?)`)
+function add(userId, {
+  cpId, type, items, extra = {}, note = '', day = 1, payDay = 0, leadDays = 0,
+}) {
+  const pay = payDay ? normalizeDay(payDay) : 0;
+  const info = db.prepare(`INSERT INTO recurring(user_id, cp_id, type, day, pay_day, lead_days,
+      items, extra, note, active, last_offer, created_at) VALUES(?,?,?,?,?,?,?,?,?,1,?,?)`)
     .run(userId, Number(cpId), String(type), normalizeDay(day),
+      pay, pay ? Math.min(27, Math.max(0, Math.round(Number(leadDays) || 0))) : 0,
       JSON.stringify(Array.isArray(items) ? items : []),
       JSON.stringify(extra && typeof extra === 'object' ? extra : {}),
       String(note).slice(0, 200), monthKey(), new Date().toISOString());
@@ -91,12 +132,16 @@ function parse(row) {
   if (!row) return null;
   // Ставка НДС и статус УПД лежат рядом с позициями: без них повторный
   // документ вышел бы с настройками по умолчанию, а не такой же, как был.
-  return {
+  const rec = {
     ...row,
     items: json(row.items, []),
     extra: json(row.extra, {}),
-    dayText: dayLabel(row.day),
   };
+  rec.offerDay = offerDay(rec);
+  rec.dayText = row.pay_day
+    ? `${dayLabel(rec.offerDay)} (оплата ${row.pay_day}-го)`
+    : dayLabel(row.day);
+  return rec;
 }
 
 /** Повторения пользователя вместе с именем контрагента. */
@@ -140,7 +185,37 @@ function markOffered(id, date = new Date()) {
   db.prepare('UPDATE recurring SET last_offer = ? WHERE id = ?').run(monthKey(date), Number(id));
 }
 
+/**
+ * У кого сегодня первый день просрочки.
+ *
+ * Возвращает только тех, у кого задан срок оплаты и он прошёл. Оплачен ли
+ * счёт, здесь не проверяется: журнал документов лежит в другом модуле, и
+ * тянуть его сюда значило бы связать расписание с учётом. Вызывающий
+ * отсеивает оплаченных сам.
+ */
+function overdue(date = new Date()) {
+  return db.prepare(`SELECT r.*, c.name AS cp_name FROM recurring r
+      JOIN counterparties c ON c.id = r.cp_id
+      WHERE r.active = 1 AND r.pay_day > 0 ORDER BY r.user_id, r.pay_day`)
+    .all().map(parse).filter((r) => isOverdue(r, date));
+}
+
+/** Отметить, что о просрочке за этот месяц уже сообщили. */
+function markDueNoticed(id, date = new Date()) {
+  db.prepare('UPDATE recurring SET last_due = ? WHERE id = ?').run(monthKey(date), Number(id));
+}
+
+/** Срок оплаты и предупреждение — вместе, одним вызовом для UI. */
+function setSchedule(userId, id, { payDay, leadDays }) {
+  const pay = payDay ? normalizeDay(payDay) : 0;
+  db.prepare('UPDATE recurring SET pay_day = ?, lead_days = ? WHERE id = ? AND user_id = ?')
+    .run(pay, pay ? Math.min(27, Math.max(0, Math.round(Number(leadDays) || 0))) : 0,
+      Number(id), userId);
+}
+
 module.exports = {
-  add, list, get, setDay, off, due, markOffered,
-  isDue, monthKey, normalizeDay, dayLabel, LAST_DAY,
+  add, list, get, setDay, setSchedule, off,
+  due, markOffered, overdue, markDueNoticed,
+  isDue, isOverdue, offerDay, dueDate,
+  monthKey, normalizeDay, dayLabel, LAST_DAY,
 };

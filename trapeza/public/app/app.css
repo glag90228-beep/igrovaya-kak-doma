@@ -434,6 +434,17 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .row-act:active { background: color-mix(in srgb, var(--danger) 12%, transparent); }
 .row-act[disabled] { opacity: .5; }
 
+/* Календарь повторения: что и какого числа произойдёт. Даты выровнены в
+   колонку — по ней читают цикл сверху вниз, не вчитываясь в подписи. */
+.plan { padding: 2px var(--pad) 12px; border-top: 1px solid var(--hairline); }
+.plan-row { display: flex; gap: 10px; align-items: baseline; padding: 4px 0; }
+.plan-when {
+  flex: none; min-width: 68px;
+  font: 600 13px/1.4 var(--font); font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.plan-what { font-size: 13px; line-height: 1.4; color: var(--muted); }
+
 /* ---------- строка банковской выписки ---------- */
 
 /* Сумма и дата сверху, назначение платежа под ними, выбор клиента снизу:

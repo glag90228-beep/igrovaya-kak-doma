@@ -758,6 +758,9 @@ const api = {
         title: (docService.ITEM_DOCS[r.type] || {}).title || r.type,
         day: r.day,
         dayText: r.dayText,
+        offerDay: r.offerDay,
+        payDay: r.pay_day,
+        leadDays: r.lead_days,
         total: round2(r.items.reduce((a, it) => a + (Number(it.qty) || 0) * (Number(it.price) || 0), 0)),
       })),
     };
@@ -774,11 +777,16 @@ const api = {
     if (!src || !docService.ITEM_DOCS[src.type]) return { error: 'Такой документ повторять нельзя.' };
     const { items = [], ...extra } = src.payload || {};
     if (!items.length) return { error: 'В документе нет позиций.' };
-    const id = recurring.add(user.id, {
-      cpId: src.cp_id, type: src.type, items, extra, day: Number(body.day),
-    });
+    // payDay задан — это цикл аренды: платят к числу договора, счёт уходит
+    // заранее, а на следующий день после срока приходит сигнал о просрочке.
+    const when = Number(body.payDay)
+      ? { payDay: Number(body.payDay), leadDays: Number(body.leadDays) || 0 }
+      : { day: Number(body.day) };
+    const id = recurring.add(user.id, { cpId: src.cp_id, type: src.type, items, extra, ...when });
     const rec = recurring.get(user.id, id);
-    return { id, day: rec.day, dayText: rec.dayText };
+    return {
+      id, day: rec.day, dayText: rec.dayText, offerDay: rec.offerDay, payDay: rec.pay_day,
+    };
   },
 
   /** Перестать напоминать. */

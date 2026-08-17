@@ -1726,8 +1726,83 @@ async function runDaily(tg) {
       console.error('регулярные документы:', e.message);
     }
   }
-  if (sent) console.log(`Регулярные документы: отправлено предложений — ${sent}`);
+  for (const rec of recurring.overdue()) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      if (await warnOverdue(tg, rec)) sent += 1;
+      recurring.markDueNoticed(rec.id);
+    } catch (e) {
+      console.error('просрочка:', e.message);
+    }
+  }
+  if (sent) console.log(`Ежедневные дела: отправлено сообщений — ${sent}`);
   return sent;
+}
+
+/** Завести повторение по уже выписанному документу и рассказать, что будет. */
+async function addRecurring(tg, chatId, user, src, when) {
+  const { items = [], ...extra } = src.payload || {};
+  const id = recurring.add(user.id, {
+    cpId: src.cp_id, type: src.type, items, extra, ...when,
+  });
+  const rec = recurring.get(user.id, id);
+  const title = docService.ITEM_DOCS[src.type].title;
+
+  // Показываем весь цикл, а не только ближайшее действие: человек должен
+  // понимать, за чем бот теперь следит, иначе напоминание о просрочке
+  // придёт неожиданно и будет выглядеть ошибкой.
+  const plan = [`• ${rec.offerDay}-го — предложу выписать «${esc(title)}»`];
+  if (rec.pay_day) {
+    plan.push(`• ${rec.pay_day}-го — срок оплаты по договору`);
+    plan.push(`• ${rec.pay_day + 1}-го — напомню, если оплата не отмечена`);
+  }
+
+  await tg.sendMessage(chatId,
+    `✅ Настроил для <b>${esc(rec.cp_name)}</b>:\n\n${plan.join('\n')}\n\n`
+    + '<i>Сам ничего не выпишу и клиенту не напишу — пришлю предложение с кнопкой. '
+    + 'За этот месяц документ уже выписан, так что начну со следующего.</i>',
+    keyboard([
+      ...(src.type !== 'usl'
+        ? [[{ text: '➕ Ещё и акт в конце месяца', data: `rec.akt:${src.cp_id}` }]] : []),
+      [{ text: '🔁 Все повторения', data: 'rec' }],
+      [{ text: '⬅️ Меню', data: 'menu' }],
+    ]));
+}
+
+/**
+ * Первый день просрочки.
+ *
+ * Сообщаем владельцу, а не контрагенту. Письмо клиенту с требованием
+ * заплатить — разговор, который человек ведёт сам: тон, отсрочка,
+ * договорённость по телефону боту неизвестны, а испорченные отношения с
+ * арендатором стоят дороже, чем несколько нажатий. Поэтому здесь готовый
+ * текст и кнопка отправки, а не автоматическая рассылка.
+ */
+async function warnOverdue(tg, rec) {
+  const user = bdb.userById(rec.user_id);
+  if (!user || user.blocked_at) return false;
+
+  // Счёт этого месяца этому контрагенту, по которому нет отметки об оплате.
+  const month = recurring.monthKey();
+  const unpaid = bdb.unpaidDocs(user.id, 200)
+    .filter((d) => d.cp_id === rec.cp_id && String(d.date).startsWith(month));
+  if (!unpaid.length) return false;              // оплачено или счёта не было
+
+  const sum = round2(unpaid.reduce((a, d) => a + (Number(d.total) || 0), 0));
+  const list = unpaid.slice(0, 5)
+    .map((d) => `• ${esc(d.title)} № ${esc(d.number)} от ${ru(d.date)} — ${formatRub(d.total)}`);
+
+  await tg.sendMessage(user.tg_id,
+    `⏰ <b>Просрочка: ${esc(rec.cp_name)}</b>\n\n`
+    + `Срок оплаты был ${ru(recurring.dueDate(rec))}, деньги не отмечены.\n`
+    + `Не оплачено: <b>${formatRub(sum)}</b>\n${list.join('\n')}\n\n`
+    + '<i>Если оплата пришла — отметьте её, и напоминание исчезнет.</i>',
+    keyboard([
+      [{ text: '✉️ Текст напоминания', data: 'debt.remind' }],
+      [{ text: '✅ Оплата пришла', data: `doc.paid:${unpaid[0].id}` }],
+      [{ text: '👤 Карточка клиента', data: `cp:${rec.cp_id}` }],
+    ]));
+  return true;
 }
 
 /**
@@ -2676,9 +2751,15 @@ async function handleCallback(tg, cq) {
         await tg.sendMessage(chatId, 'Такой документ повторять нельзя.', mainMenu());
         return;
       }
+      // Счёт на аренду живёт по договору: платят к определённому числу, а
+      // счёт нужен заранее. Остальные документы просто привязаны к числу.
+      const rent = ['sch', 'schdog'].includes(src.type);
       await tg.sendMessage(chatId,
         `<b>Повторять «${esc(docService.ITEM_DOCS[src.type].title)}» каждый месяц</b>\n\n`
-        + 'Какого числа напоминать?\n\n'
+        + (rent
+          ? 'Какого числа клиент должен платить? Это число из договора — счёт пришлю '
+            + 'заранее, а на следующий день после срока напомню, если денег не будет.\n\n'
+          : 'Какого числа напоминать?\n\n')
         + '<i>29, 30 и 31 наступают не в каждом месяце — если нужен конец месяца, '
         + 'выберите «в последний день».</i>',
         keyboard([
@@ -2695,17 +2776,54 @@ async function handleCallback(tg, cq) {
       const [, idStr, dayStr] = data.split(':');
       const src = bdb.getDoc(user.id, Number(idStr));
       if (!src || !docService.ITEM_DOCS[src.type]) return;
-      const { items = [], ...extra } = src.payload || {};
+      const day = Number(dayStr);
+
+      // У счёта спрашиваем ещё и за сколько дней выставлять: в аренде это
+      // отдельная договорённость, а «за 3 дня» — самый частый случай.
+      if (['sch', 'schdog'].includes(src.type) && day) {
+        await tg.sendMessage(chatId,
+          `Оплата ${day}-го числа. За сколько дней выставлять счёт?`,
+          keyboard([
+            [{ text: 'За 3 дня', data: `rec.lead:${src.id}:${day}:3` },
+              { text: 'За 5 дней', data: `rec.lead:${src.id}:${day}:5` }],
+            [{ text: 'За 7 дней', data: `rec.lead:${src.id}:${day}:7` },
+              { text: 'В день оплаты', data: `rec.lead:${src.id}:${day}:0` }],
+            [{ text: '⬅️ Меню', data: 'menu' }],
+          ]));
+        return;
+      }
+      await addRecurring(tg, chatId, user, src, { day });
+      return;
+    }
+    if (data.startsWith('rec.akt:')) {
+      const cpId = Number(data.slice(8));
+      const mine = recurring.list(user.id);
+      if (mine.some((r) => r.cp_id === cpId && r.type === 'usl')) {
+        await tg.sendMessage(chatId, 'Акт этому клиенту уже повторяется.', keyboard([
+          [{ text: '🔁 Все повторения', data: 'rec' }], [{ text: '⬅️ Меню', data: 'menu' }],
+        ]));
+        return;
+      }
+      // Позиции берём из счёта этому же клиенту: акт закрывает ровно то,
+      // за что выставлен счёт, и набирать их второй раз незачем.
+      const src = mine.find((r) => r.cp_id === cpId && ['sch', 'schdog'].includes(r.type));
+      if (!src) { await tg.sendMessage(chatId, 'Сначала настройте счёт.', mainMenu()); return; }
       const id = recurring.add(user.id, {
-        cpId: src.cp_id, type: src.type, items, extra, day: Number(dayStr),
+        cpId, type: 'usl', items: src.items, extra: src.extra, day: recurring.LAST_DAY,
       });
       const rec = recurring.get(user.id, id);
       await tg.sendMessage(chatId,
-        `✅ Буду напоминать ${rec.dayText}: «${esc(docService.ITEM_DOCS[src.type].title)}» `
-        + `для <b>${esc(rec.cp_name)}</b>.\n\n`
-        + '<i>Сам ничего не выпишу — пришлю предложение с кнопкой. За этот месяц '
-        + 'документ уже выписан, так что первое напоминание придёт в следующем.</i>',
-        mainMenu());
+        `✅ Акт для <b>${esc(rec.cp_name)}</b> — ${rec.dayText}.\n\n`
+        + '<i>Тоже предложением с кнопкой, не сам.</i>',
+        keyboard([[{ text: '🔁 Все повторения', data: 'rec' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
+    if (data.startsWith('rec.lead:')) {
+      const [, idStr, dayStr, leadStr] = data.split(':');
+      const src = bdb.getDoc(user.id, Number(idStr));
+      if (!src || !docService.ITEM_DOCS[src.type]) return;
+      await addRecurring(tg, chatId, user, src,
+        { payDay: Number(dayStr), leadDays: Number(leadStr) });
       return;
     }
     if (data.startsWith('rec.go:')) {
@@ -3180,4 +3298,6 @@ async function main() {
 
 if (require.main === module) main();
 
-module.exports = { handleUpdate, parseOp, parseDate, parseItemLine, readItemLine, parseAmount };
+module.exports = {
+  handleUpdate, runDaily, parseOp, parseDate, parseItemLine, readItemLine, parseAmount,
+};

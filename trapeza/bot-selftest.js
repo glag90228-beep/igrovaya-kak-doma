@@ -1569,6 +1569,28 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(on(0, '2026-08-30') === false, 'предпоследний — ещё нет');
     ok(on(0, '2026-02-28') === true, 'в невисокосном феврале последний день — 28-е');
 
+    // Цикл аренды: счёт за 3 дня до числа договора, срок оплаты, просрочка.
+    const rent = { active: 1, day: 1, pay_day: 5, lead_days: 3, last_offer: '', last_due: '' };
+    ok(rec.offerDay(rent) === 2, 'счёт за 3 дня до 5-го — это 2-е', rec.offerDay(rent));
+    ok(rec.offerDay({ ...rent, pay_day: 2, lead_days: 5 }) === 1,
+      'за 5 дней до 2-го — не «минус третье», а 1-е', rec.offerDay({ ...rent, pay_day: 2, lead_days: 5 }));
+    ok(rec.offerDay({ active: 1, day: 15, pay_day: 0 }) === 15, 'без срока оплаты работает обычный день');
+
+    const at = (iso2, over) => {
+      const d = new Date(`${iso2}T12:00:00Z`);
+      return over ? rec.isOverdue(rent, d) : rec.isDue(rent, d);
+    };
+    ok(at('2026-09-02') === true, 'второго сентября пора выставлять счёт');
+    ok(at('2026-09-01') === false, 'первого — ещё рано');
+    ok(at('2026-09-05', true) === false, 'в день оплаты просрочки ещё нет');
+    ok(at('2026-09-06', true) === true, 'шестого — первый день просрочки');
+    ok(rec.isOverdue({ ...rent, last_due: rec.monthKey(new Date('2026-09-06T12:00:00Z')) },
+      new Date('2026-09-06T12:00:00Z')) === false, 'о просрочке сообщаем раз в месяц');
+    ok(rec.isOverdue({ ...rent, pay_day: 0 }, new Date('2026-09-28T12:00:00Z')) === false,
+      'без срока оплаты просрочки не бывает');
+    ok(rec.dueDate(rent, new Date('2026-09-10T12:00:00Z')) === '2026-09-05', 'срок оплаты за месяц',
+      rec.dueDate(rent, new Date('2026-09-10T12:00:00Z')));
+
     // Заводим повторение из настоящего выписанного документа.
     const cpR = bdbR.createCp(uid, { name: 'Арендатор ООО «Тихий»', kind: 'customer', opening_date: '2026-01-01' });
     await tap(`d.sch:${cpR}`);
@@ -1578,18 +1600,37 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(Boolean(button('Повторять каждый месяц')), 'после выписки предложено повторять');
 
     await tap(button('Повторять каждый месяц'));
-    ok(last().includes('Какого числа'), 'бот спрашивает день', last().slice(0, 40));
+    ok(norm(last()).includes('Какого числа клиент должен платить'),
+      'у счёта спрашивают число из договора, а не «когда напомнить»', norm(last()).slice(0, 50));
     await tap(button('5-го'));
-    ok(last().includes('Буду напоминать 5-го числа'), 'повторение заведено', last().slice(0, 60));
-    ok(last().includes('первое напоминание придёт в следующем'),
-      'сказано, что в этом месяце документ уже выписан');
+    ok(last().includes('За сколько дней выставлять счёт'), 'второй шаг — насколько заранее',
+      last().slice(0, 50));
+    await tap(button('За 3 дня'));
+
+    ok(norm(last()).includes('2-го — предложу выписать'), 'счёт за 3 дня до 5-го → 2-го числа',
+      norm(last()).slice(0, 120));
+    ok(norm(last()).includes('5-го — срок оплаты'), 'срок оплаты показан');
+    ok(norm(last()).includes('6-го — напомню'), 'обещан сигнал в первый день просрочки');
+    ok(last().includes('клиенту не напишу'), 'обещано не писать контрагенту самому');
+    ok(last().includes('начну со следующего'), 'сказано, что за этот месяц документ уже выписан');
 
     const mine = rec.list(uid);
     const one = mine.find((r) => r.cp_id === cpR);
     ok(Boolean(one), 'повторение в списке');
+    ok(one.pay_day === 5 && one.lead_days === 3 && one.offerDay === 2,
+      'срок оплаты и упреждение сохранены', `${one.pay_day}/${one.lead_days}/${one.offerDay}`);
     ok(one.items.length === 1 && one.items[0].price === 45000, 'позиции сохранены', JSON.stringify(one.items));
     ok(one.last_offer === rec.monthKey(), 'текущий месяц сразу отмечен как отработанный', one.last_offer);
     ok(rec.isDue(one, new Date()) === false, 'сегодня повторение не сработает');
+
+    // Акт в конце месяца — вторая половина цикла аренды, одной кнопкой.
+    await tap(`rec.akt:${cpR}`);
+    const akt = rec.list(uid).find((r) => r.cp_id === cpR && r.type === 'usl');
+    ok(Boolean(akt) && akt.day === rec.LAST_DAY, 'акт заведён на конец месяца', akt && akt.day);
+    ok(akt.items.length === 1 && akt.items[0].price === 45000, 'позиции акта взяты из счёта');
+    await tap(`rec.akt:${cpR}`);
+    ok(last().includes('уже повторяется'), 'второй такой же акт не заводится', last().slice(0, 40));
+    rec.off(uid, akt.id);
 
     // Наступил следующий месяц — предложение должно прийти.
     const nextMonth = new Date();
@@ -1622,6 +1663,49 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'чужое повторение выключить нельзя');
     ok(rec.get(uid, alien) === null, 'чужое повторение не отдаётся по прямому id');
     ok(!rec.list(uid).some((r) => r.id === alien), 'чужого нет в своём списке');
+  }
+
+  console.log('\n── сигнал о просрочке ──');
+  {
+    const rec = require('./lib/recurring');
+    const bdbO = require('./lib/bot-db');
+    const { runDaily } = require('./bot.js');
+    const uid = fxUserId();
+
+    const cpO = bdbO.createCp(uid, { name: 'ООО «Должник»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.sch:${cpO}`);
+    await say('Аренда за месяц; 1; 20000');
+    await tap('items.done');
+    await tap('doc.make');
+    const bill = bdbO.listDocs(uid, 1)[0];
+
+    // Срок оплаты — вчера, о просрочке ещё не сообщали.
+    const id = rec.add(uid, { cpId: cpO, type: 'sch', items: [{ name: 'Аренда', qty: 1, price: 20000 }] });
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    rec.setSchedule(uid, id, { payDay: Math.max(1, Math.min(27, yesterday.getDate())), leadDays: 3 });
+
+    const before = sent.length;
+    await runDaily(tg);
+    const warned = sent.slice(before).map((m) => norm(m.text)).join('\n');
+    ok(/Просрочка: ООО «Должник»/.test(warned), 'бот сообщил о просрочке', warned.slice(0, 60));
+    ok(/20 000,00/.test(warned), 'в сообщении сумма неоплаченного');
+    ok(!/отправил|написал клиенту/i.test(warned), 'контрагенту бот ничего не отправлял');
+
+    // Второй раз в том же месяце — молчим.
+    const after = sent.length;
+    await runDaily(tg);
+    ok(sent.length === after, 'повторно за тот же месяц не напоминает', sent.length - after);
+
+    // Отметили оплату — на следующий месяц сигнала быть не должно.
+    bdbO.markPaid(uid, bill.id);
+    require('./db').db.prepare("UPDATE recurring SET last_due = '' WHERE id = ?").run(id);
+    const paidBefore = sent.length;
+    await runDaily(tg);
+    const said = sent.slice(paidBefore).map((m) => norm(m.text)).join('\n');
+    ok(!/Просрочка: ООО «Должник»/.test(said), 'после отметки оплаты не напоминает', said.slice(0, 60));
+
+    rec.off(uid, id);
   }
 
   console.log('\n── чем занимается бизнес ──');

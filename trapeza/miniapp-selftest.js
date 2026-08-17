@@ -385,6 +385,19 @@ async function main() {
     const mine = r.json.items.find((x) => x.id === recId);
     ok(Boolean(mine) && mine.total > 0, 'повторение в списке с суммой', mine && mine.total);
 
+    // Цикл аренды: одно число из договора задаёт счёт, срок и просрочку.
+    r = await call('POST', '/api/recurring', {
+      user: masha, body: { docId: lastDoc.id, payDay: 5, leadDays: 3 },
+    });
+    ok(r.status === 200 && r.json.offerDay === 2 && r.json.payDay === 5,
+      'счёт за 3 дня до 5-го — 2-го числа', JSON.stringify(r.json));
+    const rentId = r.json.id;
+    r = await call('GET', '/api/recurring', { user: masha });
+    const rentRec = r.json.items.find((x) => x.id === rentId);
+    ok(rentRec.payDay === 5 && rentRec.leadDays === 3 && rentRec.offerDay === 2,
+      'приложение получает весь цикл, а не одну дату', JSON.stringify(rentRec));
+    await call('POST', '/api/recurring/off', { user: masha, body: { id: rentId } });
+
     r = await call('GET', '/api/recurring', { user: petya });
     ok(r.json.items.length === 0, 'чужие повторения не видны');
     r = await call('POST', '/api/recurring/off', { user: petya, body: { id: recId } });

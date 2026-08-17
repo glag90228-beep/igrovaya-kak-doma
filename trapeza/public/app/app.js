@@ -450,27 +450,68 @@ screens.doc = async function docScreen({ id }) {
         onclick: () => go('new', { type: d.type, cpId: d.cpId, items: d.items }),
       }, 'Повторить новым номером')));
 
-    // Повторение заводится отсюда: позиции уже проверены человеком, остаётся
-    // выбрать день. 29–31 в списке нет — таких чисел нет в каждом месяце.
-    const days = h('div', { class: 'card', hidden: true },
+    /*
+     * Повторение заводится отсюда: позиции уже проверены человеком, остаётся
+     * назвать число. 29–31 в списке нет — таких чисел нет в каждом месяце.
+     *
+     * У счёта спрашиваем не «когда напомнить», а число из договора: платят
+     * к нему, счёт нужен заранее, а на следующий день после срока — сигнал
+     * о просрочке. Одно число задаёт весь цикл.
+     */
+    const isBill = ['sch', 'schdog'].includes(d.type);
+    const panel = h('div', { hidden: true });
+
+    const save = (body, done) => withBusy(done, async () => {
+      const r = await api('POST', '/api/recurring', { docId: d.id, ...body });
+      haptic('medium');
+      toast(r.payDay ? `Счёт ${r.offerDay}-го, оплата ${r.payDay}-го` : `Напомню ${r.dayText}`);
+      go('recurring');
+    });
+
+    const dayRows = (onPick, label) => h('div', { class: 'card' },
       [1, 5, 10, 15, 20, 25, 0].map((day) => h('button', {
         class: 'row',
-        onclick: (e) => withBusy(e.currentTarget, async () => {
-          const r = await api('POST', '/api/recurring', { docId: d.id, day });
-          haptic('medium');
-          toast(`Буду напоминать ${r.dayText}`);
-          go('recurring');
-        }),
+        onclick: (e) => onPick(day, e.currentTarget),
       },
       h('span', { class: 'icon-box' }, icon('clock')),
-      h('span', { class: 'grow', text: day ? `${day}-го числа` : 'В последний день месяца' }))));
+      h('span', { class: 'grow', text: label(day) }))));
+
+    if (isBill) {
+      const lead = h('div', { hidden: true });
+      panel.append(
+        h('div', { class: 'section-title', text: 'Какого числа клиент платит по договору' }),
+        dayRows((day, btn) => {
+          if (!day) { save({ day: 0 }, btn); return; }
+          // Второй шаг вместо готового ответа: «за 3 дня» — обычай, а не
+          // правило, и в договоре может стоять другой срок.
+          lead.replaceChildren(
+            h('div', { class: 'section-title', text: `Оплата ${day}-го. Выставлять счёт` }),
+            h('div', { class: 'card' }, [3, 5, 7, 0].map((days) => h('button', {
+              class: 'row',
+              onclick: (e) => save({ payDay: day, leadDays: days }, e.currentTarget),
+            },
+            h('span', { class: 'icon-box' }, icon('send')),
+            h('span', { class: 'grow', text: days ? `за ${days} ${plural(days, 'день', 'дня', 'дней')}` : 'в день оплаты' })))));
+          lead.hidden = false;
+          lead.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          haptic();
+        }, (day) => (day ? `${day}-го числа` : 'В последний день месяца')),
+        lead,
+      );
+    } else {
+      panel.append(
+        h('div', { class: 'section-title', text: 'Какого числа напоминать' }),
+        dayRows((day, btn) => save({ day }, btn),
+          (day) => (day ? `${day}-го числа` : 'В последний день месяца')),
+      );
+    }
 
     const repeat = h('button', { class: 'btn ghost' }, 'Повторять каждый месяц');
     repeat.onclick = () => {
-      days.hidden = !days.hidden;
+      panel.hidden = !panel.hidden;
       haptic();
     };
-    box.append(h('div', { class: 'btn-wrap' }, repeat), days);
+    box.append(h('div', { class: 'btn-wrap' }, repeat), panel);
   }
 
   /*
@@ -1298,30 +1339,47 @@ screens.recurring = async function recurringScreen() {
     return box;
   }
   box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
-    text: 'Ничего не выписывается само: в нужный день придёт предложение с кнопкой.' }));
+    text: 'Ничего не выписывается само и клиенту бот не пишет: в нужный день '
+      + 'придёт предложение с кнопкой.' }));
 
-  // Заголовок строки — имя клиента: по нему её и узнают. Название документа
-  // уходит вниз, иначе оно съедает ширину и обрывает как раз имя.
-  box.append(h('div', { class: 'card' }, items.map((r) => h('div', { class: 'row' },
-    h('span', { class: 'icon-box' }, icon('repeat')),
-    h('span', { class: 'grow' },
-      h('div', { class: 'ellipsis', text: r.cpName }),
-      // День — впереди: это то, ради чего экран открывают. Обрезаться при
-      // нехватке ширины должно название документа, а не срок.
-      h('div', { class: 'small muted ellipsis', text: `${r.dayText} · ${r.title}` })),
-    // Без копеек: сумма здесь для узнавания, а не для сверки, и лишние
-    // четыре знака отнимают ширину у срока.
-    h('span', { class: 'money nowrap', text: money0(r.total) }),
-    h('button', {
-      class: 'row-act',
-      'aria-label': `Перестать напоминать: ${r.title} для ${r.cpName}`,
-      onclick: (e) => withBusy(e.currentTarget, async () => {
-        await api('POST', '/api/recurring/off', { id: r.id });
-        haptic('medium');
-        toast('Больше напоминать не буду');
-        render();
-      }),
-    }, icon('trash'))))));
+  for (const r of items) {
+    const card = h('div', { class: 'card' });
+    // Заголовок строки — имя клиента: по нему её и узнают. Название документа
+    // уходит вниз, иначе оно съедает ширину и обрывает как раз имя.
+    card.append(h('div', { class: 'row' },
+      h('span', { class: 'icon-box' }, icon('repeat')),
+      h('span', { class: 'grow' },
+        h('div', { class: 'ellipsis', text: r.cpName }),
+        h('div', { class: 'small muted ellipsis', text: r.title })),
+      // Без копеек: сумма здесь для узнавания, а не для сверки.
+      h('span', { class: 'money nowrap', text: money0(r.total) }),
+      h('button', {
+        class: 'row-act',
+        'aria-label': `Перестать напоминать: ${r.title} для ${r.cpName}`,
+        onclick: (e) => withBusy(e.currentTarget, async () => {
+          await api('POST', '/api/recurring/off', { id: r.id });
+          haptic('medium');
+          toast('Больше напоминать не буду');
+          render();
+        }),
+      }, icon('trash'))));
+
+    /*
+     * Календарь цикла целиком, а не одна дата. Человек настраивает аренду
+     * одним числом из договора, но следит бот за тремя событиями — и если
+     * не показать все, напоминание о просрочке придёт неожиданно и будет
+     * выглядеть ошибкой.
+     */
+    const steps = r.payDay
+      ? [[`${r.offerDay}-го`, 'выставить счёт'],
+        [`${r.payDay}-го`, 'срок оплаты по договору'],
+        [`${r.payDay + 1}-го`, 'напомню, если денег нет']]
+      : [[r.dayText, 'выписать документ']];
+    card.append(h('div', { class: 'plan' }, steps.map(([when, what]) => h('div', { class: 'plan-row' },
+      h('span', { class: 'plan-when', text: when }),
+      h('span', { class: 'plan-what', text: what })))));
+    box.append(card);
+  }
   return box;
 };
 
