@@ -629,7 +629,11 @@ const api = {
     if (!visionAvailable()) return { error: `Распознавание не подключено. ${visionHint()}` };
     const m = /^data:([^;,]*);base64,(.+)$/s.exec(String(body.dataUrl || ''));
     if (!m) return { error: 'Не разобрал картинку — пришлите фото или скан.' };
-    if (m[2].length > (6 * 1024 * 1024 * 4) / 3) return { error: 'Снимок больше 6 МБ.' };
+    // Предел тот же, что у тела запроса: проверка на 6 МБ была недостижима —
+    // readBody отказывал раньше, и сообщение про 6 МБ никто никогда не видел.
+    if (m[2].length > (MAX_BODY * 4) / 3) {
+      return { error: `Снимок больше ${Math.round(MAX_BODY / 1024 / 1024)} МБ — сфотографируйте ближе.` };
+    }
     const res = await readInvoice(Buffer.from(m[2], 'base64'), m[1]);
     if (!res.ok) return { error: res.error };
     const f = res.fields || {};

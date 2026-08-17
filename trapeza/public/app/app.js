@@ -791,27 +791,75 @@ screens.org = async function orgScreen() {
  * Ужимаем по длинной стороне до 1400 px прямо в браузере: и загрузка
  * быстрее, и человеку не приходится ничего готовить заранее.
  */
-function shrinkImage(file, maxSide = 1400) {
+/** Примерный вес data-URI в байтах — считать по длине дешевле, чем декодировать. */
+const dataUrlBytes = (url) => Math.ceil((url.length - url.indexOf(',') - 1) * 0.75);
+
+/**
+ * Закодировать холст, проверив, что браузер послушался.
+ *
+ * toDataURL при незнакомом типе молча отдаёт PNG. Без этой проверки мы бы
+ * считали, что отправляем WebP на 400 КБ, а отправляли бы PNG на 2,5 МБ —
+ * ровно та ошибка, из-за которой не грузилась печать.
+ */
+function encodeCanvas(canvas, type, quality) {
+  const url = canvas.toDataURL(type, quality);
+  return url.startsWith(`data:${type}`) ? url : null;
+}
+
+/**
+ * Уменьшить картинку и уложиться в отведённый вес.
+ *
+ * Раньше здесь всегда был PNG. Для подписи на белом листе это работало —
+ * такой снимок сжимается хорошо, — а фотография печати весила 2,5 МБ при
+ * пределе в 1 МБ, и человек видел отказ, ничего не сделав неправильно.
+ * PNG хорош для рисунков, а тут всегда фотография: берём WebP, затем JPEG,
+ * и только если браузер не умеет ни того, ни другого — PNG.
+ *
+ * Прозрачность заливаем белым в любом случае: на документе факсимиле
+ * ложится умножением, где белое становится невидимым.
+ */
+function shrinkImage(file, maxSide = 1400, maxBytes = 900 * 1024) {
   return new Promise((done, fail) => {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
       URL.revokeObjectURL(url);
-      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
-      const w = Math.max(1, Math.round(img.width * scale));
-      const h = Math.max(1, Math.round(img.height * scale));
       const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
       const ctx = canvas.getContext('2d');
-      // Белый фон под прозрачностью: PNG с альфой на документе даст
-      // серый прямоугольник, а нам нужно, чтобы сработало умножение.
-      ctx.fillStyle = '#fff';
-      ctx.fillRect(0, 0, w, h);
-      ctx.drawImage(img, 0, 0, w, h);
+
+      const render = (side) => {
+        const scale = Math.min(1, side / Math.max(img.width, img.height));
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      };
+
       try {
-        done(canvas.toDataURL('image/png'));
-      } catch (e) { fail(new Error('Не смог обработать картинку')); }
+        let best = null;
+        // Сначала качество, потом размер: замыленная печать читается хуже
+        // мелкой, поэтому уменьшаем сторону только когда сжатие не помогло.
+        for (const side of [maxSide, Math.round(maxSide * 0.72), Math.round(maxSide * 0.5)]) {
+          render(side);
+          for (const [type, q] of [
+            ['image/webp', 0.95], ['image/webp', 0.85], ['image/webp', 0.7],
+            ['image/jpeg', 0.9], ['image/jpeg', 0.75],
+          ]) {
+            const out = encodeCanvas(canvas, type, q);
+            if (!out) continue;                 // формат браузеру незнаком
+            best = out;
+            if (dataUrlBytes(out) <= maxBytes) { done(out); return; }
+          }
+        }
+        // Ни WebP, ни JPEG — старый браузер. PNG хотя бы попробуем.
+        render(Math.round(maxSide * 0.5));
+        const png = best || canvas.toDataURL('image/png');
+        if (dataUrlBytes(png) <= maxBytes) { done(png); return; }
+        fail(new Error('Снимок слишком тяжёлый. Сфотографируйте ближе или обрежьте лишнее.'));
+      } catch (e) {
+        fail(new Error('Не смог обработать картинку'));
+      }
     };
     img.onerror = () => { URL.revokeObjectURL(url); fail(new Error('Это не картинка')); };
     img.src = url;
@@ -840,7 +888,9 @@ function facsimileCard(state) {
         const chosen = file.files && file.files[0];
         if (!chosen) return;
         try {
-          const dataUrl = await shrinkImage(chosen);
+          // Сервер принимает факсимиле до 1 МБ — оставляем запас на служебные
+          // байты запроса, чтобы отказ не приходил из-за пары килобайт.
+          const dataUrl = await shrinkImage(chosen, 1400, 900 * 1024);
           const r = await api('POST', '/api/facsimile', { kind, dataUrl });
           toast(`${label} загружена`);
           haptic('medium');
@@ -1801,7 +1851,9 @@ screens.scan = async function scan() {
     if (!file) return;
     result.replaceChildren(h('div', { class: 'boot' }, h('span', { class: 'spinner' }), 'Распознаю…'));
     try {
-      const dataUrl = await shrinkImage(file, 1600);
+      // Распознаванию нужнее разрешение, чем факсимиле, но и тело запроса
+      // ограничено двумя мегабайтами — берём с запасом.
+      const dataUrl = await shrinkImage(file, 1600, 1400 * 1024);
       const r = await api('POST', '/api/scan', { dataUrl });
       const f = r.fields || {};
       result.replaceChildren(h('div', { class: 'card' },

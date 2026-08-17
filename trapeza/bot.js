@@ -1897,13 +1897,25 @@ async function acceptFacsimile(tg, chatId, user, msg, kind) {
   try {
     buf = await tg.downloadFile(fileId, facsimile.MAX_BYTES);
   } catch (e) {
-    await tg.sendMessage(chatId, `Не смог забрать файл: ${esc(e.message)}`);
+    /*
+     * Снимок с телефона, отправленный файлом, Telegram не сжимает — и в
+     * предел не влезает. Отправленный как фото, сжимается им самим. Разница
+     * невидима: в меню вложений это соседние пункты, и человек не знает,
+     * что выбрал не тот. Поэтому подсказываем, а не сообщаем о неудаче.
+     */
+    const big = /слишком большой/i.test(e.message || '');
+    await tg.sendMessage(chatId, big
+      ? `Файл больше ${Math.round(facsimile.MAX_BYTES / 1024)} КБ.\n\n`
+        + 'Отправьте тот же снимок <b>фотографией</b>, а не файлом: Telegram сожмёт '
+        + 'его сам, и качества для печати хватит.'
+      : `Не смог забрать файл: ${esc(e.message)}`);
     return;
   }
 
   const res = facsimile.save(user.id, kind, buf, mime);
   if (!res.ok) {
-    await tg.sendMessage(chatId, `${esc(res.error)}\nПришлите другой файл.`);
+    await tg.sendMessage(chatId, `${esc(res.error)}\n\n`
+      + 'Проще всего — отправить снимок фотографией, а не файлом: Telegram сожмёт его сам.');
     return;
   }
   bdb.clearState(user.id);

@@ -586,6 +586,18 @@ async function main() {
   ok(r.status === 200 && r.json.facsimile.sign && /^data:image\/png/.test(r.json.facsimile.sign.preview),
     'подпись загружена и вернулась предпросмотром');
 
+  /*
+   * WebP: приложение кодирует снимки именно в него. Раньше отправлялся PNG,
+   * и фотография печати весила 2,5 МБ при пределе в 1 МБ — человек видел
+   * отказ, ничего не сделав неправильно. Если сервер разучится принимать
+   * WebP, печать снова перестанет грузиться, и заметить это будет негде.
+   */
+  const WEBP = 'UklGRjIAAABXRUJQVlA4WAoAAAAQAAAABwAAAwAAVlA4IFoAAAAQAgCdASoIAAQAAMASJQBOgNEAL6e5mAIAAP772P8of/lkP/ybf/on/n0l+UUfGsji//er//5P5/8TH/5QNvlf9HCm8vCmp/cN3f2EfiG7uAPr3BnNyOtTgAA=';
+  r = await call('POST', '/api/facsimile', { user: masha, body: { kind: 'stamp', dataUrl: `data:image/webp;base64,${WEBP}` } });
+  ok(r.status === 200 && r.json.facsimile.stamp && /^data:image\/webp/.test(r.json.facsimile.stamp.preview),
+    'WebP принимается — в нём приложение и присылает снимки', (r.json || {}).error);
+  await call('POST', '/api/facsimile/delete', { user: masha, body: { kind: 'stamp' } });
+
   r = await call('POST', '/api/facsimile', { user: masha, body: { kind: 'sign', dataUrl: 'привет' } });
   ok(r.status === 400, 'не-картинка отклонена', (r.json || {}).error);
   r = await call('POST', '/api/facsimile', { user: masha, body: { kind: 'подпись', dataUrl: `data:image/png;base64,${PNG}` } });
