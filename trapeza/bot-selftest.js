@@ -127,15 +127,22 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await say('/start');
   ok(last().includes('Первичка'), 'бот поздоровался и показал меню');
   await tap('org.new');
-  // Ручной путь: ИНН вводим (справочник в прогоне не подключён — автозаполнения
-  // нет), название и остальное набираем сами. Порядок шагов новый:
-  // инн → название → полное → КПП → адрес → подписант → БИК → банк → к/с → р/с.
+  /*
+   * Ручной путь: ИНН вводим (справочник в прогоне не подключён — автозаполнения
+   * нет), остальное набираем сами. Шаги:
+   * инн → название → полное → адрес → подписант → БИК → банк → к/с → р/с.
+   *
+   * КПП в списке нет намеренно: ИНН здесь двенадцатизначный, то есть это
+   * предприниматель, а у него КПП не бывает — вопрос пропускается. Если он
+   * вернётся, ответы сдвинутся и прогон это заметит.
+   */
   const ORG = ['183112345637', 'ИП Сарычева М. В.',
-    'Индивидуальный предприниматель Сарычева Мария Витальевна', '-',
+    'Индивидуальный предприниматель Сарычева Мария Витальевна',
     'г. Ижевск, ул. Пушкинская, 214', 'М. В. Сарычева',
     '049401601', 'ПАО Сбербанк', '30101810400000000601', '40802810168000012341'];
   for (const v of ORG) await say(v);
   ok(last().includes('сохранена'), 'организация заведена', last().slice(0, 60));
+  ok(!sent.some((m) => /КПП/.test(m.text || '')), 'у предпринимателя КПП не спрашивали');
   await tap('org');
   ok(last().includes('049401601'), 'реквизиты организации показываются');
 
@@ -1040,6 +1047,71 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'у организации подпись стоит у руководителя');
     ok(!line(updOoo, 'Индивидуальный предприниматель или иное').includes('Сарычев'),
       'и не дублируется в строке ИП');
+  }
+
+  console.log('\n── НДС в накладной и оговорка про УСН ──');
+  {
+    const { buildTorg12Html } = require('./lib/torg12');
+    const { buildUpdHtml } = require('./lib/upd');
+    const { usnNote } = require('./lib/doc-html');
+
+    const usn = { name: 'ИП Тест', inn: '183114389446', signer: 'И. Т.', vat_rate: '' };
+    const nds = { ...usn, name: 'ООО Тест', inn: '7707083893', vat_rate: '20' };
+    const cp2 = { name: 'ООО «Покупатель»', inn: '1800047200' };
+    const items = [{ name: 'Товар', unit: 'шт.', qty: 10, price: 1200 }];
+
+    ok(usnNote(usn).includes('упрощённую'), 'у неплательщика оговорка про УСН печатается');
+    ok(usnNote(nds) === '', 'у плательщика НДС её нет — это была бы неправда');
+
+    const t0 = buildTorg12Html({ org: usn, cp: cp2, doc: { number: '1', date: '2026-08-17', items } });
+    ok(t0.includes('без НДС') && t0.includes('упрощённую'), 'накладная на УСН осталась прежней');
+
+    const t1 = buildTorg12Html({
+      org: nds, cp: cp2, doc: { number: '1', date: '2026-08-17', items, vatRate: 20 },
+    });
+    ok(!t1.includes('упрощённую'), 'у плательщика накладная не заявляет УСН');
+    ok(norm(t1).includes('2 400,00'), 'НДС 20% с 12 000 посчитан');
+    ok(norm(t1).includes('14 400,00'), 'сумма с налогом отличается от суммы без него');
+
+    const u2 = buildUpdHtml({ org: nds, cp: cp2, doc: { number: '1', date: '2026-08-17', items, status: 2 } });
+    ok(!u2.includes('упрощённую'), 'УПД плательщика тоже не заявляет УСН');
+    const u2usn = buildUpdHtml({ org: usn, cp: cp2, doc: { number: '1', date: '2026-08-17', items, status: 2 } });
+    ok(u2usn.includes('упрощённую'), 'а у неплательщика заявляет');
+  }
+
+  console.log('\n── автозаполнение реквизитов ──');
+  {
+    const dd = require('./lib/dadata');
+    const bdbA = require('./lib/bot-db');
+    const uid = fxUserId();
+
+    // Ответ реестра для предпринимателя: ОГРНИП в нём есть всегда.
+    process.env.DADATA_MOCK = JSON.stringify({
+      183114389446: {
+        type: 'INDIVIDUAL',
+        name: { full_with_opf: 'Индивидуальный предприниматель Тестов Тест Тестович' },
+        inn: '183114389446',
+        ogrn: '318183200012345',
+        address: { value: 'г Ижевск, ул Тестовая, д 1' },
+        fio: { surname: 'Тестов', name: 'Тест', patronymic: 'Тестович' },
+        state: { status: 'ACTIVE' },
+      },
+    });
+    const r = await dd.partyByInn('183114389446');
+    ok(r.ok, 'справочник ответил', r.error);
+    ok(r.fields.ogrnip === '318183200012345',
+      'ОГРНИП взят из реестра — раньше его теряли', r.fields.ogrnip);
+    ok(r.fields.kpp === '', 'у предпринимателя КПП пустой');
+    ok(r.fields.signer === 'Т. Т. Тестов', 'подписант собран из ФИО', r.fields.signer);
+    delete process.env.DADATA_MOCK;
+
+    const isIpInn = (inn) => String(inn || '').replace(/\D/g, '').length === 12;
+    ok(isIpInn('183114389446') && !isIpInn('7707083893'),
+      'предприниматель определяется по длине ИНН и в анкете');
+
+    bdbA.saveMyOrg(uid, { ...bdbA.getDefaultOrg(uid), ogrnip: '318183200012345' });
+    ok(bdbA.getDefaultOrg(uid).ogrnip === '318183200012345', 'ОГРНИП сохраняется',
+      bdbA.getDefaultOrg(uid).ogrnip);
   }
 
   console.log('\n── разбор вставленных реквизитов ──');

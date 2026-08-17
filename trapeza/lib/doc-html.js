@@ -130,6 +130,25 @@ function signRows(org, fx = () => '') {
   ];
 }
 
+/**
+ * Оговорка «поставщик на УСН и НДС не платит».
+ *
+ * Печаталась в накладной и в УПД безусловно. Для плательщика НДС это
+ * прямая неправда в документе, который уходит покупателю: его бухгалтерия
+ * по такой строке не примет налог к вычету, а при проверке расхождение
+ * документа с налоговым режимом объяснять придётся продавцу.
+ *
+ * @param {object} org организация (смотрим vat_rate)
+ * @param {string} tail что дописать, если оговорка уместна
+ */
+function usnNote(org, tail = '') {
+  const raw = org && org.vat_rate;
+  const payer = !(raw === '' || raw == null) && Number.isFinite(Number(raw));
+  if (payer) return '';
+  return `<p class="note">Поставщик применяет упрощённую систему налогообложения и не является
+     плательщиком НДС (гл. 26.2 НК РФ).${tail ? ` ${esc(tail)}` : ''}</p>`;
+}
+
 function page(title, body) {
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8">`
     + `<title>${esc(title)}</title><style>${CSS}</style></head>`
@@ -137,5 +156,5 @@ function page(title, body) {
 }
 
 module.exports = {
-  esc, ru, page, fxHtml, isIp, signRows, formatMoney, formatRub, amountInWords,
+  esc, ru, page, fxHtml, isIp, signRows, usnNote, formatMoney, formatRub, amountInWords,
 };

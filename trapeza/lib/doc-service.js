@@ -146,8 +146,11 @@ async function issueDocument(userId, {
   // выписывало бы счета всегда без налога, игнорируя настройку.
   // Явно переданный vatRate (в том числе null — «этот счёт без НДС»)
   // сильнее умолчания, поэтому проверяем наличие ключа, а не значение.
+  // Накладная сюда добавлена не сразу: она считала «без НДС» всегда, даже
+  // у плательщика, и печатала одинаковый итог в графах с налогом и без.
   let fields = extra;
-  if (['sch', 'schdog'].includes(type) && !Object.prototype.hasOwnProperty.call(extra, 'vatRate')) {
+  if (['sch', 'schdog', 'torg12'].includes(type)
+      && !Object.prototype.hasOwnProperty.call(extra, 'vatRate')) {
     const v = bdb.vatOf(org);
     if (v.rate != null) fields = { ...extra, vatRate: v.rate, priceIncludesVat: v.gross };
   }

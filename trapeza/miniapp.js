@@ -240,6 +240,9 @@ const api = {
       full_name: str(body.full_name, 400),
       inn: str(body.inn, 12),
       kpp: str(body.kpp, 9),
+      // ОГРНИП печатается в УПД. Через приложение он не сохранялся вовсе:
+      // поле в форме появилось, а до базы не доезжало.
+      ogrnip: str(body.ogrnip, 15),
       signer: str(body.signer, 200),
       address: str(body.address, 400),
       bank_name: str(body.bank_name, 300),

@@ -147,7 +147,11 @@ function esc(s) {
 // ---------- пошаговые формы (организация, контрагент) ----------
 
 // Шаги помечены: auto — по значению дозаполняет соседние поля из реестра;
+/** Двенадцать цифр в ИНН — предприниматель; у него нет КПП. */
+const isIpInn = (inn) => String(inn || '').replace(/\D/g, '').length === 12;
+
 // skipIfFilled — пропускается, если значение уже подставлено автозаполнением.
+// skipIf — вопрос вообще неприменим (например, КПП у предпринимателя).
 // Поэтому ИНН и БИК стоят первыми: с них подтягивается всё остальное.
 
 const ORG_STEPS = [
@@ -159,7 +163,10 @@ const ORG_STEPS = [
   },
   { key: 'name', skipIfFilled: true, q: 'Краткое название (напр. «ИП Иванов И. И.» или «ООО Ромашка»):' },
   { key: 'full_name', skipIfFilled: true, opt: true, q: 'Полное наименование для документов (или «-»):' },
-  { key: 'kpp', skipIfFilled: true, opt: true, q: 'КПП (для ООО; ИП отправьте «-»):' },
+  // У предпринимателя КПП не бывает: если ИНН двенадцатизначный, вопрос
+  // не задаём вовсе — незачем спрашивать то, чего у человека нет.
+  { key: 'kpp', skipIfFilled: true, opt: true, skipIf: (v) => isIpInn(v.inn),
+    q: 'КПП (для ООО; ИП отправьте «-»):' },
   { key: 'address', skipIfFilled: true, opt: true, q: 'Адрес (или «-»):' },
   { key: 'signer', skipIfFilled: true, opt: true, q: 'ФИО подписанта (напр. «И. И. Иванов»; или «-»):' },
   {
@@ -179,7 +186,8 @@ const CP_STEPS = [
   },
   { key: 'name', skipIfFilled: true, q: 'Краткое имя контрагента (напр. «ООО Заря»):' },
   { key: 'full_name', skipIfFilled: true, opt: true, q: 'Полное наименование (или «-»):' },
-  { key: 'kpp', skipIfFilled: true, opt: true, q: 'КПП (или «-»):' },
+  { key: 'kpp', skipIfFilled: true, opt: true, skipIf: (v) => isIpInn(v.inn),
+    q: 'КПП (или «-»):' },
   { key: 'address', skipIfFilled: true, opt: true, q: 'Адрес контрагента (или «-»):' },
   {
     key: 'kind', q: 'Тип контрагента:',
@@ -283,8 +291,12 @@ async function advanceForm(tg, chatId, user, formName, values, from) {
     const s = form.steps[next];
     // Пропускаем заполненное; после вставки блока — и пустые поля-реквизиты,
     // кроме расчётного счёта: без него не будет QR, поэтому его переспросим.
-    const skip = s.skipIfFilled
-      && (values[s.key] || (values.__pasted && s.opt && s.key !== 'acc'));
+    const skip = (s.skipIfFilled
+      && (values[s.key] || (values.__pasted && s.opt && s.key !== 'acc')))
+      // skipIf — вопрос неприменим к этому человеку, а не «уже отвечен».
+      // Спрашивать у предпринимателя КПП значит просить у него то, чего у
+      // него не бывает: он гадает, что вписать, и вписывает что-нибудь.
+      || (typeof s.skipIf === 'function' && s.skipIf(values));
     if (skip) { next += 1; continue; }
     break;
   }
@@ -322,7 +334,7 @@ async function runAuto(kind, rawValue, values) {
     // по БИК — точное название банка и корр. счёт.
     if (p.inn && dadata.dadataAvailable() && (!values.address || !values.signer)) {
       const r = await dadata.partyByInn(p.inn).catch(() => ({ ok: false }));
-      if (r.ok) fill(values, r.fields, ['name', 'full_name', 'kpp', 'address', 'signer']);
+      if (r.ok) fill(values, r.fields, ['name', 'full_name', 'kpp', 'address', 'signer', 'ogrnip']);
     }
     if (values.bik && dadata.dadataAvailable()) {
       const rb = await dadata.bankByBik(values.bik).catch(() => ({ ok: false }));
@@ -348,7 +360,7 @@ async function runAuto(kind, rawValue, values) {
     }
     const r = await dadata.partyByInn(raw);
     if (!r.ok) return { note: '', warn: r.error };
-    fill(values, r.fields, ['name', 'full_name', 'kpp', 'address', 'signer']);
+    fill(values, r.fields, ['name', 'full_name', 'kpp', 'address', 'signer', 'ogrnip']);
     return { note: `Нашёл: <b>${esc(r.fields.name)}</b>${r.fields.address ? `, ${esc(r.fields.address)}` : ''}.`, warn: r.warn };
   }
 

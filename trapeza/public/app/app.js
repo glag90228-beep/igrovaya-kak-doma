@@ -741,6 +741,22 @@ screens.cp = async function cpScreen({ id }) {
     }),
   }, 'Заполнить по ИНН и БИК');
 
+  // То же самое, но без нажатия: дописали ИНН — поля заполнились.
+  autoLookup(f, (r) => {
+    if (r.party) {
+      if (!f.name.input.value) f.name.input.value = r.party.name || '';
+      f.full_name.input.value = r.party.full_name || f.full_name.input.value;
+      f.kpp.input.value = r.party.kpp || f.kpp.input.value;
+      f.address.input.value = r.party.address || f.address.input.value;
+      toast(`Нашёл: ${r.party.name}`);
+    }
+    if (r.bank) {
+      f.bank_name.input.value = r.bank.bank_name || f.bank_name.input.value;
+      f.corr_acc.input.value = r.bank.corr_acc || f.corr_acc.input.value;
+      toast(`Банк: ${r.bank.bank_name}`);
+    }
+  });
+
   const box = h('div', {}, h('h1', { text: id ? cp.name || 'Клиент' : 'Новый клиент' }));
 
   /*
@@ -798,6 +814,7 @@ screens.org = async function orgScreen() {
     full_name: field('full_name', 'Полное наименование', o.full_name),
     inn: field('inn', 'ИНН', o.inn, { inputmode: 'numeric' }),
     kpp: field('kpp', 'КПП', o.kpp, { inputmode: 'numeric', hint: 'У ИП его нет — оставьте пустым' }),
+    ogrnip: field('ogrnip', 'ОГРНИП', o.ogrnip, { inputmode: 'numeric', hint: 'Подставится по ИНН; печатается в УПД' }),
     signer: field('signer', 'Кто подписывает', o.signer, { placeholder: 'И. И. Иванов' }),
     address: field('address', 'Адрес', o.address),
     bank_name: field('bank_name', 'Банк', o.bank_name),
@@ -824,6 +841,37 @@ screens.org = async function orgScreen() {
     }),
   }, 'Разобрать текст');
 
+  /*
+   * У предпринимателя нет КПП, у организации нет ОГРНИП. Показывать оба
+   * поля всем значит просить человека решать, что из этого про него, —
+   * а он впишет наугад. Определяем по длине ИНН и прячем лишнее.
+   */
+  const ipFields = () => {
+    const ip = String(f.inn.input.value || '').replace(/\D/g, '').length === 12;
+    f.kpp.hidden = ip;
+    f.ogrnip.hidden = !ip;
+  };
+  f.inn.input.addEventListener('input', ipFields);
+  ipFields();
+
+  autoLookup(f, (r) => {
+    if (r.party) {
+      if (!f.name.input.value) f.name.input.value = r.party.name || '';
+      f.full_name.input.value = r.party.full_name || f.full_name.input.value;
+      f.kpp.input.value = r.party.kpp || f.kpp.input.value;
+      f.address.input.value = r.party.address || f.address.input.value;
+      if (r.party.ogrnip) f.ogrnip.input.value = r.party.ogrnip;
+      if (r.party.signer && !f.signer.input.value) f.signer.input.value = r.party.signer;
+      ipFields();
+      toast(`Нашёл: ${r.party.name}`);
+    }
+    if (r.bank) {
+      f.bank_name.input.value = r.bank.bank_name || f.bank_name.input.value;
+      f.corr_acc.input.value = r.bank.corr_acc || f.corr_acc.input.value;
+      toast(`Банк: ${r.bank.bank_name}`);
+    }
+  });
+
   const box = h('div', {}, h('h1', { text: 'Моя организация' }));
   box.append(h('div', { class: 'banner info' }, icon('help'),
     h('div', { text: 'Эти реквизиты подставляются во все документы. Заполняются один раз.' })));
@@ -834,7 +882,7 @@ screens.org = async function orgScreen() {
   box.append(h('div', { class: 'btn-wrap' }, parseBtn));
 
   box.append(h('div', { class: 'section-title', text: 'Организация' }));
-  box.append(h('div', { class: 'card' }, f.name, f.full_name, f.inn, f.kpp, f.signer, f.address));
+  box.append(h('div', { class: 'card' }, f.name, f.full_name, f.inn, f.kpp, f.ogrnip, f.signer, f.address));
   box.append(h('div', { class: 'btn-wrap' }, h('button', {
     class: 'btn secondary',
     onclick: (e) => withBusy(e.currentTarget, async () => {
@@ -846,7 +894,11 @@ screens.org = async function orgScreen() {
         f.full_name.input.value = r.party.full_name || '';
         f.kpp.input.value = r.party.kpp || '';
         f.address.input.value = r.party.address || '';
+        // ОГРНИП раньше не подставлялся ниоткуда: поле было, в УПД
+        // печаталось, и всегда пустовало.
+        if (r.party.ogrnip) f.ogrnip.input.value = r.party.ogrnip;
         if (r.party.signer) f.signer.input.value = r.party.signer;
+        ipFields();
       }
       if (r.bank) {
         f.bank_name.input.value = r.bank.bank_name || '';
@@ -959,6 +1011,46 @@ function shrinkImage(file, maxSide = 1400, maxBytes = 900 * 1024) {
     img.onerror = () => { URL.revokeObjectURL(url); fail(new Error('Это не картинка')); };
     img.src = url;
   });
+}
+
+/**
+ * Подставить реквизиты из реестра, как только ИНН или БИК дописан.
+ *
+ * В боте это происходит само — там ИНН это отдельный шаг. В приложении
+ * рядом стояла кнопка «Заполнить по ИНН и БИК», и человек, который её не
+ * заметил, набирал название и адрес руками, хотя они есть в реестре.
+ *
+ * Срабатывает при уходе из поля, а не на каждый набранный символ: иначе
+ * на каждую цифру уходил бы запрос в справочник. И только когда поле
+ * дописано до правильной длины — 10 или 12 цифр у ИНН, 9 у БИКа.
+ *
+ * @param {object} f поля формы
+ * @param {Function} apply что сделать с ответом
+ */
+function autoLookup(f, apply) {
+  let last = '';
+  const run = async (kind) => {
+    const inn = String(f.inn.input.value || '').replace(/\D/g, '');
+    const bik = String((f.bik && f.bik.input.value) || '').replace(/\D/g, '');
+    const okInn = inn.length === 10 || inn.length === 12;
+    const okBik = bik.length === 9;
+    if (kind === 'inn' && !okInn) return;
+    if (kind === 'bik' && !okBik) return;
+    const key = `${kind}:${kind === 'inn' ? inn : bik}`;
+    if (key === last) return;                 // тот же номер — не дёргаем справочник
+    last = key;
+    try {
+      const r = await api('POST', '/api/lookup',
+        kind === 'inn' ? { inn } : { bik });
+      apply(r);
+      haptic();
+    } catch (_) {
+      // Молча: человек мог просто ошибиться цифрой, а кнопка рядом никуда
+      // не делась. Ругаться на ввод, который он ещё правит, — навязчиво.
+    }
+  };
+  f.inn.input.addEventListener('change', () => run('inn'));
+  if (f.bik) f.bik.input.addEventListener('change', () => run('bik'));
 }
 
 /**

@@ -93,6 +93,11 @@ function mapParty(data) {
     address: (data.address && (data.address.unrestricted_value || data.address.value)) || '',
     signer,
     isIp,
+    // ОГРНИП печатается в УПД. Справочник его отдаёт всегда, а мы раньше
+    // не брали — поле в базе было, в бланке было, и всегда пустовало,
+    // потому что вводить его никто не просил.
+    ogrnip: isIp ? (data.ogrn || '') : '',
+    ogrn: data.ogrn || '',
     status: (data.state && data.state.status) || '', // ACTIVE / LIQUIDATED …
   };
 }

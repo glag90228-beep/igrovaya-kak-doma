@@ -9,8 +9,8 @@
  * Отпуск разрешил / отпустил / груз принял оформлены как в бланке.
  */
 
-const { esc, ru, page, fxHtml, formatMoney, amountInWords } = require('./doc-html');
-const { round2 } = require('./money');
+const { esc, ru, page, fxHtml, usnNote, formatMoney, amountInWords } = require('./doc-html');
+const { round2, vatSplit, vatTotals, rateLabel } = require('./money');
 
 const LAND = `
   @page { size: A4 landscape; }
@@ -36,21 +36,30 @@ function plural(n, one, few, many) {
 /** @param doc { number, date, items:[{name,qty,unit,price,code?,weight?}], basis?, note? } */
 function buildTorg12Html({ org, cp, doc }) {
   const items = doc.items || [];
-  const total = round2(items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0));
+  /*
+   * НДС в накладной раньше не считался вовсе: в графе стояло «без НДС», а
+   * итог печатался дважды одинаковым числом. Для плательщика НДС такая
+   * накладная неверна — покупателю нечего принять к вычету. Ставку берём
+   * ту же, что у остальных документов.
+   */
+  const rate = doc.vatRate == null ? null : Number(doc.vatRate);
+  const gross = Boolean(doc.priceIncludesVat);
+  const sums = vatTotals(items, rate, gross);
+  const total = sums.total;
   const places = items.reduce((s, it) => s + (Number(it.qty) || 0), 0);
 
   const rows = items.map((it, i) => {
-    const sum = round2((Number(it.qty) || 0) * (Number(it.price) || 0));
+    const s1 = vatSplit(it, rate, gross);
     return `<tr>
       <td class="c">${i + 1}</td>
       <td class="nm">${esc(it.name)}</td>
       <td class="c">${esc(it.code || '')}</td>
       <td class="c">${esc(it.unit || 'шт.')}</td>
       <td class="c">${esc(it.qty ?? '')}</td>
-      <td class="r">${formatMoney(it.price)}</td>
-      <td class="r">${formatMoney(sum)}</td>
-      <td class="c">без НДС</td>
-      <td class="r">${formatMoney(sum)}</td>
+      <td class="r">${formatMoney(s1.unitNet)}</td>
+      <td class="r">${formatMoney(s1.net)}</td>
+      <td class="c">${rate == null ? 'без НДС' : formatMoney(s1.vat)}</td>
+      <td class="r">${formatMoney(s1.total)}</td>
     </tr>`;
   }).join('');
 
@@ -89,8 +98,9 @@ function buildTorg12Html({ org, cp, doc }) {
       <tbody>
         ${rows || '<tr><td colspan="9" class="c muted">— нет позиций —</td></tr>'}
         <tr class="total"><td colspan="6" class="r">Всего по накладной:</td>
-            <td class="r">${formatMoney(total)}</td><td class="c">—</td>
-            <td class="r">${formatMoney(total)}</td></tr>
+            <td class="r">${formatMoney(sums.net)}</td>
+            <td class="c">${sums.vat == null ? '—' : formatMoney(sums.vat)}</td>
+            <td class="r">${formatMoney(sums.total)}</td></tr>
       </tbody>
     </table>
 
@@ -99,8 +109,9 @@ function buildTorg12Html({ org, cp, doc }) {
     <p class="b">${amountInWords(total)}.</p>
     <p class="small">Всего мест: ${places} ${plural(places, 'место', 'места', 'мест')}.
        Отпущено ${items.length} ${plural(items.length, 'наименование', 'наименования', 'наименований')}.</p>
-    <p class="note">Поставщик применяет упрощённую систему налогообложения и не является
-       плательщиком НДС (гл. 26.2 НК РФ).</p>
+    ${rate == null ? usnNote(org)
+      : `<p class="note">Сумма НДС по ставке ${esc(rateLabel(rate))} —
+         ${formatMoney(sums.vat)} руб.${gross ? ' Цены пересчитаны из цен с налогом.' : ''}</p>`}
     ${doc.note ? `<p class="note">${esc(doc.note)}</p>` : ''}
 
     <div class="foot">
