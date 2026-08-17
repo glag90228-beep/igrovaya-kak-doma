@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Первичка без Excel</title>
+<meta name="description" content="Счета, акты, УПД и платёжки прямо в Telegram. Реквизиты вводятся один раз, номера бот ведёт сам.">
+<meta property="og:title" content="Первичка без Excel">
+<meta property="og:description" content="Счета, акты, УПД и платёжки прямо в Telegram. Первые 5 документов в месяц — бесплатно.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧾</text></svg>">
+<style>
+/*
+ * Первичка — страница продукта.
+ *
+ * Синий #2E3A8C здесь не выбран «под настроение»: этим же цветом продукт
+ * печатает документы, поэтому страница и счёт, который клиент получит,
+ * выглядят одним хозяйством. Зелёный тоже со смыслом — в приложении
+ * зелёным показаны деньги, которые вам должны.
+ *
+ * Шрифт системный. Артефакты и строгий CSP не пускают шрифтовые CDN, а
+ * тихий фолбэк на Times хуже, чем осознанно набранный системный стек:
+ * на iOS это SF Pro, на Windows Segoe UI, на Android Roboto — у всех трёх
+ * есть кириллица и настоящие тяжёлые начертания.
+ */
+
+:root {
+  --deep:    #0A1230;   /* тёмно-синие полосы — герой и нижний призыв */
+  --deep-2:  #16204A;
+  --surface: #FFFFFF;
+  --mist:    #F2F5FB;   /* холодный нейтрал с синим уклоном, не серый по умолчанию */
+  --text:    #0A1230;
+  --muted:   #5C6788;
+  --line:    rgba(10, 18, 48, .11);
+  --blue:    #2E3A8C;
+  --green:   #0E9F58;
+  --on-deep: #FFFFFF;
+  --on-deep-muted: #A9B4D6;
+
+  --w: 1120px;
+  --pad: 24px;
+  --r: 14px;
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+/* Тёмная тема. Правим только токены: цвет, объявленный внутри media-блока,
+   не применится у зрителя с настройкой «как в системе». */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --deep:    #05091A;
+    --deep-2:  #141E44;
+    --surface: #0E1730;
+    --mist:    #16203F;
+    --text:    #E9EDF8;
+    --muted:   #96A1C0;
+    --line:    rgba(255, 255, 255, .12);
+    --blue:    #8492EC;
+    --green:   #34C77B;
+    --on-deep: #FFFFFF;
+    --on-deep-muted: #9AA6CB;
+  }
+}
+:root[data-theme="dark"] {
+  --deep:    #05091A;
+  --deep-2:  #141E44;
+  --surface: #0E1730;
+  --mist:    #16203F;
+  --text:    #E9EDF8;
+  --muted:   #96A1C0;
+  --line:    rgba(255, 255, 255, .12);
+  --blue:    #8492EC;
+  --green:   #34C77B;
+  --on-deep: #FFFFFF;
+  --on-deep-muted: #9AA6CB;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--surface);           /* явно: прозрачный фон занял бы чужой */
+  color: var(--text);
+  font: 400 17px/1.6 var(--font);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.wrap { width: 100%; max-width: var(--w); margin: 0 auto; padding: 0 var(--pad); }
+
+/* ---------- типографика ---------- */
+
+h1, h2, h3 { margin: 0; text-wrap: balance; letter-spacing: -.035em; font-weight: 800; }
+h1 { font-size: clamp(40px, 8.5vw, 82px); line-height: 1.02; }
+h2 { font-size: clamp(30px, 5vw, 46px); line-height: 1.08; }
+h3 { font-size: 19px; line-height: 1.35; letter-spacing: -.02em; font-weight: 700; }
+p  { margin: 0; }
+
+.lead { font-size: clamp(18px, 2.4vw, 22px); line-height: 1.5; color: var(--muted); max-width: 34em; }
+.eyebrow {
+  font: 600 12px/1 var(--font);
+  letter-spacing: .14em; text-transform: uppercase;
+  color: var(--blue);
+}
+.num { font-variant-numeric: tabular-nums; }
+
+/* ---------- секции ---------- */
+
+section { padding: clamp(64px, 11vw, 130px) 0; }
+.band { background: var(--deep); color: var(--on-deep); }
+.band .lead, .band .muted { color: var(--on-deep-muted); }
+.rule { height: 1px; background: var(--line); border: 0; margin: 0; }
+
+.head { display: flex; flex-direction: column; gap: 18px; max-width: 42rem; }
+.head .eyebrow + h2 { margin-top: -4px; }
+
+/* ---------- шапка ---------- */
+
+.nav {
+  position: sticky; top: 0; z-index: 20;
+  background: color-mix(in srgb, var(--deep) 88%, transparent);
+  backdrop-filter: saturate(1.4) blur(12px);
+  border-bottom: 1px solid rgba(255, 255, 255, .09);
+}
+.nav .wrap { display: flex; align-items: center; gap: 28px; height: 66px; }
+.brand {
+  display: flex; align-items: center; gap: 9px;
+  font: 800 18px/1 var(--font); letter-spacing: -.03em; color: #fff;
+  text-decoration: none;
+}
+.brand .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); }
+.nav nav { display: flex; gap: 26px; margin-left: auto; }
+.nav nav a {
+  color: #C3CCE8; text-decoration: none; font-size: 15px; font-weight: 500;
+  padding: 6px 0; border-bottom: 1px solid transparent;
+}
+.nav nav a:hover { color: #fff; border-bottom-color: var(--green); }
+/* На телефоне разделы уходят: рядом с кнопкой они не помещаются и вытесняют
+   её за край экрана. Кнопка важнее — за ней сюда и приходят. */
+@media (max-width: 700px) {
+  .nav nav { display: none; }
+  .nav .wrap { gap: 12px; }
+  .nav .btn.sm { margin-left: auto; }
+}
+
+/* ---------- кнопки ---------- */
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+  min-height: 54px; padding: 0 28px;
+  border: 0; border-radius: 999px;
+  background: var(--green); color: #fff;
+  font: 700 17px/1 var(--font); letter-spacing: -.01em;
+  text-decoration: none; cursor: pointer;
+  transition: transform .16s ease, box-shadow .16s ease, background-color .16s ease;
+  box-shadow: 0 1px 2px rgba(10, 18, 48, .18), 0 10px 26px -12px rgba(14, 159, 88, .75);
+}
+.btn:hover { transform: translateY(-1px); background: #0C8C4D; }
+.btn:active { transform: translateY(0); }
+.btn.ghost {
+  background: transparent; color: inherit; box-shadow: none;
+  border: 1px solid rgba(255, 255, 255, .3);
+}
+.btn.ghost:hover { background: rgba(255, 255, 255, .08); }
+.btn.sm { min-height: 42px; padding: 0 20px; font-size: 15px; }
+:where(a, button):focus-visible { outline: 3px solid var(--green); outline-offset: 3px; border-radius: 999px; }
+
+/* ---------- герой ---------- */
+
+.hero { padding: clamp(72px, 13vw, 140px) 0 clamp(56px, 9vw, 104px); }
+.hero h1 { max-width: 15ch; }
+.hero h1 em { font-style: normal; color: var(--green); }
+.hero .lead { margin-top: 26px; color: var(--on-deep-muted); }
+.hero .cta { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-top: 40px; }
+.hero .fine { font-size: 14px; color: var(--on-deep-muted); }
+
+/*
+ * Строка ввода. Главное в продукте — что документ рождается из фразы,
+ * которую человек и так произносит вслух. Показываем ровно это, настоящим
+ * синтаксисом бота, а не абстрактной картинкой «автоматизации».
+ */
+.demo {
+  margin-top: 54px;
+  display: grid; gap: 14px; align-items: center;
+  grid-template-columns: 1fr auto 1fr;
+  max-width: 900px;
+}
+.demo .cell {
+  background: var(--deep-2);
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: var(--r);
+  padding: 20px 22px;
+  min-width: 0;
+}
+.demo .k { font: 600 11px/1 var(--font); letter-spacing: .14em; text-transform: uppercase; color: #8290BE; }
+.demo .v { margin-top: 10px; font-size: 17px; line-height: 1.45; color: #fff; overflow-wrap: anywhere; }
+.demo .v.mono { font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; font-size: 15px; }
+.demo .arrow { color: var(--green); font-size: 26px; line-height: 1; text-align: center; }
+@media (max-width: 720px) {
+  .demo { grid-template-columns: 1fr; }
+  .demo .arrow { transform: rotate(90deg); }
+}
+
+/* ---------- цифры ---------- */
+
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line); }
+.stats > div { background: var(--surface); padding: 30px 22px; }
+.band .stats { background: rgba(255, 255, 255, .12); }
+.band .stats > div { background: var(--deep); }
+.stats .v { font: 800 clamp(30px, 4.4vw, 42px)/1 var(--font); letter-spacing: -.04em; }
+.stats .k { margin-top: 10px; font-size: 14px; line-height: 1.4; color: var(--muted); }
+.band .stats .k { color: var(--on-deep-muted); }
+@media (max-width: 760px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+
+/* ---------- возможности ---------- */
+
+/* Без карточек: у Tally воздух и волосяные линии делают ту же работу, а
+   рамка вокруг каждого пункта превращает список в набор кнопок. */
+.feats { margin-top: 60px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); }
+.feat { background: var(--surface); padding: 34px 30px 38px; display: flex; flex-direction: column; gap: 12px; }
+.feat .ico { width: 34px; height: 34px; color: var(--blue); }
+.feat p { color: var(--muted); font-size: 16px; line-height: 1.55; }
+@media (max-width: 900px) { .feats { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 620px) { .feats { grid-template-columns: 1fr; } }
+
+/* ---------- экраны ---------- */
+
+/*
+ * На широком экране — сетка: лента, обрывающаяся на середине четвёртого
+ * телефона, читается как поломка вёрстки, а не как приглашение листать.
+ * На узком — та же разметка становится лентой с прилипанием, где листать
+ * привычно и естественно.
+ */
+.shots { margin-top: 56px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 40px 26px; }
+.shot { min-width: 0; }
+@media (max-width: 900px) {
+  .shots {
+    display: flex; gap: 22px;
+    overflow-x: auto; scroll-snap-type: x mandatory;
+    padding-bottom: 18px;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+    /* Лента идёт от края до края, а отступы страницы держат сами карточки:
+       обрезанная у самой рамки картинка выглядит случайной. */
+    margin-inline: calc(var(--pad) * -1);
+    padding-inline: var(--pad);
+  }
+  .shot { flex: 0 0 auto; width: 250px; scroll-snap-align: center; }
+}
+.shot .frame {
+  border-radius: 26px; overflow: hidden;
+  background: var(--mist);
+  border: 1px solid var(--line);
+  box-shadow: 0 30px 60px -34px rgba(10, 18, 48, .55);
+  line-height: 0;
+}
+.shot img { width: 100%; height: auto; display: block; }
+.shot .cap { margin-top: 16px; font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+.shot .sub { margin-top: 3px; font-size: 14px; color: var(--muted); line-height: 1.45; }
+
+/* ---------- как это устроено ---------- */
+
+/* Нумерация здесь честная: это последовательность, третий шаг невозможен
+   без первого. В остальных разделах номеров нет. */
+.steps { margin-top: 56px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 34px; }
+.step { display: flex; flex-direction: column; gap: 12px; }
+.step .n {
+  font: 800 15px/1 var(--font); color: var(--green);
+  font-variant-numeric: tabular-nums;
+  padding-bottom: 14px; border-bottom: 2px solid var(--green); width: fit-content;
+}
+.step p { color: var(--muted); font-size: 16px; }
+@media (max-width: 800px) { .steps { grid-template-columns: 1fr; gap: 28px; } }
+
+/* ---------- отзывы ---------- */
+
+.quotes { margin-top: 52px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+.quote {
+  border: 1px dashed var(--line); border-radius: var(--r);
+  padding: 28px; display: flex; flex-direction: column; gap: 18px;
+  background: var(--mist);
+}
+.quote .q { font-size: 17px; line-height: 1.55; color: var(--muted); font-style: italic; }
+.quote .who { display: flex; align-items: center; gap: 12px; margin-top: auto; }
+.quote .av {
+  width: 38px; height: 38px; border-radius: 50%; flex: none;
+  background: var(--line); display: grid; place-items: center;
+  font: 700 14px/1 var(--font); color: var(--muted);
+}
+.quote .nm { font-size: 15px; font-weight: 600; }
+.quote .rl { font-size: 13px; color: var(--muted); }
+.slot {
+  display: inline-block; padding: 3px 9px; border-radius: 6px;
+  background: color-mix(in srgb, var(--green) 16%, transparent);
+  color: var(--green); font: 600 12px/1.4 var(--font); letter-spacing: .02em;
+}
+@media (max-width: 900px) { .quotes { grid-template-columns: 1fr; } }
+
+/* ---------- цена и призыв ---------- */
+
+.price { display: flex; flex-wrap: wrap; gap: 40px; align-items: flex-start; margin-top: 44px; }
+.price .col { flex: 1 1 260px; display: flex; flex-direction: column; gap: 14px; }
+.price .big { font: 800 clamp(34px, 5vw, 50px)/1 var(--font); letter-spacing: -.04em; }
+.price ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px; }
+.price li { display: flex; gap: 11px; align-items: flex-start; font-size: 16px; color: var(--on-deep-muted); }
+.price li svg { flex: none; width: 20px; height: 20px; color: var(--green); margin-top: 2px; }
+
+.final { text-align: left; }
+.final .cta { margin-top: 36px; display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+
+/* ---------- подвал ---------- */
+
+footer { background: var(--deep); color: var(--on-deep-muted); padding: 56px 0 44px; border-top: 1px solid rgba(255, 255, 255, .1); }
+.foot { display: flex; flex-wrap: wrap; gap: 32px; justify-content: space-between; }
+.foot a { color: #C3CCE8; text-decoration: none; }
+.foot a:hover { color: #fff; text-decoration: underline; }
+.foot .links { display: flex; flex-wrap: wrap; gap: 22px; font-size: 15px; }
+.foot .legal { font-size: 13px; line-height: 1.6; max-width: 46ch; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="#top"><span class="dot"></span>Первичка</a>
+    <nav>
+      <a href="#chto">Возможности</a>
+      <a href="#ekrany">Экраны</a>
+      <a href="#cena">Цена</a>
+    </nav>
+    <a class="btn sm" href="https://t.me/pervichka_app_bot">Запустить бота</a>
+  </div>
+</header>
+
+<div class="band" id="top">
+  <section class="hero">
+    <div class="wrap">
+      <h1>Первичка сама.<br>Без Excel и <em>без бухгалтера</em>.</h1>
+      <p class="lead">Счёт, акт, УПД, накладная, платёжка и акт сверки — прямо в Telegram.
+        Реквизиты вводятся один раз, номера бот ведёт сам, документ приходит файлом
+        через минуту.</p>
+
+      <div class="cta">
+        <a class="btn" href="https://t.me/pervichka_app_bot">Запустить бота</a>
+        <a class="btn ghost" href="#ekrany">Посмотреть экраны</a>
+      </div>
+      <p class="fine" style="margin-top:18px">Первые 5 документов в месяц — бесплатно. Карта не нужна.</p>
+
+      <div class="demo">
+        <div class="cell">
+          <div class="k">Вы пишете</div>
+          <div class="v mono">Аренда, сентябрь; 1; 45000</div>
+        </div>
+        <div class="arrow" aria-hidden="true">→</div>
+        <div class="cell">
+          <div class="k">Через минуту</div>
+          <div class="v">Счёт № 14 от 17.08.2026 на 45 000,00 ₽, PDF с платёжным QR</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="wrap">
+    <div class="stats">
+      <div><div class="v num">8</div><div class="k">типов документов</div></div>
+      <div><div class="v num">1</div><div class="k">минута на счёт</div></div>
+      <div><div class="v num">5</div><div class="k">документов в месяц бесплатно</div></div>
+      <div><div class="v num">0</div><div class="k">программ на компьютере</div></div>
+    </div>
+  </div>
+</div>
+
+<section id="chto">
+  <div class="wrap">
+    <div class="head">
+      <span class="eyebrow">Возможности</span>
+      <h2>Всё, что нужно микробизнесу, — и ничего сверх того</h2>
+      <p class="lead">Никакой настройки плана счетов и проводок. Заполняете реквизиты один
+        раз, дальше — только суммы и позиции.</p>
+    </div>
+
+    <div class="feats">
+      <div class="feat">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h6"/></svg>
+        <h3>Счёт с платёжным QR</h3>
+        <p>Клиент наводит камеру банка и платит. Код по ГОСТ Р 56042 — если реквизиты
+          неполные, он не рисуется вовсе, чтобы никто не получил ошибку в банке.</p>
+      </div>
+      <div class="feat">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/><path d="M14 3v5h4"/><path d="m9 13.5 2.2 2.2L16 11"/></svg>
+        <h3>Акт, УПД и ТОРГ-12</h3>
+        <p>УПД в обоих статусах: передаточный документ и счёт-фактура с расчётом НДС
+          по постановлению № 1137. Накладная — для тех, кто передаёт товар.</p>
+      </div>
+      <div class="feat">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 3h6l4 4v10a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M15 3v4h4"/><path d="M4.5 7.5V19a2.5 2.5 0 0 0 2.5 2.5h8"/></svg>
+        <h3>Счёт-договор</h3>
+        <p>Счёт и условия сделки на одном листе: оплата считается акцептом оферты
+          по п. 3 ст. 438 ГК РФ. Отдельный договор подписывать не нужно.</p>
+      </div>
+      <div class="feat">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 8 4.4v9.2L12 21l-8-4.4V7.4z"/><path d="m4.2 7.5 7.8 4.3 7.8-4.3"/><path d="M12 11.8V21"/></svg>
+        <h3>Выписка из банка</h3>
+        <p>Загружаете выгрузку — 1С «Клиент-Банк», OFX или CSV — и видите, кто заплатил.
+          Оплаты сводятся с долгами по ИНН. Повторная загрузка ничего не задваивает.</p>
+      </div>
+      <div class="feat">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 11V9a4 4 0 0 1 4-4h9"/><path d="m14 2 3 3-3 3"/><path d="M20 13v2a4 4 0 0 1-4 4H7"/><path d="m10 22-3-3 3-3"/></svg>
+        <h3>Аренда по расписанию</h3>
+        <p>Назвали число из договора — бот сам предложит выставить счёт заранее,
+          акт в конце месяца, а на следующий день после срока напомнит о просрочке.</p>
+      </div>
+      <div class="feat">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H18a2 2 0 0 1 2 2v1"/><path d="M3 7.5V18a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-2"/><path d="M21 10.5h-4a2.5 2.5 0 0 0 0 5h4z"/></svg>
+        <h3>Кто сколько должен</h3>
+        <p>Журнал операций и сальдо по каждому клиенту. Акт сверки — готовым Excel
+          с формулами, а не картинкой.</p>
+      </div>
+      <div class="feat">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 6.5h17v11h-17z"/><path d="m3.8 7 8.2 6 8.2-6"/></svg>
+        <h3>Своя почта</h3>
+        <p>Документ уходит клиенту с вашего адреса, а не с чужого. Входящие бот
+          просматривает сам и показывает письма со счетами и актами.</p>
+      </div>
+      <div class="feat">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17z"/><path d="m14.5 7.5 2 2"/><path d="M4 20v-4"/></svg>
+        <h3>Подпись и печать</h3>
+        <p>Снимок подписи и печати ложится на документ сам. На платёжку и договор —
+          никогда: там по закону нужна живая подпись.</p>
+      </div>
+      <div class="feat">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
+        <h3>Реквизиты по ИНН</h3>
+        <p>Вводите ИНН — название, адрес, КПП и директор подставляются из реестра;
+          по БИК — банк и корреспондентский счёт. Контрольные цифры проверяются.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="rule">
+
+<section id="ekrany">
+  <div class="wrap">
+    <div class="head">
+      <span class="eyebrow">Как это выглядит</span>
+      <h2>Приложение внутри Telegram</h2>
+      <p class="lead">Ставить нечего: открывается кнопкой в чате с ботом. Тёмная тема
+        подхватывается из мессенджера — снимки ниже меняются вместе с вашей.</p>
+    </div>
+
+    <div class="shots">
+      <figure class="shot" style="margin:0">
+        <div class="frame"><picture><source srcset="shots/glavnaya-dark.webp" media="(prefers-color-scheme: dark)"><img src="shots/glavnaya.webp" width="420" height="909" loading="lazy" decoding="async" alt="Главный экран: сумма, которую должны, и кнопка выписать счёт"></picture></div>
+        <figcaption><div class="cap">Главная</div><div class="sub">Сколько вам должны — первым делом</div></figcaption>
+      </figure>
+      <figure class="shot" style="margin:0">
+        <div class="frame"><picture><source srcset="shots/novyy-schet-dark.webp" media="(prefers-color-scheme: dark)"><img src="shots/novyy-schet.webp" width="420" height="909" loading="lazy" decoding="async" alt="Экран создания счёта со списком позиций"></picture></div>
+        <figcaption><div class="cap">Новый счёт</div><div class="sub">Позиции запоминаются с прошлого раза</div></figcaption>
+      </figure>
+      <figure class="shot" style="margin:0">
+        <div class="frame"><picture><source srcset="shots/vypiska-dark.webp" media="(prefers-color-scheme: dark)"><img src="shots/vypiska.webp" width="420" height="909" loading="lazy" decoding="async" alt="Разобранная банковская выписка: поступления и предполагаемые клиенты"></picture></div>
+        <figcaption><div class="cap">Выписка из банка</div><div class="sub">Кто заплатил — видно сразу</div></figcaption>
+      </figure>
+      <figure class="shot" style="margin:0">
+        <div class="frame"><picture><source srcset="shots/dolgi-dark.webp" media="(prefers-color-scheme: dark)"><img src="shots/dolgi.webp" width="420" height="909" loading="lazy" decoding="async" alt="Список должников с суммами"></picture></div>
+        <figcaption><div class="cap">Долги</div><div class="sub">Зелёное — вам, красное — вы</div></figcaption>
+      </figure>
+      <figure class="shot" style="margin:0">
+        <div class="frame"><picture><source srcset="shots/kazhdyy-mesyac-dark.webp" media="(prefers-color-scheme: dark)"><img src="shots/kazhdyy-mesyac.webp" width="420" height="909" loading="lazy" decoding="async" alt="Регулярные документы: календарь цикла аренды"></picture></div>
+        <figcaption><div class="cap">Каждый месяц</div><div class="sub">Счёт, срок оплаты, просрочка</div></figcaption>
+      </figure>
+      <figure class="shot" style="margin:0">
+        <div class="frame"><picture><source srcset="shots/kartochka-dokumenta-dark.webp" media="(prefers-color-scheme: dark)"><img src="shots/kartochka-dokumenta.webp" width="420" height="909" loading="lazy" decoding="async" alt="Карточка выписанного счёта с позициями и отметкой оплаты"></picture></div>
+        <figcaption><div class="cap">Карточка документа</div><div class="sub">Отметить оплату, выслать заново</div></figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<hr class="rule">
+
+<section>
+  <div class="wrap">
+    <div class="head">
+      <span class="eyebrow">Начало работы</span>
+      <h2>Три шага, дальше — только суммы</h2>
+    </div>
+    <div class="steps">
+      <div class="step">
+        <div class="n num">01</div>
+        <h3>Заполнить свою организацию</h3>
+        <p>Введите ИНН — остальное подставится. Добавьте банк, чтобы в счёте появился QR.</p>
+      </div>
+      <div class="step">
+        <div class="n num">02</div>
+        <h3>Добавить клиента</h3>
+        <p>Тоже по ИНН. Реквизиты и почта запомнятся — второй раз вводить не придётся.</p>
+      </div>
+      <div class="step">
+        <div class="n num">03</div>
+        <h3>Выписать документ</h3>
+        <p>Выберите тип, наберите позиции. Файл придёт в чат — отправьте клиенту или
+          сохраните.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="rule">
+
+<section>
+  <div class="wrap">
+    <div class="head">
+      <span class="eyebrow">Отзывы</span>
+      <h2>Что говорят пользователи</h2>
+      <p class="lead">Здесь будут настоящие отзывы ваших клиентов. Замените текст и имена —
+        и уберите пунктирную рамку в стилях <code>.quote</code>.</p>
+    </div>
+    <div class="quotes">
+      <figure class="quote" style="margin:0">
+        <span class="slot">Место для отзыва</span>
+        <blockquote class="q" style="margin:0">Попросите отзыв у клиента, который пользуется
+          ботом дольше месяца. Лучше всего работает конкретика: что делал раньше, сколько
+          времени уходило, что изменилось.</blockquote>
+        <figcaption class="who">
+          <span class="av">?</span>
+          <span><span class="nm">Имя и фамилия</span><br><span class="rl">чем занимается, город</span></span>
+        </figcaption>
+      </figure>
+      <figure class="quote" style="margin:0">
+        <span class="slot">Место для отзыва</span>
+        <blockquote class="q" style="margin:0">Второй отзыв стоит взять у другого типа бизнеса —
+          если первый от арендодателя, то этот от подрядчика или магазина.</blockquote>
+        <figcaption class="who">
+          <span class="av">?</span>
+          <span><span class="nm">Имя и фамилия</span><br><span class="rl">чем занимается, город</span></span>
+        </figcaption>
+      </figure>
+      <figure class="quote" style="margin:0">
+        <span class="slot">Место для отзыва</span>
+        <blockquote class="q" style="margin:0">Третий — про конкретную возможность: выписку из
+          банка, акт сверки или напоминания о просрочке.</blockquote>
+        <figcaption class="who">
+          <span class="av">?</span>
+          <span><span class="nm">Имя и фамилия</span><br><span class="rl">чем занимается, город</span></span>
+        </figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<div class="band" id="cena">
+  <section>
+    <div class="wrap">
+      <div class="head">
+        <span class="eyebrow">Цена</span>
+        <h2>Сначала бесплатно, потом по подписке</h2>
+      </div>
+      <div class="price">
+        <div class="col">
+          <div class="big">5 документов</div>
+          <p class="lead" style="font-size:17px">в месяц бесплатно, без карты и без срока.
+            Этого хватает, чтобы понять, подходит ли вам бот.</p>
+        </div>
+        <div class="col">
+          <div class="big"><span class="slot" style="font-size:15px;vertical-align:middle">Впишите цену</span></div>
+          <ul>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 12 5 5L20 6"/></svg>Документы без ограничений</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 12 5 5L20 6"/></svg>Отправка с вашей почты</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 12 5 5L20 6"/></svg>Выписки из банка и напоминания</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 12 5 5L20 6"/></svg>Поддержка прямо в чате</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <hr class="rule" style="background:rgba(255,255,255,.1)">
+
+  <section class="final">
+    <div class="wrap">
+      <h2>Выпишите первый счёт прямо сейчас</h2>
+      <p class="lead" style="margin-top:18px">Ставить ничего не нужно — бот открывается
+        в Telegram, который у вас уже есть.</p>
+      <div class="cta">
+        <a class="btn" href="https://t.me/pervichka_app_bot">Запустить бота</a>
+        <span class="fine">Первые 5 документов — бесплатно</span>
+      </div>
+    </div>
+  </section>
+</div>
+
+<footer>
+  <div class="wrap foot">
+    <div>
+      <a class="brand" href="#top" style="color:inherit"><span class="dot"></span>Первичка</a>
+      <p class="legal" style="margin-top:14px">Документы формируются по данным, которые вы
+        вводите сами. Бот не ведёт бухгалтерский учёт и не сдаёт отчётность.</p>
+    </div>
+    <div class="links">
+      <a href="#chto">Возможности</a>
+      <a href="#ekrany">Экраны</a>
+      <a href="#cena">Цена</a>
+      <a href="https://t.me/pervichka_app_bot">Telegram</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
