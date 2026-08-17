@@ -504,6 +504,72 @@ const api = {
     return { file: { url: `/api/file/${keepFile(user.id, file)}`, name: file.filename } };
   },
 
+  /**
+   * Акты сверки сразу всем, кто должен.
+   *
+   * В боте это одна кнопка, в приложении её не было — приходилось заходить
+   * в каждого клиента отдельно. Файлы уходят в чат: внутри Telegram скачать
+   * несколько файлов по ссылкам нельзя, а в переписке они остаются.
+   */
+  async 'GET /api/akt/all'({ user }) {
+    const org = bdb.getDefaultOrg(user.id);
+    if (!org) return { error: 'Сначала заполните реквизиты организации.' };
+    const rows = bdb.debtors(user.id).filter((d) => d.theyOwe);
+    if (!rows.length) return { error: 'Должников нет — сверять не с кем.' };
+
+    const made = [];
+    for (const row of rows.slice(0, 20)) {
+      const cp = bdb.getCp(user.id, row.cpId);
+      if (!cp) continue;
+      if (!cp.period_end) {
+        bdb.updateCp(user.id, cp.id, { period_end: docService.todayISO() });
+        cp.period_end = docService.todayISO();
+      }
+      // eslint-disable-next-line no-await-in-loop
+      const buf = await buildAkt({
+        org: { brand: org.name, org_short: org.name, org_full: org.full_name || org.name,
+          org_inn: org.inn, signer: org.signer },
+        cp,
+        ops: bdb.listOps(user.id, cp.id),
+      });
+      const file = {
+        filename: `Акт_сверки_${docService.safeName(cp.name)}.xlsx`,
+        buffer: Buffer.from(buf),
+        mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      };
+      // eslint-disable-next-line no-await-in-loop
+      await sendFileToChat(user, file, `Акт сверки с <b>${cp.name}</b> — долг ${formatRub(row.amount)}.`);
+      made.push({ cp: cp.name, amount: row.amount });
+    }
+    return { count: made.length, items: made };
+  },
+
+  /**
+   * «Я оплатил»: найти платёж по почте, указанной при оплате.
+   *
+   * Раньше приложение отправляло человека обратно в чат — оплатив, он
+   * упирался в текст «вернитесь в бота». Платёж мог не привязаться к
+   * аккаунту сам: в Telegram платят из браузера, и связь между оплатой и
+   * пользователем восстанавливается по почте.
+   */
+  async 'POST /api/pay/claim'({ user, body }) {
+    const email = str(body.email, 254).toLowerCase();
+    if (!mailer.validEmail(email)) return { error: 'Это не похоже на почту.' };
+    const found = billing.unclaimedByEmail(email);
+    if (!found.length) {
+      return {
+        error: 'Оплату по этой почте не вижу. Деньги могли ещё не дойти — попробуйте через '
+          + 'пару минут. Если прошло больше получаса, напишите в поддержку.',
+      };
+    }
+    let until = '';
+    for (const p of found) {
+      billing.attachPayment(p.id, user.id);
+      until = billing.grantDays(user.id, p.days || 30);
+    }
+    return { found: found.length, until };
+  },
+
   /** Реестр всех документов за период — тоже Excel. */
   async 'GET /api/registry'({ user, url }) {
     const org = bdb.getDefaultOrg(user.id);

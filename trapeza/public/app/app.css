@@ -420,6 +420,33 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .badge.ok { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success); }
 .badge.warn { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
 
+/* ---------- смахивание влево ---------- */
+
+/* Кнопка лежит под строкой и открывается, когда строка уезжает. Удаляет
+   именно нажатие по ней: смахнуть можно случайно при прокрутке, а документ
+   уходит вместе с проводкой, и вернуть его нечем. */
+.swipe { position: relative; overflow: hidden; }
+.swipe + .swipe { border-top: 1px solid var(--hairline); }
+.swipe-face {
+  position: relative; z-index: 1;
+  background: var(--surface);
+  touch-action: pan-y;              /* вертикальную прокрутку отдаём странице */
+  will-change: transform;
+}
+.swipe-del {
+  position: absolute; top: 0; right: 0; bottom: 0;
+  width: 92px;
+  display: grid; place-items: center;
+  border: 0; padding: 0;
+  background: var(--danger); color: #fff;
+  cursor: pointer;
+}
+.swipe-del .icon { width: 22px; height: 22px; }
+.swipe-del[disabled] { opacity: .6; }
+/* Внутри .swipe строки уже разделены рамкой обёртки — вторая линия удвоила
+   бы её толщину. */
+.swipe .row + .row, .swipe .row { border-top: 0; }
+
 /* Второе действие в строке — например, «перестать напоминать». Отдельная
    цель нажатия шириной в палец: рядом с ней обычно есть первая, и промах
    стоит удалённой записи. */

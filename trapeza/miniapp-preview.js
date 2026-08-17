@@ -197,6 +197,8 @@ async function main() {
     SHOTS.push({ name: 'kazhdyy-mesyac', title: 'Каждый месяц', go: ['recurring', {}] });
     SHOTS.push({ name: 'zhdut-oplaty', title: 'Ждут оплаты', go: ['unpaid', {}] });
     SHOTS.push({ name: 'reestr', title: 'Реестр', go: ['registry', {}] });
+    SHOTS.push({ name: 'akt-sverki', title: 'Акт сверки', go: ['akt', {}] });
+    SHOTS.push({ name: 'kak-polzovatsya', title: 'Как пользоваться', go: ['help', {}] });
     if (firstCp) SHOTS.push({ name: 'operaciya', title: 'Операция', go: ['op', { cpId: firstCp.id }] });
     SHOTS.push({ name: 'platezhka', title: 'Платёжка', go: ['other', { type: 'pp' }] });
     SHOTS.push({ name: 'dogovor', title: 'Договор', go: ['other', { type: 'dog' }] });
