@@ -987,6 +987,80 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       nLast().slice(0, 30));
   }
 
+  console.log('\n── подписи: ИП и организация ──');
+  {
+    const { buildSchetHtml } = require('./lib/schet');
+    const { buildUpdHtml } = require('./lib/upd');
+    const { signRows, isIp } = require('./lib/doc-html');
+
+    // Различаем по длине ИНН: у ИП он двенадцатизначный, у организации — из десяти.
+    ok(isIp({ inn: '183114389446' }) === true, 'ИНН из 12 цифр — это предприниматель');
+    ok(isIp({ inn: '7707083893' }) === false, 'ИНН из 10 цифр — организация');
+    ok(isIp({}) === false, 'без ИНН считаем организацией');
+    ok(signRows({ inn: '183114389446', signer: 'И. Н. Сарычев' }).length === 1,
+      'у предпринимателя одна строка подписи');
+    ok(signRows({ inn: '7707083893', signer: 'И. Иванов' }).length === 2,
+      'у организации две: руководитель и бухгалтер');
+
+    const ipOrg = {
+      name: 'ИП Сарычев И. Н.', inn: '183114389446', signer: 'И.Н. Сарычев',
+      bank_name: 'Сбербанк', bik: '049401601', acc: '40802810668000008020',
+      corr_acc: '30101810400000000601',
+    };
+    const ooo = { ...ipOrg, name: 'ООО «Ромашка»', inn: '7707083893' };
+    const cp = { name: 'ООО «Инженер-Д»', inn: '1800047200' };
+    const doc = { number: '1', date: '2026-08-17', items: [{ name: 'Аренда', qty: 1, price: 125000 }] };
+
+    const ipHtml = buildSchetHtml({ org: ipOrg, cp, doc });
+    ok(ipHtml.includes('Индивидуальный предприниматель'), 'в счёте ИП подпись названа верно');
+    ok(!ipHtml.includes('>Руководитель<') && !ipHtml.includes('Бухгалтер'),
+      'у ИП в счёте нет ни руководителя, ни бухгалтера — таких должностей у него не бывает');
+
+    const oooHtml = buildSchetHtml({ org: ooo, cp, doc });
+    ok(oooHtml.includes('Руководитель') && oooHtml.includes('Бухгалтер'),
+      'у организации подписи на месте');
+    ok(!oooHtml.includes('Индивидуальный предприниматель'), 'и лишней строки ИП нет');
+
+    // УПД: бланк 1137 содержит все три строки, но заполняется одна.
+    const updIp = buildUpdHtml({ org: ipOrg, cp, doc: { ...doc, status: 1, vatRate: 20 } });
+    // Берём ровно одну строку подписи: окно «столько-то символов от
+    // заголовка» перехлёстывало на соседнюю и находило имя не там.
+    const line = (html, title) => {
+      const i = html.indexOf(title);
+      if (i < 0) return '';
+      const end = html.indexOf('</div>', html.indexOf('<div class="line">', i));
+      return html.slice(i, end < 0 ? i : end);
+    };
+    ok(!line(updIp, 'Руководитель организации').includes('Сарычев'),
+      'в УПД предприниматель не подписывается за руководителя организации');
+    ok(line(updIp, 'Индивидуальный предприниматель или иное').includes('Сарычев'),
+      'он подписывается в своей строке');
+    const updOoo = buildUpdHtml({ org: ooo, cp, doc: { ...doc, status: 1, vatRate: 20 } });
+    ok(line(updOoo, 'Руководитель организации').includes('Сарычев'),
+      'у организации подпись стоит у руководителя');
+    ok(!line(updOoo, 'Индивидуальный предприниматель или иное').includes('Сарычев'),
+      'и не дублируется в строке ИП');
+  }
+
+  console.log('\n── разбор вставленных реквизитов ──');
+  {
+    const { parseRequisites } = require('./lib/reqs');
+    // Ровно та беда, что видна в живом счёте: в адрес затекло соседнее поле.
+    const block = 'ИП Сарычев Иван Николаевич\n'
+      + 'ИНН 183114389446\n'
+      + 'Адрес 426054, Удмуртская Респ, Ижевск г, Тарасова ул, дом №6\n'
+      + 'Свидетельство о государственной регистрации 18 №003286312\n'
+      + 'Р/с 40802810668000008020 в ПАО Сбербанк БИК 049401601';
+    const p = parseRequisites(block);
+    ok(p.address === '426054, Удмуртская Респ, Ижевск г, Тарасова ул, дом №6',
+      'адрес заканчивается там, где кончается адрес', p.address);
+    ok(p.inn === '183114389446' && p.bik === '049401601', 'ИНН и БИК разобраны',
+      `${p.inn} / ${p.bik}`);
+
+    const withMail = parseRequisites('Адрес 426054, Ижевск, Ленина 1 Email buh@mail.ru');
+    ok(withMail.address === '426054, Ижевск, Ленина 1', 'почта в адрес не затекает', withMail.address);
+  }
+
   console.log('\n── контрольные суммы реквизитов ──');
   {
     const rc = require('./lib/requisites-check');

@@ -19,7 +19,7 @@
  * применением сверьтесь с действующей редакцией постановления № 1137.
  */
 
-const { esc, ru, page, fxHtml, formatMoney, amountInWords } = require('./doc-html');
+const { esc, ru, page, fxHtml, isIp, formatMoney, amountInWords } = require('./doc-html');
 const { round2, vatSplit, rateLabel } = require('./money');
 
 /** Коды единиц измерения по ОКЕИ — самые ходовые. */
@@ -208,14 +208,23 @@ function buildUpdHtml({ org, cp, doc }) {
     </table>`;
 
   // ── подписи счёта-фактуры (только статус 1) ──
+  /*
+   * Бланк счёта-фактуры по постановлению № 1137 содержит все три строки
+   * подписи, но заполняется одна: организация подписывает у руководителя и
+   * бухгалтера, предприниматель — у себя. Раньше имя и факсимиле ставились
+   * на первые две строки всегда, и у ИП получалось «Руководитель
+   * организации И.Н. Сарычев» — должность, которой у него нет.
+   */
+  const ip = isIp(org);
+  const ipLine = esc(org.ogrnip ? `${org.signer || ''} · ОГРНИП ${org.ogrnip}` : (org.signer || ''));
   const sfSign = status === 1 ? `
     <div class="sfsign">
       <div>Руководитель организации или иное уполномоченное лицо
-        <div class="line">${fxHtml(org.fx, { stamp: true })}${esc(org.signer || '')}</div></div>
+        <div class="line">${ip ? '' : `${fxHtml(org.fx, { stamp: true })}${esc(org.signer || '')}`}</div></div>
       <div>Главный бухгалтер или иное уполномоченное лицо
-        <div class="line">${fxHtml(org.fx)}${esc(org.signer || '')}</div></div>
+        <div class="line">${ip ? '' : fxHtml(org.fx) + esc(org.signer || '')}</div></div>
       <div>Индивидуальный предприниматель или иное уполномоченное лицо
-        <div class="line">${esc(org.ogrnip ? `${org.signer || ''} · ОГРНИП ${org.ogrnip}` : (org.signer || ''))}</div></div>
+        <div class="line">${ip ? `${fxHtml(org.fx, { stamp: true })}${ipLine}` : ''}</div></div>
     </div>` : '';
 
   const taxNote = status === 1

@@ -95,10 +95,47 @@ function fxHtml(fx, opts = {}) {
   return parts.length ? `<span class="fx-box">${parts.join('')}</span>` : '';
 }
 
+/**
+ * Индивидуальный предприниматель это или организация.
+ *
+ * Определяем по длине ИНН: у физлица и ИП он двенадцатизначный, у
+ * организации — десятизначный. Отдельного поля не заводим, потому что ИНН
+ * есть всегда и подделать его длину случайно нельзя, а лишняя галочка в
+ * анкете — это ещё один вопрос, на который человек ответит наугад.
+ */
+const isIp = (org) => String((org && org.inn) || '').replace(/\D/g, '').length === 12;
+
+/**
+ * Подписи под документом.
+ *
+ * У ИП нет ни руководителя, ни главного бухгалтера: он подписывает сам за
+ * себя. Печатать «Руководитель И.Н. Сарычев» под счётом предпринимателя —
+ * это должность, которой у него нет, и такой счёт бухгалтерия покупателя
+ * законно возвращает на переделку. Организация подписывает двумя строками:
+ * руководитель и бухгалтер.
+ *
+ * @param {object} org организация из базы (нужны inn и signer)
+ * @param {Function} fx готовая разметка факсимиле — передаём снаружи, чтобы
+ *        модуль не решал за шаблон, где ставить печать
+ */
+function signRows(org, fx = () => '') {
+  const who = esc((org && org.signer) || '');
+  if (isIp(org)) {
+    // Одна подпись — и она же с печатью, если печать загружена.
+    return [{ title: 'Индивидуальный предприниматель', html: `${fx({ stamp: true })}${who}` }];
+  }
+  return [
+    { title: 'Руководитель', html: `${fx({ stamp: true })}${who}` },
+    { title: 'Бухгалтер', html: `${fx()}${who}` },
+  ];
+}
+
 function page(title, body) {
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8">`
     + `<title>${esc(title)}</title><style>${CSS}</style></head>`
     + `<body><div class="doc">${body}</div></body></html>`;
 }
 
-module.exports = { esc, ru, page, fxHtml, formatMoney, formatRub, amountInWords };
+module.exports = {
+  esc, ru, page, fxHtml, isIp, signRows, formatMoney, formatRub, amountInWords,
+};

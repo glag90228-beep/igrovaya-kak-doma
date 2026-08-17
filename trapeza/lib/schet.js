@@ -2,9 +2,9 @@
 
 // Счёт на оплату (HTML → PDF). Классическая российская форма:
 // «шапка-банк» получателя, реквизиты поставщика/покупателя, таблица позиций,
-// «Без НДС», всего к оплате прописью, подписи Руководитель / Бухгалтер.
+// «Без НДС», всего к оплате прописью, подписи (у ИП — одна, см. signRows).
 
-const { esc, ru, page, fxHtml, formatMoney, amountInWords } = require('./doc-html');
+const { esc, ru, page, fxHtml, signRows, formatMoney, amountInWords } = require('./doc-html');
 const { round2, vatTotals, rateLabel } = require('./money');
 const { payQrSvg } = require('./qr-pay');
 
@@ -112,8 +112,12 @@ function buildSchetHtml({ org, cp, doc }) {
     </div>
 
     <div class="sign">
-      <div style="flex:1">Руководитель<div class="line">${fxHtml(org.fx, { stamp: true })}${esc(org.signer || '')}</div></div>
-      <div style="flex:1">Бухгалтер<div class="line">${fxHtml(org.fx)}${esc(org.signer || '')}</div></div>
+      ${signRows(org, (o) => fxHtml(org.fx, o))
+        // Ширину ограничиваем: у предпринимателя строка одна, и без предела
+        // линия для подписи растягивалась во весь лист.
+        .map((r) => `<div style="flex:1;max-width:46%">${esc(r.title)}`
+          + `<div class="line">${r.html}</div></div>`)
+        .join('')}
     </div>`;
 
   return page(`Счёт на оплату № ${doc.number || '1'}`, body);
