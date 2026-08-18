@@ -293,6 +293,10 @@ section { padding: clamp(64px, 11vw, 130px) 0; }
 .step p { color: var(--muted); font-size: 16px; }
 @media (max-width: 800px) { .steps { grid-template-columns: 1fr; gap: 28px; } }
 
+/* Якоря из меню: шапка липкая и высотой 67px, без отступа заголовок
+   секции уезжает ровно под неё — нажимаешь «Цена» и цены не видишь. */
+[id] { scroll-margin-top: 84px; }
+
 /* ---------- отзывы ---------- */
 
 .quotes { margin-top: 52px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
@@ -587,7 +591,8 @@ footer { background: var(--deep); color: var(--on-deep-muted); padding: 56px 0 4
             Этого хватает, чтобы понять, подходит ли вам бот.</p>
         </div>
         <div class="col">
-          <div class="big"><span class="slot" style="font-size:15px;vertical-align:middle">Впишите цену</span></div>
+          <div class="big">390 ₽<span style="font-size:.42em;font-weight:600;letter-spacing:0"> / месяц</span></div>
+          <p class="lead" style="font-size:16px;margin:-4px 0 6px">Или 2990 ₽ за год — выгода 1690 ₽.</p>
           <ul>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 12 5 5L20 6"/></svg>Документы без ограничений</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 12 5 5L20 6"/></svg>Отправка с вашей почты</li>
