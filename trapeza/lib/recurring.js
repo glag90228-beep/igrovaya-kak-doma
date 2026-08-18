@@ -25,11 +25,20 @@ const { db } = require('../db');
 /** День «последнее число месяца» — 30-е и 31-е есть не в каждом месяце. */
 const LAST_DAY = 0;
 
-const iso = (d) => d.toISOString().slice(0, 10);
+/*
+ * Календарь здесь московский, тот же, что у документов (lib/period.js).
+ *
+ * Раньше месяц брался через toISOString(), то есть по UTC, а день месяца —
+ * через getDate(), то есть по поясу сервера. Две разные шкалы в одном
+ * условии: ежедневный обход просыпается в московскую полночь, а месяц в
+ * этот момент по UTC ещё прошлый — предложение выписать документ считалось
+ * уже сделанным и пропадало на весь месяц. Молча.
+ */
+const { iso, todayDate } = require('./period');
 
 /** Месяц как YYYY-MM. Правило «раз в месяц» проверяется именно по нему:
  *  считать дни от прошлого запуска — верный способ ошибиться на границе. */
-const monthKey = (date = new Date()) => iso(date).slice(0, 7);
+const monthKey = (date = todayDate()) => iso(date).slice(0, 7);
 
 function isLastDayOfMonth(date) {
   const next = new Date(date.getTime());
@@ -71,7 +80,7 @@ function offerDay(rec) {
 }
 
 /** Срок оплаты этого месяца, ISO. Пусто — если срок не задан. */
-function dueDate(rec, date = new Date()) {
+function dueDate(rec, date = todayDate()) {
   if (!rec.pay_day) return '';
   return `${monthKey(date)}-${String(rec.pay_day).padStart(2, '0')}`;
 }
@@ -82,7 +91,7 @@ function dueDate(rec, date = new Date()) {
  * Условие «не раньше дня X», а не «ровно в день X»: если бот был выключен
  * пятого числа, предложение должно прийти шестого, а не пропасть на месяц.
  */
-function isDue(rec, date = new Date()) {
+function isDue(rec, date = todayDate()) {
   if (!rec.active) return false;
   if (rec.last_offer === monthKey(date)) return false;
   const day = offerDay(rec);
@@ -97,7 +106,7 @@ function isDue(rec, date = new Date()) {
  * как это и делают вручную. Оплачен ли счёт на самом деле, здесь не видно:
  * это проверяет вызывающий по журналу документов.
  */
-function isOverdue(rec, date = new Date()) {
+function isOverdue(rec, date = todayDate()) {
   if (!rec.active || !rec.pay_day) return false;
   if (rec.last_due === monthKey(date)) return false;
   return date.getDate() > rec.pay_day;
@@ -173,7 +182,7 @@ function off(userId, id) {
  * JOIN с контрагентами не для красоты: удалённый контрагент оставил бы
  * повторение, которое каждый месяц предлагает выписать документ в пустоту.
  */
-function due(date = new Date()) {
+function due(date = todayDate()) {
   return db.prepare(`SELECT r.*, c.name AS cp_name FROM recurring r
       JOIN counterparties c ON c.id = r.cp_id
       WHERE r.active = 1 ORDER BY r.user_id, r.day`)
@@ -181,7 +190,7 @@ function due(date = new Date()) {
 }
 
 /** Отметить, что за этот месяц предложение отправлено. */
-function markOffered(id, date = new Date()) {
+function markOffered(id, date = todayDate()) {
   db.prepare('UPDATE recurring SET last_offer = ? WHERE id = ?').run(monthKey(date), Number(id));
 }
 
@@ -193,7 +202,7 @@ function markOffered(id, date = new Date()) {
  * тянуть его сюда значило бы связать расписание с учётом. Вызывающий
  * отсеивает оплаченных сам.
  */
-function overdue(date = new Date()) {
+function overdue(date = todayDate()) {
   return db.prepare(`SELECT r.*, c.name AS cp_name FROM recurring r
       JOIN counterparties c ON c.id = r.cp_id
       WHERE r.active = 1 AND r.pay_day > 0 ORDER BY r.user_id, r.pay_day`)
@@ -201,7 +210,7 @@ function overdue(date = new Date()) {
 }
 
 /** Отметить, что о просрочке за этот месяц уже сообщили. */
-function markDueNoticed(id, date = new Date()) {
+function markDueNoticed(id, date = todayDate()) {
   db.prepare('UPDATE recurring SET last_due = ? WHERE id = ?').run(monthKey(date), Number(id));
 }
 

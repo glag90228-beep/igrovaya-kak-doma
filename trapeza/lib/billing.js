@@ -61,6 +61,14 @@ migrate();
 // «Сегодня» — по Москве, общая реализация в lib/period.js: по UTC доступ
 // заканчивался на день раньше, чем показывали пользователю.
 const { todayISO } = require('./period');
+
+/** 'YYYY-MM-DD' плюс n дней — в календаре, без часовых поясов. */
+function addDays(dateISO, n) {
+  const [y, m, d] = String(dateISO).split('-').map(Number);
+  const at = new Date(y, m - 1, d + n, 12);
+  const pad = (v) => String(v).padStart(2, '0');
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
+}
 const norm = (s) => String(s || '').trim().toLowerCase();
 
 /** Текущий доступ пользователя. */
@@ -81,9 +89,10 @@ function accessInfo(userId) {
 function grantDays(userId, days) {
   const n = Math.max(1, Math.round(Number(days) || 0));
   const { until } = accessInfo(userId);
-  const from = until && until > todayISO() ? new Date(until) : new Date(todayISO());
-  from.setDate(from.getDate() + n);
-  const next = from.toISOString().slice(0, 10);
+  // Считаем в датах, а не в миллисекундах: new Date('2026-08-18') — это
+  // полночь UTC, и дальше всё зависело бы от пояса. Здесь день прибавляется
+  // к календарной дате, и результат читается тем же календарём.
+  const next = addDays(until && until > todayISO() ? until : todayISO(), n);
   db.prepare('UPDATE bot_users SET access_until = ? WHERE id = ?').run(next, userId);
   return next;
 }
@@ -136,9 +145,7 @@ function createCodes({ days = 30, count = 1, maxUses = 1, note = '', expiresInDa
   const uses = Math.max(1, Math.min(10000, Math.round(Number(maxUses) || 1)));
   let expires = '';
   if (Number(expiresInDays) > 0) {
-    const e = new Date();
-    e.setDate(e.getDate() + Number(expiresInDays));
-    expires = e.toISOString().slice(0, 10);
+    expires = addDays(todayISO(), Number(expiresInDays));
   }
   const out = [];
   for (let i = 0; i < n; i += 1) {

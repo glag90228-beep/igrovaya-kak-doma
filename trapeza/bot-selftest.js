@@ -606,6 +606,16 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     'доступ выдан на 30 дней', until1);
   const until2 = bill.grantDays(meUser.id, 30);
   ok(until2 > until1, 'продление добавляется к остатку, а не сгорает', `${until1} → ${until2}`);
+  // Ровно 30 дней, а не 29 и не 31: раньше дни прибавлялись к полуночи UTC,
+  // и в зависимости от пояса результат уезжал на сутки.
+  {
+    const pr = require('./lib/period');
+    const days = Math.round(
+      (new Date(`${until1}T12:00:00Z`) - new Date(`${pr.todayISO()}T12:00:00Z`)) / 86400000,
+    );
+    ok(days === 30, 'выдано ровно 30 календарных дней', `${pr.todayISO()} → ${until1} = ${days}`);
+    ok(until2.slice(0, 4).length === 4 && until2 > until1, 'и продление считается от той же даты');
+  }
   bill.revokeAccess(meUser.id);
 
   const { handlePayment } = require('./lava-webhook');
@@ -1920,6 +1930,26 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(rec.normalizeDay(31) === 28, '31-е сводится к 28-му: такого дня нет в феврале', rec.normalizeDay(31));
     ok(rec.normalizeDay(0) === 0, '0 — это «последний день месяца», а не ошибка');
     ok(rec.normalizeDay('пятое') === 1, 'мусор превращается в 1-е, а не в NaN', rec.normalizeDay('пятое'));
+
+    // Часы у повторений и у документов должны быть одни.
+    //
+    // Ежедневный обход просыпается по московской дате. Пока месяц здесь
+    // считался по UTC, в промежутке с 21:00 до полуночи по Гринвичу обход
+    // уже видел новый день, а месяц — ещё старый: предложение выписать
+    // документ считалось сделанным и пропадало на весь месяц. Молча.
+    {
+      const pr = require('./lib/period');
+      ok(rec.monthKey() === pr.todayISO().slice(0, 7),
+        'месяц повторений и дата документов идут по одним часам',
+        `${rec.monthKey()} vs ${pr.todayISO().slice(0, 7)}`);
+      const night = pr.todayDate(new Date('2026-08-31T22:30:00Z')); // 01:30 первого сентября в Москве
+      ok(rec.monthKey(night) === '2026-09',
+        'ночью первого числа месяц уже новый', rec.monthKey(night));
+      ok(rec.isDue({ active: 1, day: 1, last_offer: '2026-08' }, night),
+        'и предложение за новый месяц не пропадает');
+      ok(!rec.isDue({ active: 1, day: 1, last_offer: '2026-09' }, night),
+        'а дважды за один месяц не предлагается');
+    }
     const on = (day, iso2, lastOffer = '') => rec.isDue(
       { active: 1, day, last_offer: lastOffer }, new Date(`${iso2}T12:00:00Z`),
     );

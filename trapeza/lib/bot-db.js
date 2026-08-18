@@ -517,7 +517,7 @@ function deleteOpsOfDoc(userId, docId, kind = null) {
 function markPaid(userId, docId, date) {
   const d = getDoc(userId, docId);
   if (!d) return null;
-  const when = /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? date : new Date().toISOString().slice(0, 10);
+  const when = /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? date : todayISO();
   db.prepare('UPDATE documents SET paid_at = ? WHERE id = ? AND user_id = ?').run(when, docId, userId);
   // В ручном режиме журнал ведёт человек, и лезть туда нельзя: проводка
   // оплаты без встречной реализации увела бы сальдо в минус — вышло бы,
@@ -795,7 +795,7 @@ function docsThisMonth(userId) {
 function quota(userId) {
   const limit = freePerMonth();
   const u = db.prepare('SELECT access_until FROM bot_users WHERE id = ?').get(userId) || {};
-  const paid = Boolean(u.access_until && u.access_until >= new Date().toISOString().slice(0, 10));
+  const paid = Boolean(u.access_until && u.access_until >= todayISO());
   const used = docsThisMonth(userId);
   const left = Math.max(0, limit - used);
   return {
