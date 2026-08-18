@@ -856,6 +856,26 @@ async function main() {
     ok(r.json.delta === 0, 'и при его удалении сальдо честно не меняется', r.json.delta);
   }
 
+  console.log('\n── акты всем должникам ──');
+  {
+    /*
+     * Этот адрес отвечал 500 с самого своего появления: в него передавали
+     * row.cpId, а debtors() отдаёт row.cp. Ни один тест его не вызывал —
+     * поэтому поломка и уехала на сервер. Теперь вызывает.
+     */
+    const cpDebt = (await call('POST', '/api/cp', {
+      user: masha, body: { name: 'ООО «Должник по актам»', kind: 'customer' },
+    })).json.cp.id;
+    await call('POST', '/api/op', {
+      user: masha, body: { cpId: cpDebt, amount: 33000, kind: 'credit', date: '2026-03-01' },
+    });
+    const r2 = await call('GET', '/api/akt/all', { user: masha });
+    ok(r2.status === 200, 'акты всем должникам отвечают, а не падают', r2.status);
+    ok(r2.json && r2.json.count >= 1, 'хотя бы один акт собран', r2.json && r2.json.count);
+    ok(r2.json && Array.isArray(r2.json.items) && r2.json.items.some((i) => i.cp.includes('Должник')),
+      'и это акт по настоящему должнику', r2.json && JSON.stringify(r2.json.items));
+  }
+
   console.log('\n── проверка подписи отдельно ──');
   ok(verifyInitData('', { token: TOKEN }).ok === false, 'пустая initData не проходит');
   ok(verifyInitData(initDataFor(MASHA), { token: TOKEN }).user.id === MASHA.id,

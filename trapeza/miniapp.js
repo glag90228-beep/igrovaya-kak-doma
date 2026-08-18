@@ -262,7 +262,16 @@ const api = {
      * В боте это спрашивалось, в приложении полей не было вовсе.
      */
     if (body.opening_balance !== undefined) {
-      fields.opening_balance = Number(String(body.opening_balance).replace(',', '.')) || 0;
+      /*
+       * Пробелы внутри числа — это разделитель разрядов, а не мусор.
+       * «12 000,50» превращалось в ноль: Number() не понимает пробел, || 0
+       * это прятал, и человек получал пустое сальдо вместо двенадцати тысяч.
+       * Молча — сообщения об ошибке не было.
+       */
+      const raw = String(body.opening_balance).replace(/[\s\u00A0]/g, '').replace(',', '.');
+      const num = Number(raw);
+      fields.opening_balance = Number.isFinite(num) && Math.abs(num) < 1e12
+        ? Math.round(num * 100) / 100 : 0;
     }
     if (body.opening_date !== undefined) {
       const d = str(body.opening_date, 10);
@@ -582,7 +591,11 @@ const api = {
       // Лимит проверяем перед каждым: пачка не должна пробивать его скопом.
       const q = bdb.quota(user.id);
       if (!q.allowed) { stopped = rows.length - made.length; break; }
-      const p = bdb.cpForPeriod(user.id, row.cpId);
+      // row.cp, а не row.cpId: debtors() возвращает самого контрагента.
+      // С несуществующим полем сюда уходил undefined, SQLite отказывался
+      // его принимать, и «акты всем должникам» отвечали 500 — с самого дня,
+      // как их сделали. Ни один тест этот адрес не дёргал.
+      const p = bdb.cpForPeriod(user.id, row.cp.id);
       if (!p) continue;
       // eslint-disable-next-line no-await-in-loop
       await makeAkt(user, org, p, `Акт сверки с <b>${p.cp.name}</b> — долг ${formatRub(row.amount)}.`);

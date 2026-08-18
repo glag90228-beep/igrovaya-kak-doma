@@ -45,19 +45,26 @@ const ai = require('./lib/ai-agent');
 // новогоднюю ночь — ещё и номер из прошлого года. Подробности в lib/period.js.
 const { todayISO, currentYear } = period;
 
-/** «15.06.2026» / «15.06.26» / «15.06» → ISO; иначе null */
-function parseDate(s) {
-  const m = /^(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?$/.exec(String(s).trim());
-  if (!m) return null;
-  const d = m[1].padStart(2, '0');
-  const mo = m[2].padStart(2, '0');
-  let y = m[3] || String(currentYear());
-  if (y.length === 2) y = '20' + y;
-  return `${y}-${mo}-${d}`;
-}
+/**
+ * «15.06.2026» / «15.06.26» / «15.06» → ISO; иначе null.
+ *
+ * Разбор один на весь проект — period.parseDay. Своя копия здесь не
+ * проверяла, существует ли дата: «31.02.2026 приход 94193» заносилось как
+ * 2026-02-31 и вело себя дико — в карточке сумма есть, а в акт за февраль
+ * операция то попадает, то нет, смотря как сравнились строки. «45.99.2026»
+ * пропадало из всех актов вовсе, оставаясь в сальдо карточки.
+ */
+const parseDate = (s) => period.parseDay(s);
+
+/**
+ * Сумма из текста. Пробелы внутри числа убираем: их ставят как разделитель
+ * разрядов. Копейки округляем — доли копейки в деньгах не существует.
+ * Заведомо невозможные величины отвергаем: это опечатка, а не платёж.
+ */
 function parseAmount(s) {
   const v = Number(String(s).replace(/\s/g, '').replace(',', '.'));
-  return Number.isFinite(v) ? v : null;
+  if (!Number.isFinite(v) || Math.abs(v) >= 1e12) return null;
+  return Math.round(v * 100) / 100;
 }
 const clean = (s) => (String(s).trim() === '-' ? '' : String(s).trim());
 
@@ -504,7 +511,27 @@ const KIND_DEBIT = ['оплата', 'оплатил', 'принято', 'пла�
 
 /** «15.06 приход 94193 №15» → {date,kind,doc,debit,credit} | null */
 function parseOp(text) {
-  const tokens = String(text).trim().split(/\s+/);
+  /*
+   * Разряды через пробел склеиваем до разбиения на слова. Иначе «приход
+   * 1 000» распадалось на «1» и «000», первым числом оказывалась единица —
+   * и в журнал молча уходил один рубль вместо тысячи.
+   */
+  let glued = String(text).trim();
+  for (let i = 0; i < 4; i += 1) {                 // «1 000 000» — две склейки
+    const next = glued.replace(/(\d)\s+(\d{3})(?!\d)/g, '$1$2');
+    if (next === glued) break;
+    glued = next;
+  }
+  /*
+   * Дата, написанная явно, но несуществующая — это опечатка, а не «сегодня».
+   * Молча подставлять текущий день нельзя: человек увидит в журнале не ту
+   * дату, которую вводил, и заметит это в лучшем случае при сверке.
+   */
+  const looksLikeDate = /^\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?$/;
+  for (const t of glued.split(/\s+/)) {
+    if (looksLikeDate.test(t) && !parseDate(t)) return null;
+  }
+  const tokens = glued.split(/\s+/);
   let date = null, kind = null, amount = null, docNo = '';
   for (const t of tokens) {
     const low = t.toLowerCase().replace(/[.,;:]$/, '');

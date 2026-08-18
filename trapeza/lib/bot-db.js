@@ -369,13 +369,16 @@ function periodBalance(userId, cpId, from, to) {
   for (const op of all) {
     const d = String(op.date || '');
     if (from && d < from) {
-      opening += (Number(op.credit) || 0) - (Number(op.debit) || 0);
+      // Округляем на каждом шаге: иначе входящее сальдо длинного периода
+      // накапливает двоичную погрешность так же, как накапливало сальдо
+      // карточки — 1.0000000000000007 вместо рубля.
+      opening = round2(opening + round2(op.credit) - round2(op.debit));
     } else if (!to || d <= to) {
       inside.push(op);
     }
   }
-  const totalDebit = round2(inside.reduce((s, o) => s + (Number(o.debit) || 0), 0));
-  const totalCredit = round2(inside.reduce((s, o) => s + (Number(o.credit) || 0), 0));
+  const totalDebit = inside.reduce((s, o) => round2(s + round2(o.debit)), 0);
+  const totalCredit = inside.reduce((s, o) => round2(s + round2(o.credit)), 0);
   return {
     cp,
     ops: inside,
@@ -525,7 +528,18 @@ function markPaid(userId, docId, date) {
   // она нужна списку «Не оплачено» и живёт отдельно от журнала.
   const org = getDefaultOrg(userId);
   if (basisOf(org || {}) === 'manual') return when;
-  if (d.cp_id && d.total) {
+  /*
+   * Проводку оплаты делаем только по тому документу, который создаёт долг.
+   *
+   * Иначе одна оплата попадала в журнал дважды. При основании «по счёту»
+   * долг создаёт счёт; человек отмечает оплаченным и счёт, и закрывающий
+   * его акт — оба с суммой 30 000, — и сальдо уходит в минус: выходит, что
+   * это мы должны клиенту, который просто заплатил один раз.
+   *
+   * Отметку «оплачено» при этом сохраняем для обоих: она нужна списку
+   * «не оплачено» и живёт отдельно от журнала.
+   */
+  if (d.cp_id && d.total && makesDebt(org || {}, d.type)) {
     addOpForDoc(userId, d.cp_id, {
       date: when, kind: 'Оплата', doc: `${d.title} № ${d.number}`, debit: d.total,
     }, docId);

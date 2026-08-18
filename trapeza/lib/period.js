@@ -222,4 +222,9 @@ function parsePeriodText(text, today = todayDate()) {
   return null;
 }
 
-module.exports = { PRESETS, presetRange, parsePeriodText, iso, todayISO, todayDate, currentYear };
+// parseDay наружу: он единственный разбор даты, который проверяет, что
+// такая дата существует. bot.js держал свою копию без проверки — и «31.02»
+// попадало в журнал.
+module.exports = {
+  PRESETS, presetRange, parsePeriodText, parseDay, iso, todayISO, todayDate, currentYear,
+};

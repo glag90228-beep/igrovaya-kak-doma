@@ -137,14 +137,27 @@ function listMenu(onlyActive = true) {
  *   сальдо = начальное + Кредит − Дебет
  * Для заказчика  — это долг контрагента нам, для поставщика — наш долг ему.
  */
+/*
+ * Округляем на каждом шаге, а не в конце.
+ *
+ * Деньги в двоичной дробью не представимы: сто строк по копейке давали
+ * 1.0000000000000007 вместо рубля, и погрешность росла с числом операций.
+ * В акте сверки это вылезает и в колонке сальдо, и в исходящем остатке —
+ * то есть в цифре, под которой контрагент ставит подпись.
+ *
+ * Копейка — наименьшая существующая единица, поэтому округляем до неё
+ * после каждого сложения: так накопление невозможно в принципе.
+ */
+const kop = (v) => Math.round((Number(v) || 0) * 100) / 100;
+
 function computeBalance(cp, ops) {
-  let running = Number(cp.opening_balance) || 0;
+  let running = kop(cp.opening_balance);
   const rows = ops.map((op) => {
-    running += (Number(op.credit) || 0) - (Number(op.debit) || 0);
+    running = kop(running + kop(op.credit) - kop(op.debit));
     return { ...op, balance: running };
   });
-  const totalDebit = ops.reduce((s, o) => s + (Number(o.debit) || 0), 0);
-  const totalCredit = ops.reduce((s, o) => s + (Number(o.credit) || 0), 0);
+  const totalDebit = ops.reduce((s, o) => kop(s + kop(o.debit)), 0);
+  const totalCredit = ops.reduce((s, o) => kop(s + kop(o.credit)), 0);
   return { rows, totalDebit, totalCredit, closing: running };
 }
 
