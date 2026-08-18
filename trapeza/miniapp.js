@@ -45,6 +45,7 @@ const reqCheck = require('./lib/requisites-check');
 const { round2 } = require('./lib/money');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
 const { payLink, priceText, yearSaving } = require('./lib/lava');
+const { currentYear } = require('./lib/period');
 const { Telegram } = require('./lib/tg');
 
 const PORT = Number(process.env.MINIAPP_PORT || 8790);
@@ -191,6 +192,41 @@ function cpBrief(userId, cp) {
     opening_date: cp.opening_date || '',
     balance: b ? round2(b.closing) : 0,
   };
+}
+
+/**
+ * Акт сверки: собрать, записать в журнал и отправить файлом в чат.
+ *
+ * Общий для одиночного акта и для «всем должникам», и намеренно повторяет
+ * то, что делает бот. Раньше приложение собирало акт мимо журнала: документ
+ * не появлялся в «Моих документах», не попадал в счётчик бесплатных и его
+ * нельзя было переслать заново. Один и тот же акт через две двери давал
+ * разный результат, а бесплатный лимит обходился открытием приложения.
+ */
+async function makeAkt(user, org, p, caption) {
+  const buf = await buildAkt({
+    org: {
+      brand: org.name, org_short: org.name, org_full: org.full_name || org.name,
+      org_inn: org.inn, signer: org.signer,
+    },
+    cp: p.view,
+    ops: p.ops,
+  });
+  const file = {
+    filename: `Акт_сверки_${docService.safeName(p.cp.name)}.xlsx`,
+    buffer: Buffer.from(buf),
+    mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  };
+  const seq = bdb.nextSeq(user.id, 'akt', currentYear());
+  bdb.saveDoc(user.id, {
+    orgId: org.id, cpId: p.cp.id, type: 'akt', number: String(seq), seq,
+    date: docService.todayISO(), total: Math.abs(p.closing),
+    payload: { ops: p.ops.length, from: p.from, to: p.to },
+  });
+  // В чат — обязательно: внутри Telegram скачивание по ссылке блокируется,
+  // и файл в переписке остаётся единственным надёжным способом его забрать.
+  await sendFileToChat(user, file, caption);
+  return file;
 }
 
 // ---------- обработчики API ----------
@@ -513,20 +549,13 @@ const api = {
       iso0(url.searchParams.get('from')), iso0(url.searchParams.get('to')));
     if (!p) return { error: 'Контрагент не найден.' };
     const cp = p.cp;
-    const buf = await buildAkt({
-      org: { brand: org.name, org_short: org.name, org_full: org.full_name || org.name,
-        org_inn: org.inn, signer: org.signer },
-      cp: p.view,
-      ops: p.ops,
-    });
-    const file = {
-      filename: `Акт_сверки_${docService.safeName(cp.name)}.xlsx`,
-      buffer: Buffer.from(buf),
-      mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    };
-    // В чат — обязательно: внутри Telegram скачивание по ссылке блокируется,
-    // и файл в переписке остаётся единственным надёжным способом его забрать.
-    await sendFileToChat(user, file,
+    // Лимит бесплатных: в боте акт его тратил, здесь — нет, и лимит
+    // обходился простым переходом в приложение.
+    const q = bdb.quota(user.id);
+    if (!q.allowed) {
+      return { error: `Бесплатные документы на этот месяц закончились (${q.limit}).`, reason: 'quota', quota: q };
+    }
+    const file = await makeAkt(user, org, p,
       `Акт сверки с <b>${cp.name}</b> за период ${ruDate(p.from)}—${ruDate(p.to)}.`);
     return {
       file: { url: `/api/file/${keepFile(user.id, file)}`, name: file.filename },
@@ -548,27 +577,22 @@ const api = {
     if (!rows.length) return { error: 'Должников нет — сверять не с кем.' };
 
     const made = [];
+    let stopped = 0;
     for (const row of rows.slice(0, 20)) {
+      // Лимит проверяем перед каждым: пачка не должна пробивать его скопом.
+      const q = bdb.quota(user.id);
+      if (!q.allowed) { stopped = rows.length - made.length; break; }
       const p = bdb.cpForPeriod(user.id, row.cpId);
       if (!p) continue;
-      const cp = p.cp;
       // eslint-disable-next-line no-await-in-loop
-      const buf = await buildAkt({
-        org: { brand: org.name, org_short: org.name, org_full: org.full_name || org.name,
-          org_inn: org.inn, signer: org.signer },
-        cp: p.view,
-        ops: p.ops,
-      });
-      const file = {
-        filename: `Акт_сверки_${docService.safeName(cp.name)}.xlsx`,
-        buffer: Buffer.from(buf),
-        mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      };
-      // eslint-disable-next-line no-await-in-loop
-      await sendFileToChat(user, file, `Акт сверки с <b>${cp.name}</b> — долг ${formatRub(row.amount)}.`);
-      made.push({ cp: cp.name, amount: row.amount });
+      await makeAkt(user, org, p, `Акт сверки с <b>${p.cp.name}</b> — долг ${formatRub(row.amount)}.`);
+      made.push({ cp: p.cp.name, amount: row.amount });
     }
-    return { count: made.length, items: made };
+    if (!made.length) {
+      const q = bdb.quota(user.id);
+      return { error: `Бесплатные документы на этот месяц закончились (${q.limit}).`, reason: 'quota', quota: q };
+    }
+    return { count: made.length, items: made, stopped };
   },
 
   /**

@@ -807,10 +807,16 @@ const freePerMonth = () => Number(process.env.FREE_DOCS || 5);
 const enforceLimit = () => String(process.env.ENFORCE_LIMIT || '1') !== '0';
 
 function docsThisMonth(userId) {
-  const from = new Date().toISOString().slice(0, 7); // ГГГГ-ММ
+  /*
+   * Месяц — московский, как и даты документов, и считаем по дате документа,
+   * а не по времени записи в базу. created_at пишется в UTC: документ,
+   * выписанный первого числа в час ночи, попадал в квоту прошлого месяца,
+   * хотя на самом документе стоит первое число нового.
+   */
+  const month = todayISO().slice(0, 7);
   return db.prepare(
-    "SELECT COUNT(*) AS n FROM documents WHERE user_id = ? AND substr(created_at,1,7) = ?",
-  ).get(userId, from).n;
+    'SELECT COUNT(*) AS n FROM documents WHERE user_id = ? AND substr(date,1,7) = ?',
+  ).get(userId, month).n;
 }
 
 /** @returns {{allowed:boolean, used:number, left:number, limit:number, paid:boolean}} */

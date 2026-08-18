@@ -277,14 +277,24 @@ async function main() {
   console.log('\n── журнал и копии ──');
   r = await call('GET', '/api/docs', { user: masha });
   const docs = r.json.docs;
-  ok(docs.length === 3, 'в журнале три выписанных документа', docs.length);
-  ok(docs[0].items.length === 1, 'позиции сохранились вместе с документом', docs[0].items.length);
+  /*
+   * Четыре, а не три: акт сверки тоже попадает в журнал. Раньше приложение
+   * собирало его мимо — документа не было в «Моих документах», он не считался
+   * в бесплатном лимите и его нельзя было переслать заново. Бот при этом
+   * записывал: одно и то же действие через две двери давало разный результат.
+   */
+  ok(docs.length === 4, 'в журнале четыре документа, включая акт сверки', docs.length);
+  ok(docs.some((d) => d.type === 'akt'), 'акт из приложения записан в журнал',
+    docs.map((d) => d.type).join(','));
+  const withItems = docs.find((d) => d.items.length);
+  ok(withItems && withItems.items.length === 1, 'позиции сохранились вместе с документом',
+    withItems && withItems.items.length);
 
   r = await call('GET', '/api/docs', { user: petya });
   ok(r.json.docs.length === 0, 'чужой журнал пуст');
 
   sentToChat.length = 0;
-  r = await call('POST', '/api/doc/resend', { user: masha, body: { id: docs[0].id } });
+  r = await call('POST', '/api/doc/resend', { user: masha, body: { id: withItems.id } });
   ok(r.status === 200 && sentToChat.length === 1, 'копия документа пересобрана и отправлена');
   r = await call('POST', '/api/doc/resend', { user: petya, body: { id: docs[0].id } });
   ok(r.status === 400, 'чужой документ не пересобрать', (r.json || {}).error);
