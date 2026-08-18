@@ -70,8 +70,8 @@ swarm status                       // ❌ Don't check repeatedly
 
 ## Usage
 ```bash
-npx @claude-flow/cli@latest swarm init --topology hierarchical
-npx @claude-flow/cli@latest swarm status  # Only after completion
+npx @claude-flow/cli@3.38.12 swarm init --topology hierarchical
+npx @claude-flow/cli@3.38.12 swarm status  # Only after completion
 ```
 
 ## Options

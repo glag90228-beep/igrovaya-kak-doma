@@ -11,7 +11,7 @@ Manage the agent pool for automatic scaling and resource optimization.
 ## Usage
 
 ```bash
-npx @claude-flow/cli@latest agent pool [options]
+npx @claude-flow/cli@3.38.12 agent pool [options]
 ```
 
 ## Options
@@ -28,19 +28,19 @@ npx @claude-flow/cli@latest agent pool [options]
 
 ```bash
 # View current pool status
-npx @claude-flow/cli@latest agent pool
+npx @claude-flow/cli@3.38.12 agent pool
 
 # Set pool size
-npx @claude-flow/cli@latest agent pool --size 5
+npx @claude-flow/cli@3.38.12 agent pool --size 5
 
 # Configure auto-scaling
-npx @claude-flow/cli@latest agent pool --min 2 --max 15 --auto-scale
+npx @claude-flow/cli@3.38.12 agent pool --min 2 --max 15 --auto-scale
 
 # Pre-warm agents for fast response
-npx @claude-flow/cli@latest agent pool --warmup
+npx @claude-flow/cli@3.38.12 agent pool --warmup
 
 # Disable auto-scaling
-npx @claude-flow/cli@latest agent pool --auto-scale false
+npx @claude-flow/cli@3.38.12 agent pool --auto-scale false
 ```
 
 ## Output
@@ -89,7 +89,7 @@ Auto-Scale Rules
 Pre-warm agents to reduce cold-start latency:
 
 ```bash
-npx @claude-flow/cli@latest agent pool --warmup
+npx @claude-flow/cli@3.38.12 agent pool --warmup
 
 # Pre-warms default agent types:
 # - coder (2 instances)
@@ -122,6 +122,6 @@ agent:
 
 ## Related Commands
 
-- `npx @claude-flow/cli@latest agent spawn` - Manual agent spawning
-- `npx @claude-flow/cli@latest agent list` - View active agents
-- `npx @claude-flow/cli@latest swarm scale` - Swarm-level scaling
+- `npx @claude-flow/cli@3.38.12 agent spawn` - Manual agent spawning
+- `npx @claude-flow/cli@3.38.12 agent list` - View active agents
+- `npx @claude-flow/cli@3.38.12 swarm scale` - Swarm-level scaling

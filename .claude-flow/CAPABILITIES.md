@@ -60,13 +60,13 @@ RuFlo V3 is a domain-driven design architecture for multi-agent AI coordination 
 ### Quick Commands
 ```bash
 # Initialize swarm
-npx @claude-flow/cli@latest swarm init --topology hierarchical --max-agents 8 --strategy specialized
+npx @claude-flow/cli@3.38.12 swarm init --topology hierarchical --max-agents 8 --strategy specialized
 
 # Check status
-npx @claude-flow/cli@latest swarm status
+npx @claude-flow/cli@3.38.12 swarm status
 
 # Monitor activity
-npx @claude-flow/cli@latest swarm monitor
+npx @claude-flow/cli@3.38.12 swarm monitor
 ```
 
 ---
@@ -150,17 +150,17 @@ npx @claude-flow/cli@latest swarm monitor
 ### Example Commands
 ```bash
 # Initialize
-npx @claude-flow/cli@latest init --wizard
+npx @claude-flow/cli@3.38.12 init --wizard
 
 # Spawn agent
-npx @claude-flow/cli@latest agent spawn -t coder --name my-coder
+npx @claude-flow/cli@3.38.12 agent spawn -t coder --name my-coder
 
 # Memory operations
-npx @claude-flow/cli@latest memory store --key "pattern" --value "data" --namespace patterns
-npx @claude-flow/cli@latest memory search --query "authentication"
+npx @claude-flow/cli@3.38.12 memory store --key "pattern" --value "data" --namespace patterns
+npx @claude-flow/cli@3.38.12 memory search --query "authentication"
 
 # Diagnostics
-npx @claude-flow/cli@latest doctor --fix
+npx @claude-flow/cli@3.38.12 doctor --fix
 ```
 
 ---
@@ -259,16 +259,16 @@ High-confidence insights (>0.8) can transfer between agents.
 ### Memory Commands
 ```bash
 # Store pattern
-npx @claude-flow/cli@latest memory store --key "name" --value "data" --namespace patterns
+npx @claude-flow/cli@3.38.12 memory store --key "name" --value "data" --namespace patterns
 
 # Semantic search
-npx @claude-flow/cli@latest memory search --query "authentication"
+npx @claude-flow/cli@3.38.12 memory search --query "authentication"
 
 # List entries
-npx @claude-flow/cli@latest memory list --namespace patterns
+npx @claude-flow/cli@3.38.12 memory list --namespace patterns
 
 # Initialize database
-npx @claude-flow/cli@latest memory init --force
+npx @claude-flow/cli@3.38.12 memory init --force
 ```
 
 ---
@@ -297,16 +297,16 @@ npx @claude-flow/cli@latest memory init --force
 ### Hive-Mind Commands
 ```bash
 # Initialize
-npx @claude-flow/cli@latest hive-mind init --queen-type strategic
+npx @claude-flow/cli@3.38.12 hive-mind init --queen-type strategic
 
 # Status
-npx @claude-flow/cli@latest hive-mind status
+npx @claude-flow/cli@3.38.12 hive-mind status
 
 # Spawn workers
-npx @claude-flow/cli@latest hive-mind spawn --count 5 --type worker
+npx @claude-flow/cli@3.38.12 hive-mind spawn --count 5 --type worker
 
 # Consensus
-npx @claude-flow/cli@latest hive-mind consensus --propose "task"
+npx @claude-flow/cli@3.38.12 hive-mind consensus --propose "task"
 ```
 
 ---
@@ -350,7 +350,7 @@ npx @claude-flow/cli@latest hive-mind consensus --propose "task"
 ### MCP Server Setup
 ```bash
 # Add Ruflo MCP
-claude mcp add ruflo -- npx -y ruflo@latest mcp start
+claude mcp add ruflo -- npx -y ruflo@3.38.12 mcp start
 
 # Optional servers
 claude mcp add ruv-swarm -- npx -y ruv-swarm mcp start
@@ -364,24 +364,24 @@ claude mcp add flow-nexus -- npx -y flow-nexus@latest mcp start
 ### Essential Commands
 ```bash
 # Setup
-npx ruflo@latest init --wizard
-npx ruflo@latest daemon start
-npx ruflo@latest doctor --fix
+npx ruflo@3.38.12 init --wizard
+npx ruflo@3.38.12 daemon start
+npx ruflo@3.38.12 doctor --fix
 
 # Swarm
-npx ruflo@latest swarm init --topology hierarchical --max-agents 8
-npx ruflo@latest swarm status
+npx ruflo@3.38.12 swarm init --topology hierarchical --max-agents 8
+npx ruflo@3.38.12 swarm status
 
 # Agents
-npx ruflo@latest agent spawn -t coder
-npx ruflo@latest agent list
+npx ruflo@3.38.12 agent spawn -t coder
+npx ruflo@3.38.12 agent list
 
 # Memory
-npx ruflo@latest memory search --query "patterns"
+npx ruflo@3.38.12 memory search --query "patterns"
 
 # Hooks
-npx ruflo@latest hooks pre-task --description "task"
-npx ruflo@latest hooks worker dispatch --trigger optimize
+npx ruflo@3.38.12 hooks pre-task --description "task"
+npx ruflo@3.38.12 hooks worker dispatch --trigger optimize
 ```
 
 ### File Structure

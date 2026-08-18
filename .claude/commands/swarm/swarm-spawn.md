@@ -4,7 +4,7 @@ Spawn agents in the swarm.
 
 ## Usage
 ```bash
-npx @claude-flow/cli@latest swarm spawn [options]
+npx @claude-flow/cli@3.38.12 swarm spawn [options]
 ```
 
 ## Options
@@ -14,6 +14,6 @@ npx @claude-flow/cli@latest swarm spawn [options]
 
 ## Examples
 ```bash
-npx @claude-flow/cli@latest swarm spawn --type coder --count 3
-npx @claude-flow/cli@latest swarm spawn --type researcher --capabilities "web-search,analysis"
+npx @claude-flow/cli@3.38.12 swarm spawn --type coder --count 3
+npx @claude-flow/cli@3.38.12 swarm spawn --type researcher --capabilities "web-search,analysis"
 ```

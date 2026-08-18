@@ -38,7 +38,7 @@ const dim = (msg) => console.log(`  ${DIM}${msg}${RESET}`);
 // transcript, and stderr, per the issue's requested channel).
 function warnMemoryUnavailable() {
   const line1 = `[AutoMemory] @claude-flow/memory not resolvable from ${PROJECT_ROOT} — self-learning imports are DISABLED.`;
-  const line2 = '             Fix: npm i -D @claude-flow/memory   (or re-run: npx ruflo@latest init, then npx ruflo@latest doctor --fix)';
+  const line2 = '             Fix: npm i -D @claude-flow/memory   (or re-run: npx ruflo@3.38.12 init, then npx ruflo@3.38.12 doctor --fix)';
   console.log(`${YELLOW}${line1}${RESET}`);
   console.log(`${YELLOW}${line2}${RESET}`);
   process.stderr.write(`${line1}\n${line2}\n`);
@@ -189,7 +189,7 @@ async function loadMemoryPackage() {
   }
 
   // Strategy 2: Use createRequire for CJS-style resolution (handles nested node_modules
-  // when installed as a transitive dependency via npx ruflo / npx @claude-flow/cli@latest)
+  // when installed as a transitive dependency via npx ruflo / npx @claude-flow/cli@3.38.12)
   try {
     const { createRequire } = await import('module');
     const require = createRequire(join(PROJECT_ROOT, 'package.json'));
@@ -379,7 +379,7 @@ async function doStatus() {
 
   console.log('\n=== Auto Memory Bridge Status ===\n');
   console.log(`  Package:        ${memPkg ? '✅ Available' : '❌ Not found — self-learning DISABLED (fix: npm i -D @claude-flow/memory)'}`);
-  console.log(`  Resolver:       ${hasSidecar ? '✅ .claude-flow/memory-package.json' : '⏸ no sidecar (run: npx ruflo@latest doctor --fix)'}`);
+  console.log(`  Resolver:       ${hasSidecar ? '✅ .claude-flow/memory-package.json' : '⏸ no sidecar (run: npx ruflo@3.38.12 doctor --fix)'}`);
   console.log(`  Store:          ${existsSync(STORE_PATH) ? '✅ ' + STORE_PATH : '⏸ Not initialized'}`);
   console.log(`  LearningBridge: ${config.learningBridge.enabled ? '✅ Enabled' : '⏸ Disabled'}`);
   console.log(`  MemoryGraph:    ${config.memoryGraph.enabled ? '✅ Enabled' : '⏸ Disabled'}`);

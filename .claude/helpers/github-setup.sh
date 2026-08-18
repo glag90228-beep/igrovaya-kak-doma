@@ -39,7 +39,7 @@ fi
 
 echo ""
 echo "GitHub swarm commands available:"
-echo "  - npx @claude-flow/cli@latest github swarm"
-echo "  - npx @claude-flow/cli@latest repo analyze"
-echo "  - npx @claude-flow/cli@latest pr enhance"
-echo "  - npx @claude-flow/cli@latest issue triage"
+echo "  - npx @claude-flow/cli@3.38.12 github swarm"
+echo "  - npx @claude-flow/cli@3.38.12 repo analyze"
+echo "  - npx @claude-flow/cli@3.38.12 pr enhance"
+echo "  - npx @claude-flow/cli@3.38.12 issue triage"

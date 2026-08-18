@@ -86,7 +86,7 @@ const PROMO_MEMO_TTL_MS = 6 * 60 * 60 * 1000; // 6h — long enough to bridge an
 
 // #2337: resolve an already-installed @claude-flow/cli (or ruflo) bin so we
 // can invoke it directly via `node`. The previous version called
-// `npx --yes @claude-flow/cli@latest` on every uncached render, which forces
+// `npx --yes @claude-flow/cli@3.38.12` on every uncached render, which forces
 // a registry resolution + cold-start of the entire CLI per render. With
 // multiple concurrent Claude Code sessions this storms the host (reporter
 // saw load average 40-65 on a 12-core box).

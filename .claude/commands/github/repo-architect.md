@@ -113,9 +113,9 @@ mcp__github__push_files {
 
 ## Quick Start
 \`\`\`bash
-npx @claude-flow/cli@latest init --sparc
+npx @claude-flow/cli@3.38.12 init --sparc
 npm install
-npx @claude-flow/cli@latest start --ui
+npx @claude-flow/cli@3.38.12 start --ui
 \`\`\`
 
 ## Features

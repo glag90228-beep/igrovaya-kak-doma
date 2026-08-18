@@ -52,7 +52,7 @@ function main() {
 
   if (commandExists('ruflo')) { invokeHook('ruflo', [], hookArgs, stdinData); done(); }
   if (commandExists('claude-flow')) { invokeHook('claude-flow', [], hookArgs, stdinData); done(); }
-  invokeHook('npx', ['--prefer-offline', '--yes', 'ruflo@latest'], hookArgs, stdinData);
+  invokeHook('npx', ['--prefer-offline', '--yes', 'ruflo@3.38.12'], hookArgs, stdinData);
   done();
 }
 

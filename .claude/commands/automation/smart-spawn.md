@@ -4,7 +4,7 @@ Intelligently spawn agents based on workload analysis.
 
 ## Usage
 ```bash
-npx @claude-flow/cli@latest automation smart-spawn [options]
+npx @claude-flow/cli@3.38.12 automation smart-spawn [options]
 ```
 
 ## Options
@@ -15,11 +15,11 @@ npx @claude-flow/cli@latest automation smart-spawn [options]
 ## Examples
 ```bash
 # Smart spawn with analysis
-npx @claude-flow/cli@latest automation smart-spawn --analyze
+npx @claude-flow/cli@3.38.12 automation smart-spawn --analyze
 
 # Set spawn threshold
-npx @claude-flow/cli@latest automation smart-spawn --threshold 5
+npx @claude-flow/cli@3.38.12 automation smart-spawn --threshold 5
 
 # Force topology
-npx @claude-flow/cli@latest automation smart-spawn --topology hierarchical
+npx @claude-flow/cli@3.38.12 automation smart-spawn --topology hierarchical
 ```

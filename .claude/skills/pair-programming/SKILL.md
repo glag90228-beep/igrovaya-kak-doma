@@ -22,7 +22,7 @@ This skill provides professional pair programming capabilities with AI assistanc
 ## Prerequisites
 
 **Required:**
-- Claude Flow CLI installed (`npm install -g claude-flow@alpha`)
+- Claude Flow CLI installed (`npm install -g claude-flow@3.38.12`)
 - Git repository (optional but recommended)
 
 **Recommended:**

@@ -23,7 +23,7 @@ mcp__claude-flow__task_orchestrate({
 ```
 
 ### Using CLI (Fallback)
-`npx @claude-flow/cli@latest swarm "research topic X" --strategy research`
+`npx @claude-flow/cli@3.38.12 swarm "research topic X" --strategy research`
 
 ## Agent Roles
 

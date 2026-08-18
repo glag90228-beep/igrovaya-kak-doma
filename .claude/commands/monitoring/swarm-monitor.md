@@ -4,7 +4,7 @@ Real-time swarm monitoring.
 
 ## Usage
 ```bash
-npx @claude-flow/cli@latest swarm monitor [options]
+npx @claude-flow/cli@3.38.12 swarm monitor [options]
 ```
 
 ## Options
@@ -15,11 +15,11 @@ npx @claude-flow/cli@latest swarm monitor [options]
 ## Examples
 ```bash
 # Start monitoring
-npx @claude-flow/cli@latest swarm monitor
+npx @claude-flow/cli@3.38.12 swarm monitor
 
 # Custom interval
-npx @claude-flow/cli@latest swarm monitor --interval 5000
+npx @claude-flow/cli@3.38.12 swarm monitor --interval 5000
 
 # With metrics
-npx @claude-flow/cli@latest swarm monitor --metrics
+npx @claude-flow/cli@3.38.12 swarm monitor --metrics
 ```
