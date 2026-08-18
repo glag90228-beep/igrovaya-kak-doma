@@ -9,6 +9,7 @@
  *   TRAPEZA_DB=/tmp/selftest.db node bot-selftest.js [папка-для-файлов]
  */
 
+require('./selftest-db');   // своя база на прогон — до всего, что тянет db.js
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -87,6 +88,18 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
 // ---------- сценарий ----------
 
 (async () => {
+  /*
+   * Сторож на боевую базу. На сервере приложение живёт в /opt/trapeza, и
+   * путь по умолчанию — `<папка>/data/trapeza.db` — это и есть база клиентов.
+   * Запуск `npm test` там залил бы в неё тестовые данные, а README прямо
+   * советует «cd trapeza && npm test». Отсюда selftest-db.js и эта проверка.
+   */
+  {
+    const dflt = require('node:path').join(__dirname, 'data', 'trapeza.db');
+    const used = require('node:path').resolve(process.env.TRAPEZA_DB || dflt);
+    ok(used !== dflt, 'тесты пишут не в рабочую базу приложения', used);
+  }
+
   console.log('\n── разбор текста ──');
   const op1 = parseOp('15.05 приход 94193');
   ok(op1 && op1.credit === 94193 && op1.date === '2026-05-15', 'операция «15.05 приход 94193»', JSON.stringify(op1));
@@ -596,6 +609,41 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   process.env.LAVA_OFFER_URL = 'https://lava.top/x?a=1';
   ok(lava.payLink(777001).includes('clientUtm=777001'), 'ссылка на оплату несёт Telegram-id',
     lava.payLink(777001));
+
+  console.log('\n── тарифы и цена ──');
+  {
+    /*
+     * Цена и срок доступа должны браться из одного списка.
+     *
+     * Раньше список сумм жил отдельно, а цену не показывали нигде. При смене
+     * цены список оставался старым: платёж на новую сумму не совпадал ни с
+     * одной строкой, срок брался запасной — и оплативший год получал месяц.
+     */
+    const lava = require('./lib/lava');
+    const was = process.env.LAVA_PLAN_DAYS;
+    process.env.LAVA_PLAN_DAYS = '390:30,2990:365';
+
+    ok(lava.daysFor({ amount: 2990 }) === 365, 'годовой платёж даёт год',
+      lava.daysFor({ amount: 2990 }));
+    ok(lava.daysFor({ amount: 390 }) === 30, 'месячный — месяц', lava.daysFor({ amount: 390 }));
+    ok(lava.priceText() === '390 ₽ в месяц или 2990 ₽ в год',
+      'цена собирается из тех же тарифов', lava.priceText());
+    ok(lava.yearSaving() === 1690, 'выгода годового считается, а не выдумывается',
+      lava.yearSaving());
+
+    // Тарифы поменяли, а цену забыли — так больше не выйдет: она одна и та же.
+    process.env.LAVA_PLAN_DAYS = '490:30,4900:365';
+    ok(lava.priceText() === '490 ₽ в месяц или 4900 ₽ в год',
+      'смена тарифа сразу меняет и показанную цену', lava.priceText());
+    ok(lava.daysFor({ amount: 4900 }) === 365, 'и срок за новую годовую сумму');
+
+    // Тарифов нет — цену не выдумываем.
+    process.env.LAVA_PLAN_DAYS = '';
+    ok(lava.priceText() === '', 'без тарифов цена не показывается');
+    ok(lava.yearSaving() === 0, 'и выгода тоже');
+
+    process.env.LAVA_PLAN_DAYS = was === undefined ? '' : was;
+  }
 
   console.log('\n── доступ и оплата ──');
   const bill = require('./lib/billing');

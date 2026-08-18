@@ -13,6 +13,7 @@
  * Без Chromium прогон честно сообщает, что пропущен, и не падает.
  */
 
+require('./selftest-db');   // своя база на прогон — до всего, что тянет db.js
 const crypto = require('node:crypto');
 const path = require('node:path');
 

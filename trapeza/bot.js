@@ -22,7 +22,7 @@ const { applySetup } = require('./lib/bot-setup');
 const { acquire: acquireLock } = require('./lib/lock');
 const { supportScreen, forwardToSupport, legalLine } = require('./lib/bot-support');
 const billing = require('./lib/billing');
-const { payLink, daysFor } = require('./lib/lava');
+const { payLink, daysFor, priceText, yearSaving } = require('./lib/lava');
 const dadata = require('./lib/dadata');
 const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
 const reqCheck = require('./lib/requisites-check');
@@ -1121,6 +1121,14 @@ async function showBilling(tg, chatId, user) {
     lines.push(`Сейчас бесплатно: выписано ${q.used} из ${q.limit} документов в этом месяце.`);
     lines.push('');
     lines.push('Подписка снимает лимит и оставляет всё остальное как есть.');
+  }
+  // Цену называем до кнопки, а не после перехода на оплату: человек имеет
+  // право знать, сколько это стоит, прежде чем куда-то нажимать.
+  const price = priceText();
+  if (price) {
+    lines.push('', `<b>${esc(price)}</b>`);
+    const save = yearSaving();
+    if (save > 0) lines.push(`<i>За год — выгода ${formatRub(save)}.</i>`);
   }
   if (!link) {
     lines.push('');

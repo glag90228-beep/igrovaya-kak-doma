@@ -12,6 +12,7 @@
  *   node bank-selftest.js
  */
 
+require('./selftest-db');   // своя база на прогон — до всего, что тянет db.js
 const bank = require('./lib/bank-statement');
 
 let bad = 0;

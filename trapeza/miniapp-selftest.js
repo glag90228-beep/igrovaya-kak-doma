@@ -11,6 +11,7 @@
  *   TRAPEZA_DB=/tmp/miniapp.db node miniapp-selftest.js
  */
 
+require('./selftest-db');   // своя база на прогон — до всего, что тянет db.js
 const crypto = require('node:crypto');
 
 process.env.BOT_TOKEN = process.env.BOT_TOKEN || '111:TEST-TOKEN';

@@ -121,16 +121,56 @@ function parseWebhook(body) {
   };
 }
 
+/**
+ * Тарифы: сумма платежа → сколько дней доступа. Из LAVA_PLAN_DAYS.
+ *
+ * Один список на всё: и срок при оплате, и цена, которую показываем человеку.
+ * Раньше цену не показывали нигде, а список жил сам по себе — и при смене
+ * цены он оставался старым. Платёж на новую сумму не совпадал ни с одной
+ * строкой, срок брался запасной (месяц), и оплативший год получал месяц.
+ * Молча, на первой же годовой покупке.
+ */
+function plans() {
+  return String(process.env.LAVA_PLAN_DAYS || '').trim().split(',')
+    .map((pair) => {
+      const [sum, days] = pair.split(':').map((x) => Number(String(x).trim()));
+      return { amount: sum, days };
+    })
+    .filter((p) => Number.isFinite(p.amount) && Number.isFinite(p.days) && p.days > 0)
+    .sort((a, b) => a.days - b.days);
+}
+
 /** Сколько дней даёт этот платёж. По умолчанию месяц; можно задать картой сумм. */
 function daysFor(payment) {
-  const map = String(process.env.LAVA_PLAN_DAYS || '').trim(); // «349:30,3490:365»
-  if (map) {
-    for (const pair of map.split(',')) {
-      const [sum, days] = pair.split(':').map((x) => Number(String(x).trim()));
-      if (Number.isFinite(sum) && Math.abs(sum - payment.amount) < 0.01) return days;
-    }
+  for (const p of plans()) {
+    if (Math.abs(p.amount - payment.amount) < 0.01) return p.days;
   }
   return Number(process.env.LAVA_DEFAULT_DAYS || 30);
+}
+
+/**
+ * Цена словами: «390 ₽ в месяц или 2990 ₽ в год».
+ * Пусто, если тарифы не заданы — выдумывать цену нельзя.
+ */
+function priceText() {
+  const label = (days) => {
+    if (days >= 350) return 'в год';
+    if (days >= 175) return 'за полгода';
+    if (days >= 80) return 'за квартал';
+    return 'в месяц';
+  };
+  const parts = plans().map((p) => `${p.amount} ₽ ${label(p.days)}`);
+  if (!parts.length) return '';
+  return parts.join(' или ');
+}
+
+/** Сколько экономит длинный тариф против помесячного, в рублях за год. */
+function yearSaving() {
+  const list = plans();
+  const month = list.find((p) => p.days >= 28 && p.days <= 31);
+  const year = list.find((p) => p.days >= 350);
+  if (!month || !year) return 0;
+  return Math.round(month.amount * 12 - year.amount);
 }
 
 /** Сверка секрета: сравнение постоянного времени, чтобы не подбирался побайтно. */
@@ -151,4 +191,5 @@ function payLink(tgId) {
   return `${base}${sep}${encodeURIComponent(param)}=${encodeURIComponent(String(tgId))}`;
 }
 
-module.exports = { parseWebhook, daysFor, secretOk, payLink, tgIdFrom, FIELDS };
+module.exports = {
+  plans, priceText, yearSaving, parseWebhook, daysFor, secretOk, payLink, tgIdFrom, FIELDS };

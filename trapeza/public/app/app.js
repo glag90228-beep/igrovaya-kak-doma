@@ -2339,6 +2339,21 @@ screens.billing = async function billing() {
       ['Документы без ограничений', 'Все семь типов документов', 'Автозаполнение по ИНН и БИК', 'Поддержка в чате']
         .map((t) => h('div', { class: 'row' }, h('span', { class: 'icon-box ok' }, icon('check')), h('span', { class: 'grow', text: t })))));
 
+    /*
+     * Цена — до кнопки, а не после перехода на оплату. Раньше её не было
+     * нигде: ни в боте, ни здесь, — и человек узнавал стоимость, только
+     * уйдя на сторонний сайт. Берётся из тарифов, по которым считается срок
+     * доступа, поэтому разойтись с реальной ценой не может.
+     */
+    if (s.price && s.price.text) {
+      box.append(h('div', { class: 'card' },
+        h('div', { class: 'row' },
+          h('span', { class: 'grow', text: s.price.text }),
+          s.price.saving > 0
+            ? h('span', { class: 'money ok', text: `−${money0(s.price.saving)} за год` })
+            : null)));
+    }
+
     if (s.payUrl) {
       box.append(h('div', { class: 'btn-wrap' }, h('button', {
         class: 'btn',

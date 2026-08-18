@@ -44,7 +44,7 @@ const bizTypes = require('./lib/biz-types');
 const reqCheck = require('./lib/requisites-check');
 const { round2 } = require('./lib/money');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
-const { payLink } = require('./lib/lava');
+const { payLink, priceText, yearSaving } = require('./lib/lava');
 const { Telegram } = require('./lib/tg');
 
 const PORT = Number(process.env.MINIAPP_PORT || 8790);
@@ -146,6 +146,7 @@ function stateFor(user) {
     },
     docs: bdb.listDocs(user.id, 5).map(docBrief),
     payUrl: payLink(user.tg_id),
+    price: { text: priceText(), saving: yearSaving() },
     facsimile: fxState(user.id),
     debtBasis: bdb.basisOf(org || {}),
     bizType: (org && org.biz_type) || '',

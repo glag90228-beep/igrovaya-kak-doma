@@ -11,6 +11,7 @@
  *   node mail-selftest.js
  */
 
+require('./selftest-db');   // своя база на прогон — до всего, что тянет db.js
 const net = require('node:net');
 const mail = require('./lib/mail');
 
