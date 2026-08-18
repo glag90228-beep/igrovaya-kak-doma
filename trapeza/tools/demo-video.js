@@ -49,7 +49,30 @@ function initData() {
 /** Кадры ролика: что показываем и сколько держим. */
 const SCENES = [
   { go: ['home', {}], hold: 2600, shot: 'glavnaya', scroll: 420 },
-  { go: ['new', { type: 'sch' }], hold: 2200, shot: 'vypisat-schet' },
+  {
+    go: ['new', { type: 'sch' }],
+    hold: 1400,
+    shot: 'vypisat-schet',
+    // Счёт выписывается по-настоящему: заполняем позицию и жмём кнопку.
+    // Ради этого кадра всё и снимается — «пришёл готовый документ».
+    async act(page) {
+      await page.locator('#f-cp').selectOption({ index: 0 });
+      await page.waitForTimeout(600);
+      const name = page.locator('.item input.name').first();
+      await name.click();
+      await name.type('Монтаж оборудования', { delay: 55 });
+      await page.waitForTimeout(400);
+      const nums = page.locator('.nums input');
+      await nums.nth(1).fill('');
+      await nums.nth(1).type('24000', { delay: 70 });
+      await page.waitForTimeout(1100);
+      await page.screenshot({ path: path.join(OUT, 'schet-zapolnen.png') });
+      await page.locator('#tg-main-button').click();
+      await page.waitForTimeout(2600);
+      await page.screenshot({ path: path.join(OUT, 'schet-gotov.png') });
+      await page.waitForTimeout(1200);
+    },
+  },
   { go: ['docs', {}], hold: 2400, shot: 'zhurnal', scroll: 260 },
   { go: ['cps', {}], hold: 2000, shot: 'klienty' },
   { go: ['akt', {}], hold: 2600, shot: 'akt-sverki', scroll: 300 },
@@ -83,13 +106,43 @@ const SCENES = [
   });
   await ctx.addInitScript((data) => {
     const noop = () => {};
+    /*
+     * Главную кнопку рисует сам Telegram, под окном приложения, — в браузере
+     * её нет. В ролике это заметно: экран выписки документа остаётся без
+     * действия, будто счёт выставить нечем. Поэтому рисуем её сами, как в
+     * мессенджере: снизу, во всю ширину, с текстом от приложения.
+     */
+    let btn = null;
+    const ensure = () => {
+      if (btn) return btn;
+      btn = document.createElement('button');
+      btn.id = 'tg-main-button';
+      btn.style.cssText = 'position:fixed;left:12px;right:12px;bottom:12px;height:50px;'
+        + 'border:0;border-radius:12px;background:#2481cc;color:#fff;font:600 16px/1 '
+        + '-apple-system,system-ui,sans-serif;z-index:9999;display:none;box-shadow:'
+        + '0 6px 20px rgba(36,129,204,.35)';
+      document.body.appendChild(btn);
+      return btn;
+    };
+    const main = {
+      setParams(p) {
+        const b = ensure();
+        if (p && p.text) b.textContent = p.text;
+        b.style.opacity = p && p.is_active === false ? '.45' : '1';
+        return this;
+      },
+      show() { ensure().style.display = 'block'; return this; },
+      hide() { ensure().style.display = 'none'; return this; },
+      onClick(fn) { ensure().onclick = fn; },
+      offClick() { ensure().onclick = null; },
+      showProgress: noop, hideProgress: noop,
+    };
     window.Telegram = { WebApp: {
       initData: data, initDataUnsafe: {}, themeParams: {}, colorScheme: 'light',
       ready: noop, expand: noop, close: noop, openLink: noop, setHeaderColor: noop,
       disableVerticalSwipes: noop,
       BackButton: { show: noop, hide: noop, onClick: noop },
-      MainButton: { setParams() { return this; }, show() { return this; }, hide() { return this; },
-        onClick: noop, offClick: noop, showProgress: noop, hideProgress: noop },
+      MainButton: main,
       HapticFeedback: { impactOccurred: noop, notificationOccurred: noop },
     } };
   }, initData());
@@ -106,6 +159,7 @@ const SCENES = [
     if (scene.shot) {
       await page.screenshot({ path: path.join(OUT, `${scene.shot}.png`) });
     }
+    if (scene.act) await scene.act(page);
     // Прокрутка человеческой рукой: короткими шагами, а не рывком.
     if (scene.scroll) {
       for (let done = 0; done < scene.scroll; done += 60) {
