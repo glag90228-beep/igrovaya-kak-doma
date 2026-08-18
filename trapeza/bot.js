@@ -2998,7 +2998,19 @@ async function handleCallback(tg, cq) {
     if (data === 'basis') { await showBasis(tg, chatId, user); return; }
     if (data.startsWith('basis.set:')) {
       const org = bdb.getDefaultOrg(user.id);
-      if (org) bdb.updateOrg(user.id, org.id, { debt_basis: data.slice(10) });
+      if (org) {
+        bdb.updateOrg(user.id, org.id, { debt_basis: data.slice(10) });
+        // Пересобираем журнал под новое правило. Без этого переключение
+        // меняло строчку в настройках и больше ничего: проводки создаются
+        // при выписке, и уже выписанные документы оставались как были —
+        // человек переключал основание и не видел никакой разницы.
+        const fixed = bdb.rebuildDebt(user.id);
+        if (fixed.added || fixed.removed) {
+          await tg.sendMessage(chatId,
+            `Пересчитал долги по прошлым документам: ${fixed.added ? `добавлено ${fixed.added}` : ''}`
+            + `${fixed.added && fixed.removed ? ', ' : ''}${fixed.removed ? `убрано ${fixed.removed}` : ''}.`);
+        }
+      }
       await showBasis(tg, chatId, user);
       return;
     }

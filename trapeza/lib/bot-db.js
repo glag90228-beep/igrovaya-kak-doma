@@ -501,6 +501,55 @@ function addOpForDoc(userId, cpId, op, docId) {
   return true;
 }
 
+/**
+ * Привести журнал в соответствие с выбранным основанием долга.
+ *
+ * Смена основания раньше меняла одну строчку в настройках и больше ничего.
+ * Человек, который работает счетами, переключался на «долг по счёту» — и не
+ * видел никакой разницы: проводки создаются в момент выписки документа, а
+ * уже выписанные счета так и оставались без них. Главная цифра «должны вам»
+ * стояла нулём, сколько бы счетов он ни выставил.
+ *
+ * Здесь мы досоздаём проводки тем документам, которые теперь создают долг,
+ * и убираем у тех, которые перестали. Отметки об оплате («Оплата») не
+ * трогаем никогда: их поставил человек, и они значат факт, а не правило.
+ */
+function rebuildDebt(userId) {
+  const org = getDefaultOrg(userId);
+  const types = DEBT_DOCS[basisOf(org || {})];
+  const docs = db.prepare(
+    'SELECT id, cp_id, type, date, total, number FROM documents WHERE user_id = ? AND total > 0',
+  ).all(userId);
+
+  let added = 0;
+  let removed = 0;
+  // Одной транзакцией: на середине пересчёта журнал показывал бы долг
+  // наполовину по старому правилу, наполовину по новому.
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const d of docs) {
+      if (!d.cp_id) continue;
+      const has = db.prepare(
+        "SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = 'Реализация'",
+      ).get(d.id).n > 0;
+      const should = types.includes(d.type);
+      if (should && !has) {
+        const title = DOC_TITLES[d.type] || d.type;
+        if (addOpForDoc(userId, d.cp_id, {
+          date: d.date, kind: 'Реализация', doc: `${title} № ${d.number}`, credit: d.total,
+        }, d.id)) added += 1;
+      } else if (!should && has) {
+        removed += deleteOpsOfDoc(userId, d.id, 'Реализация');
+      }
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return { added, removed };
+}
+
 function opsOfDoc(userId, docId) {
   const d = getDoc(userId, docId);
   if (!d) return [];
@@ -854,7 +903,7 @@ module.exports = {
   addOp, listOps, deleteLastOp, balanceOf, debtors, periodBalance, cpForPeriod,
   knownBankKeys, importBankRows,
   DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
-  debtByDoc,
+  debtByDoc, rebuildDebt,
   markPaid, unmarkPaid, unpaidDocs, docsBetween,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
   isSeqTaken, guardSeq,

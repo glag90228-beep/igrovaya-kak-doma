@@ -297,6 +297,38 @@ screens.home = async function home() {
       h('div', { class: 'k', text: 'Счета не оплачены' }),
       h('div', { class: 'v money', text: money0(unpaid.sum) }))));
 
+  /*
+   * Крупная цифра сверху — ноль, а неоплаченные счета есть.
+   *
+   * Так бывает законно: при основании «долг по отгрузке» долг создают акт,
+   * УПД и накладная, а счёт — нет. Но человеку, который работает счетами,
+   * это выглядит как сломанная цифра: он выписывает и удаляет счета, а
+   * главное число не шевелится. Поэтому говорим причину прямо здесь и даём
+   * исправить в одно нажатие — с пересчётом уже выписанного.
+   */
+  if (s.basisMismatch) {
+    const m = s.basisMismatch;
+    const fix = h('button', { class: 'btn' }, 'Считать долг по счетам');
+    fix.onclick = () => withBusy(fix, async () => {
+      const r = await api('POST', '/api/basis', { basis: 'invoice' });
+      haptic('medium');
+      toast(r.fixed && r.fixed.added
+        ? `Пересчитал: долг появился по ${r.fixed.added} ${plural(r.fixed.added, 'документу', 'документам', 'документам')}`
+        : 'Готово');
+      cache = {};
+      reset('home');
+    });
+    box.append(h('div', { class: 'card' },
+      h('div', { class: 'row' },
+        h('span', { class: 'icon-box warn' }, icon('warn')),
+        h('span', { class: 'grow' },
+          h('div', { text: 'Долг считается по актам, а не по счетам' }),
+          h('div', { class: 'small muted', text: `Поэтому сверху ноль, хотя ${m.count} `
+            + `${plural(m.count, 'счёт', 'счёта', 'счетов')} на ${money0(m.sum)} не оплачены. `
+            + 'Если для вас долг возникает со счёта — переключите, я пересчитаю прошлые.' }))),
+      h('div', { class: 'btn-wrap' }, fix)));
+  }
+
   if (!s.orgReady) {
     box.append(h('div', { class: 'banner' }, icon('warn'),
       h('div', {},

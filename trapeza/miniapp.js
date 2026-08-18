@@ -150,6 +150,16 @@ function stateFor(user) {
     price: { text: priceText(), saving: yearSaving() },
     facsimile: fxState(user.id),
     debtBasis: bdb.basisOf(org || {}),
+    // Расхождение между тем, как человек работает, и тем, как считается
+    // долг: счета выписаны и не оплачены, а «должны вам» — ноль. Молчать
+    // об этом нельзя, человек решит, что цифра сломана.
+    basisMismatch: (() => {
+      if (owedToUs > 0 || !unpaidDocs.length) return null;
+      const types = bdb.DEBT_DOCS[bdb.basisOf(org || {})];
+      const mute = unpaidDocs.filter((d) => !types.includes(d.type));
+      if (!mute.length) return null;
+      return { count: mute.length, sum: round2(mute.reduce((a2, d) => a2 + (Number(d.total) || 0), 0)) };
+    })(),
     bizType: (org && org.biz_type) || '',
     bizTypes: bizTypes.list(),
     recurring: recurring.list(user.id).length,
@@ -939,7 +949,11 @@ const api = {
     const org = bdb.getDefaultOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     bdb.updateOrg(user.id, org.id, { debt_basis: basis });
-    return { basis };
+    // Пересобираем журнал под новое правило: иначе переключение меняет
+    // строчку в настройках, а долг по уже выписанным документам остаётся
+    // прежним — то есть человек не видит вообще никакой разницы.
+    const fixed = bdb.rebuildDebt(user.id);
+    return { basis, fixed };
   },
 
   /**

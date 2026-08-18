@@ -1583,14 +1583,21 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'в режиме «по акту» счёт долг не создаёт', bdb3.balanceOf(uid, rentId).closing);
 
     // Режим «по счёту» — субаренда.
+    //
+    // Переключение теперь пересчитывает и уже выписанное: августовский счёт
+    // на 60 000 при основании «по акту» долга не создавал, а при «по счёту»
+    // создаёт. Раньше переключение меняло строчку в настройках и больше
+    // ничего — человек не видел никакой разницы и считал цифру сломанной.
     await tap('basis.set:invoice');
     ok(bdb3.basisOf(bdb3.getDefaultOrg(uid)) === 'invoice', 'режим «долг по счёту» сохранён');
+    ok(bdb3.balanceOf(uid, rentId).closing === 60000,
+      'переключение подхватило уже выписанный счёт', bdb3.balanceOf(uid, rentId).closing);
     await tap(`d.sch:${rentId}`);
     await say('Аренда, сентябрь; 1; 60000');
     await tap('items.done');
     await tap('doc.make');
-    ok(bdb3.balanceOf(uid, rentId).closing === 60000,
-      'в режиме «по счёту» счёт создал долг 60 000', bdb3.balanceOf(uid, rentId).closing);
+    ok(bdb3.balanceOf(uid, rentId).closing === 120000,
+      'второй счёт добавил свой долг: 60 000 + 60 000', bdb3.balanceOf(uid, rentId).closing);
     // Сообщение о проводке уходит подписью к файлу, а не отдельным письмом.
     ok(String((files[files.length - 1] || {}).caption || '').includes('внесён в журнал'),
       'бот сказал, что внёс долг в журнал',
@@ -1603,18 +1610,19 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(Boolean(payBtn), 'есть кнопка отметки оплаты', payBtn);
 
     await tap(payBtn);
-    ok(bdb3.balanceOf(uid, rentId).closing === 0, 'после отметки оплаты долг закрыт',
-      bdb3.balanceOf(uid, rentId).closing);
+    ok(bdb3.balanceOf(uid, rentId).closing === 60000,
+      'отметка оплаты закрыла долг именно этого счёта', bdb3.balanceOf(uid, rentId).closing);
     ok(bdb3.getDoc(uid, rentDoc.id).paid_at, 'дата оплаты записана', bdb3.getDoc(uid, rentDoc.id).paid_at);
 
     await tap(`doc.unpaid:${rentDoc.id}`);
-    ok(bdb3.balanceOf(uid, rentId).closing === 60000, 'отмена оплаты вернула долг');
+    ok(bdb3.balanceOf(uid, rentId).closing === 120000, 'отмена оплаты вернула долг',
+      bdb3.balanceOf(uid, rentId).closing);
 
     // Повторная отметка не должна задваивать проводку.
     await tap(`doc.paid:${rentDoc.id}`);
     await tap(`doc.paid:${rentDoc.id}`);
-    ok(bdb3.balanceOf(uid, rentId).closing === 0, 'повторная отметка оплаты не задваивает проводку',
-      bdb3.balanceOf(uid, rentId).closing);
+    ok(bdb3.balanceOf(uid, rentId).closing === 60000,
+      'повторная отметка оплаты не задваивает проводку', bdb3.balanceOf(uid, rentId).closing);
 
     await tap('unpaid');
     ok(last().includes('Не оплачено') || last().includes('Неоплаченных'),
@@ -1975,6 +1983,62 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     delete process.env.AI_ENABLED;
     delete process.env.AI_PROVIDER;
     delete process.env.AI_MOCK;
+  }
+
+  console.log('\n── смена основания пересчитывает прошлое ──');
+  {
+    const bdbR = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = fxUserId();
+    const org = bdbR.getDefaultOrg(uid);
+    const was = bdbR.basisOf(org);
+    const cpR = bdbR.createCp(uid, { name: 'ООО «Пересчёт»', kind: 'customer', opening_date: '2026-01-01' });
+
+    bdbR.updateOrg(uid, org.id, { debt_basis: 'closing' });
+    bdbR.rebuildDebt(uid);
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cpR, items: [{ name: 'Работа', qty: 1, price: 10000 }], skipQuota: true,
+    });
+    ok(bdbR.balanceOf(uid, cpR).closing === 0,
+      'при «долге по отгрузке» счёт долга не создаёт', bdbR.balanceOf(uid, cpR).closing);
+
+    /*
+     * Главная жалоба владельца: «счета удаляю, а сумма на главной не
+     * меняется». Так и было: при основании «по отгрузке» счёт долга не
+     * создаёт, крупная цифра «должны вам» стоит нулём и не шевелится, что
+     * ни делай. Переключение на «долг по счёту» не помогало — проводки
+     * создаются при выписке, а уже выписанное оставалось как было.
+     */
+    bdbR.updateOrg(uid, org.id, { debt_basis: 'invoice' });
+    const fixed = bdbR.rebuildDebt(uid);
+    // Пересчёт идёт по всем документам пользователя, а их к этому месту в
+    // прогоне уже много — проверяем не число, а результат для этой карточки.
+    ok(fixed.added >= 1, 'переключение досоздало проводки прошлым счетам', JSON.stringify(fixed));
+    ok(bdbR.balanceOf(uid, cpR).closing === 10000,
+      'и долг наконец появился', bdbR.balanceOf(uid, cpR).closing);
+
+    // И теперь удаление счёта наконец двигает цифру.
+    const doc = bdbR.listDocs(uid, 5, cpR)[0];
+    bdbR.deleteDoc(uid, doc.id);
+    ok(bdbR.balanceOf(uid, cpR).closing === 0,
+      'удаление счёта уменьшило долг — то, чего и ждал человек',
+      bdbR.balanceOf(uid, cpR).closing);
+
+    // Обратный ход убирает проводки, но не трогает отметки об оплате.
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cpR, items: [{ name: 'Ещё', qty: 1, price: 5000 }], skipQuota: true,
+    });
+    const doc2 = bdbR.listDocs(uid, 5, cpR)[0];
+    bdbR.markPaid(uid, doc2.id, '2026-08-18');
+    const paidOps = () => bdbR.listOps(uid, cpR).filter((o) => o.kind === 'Оплата').length;
+    const hadPaid = paidOps();
+    bdbR.updateOrg(uid, org.id, { debt_basis: 'closing' });
+    const back = bdbR.rebuildDebt(uid);
+    ok(back.removed >= 1, 'обратное переключение убрало проводки долга', JSON.stringify(back));
+    ok(paidOps() === hadPaid, 'а отметки об оплате не тронуты: их ставил человек', paidOps());
+
+    bdbR.updateOrg(uid, org.id, { debt_basis: was });
+    bdbR.rebuildDebt(uid);
   }
 
   console.log('\n── брошенный сценарий ──');
