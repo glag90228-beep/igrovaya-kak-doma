@@ -733,6 +733,28 @@ function withPayload(row) {
  * которую проводку отменяют, больше нет, а сальдо у контрагента висит. Долг,
  * которого никто не может убрать, — худшее, что может быть в акте сверки.
  */
+/**
+ * Сколько долга висит на каждом документе списка — одним запросом.
+ *
+ * Нужно, чтобы честно сказать перед удалением, изменится сальдо или нет.
+ * Долг создают не все документы: при основании «по отгрузке» счёт проводку
+ * не делает, и удаление такого счёта сальдо не трогает. Раньше приложение
+ * обещало обратное — «долг по нему тоже снимется» — и человек справедливо
+ * считал, что удаление сломано.
+ */
+function debtByDoc(userId, ids) {
+  const list = [...new Set((ids || []).map(Number).filter(Boolean))];
+  if (!list.length) return new Map();
+  const rows = db.prepare(`
+    SELECT o.doc_id AS id, COUNT(*) AS n,
+           ROUND(SUM(o.credit) - SUM(o.debit), 2) AS delta
+      FROM operations o
+      JOIN counterparties c ON c.id = o.cp_id
+     WHERE c.user_id = ? AND o.doc_id IN (${list.map(() => '?').join(',')})
+     GROUP BY o.doc_id`).all(userId, ...list);
+  return new Map(rows.map((r) => [r.id, { ops: r.n, delta: Number(r.delta) || 0 }]));
+}
+
 function deleteDoc(userId, id) {
   // Проводки убираем первыми: deleteOpsOfDoc сверяется с документом, и после
   // его удаления она уже ничего не найдёт.
@@ -812,6 +834,7 @@ module.exports = {
   addOp, listOps, deleteLastOp, balanceOf, debtors, periodBalance, cpForPeriod,
   knownBankKeys, importBankRows,
   DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
+  debtByDoc,
   markPaid, unmarkPaid, unpaidDocs, docsBetween,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
   isSeqTaken, guardSeq,

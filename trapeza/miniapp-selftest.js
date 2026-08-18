@@ -272,6 +272,7 @@ async function main() {
     ok(r.status === 400, 'повторное удаление отвечает понятно', (r.json || {}).error);
   }
 
+
   console.log('\n── журнал и копии ──');
   r = await call('GET', '/api/docs', { user: masha });
   const docs = r.json.docs;
@@ -803,6 +804,46 @@ async function main() {
     JSON.stringify(clean[1]));
   ok(docService.totalOf([{ qty: 3, price: 10.005 }]) === 30.02, 'копейки округляются вверх по правилу',
     docService.totalOf([{ qty: 3, price: 10.005 }]));
+
+  console.log('\n── удаление документа и сальдо ──');
+  /*
+   * Удаление должно вслух сказать, что стало с долгом.
+   *
+   * Жалоба была ровно такая: «при удалении документов не меняется сумма у
+   * контрагента». Долг создаёт не всякий документ — при основании «по
+   * отгрузке» счёт проводки не делает, — и молчаливое «удалено» неотличимо
+   * от поломки. Теперь ответ содержит delta, а список — долг по документу.
+   */
+  {
+    const closing = (await call('POST', '/api/doc', {
+      user: masha,
+      body: { type: 'usl', cpId, items: [{ name: 'Работы', qty: 1, price: 7000 }] },
+    })).json.doc;
+    const listed = (await call('GET', '/api/docs', { user: masha })).json.docs
+      .find((d) => d.id === closing.id);
+    ok(listed && listed.debt === 7000, 'в списке видно долг по акту', listed && listed.debt);
+
+    const balBefore = (await call('GET', '/api/cps', { user: masha })).json.cps
+      .find((c) => c.id === cpId).balance;
+    r = await call('POST', '/api/doc/delete', { user: masha, body: { id: closing.id } });
+    ok(r.json.delta === 7000, 'удаление акта отвечает, на сколько изменился долг', r.json.delta);
+    const balAfter = (await call('GET', '/api/cps', { user: masha })).json.cps
+      .find((c) => c.id === cpId).balance;
+    ok(balBefore - balAfter === 7000, 'и сальдо контрагента действительно изменилось',
+      `${balBefore} → ${balAfter}`);
+
+    // Счёт при основании «по отгрузке» долга не создаёт — и это надо сказать,
+    // а не молчать: иначе человек решит, что удаление сломано.
+    const invoice = (await call('POST', '/api/doc', {
+      user: masha,
+      body: { type: 'sch', cpId, items: [{ name: 'Счёт', qty: 1, price: 5000 }] },
+    })).json.doc;
+    const inList = (await call('GET', '/api/docs', { user: masha })).json.docs
+      .find((d) => d.id === invoice.id);
+    ok(inList && inList.debt === 0, 'у счёта долга нет — так и помечен', inList && inList.debt);
+    r = await call('POST', '/api/doc/delete', { user: masha, body: { id: invoice.id } });
+    ok(r.json.delta === 0, 'и при его удалении сальдо честно не меняется', r.json.delta);
+  }
 
   console.log('\n── проверка подписи отдельно ──');
   ok(verifyInitData('', { token: TOKEN }).ok === false, 'пустая initData не проходит');

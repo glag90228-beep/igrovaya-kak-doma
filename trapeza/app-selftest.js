@@ -143,6 +143,37 @@ const ok = (c, m, extra) => {
   ok(nowFirst !== first, 'удалился именно тот, что смахнули', `${first} → ${nowFirst}`);
   ok(bdb.listDocs(user.id, 50).length === 2, 'в базе тоже два', bdb.listDocs(user.id, 50).length);
 
+  /*
+   * Начальное сальдо: по цифре вверху карточки и тыкают.
+   *
+   * Жалоба была «тыкаю на цифры и нифига»: строка сальдо стояла первой в
+   * карточке, выглядела как соседние — нажимаемые, — а была мёртвым div.
+   * Поля же лежали экраном ниже, за реквизитами и почтой. Проверяем
+   * настоящим касанием, что строка ведёт к полю и что поле принимает ввод.
+   */
+  console.log('\n── начальное сальдо ──');
+  await page.evaluate((cpId) => window.__go('cp', { id: cpId }), cp);
+  await page.waitForSelector('#f-opening_balance');
+
+  const row = await page.locator('.card .row').first().boundingBox();
+  await page.touchscreen.tap(row.x + row.width / 2, row.y + row.height / 2);
+  await page.waitForTimeout(700);
+  ok(await page.evaluate(() => document.activeElement && document.activeElement.id) === 'f-opening_balance',
+    'нажатие на сальдо ведёт к полю начального сальдо',
+    await page.evaluate(() => document.activeElement && document.activeElement.id));
+  ok(await page.evaluate(() => {
+    const r = document.getElementById('f-opening_balance').getBoundingClientRect();
+    return r.top > 0 && r.bottom < window.innerHeight;
+  }), 'и поле оказалось на экране, а не за его краем');
+
+  await page.locator('#f-opening_balance').fill('15000');
+  await page.locator('#f-opening_date').fill('2026-01-01');
+  await page.getByText('Сохранить', { exact: true }).click();
+  await page.waitForTimeout(900);
+  const savedCp = bdb.getCp(user.id, cp);
+  ok(Number(savedCp.opening_balance) === 15000 && savedCp.opening_date === '2026-01-01',
+    'сальдо и дата сохранились', `${savedCp.opening_balance} / ${savedCp.opening_date}`);
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();

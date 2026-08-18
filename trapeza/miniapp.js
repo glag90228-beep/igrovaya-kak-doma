@@ -357,7 +357,11 @@ const api = {
 
   async 'GET /api/docs'({ user, url }) {
     const cpId = Number(url.searchParams.get('cp')) || null;
-    return { docs: bdb.listDocs(user.id, 30, cpId).map(docBrief) };
+    const rows = bdb.listDocs(user.id, 30, cpId);
+    // Долг по документу — чтобы карточка могла честно сказать, изменится
+    // ли сальдо при удалении. Одним запросом на весь список, не по одному.
+    const debt = bdb.debtByDoc(user.id, rows.map((d) => d.id));
+    return { docs: rows.map((d) => ({ ...docBrief(d), debt: (debt.get(d.id) || {}).delta || 0 })) };
   },
 
   /**
@@ -880,8 +884,14 @@ const api = {
     const id = Number(body.id);
     const d = bdb.getDoc(user.id, id);
     if (!d) return { error: 'Документ не найден.' };
+    // Считаем изменение сальдо до удаления и возвращаем его: иначе человек
+    // видит «удалено», смотрит на неизменившийся долг и справедливо решает,
+    // что удаление не работает. Долг создаёт не всякий документ.
+    const before = d.cp_id ? bdb.balanceOf(user.id, d.cp_id) : null;
     bdb.deleteDoc(user.id, id);
-    return { deleted: true, title: `${d.title} № ${d.number}` };
+    const after = d.cp_id ? bdb.balanceOf(user.id, d.cp_id) : null;
+    const delta = before && after ? round2(before.closing - after.closing) : 0;
+    return { deleted: true, title: `${d.title} № ${d.number}`, delta, balance: after ? after.closing : 0 };
   },
 
   /** Из чего возникает долг: по акту, по счёту или вручную. */

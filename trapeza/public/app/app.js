@@ -228,6 +228,20 @@ const owesUs = (cp) => (cp.kind === 'supplier' ? cp.balance < 0 : cp.balance > 0
 const balanceTone = (cp) => (!cp.balance ? '' : (owesUs(cp) ? 'in' : 'out'));
 
 /** Строка-ссылка в карточке: иконка, заголовок, пояснение, шеврон. */
+/*
+ * Что сказать после удаления документа.
+ *
+ * Раньше говорили просто «удалён», и человек шёл смотреть на долг клиента.
+ * Долг создаёт не всякий документ: при основании «по отгрузке» счёт проводки
+ * не делает, и сальдо после его удаления не меняется — законно, но со
+ * стороны неотличимо от поломки. Поэтому говорим прямо.
+ */
+function deletedText(d, r) {
+  const head = `${d.title} № ${d.number} удалён`;
+  if (r && Number(r.delta)) return `${head}. Долг изменился на ${money(Math.abs(r.delta))}`;
+  return `${head}. Сальдо клиента не изменилось — проводки у него не было`;
+}
+
 function navRow(opts) {
   return h('button', { class: 'row', onclick: () => { haptic(); opts.onclick(); } },
     opts.icon && h('span', { class: `icon-box ${opts.tone || ''}` }, icon(opts.icon)),
@@ -373,9 +387,9 @@ screens.docs = async function docs({ cp } = {}) {
     {
       label: `Удалить ${d.title} № ${d.number}`,
       onDelete: async () => {
-        await api('POST', '/api/doc/delete', { id: d.id });
+        const r = await api('POST', '/api/doc/delete', { id: d.id });
         haptic('medium');
-        toast(`${d.title} № ${d.number} удалён`);
+        toast(deletedText(d, r));
         render();
       },
     },
@@ -624,16 +638,15 @@ screens.doc = async function docScreen({ id }) {
   del.onclick = () => {
     const sure = h('button', { class: 'btn danger' }, 'Да, удалить безвозвратно');
     sure.onclick = () => withBusy(sure, async () => {
-      await api('POST', '/api/doc/delete', { id: d.id });
+      const r = await api('POST', '/api/doc/delete', { id: d.id });
       haptic('medium');
-      toast('Документ удалён');
+      toast(deletedText(d, r));
       reset('docs');
     });
     del.replaceWith(h('div', {},
-      h('p', { class: 'small muted', style: 'margin:0 6px 10px',
-        text: d.total
-          ? 'Документ исчезнет из журнала вместе со своей проводкой — долг по нему тоже снимется.'
-          : 'Документ исчезнет из журнала.' }),
+      h('p', { class: 'small muted', style: 'margin:0 6px 10px', text: d.debt
+        ? `Документ исчезнет из журнала вместе со своей проводкой: долг клиента изменится на ${money(Math.abs(d.debt))}.`
+        : 'Документ исчезнет из журнала. Проводки у него нет — сальдо клиента не изменится.' }),
       sure));
   };
   box.append(h('div', { class: 'btn-wrap' }, del));
@@ -777,11 +790,35 @@ screens.cp = async function cpScreen({ id }) {
    * выписать счёт, внести оплату или собрать акт сверки, а реквизиты правят
    * раз в жизни. Раньше здесь были только поля, и всё это жило в боте.
    */
+  /*
+   * Строка сальдо ведёт к начальному сальдо — по ней и тыкают.
+   *
+   * Раньше это был мёртвый div: выглядел как соседние строки, стоял первым
+   * в карточке и на нажатие не отвечал ничем. Человек, которому нужно
+   * выставить долг «с прошлого года», жмёт именно на цифру — а поля для
+   * него лежат экраном ниже, за реквизитами и почтой, и найти их нельзя.
+   */
+  const openingHint = () => {
+    const v = Number(cp.opening_balance) || 0;
+    if (!v) return 'Задать начальное сальдо';
+    return `Начали с ${money(Math.abs(v))}${cp.opening_date ? ` на ${ru(cp.opening_date)}` : ''}`;
+  };
+  const gotoOpening = () => {
+    const el = f.opening_balance.input;
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    // preventScroll — иначе браузер дёрнет экран второй раз, поверх плавного.
+    setTimeout(() => el.focus({ preventScroll: true }), 350);
+  };
+
   if (id) {
     box.append(h('div', { class: 'card' },
-      h('div', { class: 'row' },
-        h('span', { class: 'grow muted', text: cp.balance ? (owesUs(cp) ? 'Должен нам' : 'Должны мы') : 'Сальдо' }),
-        h('span', { class: `money ${balanceTone(cp)}`, text: money(Math.abs(cp.balance || 0)) })),
+      navRow({
+        title: cp.balance ? (owesUs(cp) ? 'Должен нам' : 'Должны мы') : 'Сальдо',
+        sub: openingHint(),
+        right: money(Math.abs(cp.balance || 0)),
+        rightTone: balanceTone(cp),
+        onclick: gotoOpening,
+      }),
       navRow({ icon: 'receipt', title: 'Выписать счёт', onclick: () => go('new', { type: 'sch', cpId: id }) }),
       navRow({ icon: 'wallet', title: 'Внести оплату или приход', onclick: () => go('op', { cpId: id }) }),
       navRow({ icon: 'doc', title: 'Акт сверки', sub: 'таблица операций в Excel',
