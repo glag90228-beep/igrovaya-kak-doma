@@ -501,6 +501,7 @@ function matchToCounterparties(rows, cps, balanceOf = () => 0) {
   return rows.filter((t) => t.incoming).map((t) => {
     let best = null;
     let score = 0;
+    let rival = null;
     for (const cp of cps) {
       let s = 0;
       if (t.inn && cp.inn && digits(t.inn) === digits(cp.inn)) s += 60;
@@ -513,11 +514,23 @@ function matchToCounterparties(rows, cps, balanceOf = () => 0) {
       const debt = Math.abs(Number(balanceOf(cp.id)) || 0);
       if (debt && Math.abs(debt - t.amount) < 0.01) s += 25;
       else if (debt && Math.abs(debt - t.amount) < debt * 0.05) s += 10;
-      if (s > score) { score = s; best = cp; }
+      if (s > score) { score = s; best = cp; rival = null; }
+      else if (s === score && s > 0 && best && cp.id !== best.id) rival = cp;
     }
+    /*
+     * Ничья — это отказ, а не выбор первого попавшегося.
+     *
+     * Раньше при равном счёте побеждал тот, кого раньше завели: строка
+     * набирала 60 и попадала в «узнал уверенно», то есть заносилась одним
+     * нажатием. Два клиента с одинаковым коротким названием — и оплата
+     * молча уходит не тому. Ошибка в деньгах, которую никто не заметит.
+     */
+    const tie = Boolean(rival && score > 0);
     return {
       ...t,
-      cp: score >= 30 && best ? { id: best.id, name: best.name } : null,
+      cp: !tie && score >= 30 && best ? { id: best.id, name: best.name } : null,
+      ambiguous: tie,
+      rivals: tie ? [best.name, rival.name] : [],
       confidence: Math.min(100, score),
     };
   });

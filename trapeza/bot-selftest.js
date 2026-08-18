@@ -1919,6 +1919,38 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     delete process.env.AI_MOCK;
   }
 
+  console.log('\n── брошенный сценарий ──');
+  {
+    const bdbS = require('./lib/bot-db');
+    const uid = fxUserId();
+    const st = () => bdbS.getState(uid).state;
+
+    // Ушёл в другой раздел — недописанное отменяется. Раньше состояние
+    // жило дальше, и «Спасибо» в чате бот принимал за позицию счёта.
+    await tap(`d.sch:${cpId}`);
+    ok(st().startsWith('items:'), 'счёт начат', st());
+    await say('Аренда помещения; 1; 30000');
+    await tap('docs');
+    ok(st() === '', 'уход в «Мои документы» отменяет незаконченный счёт', st());
+    ok(/Незаконченный документ отменил/.test(sent[sent.length - 2].text || ''),
+      'и об отмене сказано, а не потеряно молча',
+      (sent[sent.length - 2].text || '').slice(0, 60));
+
+    const mark = sent.length;
+    await say('Спасибо');
+    ok(!/по какой цене/.test(last()), 'обычное слово больше не уходит в брошенный счёт',
+      last().slice(0, 60));
+    ok(sent.length > mark, 'бот всё равно отвечает, а не молчит');
+
+    // А кнопки самого сценария состояние сохраняют — иначе его не пройти.
+    await tap(`d.sch:${cpId}`);
+    await say('Канапе; 20; 650');
+    await tap('items.undo');
+    ok(st().startsWith('items:'), 'кнопка внутри сценария его не сбрасывает', st());
+    await tap('menu');
+    ok(st() === '', 'а «Меню» сбрасывает', st());
+  }
+
   console.log('\n── регулярные документы ──');
   {
     const rec = require('./lib/recurring');

@@ -61,6 +61,32 @@ function parseAmount(s) {
 }
 const clean = (s) => (String(s).trim() === '-' ? '' : String(s).trim());
 
+/**
+ * Какие кнопки принадлежат какому незаконченному сценарию.
+ *
+ * Нажатие всего остального — уход в другой раздел, и недописанное надо
+ * отменить: иначе состояние диалога живёт, пока его кто-нибудь не
+ * перезапишет, и следующее слово в чате попадает в брошенный сценарий.
+ *
+ * Таблица, а не список исключений: список пришлось бы выводить из того,
+ * кто читает состояние, — а читают его функции внутри обработчиков, и
+ * пропустить одну ничего не стоит (так и вышло с разбором фотографии).
+ * Здесь же видно каждый сценарий и его кнопки рядом.
+ *
+ * Сценарии, которых тут нет (claim, promo, support, op:, rm:, aktp:, mail:),
+ * ждут только текста, и любая кнопка для них — выход.
+ */
+const FLOW_BUTTONS = {
+  'items:': ['items.', 'tpl:', 'doc.make', 'doc.num', 'doc.date', 'doc.vat'],
+  'form:': ['fb:', 'form.skip'],
+  photo: ['ph.'],
+  bank: ['bank:'],
+  'pp:': ['pp.'],
+  'dog:': ['dog.'],
+  'fx:': ['fx.'],
+  'mb:': ['mb.'],
+};
+
 // ---------- меню ----------
 
 /**
@@ -2061,6 +2087,16 @@ async function handleStatement(tg, chatId, user, msg) {
     lines.push('', `Ещё ${rest} ${plural(rest, 'поступление', 'поступления', 'поступлений')} `
       + 'не удалось привязать к клиенту наверняка — это видно в приложении.');
   }
+  // Спорные называем поимённо: «не привязалось» без причины выглядит как
+  // недоработка, а тут причина понятная и человеку решать её секунду.
+  const doubtful = fresh.filter((t) => t.ambiguous);
+  if (doubtful.length) {
+    lines.push('', `Из них ${doubtful.length} совпало сразу с двумя клиентами:`);
+    for (const t of doubtful.slice(0, 5)) {
+      lines.push(`• ${ru(t.date)} · ${formatRub(t.amount)} — ${esc(t.rivals.join(' или '))}`);
+    }
+    lines.push('<i>Выберите нужного в приложении — сам не угадываю.</i>');
+  }
 
   // Строки кладём в состояние: кнопка нажимается позже, а файла к тому
   // времени уже нет.
@@ -2836,7 +2872,34 @@ async function handleCallback(tg, cq) {
   await tg.answerCallbackQuery(cq.id).catch(() => {});
 
   try {
-    if (data === 'menu') { bdb.clearState(user.id); await tg.sendMessage(chatId, 'Главное меню:', mainMenu()); return; }
+    /*
+     * Ушёл в другой раздел — недописанное отменяем.
+     *
+     * Состояние диалога жило до тех пор, пока его кто-нибудь не перезапишет.
+     * Человек начинал счёт, передумывал, уходил в «Мои документы» — и любое
+     * следующее слово в чате попадало в брошенный сценарий: на «Спасибо»
+     * бот отвечал «Сколько и по какой цене?». Выглядело как поломка.
+     *
+     * Кнопки самого сценария (позиции, предпросмотр, шаги формы) состояние,
+     * разумеется, сохраняют — иначе сценарий не пройти.
+     */
+    {
+      const was = bdb.getState(user.id);
+      const own = was.state ? (FLOW_BUTTONS[Object.keys(FLOW_BUTTONS)
+        .find((k) => was.state.startsWith(k))] || []) : [];
+      if (was.state && !own.some((p) => data.startsWith(p))) {
+        bdb.clearState(user.id);
+        // Молча терять набранное нельзя: человек мог ввести десяток позиций.
+        const items = (was.data && was.data.items) || [];
+        if (was.state.startsWith('items:') && items.length) {
+          await tg.sendMessage(chatId,
+            `Незаконченный документ отменил — ${items.length} `
+            + `${plural(items.length, 'позиция', 'позиции', 'позиций')} не сохранились.`);
+        }
+      }
+    }
+
+    if (data === 'menu') { await tg.sendMessage(chatId, 'Главное меню:', mainMenu()); return; }
     if (data === 'bank:take') {
       const st = bdb.getState(user.id);
       const rows = st.state === 'bank' && Array.isArray(st.data.rows) ? st.data.rows : [];
