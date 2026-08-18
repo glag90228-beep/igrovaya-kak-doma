@@ -344,8 +344,8 @@ npx @claude-flow/cli@3.38.12 hive-mind consensus --propose "task"
 | Package | Command |
 |---------|---------|
 | ruv-swarm | `npx ruv-swarm mcp start` |
-| flow-nexus | `npx flow-nexus@latest mcp start` |
-| agentic-jujutsu | `npx agentic-jujutsu@latest` |
+| flow-nexus | `npx flow-nexus@0.1.128 mcp start` |
+| agentic-jujutsu | `npx agentic-jujutsu@2.3.6` |
 
 ### MCP Server Setup
 ```bash
@@ -354,7 +354,7 @@ claude mcp add ruflo -- npx -y ruflo@3.38.12 mcp start
 
 # Optional servers
 claude mcp add ruv-swarm -- npx -y ruv-swarm mcp start
-claude mcp add flow-nexus -- npx -y flow-nexus@latest mcp start
+claude mcp add flow-nexus -- npx -y flow-nexus@0.1.128 mcp start
 ```
 
 ---
