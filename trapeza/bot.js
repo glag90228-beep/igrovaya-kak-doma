@@ -953,26 +953,26 @@ async function repeatDoc(tg, chatId, user, docId) {
   await showPreview(tg, chatId, user, bdb.getState(user.id));
 }
 
-/** Границы периода по короткому имени. */
+/**
+ * Границы периода для реестра документов.
+ *
+ * Считает их общий lib/period.js — второй набор периодов в том же боте
+ * рано или поздно разъехался бы с первым. Отличие у реестра одно и оно
+ * осознанное: месяц, квартал и год берутся целиком, а не по сегодня —
+ * реестр собирают за период, в том числе заранее. Подписи свои: в реестре
+ * привычнее «текущий месяц», в акте сверки — «этот месяц».
+ */
+const REGISTRY_PERIODS = {
+  prev: { code: 'pm', title: 'прошлый месяц' },
+  quarter: { code: 'q', title: 'текущий квартал' },
+  year: { code: 'y', title: 'текущий год' },
+  month: { code: 'm', title: 'текущий месяц' },
+};
+
 function periodOf(name) {
-  // Московский календарь, как и у дат документов: на сервере в UTC «текущий
-  // месяц» ночью первого числа оказался бы прошлым.
-  const now = period.todayDate();
-  const y = now.getFullYear();
-  const m = now.getMonth();
-  // Одна шкала дат на весь файл — та же, что у периодов акта сверки.
-  const at = (yy, mm, dd) => period.iso(new Date(yy, mm, dd));
-  if (name === 'prev') {
-    return { from: at(y, m - 1, 1), to: at(y, m, 0), title: 'прошлый месяц' };
-  }
-  if (name === 'quarter') {
-    const q = Math.floor(m / 3) * 3;
-    return { from: at(y, q, 1), to: at(y, q + 3, 0), title: 'текущий квартал' };
-  }
-  if (name === 'year') {
-    return { from: `${y}-01-01`, to: `${y}-12-31`, title: `${y} год` };
-  }
-  return { from: at(y, m, 1), to: at(y, m + 1, 0), title: 'текущий месяц' };
+  const p = REGISTRY_PERIODS[name] || REGISTRY_PERIODS.month;
+  const r = period.presetRange(p.code, period.todayDate(), { whole: true });
+  return { from: r.from, to: r.to, title: p.title };
 }
 
 /** Реестр выписанного за период — то, чем закрывают месяц. */

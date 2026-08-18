@@ -84,16 +84,25 @@ const last = (y, m) => iso(new Date(y, m + 1, 0));
  * Готовые периоды. Возвращает { code, from, to, label }.
  * Незнакомый код — как «за всё время»: лучше показать больше, чем пустой акт.
  */
-function presetRange(code, today = todayDate()) {
+function presetRange(code, today = todayDate(), { whole = false } = {}) {
   const y = today.getFullYear();
   const m = today.getMonth();
-  const now = iso(today);
+  /*
+   * Незакрытые периоды кончаются сегодня или последним числом — смотря
+   * зачем спрашивают. Акт сверки подписывают «по сегодня»: сверять надо то,
+   * что уже случилось. Реестр документов, наоборот, собирают за месяц
+   * целиком, в том числе заранее. Отсюда флаг whole.
+   */
+  const now = whole ? last(y, m) : iso(today);
   switch (String(code)) {
     case 'm': return { code: 'm', from: first(y, m), to: now, label: 'этот месяц' };
     case 'pm': return { code: 'pm', from: first(y, m - 1), to: last(y, m - 1), label: 'прошлый месяц' };
     case 'q': {
       const qm = Math.floor(m / 3) * 3;
-      return { code: 'q', from: first(y, qm), to: now, label: `${qm / 3 + 1}-й квартал` };
+      return {
+        code: 'q', from: first(y, qm), label: `${qm / 3 + 1}-й квартал`,
+        to: whole ? last(y, qm + 2) : iso(today),
+      };
     }
     case 'pq': {
       const qm = Math.floor(m / 3) * 3 - 3;
@@ -101,7 +110,10 @@ function presetRange(code, today = todayDate()) {
       const pm = qm < 0 ? qm + 12 : qm;
       return { code: 'pq', from: first(py, pm), to: last(py, pm + 2), label: `${pm / 3 + 1}-й квартал ${py}` };
     }
-    case 'y': return { code: 'y', from: `${y}-01-01`, to: now, label: `${y} год` };
+    case 'y': return {
+      code: 'y', from: `${y}-01-01`, label: `${y} год`,
+      to: whole ? `${y}-12-31` : iso(today),
+    };
     case 'py': return { code: 'py', from: `${y - 1}-01-01`, to: `${y - 1}-12-31`, label: `${y - 1} год` };
     default: return { code: 'all', from: '', to: now, label: 'за всё время' };
   }
