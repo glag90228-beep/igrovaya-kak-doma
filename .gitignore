@@ -1,0 +1,25 @@
+# Ruflo local secrets and runtime data
+.env
+.env.local
+.env.*.local
+.claude-flow/data/
+.claude-flow/logs/
+.claude-flow/sessions/
+
+# Базы роя. Их создаёт ruflo при первом запуске у каждого на своей машине:
+# это локальная память агентов, а не исходники. В git от них только
+# конфликты — файлы двоичные и по паре мегабайт.
+.swarm/
+ruvector.db
+
+# Состояние роя на конкретной машине: id запущенного роя, счётчики воркеров,
+# метрики, путь к npx-кэшу. Меняется при каждом запуске и у каждого своё —
+# в репозитории от этого только конфликты. Общая настройка роя лежит рядом,
+# в .claude-flow/config.yaml, и она в git остаётся.
+.claude-flow/daemon-state.json
+.claude-flow/harness-active-policy.json
+.claude-flow/memory-package.json
+.claude-flow/metrics/
+.claude-flow/policy/
+.claude-flow/security/
+.claude-flow/swarm/
