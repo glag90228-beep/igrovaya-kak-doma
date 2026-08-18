@@ -1,0 +1,20 @@
+{
+  "agents": {
+    "agent-1787037283990-7my6i5": {
+      "agentId": "agent-1787037283990-7my6i5",
+      "agentType": "coder",
+      "status": "idle",
+      "health": 1,
+      "taskCount": 0,
+      "config": {
+        "provider": "anthropic",
+        "timeout": 300,
+        "autoTools": true
+      },
+      "createdAt": "2026-08-18T07:14:43.990Z",
+      "model": "sonnet",
+      "modelRoutedBy": "default"
+    }
+  },
+  "version": "3.0.0"
+}
