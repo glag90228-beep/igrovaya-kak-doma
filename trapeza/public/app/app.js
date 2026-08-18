@@ -55,7 +55,13 @@ const rub0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
 const money0 = (n) => `${rub0.format(Math.round(Number(n) || 0))} ₽`;
 const ru = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(iso || '')
   ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : (iso || ''));
-const todayISO = () => new Date().toISOString().slice(0, 10);
+/*
+ * Дата в ISO по местному времени телефона. Через toISOString() было бы
+ * короче, но она переводит в UTC: в Москве 1 августа в 00:30 «сегодня»
+ * превращалось в 31 июля, и период уезжал на день назад.
+ */
+const isoDate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const todayISO = () => isoDate(new Date());
 
 /** «3 документа» / «1 документ» — без этого текст читается коряво. */
 function plural(n, one, few, many) {
@@ -1810,7 +1816,7 @@ screens.akt = async function aktScreen() {
    * дату, а в таблицу складывал всё по сегодняшний день.
    */
   const now = new Date();
-  const iso = (d) => d.toISOString().slice(0, 10);
+  const iso = isoDate;
   const from = field('from', 'С какой даты', '', { type: 'date' });
   const to = field('to', 'По какую', iso(now), { type: 'date' });
 
@@ -1819,10 +1825,15 @@ screens.akt = async function aktScreen() {
     to.input.value = b;
     haptic();
   };
-  const quarterStart = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
+  // Набор периодов тот же, что кнопками в боте (lib/period.js), чтобы
+  // «прошлый месяц» значил одно и то же и там, и здесь.
+  const qm = Math.floor(now.getMonth() / 3) * 3;
+  const quarterStart = new Date(now.getFullYear(), qm, 1);
   const chips = h('div', { class: 'chips' },
     h('button', { class: 'chip', onclick: () => setRange(iso(new Date(now.getFullYear(), now.getMonth(), 1)), iso(now)) }, 'Этот месяц'),
+    h('button', { class: 'chip', onclick: () => setRange(iso(new Date(now.getFullYear(), now.getMonth() - 1, 1)), iso(new Date(now.getFullYear(), now.getMonth(), 0))) }, 'Прошлый месяц'),
     h('button', { class: 'chip', onclick: () => setRange(iso(quarterStart), iso(now)) }, 'Квартал'),
+    h('button', { class: 'chip', onclick: () => setRange(iso(new Date(now.getFullYear(), qm - 3, 1)), iso(new Date(now.getFullYear(), qm, 0))) }, 'Прошлый квартал'),
     h('button', { class: 'chip', onclick: () => setRange(`${now.getFullYear()}-01-01`, iso(now)) }, 'Год'),
     h('button', { class: 'chip', onclick: () => setRange('', iso(now)) }, 'За всё время'));
 

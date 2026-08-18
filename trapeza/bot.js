@@ -34,6 +34,7 @@ const { fetchNew } = require('./lib/imap');
 const mime = require('./lib/mime');
 const bank = require('./lib/bank-statement');
 const recurring = require('./lib/recurring');
+const period = require('./lib/period');
 const bizTypes = require('./lib/biz-types');
 const ai = require('./lib/ai-agent');
 
@@ -572,6 +573,44 @@ async function genAktSverki(tg, chatId, user, cpId, from, to) {
     orgId: org.id, cpId, type: 'akt', number: String(seq), seq, date: todayISO(),
     total: Math.abs(p.closing), payload: { ops: p.ops.length, from: p.from, to: p.to },
   });
+}
+
+/**
+ * Спросить период перед актом сверки.
+ *
+ * Бот раньше молча брал весь срок отношений, а сверяются обычно за месяц
+ * или квартал — и в мини-приложении выбор периода уже был. Кнопки закрывают
+ * частые случаи, «свой период» — всё остальное.
+ */
+async function askAktPeriod(tg, chatId, user, cpId) {
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Клиент не найден.', mainMenu()); return; }
+  const rows = [];
+  for (let i = 0; i < period.PRESETS.length; i += 2) {
+    rows.push(period.PRESETS.slice(i, i + 2)
+      .map((p) => ({ text: p.text, data: `akt.p:${cpId}:${p.code}` })));
+  }
+  rows.push([{ text: '📅 Свой период', data: `akt.own:${cpId}` }]);
+  rows.push([{ text: '⬅️ Назад', data: `cp:${cpId}` }]);
+  await tg.sendMessage(chatId,
+    `Акт сверки с <b>${esc(cp.name)}</b>. За какой период?\n\n`
+    + '<i>«За всё время» — от начала расчётов, с начальным сальдо из карточки.</i>',
+    keyboard(rows));
+}
+
+/** Свой период текстом: «01.01.2026 - 31.03.2026», «март», «2 квартал». */
+async function handleAktPeriodText(tg, chatId, user, cpId, text) {
+  const r = period.parsePeriodText(text);
+  if (!r) {
+    await tg.sendMessage(chatId,
+      'Не понял период. Напишите одним из способов:\n'
+      + '<code>01.01.2026 - 31.03.2026</code>\n'
+      + '<code>март</code>  ·  <code>апрель 2025</code>\n'
+      + '<code>2 квартал</code>  ·  <code>2025</code>');
+    return;
+  }
+  bdb.clearState(user.id);
+  await genAktSverki(tg, chatId, user, cpId, r.from, r.to);
 }
 
 // ---------- сбор позиций (для акта услуг и счёта) ----------
@@ -2684,6 +2723,10 @@ async function handleMessage(tg, msg) {
     await sendReminderMail(tg, chatId, user, cpId, text.trim());
     return;
   }
+  if (state.state.startsWith('aktp:')) {
+    await handleAktPeriodText(tg, chatId, user, Number(state.state.slice(5)), text);
+    return;
+  }
   if (state.state === 'claim') { await claimByEmail(tg, chatId, user, text); return; }
   if (state.state === 'promo') { await redeemPromo(tg, chatId, user, text); return; }
   if (state.state === 'mb:email') {
@@ -3128,7 +3171,24 @@ async function handleCallback(tg, cq) {
       await tg.sendMessage(chatId, (ok ? '↩️ Последняя операция удалена.\n\n' : 'Операций нет.\n\n') + info, kb);
       return;
     }
-    if (data.startsWith('d.akt:')) { await genAktSverki(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('d.akt:')) { await askAktPeriod(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('akt.p:')) {
+      const [cpId, code] = data.slice(6).split(':');
+      const r = period.presetRange(code);
+      await genAktSverki(tg, chatId, user, Number(cpId), r.from, r.to);
+      return;
+    }
+    if (data.startsWith('akt.own:')) {
+      const cpId = Number(data.slice(8));
+      bdb.setState(user.id, `aktp:${cpId}`, {});
+      await tg.sendMessage(chatId,
+        'Напишите период — как удобно:\n'
+        + '<code>01.01.2026 - 31.03.2026</code>\n'
+        + '<code>март</code>  ·  <code>апрель 2025</code>\n'
+        + '<code>2 квартал</code>  ·  <code>2025</code>',
+        keyboard([[{ text: '✖️ Отмена', data: `cp:${cpId}` }]]));
+      return;
+    }
     if (data.startsWith('d.usl:')) { await startItems(tg, chatId, user, 'usl', Number(data.slice(6))); return; }
     if (data.startsWith('d.schdog:')) {
       // Счёт-договор — тот же счёт по сути, ставку НДС берём так же.
