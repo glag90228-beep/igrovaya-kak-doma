@@ -559,6 +559,54 @@ async function main() {
     r = await call('POST', '/api/doc/mail', { user: petya, body: { id: someDoc.id, email: 'a@b.ru' } });
     ok(r.status === 400, 'чужой документ по почте не отправить', (r.json || {}).error);
 
+    /*
+     * Напоминание должнику письмом. Раньше приложение умело только показать
+     * текст и предложить скопировать — при том что счёт тому же клиенту
+     * уходит с того же ящика по кнопке.
+     */
+    got.rcpt.length = 0; got.data = '';
+    r = await call('GET', '/api/reminders', { user: masha });
+    ok(r.json.canMail === true, 'приложение знает, что почта подключена');
+    const debt = (r.json.reminders || [])[0];
+    ok(Boolean(debt) && debt.text.includes('задолженность'), 'текст напоминания готов');
+
+    r = await call('POST', '/api/reminder/mail', {
+      user: masha, body: { cpId: debt.cpId, email: 'buh@dolzhnik.ru', text: debt.text },
+    });
+    ok(r.status === 200 && r.json.sent === 'buh@dolzhnik.ru', 'напоминание отправлено',
+      r.status === 200 ? r.json.sent : (r.json || {}).error);
+    ok(r.json.withAkt === true, 'акт сверки приложен');
+    ok(got.rcpt.includes('buh@dolzhnik.ru'), 'сервер получил адрес должника', got.rcpt.join());
+    ok(/Content-Disposition: attachment/.test(got.data), 'вложение на месте');
+
+    /*
+     * Текст правится человеком, и уйти должна именно его правка, а не наша
+     * заготовка. Тело письма — base64, поэтому ищем не в сыром потоке, а в
+     * расшифрованном: иначе проверка пройдёт на чём угодно.
+     */
+    got.data = '';
+    const myText = 'Иван, добрый день! Напомню про оплату по договору 7.';
+    r = await call('POST', '/api/reminder/mail', {
+      user: masha, body: { cpId: debt.cpId, email: 'buh@dolzhnik.ru', text: myText },
+    });
+    ok(r.status === 200, 'правленый текст принят', (r.json || {}).error);
+    const decoded = got.data.split(/\r?\n\r?\n/)
+      .map((part) => Buffer.from(part.replace(/[^A-Za-z0-9+/=]/g, ''), 'base64').toString('utf8'))
+      .join('\n');
+    ok(decoded.includes(myText), 'в письме именно то, что написал человек',
+      decoded.slice(0, 80).replace(/\s+/g, ' '));
+    ok(!decoded.includes('числится задолженность'), 'наша заготовка его не подменила');
+
+    r = await call('POST', '/api/reminder/mail', {
+      user: masha, body: { cpId: debt.cpId, email: 'buh@dolzhnik.ru', text: 'ок' },
+    });
+    ok(r.status === 400, 'пустой текст напоминания не отправляется', (r.json || {}).error);
+
+    r = await call('POST', '/api/reminder/mail', {
+      user: petya, body: { cpId: debt.cpId, email: 'a@b.ru', text: debt.text },
+    });
+    ok(r.status === 400, 'чужому контрагенту напоминание не отправить', (r.json || {}).error);
+
     // Отдельная кнопка «отправить проверочное письмо» — её добавили позже
     // экрана почты, и она никем не проверялась.
     got.rcpt.length = 0;

@@ -667,10 +667,12 @@ const api = {
       ? `\n\nРеквизиты для оплаты:\n${org.bank_name || ''}\nБИК ${org.bik || '—'}\nР/с ${org.acc}`
       : '';
     return {
+      canMail: mailbox.resolve(user.id).ok,
       reminders: rows.slice(0, 20).map((r) => ({
         cpId: r.cp.id,
         name: r.cp.name,
         amount: r.amount,
+        email: r.cp.email || '',
         text: 'Здравствуйте!\n\n'
           + `По нашим данным на ${ruDate(docService.todayISO())} за вами числится задолженность `
           + `${formatRub(r.amount).replace(/\sруб\.$/, ' руб')}`
@@ -679,6 +681,77 @@ const api = {
           + 'Если платёж уже прошёл — пришлите, пожалуйста, платёжное поручение.'
           + `${bank}\n\nС уважением,\n${org.full_name || org.name || ''}`,
       })),
+    };
+  },
+
+  /**
+   * Отправить напоминание должнику письмом.
+   *
+   * Раньше здесь был только готовый текст «скопируйте и отправьте сами», и
+   * это не сходилось с остальным: счёт тому же клиенту уходит с вашего
+   * ящика по кнопке. Разницы между ними нет — в обоих случаях письмо
+   * отправляет человек, увидев текст.
+   *
+   * Чего по-прежнему не бывает: писем без нажатия. Сигнал о просрочке
+   * приходит владельцу, а не клиенту, и отправку он подтверждает сам.
+   *
+   * Текст принимаем от приложения: там его можно поправить перед отправкой,
+   * и навязывать свою редакцию поверх правки человека было бы грубо.
+   */
+  async 'POST /api/reminder/mail'({ user, body }) {
+    const box = mailbox.resolve(user.id);
+    if (!box.ok) return { error: box.reason };
+
+    const cp = bdb.getCp(user.id, Number(body.cpId));
+    if (!cp) return { error: 'Контрагент не найден.' };
+    const to = str(body.email, 254) || cp.email;
+    if (!mailer.validEmail(to)) return { error: 'Укажите почту клиента — куда отправлять.' };
+
+    const text = str(body.text, 4000);
+    if (text.length < 20) return { error: 'Текст напоминания пустой.' };
+
+    const org = bdb.getDefaultOrg(user.id) || {};
+    const b = bdb.balanceOf(user.id, cp.id);
+
+    /*
+     * Акт сверки прикладываем: в тексте напоминания прямо написано
+     * «направляем акт сверки», и письмо без вложения этому противоречит.
+     * Если акт не собрался, отправляем письмо без него, а не молчим.
+     */
+    const attachments = [];
+    try {
+      if (!cp.period_end) {
+        bdb.updateCp(user.id, cp.id, { period_end: docService.todayISO() });
+        cp.period_end = docService.todayISO();
+      }
+      const buf = await buildAkt({
+        org: { brand: org.name, org_short: org.name, org_full: org.full_name || org.name,
+          org_inn: org.inn, signer: org.signer },
+        cp,
+        ops: bdb.listOps(user.id, cp.id),
+      });
+      attachments.push({
+        filename: `Акт_сверки_${docService.safeName(cp.name)}.xlsx`,
+        content: Buffer.from(buf),
+        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      });
+    } catch (e) {
+      console.error('акт сверки к напоминанию:', e.message);
+    }
+
+    const res = await mailer.sendMail({
+      to,
+      subject: `Задолженность по расчётам${org.name ? ` — ${org.name}` : ''}`,
+      text,
+      attachments,
+    }, box.options);
+    if (!res.ok) return { error: `Не отправилось: ${res.error}` };
+
+    if (to !== cp.email) bdb.updateCp(user.id, cp.id, { email: to });
+    return {
+      sent: to,
+      withAkt: attachments.length > 0,
+      amount: b ? round2(Math.abs(b.closing)) : 0,
     };
   },
 

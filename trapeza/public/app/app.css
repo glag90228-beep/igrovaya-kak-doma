@@ -420,6 +420,15 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .badge.ok { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success); }
 .badge.warn { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
 
+/* Текст напоминания правят перед отправкой, поэтому поле сразу высокое:
+   письмо, свёрнутое в три строки, никто не перечитает. */
+.remind-text {
+  width: 100%; min-height: 120px; resize: none; overflow: hidden;
+  border: 0; padding: 6px 0; background: none;
+  color: var(--text); font: 400 15px/1.5 var(--font);
+}
+.remind-text:focus { outline: none; }
+
 /* ---------- смахивание влево ---------- */
 
 /* Кнопка лежит под строкой и открывается, когда строка уезжает. Удаляет

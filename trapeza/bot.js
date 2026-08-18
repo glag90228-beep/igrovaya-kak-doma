@@ -2192,29 +2192,114 @@ async function sendDebtAkts(tg, chatId, user) {
     await genAktSverki(tg, chatId, user, r.cp.id);
   }
   await tg.sendMessage(chatId,
-    'Готово. Файлы перешлите должникам — бот не пишет вашим контрагентам сам, '
-    + 'у него нет их контактов.', mainMenu());
+    'Готово. Перешлите файлы должникам — или отправьте письмом из «Текста напоминания»: '
+    + 'акт сверки уйдёт вложением.',
+    keyboard([[{ text: '✉️ Текст напоминания', data: 'debt.remind' }],
+      [{ text: '⬅️ Меню', data: 'menu' }]]));
 }
 
-/** Готовый текст, который остаётся переслать должнику. */
+/** Текст напоминания: и для копирования, и для письма — один и тот же. */
+function reminderText(org, r) {
+  const bank = org && org.acc
+    ? `\n\nРеквизиты для оплаты:\n${org.bank_name || ''}\nБИК ${org.bik || '—'}\nР/с ${org.acc}`
+    : '';
+  return 'Здравствуйте!\n\n'
+    + `По нашим данным на ${ru(todayISO())} за вами числится задолженность `
+    + `${formatRub(r.amount).replace(/ /g, ' ').replace(/\sруб\.$/, ' руб')}`
+    + `${r.cp.contract ? ` по ${r.cp.contract}` : ''}.\n\n`
+    + 'Направляем акт сверки. Просим подтвердить сумму и сообщить срок оплаты. '
+    + 'Если платёж уже прошёл — пришлите, пожалуйста, платёжное поручение.'
+    + `${bank}\n\nС уважением,\n${(org && (org.full_name || org.name)) || ''}`;
+}
+
+/**
+ * Напоминания должникам.
+ *
+ * Кнопка отправки появляется, если подключён свой ящик. Раньше здесь был
+ * только текст «скопируйте и отправьте сами» — и это не сходилось с
+ * остальным: счёт тому же клиенту уходит с того же ящика по кнопке.
+ * Разницы между ними нет, в обоих случаях письмо отправляет человек,
+ * увидев текст. Чего по-прежнему не бывает — писем без нажатия.
+ */
 async function debtReminder(tg, chatId, user) {
   const org = bdb.getDefaultOrg(user.id);
   const rows = bdb.debtors(user.id).filter((r) => r.theyOwe);
   if (!rows.length) { await tg.sendMessage(chatId, 'Должников нет.', mainMenu()); return; }
-  await tg.sendMessage(chatId, 'Тексты ниже — скопируйте и отправьте каждому. Один должник — одно сообщение:');
+  const canMail = mailbox.has(user.id);
+  await tg.sendMessage(chatId, canMail
+    ? 'Тексты ниже. Отправлю письмом с актом сверки по кнопке — или скопируйте '
+      + 'и отправьте как удобно.'
+    : 'Тексты ниже — скопируйте и отправьте каждому.\n\n'
+      + '<i>Подключите свою почту, и я смогу отправлять их письмом отсюда.</i>');
+
   for (const r of rows.slice(0, 10)) {
-    const bank = org && org.acc
-      ? `\n\nРеквизиты для оплаты:\n${org.bank_name || ''}\nБИК ${org.bik || '—'}\nР/с ${org.acc}`
-      : '';
-    await tg.sendMessage(chatId,
-      `<code>Здравствуйте!\n\n`
-      + `По нашим данным на ${ru(todayISO())} за вами числится задолженность `
-      + `${formatRub(r.amount).replace(/ /g, ' ').replace(/\sруб\.$/, ' руб')}`
-      + `${r.cp.contract ? ` по ${r.cp.contract}` : ''}.\n\n`
-      + `Направляем акт сверки. Просим подтвердить сумму и сообщить срок оплаты. `
-      + `Если платёж уже прошёл — пришлите, пожалуйста, платёжное поручение.`
-      + `${bank}\n\nС уважением,\n${(org && (org.full_name || org.name)) || ''}</code>`);
+    const kb = [];
+    if (canMail) {
+      kb.push([r.cp.email
+        ? { text: `✉️ Отправить на ${r.cp.email}`.slice(0, 60), data: `rm.mail:${r.cp.id}` }
+        : { text: '✉️ Указать почту и отправить', data: `rm.ask:${r.cp.id}` }]);
+    }
+    await tg.sendMessage(chatId, `<code>${esc(reminderText(org, r))}</code>`,
+      kb.length ? keyboard(kb) : undefined);
   }
+}
+
+/** Отправить напоминание должнику письмом — с актом сверки во вложении. */
+async function sendReminderMail(tg, chatId, user, cpId, email) {
+  const box = mailbox.resolve(user.id);
+  if (!box.ok) { await tg.sendMessage(chatId, esc(box.reason), mainMenu()); return; }
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+  const to = String(email || cp.email || '').trim();
+  if (!mailer.validEmail(to)) {
+    await tg.sendMessage(chatId, 'Адрес почты выглядит неправильно.', mainMenu());
+    return;
+  }
+  const row = bdb.debtors(user.id).find((d) => d.cp.id === cpId);
+  if (!row) { await tg.sendMessage(chatId, 'Долга за этим клиентом нет.', mainMenu()); return; }
+  const org = bdb.getDefaultOrg(user.id) || {};
+
+  await tg.sendChatAction(chatId, 'typing');
+  /*
+   * Акт прикладываем: в тексте прямо написано «направляем акт сверки», и
+   * письмо без вложения этому противоречит. Не собрался — отправляем без
+   * него, а не молчим: напоминание важнее приложения к нему.
+   */
+  const attachments = [];
+  try {
+    if (!cp.period_end) {
+      bdb.updateCp(user.id, cp.id, { period_end: todayISO() });
+      cp.period_end = todayISO();
+    }
+    const buf = await buildAkt({
+      org: { brand: org.name, org_short: org.name, org_full: org.full_name || org.name,
+        org_inn: org.inn, signer: org.signer },
+      cp,
+      ops: bdb.listOps(user.id, cp.id),
+    });
+    attachments.push({
+      filename: `Акт_сверки_${docService.safeName(cp.name)}.xlsx`,
+      content: Buffer.from(buf),
+      contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    });
+  } catch (e) {
+    console.error('акт сверки к напоминанию:', e.message);
+  }
+
+  const res = await mailer.sendMail({
+    to,
+    subject: `Задолженность по расчётам${org.name ? ` — ${org.name}` : ''}`,
+    text: reminderText(org, row),
+    attachments,
+  }, box.options);
+  if (!res.ok) {
+    await tg.sendMessage(chatId, `Не отправилось: ${esc(res.error)}`, mainMenu());
+    return;
+  }
+  if (to !== cp.email) bdb.updateCp(user.id, cp.id, { email: to });
+  await tg.sendMessage(chatId,
+    `✅ Отправлено на <b>${esc(to)}</b>${attachments.length ? ' вместе с актом сверки' : ''}.`,
+    mainMenu());
 }
 
 // ---------- договор (три вопроса, остальное из реквизитов) ----------
@@ -2584,6 +2669,12 @@ async function handleMessage(tg, msg) {
   if (state.state.startsWith('pp:')) { await handlePpText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('dog:')) { await handleDogText(tg, chatId, user, state, text); return; }
   if (state.state === 'support') { await handleSupportText(tg, chatId, user, text); return; }
+  if (state.state.startsWith('rm:')) {
+    const cpId = Number(state.state.slice(3));
+    bdb.clearState(user.id);
+    await sendReminderMail(tg, chatId, user, cpId, text.trim());
+    return;
+  }
   if (state.state === 'claim') { await claimByEmail(tg, chatId, user, text); return; }
   if (state.state === 'promo') { await redeemPromo(tg, chatId, user, text); return; }
   if (state.state === 'mb:email') {
@@ -3139,6 +3230,20 @@ async function handleCallback(tg, cq) {
     if (data === 'debts') { await showDebts(tg, chatId, user); return; }
     if (data === 'debt.akts') { await sendDebtAkts(tg, chatId, user); return; }
     if (data === 'debt.remind') { await debtReminder(tg, chatId, user); return; }
+    if (data.startsWith('rm.mail:')) {
+      await sendReminderMail(tg, chatId, user, Number(data.slice(8)));
+      return;
+    }
+    if (data.startsWith('rm.ask:')) {
+      const cpId = Number(data.slice(7));
+      bdb.setState(user.id, `rm:${cpId}`, {});
+      const cp = bdb.getCp(user.id, cpId);
+      await tg.sendMessage(chatId,
+        `Куда отправить напоминание для <b>${esc((cp && cp.name) || 'клиента')}</b>?\n\n`
+        + '<i>Пришлите адрес почты — запомню его в карточке клиента.</i>',
+        keyboard([[{ text: '✖️ Отмена', data: 'debts' }]]));
+      return;
+    }
     if (data === 'docs') { await showDocs(tg, chatId, user); return; }
     if (data.startsWith('docs.cp:')) { await showDocs(tg, chatId, user, Number(data.slice(8))); return; }
     if (data.startsWith('doc.get:')) { await resendDoc(tg, chatId, user, Number(data.slice(8))); return; }

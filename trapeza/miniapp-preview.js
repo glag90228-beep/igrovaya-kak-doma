@@ -144,6 +144,17 @@ async function seed() {
     await br.close();
   }
 
+  // Подключённый ящик: без него экран напоминаний показывает только
+  // «скопируйте текст», а главное на нём — отправка письмом.
+  require('./lib/mailbox').save(user.id, {
+    preset: 'custom', login: 'buh@sarycheva.ru', from: 'buh@sarycheva.ru',
+    pass: 'для-снимков', fromName: 'ИП Сарычева М. В.',
+    host: 'smtp.example.invalid', port: 587, secure: false,
+  });
+  for (const [i, id] of ids.entries()) {
+    if (i < 2) bdb.updateCp(user.id, id, { email: `buh${i + 1}@client.ru` });
+  }
+
   // Пара позиций про запас, чтобы было видно «частые позиции».
   bdb.rememberItems(user.id, [
     { name: 'Кофе-брейк', unit: 'шт.', price: 480 },

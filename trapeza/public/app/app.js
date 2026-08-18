@@ -1919,15 +1919,18 @@ screens.other = async function other({ type, cpId }) {
  * адресов у нас нет. Отдаём текст — человек отправит его от своего имени.
  */
 screens.reminders = async function reminders() {
-  const { reminders: list } = await api('GET', '/api/reminders');
+  const { reminders: list, canMail } = await api('GET', '/api/reminders');
   const box = h('div', {}, h('h1', { text: 'Напомнить о долге' }));
   if (!list.length) {
     box.append(empty('check', 'Должников нет', 'Некому напоминать — все рассчитались.'));
     return box;
   }
   box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
-    text: 'Нажмите на текст — он скопируется. Отправьте его должнику сами, от своего имени: '
-      + 'бот вашим контрагентам не пишет.' }));
+    text: canMail
+      ? 'Текст можно поправить и отправить с вашей почты — вместе с актом сверки. '
+        + 'Или скопировать и отправить как удобно.'
+      : 'Скопируйте текст и отправьте должнику сами. Чтобы отправлять письмом '
+        + 'прямо отсюда, подключите свою почту в разделе «Ещё».' }));
 
   for (const r of list) {
     const card = h('div', { class: 'card' });
@@ -1937,23 +1940,59 @@ screens.reminders = async function reminders() {
         h('div', { class: 'ellipsis', text: r.name }),
         h('div', { class: 'small muted', text: 'должен нам' })),
       h('span', { class: 'money in nowrap', text: money0(r.amount) })));
-    const pre = h('div', {
-      class: 'small',
-      style: 'padding:12px 18px;white-space:pre-wrap;border-top:1px solid var(--hairline);color:var(--muted)',
-      text: r.text,
-    });
-    card.append(pre);
-    const copy = h('button', { class: 'btn secondary' }, 'Скопировать текст');
+
+    /*
+     * Текст правится прямо здесь. Готовая формулировка подходит не всякому
+     * клиенту: с одним говорят строже, с другим мягче, а с третьим уже
+     * договорились по телефону. Отправлять чужими словами то, что испортит
+     * отношения с плательщиком, — плохая услуга.
+     */
+    const text = h('textarea', { class: 'remind-text', id: `rm-${r.cpId}` });
+    text.value = r.text;
+    // Высота по содержимому: письмо, обрезанное на полуслове, не перечитают,
+    // а перечитать его — весь смысл этого экрана.
+    const grow = () => { text.style.height = 'auto'; text.style.height = `${text.scrollHeight}px`; };
+    text.addEventListener('input', grow);
+    requestAnimationFrame(grow);
+    card.append(h('div', { class: 'field' },
+      h('label', { for: `rm-${r.cpId}`, text: 'Текст письма' }), text));
+
+    const copy = h('button', { class: 'btn secondary' }, 'Скопировать');
     copy.onclick = async () => {
       try {
-        await navigator.clipboard.writeText(r.text);
+        await navigator.clipboard.writeText(text.value);
         haptic('medium');
         toast('Текст скопирован');
       } catch (_) {
         toast('Скопируйте вручную — браузер не дал доступ к буферу', true);
       }
     };
-    box.append(card, h('div', { class: 'btn-wrap' }, copy));
+
+    if (!canMail) {
+      box.append(card, h('div', { class: 'btn-wrap' }, copy));
+      continue;
+    }
+
+    const mail = field('to', 'Почта клиента', r.email, {
+      type: 'email', placeholder: 'buh@company.ru',
+      hint: r.email ? 'Сохранена в карточке клиента' : 'Запомню её для этого клиента',
+    });
+    card.append(mail);
+
+    const send = h('button', { class: 'btn' }, 'Отправить с моей почты');
+    send.onclick = (e) => withBusy(e.currentTarget, async () => {
+      clearErrors({ mail });
+      const to = mail.input.value.trim();
+      if (!to) { showError(mail, 'Некуда отправлять — укажите почту'); return; }
+      const res = await api('POST', '/api/reminder/mail', {
+        cpId: r.cpId, email: to, text: text.value,
+      });
+      haptic('medium');
+      toast(res.withAkt ? `Отправлено на ${res.sent} вместе с актом сверки` : `Отправлено на ${res.sent}`);
+    });
+
+    box.append(card, h('div', { class: 'btn-wrap' }, send),
+      h('div', { class: 'btn-wrap', style: 'padding-top:0' }, copy));
   }
   return box;
 };

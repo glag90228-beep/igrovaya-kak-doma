@@ -498,8 +498,11 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   const before = files.length;
   await tap('debt.akts');
   ok(files.length === before + 1, 'акт сверки собран по каждому должнику', String(files.length - before));
-  ok(last().includes('не пишет вашим контрагентам'),
-    'честно сказано, что рассылку делает пользователь');
+  // Прежняя формулировка — «бот не пишет вашим контрагентам, у него нет их
+  // контактов» — перестала быть правдой: письмо должнику отправляется по
+  // кнопке. Осталось главное: без нажатия человека не уходит ничего.
+  ok(Boolean(button('Текст напоминания')), 'отсюда можно перейти к отправке напоминаний');
+  ok(files.length > before, 'файлы отданы пользователю, а не отправлены за него');
 
   await tap('debt.remind');
   ok(last().includes('задолженность') && last().includes('Р/с'),
@@ -1552,8 +1555,58 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const cpNow = require('./lib/bot-db').getCp(uidM, schDoc.cp_id);
     ok(cpNow.email === 'buh@zarya.ru', 'адрес запомнился у контрагента', cpNow.email);
 
+    /*
+     * Напоминание должнику письмом. Раньше здесь был только текст
+     * «скопируйте и отправьте сами» — при том что счёт тому же клиенту
+     * уходит с того же ящика по кнопке. Разницы между ними нет.
+     */
+    got.rcpt.length = 0; got.data = '';
+    const bdbR = require('./lib/bot-db');
+    const cpDebt = bdbR.createCp(uidM, {
+      name: 'ООО «Забывчивый»', kind: 'customer', opening_date: '2026-01-01', email: 'buh@zabyv.ru',
+    });
+    bdbR.addOp(uidM, cpDebt, { date: '2026-07-01', kind: 'Приход', doc: 'Акт 3', credit: 31000 });
+
+    await tap('debt.remind');
+    const sendBtn = button('Отправить на buh@zabyv.ru');
+    ok(Boolean(sendBtn), 'у должника с известной почтой есть кнопка отправки', sendBtn);
+    ok(sent.some((m) => /числится задолженность/.test(m.text || '')), 'текст напоминания показан');
+
+    await tap(sendBtn);
+    ok(last().includes('Отправлено на'), 'напоминание отправлено', last().slice(0, 60));
+    ok(got.rcpt.includes('buh@zabyv.ru'), 'сервер получил адрес должника', got.rcpt.join());
+    ok(/Content-Disposition: attachment/.test(got.data), 'акт сверки приложен к письму');
+    ok(/xlsx/i.test(got.data), 'вложение — именно Excel с актом сверки');
+    ok(last().includes('вместе с актом сверки'), 'бот сказал, что приложил акт');
+
+    // Должнику без почты — сначала спрашиваем адрес, потом отправляем.
+    got.rcpt.length = 0;
+    const cpNoMail = bdbR.createCp(uidM, {
+      name: 'ООО «Безадресный»', kind: 'customer', opening_date: '2026-01-01',
+    });
+    bdbR.addOp(uidM, cpNoMail, { date: '2026-07-01', kind: 'Приход', doc: 'Акт 4', credit: 5000 });
+    await tap(`rm.ask:${cpNoMail}`);
+    ok(last().includes('Куда отправить'), 'бот спрашивает адрес', last().slice(0, 40));
+    await say('не-почта');
+    ok(last().includes('выглядит неправильно'), 'кривой адрес отклонён');
+    await tap(`rm.ask:${cpNoMail}`);
+    await say('buh@bezadres.ru');
+    ok(got.rcpt.includes('buh@bezadres.ru'), 'письмо ушло на указанный адрес', got.rcpt.join());
+    ok(bdbR.getCp(uidM, cpNoMail).email === 'buh@bezadres.ru', 'адрес запомнился в карточке');
+
     await tap('mb.del');
     ok(!mailbox.has(uidM), 'почту можно отключить');
+
+    // Без ящика кнопки отправки быть не должно — только текст.
+    // Смотрим лишь сообщения после нажатия: button() ищет по всей переписке
+    // и нашёл бы кнопку, показанную до отключения почты.
+    const mark = sent.length;
+    await tap('debt.remind');
+    const fresh = sent.slice(mark);
+    ok(!fresh.some((m) => (m.kb || []).flat().some((b) => /Отправить на/.test(b.text))),
+      'без почты кнопка отправки не показывается');
+    ok(fresh.some((m) => /Подключите свою почту/.test(m.text || '')),
+      'и сказано, что почту можно подключить');
     smtp.close();
   }
 
