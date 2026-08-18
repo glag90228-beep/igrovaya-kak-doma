@@ -706,6 +706,13 @@ screens.cp = async function cpScreen({ id }) {
     inn: field('inn', 'ИНН', cp.inn, { inputmode: 'numeric', hint: 'Заполним остальное из реестра' }),
     kpp: field('kpp', 'КПП', cp.kpp, { inputmode: 'numeric' }),
     address: field('address', 'Адрес', cp.address),
+    opening_balance: field('opening_balance', 'Начальное сальдо, ₽', cp.opening_balance || '', {
+      inputmode: 'decimal',
+      hint: 'Сколько числилось за клиентом, когда начали вести расчёты. 0 — если с нуля',
+    }),
+    opening_date: field('opening_date', 'На какую дату', cp.opening_date || '', {
+      type: 'date', hint: 'С неё начинается акт сверки',
+    }),
     email: field('email', 'Почта', cp.email, {
       type: 'email', placeholder: 'buh@company.ru',
       hint: 'Туда уйдут счета и акты, если отправлять из приложения',
@@ -787,6 +794,14 @@ screens.cp = async function cpScreen({ id }) {
     h('div', { class: 'field' }, h('label', { for: 'f-kind', text: 'Кто это' }), kindSel)));
   if (!id) box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
   box.append(h('div', { class: 'card' }, f.inn, f.kpp, f.address, f.email));
+
+  /*
+   * Начальное сальдо. Без него акт сверки открывается нулём, и клиент,
+   * у которого долг тянется с прошлого года, такой акт не подпишет.
+   * В боте это спрашивали при заведении, в приложении задать было негде.
+   */
+  box.append(h('div', { class: 'section-title', text: 'С чего начинаем расчёты' }));
+  box.append(h('div', { class: 'card' }, f.opening_balance, f.opening_date));
   box.append(h('div', { class: 'btn-wrap' }, lookup));
   box.append(h('div', { class: 'section-title', text: 'Банк' }));
   box.append(h('div', { class: 'card' }, f.bank_name, f.bik, f.acc, f.corr_acc));
@@ -795,7 +810,11 @@ screens.cp = async function cpScreen({ id }) {
     clearErrors(f);
     const v = values(f);
     if (!v.name) { showError(f.name, 'Без названия документ не подписать'); return; }
-    await api('POST', '/api/cp', { id: id || 0, ...v, kind: kindSel.value });
+    await api('POST', '/api/cp', {
+      id: id || 0, ...v, kind: kindSel.value,
+      opening_balance: f.opening_balance.input.value.trim(),
+      opening_date: f.opening_date.input.value,
+    });
     toast(id ? 'Сохранил' : 'Контрагент добавлен');
     haptic('medium');
     back();
@@ -1784,10 +1803,36 @@ screens.akt = async function aktScreen() {
       h('div', { class: 'btn-wrap' }, h('button', { class: 'btn', onclick: () => go('cp', {}) }, 'Добавить клиента'))));
     return box;
   }
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
-    text: 'С кем сверяемся? Excel с журналом операций и сальдо придёт в чат с ботом.' }));
 
-  // Сначала те, у кого есть долг: сверяются обычно именно с ними.
+  /*
+   * Период выбирается здесь. Раньше конец периода запоминался в карточке
+   * при первом акте и больше не менялся: второй акт печатал в шапке старую
+   * дату, а в таблицу складывал всё по сегодняшний день.
+   */
+  const now = new Date();
+  const iso = (d) => d.toISOString().slice(0, 10);
+  const from = field('from', 'С какой даты', '', { type: 'date' });
+  const to = field('to', 'По какую', iso(now), { type: 'date' });
+
+  const setRange = (a, b) => {
+    from.input.value = a;
+    to.input.value = b;
+    haptic();
+  };
+  const quarterStart = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
+  const chips = h('div', { class: 'chips' },
+    h('button', { class: 'chip', onclick: () => setRange(iso(new Date(now.getFullYear(), now.getMonth(), 1)), iso(now)) }, 'Этот месяц'),
+    h('button', { class: 'chip', onclick: () => setRange(iso(quarterStart), iso(now)) }, 'Квартал'),
+    h('button', { class: 'chip', onclick: () => setRange(`${now.getFullYear()}-01-01`, iso(now)) }, 'Год'),
+    h('button', { class: 'chip', onclick: () => setRange('', iso(now)) }, 'За всё время'));
+
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Excel с журналом операций и сальдо придёт в чат с ботом. Пустая дата начала — '
+      + 'от начала расчётов, с начальным сальдо из карточки клиента.' }));
+  box.append(h('div', { class: 'section-title', text: 'Период' }));
+  box.append(h('div', { class: 'card' }, from, to), chips);
+
+  box.append(h('div', { class: 'section-title', text: 'С кем сверяемся' }));
   const sorted = [...list].sort((a, b) => Math.abs(b.balance || 0) - Math.abs(a.balance || 0));
   box.append(h('div', { class: 'card' }, sorted.map((c) => navRow({
     icon: 'users',
@@ -1797,9 +1842,12 @@ screens.akt = async function aktScreen() {
     rightTone: balanceTone(c),
     onclick: async () => {
       try {
-        const r = await api('GET', `/api/akt?cp=${c.id}`);
+        const q = new URLSearchParams({ cp: String(c.id) });
+        if (from.input.value) q.set('from', from.input.value);
+        if (to.input.value) q.set('to', to.input.value);
+        const r = await api('GET', `/api/akt?${q}`);
         haptic('medium');
-        toast('Акт сверки готов');
+        toast(`Сальдо на конец: ${money0(Math.abs(r.closing))} · операций ${r.ops}`);
         download(r.file);
       } catch (e) { toast(e.message, true); }
     },

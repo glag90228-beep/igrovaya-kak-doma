@@ -1052,6 +1052,60 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'и не дублируется в строке ИП');
   }
 
+  console.log('\n── акт сверки за период ──');
+  {
+    const bdbP = require('./lib/bot-db');
+    const uid = fxUserId();
+    const cpP = bdbP.createCp(uid, {
+      name: 'ООО «Долгий»', kind: 'customer',
+      opening_balance: 10000, opening_date: '2026-01-01',
+    });
+    bdbP.addOp(uid, cpP, { date: '2026-01-15', kind: 'Приход', doc: 'Счёт 1', credit: 5000 });
+    bdbP.addOp(uid, cpP, { date: '2026-02-10', kind: 'Оплата', doc: 'п/п 5', debit: 3000 });
+    bdbP.addOp(uid, cpP, { date: '2026-03-05', kind: 'Приход', doc: 'Счёт 2', credit: 2000 });
+
+    // Начальное сальдо — то, ради чего акт вообще подписывают: клиент
+    // с долгом с прошлого года не примет акт, открывающийся нулём.
+    const all = bdbP.periodBalance(uid, cpP, '', '2026-12-31');
+    ok(all.opening === 10000, 'акт с начала расчётов открывается начальным сальдо', all.opening);
+    ok(all.ops.length === 3 && all.closing === 14000, 'и сходится к текущему сальдо',
+      `${all.ops.length} оп., ${all.closing}`);
+
+    // Входящее сальдо периода считается, а не берётся из карточки.
+    const feb = bdbP.periodBalance(uid, cpP, '2026-02-01', '2026-02-28');
+    ok(feb.opening === 15000, 'входящее сальдо февраля = начальное плюс январь', feb.opening);
+    ok(feb.ops.length === 1, 'в февральский акт попала одна операция', feb.ops.length);
+    ok(feb.totalDebit === 3000 && feb.totalCredit === 0, 'обороты только февральские',
+      `${feb.totalDebit}/${feb.totalCredit}`);
+    ok(feb.closing === 12000, 'исходящее сальдо февраля', feb.closing);
+
+    // Границы включительные: операция в первый и последний день периода — внутри.
+    const day = bdbP.periodBalance(uid, cpP, '2026-02-10', '2026-02-10');
+    ok(day.ops.length === 1 && day.opening === 15000, 'границы периода включительные',
+      `${day.ops.length} оп., вход ${day.opening}`);
+
+    // Шапка Excel должна совпадать с таблицей, а не жить своей жизнью.
+    const { buildAkt } = require('./lib/xlsx-akt');
+    const ExcelJS = require('exceljs');
+    const p = bdbP.cpForPeriod(uid, cpP, '2026-02-01', '2026-02-28');
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(await buildAkt({
+      org: { brand: 'ИП Тест', org_short: 'ИП Тест', org_full: 'ИП Тест', org_inn: '183114389446', signer: 'И. Т.' },
+      cp: p.view, ops: p.ops,
+    }));
+    const j = wb.getWorksheet('Журнал операций');
+    ok(String(j.getCell('D9').value).includes('01.02.2026'),
+      'в шапке акта дата начала выбранного периода', String(j.getCell('D9').value).trim());
+    ok(j.getCell('G9').value === 15000, 'и входящее сальдо этого периода', j.getCell('G9').value);
+
+    // Карточку акт не портит: там своё значение — начало отношений.
+    ok(bdbP.getCp(uid, cpP).opening_date === '2026-01-01',
+      'начало расчётов в карточке не подменяется периодом акта',
+      bdbP.getCp(uid, cpP).opening_date);
+    ok(!bdbP.getCp(uid, cpP).period_end,
+      'и конец периода в карточке не замерзает после первого акта');
+  }
+
   console.log('\n── НДС в накладной и оговорка про УСН ──');
   {
     const { buildTorg12Html } = require('./lib/torg12');

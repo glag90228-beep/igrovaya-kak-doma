@@ -546,22 +546,31 @@ async function requireQuota(tg, chatId, user) {
   return false;
 }
 
-async function genAktSverki(tg, chatId, user, cpId) {
+/**
+ * Акт сверки за период.
+ *
+ * Период задаётся снаружи; по умолчанию — от начала отношений до сегодня.
+ * Раньше конец периода запоминался в карточке при первом акте и больше не
+ * менялся: второй акт печатал в шапке прошлогоднюю дату, а в таблицу
+ * складывал операции по сегодняшний день. Теперь карточку не трогаем —
+ * в ней opening_date значит начало отношений, а не начало выбранного
+ * периода, и подменять одно другим нельзя.
+ */
+async function genAktSverki(tg, chatId, user, cpId, from, to) {
   if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
-  const cp = bdb.getCp(user.id, cpId); if (!cp) return;
-  if (!cp.period_end) { bdb.updateCp(user.id, cpId, { period_end: todayISO() }); cp.period_end = todayISO(); }
-  const ops = bdb.listOps(user.id, cpId);
-  const buf = await buildAkt({ org: orgForAkt(org), cp, ops });
+  const p = bdb.cpForPeriod(user.id, cpId, from, to);
+  if (!p) return;
+  const buf = await buildAkt({ org: orgForAkt(org), cp: p.view, ops: p.ops });
   const seq = bdb.nextSeq(user.id, 'akt', new Date().getFullYear());
   await sendGenerated(tg, chatId, {
-    xlsxBuffer: Buffer.from(buf), base: `Акт_сверки_${safeName(cp.name)}`,
-    caption: `Акт сверки с <b>${esc(cp.name)}</b> за период ${ru(cp.opening_date)}—${ru(cp.period_end)}.`,
+    xlsxBuffer: Buffer.from(buf), base: `Акт_сверки_${safeName(p.cp.name)}`,
+    caption: `Акт сверки с <b>${esc(p.cp.name)}</b> за период ${ru(p.from)}—${ru(p.to)}.\n`
+      + `Входящее сальдо ${formatRub(Math.abs(p.opening))}, исходящее ${formatRub(Math.abs(p.closing))}.`,
   });
-  const b = bdb.balanceOf(user.id, cpId);
   bdb.saveDoc(user.id, {
     orgId: org.id, cpId, type: 'akt', number: String(seq), seq, date: todayISO(),
-    total: b ? Math.abs(round2(b.closing)) : 0, payload: { ops: ops.length },
+    total: Math.abs(p.closing), payload: { ops: p.ops.length, from: p.from, to: p.to },
   });
 }
 

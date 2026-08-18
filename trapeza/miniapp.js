@@ -186,6 +186,8 @@ function cpBrief(userId, cp) {
     id: cp.id, name: cp.name, full_name: cp.full_name, inn: cp.inn, kpp: cp.kpp,
     kind: cp.kind, address: cp.address, bank_name: cp.bank_name, bik: cp.bik,
     acc: cp.acc, corr_acc: cp.corr_acc, contract: cp.contract, email: cp.email,
+    opening_balance: round2(Number(cp.opening_balance) || 0),
+    opening_date: cp.opening_date || '',
     balance: b ? round2(b.closing) : 0,
   };
 }
@@ -216,6 +218,19 @@ const api = {
       contract: str(body.contract, 200),
       email: str(body.email, 254),
     };
+    /*
+     * Начальное сальдо: сколько числилось за клиентом на день, с которого
+     * мы начали вести расчёты. Без него акт сверки открывается нулём — а он
+     * должен открываться тем, что было, иначе клиент его не подпишет.
+     * В боте это спрашивалось, в приложении полей не было вовсе.
+     */
+    if (body.opening_balance !== undefined) {
+      fields.opening_balance = Number(String(body.opening_balance).replace(',', '.')) || 0;
+    }
+    if (body.opening_date !== undefined) {
+      const d = str(body.opening_date, 10);
+      fields.opening_date = /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : '';
+    }
     const wrong = reqCheck.checkRequisites(body);
     if (wrong.length) return { error: wrong[0].error, field: wrong[0].field };
     const id = Number(body.id) || 0;
@@ -224,7 +239,13 @@ const api = {
       bdb.updateCp(user.id, id, fields);
       return { cp: cpBrief(user.id, bdb.getCp(user.id, id)) };
     }
-    const newId = bdb.createCp(user.id, { ...fields, opening_date: docService.todayISO() });
+    // Дата начала расчётов — сегодня только если её не назвали. Раньше она
+    // ставилась всегда, поверх присланной: клиент с долгом с прошлого года
+    // всё равно заводился «с сегодня», и акт открывался нулём.
+    const newId = bdb.createCp(user.id, {
+      ...fields,
+      opening_date: fields.opening_date || docService.todayISO(),
+    });
     return { cp: cpBrief(user.id, bdb.getCp(user.id, newId)) };
   },
 
@@ -482,18 +503,16 @@ const api = {
   async 'GET /api/akt'({ user, url }) {
     const org = bdb.getDefaultOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
-    const cp = bdb.getCp(user.id, Number(url.searchParams.get('cp')));
-    if (!cp) return { error: 'Контрагент не найден.' };
-    if (!cp.period_end) {
-      bdb.updateCp(user.id, cp.id, { period_end: docService.todayISO() });
-      cp.period_end = docService.todayISO();
-    }
-    const ops = bdb.listOps(user.id, cp.id);
+    const iso0 = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(v || '') ? v : '');
+    const p = bdb.cpForPeriod(user.id, Number(url.searchParams.get('cp')),
+      iso0(url.searchParams.get('from')), iso0(url.searchParams.get('to')));
+    if (!p) return { error: 'Контрагент не найден.' };
+    const cp = p.cp;
     const buf = await buildAkt({
       org: { brand: org.name, org_short: org.name, org_full: org.full_name || org.name,
         org_inn: org.inn, signer: org.signer },
-      cp,
-      ops,
+      cp: p.view,
+      ops: p.ops,
     });
     const file = {
       filename: `Акт_сверки_${docService.safeName(cp.name)}.xlsx`,
@@ -503,8 +522,11 @@ const api = {
     // В чат — обязательно: внутри Telegram скачивание по ссылке блокируется,
     // и файл в переписке остаётся единственным надёжным способом его забрать.
     await sendFileToChat(user, file,
-      `Акт сверки с <b>${cp.name}</b> за период ${ruDate(cp.opening_date)}—${ruDate(cp.period_end)}.`);
-    return { file: { url: `/api/file/${keepFile(user.id, file)}`, name: file.filename } };
+      `Акт сверки с <b>${cp.name}</b> за период ${ruDate(p.from)}—${ruDate(p.to)}.`);
+    return {
+      file: { url: `/api/file/${keepFile(user.id, file)}`, name: file.filename },
+      from: p.from, to: p.to, opening: p.opening, closing: p.closing, ops: p.ops.length,
+    };
   },
 
   /**
@@ -522,18 +544,15 @@ const api = {
 
     const made = [];
     for (const row of rows.slice(0, 20)) {
-      const cp = bdb.getCp(user.id, row.cpId);
-      if (!cp) continue;
-      if (!cp.period_end) {
-        bdb.updateCp(user.id, cp.id, { period_end: docService.todayISO() });
-        cp.period_end = docService.todayISO();
-      }
+      const p = bdb.cpForPeriod(user.id, row.cpId);
+      if (!p) continue;
+      const cp = p.cp;
       // eslint-disable-next-line no-await-in-loop
       const buf = await buildAkt({
         org: { brand: org.name, org_short: org.name, org_full: org.full_name || org.name,
           org_inn: org.inn, signer: org.signer },
-        cp,
-        ops: bdb.listOps(user.id, cp.id),
+        cp: p.view,
+        ops: p.ops,
       });
       const file = {
         filename: `Акт_сверки_${docService.safeName(cp.name)}.xlsx`,
@@ -720,15 +739,12 @@ const api = {
      */
     const attachments = [];
     try {
-      if (!cp.period_end) {
-        bdb.updateCp(user.id, cp.id, { period_end: docService.todayISO() });
-        cp.period_end = docService.todayISO();
-      }
+      const p = bdb.cpForPeriod(user.id, cp.id);
       const buf = await buildAkt({
         org: { brand: org.name, org_short: org.name, org_full: org.full_name || org.name,
           org_inn: org.inn, signer: org.signer },
-        cp,
-        ops: bdb.listOps(user.id, cp.id),
+        cp: p.view,
+        ops: p.ops,
       });
       attachments.push({
         filename: `Акт_сверки_${docService.safeName(cp.name)}.xlsx`,

@@ -5,6 +5,9 @@
 // никогда не видит чужие данные. Надстройка над существующей базой (db.js).
 
 const { db, computeBalance } = require('../db');
+const { round2 } = require('./money');
+
+const todayISO = () => new Date().toISOString().slice(0, 10);
 
 // ---------- миграции (не ломают существующие таблицы) ----------
 
@@ -337,6 +340,70 @@ function deleteLastOp(userId, cpId) {
   // числится импортированной.
   db.prepare('DELETE FROM bank_imports WHERE user_id = ? AND op_id = ?').run(userId, row.id);
   return true;
+}
+
+/**
+ * Сверка за период: входящее сальдо, операции внутри, исходящее сальдо.
+ *
+ * Так акт сверки и устроен по смыслу: «на начало периода за вами столько,
+ * за период было то-то, на конец — столько». Раньше в акт шли все операции
+ * за всю историю, а в шапке стоял период — и начиная со второго акта шапка
+ * противоречила таблице.
+ *
+ * Входящее сальдо считается, а не хранится: это начальное сальдо
+ * контрагента плюс всё, что случилось до начала периода. Хранить его
+ * отдельно значило бы держать число, которое разъедется с журналом при
+ * первой же правке задним числом.
+ *
+ * @param {string} from ISO-дата начала (включительно)
+ * @param {string} to ISO-дата конца (включительно)
+ */
+function periodBalance(userId, cpId, from, to) {
+  const cp = getCp(userId, cpId);
+  if (!cp) return null;
+  const all = listOps(userId, cpId);
+
+  let opening = Number(cp.opening_balance) || 0;
+  const inside = [];
+  for (const op of all) {
+    const d = String(op.date || '');
+    if (from && d < from) {
+      opening += (Number(op.credit) || 0) - (Number(op.debit) || 0);
+    } else if (!to || d <= to) {
+      inside.push(op);
+    }
+  }
+  const totalDebit = round2(inside.reduce((s, o) => s + (Number(o.debit) || 0), 0));
+  const totalCredit = round2(inside.reduce((s, o) => s + (Number(o.credit) || 0), 0));
+  return {
+    cp,
+    ops: inside,
+    opening: round2(opening),
+    totalDebit,
+    totalCredit,
+    closing: round2(opening + totalCredit - totalDebit),
+    from: from || cp.opening_date || '',
+    to: to || todayISO(),
+  };
+}
+
+/**
+ * Контрагент «как на период»: тот же объект, но с сальдо и датами периода.
+ *
+ * Шаблон акта читает opening_balance, opening_date и period_end прямо из
+ * контрагента. Подменяя их копией, мы получаем правильный акт без правки
+ * шаблона — и не трогаем саму карточку, где эти поля значат другое:
+ * начало отношений, а не начало выбранного периода.
+ */
+function cpForPeriod(userId, cpId, from, to) {
+  const b = periodBalance(userId, cpId, from, to);
+  if (!b) return null;
+  return {
+    ...b,
+    view: {
+      ...b.cp, opening_balance: b.opening, opening_date: b.from, period_end: b.to,
+    },
+  };
 }
 
 // ---------- банковская выписка ----------
@@ -741,7 +808,7 @@ module.exports = {
   getOrCreateUser, setState, getState, clearState,
   createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp,
-  addOp, listOps, deleteLastOp, balanceOf, debtors,
+  addOp, listOps, deleteLastOp, balanceOf, debtors, periodBalance, cpForPeriod,
   knownBankKeys, importBankRows,
   DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
   markPaid, unmarkPaid, unpaidDocs, docsBetween,

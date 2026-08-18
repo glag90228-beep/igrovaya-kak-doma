@@ -360,6 +360,54 @@ async function main() {
     await call('POST', '/api/basis', { user: masha, body: { basis: 'closing' } });
   }
 
+  console.log('\n── начальное сальдо и период акта ──');
+  {
+    // Раньше приложение не умело задать начальное сальдо вовсе: полей не
+    // было, а endpoint их игнорировал. Акт открывался нулём.
+    r = await call('POST', '/api/cp', {
+      user: masha,
+      body: {
+        name: 'ООО «С долгом»', kind: 'customer',
+        opening_balance: '10000,50', opening_date: '2026-01-01',
+      },
+    });
+    ok(r.status === 200, 'клиент с начальным сальдо создан', (r.json || {}).error);
+    const cpOpen = r.json.cp.id;
+    ok(r.json.cp.opening_balance === 10000.5, 'запятая в сумме принята',
+      r.json.cp.opening_balance);
+    ok(r.json.cp.opening_date === '2026-01-01', 'дата сохранена', r.json.cp.opening_date);
+
+    r = await call('GET', '/api/cps', { user: masha });
+    const back = r.json.cps.find((c) => c.id === cpOpen);
+    ok(back.opening_balance === 10000.5, 'сальдо возвращается в приложение — есть что править',
+      back.opening_balance);
+
+    await call('POST', '/api/op', {
+      user: masha, body: { cpId: cpOpen, kind: 'income', amount: 5000, date: '2026-01-20' },
+    });
+    await call('POST', '/api/op', {
+      user: masha, body: { cpId: cpOpen, kind: 'payment', amount: 2000, date: '2026-02-15' },
+    });
+
+    r = await call('GET', `/api/akt?cp=${cpOpen}&from=2026-02-01&to=2026-02-28`, { user: masha });
+    ok(r.status === 200 && r.json.opening === 15000.5,
+      'акт за февраль открывается сальдо на 1 февраля, а не нулём', (r.json || {}).opening);
+    ok(r.json.ops === 1 && r.json.closing === 13000.5, 'внутри только февральская операция',
+      `${r.json.ops} оп., ${r.json.closing}`);
+    ok(r.json.from === '2026-02-01' && r.json.to === '2026-02-28', 'период тот, что запросили',
+      `${r.json.from}—${r.json.to}`);
+
+    // Второй акт за другой период не должен унаследовать прошлые даты.
+    r = await call('GET', `/api/akt?cp=${cpOpen}`, { user: masha });
+    ok(r.json.from === '2026-01-01' && r.json.opening === 10000.5,
+      'акт за всё время снова начинается с начального сальдо',
+      `${r.json.from} / ${r.json.opening}`);
+    ok(r.json.ops === 2, 'и включает обе операции', r.json.ops);
+
+    r = await call('GET', `/api/akt?cp=${cpOpen}`, { user: petya });
+    ok(r.status === 400, 'по чужому клиенту акт не собрать', (r.json || {}).error);
+  }
+
   console.log('\n── вид деятельности и повторения ──');
   {
     r = await call('POST', '/api/biztype', { user: masha, body: { key: 'выдумка' } });
