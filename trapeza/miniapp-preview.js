@@ -372,4 +372,10 @@ async function main() {
   process.exit(0);
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+// Показательные данные нужны и записи демо-ролика (tools/demo-video.js) —
+// заводить их во второй раз значило бы разойтись с тем, что на снимках.
+module.exports = { seed, USER };
+
+if (require.main === module) {
+  main().catch((e) => { console.error(e); process.exit(1); });
+}
