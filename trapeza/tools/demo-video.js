@@ -154,7 +154,16 @@ const SCENES = [
     await new Promise((r) => server.close(r));
     process.exit(1);
   }
-  const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  /*
+   * Поля <input type=date> Chromium рисует по локали своего процесса, а не по
+   * locale страницы: без этого в ролике про российскую бухгалтерию даты
+   * выглядят как 08/18/2026 и mm/dd/yyyy. Флаг --lang на это не влияет,
+   * проверено — решает именно LANG в окружении процесса браузера.
+   */
+  const browser = await chromium.launch({
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--lang=ru-RU'],
+    env: { ...process.env, LANG: 'ru_RU.UTF-8', LANGUAGE: 'ru_RU' },
+  });
   const ctx = await browser.newContext({
     viewport: { width: 390, height: 844 },
     deviceScaleFactor: 2,
@@ -210,11 +219,27 @@ const SCENES = [
   }, initData());
 
   const page = await ctx.newPage();
+  // Ноль отсчёта — здесь: запись начинается с появлением страницы, а не с
+  // первой сцены. Иначе все отсечки в монтажном листе уехали бы на полторы
+  // секунды, и монтажёр резал бы мимо.
+  const startedAt = Date.now();
   await page.goto(base, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('#app .screen');
   await page.waitForTimeout(1200);
 
+  /*
+   * Отсечки печатаем в конце: без них монтажный лист приходится составлять
+   * на глаз, пересматривая ролик. Отсчёт от первого кадра записи, а не от
+   * старта процесса, — Playwright пишет с момента открытия страницы.
+   */
+  const marks = [];
+  const stamp = (ms) => {
+    const t = Math.round(ms / 1000);
+    return `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
+  };
+
   for (const scene of SCENES) {
+    const from = Date.now() - startedAt;
     await page.evaluate(([name, params]) => window.__go(name, params), scene.go);
     await page.waitForSelector('#app .screen');
     await page.waitForTimeout(scene.hold);
@@ -234,6 +259,11 @@ const SCENES = [
       await page.mouse.wheel(0, -scene.scroll);
       await page.waitForTimeout(700);
     }
+    marks.push({
+      name: scene.shot || scene.go[0],
+      from: stamp(from),
+      to: stamp(Date.now() - startedAt),
+    });
     console.log(`  снято: ${scene.shot || scene.go[0]}`);
   }
 
@@ -265,5 +295,9 @@ const SCENES = [
   if (mp4) console.log(`  demo.mp4  — ${size(mp4)}`);
   else console.log('  mp4 не собран: нет системного ffmpeg. webm понимают браузеры,\n                   Telegram и все монтажки; для mp4 —  ffmpeg -i demo.webm demo.mp4');
   console.log(`  кадры PNG — ${SCENES.filter((s) => s.shot).length} шт.`);
+  console.log('\nМонтажный лист:');
+  for (const m of marks) console.log(`  ${m.from}–${m.to}  ${m.name}`);
+  fs.writeFileSync(path.join(OUT, 'montazh.txt'),
+    `${marks.map((m) => `${m.from}–${m.to}\t${m.name}`).join('\n')}\n`);
   process.exit(0);
 })().catch((e) => { console.error('ЗАПИСЬ УПАЛА:', e); process.exit(1); });
