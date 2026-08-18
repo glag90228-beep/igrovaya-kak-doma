@@ -17,6 +17,9 @@ ruvector.db
 # в репозитории от этого только конфликты. Общая настройка роя лежит рядом,
 # в .claude-flow/config.yaml, и она в git остаётся.
 .claude-flow/daemon-state.json
+# pid живущего процесса: появляется сам при любой команде ruflo, потому что
+# она поднимает фоновый демон, и исчезает при его остановке.
+.claude-flow/daemon.pid
 .claude-flow/harness-active-policy.json
 .claude-flow/memory-package.json
 .claude-flow/metrics/
