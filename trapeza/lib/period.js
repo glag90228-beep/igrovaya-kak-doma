@@ -46,6 +46,35 @@ function iso(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+/*
+ * «Сегодня» — по Москве, а не по часовому поясу сервера.
+ *
+ * Раньше дата бралась как new Date().toISOString(), то есть по UTC. Сервер
+ * стоит в UTC, значит с 21:00 до полуночи по Москве наступал уже следующий
+ * день — и счёт, выписанный в 01:00 первого сентября, получал дату
+ * 31 августа. Для бухгалтерского документа это не косметика: он попадает
+ * в другой месяц, а в новогоднюю ночь ещё и номер уходит в другой год.
+ *
+ * Москва выбрана как единый ориентир: документы российские, и дата на них
+ * не должна зависеть от того, где физически стоит сервер.
+ */
+const mskFmt = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Europe/Moscow', year: 'numeric', month: '2-digit', day: '2-digit',
+});
+
+/** Сегодняшняя дата по Москве, 'YYYY-MM-DD'. */
+function todayISO(at = new Date()) { return mskFmt.format(at); }
+
+/** Сегодня как Date с московским календарём в местных getFullYear/getMonth.
+ *  Полдень — чтобы никакой сдвиг на час не перекинул дату на соседний день. */
+function todayDate(at = new Date()) {
+  const [y, m, d] = todayISO(at).split('-').map(Number);
+  return new Date(y, m - 1, d, 12);
+}
+
+/** Текущий год по Москве — для нумерации документов. */
+function currentYear(at = new Date()) { return Number(todayISO(at).slice(0, 4)); }
+
 /** Первое число месяца (y, m — 0-based месяц; переполнение месяца допустимо). */
 const first = (y, m) => iso(new Date(y, m, 1));
 /** Последнее число месяца — нулевой день следующего. */
@@ -55,7 +84,7 @@ const last = (y, m) => iso(new Date(y, m + 1, 0));
  * Готовые периоды. Возвращает { code, from, to, label }.
  * Незнакомый код — как «за всё время»: лучше показать больше, чем пустой акт.
  */
-function presetRange(code, today = new Date()) {
+function presetRange(code, today = todayDate()) {
   const y = today.getFullYear();
   const m = today.getMonth();
   const now = iso(today);
@@ -89,7 +118,7 @@ const PRESETS = [
 ];
 
 /** '15.06.2026' / '15.6.26' / '15.06' → ISO; иначе null. */
-function parseDay(s, today = new Date()) {
+function parseDay(s, today = todayDate()) {
   const m = /^(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?$/.exec(String(s).trim());
   if (!m) return null;
   const day = Number(m[1]);
@@ -124,7 +153,7 @@ function monthByWord(word) {
  *
  * Возвращает { from, to } или null, если не разобрали.
  */
-function parsePeriodText(text, today = new Date()) {
+function parsePeriodText(text, today = todayDate()) {
   const raw = String(text || '').trim().toLowerCase().replace(/ё/g, 'е');
   if (!raw) return null;
   if (/^(вс[её]|все время|за вс[её]|весь период|с начала)/.test(raw)) {
@@ -181,4 +210,4 @@ function parsePeriodText(text, today = new Date()) {
   return null;
 }
 
-module.exports = { PRESETS, presetRange, parsePeriodText, iso };
+module.exports = { PRESETS, presetRange, parsePeriodText, iso, todayISO, todayDate, currentYear };

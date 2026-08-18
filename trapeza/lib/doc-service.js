@@ -43,7 +43,8 @@ const OTHER_DOCS = {
 
 const ALL_DOCS = { ...ITEM_DOCS, ...OTHER_DOCS };
 
-const todayISO = () => new Date().toISOString().slice(0, 10);
+// «Сегодня» — по Москве, а не по поясу сервера (пояснение в lib/period.js).
+const { todayISO } = require('./period');
 
 /** Имя файла: кириллицу оставляем, всё остальное — в подчёркивания. */
 const safeName = (s) => String(s)

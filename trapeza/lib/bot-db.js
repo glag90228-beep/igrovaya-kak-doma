@@ -7,7 +7,8 @@
 const { db, computeBalance } = require('../db');
 const { round2 } = require('./money');
 
-const todayISO = () => new Date().toISOString().slice(0, 10);
+// «Сегодня» — по Москве, а не по поясу сервера (пояснение в lib/period.js).
+const { todayISO, currentYear } = require('./period');
 
 // ---------- миграции (не ломают существующие таблицы) ----------
 
@@ -694,7 +695,7 @@ const isSeqTaken = (e) => /idx_doc_seq_uniq|UNIQUE constraint failed: documents/
 
 /** Документ сохраняется данными; файл всегда пересобирается заново. */
 function saveDoc(userId, { orgId, cpId, type, number, seq, date, total, payload }) {
-  const year = Number(String(date).slice(0, 4)) || new Date().getFullYear();
+  const year = Number(String(date).slice(0, 4)) || currentYear();
   const info = db.prepare(`
     INSERT INTO documents(user_id, org_id, cp_id, type, number, seq, year, date, total, payload, created_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(

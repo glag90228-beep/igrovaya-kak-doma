@@ -40,7 +40,10 @@ const ai = require('./lib/ai-agent');
 
 // ---------- утилиты дат/чисел ----------
 
-function todayISO() { return new Date().toISOString().slice(0, 10); }
+// «Сегодня» и текущий год — по Москве, а не по часовому поясу сервера:
+// иначе документ, выписанный ночью, получал вчерашнюю дату, а в
+// новогоднюю ночь — ещё и номер из прошлого года. Подробности в lib/period.js.
+const { todayISO, currentYear } = period;
 
 /** «15.06.2026» / «15.06.26» / «15.06» → ISO; иначе null */
 function parseDate(s) {
@@ -48,7 +51,7 @@ function parseDate(s) {
   if (!m) return null;
   const d = m[1].padStart(2, '0');
   const mo = m[2].padStart(2, '0');
-  let y = m[3] || String(new Date().getFullYear());
+  let y = m[3] || String(currentYear());
   if (y.length === 2) y = '20' + y;
   return `${y}-${mo}-${d}`;
 }
@@ -563,7 +566,7 @@ async function genAktSverki(tg, chatId, user, cpId, from, to) {
   const p = bdb.cpForPeriod(user.id, cpId, from, to);
   if (!p) return;
   const buf = await buildAkt({ org: orgForAkt(org), cp: p.view, ops: p.ops });
-  const seq = bdb.nextSeq(user.id, 'akt', new Date().getFullYear());
+  const seq = bdb.nextSeq(user.id, 'akt', currentYear());
   await sendGenerated(tg, chatId, {
     xlsxBuffer: Buffer.from(buf), base: `Акт_сверки_${safeName(p.cp.name)}`,
     caption: `Акт сверки с <b>${esc(p.cp.name)}</b> за период ${ru(p.from)}—${ru(p.to)}.\n`
@@ -633,7 +636,7 @@ function itemsKb(user, data) {
 
 async function startItems(tg, chatId, user, type, cpId, extra = {}) {
   if (!(await requireQuota(tg, chatId, user))) return;
-  const year = new Date().getFullYear();
+  const year = currentYear();
   const seq = bdb.nextSeq(user.id, type, year);
   const data = { seq, number: String(seq), date: todayISO(), items: [], ask: '', doc: extra };
   bdb.setState(user.id, `items:${type}:${cpId}`, data);
@@ -914,7 +917,7 @@ async function repeatDoc(tg, chatId, user, docId) {
     return;
   }
   const { items = [], ...extra } = src.payload || {};
-  const year = new Date().getFullYear();
+  const year = currentYear();
   const seq = bdb.nextSeq(user.id, src.type, year);
   const data = { seq, number: String(seq), date: todayISO(), items, ask: '', doc: extra };
   bdb.setState(user.id, `items:${src.type}:${src.cp_id}`, data);
@@ -2362,7 +2365,7 @@ async function startDogovor(tg, chatId, user, cpId) {
   if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
   const cp = bdb.getCp(user.id, cpId); if (!cp) return;
-  const seq = bdb.nextSeq(user.id, 'dog', new Date().getFullYear());
+  const seq = bdb.nextSeq(user.id, 'dog', currentYear());
   bdb.setState(user.id, `dog:${cpId}`, { i: 0, seq, number: String(seq), date: todayISO(), values: {} });
   await tg.sendMessage(chatId,
     `Договор № ${seq} с <b>${esc(cp.name)}</b>. Реквизиты обеих сторон подставлю сам — `
@@ -2416,7 +2419,7 @@ async function handleDogText(tg, chatId, user, state, text) {
 async function startPp(tg, chatId, user, cpId) {
   if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
-  const seq = bdb.nextSeq(user.id, 'pp', new Date().getFullYear());
+  const seq = bdb.nextSeq(user.id, 'pp', currentYear());
   bdb.setState(user.id, `pp:${cpId}`, { step: 'amount', seq, number: String(seq), date: todayISO() });
   await tg.sendMessage(chatId, `Платёжное поручение № ${seq}. Введите <b>сумму</b>, руб.:`);
 }

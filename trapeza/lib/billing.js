@@ -58,7 +58,9 @@ function migrate() {
 }
 migrate();
 
-const todayISO = () => new Date().toISOString().slice(0, 10);
+// «Сегодня» — по Москве, общая реализация в lib/period.js: по UTC доступ
+// заканчивался на день раньше, чем показывали пользователю.
+const { todayISO } = require('./period');
 const norm = (s) => String(s || '').trim().toLowerCase();
 
 /** Текущий доступ пользователя. */
