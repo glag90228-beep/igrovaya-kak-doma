@@ -73,6 +73,68 @@ const SCENES = [
       await page.waitForTimeout(1200);
     },
   },
+  {
+    // Самый нужный кадр: что именно человек получит. Раньше в ролике был
+    // только всплывающий «файл отправлен в чат», а сам счёт не показан —
+    // покупатель как раз хочет увидеть документ, а не сообщение о нём.
+    // HTML берётся тем же генератором, что печатает боевой PDF, поэтому
+    // это настоящий документ, а не картинка «как бы счёта».
+    go: ['docs', {}],
+    hold: 600,
+    async act(page) {
+      const bdb = require(path.join(APP, 'lib/bot-db'));
+      const { buildSchetHtml } = require(path.join(APP, 'lib/schet'));
+      const user = bdb.getOrCreateUser(USER.id);
+      const org = bdb.getDefaultOrg(user.id);
+      const doc = bdb.listDocs(user.id, 30).find((d) => d.type === 'sch');
+      if (!doc) return;
+      const cp = bdb.getCp(user.id, doc.cp_id);
+      const html = await buildSchetHtml({
+        org: { ...org, org_short: org.name, org_full: org.full_name, org_inn: org.inn },
+        cp,
+        doc: { number: doc.number, date: doc.date, items: (doc.payload || {}).items || [] },
+      });
+      const sheet = await page.context().newPage();
+      await sheet.setViewportSize({ width: 780, height: 1688 });
+      await sheet.setContent(html, { waitUntil: 'networkidle' });
+      // Лист А4 наполовину пустой, а в вертикальном кадре из-за этого текст
+      // мельчает до нечитаемого. Режем по нижнему краю содержимого.
+      const bottom = await sheet.evaluate(() => {
+        let low = 0;
+        for (const el of document.body.querySelectorAll('*')) {
+          const r = el.getBoundingClientRect();
+          if (r.height && r.bottom > low) low = r.bottom;
+        }
+        return Math.ceil(low + 24);
+      });
+      await sheet.screenshot({
+        path: path.join(OUT, 'dokument.png'),
+        clip: { x: 0, y: 0, width: 780, height: Math.max(400, bottom) },
+      });
+      await sheet.close();
+      // Показываем лист поверх приложения — как будто открыли присланный файл.
+      const png = fs.readFileSync(path.join(OUT, 'dokument.png')).toString('base64');
+      await page.evaluate((b64) => {
+        const wrap = document.createElement('div');
+        wrap.id = 'demo-doc';
+        wrap.style.cssText = 'position:fixed;inset:0;background:#5a6472;z-index:99999;'
+          + 'display:flex;align-items:flex-start;justify-content:center;padding:18px;'
+          + 'overflow:hidden;opacity:0;transition:opacity .35s';
+        const img = document.createElement('img');
+        img.src = `data:image/png;base64,${b64}`;
+        img.style.cssText = 'width:100%;border-radius:8px;box-shadow:0 18px 50px rgba(0,0,0,.45)';
+        wrap.appendChild(img);
+        document.body.appendChild(wrap);
+        requestAnimationFrame(() => { wrap.style.opacity = '1'; });
+      }, png);
+      await page.waitForTimeout(3400);
+      await page.evaluate(() => {
+        const w = document.getElementById('demo-doc');
+        if (w) { w.style.opacity = '0'; setTimeout(() => w.remove(), 400); }
+      });
+      await page.waitForTimeout(700);
+    },
+  },
   { go: ['docs', {}], hold: 2400, shot: 'zhurnal', scroll: 260 },
   { go: ['cps', {}], hold: 2000, shot: 'klienty' },
   { go: ['akt', {}], hold: 2600, shot: 'akt-sverki', scroll: 300 },
