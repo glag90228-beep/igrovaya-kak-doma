@@ -1985,6 +1985,57 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     delete process.env.AI_MOCK;
   }
 
+  console.log('\n── проводка не переживает свой документ ──');
+  {
+    const bdbO = require('./lib/bot-db');
+    const { db: rawDb } = require('./db');
+    const docSvc = require('./lib/doc-service');
+    const uid = fxUserId();
+    const org = bdbO.getDefaultOrg(uid);
+    const was = bdbO.basisOf(org);
+    bdbO.updateOrg(uid, org.id, { debt_basis: 'invoice' });
+    const cpO = bdbO.createCp(uid, { name: 'ООО «Сирота»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cpO, items: [{ name: 'Работа', qty: 1, price: 9000 }], skipQuota: true,
+    });
+    ok(bdbO.balanceOf(uid, cpO).closing === 9000, 'счёт создал долг', bdbO.balanceOf(uid, cpO).closing);
+
+    // Штатное удаление забирает проводку с собой.
+    const doc = bdbO.listDocs(uid, 5, cpO)[0];
+    bdbO.deleteDoc(uid, doc.id);
+    ok(bdbO.balanceOf(uid, cpO).closing === 0,
+      'удаление документа убрало и его проводку', bdbO.balanceOf(uid, cpO).closing);
+
+    /*
+     * А теперь беда с боевого сервера: документ удалён мимо deleteDoc —
+     * так делали старые версии бота. Проводка остаётся, долг держится
+     * вечно, и убрать его из приложения нельзя: карточки документа нет.
+     * Ровно на этот случай есть tools/debt-audit.js, и schema-check
+     * теперь про такие проводки предупреждает.
+     */
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cpO, items: [{ name: 'Ещё', qty: 1, price: 4000 }], skipQuota: true,
+    });
+    const doc2 = bdbO.listDocs(uid, 5, cpO)[0];
+    rawDb.prepare('DELETE FROM documents WHERE id = ?').run(doc2.id);
+    ok(bdbO.balanceOf(uid, cpO).closing === 4000,
+      'проводка пережила документ — долг держится', bdbO.balanceOf(uid, cpO).closing);
+
+    const lost = rawDb.prepare(`
+      SELECT COUNT(*) AS n FROM operations o
+       WHERE o.doc_id > 0 AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = o.doc_id)`).get().n;
+    ok(lost >= 1, 'такую проводку видно запросом — на нём стоит schema-check', lost);
+
+    rawDb.prepare(`
+      DELETE FROM operations
+       WHERE doc_id > 0 AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = doc_id)`).run();
+    ok(bdbO.balanceOf(uid, cpO).closing === 0,
+      'после уборки сирот долг сошёлся к нулю', bdbO.balanceOf(uid, cpO).closing);
+
+    bdbO.updateOrg(uid, org.id, { debt_basis: was });
+    bdbO.rebuildDebt(uid);
+  }
+
   console.log('\n── смена основания пересчитывает прошлое ──');
   {
     const bdbR = require('./lib/bot-db');

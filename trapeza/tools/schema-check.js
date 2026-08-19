@@ -90,6 +90,31 @@ const rows = (t) => (have.has(t) ? db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).
 console.log(`\nПользователей: ${rows('bot_users')} · документов: ${rows('documents')}`
   + ` · контрагентов: ${rows('counterparties')} · повторений: ${rows('recurring')}`);
 
+/*
+ * Проводки, чей документ уже удалён.
+ *
+ * Схема при этом целая, а долг у контрагента держится вечно: убрать такую
+ * проводку из приложения нельзя — карточки документа нет. Оставляли старые
+ * версии бота, удалявшие документ без его проводок. Проверяем здесь, чтобы
+ * это всплывало на обычной проверке после обновления, а не через месяц
+ * жалобой «сумма висит, а документов нет».
+ */
+if (have.has('operations') && have.has('documents')) {
+  const lost = db.prepare(`
+    SELECT COUNT(*) AS n, ROUND(SUM(COALESCE(credit,0) - COALESCE(debit,0)), 2) AS sum
+      FROM operations o
+     WHERE o.doc_id IS NOT NULL AND o.doc_id > 0
+       AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = o.doc_id)`).get();
+  if (lost.n) {
+    console.log(`\n⚠ Проводок без документа: ${lost.n} на ${lost.sum} ₽.`);
+    console.log('  Они держат долг, которого уже нет. Разбор и починка:');
+    console.log('    node tools/debt-audit.js          # показать, откуда сумма');
+    console.log('    node backup.js && node tools/debt-audit.js --fix');
+  } else {
+    console.log('\n✅ Проводки без документов не найдены.');
+  }
+}
+
 console.log(bad ? `\n❌ Не хватает: ${bad}. Миграция не прошла — смотрите лог бота.`
   : '\n✅ Схема в порядке.');
 process.exit(bad ? 1 : 0);
