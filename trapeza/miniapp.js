@@ -1078,6 +1078,11 @@ const api = {
     };
   },
 
+  /** Из чего складывается крупная цифра на главной. */
+  async 'GET /api/debts/why'({ user }) {
+    return bdb.debtBreakdown(user.id);
+  },
+
   async 'GET /api/templates'({ user }) {
     return { templates: bdb.listTemplates(user.id, 20) };
   },

@@ -175,6 +175,34 @@ const ok = (c, m, extra) => {
   ok(Number(savedCp.opening_balance) === 15000 && savedCp.opening_date === '2026-01-01',
     'сальдо и дата сохранились', `${savedCp.opening_balance} / ${savedCp.opening_date}`);
 
+  /*
+   * Крупная цифра на главной.
+   *
+   * Жалоба та же, что и про сальдо, только громче: «счета удаляю, а сумма
+   * на главной прежняя». Здесь она законна — при основании «по отгрузке»
+   * счёт долга не создаёт, и всю сумму держит начальное сальдо, — но пока
+   * цифра молчит, это неотличимо от поломки. Проверяем настоящим касанием,
+   * что по ней можно нажать и что разбор называет источник.
+   */
+  console.log('\n── из чего сумма на главной ──');
+  await page.evaluate(() => window.__go('home', {}));
+  await page.waitForSelector('.hero .sum');
+  ok(await page.evaluate(() => document.querySelector('.hero .sum').textContent.replace(/\s/g, ''))
+    === '15000₽', 'на главной видно сальдо контрагента',
+  await page.evaluate(() => document.querySelector('.hero .sum').textContent));
+
+  const hero = await page.locator('.hero .tap').boundingBox();
+  await page.touchscreen.tap(hero.x + hero.width / 2, hero.y + 20);
+  await page.waitForTimeout(700);
+  ok(await page.evaluate(() => document.querySelector('h1') && document.querySelector('h1').textContent)
+    === 'Из чего эта сумма', 'нажатие на цифру ведёт к разбору',
+  await page.evaluate(() => document.querySelector('h1') && document.querySelector('h1').textContent));
+
+  const rows = await page.evaluate(() => [...document.querySelectorAll('.card .row .ellipsis')]
+    .map((el) => el.textContent));
+  ok(rows.includes('Начальное сальдо'), 'и разбор называет источник — начальное сальдо', rows.join(', '));
+  ok(!rows.includes('Документы'), 'а документов в сумме нет: при «долге по отгрузке» счёт её не создаёт');
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();

@@ -202,6 +202,13 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   margin: 6px 0 0;
 }
 .hero .sub { color: var(--muted); font-size: 15px; margin-top: 6px; }
+/* Сумма нажимается: под ней разбор по источникам. Кнопка выглядит как текст,
+   иначе шапка превратится в панель управления, — но это настоящая кнопка,
+   а не div с обработчиком: по мёртвой на вид цифре никто не тыкает. */
+.hero .tap { display: block; width: 100%; text-align: left; border: 0; padding: 0;
+  background: none; color: inherit; font: inherit; cursor: pointer; }
+.hero .tap:active { opacity: .6; }
+.hero .why { color: var(--primary); font-size: 14px; margin-top: 4px; }
 
 /* Пара «нам должны / мы должны» — один взгляд вместо двух экранов. */
 .stats { display: flex; margin: var(--gap) 12px; background: var(--surface);

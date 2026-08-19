@@ -710,6 +710,50 @@ function debtors(userId) {
   return out;
 }
 
+/**
+ * Из чего складывается сумма «должны вам».
+ *
+ * Самая частая жалоба: «удалил документы, а сумма на главной прежняя».
+ * Обычно это не поломка — цифру держит начальное сальдо из карточки или
+ * проводка, внесённая руками: документы к ним отношения не имеют. Но по
+ * экрану этого не видно, и человек справедливо считает, что число мёртвое.
+ * Поэтому раскладываем его по источникам прямо в приложении, а не в
+ * консольном скрипте, до которого клиенту не добраться.
+ *
+ * Четвёртый источник — поломка: проводка есть, а её документа уже нет.
+ * Такие оставляли старые версии бота; убрать их из приложения нельзя,
+ * поэтому показываем отдельной строкой и зовём tools/debt-audit.js.
+ */
+function debtBreakdown(userId) {
+  const lost = new Set(db.prepare(`
+    SELECT o.id FROM operations o
+      JOIN counterparties c ON c.id = o.cp_id
+     WHERE c.user_id = ?
+       AND o.doc_id IS NOT NULL AND o.doc_id > 0
+       AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = o.doc_id)`)
+    .all(userId).map((r) => r.id));
+
+  const sum = { opening: 0, docs: 0, manual: 0, orphan: 0 };
+  let total = 0;
+  for (const d of debtors(userId)) {
+    if (!d.theyOwe) continue;              // «должны вам» — только эта сторона
+    const b = balanceOf(userId, d.cp.id);
+    if (!b) continue;
+    // У поставщика знак читается наоборот — тот же разворот, что в debtors().
+    const sgn = d.cp.kind === 'supplier' ? -1 : 1;
+    sum.opening += sgn * (Number(d.cp.opening_balance) || 0);
+    for (const o of b.ops) {
+      const v = sgn * ((Number(o.credit) || 0) - (Number(o.debit) || 0));
+      if (lost.has(o.id)) sum.orphan += v;
+      else if (o.doc_id) sum.docs += v;
+      else sum.manual += v;
+    }
+    total += d.amount;
+  }
+  for (const k of Object.keys(sum)) sum[k] = Math.round(sum[k] * 100) / 100;
+  return { total: Math.round(total * 100) / 100, ...sum, orphanCount: lost.size };
+}
+
 // ---------- выписанные документы и сквозная нумерация ----------
 
 const DOC_TITLES = {
@@ -900,7 +944,7 @@ module.exports = {
   getOrCreateUser, setState, getState, clearState,
   createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp,
-  addOp, listOps, deleteLastOp, balanceOf, debtors, periodBalance, cpForPeriod,
+  addOp, listOps, deleteLastOp, balanceOf, debtors, debtBreakdown, periodBalance, cpForPeriod,
   knownBankKeys, importBankRows,
   DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
   debtByDoc, rebuildDebt,

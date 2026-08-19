@@ -2036,6 +2036,57 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     bdbO.rebuildDebt(uid);
   }
 
+  console.log('\n── из чего складывается сумма на главной ──');
+  {
+    /*
+     * Жалоба звучит так: «удалил документы, а сумма прежняя». Почти всегда
+     * её держат не документы, и человеку это нужно показать. Проверяем, что
+     * разбор сходится к самой цифре и что каждое слагаемое попало в свою
+     * графу — иначе экран будет врать убедительнее, чем молчащая цифра.
+     */
+    const bdbW = require('./lib/bot-db');
+    const { db: rawDb } = require('./db');
+    const docSvc = require('./lib/doc-service');
+    const uidW = bdbW.getOrCreateUser(778899001, 'Разбор суммы').id;
+    const orgW = bdbW.createOrg(uidW, { name: 'ИП Разбор', inn: '123456789012' });
+    bdbW.updateOrg(uidW, orgW, { debt_basis: 'invoice' });
+    const cpW = bdbW.createCp(uidW, {
+      name: 'ООО «Слагаемые»', kind: 'customer',
+      opening_balance: 5000, opening_date: '2026-01-01',
+    });
+    await docSvc.issueDocument(uidW, {
+      type: 'sch', cpId: cpW, items: [{ name: 'Работа', qty: 1, price: 10000 }], skipQuota: true,
+    });
+    bdbW.addOp(uidW, cpW, { date: '2026-03-01', kind: 'Оплата', doc: 'п/п 7', debit: 3000 });
+
+    const b1 = bdbW.debtBreakdown(uidW);
+    ok(b1.total === 12000, 'сумма долга — 12 000', b1.total);
+    ok(b1.opening === 5000, 'начальное сальдо в своей графе', b1.opening);
+    ok(b1.docs === 10000, 'документ в своей графе', b1.docs);
+    ok(b1.manual === -3000, 'ручная оплата в своей графе', b1.manual);
+    ok(b1.orphan === 0, 'строк без документа нет', b1.orphan);
+    ok(b1.opening + b1.docs + b1.manual + b1.orphan === b1.total,
+      'слагаемые сходятся к самой цифре');
+
+    // Документ удалён мимо deleteDoc — его проводка переезжает в «сироты»,
+    // а не растворяется в графе документов: иначе поломку не увидеть.
+    const docW = bdbW.listDocs(uidW, 5, cpW)[0];
+    rawDb.prepare('DELETE FROM documents WHERE id = ?').run(docW.id);
+    const b2 = bdbW.debtBreakdown(uidW);
+    ok(b2.total === 12000, 'сумма не изменилась — документа нет, а долг держится', b2.total);
+    ok(b2.docs === 0 && b2.orphan === 10000, 'строка ушла в «без документа»', `${b2.docs}/${b2.orphan}`);
+    ok(b2.orphanCount === 1, 'и посчитана штучно', b2.orphanCount);
+
+    // Долг поставщику в «должны вам» не попадает — там другая сторона.
+    bdbW.createCp(uidW, {
+      name: 'ООО «Поставщик»', kind: 'supplier',
+      opening_balance: 7000, opening_date: '2026-01-01',
+    });
+    const b3 = bdbW.debtBreakdown(uidW);
+    ok(b3.total === 12000, 'наш долг поставщику сюда не приплюсовался', b3.total);
+    ok(b3.opening === 5000, 'и его начальное сальдо тоже', b3.opening);
+  }
+
   console.log('\n── смена основания пересчитывает прошлое ──');
   {
     const bdbR = require('./lib/bot-db');

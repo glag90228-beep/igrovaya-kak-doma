@@ -265,15 +265,23 @@ screens.home = async function home() {
    * Шапка. Сумма — крупнейшее на экране, и это не украшение: человек
    * открывает приложение, чтобы узнать цифру, а не чтобы прочитать меню.
    */
-  box.append(h('div', { class: 'hero' },
-    h('div', { class: 'greet', text: s.user.name ? `Здравствуйте, ${s.user.name.split(' ')[0]}` : 'Здравствуйте' }),
+  const sumBtn = h('button', { class: 'tap' },
     h('div', { class: 'sum money', text: money0(s.debts.owedToUs) }),
     h('div', {
       class: 'sub',
       text: s.debts.owedToUs
         ? `должны вам · ${s.counts.debtors} ${plural(s.counts.debtors, 'контрагент', 'контрагента', 'контрагентов')}`
         : 'все рассчитались',
-    })));
+    }),
+    // Главная жалоба: «удалил документы, а сумма прежняя». Чаще всего её
+    // держит начальное сальдо или ручная проводка — и об этом надо сказать
+    // там же, где стоит цифра, а не в переписке с поддержкой.
+    s.debts.owedToUs ? h('div', { class: 'why', text: 'Из чего эта сумма →' }) : null);
+  sumBtn.onclick = () => { haptic(); go('why'); };
+
+  box.append(h('div', { class: 'hero' },
+    h('div', { class: 'greet', text: s.user.name ? `Здравствуйте, ${s.user.name.split(' ')[0]}` : 'Здравствуйте' }),
+    sumBtn));
 
   // Одно главное действие, крупнее всего остального.
   const cta = h('button', { class: 'cta' },
@@ -385,6 +393,54 @@ screens.home = async function home() {
       right: d.total ? money(d.total) : '',
       onclick: () => go('doc', { id: d.id }),
     }))));
+  }
+  return box;
+};
+
+/*
+ * Из чего складывается «должны вам».
+ *
+ * Экран отвечает на один вопрос, который задают чаще всего: почему цифра не
+ * шевелится, когда документы удаляются. Ответ почти всегда в том, что её
+ * держат не документы, — и пока это не сказано вслух, число выглядит мёртвым.
+ */
+screens.why = async function why() {
+  const b = await api('GET', '/api/debts/why');
+  const box = h('div', {}, h('h1', { text: 'Из чего эта сумма' }));
+  box.append(h('div', { class: 'hero' }, h('div', { class: 'sum money', text: money0(b.total) })));
+
+  const parts = [
+    ['Начальное сальдо', b.opening, 'долг, который был до бота — из карточек контрагентов', 'cps'],
+    ['Документы', b.docs, 'акты, УПД, накладные и счета — уходит вместе с документом', 'docs'],
+    ['Внесено руками', b.manual, 'операции из журнала и банковской выписки', 'debts'],
+  ].filter(([, v]) => v);
+
+  if (!parts.length && !b.orphan) {
+    box.append(empty('wallet', 'Никто не должен', 'Все расчёты сошлись.'));
+    return box;
+  }
+
+  box.append(h('div', { class: 'card' }, parts.map(([title, v, sub, screen]) => navRow({
+    icon: 'wallet', title, sub, right: money(v), onclick: () => go(screen),
+  }))));
+
+  // Слово «удалил» звучит в каждой жалобе, поэтому объясняем именно его.
+  box.append(h('div', { class: 'card' }, h('div', { class: 'row muted small' },
+    'Удаление документа снимает только его строку. Начальное сальдо правится '
+    + 'в карточке контрагента, ручные операции — в журнале.')));
+
+  if (b.orphan) {
+    box.append(h('div', { class: 'card' }, h('div', { class: 'row' },
+      h('span', { class: 'icon-box warn' }, icon('warn')),
+      h('span', { class: 'grow' },
+        h('div', { text: `Строки без документа — ${money(b.orphan)}` }),
+        h('div', { class: 'small muted', text: `${b.orphanCount} `
+          + `${plural(b.orphanCount, 'операция осталась', 'операции остались', 'операций осталось')} `
+          + 'от документов, удалённых старой версией бота. Из приложения их не убрать — '
+          + 'напишите в поддержку, уберём.' }))),
+    h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn secondary', onclick: () => { haptic(); go('support'); } },
+        'Написать в поддержку'))));
   }
   return box;
 };
