@@ -2085,6 +2085,73 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const b3 = bdbW.debtBreakdown(uidW);
     ok(b3.total === 12000, 'наш долг поставщику сюда не приплюсовался', b3.total);
     ok(b3.opening === 5000, 'и его начальное сальдо тоже', b3.opening);
+
+    /*
+     * Сироты у контрагента, который в сумму не входит. Считать их вместе с
+     * теми, что сумму держат, нельзя: экран сказал бы «три операции держат
+     * 3 000», хотя держит одна, а две другие гасят друг друга.
+     */
+    const cpQ = bdbW.createCp(uidW, { name: 'ООО «Тишина»', kind: 'customer', opening_date: '2026-01-01' });
+    for (const [credit, debit] of [[8000, 0], [0, 8000]]) {
+      // eslint-disable-next-line no-await-in-loop
+      await docSvc.issueDocument(uidW, {
+        type: 'sch', cpId: cpQ, items: [{ name: 'Туда-обратно', qty: 1, price: 8000 }], skipQuota: true,
+      });
+      const dq = bdbW.listDocs(uidW, 5, cpQ)[0];
+      rawDb.prepare('UPDATE operations SET credit = ?, debit = ? WHERE doc_id = ?').run(credit, debit, dq.id);
+      rawDb.prepare('DELETE FROM documents WHERE id = ?').run(dq.id);
+    }
+    const b4 = bdbW.debtBreakdown(uidW);
+    ok(b4.orphanCount === 1 && b4.orphan === 10000,
+      'в сумме сидит одна сирота, и это видно', `${b4.orphanCount} шт. на ${b4.orphan}`);
+    ok(b4.orphanOther === 2, 'а про остальных сказано отдельно', b4.orphanOther);
+    ok(bdbW.debtBreakdown(uidW).total === 12000, 'сумма от их появления не поехала');
+
+    /*
+     * Полукопейки. computeBalance округляет после каждой операции, и разбор
+     * обязан считать так же: иначе слагаемые не сойдутся с самой цифрой —
+     * ровно то, ради чего этот экран и сделан.
+     */
+    const cpK = bdbW.createCp(uidW, { name: 'ООО «Копейка»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbW.addOp(uidW, cpK, { date: '2026-04-01', kind: 'Реализация', credit: 0.005 });
+    bdbW.addOp(uidW, cpK, { date: '2026-04-02', kind: 'Реализация', credit: 0.005 });
+    const b5 = bdbW.debtBreakdown(uidW);
+    ok(b5.opening + b5.docs + b5.manual + b5.orphan === b5.total,
+      'на полукопейках слагаемые тоже сходятся', JSON.stringify(b5));
+  }
+
+  console.log('\n── отменённую руками проводку пересчёт не воскрешает ──');
+  {
+    /*
+     * Человек выписал акт, увидел, что долга по нему нет, и отменил проводку
+     * кнопкой. Любая последующая смена основания возвращала её: пересчёт
+     * видел документ без проводки и считал это упущением. Выходило, что
+     * приложение спорит с человеком и всегда выигрывает.
+     */
+    const bdbN = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = fxUserId();
+    const org = bdbN.getDefaultOrg(uid);
+    const was = bdbN.basisOf(org);
+    bdbN.updateOrg(uid, org.id, { debt_basis: 'closing' });
+    const cpN = bdbN.createCp(uid, { name: 'ООО «Отменяю»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uid, {
+      type: 'usl', cpId: cpN, items: [{ name: 'Работа', qty: 1, price: 20000 }], skipQuota: true,
+    });
+    ok(bdbN.balanceOf(uid, cpN).closing === 20000, 'акт создал долг', bdbN.balanceOf(uid, cpN).closing);
+
+    bdbN.deleteLastOp(uid, cpN);
+    ok(bdbN.balanceOf(uid, cpN).closing === 0, 'человек отменил проводку', bdbN.balanceOf(uid, cpN).closing);
+
+    bdbN.updateOrg(uid, org.id, { debt_basis: 'invoice' });
+    bdbN.rebuildDebt(uid);
+    bdbN.updateOrg(uid, org.id, { debt_basis: 'closing' });
+    bdbN.rebuildDebt(uid);
+    ok(bdbN.balanceOf(uid, cpN).closing === 0,
+      'и после двух смен основания долг не вернулся', bdbN.balanceOf(uid, cpN).closing);
+
+    bdbN.updateOrg(uid, org.id, { debt_basis: was });
+    bdbN.rebuildDebt(uid);
   }
 
   console.log('\n── смена основания пересчитывает прошлое ──');
@@ -2126,18 +2193,38 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'удаление счёта уменьшило долг — то, чего и ждал человек',
       bdbR.balanceOf(uid, cpR).closing);
 
-    // Обратный ход убирает проводки, но не трогает отметки об оплате.
+    /*
+     * Обратный ход. Проводка оплаты ходит с реализацией в паре: снять одну
+     * и оставить другую — значит увести сальдо в минус и объявить, что это
+     * мы должны клиенту, который просто заплатил. Отметка «оплачено» на
+     * самом документе при этом остаётся: её ставил человек, и она значит
+     * факт, а не правило учёта.
+     */
     await docSvc.issueDocument(uid, {
       type: 'sch', cpId: cpR, items: [{ name: 'Ещё', qty: 1, price: 5000 }], skipQuota: true,
     });
     const doc2 = bdbR.listDocs(uid, 5, cpR)[0];
     bdbR.markPaid(uid, doc2.id, '2026-08-18');
-    const paidOps = () => bdbR.listOps(uid, cpR).filter((o) => o.kind === 'Оплата').length;
-    const hadPaid = paidOps();
+    const payOps = () => bdbR.listOps(uid, cpR).filter((o) => o.kind === 'Оплата' && o.doc_id === doc2.id).length;
+    ok(payOps() === 1 && bdbR.balanceOf(uid, cpR).closing === 0,
+      'оплаченный счёт даёт пару проводок и нулевое сальдо', bdbR.balanceOf(uid, cpR).closing);
+
     bdbR.updateOrg(uid, org.id, { debt_basis: 'closing' });
     const back = bdbR.rebuildDebt(uid);
     ok(back.removed >= 1, 'обратное переключение убрало проводки долга', JSON.stringify(back));
-    ok(paidOps() === hadPaid, 'а отметки об оплате не тронуты: их ставил человек', paidOps());
+    ok(payOps() === 0, 'и оплату убрало вместе с ней — иначе сальдо ушло бы в минус', payOps());
+    ok(bdbR.balanceOf(uid, cpR).closing === 0,
+      'сальдо осталось нулём, а не минус пять тысяч', bdbR.balanceOf(uid, cpR).closing);
+    ok(bdbR.getDoc(uid, doc2.id).paid_at === '2026-08-18',
+      'отметка «оплачено» на документе не тронута: её ставил человек',
+      bdbR.getDoc(uid, doc2.id).paid_at);
+
+    // И обратно: вернулись к «долгу по счёту» — пара восстановилась целиком.
+    bdbR.updateOrg(uid, org.id, { debt_basis: 'invoice' });
+    bdbR.rebuildDebt(uid);
+    ok(payOps() === 1 && bdbR.balanceOf(uid, cpR).closing === 0,
+      'возврат основания восстановил пару, сальдо снова ноль',
+      `${payOps()} / ${bdbR.balanceOf(uid, cpR).closing}`);
 
     bdbR.updateOrg(uid, org.id, { debt_basis: was });
     bdbR.rebuildDebt(uid);

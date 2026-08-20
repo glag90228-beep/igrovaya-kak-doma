@@ -189,6 +189,10 @@ function migrate() {
   // отменяют проводку и не создают её дважды.
   addColumn('documents', 'paid_at', "TEXT NOT NULL DEFAULT ''");
   addColumn('operations', 'doc_id', 'INTEGER NOT NULL DEFAULT 0');
+  // Человек отменил проводку долга по этому документу руками. Без такой
+  // отметки пересчёт основания создавал её заново: он видит, что проводки
+  // нет, и считает это упущением, — а это было решение человека.
+  addColumn('documents', 'no_debt', 'INTEGER NOT NULL DEFAULT 0');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ops_doc ON operations(doc_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_cp_user ON counterparties(user_id)');
 }
@@ -333,9 +337,15 @@ function listOps(userId, cpId) {
 function deleteLastOp(userId, cpId) {
   const cp = getCp(userId, cpId);
   if (!cp) return false;
-  const row = db.prepare('SELECT id FROM operations WHERE cp_id = ? ORDER BY date DESC, sort DESC, id DESC LIMIT 1').get(cpId);
+  const row = db.prepare('SELECT id, kind, doc_id FROM operations WHERE cp_id = ? ORDER BY date DESC, sort DESC, id DESC LIMIT 1').get(cpId);
   if (!row) return false;
   db.prepare('DELETE FROM operations WHERE id = ?').run(row.id);
+  // Отменили долг по документу — запоминаем это на самом документе. Иначе
+  // ближайший пересчёт основания вернёт проводку: он не отличает «ещё не
+  // создали» от «человек убрал».
+  if (row.doc_id && row.kind === 'Реализация') {
+    db.prepare('UPDATE documents SET no_debt = 1 WHERE id = ? AND user_id = ?').run(row.doc_id, userId);
+  }
   // Если операция пришла из выписки, забываем и отметку о загрузке: иначе
   // отменённую по ошибке оплату больше не загрузить — строка навсегда
   // числится импортированной.
@@ -511,35 +521,60 @@ function addOpForDoc(userId, cpId, op, docId) {
  * стояла нулём, сколько бы счетов он ни выставил.
  *
  * Здесь мы досоздаём проводки тем документам, которые теперь создают долг,
- * и убираем у тех, которые перестали. Отметки об оплате («Оплата») не
- * трогаем никогда: их поставил человек, и они значат факт, а не правило.
+ * и убираем у тех, которые перестали.
+ *
+ * Оплата ходит с реализацией в паре, и вести её надо тем же правилом, что в
+ * markPaid: проводка «Оплата» есть ровно у того документа, который создаёт
+ * долг и отмечен оплаченным. Пока пересчёт трогал одну реализацию, пары
+ * рвались в обе стороны. Арендодатель с четырьмя счетами, три из которых
+ * оплачены, переключался на «долг по счёту» и получал 200 000 вместо 50 000:
+ * реализации создались всем четырём, а оплат не было ни одной. Подрядчик,
+ * наоборот, уходил в минус — оплата по акту оставалась, а её реализацию
+ * пересчёт снимал, и приложение сообщало, что это он должен клиенту.
+ *
+ * Документы, у которых человек отменил проводку руками (no_debt), не трогаем:
+ * его решение — не то же самое, что «мы ещё не создали».
  */
 function rebuildDebt(userId) {
   const org = getDefaultOrg(userId);
   const types = DEBT_DOCS[basisOf(org || {})];
   const docs = db.prepare(
-    'SELECT id, cp_id, type, date, total, number FROM documents WHERE user_id = ? AND total > 0',
+    'SELECT id, cp_id, type, date, total, number, paid_at, no_debt FROM documents WHERE user_id = ? AND total > 0',
   ).all(userId);
 
   let added = 0;
   let removed = 0;
+  const hasOp = (docId, kind) => db.prepare(
+    'SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = ?',
+  ).get(docId, kind).n > 0;
+
   // Одной транзакцией: на середине пересчёта журнал показывал бы долг
   // наполовину по старому правилу, наполовину по новому.
   db.exec('BEGIN IMMEDIATE');
   try {
     for (const d of docs) {
       if (!d.cp_id) continue;
-      const has = db.prepare(
-        "SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = 'Реализация'",
-      ).get(d.id).n > 0;
-      const should = types.includes(d.type);
-      if (should && !has) {
-        const title = DOC_TITLES[d.type] || d.type;
+      const title = DOC_TITLES[d.type] || d.type;
+      const should = types.includes(d.type) && !d.no_debt;
+
+      if (should && !hasOp(d.id, 'Реализация')) {
         if (addOpForDoc(userId, d.cp_id, {
           date: d.date, kind: 'Реализация', doc: `${title} № ${d.number}`, credit: d.total,
         }, d.id)) added += 1;
-      } else if (!should && has) {
+      } else if (!should && hasOp(d.id, 'Реализация')) {
         removed += deleteOpsOfDoc(userId, d.id, 'Реализация');
+      }
+
+      // Оплату держим в паре с реализацией. Счётчики не трогаем: человеку
+      // сообщают, по скольким документам появился долг, а не сколько строк
+      // мы переложили внутри журнала.
+      const shouldPay = should && Boolean(d.paid_at);
+      if (shouldPay && !hasOp(d.id, 'Оплата')) {
+        addOpForDoc(userId, d.cp_id, {
+          date: d.paid_at, kind: 'Оплата', doc: `${title} № ${d.number}`, debit: d.total,
+        }, d.id);
+      } else if (!shouldPay && hasOp(d.id, 'Оплата')) {
+        deleteOpsOfDoc(userId, d.id, 'Оплата');
       }
     }
     db.exec('COMMIT');
@@ -723,6 +758,15 @@ function debtors(userId) {
  * Четвёртый источник — поломка: проводка есть, а её документа уже нет.
  * Такие оставляли старые версии бота; убрать их из приложения нельзя,
  * поэтому показываем отдельной строкой и зовём tools/debt-audit.js.
+ *
+ * Считаем только сторону «должны вам»: наверху стоит именно эта цифра.
+ * Сирот при этом две породы — те, что сидят в самой сумме (orphanCount), и
+ * те, что висят у остальных контрагентов (orphanOther). Складывать их в один
+ * счётчик нельзя: экран сказал бы «три операции держат 3 000», хотя эти
+ * 3 000 держит одна, а две другие гасят друг друга у совсем другого клиента.
+ *
+ * Округляем на каждом шаге, как computeBalance: если копить полукопейки и
+ * округлить один раз в конце, слагаемые не сойдутся с самой цифрой.
  */
 function debtBreakdown(userId) {
   const lost = new Set(db.prepare(`
@@ -735,23 +779,23 @@ function debtBreakdown(userId) {
 
   const sum = { opening: 0, docs: 0, manual: 0, orphan: 0 };
   let total = 0;
+  let counted = 0;                         // сирот попало в саму сумму
   for (const d of debtors(userId)) {
     if (!d.theyOwe) continue;              // «должны вам» — только эта сторона
     const b = balanceOf(userId, d.cp.id);
     if (!b) continue;
     // У поставщика знак читается наоборот — тот же разворот, что в debtors().
     const sgn = d.cp.kind === 'supplier' ? -1 : 1;
-    sum.opening += sgn * (Number(d.cp.opening_balance) || 0);
+    sum.opening = round2(sum.opening + sgn * (Number(d.cp.opening_balance) || 0));
     for (const o of b.ops) {
-      const v = sgn * ((Number(o.credit) || 0) - (Number(o.debit) || 0));
-      if (lost.has(o.id)) sum.orphan += v;
-      else if (o.doc_id) sum.docs += v;
-      else sum.manual += v;
+      const v = round2(sgn * (round2(Number(o.credit) || 0) - round2(Number(o.debit) || 0)));
+      if (lost.has(o.id)) { sum.orphan = round2(sum.orphan + v); counted += 1; }
+      else if (o.doc_id) sum.docs = round2(sum.docs + v);
+      else sum.manual = round2(sum.manual + v);
     }
-    total += d.amount;
+    total = round2(total + d.amount);
   }
-  for (const k of Object.keys(sum)) sum[k] = Math.round(sum[k] * 100) / 100;
-  return { total: Math.round(total * 100) / 100, ...sum, orphanCount: lost.size };
+  return { total, ...sum, orphanCount: counted, orphanOther: lost.size - counted };
 }
 
 // ---------- выписанные документы и сквозная нумерация ----------

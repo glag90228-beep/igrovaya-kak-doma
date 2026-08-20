@@ -301,8 +301,10 @@ screens.home = async function home() {
     h('button', { class: 'stat', onclick: () => { haptic(); go('debts'); } },
       h('div', { class: 'k', text: 'Должны мы' }),
       h('div', { class: `v money ${s.debts.owedByUs ? 'out' : ''}`, text: money0(s.debts.owedByUs) })),
+    // «Ждут оплаты», а не «Счета»: при основании «по отгрузке» в этой
+    // плитке стоят акты и накладные — счёт долга там не создаёт.
     h('button', { class: 'stat', onclick: () => { haptic(); go('docs'); } },
-      h('div', { class: 'k', text: 'Счета не оплачены' }),
+      h('div', { class: 'k', text: 'Ждут оплаты' }),
       h('div', { class: 'v money', text: money0(unpaid.sum) }))));
 
   /*
@@ -415,29 +417,41 @@ screens.why = async function why() {
     ['Внесено руками', b.manual, 'операции из журнала и банковской выписки', 'debts'],
   ].filter(([, v]) => v);
 
-  if (!parts.length && !b.orphan) {
+  const lost = (b.orphanCount || 0) + (b.orphanOther || 0);
+  if (!parts.length && !lost) {
     box.append(empty('wallet', 'Никто не должен', 'Все расчёты сошлись.'));
     return box;
   }
 
-  box.append(h('div', { class: 'card' }, parts.map(([title, v, sub, screen]) => navRow({
-    icon: 'wallet', title, sub, right: money(v), onclick: () => go(screen),
-  }))));
+  if (parts.length) {
+    box.append(h('div', { class: 'card' }, parts.map(([title, v, sub, screen]) => navRow({
+      icon: 'wallet', title, sub, right: money(v), onclick: () => go(screen),
+    }))));
 
-  // Слово «удалил» звучит в каждой жалобе, поэтому объясняем именно его.
-  box.append(h('div', { class: 'card' }, h('div', { class: 'row muted small' },
-    'Удаление документа снимает только его строку. Начальное сальдо правится '
-    + 'в карточке контрагента, ручные операции — в журнале.')));
+    // Слово «удалил» звучит в каждой жалобе, поэтому объясняем именно его.
+    box.append(h('div', { class: 'card' }, h('div', { class: 'row muted small' },
+      'Удаление документа снимает только его строку. Начальное сальдо правится '
+      + 'в карточке контрагента, ручные операции — в журнале.')));
+  }
 
-  if (b.orphan) {
+  if (lost) {
+    // Сирот, сидящих в самой сумме, и сирот у остальных контрагентов
+    // называем врозь: одним числом вышло бы «три операции держат 3 000»,
+    // хотя держит одна, а две другие гасят друг друга у другого клиента.
+    const here = b.orphanCount
+      ? `${money(b.orphan)} в этой сумме держат ${b.orphanCount} `
+        + `${plural(b.orphanCount, 'операция', 'операции', 'операций')}`
+      : 'В этой сумме их нет, но в журнале они есть';
+    const other = b.orphanOther
+      ? `. Ещё ${b.orphanOther} ${plural(b.orphanOther, 'такая операция', 'такие операции', 'таких операций')} `
+        + 'у других контрагентов'
+      : '';
     box.append(h('div', { class: 'card' }, h('div', { class: 'row' },
       h('span', { class: 'icon-box warn' }, icon('warn')),
       h('span', { class: 'grow' },
-        h('div', { text: `Строки без документа — ${money(b.orphan)}` }),
-        h('div', { class: 'small muted', text: `${b.orphanCount} `
-          + `${plural(b.orphanCount, 'операция осталась', 'операции остались', 'операций осталось')} `
-          + 'от документов, удалённых старой версией бота. Из приложения их не убрать — '
-          + 'напишите в поддержку, уберём.' }))),
+        h('div', { text: 'Строки без документа' }),
+        h('div', { class: 'small muted', text: `${here}${other}. Они остались от документов, `
+          + 'удалённых старой версией бота. Из приложения их не убрать — напишите в поддержку.' }))),
     h('div', { class: 'btn-wrap' },
       h('button', { class: 'btn secondary', onclick: () => { haptic(); go('support'); } },
         'Написать в поддержку'))));

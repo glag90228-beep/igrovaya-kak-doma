@@ -3020,7 +3020,15 @@ async function handleCallback(tg, cq) {
       const org = bdb.getDefaultOrg(user.id);
       if (t && org) {
         bdb.updateOrg(user.id, org.id, { biz_type: data.slice(8), debt_basis: t.basis });
-        await tg.sendMessage(chatId, `<b>${esc(t.name)}</b>\n\n${esc(t.why)}`);
+        // Та же дверь к тому же правилу, что и basis.set — значит, и тот же
+        // пересчёт. Иначе выбравший «Аренда» читает «долг по счёту», а долг
+        // по уже выписанным счетам не появляется.
+        const fixed = bdb.rebuildDebt(user.id);
+        const tail = fixed.added || fixed.removed
+          ? `\n\nПересчитал прошлые документы: ${fixed.added ? `добавлено ${fixed.added}` : ''}`
+            + `${fixed.added && fixed.removed ? ', ' : ''}${fixed.removed ? `убрано ${fixed.removed}` : ''}.`
+          : '';
+        await tg.sendMessage(chatId, `<b>${esc(t.name)}</b>\n\n${esc(t.why)}${tail}`);
       }
       await showBasis(tg, chatId, user);
       return;

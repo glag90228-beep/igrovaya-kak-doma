@@ -133,6 +133,17 @@ function stateFor(user) {
   const owedToUs = round2(debts.filter((d) => d.theyOwe).reduce((s, d) => s + d.amount, 0));
   const owedByUs = round2(debts.filter((d) => !d.theyOwe).reduce((s, d) => s + d.amount, 0));
   const unpaidDocs = bdb.unpaidDocs(user.id);
+  /*
+   * В плитку «Ждут оплаты» берём только те документы, которые при нынешнем
+   * основании создают долг. Иначе одна сделка считается дважды: человек
+   * выписывает счёт и закрывающий его акт на те же 30 000 и видит 60 000 —
+   * ровно ту пару, про которую markPaid пишет, что она обычное дело.
+   * В ручном режиме правила нет, поэтому показываем всё как есть.
+   */
+  const debtTypes = bdb.DEBT_DOCS[bdb.basisOf(org || {})];
+  const awaiting = debtTypes.length
+    ? unpaidDocs.filter((d) => debtTypes.includes(d.type))
+    : unpaidDocs;
   return {
     user: { id: user.id, tgId: user.tg_id, name: user.name },
     org: org || null,
@@ -142,8 +153,8 @@ function stateFor(user) {
     counts: { cps: bdb.listCps(user.id).length, debtors: debts.length },
     debts: { owedToUs, owedByUs },
     unpaid: {
-      count: unpaidDocs.length,
-      sum: round2(unpaidDocs.reduce((acc, d) => acc + (Number(d.total) || 0), 0)),
+      count: awaiting.length,
+      sum: round2(awaiting.reduce((acc, d) => acc + (Number(d.total) || 0), 0)),
     },
     docs: bdb.listDocs(user.id, 5).map(docBrief),
     payUrl: payLink(user.tg_id),
@@ -155,6 +166,10 @@ function stateFor(user) {
     // об этом нельзя, человек решит, что цифра сломана.
     basisMismatch: (() => {
       if (owedToUs > 0 || !unpaidDocs.length) return null;
+      // В ручном режиме молчим: человек сам сказал, что журнал ведёт он, и
+      // подсказка «долг считается по актам» была бы неправдой, а кнопка
+      // рядом с ней молча начала бы делать проводки за него.
+      if (bdb.basisOf(org || {}) === 'manual') return null;
       const types = bdb.DEBT_DOCS[bdb.basisOf(org || {})];
       const mute = unpaidDocs.filter((d) => !types.includes(d.type));
       if (!mute.length) return null;
@@ -968,7 +983,12 @@ const api = {
     const org = bdb.getDefaultOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     bdb.updateOrg(user.id, org.id, { biz_type: key, debt_basis: t.basis });
-    return { key, basis: t.basis, why: t.why };
+    // Пересчёт нужен ровно так же, как в /api/basis: это вторая дверь к тому
+    // же правилу, и заходит в неё как раз тот, кто в основаниях не
+    // разбирается. Без пересчёта он выбирает «Аренда», читает «долг будет
+    // считаться по счёту» — и цифра на главной не двигается.
+    const fixed = bdb.rebuildDebt(user.id);
+    return { key, basis: t.basis, why: t.why, fixed };
   },
 
   /** Что повторяется каждый месяц. */

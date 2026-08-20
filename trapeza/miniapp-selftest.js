@@ -64,6 +64,9 @@ function initDataFor(user, { authDate = Math.floor(Date.now() / 1000), token = T
 
 const MASHA = { id: 500101, first_name: 'Мария', username: 'masha' };
 const PETYA = { id: 500202, first_name: 'Пётр', username: 'petya' };
+// Отдельный человек для проверок главного экрана: у Маши к тому месту в
+// прогоне уже десяток документов, и по её цифрам ничего не разглядеть.
+const ANNA = { id: 500303, first_name: 'Анна', username: 'anna' };
 
 // Телеграм подменяем: файлы «отправляются», но в сеть никто не идёт.
 const sentToChat = [];
@@ -370,6 +373,76 @@ async function main() {
     ok(r.status === 400, 'чужой документ оплаченным не отметить');
 
     await call('POST', '/api/basis', { user: masha, body: { basis: 'closing' } });
+  }
+
+  console.log('\n── что показывает главный экран ──');
+  {
+    /*
+     * Три жалобы, которые на этом экране сходятся в одну: «цифры врут».
+     * Проверяем их разом на чистом человеке — у Маши к этому месту в
+     * прогоне уже слишком много документов, чтобы что-то разглядеть.
+     */
+    const anna = initDataFor(ANNA);
+    // ИНН настоящий по контрольным суммам: /api/org их проверяет.
+    r = await call('POST', '/api/org', {
+      user: anna, body: { name: 'ИП Анна', inn: '183209316100', signer: 'А. А.' },
+    });
+    ok(r.status === 200 && r.json.org, 'организация Анны заведена', (r.json || {}).error);
+    const cpA = (await call('POST', '/api/cp', {
+      user: anna, body: { name: 'ООО «Сделка»', kind: 'customer' },
+    })).json.cp.id;
+
+    // Одна сделка, два документа: счёт и закрывающий его акт на те же 30 000.
+    for (const type of ['sch', 'usl']) {
+      // eslint-disable-next-line no-await-in-loop
+      await call('POST', '/api/doc', {
+        user: anna, body: { type, cpId: cpA, items: [{ name: 'Работа', qty: 1, price: 30000 }] },
+      });
+    }
+    r = await call('GET', '/api/state', { user: anna });
+    ok(r.json.unpaid.sum === 30000 && r.json.unpaid.count === 1,
+      'счёт и закрывающий его акт — одна сделка, а не две',
+      `${r.json.unpaid.sum} / ${r.json.unpaid.count} шт.`);
+    ok(r.json.debts.owedToUs === 30000, 'и долг тоже один', r.json.debts.owedToUs);
+
+    // Вид деятельности — вторая дверь к тому же правилу, что и основание.
+    // Заходит в неё как раз тот, кто в основаниях не разбирается.
+    await call('POST', '/api/basis', { user: anna, body: { basis: 'closing' } });
+    const cpR2 = (await call('POST', '/api/cp', {
+      user: anna, body: { name: 'ООО «Арендатор»', kind: 'customer' },
+    })).json.cp.id;
+    // Мимо HTTP: бесплатных документов в прогоне всего два, и оба уже ушли
+    // на сделку выше. Здесь проверяется пересчёт, а не лимит.
+    await docService.issueDocument(bdb.getOrCreateUser(ANNA.id).id, {
+      type: 'sch', cpId: cpR2, items: [{ name: 'Аренда', qty: 1, price: 40000 }], skipQuota: true,
+    });
+    r = await call('GET', '/api/state', { user: anna });
+    const before = r.json.debts.owedToUs;
+    r = await call('POST', '/api/biztype', { user: anna, body: { key: 'rent' } });
+    ok(r.status === 200 && r.json.fixed && r.json.fixed.added >= 1,
+      'выбор «Аренда» пересчитал прошлые счета, а не только настройку',
+      JSON.stringify((r.json || {}).fixed));
+    r = await call('GET', '/api/state', { user: anna });
+    // Долг переехал со счёта на счёт: акт перестал его создавать, зато оба
+    // счёта начали. 30 000 у первого клиента + 40 000 у арендатора.
+    ok(r.json.debts.owedToUs === 70000,
+      'и цифра на главной наконец сдвинулась', `${before} → ${r.json.debts.owedToUs}`);
+
+    // Ручной режим: человек сам сказал, что журнал ведёт он.
+    await call('POST', '/api/basis', { user: anna, body: { basis: 'manual' } });
+    r = await call('GET', '/api/state', { user: anna });
+    ok(r.json.basisMismatch === null,
+      'в ручном режиме подсказка про основание молчит — иначе она врёт',
+      JSON.stringify(r.json.basisMismatch));
+
+    // Разбор суммы: слагаемые обязаны сходиться с самой цифрой.
+    await call('POST', '/api/basis', { user: anna, body: { basis: 'invoice' } });
+    const st = (await call('GET', '/api/state', { user: anna })).json;
+    const w = (await call('GET', '/api/debts/why', { user: anna })).json;
+    ok(w.total === st.debts.owedToUs, 'разбор считает ту же цифру, что и главная',
+      `${w.total} / ${st.debts.owedToUs}`);
+    ok(w.opening + w.docs + w.manual + w.orphan === w.total,
+      'и слагаемые сходятся', JSON.stringify(w));
   }
 
   console.log('\n── начальное сальдо и период акта ──');
