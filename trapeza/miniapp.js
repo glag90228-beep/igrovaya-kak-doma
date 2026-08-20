@@ -132,18 +132,10 @@ function stateFor(user) {
   const debts = bdb.debtors(user.id);
   const owedToUs = round2(debts.filter((d) => d.theyOwe).reduce((s, d) => s + d.amount, 0));
   const owedByUs = round2(debts.filter((d) => !d.theyOwe).reduce((s, d) => s + d.amount, 0));
-  const unpaidDocs = bdb.unpaidDocs(user.id);
-  /*
-   * В плитку «Ждут оплаты» берём только те документы, которые при нынешнем
-   * основании создают долг. Иначе одна сделка считается дважды: человек
-   * выписывает счёт и закрывающий его акт на те же 30 000 и видит 60 000 —
-   * ровно ту пару, про которую markPaid пишет, что она обычное дело.
-   * В ручном режиме правила нет, поэтому показываем всё как есть.
-   */
-  const debtTypes = bdb.DEBT_DOCS[bdb.basisOf(org || {})];
-  const awaiting = debtTypes.length
-    ? unpaidDocs.filter((d) => debtTypes.includes(d.type))
-    : unpaidDocs;
+  // Одно число на всё приложение: плитка, список и напоминание раньше
+  // считали каждый по-своему и расходились между собой.
+  const awaiting = bdb.unpaidSummary(user.id);
+  const unpaidDocs = awaiting.docs;
   return {
     user: { id: user.id, tgId: user.tg_id, name: user.name },
     org: org || null,
@@ -152,10 +144,7 @@ function stateFor(user) {
     access,
     counts: { cps: bdb.listCps(user.id).length, debtors: debts.length },
     debts: { owedToUs, owedByUs },
-    unpaid: {
-      count: awaiting.length,
-      sum: round2(awaiting.reduce((acc, d) => acc + (Number(d.total) || 0), 0)),
-    },
+    unpaid: { count: awaiting.count, sum: awaiting.sum },
     docs: bdb.listDocs(user.id, 5).map(docBrief),
     payUrl: payLink(user.tg_id),
     price: { text: priceText(), saving: yearSaving() },
@@ -169,11 +158,25 @@ function stateFor(user) {
       // В ручном режиме молчим: человек сам сказал, что журнал ведёт он, и
       // подсказка «долг считается по актам» была бы неправдой, а кнопка
       // рядом с ней молча начала бы делать проводки за него.
-      if (bdb.basisOf(org || {}) === 'manual') return null;
-      const types = bdb.DEBT_DOCS[bdb.basisOf(org || {})];
+      const basis = bdb.basisOf(org || {});
+      if (basis === 'manual') return null;
+      const types = bdb.DEBT_DOCS[basis];
       const mute = unpaidDocs.filter((d) => !types.includes(d.type));
       if (!mute.length) return null;
-      return { count: mute.length, sum: round2(mute.reduce((a2, d) => a2 + (Number(d.total) || 0), 0)) };
+      /*
+       * Куда переключать — выводим из самих документов, а не подставляем
+       * «по счёту» всегда. Иначе выходил замкнутый круг: у человека уже
+       * стоит «по счёту», висит неоплаченный акт, экран советует включить
+       * то, что включено, кнопка ничего не меняет и рапортует «Готово».
+       */
+      const to = mute.every((d) => bdb.DEBT_DOCS.invoice.includes(d.type)) ? 'invoice'
+        : (mute.every((d) => bdb.DEBT_DOCS.closing.includes(d.type)) ? 'closing' : null);
+      if (!to || to === basis) return null;
+      return {
+        to,
+        count: mute.length,
+        sum: round2(mute.reduce((a2, d) => a2 + (Number(d.total) || 0), 0)),
+      };
     })(),
     bizType: (org && org.biz_type) || '',
     bizTypes: bizTypes.list(),
@@ -203,6 +206,9 @@ function docBrief(d) {
   return {
     id: d.id, type: d.type, title: d.title, number: d.number, date: d.date,
     total: d.total, cpId: d.cp_id, paidAt: d.paid_at || '',
+    // Долг по документу отменён руками — приложению это надо показать и дать
+    // обратный ход, иначе отмена выходит дорогой в один конец.
+    noDebt: Boolean(d.no_debt),
     items: (d.payload && d.payload.items) || [],
   };
 }
@@ -560,7 +566,9 @@ const api = {
   async 'POST /api/op'({ user, body }) {
     const cp = bdb.getCp(user.id, Number(body.cpId));
     if (!cp) return { error: 'Контрагент не найден.' };
-    const amount = Math.abs(Number(body.amount) || 0);
+    // До копейки на самой границе: полукопейки внутри базы разводят
+    // колонку сальдо и её разбор — считают-то они по-разному.
+    const amount = round2(Math.abs(Number(body.amount) || 0));
     if (!amount) return { error: 'Укажите сумму.' };
     const paid = body.kind === 'payment';
     const date = /^\d{4}-\d{2}-\d{2}$/.test(String(body.date)) ? String(body.date) : docService.todayISO();
@@ -955,6 +963,15 @@ const api = {
     const after = d.cp_id ? bdb.balanceOf(user.id, d.cp_id) : null;
     const delta = before && after ? round2(before.closing - after.closing) : 0;
     return { deleted: true, title: `${d.title} № ${d.number}`, delta, balance: after ? after.closing : 0 };
+  },
+
+  /** Вернуть документ в долг после отмены проводки руками. */
+  async 'POST /api/doc/debt'({ user, body }) {
+    const d = bdb.getDoc(user.id, Number(body.id));
+    if (!d) return { error: 'Документ не найден.' };
+    bdb.restoreDebt(user.id, d.id);
+    const b = d.cp_id ? bdb.balanceOf(user.id, d.cp_id) : null;
+    return { ok: true, balance: b ? round2(b.closing) : 0 };
   },
 
   /** Из чего возникает долг: по акту, по счёту или вручную. */

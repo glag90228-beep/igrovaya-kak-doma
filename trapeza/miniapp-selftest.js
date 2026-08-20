@@ -435,6 +435,46 @@ async function main() {
       'в ручном режиме подсказка про основание молчит — иначе она врёт',
       JSON.stringify(r.json.basisMismatch));
 
+    /*
+     * Подсказка не должна звать туда, где человек уже стоит. У Кати
+     * основание «по счёту», висит неоплаченный акт и долга нет: раньше
+     * экран советовал «считать по счетам», кнопка ничего не меняла и
+     * рапортовала «Готово» — замкнутый круг.
+     */
+    const katya = initDataFor({ id: 500404, first_name: 'Катя', username: 'katya' });
+    await call('POST', '/api/org', {
+      user: katya, body: { name: 'ИП Катя', inn: '183209316100', signer: 'К. К.' },
+    });
+    await call('POST', '/api/basis', { user: katya, body: { basis: 'invoice' } });
+    const cpK = (await call('POST', '/api/cp', {
+      user: katya, body: { name: 'ООО «Акт»', kind: 'customer' },
+    })).json.cp.id;
+    await call('POST', '/api/doc', {
+      user: katya, body: { type: 'usl', cpId: cpK, items: [{ name: 'Работа', qty: 1, price: 20000 }] },
+    });
+    r = await call('GET', '/api/state', { user: katya });
+    ok(r.json.basisMismatch && r.json.basisMismatch.to === 'closing',
+      'подсказка зовёт туда, где долг появится, а не туда, где уже стоим',
+      JSON.stringify(r.json.basisMismatch));
+
+    // Отмена проводки руками — и путь назад из неё.
+    const docK = (await call('GET', '/api/docs', { user: katya })).json.docs[0];
+    r = await call('GET', '/api/cps', { user: katya });
+    ok(r.json.cps.find((c) => c.id === cpK).balance === 0, 'при «долге по счёту» акт долга не создаёт');
+    await call('POST', '/api/basis', { user: katya, body: { basis: 'closing' } });
+    r = await call('GET', '/api/cps', { user: katya });
+    ok(r.json.cps.find((c) => c.id === cpK).balance === 20000, 'после переключения долг появился');
+
+    // Отменить проводку можно из бота; приложение обязано это показать.
+    bdb.deleteLastOp(bdb.getOrCreateUser(500404).id, cpK);
+    r = await call('GET', '/api/docs', { user: katya });
+    const undone = r.json.docs.find((x) => x.id === docK.id);
+    ok(undone && undone.noDebt === true,
+      'отмена проводки видна в карточке документа', JSON.stringify(undone && undone.noDebt));
+    r = await call('POST', '/api/doc/debt', { user: katya, body: { id: docK.id } });
+    ok(r.status === 200 && r.json.balance === 20000,
+      'и «вернуть в долг» возвращает его обратно', JSON.stringify(r.json));
+
     // Разбор суммы: слагаемые обязаны сходиться с самой цифрой.
     await call('POST', '/api/basis', { user: anna, body: { basis: 'invoice' } });
     const st = (await call('GET', '/api/state', { user: anna })).json;

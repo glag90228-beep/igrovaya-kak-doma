@@ -1033,7 +1033,9 @@ async function showUnpaid(tg, chatId, user) {
     return;
   }
   const today = todayISO();
-  const sum = round2(list.reduce((a2, d) => a2 + (Number(d.total) || 0), 0));
+  // Сумма — сделками, а не документами: счёт и закрывающий его акт на одну
+  // сделку иначе складывались, и сводка расходилась с плиткой в приложении.
+  const sum = bdb.dealTotals(list).sum;
   const rows = list.map((d) => {
     const cp = d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
     const days = Math.floor((new Date(today) - new Date(d.date)) / 86400000);
@@ -1075,6 +1077,21 @@ async function showDocs(tg, chatId, user, cpId = null) {
 }
 
 /** Карточка документа: выслать файл заново или повторить новым номером. */
+/**
+ * Что сказать после пересчёта основания.
+ *
+ * Про строки оплаты надо говорить наравне с долгом: пересчёт может снять
+ * оплату на 30 000 — сальдо уезжает ровно настолько, — а сообщение раньше
+ * считало только реализации и рапортовало «ничего не менял».
+ */
+function rebuildText(fixed) {
+  const parts = [];
+  if (fixed.added) parts.push(`долг добавлен по ${fixed.added} ${plural(fixed.added, 'документу', 'документам', 'документам')}`);
+  if (fixed.removed) parts.push(`убран у ${fixed.removed}`);
+  if (fixed.paid) parts.push(`поправлено строк оплаты: ${fixed.paid}`);
+  return parts.length ? `Пересчитал журнал: ${parts.join(', ')}.` : '';
+}
+
 async function showDoc(tg, chatId, user, docId) {
   const d = bdb.getDoc(user.id, docId);
   if (!d) { await tg.sendMessage(chatId, 'Документ не найден.', mainMenu()); return; }
@@ -1089,6 +1106,9 @@ async function showDoc(tg, chatId, user, docId) {
       ? { text: `↩️ Снять отметку об оплате (${ru(d.paid_at)})`, data: `doc.unpaid:${d.id}` }
       : { text: '✅ Отметить оплаченным', data: `doc.paid:${d.id}` }]);
   }
+  // Отмену проводки надо уметь отменить. Без этой кнопки документ навсегда
+  // выпадал из долга, продолжая числиться в «Ждут оплаты».
+  if (d.no_debt) rows.push([{ text: '↩️ Вернуть в долг', data: `doc.debt:${d.id}` }]);
   if (mailbox.resolve(user.id).ok && d.type !== 'akt') {
     rows.push([{
       text: cp && cp.email ? `✉️ Отправить на ${cp.email}`.slice(0, 60) : '✉️ Отправить на почту',
@@ -1104,6 +1124,7 @@ async function showDoc(tg, chatId, user, docId) {
     + (cp ? `Контрагент: ${esc(cp.name)}\n` : '')
     + (d.total ? `Сумма: <b>${formatRub(d.total)}</b>\n` : '')
     + (payable ? `Оплата: <b>${d.paid_at ? `получена ${ru(d.paid_at)}` : 'не отмечена'}</b>\n` : '')
+    + (d.no_debt ? 'Долг по этому документу отменён вручную.\n' : '')
     + (items ? `\n${items}` : ''),
     keyboard(rows));
 }
@@ -1915,7 +1936,7 @@ async function warnOverdue(tg, rec) {
     .filter((d) => d.cp_id === rec.cp_id && String(d.date).startsWith(month));
   if (!unpaid.length) return false;              // оплачено или счёта не было
 
-  const sum = round2(unpaid.reduce((a, d) => a + (Number(d.total) || 0), 0));
+  const sum = bdb.dealTotals(unpaid).sum;
   const list = unpaid.slice(0, 5)
     .map((d) => `• ${esc(d.title)} № ${esc(d.number)} от ${ru(d.date)} — ${formatRub(d.total)}`);
 
@@ -3005,11 +3026,8 @@ async function handleCallback(tg, cq) {
         // при выписке, и уже выписанные документы оставались как были —
         // человек переключал основание и не видел никакой разницы.
         const fixed = bdb.rebuildDebt(user.id);
-        if (fixed.added || fixed.removed) {
-          await tg.sendMessage(chatId,
-            `Пересчитал долги по прошлым документам: ${fixed.added ? `добавлено ${fixed.added}` : ''}`
-            + `${fixed.added && fixed.removed ? ', ' : ''}${fixed.removed ? `убрано ${fixed.removed}` : ''}.`);
-        }
+        const said = rebuildText(fixed);
+        if (said) await tg.sendMessage(chatId, said);
       }
       await showBasis(tg, chatId, user);
       return;
@@ -3023,12 +3041,9 @@ async function handleCallback(tg, cq) {
         // Та же дверь к тому же правилу, что и basis.set — значит, и тот же
         // пересчёт. Иначе выбравший «Аренда» читает «долг по счёту», а долг
         // по уже выписанным счетам не появляется.
-        const fixed = bdb.rebuildDebt(user.id);
-        const tail = fixed.added || fixed.removed
-          ? `\n\nПересчитал прошлые документы: ${fixed.added ? `добавлено ${fixed.added}` : ''}`
-            + `${fixed.added && fixed.removed ? ', ' : ''}${fixed.removed ? `убрано ${fixed.removed}` : ''}.`
-          : '';
-        await tg.sendMessage(chatId, `<b>${esc(t.name)}</b>\n\n${esc(t.why)}${tail}`);
+        const said = rebuildText(bdb.rebuildDebt(user.id));
+        await tg.sendMessage(chatId,
+          `<b>${esc(t.name)}</b>\n\n${esc(t.why)}${said ? `\n\n${said}` : ''}`);
       }
       await showBasis(tg, chatId, user);
       return;
@@ -3151,6 +3166,17 @@ async function handleCallback(tg, cq) {
       const id = Number(data.slice(11));
       bdb.unmarkPaid(user.id, id);
       await tg.sendMessage(chatId, 'Отметку об оплате снял, долг вернул в журнал.');
+      await showDoc(tg, chatId, user, id);
+      return;
+    }
+    if (data.startsWith('doc.debt:')) {
+      const id = Number(data.slice(9));
+      const d = bdb.getDoc(user.id, id);
+      if (d && bdb.restoreDebt(user.id, id)) {
+        const b = d.cp_id ? bdb.balanceOf(user.id, d.cp_id) : null;
+        await tg.sendMessage(chatId, 'Вернул документ в долг.'
+          + (b ? ` Сальдо: <b>${formatRub(Math.abs(b.closing))}</b>.` : ''));
+      }
       await showDoc(tg, chatId, user, id);
       return;
     }

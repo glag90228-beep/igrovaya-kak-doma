@@ -193,6 +193,11 @@ function migrate() {
   // отметки пересчёт основания создавал её заново: он видит, что проводки
   // нет, и считает это упущением, — а это было решение человека.
   addColumn('documents', 'no_debt', 'INTEGER NOT NULL DEFAULT 0');
+  // Сколько денег закрыла отметка «оплачено». Не всегда вся сумма документа:
+  // если часть уже внесли руками, дописывать полную — значит увести сальдо
+  // в минус. Ноль означает «отметки не было» или «поставлена до этой графы»,
+  // и тогда в дело идёт полная сумма, как и было раньше.
+  addColumn('documents', 'paid_sum', 'REAL NOT NULL DEFAULT 0');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ops_doc ON operations(doc_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_cp_user ON counterparties(user_id)');
 }
@@ -340,11 +345,27 @@ function deleteLastOp(userId, cpId) {
   const row = db.prepare('SELECT id, kind, doc_id FROM operations WHERE cp_id = ? ORDER BY date DESC, sort DESC, id DESC LIMIT 1').get(cpId);
   if (!row) return false;
   db.prepare('DELETE FROM operations WHERE id = ?').run(row.id);
-  // Отменили долг по документу — запоминаем это на самом документе. Иначе
-  // ближайший пересчёт основания вернёт проводку: он не отличает «ещё не
-  // создали» от «человек убрал».
+  /*
+   * Проводка пришла из документа — значит, отменили не строку в журнале, а
+   * решение по документу, и хранить это надо на нём. Иначе ближайший
+   * пересчёт вернёт проводку: он не отличает «ещё не создали» от «человек
+   * убрал». Отмену видно в карточке документа, и оттуда же её можно снять.
+   *
+   * Оплата и реализация — две стороны одной пары, поэтому и отменяются
+   * по-разному: убрали реализацию — документ выходит из долга целиком;
+   * убрали оплату — снимается отметка «оплачено», иначе пересчёт впишет
+   * её обратно, ведь отметка на документе осталась.
+   */
   if (row.doc_id && row.kind === 'Реализация') {
     db.prepare('UPDATE documents SET no_debt = 1 WHERE id = ? AND user_id = ?').run(row.doc_id, userId);
+    // Оплату этого документа забираем сразу же: одна без другой оставляет
+    // сальдо в минусе — выходит, что это мы должны клиенту. Отметку
+    // «оплачено» не трогаем, она вернётся вместе с долгом.
+    deleteOpsOfDoc(userId, row.doc_id, 'Оплата');
+  }
+  if (row.doc_id && row.kind === 'Оплата') {
+    db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0 WHERE id = ? AND user_id = ?")
+      .run(row.doc_id, userId);
   }
   // Если операция пришла из выписки, забываем и отметку о загрузке: иначе
   // отменённую по ошибке оплату больше не загрузить — строка навсегда
@@ -539,11 +560,12 @@ function rebuildDebt(userId) {
   const org = getDefaultOrg(userId);
   const types = DEBT_DOCS[basisOf(org || {})];
   const docs = db.prepare(
-    'SELECT id, cp_id, type, date, total, number, paid_at, no_debt FROM documents WHERE user_id = ? AND total > 0',
+    'SELECT id, cp_id, type, date, total, number, paid_at, paid_sum, no_debt FROM documents WHERE user_id = ? AND total > 0',
   ).all(userId);
 
   let added = 0;
   let removed = 0;
+  let paid = 0;                            // сколько строк оплаты поправили
   const hasOp = (docId, kind) => db.prepare(
     'SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = ?',
   ).get(docId, kind).n > 0;
@@ -565,16 +587,27 @@ function rebuildDebt(userId) {
         removed += deleteOpsOfDoc(userId, d.id, 'Реализация');
       }
 
-      // Оплату держим в паре с реализацией. Счётчики не трогаем: человеку
-      // сообщают, по скольким документам появился долг, а не сколько строк
-      // мы переложили внутри журнала.
+      /*
+       * Оплату держим в паре с реализацией — и на ту же сумму, что была
+       * записана при отметке (paid_sum). Полная сумма документа годится
+       * только для старых отметок, поставленных до появления этой графы:
+       * если оплата была частичной, пересчёт вернул бы её полной и увёл
+       * сальдо в минус.
+       *
+       * Движение по оплатам считаем отдельно и показываем человеку: раньше
+       * пересчёт мог молча снять оплату на 30 000 и отчитаться «ничего не
+       * менял» — сальдо уезжало, а сообщение говорило обратное.
+       */
       const shouldPay = should && Boolean(d.paid_at);
       if (shouldPay && !hasOp(d.id, 'Оплата')) {
-        addOpForDoc(userId, d.cp_id, {
-          date: d.paid_at, kind: 'Оплата', doc: `${title} № ${d.number}`, debit: d.total,
-        }, d.id);
+        if (addOpForDoc(userId, d.cp_id, {
+          date: d.paid_at,
+          kind: 'Оплата',
+          doc: `${title} № ${d.number}`,
+          debit: round2(Number(d.paid_sum) || Number(d.total)),
+        }, d.id)) paid += 1;
       } else if (!shouldPay && hasOp(d.id, 'Оплата')) {
-        deleteOpsOfDoc(userId, d.id, 'Оплата');
+        paid += deleteOpsOfDoc(userId, d.id, 'Оплата');
       }
     }
     db.exec('COMMIT');
@@ -582,7 +615,23 @@ function rebuildDebt(userId) {
     db.exec('ROLLBACK');
     throw e;
   }
-  return { added, removed };
+  return { added, removed, paid };
+}
+
+/**
+ * Вернуть документ в долг после отмены проводки руками.
+ *
+ * Без этого отмена была дорогой в один конец: флаг no_debt ставился, а снять
+ * его было нечем — документ навсегда выпадал из долга, продолжая при этом
+ * числиться в «Ждут оплаты». Кнопка «Вернуть в долг» — обратный ход, и
+ * пересчёт восстанавливает пару целиком, включая оплату.
+ */
+function restoreDebt(userId, docId) {
+  const d = getDoc(userId, docId);
+  if (!d) return false;
+  db.prepare('UPDATE documents SET no_debt = 0 WHERE id = ? AND user_id = ?').run(docId, userId);
+  rebuildDebt(userId);
+  return true;
 }
 
 function opsOfDoc(userId, docId) {
@@ -623,10 +672,25 @@ function markPaid(userId, docId, date) {
    * Отметку «оплачено» при этом сохраняем для обоих: она нужна списку
    * «не оплачено» и живёт отдельно от журнала.
    */
-  if (d.cp_id && d.total && makesDebt(org || {}, d.type)) {
-    addOpForDoc(userId, d.cp_id, {
-      date: when, kind: 'Оплата', doc: `${d.title} № ${d.number}`, debit: d.total,
-    }, docId);
+  /*
+   * И только на ту сумму, которая по этому клиенту ещё не закрыта.
+   *
+   * Человек вносит частичную оплату руками — «пришло 20 000 из 50 000», —
+   * а потом жмёт «оплачен», имея в виду «остальное тоже пришло». Полная
+   * сумма поверх частичной давала −20 000: приложение объявляло, что это
+   * мы должны клиенту, который просто доплатил. Берём меньшее из суммы
+   * документа и текущего долга; аванс клиента точно так же уменьшает то,
+   * что осталось закрыть.
+   */
+  if (d.cp_id && d.total && !d.no_debt && makesDebt(org || {}, d.type)) {
+    const bal = balanceOf(userId, d.cp_id);
+    const left = round2(Math.min(Number(d.total), Math.max(0, bal ? bal.closing : 0)));
+    if (left > 0) {
+      addOpForDoc(userId, d.cp_id, {
+        date: when, kind: 'Оплата', doc: `${d.title} № ${d.number}`, debit: left,
+      }, docId);
+      db.prepare('UPDATE documents SET paid_sum = ? WHERE id = ? AND user_id = ?').run(left, docId, userId);
+    }
   }
   return when;
 }
@@ -634,7 +698,7 @@ function markPaid(userId, docId, date) {
 function unmarkPaid(userId, docId) {
   const d = getDoc(userId, docId);
   if (!d) return false;
-  db.prepare("UPDATE documents SET paid_at = '' WHERE id = ? AND user_id = ?").run(docId, userId);
+  db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0 WHERE id = ? AND user_id = ?").run(docId, userId);
   deleteOpsOfDoc(userId, docId, 'Оплата');
   return true;
 }
@@ -664,6 +728,42 @@ function unpaidDocs(userId, limit = 50) {
        AND type IN ('sch','schdog','usl','upd','torg12')
      ORDER BY date, id LIMIT ?`).all(userId, limit);
   return rows.map(withPayload);
+}
+
+/**
+ * Сколько денег ждём — одним числом, без задвоения по одной сделке.
+ *
+ * Список неоплаченных показываем целиком: человек хочет видеть оба документа.
+ * А вот складывать их нельзя. На одну сделку выписывают счёт и закрывающий
+ * его акт на те же 30 000 — markPaid прямо пишет, что это обычное дело, — и
+ * в сводке выходило 60 000. Считаем сделками: у одного контрагента счёт и
+ * закрывающий документ на одну и ту же сумму — это одна сделка, а не две.
+ *
+ * Число берут и плитка на главной, и сводка в боте, и напоминание: пока
+ * каждый считал сам, они расходились между собой.
+ */
+const CLOSING_DOCS = ['usl', 'upd', 'torg12'];
+function dealTotals(docs) {
+  const deals = new Map();
+  for (const d of docs) {
+    const key = `${d.cp_id}|${round2(Number(d.total) || 0)}`;
+    const g = deals.get(key) || { total: round2(Number(d.total) || 0), bill: 0, close: 0 };
+    if (CLOSING_DOCS.includes(d.type)) g.close += 1; else g.bill += 1;
+    deals.set(key, g);
+  }
+  let count = 0;
+  let sum = 0;
+  for (const g of deals.values()) {
+    const n = g.bill && g.close ? Math.max(g.bill, g.close) : g.bill + g.close;
+    count += n;
+    sum = round2(sum + n * g.total);
+  }
+  return { count, sum };
+}
+
+function unpaidSummary(userId, limit = 200) {
+  const docs = unpaidDocs(userId, limit);
+  return { docs, ...dealTotals(docs) };
 }
 
 /** Сальдо по контрагенту (переиспользует computeBalance из db.js) */
@@ -765,8 +865,11 @@ function debtors(userId) {
  * счётчик нельзя: экран сказал бы «три операции держат 3 000», хотя эти
  * 3 000 держит одна, а две другие гасят друг друга у совсем другого клиента.
  *
- * Округляем на каждом шаге, как computeBalance: если копить полукопейки и
- * округлить один раз в конце, слагаемые не сойдутся с самой цифрой.
+ * Слагаемые берём не из самих проводок, а из того, насколько каждая сдвинула
+ * сальдо: computeBalance округляет после каждого шага, и повторять его
+ * арифметику отдельной формулой — значит однажды разойтись с ней на копейку.
+ * Разница соседних значений в колонке сальдо сходится к итогу всегда, какое
+ * бы округление ни применялось внутри.
  */
 function debtBreakdown(userId) {
   const lost = new Set(db.prepare(`
@@ -783,14 +886,19 @@ function debtBreakdown(userId) {
   for (const d of debtors(userId)) {
     if (!d.theyOwe) continue;              // «должны вам» — только эта сторона
     const b = balanceOf(userId, d.cp.id);
-    if (!b) continue;
+    if (!b || !b.rows) continue;
     // У поставщика знак читается наоборот — тот же разворот, что в debtors().
-    const sgn = d.cp.kind === 'supplier' ? -1 : 1;
-    sum.opening = round2(sum.opening + sgn * (Number(d.cp.opening_balance) || 0));
-    for (const o of b.ops) {
-      const v = round2(sgn * (round2(Number(o.credit) || 0) - round2(Number(o.debit) || 0)));
-      if (lost.has(o.id)) { sum.orphan = round2(sum.orphan + v); counted += 1; }
-      else if (o.doc_id) sum.docs = round2(sum.docs + v);
+    const sgn = b.closing < 0 ? -1 : 1;
+    // Начальное сальдо — это первая точка колонки: сальдо до первой операции.
+    let prev = b.rows.length
+      ? round2(b.rows[0].balance - (round2(Number(b.rows[0].credit) || 0) - round2(Number(b.rows[0].debit) || 0)))
+      : b.closing;
+    sum.opening = round2(sum.opening + sgn * prev);
+    for (const row of b.rows) {
+      const v = round2(sgn * (row.balance - prev));
+      prev = row.balance;
+      if (lost.has(row.id)) { sum.orphan = round2(sum.orphan + v); counted += 1; }
+      else if (row.doc_id) sum.docs = round2(sum.docs + v);
       else sum.manual = round2(sum.manual + v);
     }
     total = round2(total + d.amount);
@@ -991,8 +1099,8 @@ module.exports = {
   addOp, listOps, deleteLastOp, balanceOf, debtors, debtBreakdown, periodBalance, cpForPeriod,
   knownBankKeys, importBankRows,
   DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
-  debtByDoc, rebuildDebt,
-  markPaid, unmarkPaid, unpaidDocs, docsBetween,
+  debtByDoc, rebuildDebt, restoreDebt,
+  markPaid, unmarkPaid, unpaidDocs, unpaidSummary, dealTotals, docsBetween,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
   isSeqTaken, guardSeq,
   nextSeq, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,

@@ -2154,6 +2154,110 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     bdbN.rebuildDebt(uid);
   }
 
+  console.log('\n── оплата и реализация ходят парой ──');
+  {
+    /*
+     * Пара живёт по одному правилу: есть долг по документу — есть и оплата
+     * по нему; нет долга — нет и оплаты. Разорвать её можно четырьмя
+     * способами, и каждый однажды показывал человеку, что это он должен
+     * клиенту, который просто заплатил.
+     */
+    const bdbP = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = bdbP.getOrCreateUser(778899002, 'Пара').id;
+    const orgP = bdbP.createOrg(uid, { name: 'ИП Пара', inn: '183209316100' });
+    bdbP.updateOrg(uid, orgP, { debt_basis: 'invoice' });
+    const bal = (cp) => bdbP.balanceOf(uid, cp).closing;
+
+    // 1. Убрали оплату руками — отметка снимается, пересчёт её не возвращает.
+    const cp1 = bdbP.createCp(uid, { name: 'ООО «Первый»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cp1, items: [{ name: 'Работа', qty: 1, price: 40000 }], skipQuota: true,
+    });
+    const d1 = bdbP.listDocs(uid, 5, cp1)[0];
+    bdbP.markPaid(uid, d1.id, '2026-12-31');       // позже счёта, значит последняя
+    bdbP.deleteLastOp(uid, cp1);
+    ok(bal(cp1) === 40000 && !bdbP.getDoc(uid, d1.id).paid_at,
+      'убрали оплату руками — отметка снялась вместе с ней', `${bal(cp1)} / ${bdbP.getDoc(uid, d1.id).paid_at}`);
+    bdbP.rebuildDebt(uid);
+    ok(bal(cp1) === 40000, 'и пересчёт её не вернул', bal(cp1));
+
+    // 2. Убрали реализацию — оплата уходит с ней, минуса не остаётся.
+    const cp2 = bdbP.createCp(uid, { name: 'ООО «Второй»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cp2, items: [{ name: 'Работа', qty: 1, price: 40000 }], skipQuota: true,
+    });
+    const d2 = bdbP.listDocs(uid, 5, cp2)[0];
+    bdbP.markPaid(uid, d2.id, '2026-01-05');       // раньше счёта, значит последней будет реализация
+    bdbP.deleteLastOp(uid, cp2);
+    ok(bal(cp2) === 0, 'убрали реализацию — оплата ушла с ней, а не оставила минус', bal(cp2));
+    bdbP.rebuildDebt(uid);
+    ok(bal(cp2) === 0, 'и после пересчёта минуса нет', bal(cp2));
+    bdbP.restoreDebt(uid, d2.id);
+    ok(bal(cp2) === 0 && bdbP.opsOfDoc(uid, d2.id).length === 2,
+      '«вернуть в долг» возвращает пару целиком', `${bal(cp2)} / ${bdbP.opsOfDoc(uid, d2.id).length}`);
+
+    // 3. Отметка оплаты на отменённом документе не уводит сальдо в минус.
+    const cp3 = bdbP.createCp(uid, { name: 'ООО «Третий»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cp3, items: [{ name: 'Работа', qty: 1, price: 25000 }], skipQuota: true,
+    });
+    const d3 = bdbP.listDocs(uid, 5, cp3)[0];
+    bdbP.deleteLastOp(uid, cp3);
+    bdbP.markPaid(uid, d3.id, '2026-03-01');
+    ok(bal(cp3) === 0, 'оплата отменённого документа не уводит в минус', bal(cp3));
+
+    // 4. Частичную оплату отметка не задваивает.
+    const cp4 = bdbP.createCp(uid, { name: 'ООО «Четвёртый»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cp4, items: [{ name: 'Работа', qty: 1, price: 50000 }], skipQuota: true,
+    });
+    const d4 = bdbP.listDocs(uid, 5, cp4)[0];
+    bdbP.addOp(uid, cp4, { date: '2026-03-01', kind: 'Оплата', doc: 'п/п 1', debit: 20000 });
+    bdbP.markPaid(uid, d4.id, '2026-03-05');
+    ok(bal(cp4) === 0, 'отметка после частичной оплаты закрывает только остаток', bal(cp4));
+    bdbP.updateOrg(uid, orgP, { debt_basis: 'closing' });
+    bdbP.rebuildDebt(uid);
+    bdbP.updateOrg(uid, orgP, { debt_basis: 'invoice' });
+    bdbP.rebuildDebt(uid);
+    ok(bal(cp4) === 0, 'и пересчёт возвращает ту же сумму, а не полную', bal(cp4));
+
+    // Пересчёт рассказывает и про строки оплаты: раньше он мог снять оплату
+    // на 30 000 и отчитаться «ничего не менял».
+    bdbP.updateOrg(uid, orgP, { debt_basis: 'closing' });
+    const rep = bdbP.rebuildDebt(uid);
+    ok(rep.paid >= 1, 'пересчёт отчитывается и о строках оплаты', JSON.stringify(rep));
+    bdbP.updateOrg(uid, orgP, { debt_basis: 'invoice' });
+    bdbP.rebuildDebt(uid);
+  }
+
+  console.log('\n── сколько денег ждём ──');
+  {
+    // Считаем сделками, а не документами: счёт и закрывающий его акт на одну
+    // сделку — это одни деньги. Но разные сделки складываться обязаны.
+    const bdbU = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = bdbU.getOrCreateUser(778899003, 'Ожидание').id;
+    bdbU.createOrg(uid, { name: 'ИП Ожидание', inn: '183209316100' });
+    const cpA = bdbU.createCp(uid, { name: 'ООО «А»', kind: 'customer', opening_date: '2026-01-01' });
+    const cpB = bdbU.createCp(uid, { name: 'ООО «Б»', kind: 'customer', opening_date: '2026-01-01' });
+    for (const t of ['sch', 'usl']) {
+      // eslint-disable-next-line no-await-in-loop
+      await docSvc.issueDocument(uid, {
+        type: t, cpId: cpA, items: [{ name: 'Сделка', qty: 1, price: 30000 }], skipQuota: true,
+      });
+    }
+    let s = bdbU.unpaidSummary(uid);
+    ok(s.sum === 30000 && s.count === 1, 'счёт и закрывающий его акт — одна сделка', `${s.sum} / ${s.count}`);
+    ok(s.docs.length === 2, 'но в списке оба документа: прятать их нельзя', s.docs.length);
+
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cpB, items: [{ name: 'Другое', qty: 1, price: 90000 }], skipQuota: true,
+    });
+    s = bdbU.unpaidSummary(uid);
+    ok(s.sum === 120000 && s.count === 2, 'а разные сделки складываются', `${s.sum} / ${s.count}`);
+  }
+
   console.log('\n── смена основания пересчитывает прошлое ──');
   {
     const bdbR = require('./lib/bot-db');

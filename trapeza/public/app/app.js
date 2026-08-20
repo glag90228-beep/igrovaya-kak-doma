@@ -318,24 +318,33 @@ screens.home = async function home() {
    */
   if (s.basisMismatch) {
     const m = s.basisMismatch;
-    const fix = h('button', { class: 'btn' }, 'Считать долг по счетам');
+    // Куда переключать — говорит сервер, по самим документам. Кнопка «по
+    // счетам» у того, у кого счета уже включены, ничего не меняла и
+    // рапортовала «Готово» — замкнутый круг вместо помощи.
+    const toBill = m.to === 'invoice';
+    const fix = h('button', { class: 'btn' }, toBill ? 'Считать долг по счетам' : 'Считать долг по актам');
     fix.onclick = () => withBusy(fix, async () => {
-      const r = await api('POST', '/api/basis', { basis: 'invoice' });
+      const r = await api('POST', '/api/basis', { basis: m.to });
       haptic('medium');
-      toast(r.fixed && r.fixed.added
-        ? `Пересчитал: долг появился по ${r.fixed.added} ${plural(r.fixed.added, 'документу', 'документам', 'документам')}`
-        : 'Готово');
+      const f = r.fixed || {};
+      toast(f.added
+        ? `Пересчитал: долг появился по ${f.added} ${plural(f.added, 'документу', 'документам', 'документам')}`
+        : (f.paid ? `Пересчитал журнал: поправлено строк оплаты — ${f.paid}` : 'Готово'));
       cache = {};
       reset('home');
     });
+    const what = toBill ? ['счёт', 'счёта', 'счетов'] : ['документ', 'документа', 'документов'];
     box.append(h('div', { class: 'card' },
       h('div', { class: 'row' },
         h('span', { class: 'icon-box warn' }, icon('warn')),
         h('span', { class: 'grow' },
-          h('div', { text: 'Долг считается по актам, а не по счетам' }),
+          h('div', { text: toBill ? 'Долг считается по актам, а не по счетам'
+            : 'Долг считается по счетам, а не по актам' }),
           h('div', { class: 'small muted', text: `Поэтому сверху ноль, хотя ${m.count} `
-            + `${plural(m.count, 'счёт', 'счёта', 'счетов')} на ${money0(m.sum)} не оплачены. `
-            + 'Если для вас долг возникает со счёта — переключите, я пересчитаю прошлые.' }))),
+            + `${plural(m.count, ...what)} на ${money0(m.sum)} не оплачены. `
+            + (toBill
+              ? 'Если для вас долг возникает со счёта — переключите, я пересчитаю прошлые.'
+              : 'Если для вас долг возникает с акта — переключите, я пересчитаю прошлые.') }))),
       h('div', { class: 'btn-wrap' }, fix)));
   }
 
@@ -438,13 +447,17 @@ screens.why = async function why() {
     // Сирот, сидящих в самой сумме, и сирот у остальных контрагентов
     // называем врозь: одним числом вышло бы «три операции держат 3 000»,
     // хотя держит одна, а две другие гасят друг друга у другого клиента.
-    const here = b.orphanCount
-      ? `${money(b.orphan)} в этой сумме держат ${b.orphanCount} `
-        + `${plural(b.orphanCount, 'операция', 'операции', 'операций')}`
-      : 'В этой сумме их нет, но в журнале они есть';
-    const other = b.orphanOther
-      ? `. Ещё ${b.orphanOther} ${plural(b.orphanOther, 'такая операция', 'такие операции', 'таких операций')} `
-        + 'у других контрагентов'
+    // Считаем держащими только тех, кто действительно что-то держит: две
+    // операции, гасящие друг друга, дали бы «0,00 ₽ держат 2 операции».
+    const held = b.orphan ? b.orphanCount : 0;
+    const rest = lost - held;
+    const here = held
+      ? `${money(b.orphan)} в этой сумме держат ${held} `
+        + `${plural(held, 'операция', 'операции', 'операций')}`
+      : 'На саму сумму они не влияют, но в журнале есть';
+    const other = rest
+      ? `${held ? '. Ещё' : ':'} ${rest} `
+        + `${plural(rest, 'такая операция', 'такие операции', 'таких операций')}`
       : '';
     box.append(h('div', { class: 'card' }, h('div', { class: 'row' },
       h('span', { class: 'icon-box warn' }, icon('warn')),
@@ -603,7 +616,24 @@ screens.doc = async function docScreen({ id }) {
         h('span', { class: `icon-box ${paid ? 'ok' : ''}` }, icon(paid ? 'check' : 'clock')),
         h('span', { class: 'grow' },
           h('div', { text: paid ? 'Оплачен' : 'Ждёт оплаты' }),
-          h('div', { class: 'small muted', text: paid ? `отмечено ${ru(d.paidAt)}` : 'долг числится за клиентом' })))));
+          h('div', {
+            class: 'small muted',
+            text: paid ? `отмечено ${ru(d.paidAt)}`
+              : (d.noDebt ? 'долг по этому документу отменён вручную' : 'долг числится за клиентом'),
+          })))));
+    // Отмену проводки надо уметь отменить: без этой кнопки документ навсегда
+    // выпадал из долга, продолжая числиться в ожидающих оплаты.
+    if (d.noDebt) {
+      box.append(h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn secondary',
+        onclick: (e) => withBusy(e.currentTarget, async () => {
+          await api('POST', '/api/doc/debt', { id: d.id });
+          haptic('medium');
+          toast('Документ вернулся в долг');
+          render();
+        }),
+      }, 'Вернуть в долг')));
+    }
     box.append(h('div', { class: 'btn-wrap' }, h('button', {
       class: paid ? 'btn ghost' : 'btn',
       onclick: (e) => withBusy(e.currentTarget, async () => {
