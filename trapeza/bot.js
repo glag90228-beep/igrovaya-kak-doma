@@ -18,6 +18,7 @@ const { buildTorg12Html } = require('./lib/torg12');
 const { buildDogovorHtml } = require('./lib/dogovor');
 const { pdfAvailable, htmlToPdf } = require('./lib/pdf');
 const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
+const speech = require('./lib/speech');
 const { applySetup } = require('./lib/bot-setup');
 const { acquire: acquireLock } = require('./lib/lock');
 const { supportScreen, forwardToSupport, legalLine } = require('./lib/bot-support');
@@ -2206,6 +2207,49 @@ async function handleStatement(tg, chatId, user, msg) {
   ]));
 }
 
+/**
+ * Голосовое сообщение.
+ *
+ * Расшифровка — не действие, а всего лишь ввод: дальше фраза идёт ровно тем
+ * же путём, что и напечатанная. Поэтому распознанное сначала показываем, и
+ * только потом отвечаем: человек должен увидеть, что бот услышал, прежде
+ * чем тот начнёт заполнять счёт. Расслышать «Заре» как «Заре-Строй» дороже,
+ * чем лишняя строка в переписке.
+ */
+async function handleVoice(tg, chatId, user, msg) {
+  if (!speech.speechAvailable()) {
+    await tg.sendMessage(chatId,
+      'Голосовые я пока не разбираю — нужен внешний сервис распознавания речи.\n'
+      + `<i>${esc(speech.speechHint())}</i>\n\n`
+      + 'Напишите то же самое текстом — пойму так же.', mainMenu());
+    return;
+  }
+
+  const src = msg.voice || msg.audio || msg.video_note || {};
+  if (!src.file_id) return;
+  // Потолок Telegram на скачивание ботом — 20 МБ, выше него файла не будет.
+  const buf = await tg.downloadFile(src.file_id, 20 * 1024 * 1024).catch(() => null);
+  if (!buf) {
+    await tg.sendMessage(chatId, 'Не смог забрать запись из Telegram. Попробуйте ещё раз.', mainMenu());
+    return;
+  }
+
+  await tg.sendMessage(chatId, '🎧 Слушаю…');
+  const got = await speech.transcribe(buf, Number(src.duration) || 0);
+  if (!got.ok) {
+    await tg.sendMessage(chatId, `Не разобрал запись: ${esc(got.error)}`, mainMenu());
+    return;
+  }
+
+  await tg.sendMessage(chatId, `Услышал: «${esc(got.text)}»`);
+  const answered = await handleFreeText(tg, chatId, user, got.text);
+  if (!answered) {
+    await tg.sendMessage(chatId,
+      'Не понял, что с этим сделать. Скажите иначе — например: «выставь счёт Заре на 30 тысяч» '
+      + 'или «кто мне должен».', mainMenu());
+  }
+}
+
 async function handlePhoto(tg, chatId, user, msg) {
   // Ждём снимок подписи или печати — тогда это не счёт для распознавания.
   const st = bdb.getState(user.id);
@@ -2718,6 +2762,12 @@ async function route(tg, update) {
     const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
     bdb.markActive(user.id);
     return handleStatement(tg, msg.chat.id, user, msg);
+  }
+  if (msg.voice || msg.audio || msg.video_note) {
+    const from = msg.from || {};
+    const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
+    bdb.markActive(user.id);
+    return handleVoice(tg, msg.chat.id, user, msg);
   }
   if (msg.text) return handleMessage(tg, msg);
   return undefined;

@@ -529,6 +529,10 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 
 /* ---------- нижняя навигация ---------- */
 
+/* Высота вкладок нужна не только им: над ними стоит строка ввода в
+   переписке, и обе должны считать её от одного числа. */
+:root { --tabs-h: calc(57px + env(safe-area-inset-bottom, 0px)); }
+
 .tabs {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
   display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
@@ -571,6 +575,49 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .toast[hidden] { display: none; }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .toast.err { background: #8c2b23; }
+
+/* ---------- переписка с агентом ---------- */
+
+/* Место под строку ввода: она приклеена к низу над вкладками, и без
+   отступа последний ответ прячется под ней. */
+/* Отступ снизу считаем от того, что реально стоит над лентой: вкладки
+   (56px + безопасная зона) и строка ввода поверх них. Без этого последний
+   ответ прятался под строкой — а именно его и читают. */
+.chat {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 0 var(--pad);
+  padding-bottom: calc(var(--tabs-h) + 76px);
+}
+.bubble {
+  max-width: 88%; padding: 11px 14px; border-radius: 16px;
+  font-size: 15px; line-height: 1.45; white-space: pre-line;
+  background: var(--surface); box-shadow: var(--shadow-1);
+}
+.bubble.me { align-self: flex-end; background: var(--primary); color: #fff; }
+.bubble .btn-wrap { margin: 10px 0 0; padding: 0; }
+
+.ask-bar {
+  position: fixed; left: 0; right: 0; bottom: var(--tabs-h); z-index: 41;
+  display: flex; gap: 8px; align-items: center;
+  padding: 10px var(--pad);
+  background: var(--bg); border-top: 1px solid var(--hairline);
+}
+.ask-input {
+  flex: 1; min-width: 0; min-height: 44px;
+  padding: 10px 14px; border-radius: 22px;
+  border: 1px solid var(--hairline); background: var(--surface);
+  color: inherit; font: inherit;
+}
+.mic {
+  width: 44px; height: 44px; flex: none; border: 0; border-radius: 50%;
+  display: grid; place-items: center; cursor: pointer;
+  background: var(--surface); color: var(--primary); box-shadow: var(--shadow-1);
+}
+.mic.send { background: var(--primary); color: #fff; }
+/* Идёт запись: кнопка красная и считает секунды вслух — иначе непонятно,
+   слышит ли она вообще. */
+.mic.on { background: var(--money-out); color: #fff; }
+.mic .rec-sec { font: 600 15px/1 var(--font); font-variant-numeric: tabular-nums; }
 
 /* ---------- появление экрана ---------- */
 

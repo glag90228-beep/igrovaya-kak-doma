@@ -289,6 +289,48 @@ const ok = (c, m, extra) => {
   ok(bdb.balanceOf(user.id, cp).closing === 15000,
     'и сальдо вернулось к начальному', bdb.balanceOf(user.id, cp).closing);
 
+  /*
+   * Экран переписки. Рамки должны быть названы до того, как человек начал
+   * печатать: узнать после третьего вопроса про взносы, что бот их не
+   * ведёт, — обидно. И агент не должен ничего выписывать сам.
+   */
+  console.log('\n── переписка с агентом ──');
+  await page.evaluate(() => window.__go('ask', {}));
+  await page.waitForSelector('.ask-bar');
+  const hello = await page.evaluate(() => document.querySelector('.bubble').textContent);
+  ok(/Налоги/.test(hello) && /не веду/.test(hello), 'рамки объявлены сразу, до первого вопроса',
+    hello.slice(0, 60));
+  ok(await page.evaluate(() => Boolean(document.querySelector('.mic'))), 'кнопка записи на месте');
+
+  const docsWas = bdb.listDocs(user.id, 50).length;
+  await page.locator('.ask-input').fill('выставь счёт Заре');
+  await page.locator('.ask-input').press('Enter');
+  await page.waitForTimeout(900);
+  const replies = await page.evaluate(() => [...document.querySelectorAll('.bubble')].map((b) => b.textContent));
+  ok(replies.some((t) => /Заре/.test(t)), 'услышанное показано в переписке', replies.length);
+  ok(replies.some((t) => /сам я ничего не выписываю/.test(t)),
+    'и сказано прямо: сам не выписывает');
+  ok(bdb.listDocs(user.id, 50).length === docsWas,
+    'документ действительно не выписан', `${docsWas} → ${bdb.listDocs(user.id, 50).length}`);
+
+  await page.locator('.ask-input').fill('когда платить взносы за себя');
+  await page.locator('.ask-input').press('Enter');
+  await page.waitForTimeout(900);
+  const last = await page.evaluate(() => {
+    const all = document.querySelectorAll('.bubble');
+    return all[all.length - 1].textContent;
+  });
+  ok(/не моя работа/.test(last), 'за налоги не берётся и говорит почему', last.slice(0, 60));
+
+  // Строка ввода приклеена к низу — последний ответ не должен под ней прятаться.
+  const fits = await page.evaluate(() => {
+    const all = document.querySelectorAll('.bubble');
+    const b = all[all.length - 1].getBoundingClientRect();
+    const bar = document.querySelector('.ask-bar').getBoundingClientRect();
+    return b.bottom <= bar.top + 1;
+  });
+  ok(fits, 'последний ответ виден целиком, а не под строкой ввода');
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();

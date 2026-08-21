@@ -170,7 +170,7 @@ const PARENT = {
   letter: 'inbox', inbox: 'more', mail: 'more', bank: 'more', org: 'more',
   billing: 'more', support: 'more', help: 'more', vat: 'more', basis: 'more',
   recurring: 'more', reminders: 'more', registry: 'docs', akt: 'docs',
-  unpaid: 'docs', scan: 'docs', ops: 'cps',
+  unpaid: 'docs', scan: 'docs', ops: 'cps', ask: 'home',
 };
 
 function back() {
@@ -302,6 +302,17 @@ screens.home = async function home() {
   box.append(h('div', { class: 'hero' },
     h('div', { class: 'greet', text: s.user.name ? `Здравствуйте, ${s.user.name.split(' ')[0]}` : 'Здравствуйте' }),
     sumBtn));
+
+  // Спросить словами — рядом с главным действием, а не в «Ещё»: это второй
+  // способ сделать то же самое, и прятать его вглубь бессмысленно.
+  const askRow = h('button', { class: 'row' },
+    h('span', { class: 'icon-box' }, icon('mic')),
+    h('span', { class: 'grow' },
+      h('div', { text: 'Спросить словами' }),
+      h('div', { class: 'small muted', text: 'голосом или текстом — про документы и долги' })),
+    icon('chev', 'chev'));
+  askRow.onclick = () => { haptic(); go('ask'); };
+  box.append(h('div', { class: 'card' }, askRow));
 
   // Одно главное действие, крупнее всего остального.
   const cta = h('button', { class: 'cta' },
@@ -1994,6 +2005,209 @@ screens.ops = async function opsScreen({ cpId }) {
   box.append(h('div', { class: 'card' }, rows));
   box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
     text: 'Смахните строку влево, чтобы убрать. Строки из документов убираются вместе с документом.' }));
+  return box;
+};
+
+/*
+ * Запись голоса в браузере.
+ *
+ * MediaRecorder не годится: он отдаёт WebM (в Safari — MP4), а распознавание
+ * ни того, ни другого не принимает, и перекодировать нечем — ffmpeg на
+ * сервере нет. Поэтому пишем звук сами через Web Audio и собираем WAV: его
+ * принимают все, а заголовок у WAV — сорок четыре байта.
+ *
+ * Сразу к 16 кГц моно: речи этого хватает с запасом, а байтов выходит втрое
+ * меньше — тридцать секунд укладываются в мегабайт и уходят «быстрым»
+ * методом распознавания, который отвечает сразу.
+ */
+const REC_RATE = 16000;
+const REC_MAX_SEC = 30;
+
+async function recordWav(onTick) {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createMediaStreamSource(stream);
+  const node = ctx.createScriptProcessor(4096, 1, 1);
+  const chunks = [];
+  let total = 0;
+  const step = Math.max(1, Math.round(ctx.sampleRate / REC_RATE));
+
+  node.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    const out = new Int16Array(Math.floor(input.length / step));
+    for (let i = 0; i < out.length; i += 1) {
+      // Усредняем группу отсчётов, а не берём каждый третий: прореживание
+      // без усреднения даёт скрежет на шипящих, и слова теряются.
+      let sum = 0;
+      for (let k = 0; k < step; k += 1) sum += input[i * step + k] || 0;
+      const v = Math.max(-1, Math.min(1, sum / step));
+      out[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+    }
+    chunks.push(out);
+    total += out.length;
+    if (onTick) onTick(total / REC_RATE);
+  };
+  src.connect(node);
+  node.connect(ctx.destination);
+
+  const stop = async () => {
+    node.disconnect();
+    src.disconnect();
+    stream.getTracks().forEach((t) => t.stop());
+    await ctx.close().catch(() => {});
+
+    const pcm = new Int16Array(total);
+    let at = 0;
+    for (const c of chunks) { pcm.set(c, at); at += c.length; }
+
+    const buf = new ArrayBuffer(44 + pcm.length * 2);
+    const view = new DataView(buf);
+    const put = (off, s) => { for (let i = 0; i < s.length; i += 1) view.setUint8(off + i, s.charCodeAt(i)); };
+    put(0, 'RIFF'); view.setUint32(4, 36 + pcm.length * 2, true); put(8, 'WAVE');
+    put(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true); view.setUint32(24, REC_RATE, true);
+    view.setUint32(28, REC_RATE * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    put(36, 'data'); view.setUint32(40, pcm.length * 2, true);
+    new Int16Array(buf, 44).set(pcm);
+
+    let bin = '';
+    const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return { audio: btoa(bin), seconds: Math.round(total / REC_RATE) };
+  };
+
+  return { stop };
+}
+
+/*
+ * Переписка с агентом.
+ *
+ * Рамки объявлены первой же строкой, до того как человек начал печатать:
+ * бот работает с документами и расчётами и не ведёт налоги. Узнать это
+ * после третьего вопроса про взносы — обидно; узнать сразу — честно.
+ *
+ * Агент ничего не выписывает сам. Он понимает фразу и открывает нужный
+ * экран с заполненными полями — кнопку жмёт человек. Документ забирает
+ * номер в сквозном ряду, и лишний счёт нельзя тихо удалить.
+ */
+const ASK_GO = {
+  debts: ['Открыть долги', 'debts'],
+  unpaid: ['Кто не заплатил', 'unpaid'],
+  docs: ['Открыть документы', 'docs'],
+  cps: ['Открыть контрагентов', 'cps'],
+  org: ['Открыть реквизиты', 'org'],
+  recurring: ['Открыть повторения', 'recurring'],
+  billing: ['Открыть подписку', 'billing'],
+  akt: ['Собрать акт сверки', 'akt'],
+};
+
+screens.ask = async function ask() {
+  const box = h('div', {}, h('h1', { text: 'Спросить' }));
+  const log = h('div', { class: 'chat' });
+
+  const say = (who, text, action) => {
+    const bubble = h('div', { class: `bubble ${who}` }, h('div', { text }));
+    if (action) bubble.append(h('div', { class: 'btn-wrap' }, action));
+    log.append(bubble);
+    /*
+     * Прокручиваем страницу до конца, а не scrollIntoView по пузырю.
+     * Для браузера пузырь «виден», если попал в окно, — а его закрывает
+     * строка ввода, которая приклеена поверх. Отступ снизу у ленты как раз
+     * на её высоту, поэтому конец страницы — это и есть нужное место.
+     */
+    requestAnimationFrame(() => {
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+    });
+  };
+
+  say('bot', 'Я помогаю с документами и расчётами: счета, акты, УПД, накладные, '
+    + 'договоры и платёжки, кто сколько должен, акт сверки.\n\n'
+    + 'Налоги, взносы, КУДиР, отчётность и зарплату не веду — у меня нет доступа '
+    + 'к вашему банку и кассе, а ошибиться в этом дорого.\n\n'
+    + 'Скажите или напишите, что нужно. Например: «выставь счёт Заре на 30 тысяч за аренду».');
+
+  const field = h('input', { class: 'ask-input', type: 'text', placeholder: 'Что нужно сделать?',
+    enterkeyhint: 'send', autocomplete: 'off' });
+
+  const answer = (r) => {
+    if (r.heard) say('me', r.heard);
+    if (r.error) { say('bot', r.error); return; }
+
+    if (r.action === 'draft') {
+      const btn = h('button', { class: 'btn' }, 'Заполнить документ');
+      btn.onclick = () => { haptic('medium'); go('new', { type: r.docType, items: r.items || [] }); };
+      say('bot', r.who ? `Готовлю документ для «${r.who}». Проверьте поля и нажмите выпуск — сам я ничего не выписываю.`
+        : 'Готовлю документ. Клиента выберете на следующем экране.', btn);
+      return;
+    }
+    if (r.action === 'outofscope') {
+      say('bot', 'Это не моя работа: налоги, взносы, отчётность и зарплату я не веду — '
+        + 'нет доступа к банку и кассе, а подскажу неверно — платить штраф вам.\n\n'
+        + 'Спросите про документы, долги или сверку.');
+      return;
+    }
+    const known = ASK_GO[r.action];
+    if (known) {
+      const btn = h('button', { class: 'btn' }, known[0]);
+      btn.onclick = () => { haptic('medium'); go(known[1]); };
+      say('bot', 'Понял.', btn);
+      return;
+    }
+    if (r.source === 'limit') {
+      say('bot', 'Разбор фраз на этот месяц исчерпан. Кнопки и команды работают как обычно.');
+      return;
+    }
+    if (r.source === 'off') {
+      say('bot', 'Свободный ввод сейчас выключен — пользуйтесь кнопками, они умеют всё то же самое.');
+      return;
+    }
+    say('bot', 'Не понял. Скажите иначе — например: «кто мне должен» или «выставь счёт Заре на 30 тысяч».');
+  };
+
+  const send = async () => {
+    const text = field.value.trim();
+    if (!text) return;
+    field.value = '';
+    try { answer(await api('POST', '/api/ask', { text })); } catch (e) { say('bot', e.message); }
+  };
+  field.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); send(); } };
+
+  const mic = h('button', { class: 'mic', 'aria-label': 'Записать голосом' }, icon('mic'));
+  let rec = null;
+  mic.onclick = async () => {
+    if (rec) {
+      const r = rec; rec = null;
+      mic.classList.remove('on');
+      mic.replaceChildren(icon('mic'));
+      const { audio, seconds } = await r.stop();
+      if (!seconds) { say('bot', 'Запись пустая — кажется, микрофон не слышит.'); return; }
+      say('bot', '🎧 Слушаю…');
+      try { answer(await api('POST', '/api/ask/voice', { audio, seconds })); } catch (e) { say('bot', e.message); }
+      return;
+    }
+    try {
+      haptic('medium');
+      mic.classList.add('on');
+      rec = await recordWav((sec) => {
+        mic.replaceChildren(h('span', { class: 'rec-sec', text: String(Math.floor(sec)) }));
+        // Больше тридцати секунд «быстрый» метод не берёт, и ждать
+        // распознавания пришлось бы вдвое дольше самой записи.
+        if (sec >= REC_MAX_SEC) mic.click();
+      });
+    } catch (_) {
+      rec = null;
+      mic.classList.remove('on');
+      mic.replaceChildren(icon('mic'));
+      say('bot', 'Не дали доступ к микрофону. Напишите текстом — пойму так же.');
+    }
+  };
+
+  const sendBtn = h('button', { class: 'mic send', 'aria-label': 'Отправить' }, icon('send'));
+  sendBtn.onclick = send;
+
+  box.append(log, h('div', { class: 'ask-bar' }, field, mic, sendBtn));
   return box;
 };
 

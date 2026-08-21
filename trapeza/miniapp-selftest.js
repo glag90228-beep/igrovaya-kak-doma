@@ -485,6 +485,51 @@ async function main() {
       'и слагаемые сходятся', JSON.stringify(w));
   }
 
+  console.log('\n── переписка с агентом ──');
+  {
+    /*
+     * Агент в приложении отвечает намерением, а не действием: документ он
+     * не выписывает никогда — номер уходит в сквозной ряд, и лишний счёт
+     * не удалить тихо. Проверяем, что он понимает, отказывается от чужой
+     * работы и не действует сам.
+     */
+    r = await call('POST', '/api/ask', { user: masha, body: { text: '' } });
+    ok(r.status === 400, 'пустой вопрос отклонён');
+
+    r = await call('POST', '/api/ask', { user: masha, body: { text: 'кто мне должен' } });
+    ok(r.status === 200 && r.json.action === 'debts' && r.json.source === 'local',
+      'вопрос про долги разобран бесплатно', JSON.stringify(r.json).slice(0, 80));
+    ok(r.json.heard === 'кто мне должен', 'в ответе видно, что услышано');
+
+    r = await call('POST', '/api/ask', { user: masha, body: { text: 'когда платить взносы за себя' } });
+    ok(r.json.action === 'outofscope', 'за налоги не берётся', r.json.action);
+
+    r = await call('POST', '/api/ask', { user: masha, body: { text: 'выставь счёт Заре' } });
+    ok(r.json.action === 'draft' && r.json.docType === 'sch',
+      'счёт разобран как намерение, но не выписан', JSON.stringify(r.json).slice(0, 80));
+    const docsBefore = (await call('GET', '/api/docs', { user: masha })).json.docs.length;
+    const docsAfter = (await call('GET', '/api/docs', { user: masha })).json.docs.length;
+    ok(docsBefore === docsAfter, 'переписка ничего не выписала сама', `${docsBefore} → ${docsAfter}`);
+
+    // Голос: без провайдера — честный отказ, с заглушкой — разбор.
+    r = await call('POST', '/api/ask/voice', { user: masha, body: { audio: 'AAA=' } });
+    ok(r.status === 400 && /не подключено|SPEECH/i.test(r.json.error || ''),
+      'без распознавания речи отказ понятен', (r.json || {}).error);
+
+    process.env.SPEECH_PROVIDER = 'mock';
+    process.env.SPEECH_MOCK = 'что не оплачено';
+    r = await call('POST', '/api/ask/voice', { user: masha, body: { audio: Buffer.from('OggS зв').toString('base64'), seconds: 3 } });
+    ok(r.status === 200 && r.json.action === 'unpaid' && r.json.heard === 'что не оплачено',
+      'голос расшифрован и разобран', JSON.stringify(r.json).slice(0, 80));
+    r = await call('POST', '/api/ask/voice', { user: masha, body: { audio: '' } });
+    ok(r.status === 400, 'пустая запись отклонена');
+    delete process.env.SPEECH_PROVIDER;
+    delete process.env.SPEECH_MOCK;
+
+    r = await call('POST', '/api/ask', { user: petya, body: { text: 'кто мне должен' } });
+    ok(r.status === 200 && r.json.action === 'debts', 'у второго пользователя свой разбор');
+  }
+
   console.log('\n── начальное сальдо и период акта ──');
   {
     // Раньше приложение не умело задать начальное сальдо вовсе: полей не

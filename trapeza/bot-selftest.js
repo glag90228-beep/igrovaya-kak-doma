@@ -2020,6 +2020,78 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     delete process.env.AI_MOCK;
   }
 
+  console.log('\n── голосовое сообщение ──');
+  {
+    /*
+     * Голос — это ввод, а не действие: расшифровка идёт тем же путём, что и
+     * напечатанная фраза. Проверяем весь путь с заглушкой вместо сети: бот
+     * должен сперва показать услышанное и только потом отвечать.
+     */
+    const sp = require('./lib/speech');
+    ok(sp.speechAvailable() === false, 'без провайдера речи модуль молчит');
+    ok(/не подключено/i.test(sp.speechHint()), 'и объясняет почему', sp.speechHint());
+
+    // Определение формата по сигнатуре, а не по слову отправителя.
+    ok(sp.sniff(Buffer.from('OggS\0\0\0\0')) === 'oggopus', 'OGG узнаётся по сигнатуре');
+    ok(sp.sniff(Buffer.concat([Buffer.alloc(4), Buffer.from('ftypisom')])) === 'mp4',
+      'MP4 узнаётся по сигнатуре');
+    ok(sp.sniff(Buffer.from('что-то не то')) === '', 'мусор не выдаёт себя за звук');
+
+    // WAV из приложения: заголовок снимается, частота читается.
+    const wav = Buffer.alloc(44 + 200);
+    wav.write('RIFF', 0); wav.writeUInt32LE(36 + 200, 4); wav.write('WAVE', 8);
+    wav.write('fmt ', 12); wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20);
+    wav.writeUInt16LE(1, 22); wav.writeUInt32LE(16000, 24); wav.writeUInt32LE(32000, 28);
+    wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34);
+    wav.write('data', 36); wav.writeUInt32LE(200, 40);
+    const parsed = sp.parseWav(wav);
+    ok(parsed && parsed.rate === 16000 && parsed.pcm.length === 200,
+      'WAV разобран: частота и звук отдельно', parsed && `${parsed.rate}/${parsed.pcm.length}`);
+    ok(sp.parseWav(Buffer.from('не wav совсем')) === null, 'не-WAV честно отвергнут');
+
+    /*
+     * Ответ асинхронного распознавания — склеенные подряд объекты, а не
+     * массив. Наивный JSON.parse на таком падает, поэтому разбираем сами —
+     * и скобка внутри строки не должна нас сбить.
+     */
+    const stream = sp.splitJsonStream('{"a":1}{"b":{"c":"}"}}{битый');
+    ok(stream.length === 2 && stream[1].b.c === '}',
+      'поток JSON разобран, скобка в строке не сбила', JSON.stringify(stream));
+
+    process.env.SPEECH_PROVIDER = 'mock';
+    tg.downloadFile = async () => Buffer.from('OggS запись');
+    ok(sp.speechAvailable() === true, 'с заглушкой модуль готов');
+    process.env.SPEECH_MOCK = 'кто мне должен';
+    const heard = await sp.transcribe(Buffer.from('OggS звук'), 5);
+    ok(heard.ok && heard.text === 'кто мне должен', 'заглушка расшифровала', JSON.stringify(heard));
+    ok((await sp.transcribe(Buffer.alloc(0))).ok === false, 'пустая запись отвергнута');
+
+    // Весь путь: пришло голосовое — бот показал услышанное и ответил долгами.
+    sent.length = 0;
+    await handleUpdate(tg, {
+      message: {
+        message_id: 900, chat: CHAT, from: USER,
+        voice: { file_id: 'voice-1', duration: 4, mime_type: 'audio/ogg' },
+      },
+    });
+    const texts = sent.map((m) => norm(m.text || ''));
+    ok(texts.some((t) => t.includes('Услышал')), 'бот показал, что услышал', texts.join(' | ').slice(0, 120));
+    ok(texts.some((t) => /должен|долг/i.test(t)), 'и выполнил услышанное');
+
+    delete process.env.SPEECH_PROVIDER;
+    delete process.env.SPEECH_MOCK;
+    sent.length = 0;
+    await handleUpdate(tg, {
+      message: {
+        message_id: 901, chat: CHAT, from: USER,
+        voice: { file_id: 'voice-2', duration: 4 },
+      },
+    });
+    ok(norm(sent.map((m) => m.text).join(' ')).includes('не разбираю'),
+      'без провайдера бот честно говорит, что голос не разбирает',
+      norm(sent.map((m) => m.text).join(' ')).slice(0, 80));
+  }
+
   console.log('\n── проводка не переживает свой документ ──');
   {
     const bdbO = require('./lib/bot-db');

@@ -35,6 +35,8 @@ const { buildAkt } = require('./lib/xlsx-akt');
 const { buildRegistry } = require('./lib/xlsx-registry');
 const { fetchNew } = require('./lib/imap');
 const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
+const speech = require('./lib/speech');
+const ai = require('./lib/ai-agent');
 const { forwardToSupport } = require('./lib/bot-support');
 const { formatRub } = require('./lib/money');
 const mime = require('./lib/mime');
@@ -1113,6 +1115,34 @@ const api = {
         theyOwe: d.theyOwe, days: d.days, lastOp: d.lastOp,
       })),
     };
+  },
+
+  /**
+   * Переписка с агентом. Разбирает фразу и говорит, куда пойти, — но сам
+   * ничего не выписывает: документ забирает номер в сквозном ряду, и лишний
+   * счёт нельзя тихо удалить. Приложение по ответу открывает нужный экран,
+   * кнопку жмёт человек.
+   */
+  async 'POST /api/ask'({ user, body }) {
+    const text = str(body.text, 1000);
+    if (!text) return { error: 'Напишите или скажите, что нужно.' };
+    const intent = await ai.understand(text, user.id);
+    return { ...intent, heard: text, budget: ai.budget(user.id) };
+  },
+
+  /** То же самое, но голосом: расшифровали и сразу разобрали. */
+  async 'POST /api/ask/voice'({ user, body }) {
+    if (!speech.speechAvailable()) return { error: speech.speechHint() };
+    const raw = String(body.audio || '');
+    if (!raw) return { error: 'Пустая запись.' };
+    // Запись приходит base64 из MediaRecorder. Потолок тот же, что у
+    // Telegram: 20 МБ, дальше это уже не голосовое сообщение.
+    const buf = Buffer.from(raw, 'base64');
+    if (buf.length > 20 * 1024 * 1024) return { error: 'Запись слишком длинная.' };
+    const got = await speech.transcribe(buf, Number(body.seconds) || 0);
+    if (!got.ok) return { error: got.error };
+    const intent = await ai.understand(got.text, user.id);
+    return { ...intent, heard: got.text, budget: ai.budget(user.id) };
   },
 
   /** Журнал операций одного контрагента: что именно держит его сальдо. */
