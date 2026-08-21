@@ -156,8 +156,28 @@ function go(name, params = {}) {
   render();
 }
 
+/*
+ * Куда возвращаться, если в стопке ничего нет.
+ *
+ * Часть экранов открывается через reset — например, карточка клиента сразу
+ * после внесения оплаты. Стопка при этом схлопывается в один элемент, а
+ * кнопка «Назад» в шапке остаётся видимой (экран-то не вкладка) и не делает
+ * ничего. Со стороны это просто сломанная кнопка. Поэтому у каждого такого
+ * экрана есть родитель, и назад всегда есть куда.
+ */
+const PARENT = {
+  cp: 'cps', op: 'cps', doc: 'docs', new: 'docs', other: 'docs', why: 'home',
+  letter: 'inbox', inbox: 'more', mail: 'more', bank: 'more', org: 'more',
+  billing: 'more', support: 'more', help: 'more', vat: 'more', basis: 'more',
+  recurring: 'more', reminders: 'more', registry: 'docs', akt: 'docs',
+  unpaid: 'docs', scan: 'docs', ops: 'cps',
+};
+
 function back() {
-  if (stack.length > 1) { stack.pop(); render(); }
+  if (stack.length > 1) { stack.pop(); render(); return; }
+  const { name } = current();
+  if (TABS.some((t) => t.name === name)) return;   // вкладка — возвращаться некуда
+  reset(PARENT[name] || 'home');
 }
 
 function reset(name, params = {}) {
@@ -478,9 +498,22 @@ screens.docs = async function docs({ cp } = {}) {
   const { docs: list } = await api('GET', `/api/docs${cp ? `?cp=${cp}` : ''}`);
   const box = h('div', {}, h('h1', { text: 'Документы' }));
   if (!list.length) {
-    box.append(empty('doc', 'Журнал пуст',
-      'Здесь появятся все выписанные документы — их можно переслать заново или повторить новым номером.',
-      h('div', { class: 'btn-wrap' }, h('button', { class: 'btn', onclick: () => go('new', { type: 'sch' }) }, 'Выписать счёт'))));
+    /*
+     * Пустой журнал — не значит «денег нет». Оплаты и приходы вносят руками,
+     * и они живут отдельно от документов: человек видел здесь пустоту и
+     * тупик, хотя за клиентами числились суммы. Поэтому второй выход —
+     * в журнал операций.
+     */
+    box.append(empty('doc', 'Документов пока нет',
+      'Здесь появятся выписанные документы — их можно переслать заново или повторить '
+      + 'новым номером. Оплаты и приходы вносятся отдельно, в журнале операций.',
+      h('div', { class: 'btn-wrap' },
+        h('button', { class: 'btn', onclick: () => { haptic('medium'); go('new', { type: 'sch', cpId: cp }); } },
+          'Выписать счёт'),
+        h('button', {
+          class: 'btn secondary',
+          onclick: () => { haptic(); go(cp ? 'ops' : 'cps', cp ? { cpId: cp } : {}); },
+        }, 'Внести оплату или приход'))));
     return box;
   }
   // Оплачен или нет — то, ради чего в журнал и заходят. Без метки строки
@@ -943,14 +976,27 @@ screens.cp = async function cpScreen({ id }) {
   };
 
   if (id) {
+    /*
+     * Сумма стоит отдельной строкой, а не справа от заголовка.
+     *
+     * Справа ей не хватало места: подпись «Начали с 105 691,30 ₽ на
+     * 01.08.2026» шире половины экрана, и шестизначная сумма налезала на
+     * слова «Должен нам». А это главная цифра карточки — ради неё сюда и
+     * заходят, ей и место построчнее.
+     */
+    const balanceRow = h('button', { class: 'row balance' },
+      h('span', { class: 'grow' },
+        h('div', { class: 'ellipsis muted small',
+          text: cp.balance ? (owesUs(cp) ? 'Должен нам' : 'Должны мы') : 'Сальдо' }),
+        h('div', { class: `v money ${balanceTone(cp)}`, text: money(Math.abs(cp.balance || 0)) }),
+        h('div', { class: 'hint', text: openingHint() })),
+      icon('chev', 'chev'));
+    balanceRow.onclick = () => { haptic(); gotoOpening(); };
+
     box.append(h('div', { class: 'card' },
-      navRow({
-        title: cp.balance ? (owesUs(cp) ? 'Должен нам' : 'Должны мы') : 'Сальдо',
-        sub: openingHint(),
-        right: money(Math.abs(cp.balance || 0)),
-        rightTone: balanceTone(cp),
-        onclick: gotoOpening,
-      }),
+      balanceRow,
+      navRow({ icon: 'list', title: 'Журнал операций', sub: 'внесённое руками и из выписки',
+        onclick: () => go('ops', { cpId: id }) }),
       navRow({ icon: 'receipt', title: 'Выписать счёт', onclick: () => go('new', { type: 'sch', cpId: id }) }),
       navRow({ icon: 'wallet', title: 'Внести оплату или приход', onclick: () => go('op', { cpId: id }) }),
       navRow({ icon: 'doc', title: 'Акт сверки', sub: 'таблица операций в Excel',
@@ -1883,6 +1929,74 @@ screens.op = async function op({ cpId, doc }) {
   return box;
 };
 
+/*
+ * Журнал операций контрагента.
+ *
+ * До сих пор внесённое руками можно было только добавить: увидеть строки и
+ * убрать лишнюю было негде — в боте отменялась лишь последняя. А именно эти
+ * строки чаще всего и держат сумму на главной, из-за которой «удаляю
+ * документы, а цифра стоит». Поэтому здесь они видны все и смахиваются.
+ */
+screens.ops = async function opsScreen({ cpId }) {
+  const j = await api('GET', `/api/ops?cp=${cpId}`);
+  const box = h('div', {}, h('h1', { text: 'Журнал операций' }));
+  box.append(h('div', { class: 'hero' },
+    h('div', { class: 'greet', text: j.cp.name }),
+    h('div', { class: 'sum money', text: money0(Math.abs(j.closing)) }),
+    h('div', { class: 'sub', text: j.closing ? 'текущее сальдо' : 'расчёты сошлись' })));
+
+  const add = h('button', { class: 'btn' }, 'Внести оплату или приход');
+  add.onclick = () => { haptic('medium'); go('op', { cpId }); };
+  box.append(h('div', { class: 'btn-wrap' }, add));
+
+  if (j.opening) {
+    box.append(h('div', { class: 'card' }, navRow({
+      icon: 'clock',
+      title: 'Начальное сальдо',
+      sub: j.openingDate ? `на ${ru(j.openingDate)}` : 'до начала расчётов',
+      right: money(j.opening),
+      // Строка не из журнала: правится в карточке, а не смахиванием.
+      onclick: () => go('cp', { id: cpId }),
+    })));
+  }
+
+  if (!j.ops.length) {
+    box.append(empty('list', 'Операций нет',
+      j.opening
+        ? 'Сальдо держит начальное значение из карточки клиента.'
+        : 'Здесь появятся оплаты и приходы — внесённые руками и из выписки.'));
+    return box;
+  }
+
+  const rows = j.ops.map((o) => {
+    const row = navRow({
+      icon: o.delta > 0 ? 'plus' : 'minus',
+      title: o.kind || (o.delta > 0 ? 'Приход' : 'Оплата'),
+      sub: [ru(o.date), o.doc, o.fromDoc ? 'из документа' : ''].filter(Boolean).join(' · '),
+      right: money(Math.abs(o.delta)),
+      rightTone: o.delta > 0 ? 'in' : 'out',
+      onclick: () => {},
+    });
+    // Строки, пришедшие из документа, отсюда не трогаем: их снимает сам
+    // документ, а убрать проводку в обход него — значит развести журнал с
+    // тем, что напечатано на бумаге.
+    if (o.fromDoc) return row;
+    return swipeToDelete(row, {
+      label: 'Убрать операцию',
+      onDelete: async () => {
+        const r = await api('POST', '/api/op/delete', { id: o.id, cpId });
+        haptic('medium');
+        toast(`Убрано. Сальдо: ${money(Math.abs(r.balance))}`);
+        render();                        // перерисовать, не теряя дорогу назад
+      },
+    });
+  });
+  box.append(h('div', { class: 'card' }, rows));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Смахните строку влево, чтобы убрать. Строки из документов убираются вместе с документом.' }));
+  return box;
+};
+
 /** Счета, по которым не отметили оплату. */
 screens.unpaid = async function unpaid() {
   const { docs: list } = await api('GET', '/api/unpaid');
@@ -2734,6 +2848,43 @@ screens.new = async function newDoc(params) {
 
 // ---------- запуск ----------
 
+/*
+ * Назад пальцем от левого края.
+ *
+ * Так возвращаются во всех телефонах, и руке это привычнее, чем тянуться к
+ * шапке. Начало жеста ограничено полосой у края: строки списков смахиваются
+ * влево для удаления, и если ловить движение по всему экрану, одно будет
+ * мешать другому. Порог по горизонтали больше вертикального разброса —
+ * иначе прокрутка списка иногда уводила бы с экрана.
+ */
+function edgeSwipeBack() {
+  const EDGE = 28;          // откуда считаем жест краевым
+  const NEED = 70;          // сколько надо протянуть
+  let x0 = 0;
+  let y0 = 0;
+  let live = false;
+
+  document.addEventListener('touchstart', (e) => {
+    const t = e.touches[0];
+    live = t.clientX <= EDGE;
+    x0 = t.clientX;
+    y0 = t.clientY;
+  }, { passive: true });
+
+  document.addEventListener('touchmove', (e) => {
+    if (!live) return;
+    const t = e.touches[0];
+    if (Math.abs(t.clientY - y0) > Math.abs(t.clientX - x0)) live = false;   // это прокрутка
+  }, { passive: true });
+
+  document.addEventListener('touchend', (e) => {
+    if (!live) return;
+    live = false;
+    const t = e.changedTouches[0];
+    if (t.clientX - x0 >= NEED && Math.abs(t.clientY - y0) < NEED) { haptic(); back(); }
+  }, { passive: true });
+}
+
 function buildTabs() {
   tabsBox.replaceChildren(...TABS.map((t) => h('button', {
     class: 'tab', dataset: { name: t.name }, type: 'button',
@@ -2759,6 +2910,7 @@ function start() {
   tg.ready();
   tg.expand();
   tg.BackButton.onClick(back);
+  edgeSwipeBack();
   if (tg.setHeaderColor) { try { tg.setHeaderColor('secondary_bg_color'); } catch (_) { /* старый клиент */ } }
   if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); // чтобы список не закрывал окно
 

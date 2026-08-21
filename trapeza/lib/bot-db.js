@@ -342,7 +342,23 @@ function listOps(userId, cpId) {
 function deleteLastOp(userId, cpId) {
   const cp = getCp(userId, cpId);
   if (!cp) return false;
-  const row = db.prepare('SELECT id, kind, doc_id FROM operations WHERE cp_id = ? ORDER BY date DESC, sort DESC, id DESC LIMIT 1').get(cpId);
+  const row = db.prepare('SELECT id FROM operations WHERE cp_id = ? ORDER BY date DESC, sort DESC, id DESC LIMIT 1').get(cpId);
+  return row ? deleteOp(userId, row.id) : false;
+}
+
+/**
+ * Убрать одну операцию — любую, а не только последнюю.
+ *
+ * В боте отменяют последнюю, и этого мало: сумму на главной держат четыре
+ * строки, внесённые руками полгода назад, и чтобы добраться до второй,
+ * приходилось сносить все. В приложении их видно списком и смахивается
+ * нужная.
+ */
+function deleteOp(userId, opId) {
+  const row = db.prepare(`
+    SELECT o.id, o.kind, o.doc_id FROM operations o
+      JOIN counterparties c ON c.id = o.cp_id
+     WHERE o.id = ? AND c.user_id = ?`).get(Number(opId), userId);
   if (!row) return false;
   db.prepare('DELETE FROM operations WHERE id = ?').run(row.id);
   /*
@@ -1096,7 +1112,7 @@ module.exports = {
   getOrCreateUser, setState, getState, clearState,
   createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp,
-  addOp, listOps, deleteLastOp, balanceOf, debtors, debtBreakdown, periodBalance, cpForPeriod,
+  addOp, listOps, deleteLastOp, deleteOp, balanceOf, debtors, debtBreakdown, periodBalance, cpForPeriod,
   knownBankKeys, importBankRows,
   DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
   debtByDoc, rebuildDebt, restoreDebt,

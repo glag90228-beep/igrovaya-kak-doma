@@ -175,6 +175,20 @@ button.row:active, a.row:active, .tile:active, .btn:active {
 .row .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Вторая строка: метка состояния и пояснение в одну линию. */
 .sub-line { display: flex; align-items: center; gap: 8px; margin-top: 3px; min-width: 0; }
+/* Пояснение режем многоточием. Без этого длинная подпись не ужималась и
+   выталкивала сумму справа прямо на заголовок строки. */
+.sub-line .small { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+/* Сальдо в карточке контрагента: сумма собственной строкой.
+   Рядом с подписью «Начали с 105 691,30 ₽ на 01.08.2026» шестизначной
+   сумме не хватало места, и она налезала на слова «Должен нам». */
+.balance { align-items: center; }
+.balance .v {
+  font: 700 clamp(24px, 7.5vw, 30px)/1.15 var(--font);
+  letter-spacing: -.025em; font-variant-numeric: tabular-nums; margin-top: 2px;
+}
+.balance .hint { color: var(--muted); font-size: 13px; margin-top: 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Дату не режем: она короткая и всегда нужна целиком. Ужимается метка —
    её смысл понятен и по первому слову. */
 .sub-line .badge { min-width: 0; overflow: hidden; text-overflow: ellipsis; }

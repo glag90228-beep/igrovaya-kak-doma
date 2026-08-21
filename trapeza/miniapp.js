@@ -1115,6 +1115,41 @@ const api = {
     };
   },
 
+  /** Журнал операций одного контрагента: что именно держит его сальдо. */
+  async 'GET /api/ops'({ user, url }) {
+    const cpId = Number(url.searchParams.get('cp'));
+    const b = bdb.balanceOf(user.id, cpId);
+    if (!b) return { error: 'Контрагент не найден.' };
+    return {
+      cp: { id: b.cp.id, name: b.cp.name, kind: b.cp.kind },
+      opening: round2(Number(b.cp.opening_balance) || 0),
+      openingDate: b.cp.opening_date || '',
+      closing: round2(b.closing),
+      ops: b.rows.map((o) => ({
+        id: o.id,
+        date: o.date,
+        kind: o.kind || '',
+        doc: o.doc || '',
+        // Знак с точки зрения долга: плюс — долг вырос, минус — закрыт.
+        delta: round2((Number(o.credit) || 0) - (Number(o.debit) || 0)),
+        balance: round2(o.balance),
+        fromDoc: Boolean(o.doc_id),
+      })),
+    };
+  },
+
+  /** Убрать одну строку журнала. */
+  async 'POST /api/op/delete'({ user, body }) {
+    const before = Number(body.cpId) ? bdb.balanceOf(user.id, Number(body.cpId)) : null;
+    if (!bdb.deleteOp(user.id, Number(body.id))) return { error: 'Операция не найдена.' };
+    const after = Number(body.cpId) ? bdb.balanceOf(user.id, Number(body.cpId)) : null;
+    return {
+      deleted: true,
+      balance: after ? round2(after.closing) : 0,
+      delta: before && after ? round2(before.closing - after.closing) : 0,
+    };
+  },
+
   /** Из чего складывается крупная цифра на главной. */
   async 'GET /api/debts/why'({ user }) {
     return bdb.debtBreakdown(user.id);

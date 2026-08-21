@@ -203,6 +203,92 @@ const ok = (c, m, extra) => {
   ok(rows.includes('Начальное сальдо'), 'и разбор называет источник — начальное сальдо', rows.join(', '));
   ok(!rows.includes('Документы'), 'а документов в сумме нет: при «долге по отгрузке» счёт её не создаёт');
 
+  /*
+   * Сальдо в карточке: сумма не должна налезать на заголовок.
+   *
+   * Жалоба: «цифра стоит не в своём шаблоне, где надпись должен нам».
+   * Справа от заголовка шестизначной сумме не хватало места — подпись
+   * «Начали с 15 000,00 ₽ на 01.01.2026» шире половины экрана. Меряем
+   * прямоугольники: слова и цифра не должны пересекаться.
+   */
+  console.log('\n── сальдо в карточке ──');
+  await page.evaluate((cpId) => window.__go('cp', { id: cpId }), cp);
+  await page.waitForSelector('.balance .v');
+  const boxes = await page.evaluate(() => {
+    const r = (s) => { const e = document.querySelector(s); return e ? e.getBoundingClientRect().toJSON() : null; };
+    return { row: r('.balance'), title: r('.balance .ellipsis'), v: r('.balance .v'), hint: r('.balance .hint') };
+  });
+  const overlap = (a, b) => a && b && a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+  ok(!overlap(boxes.title, boxes.v), 'сумма не налезает на заголовок',
+    JSON.stringify({ title: boxes.title, v: boxes.v }));
+  ok(boxes.v && boxes.v.right <= boxes.row.right + 0.5, 'и не вылезает за строку',
+    boxes.v && `${Math.round(boxes.v.right)} / ${Math.round(boxes.row.right)}`);
+  ok(boxes.hint && boxes.v && boxes.hint.top >= boxes.v.bottom - 0.5,
+    'подпись стоит под суммой, а не рядом');
+
+  /*
+   * Назад после экрана, открытого с нуля.
+   *
+   * Внесли оплату — приложение показывает карточку клиента через reset,
+   * стопка схлопывается, а стрелка «Назад» в шапке остаётся видимой и не
+   * делает ничего. Проверяем настоящим жестом от левого края: он должен
+   * вывести к списку контрагентов, а не оставить на месте.
+   */
+  console.log('\n── назад пальцем от края ──');
+  await page.getByText('Внести оплату или приход', { exact: true }).click();
+  await page.waitForSelector('#f-amount');
+  await page.locator('#f-amount').fill('2500');
+  await page.getByText('Внести в журнал', { exact: true }).click();
+  await page.waitForTimeout(900);
+  ok(await page.evaluate(() => document.querySelector('h1') === null
+    || document.querySelector('.balance') !== null), 'после оплаты вернулись в карточку клиента');
+
+  await page.touchscreen.tap(200, 400);              // сбросить возможный фокус
+  const swipeBack = async () => {
+    await page.touchscreen.tap(5, 400);
+    await page.evaluate(() => {
+      const t = (type, x) => {
+        const touch = new Touch({ identifier: 1, target: document.body, clientX: x, clientY: 400 });
+        document.dispatchEvent(new TouchEvent(type, {
+          touches: type === 'touchend' ? [] : [touch],
+          changedTouches: [touch],
+          bubbles: true,
+        }));
+      };
+      t('touchstart', 6); t('touchmove', 90); t('touchend', 180);
+    });
+    await page.waitForTimeout(700);
+  };
+  await swipeBack();
+  ok(await page.evaluate(() => (document.querySelector('h1') || {}).textContent) === 'Контрагенты',
+    'жест от края увёл назад к списку, а не в никуда',
+    await page.evaluate(() => (document.querySelector('h1') || {}).textContent));
+
+  /*
+   * Журнал операций: внесённое руками видно и убирается.
+   *
+   * До этого экрана внесённую оплату нельзя было ни увидеть, ни убрать —
+   * в боте отменялась только последняя. А именно такие строки и держат
+   * сумму на главной, из-за которой «удаляю документы, а цифра стоит».
+   */
+  console.log('\n── журнал операций ──');
+  await page.evaluate((cpId) => window.__go('ops', { cpId }), cp);
+  await page.waitForSelector('.swipe-face');
+  ok(await page.evaluate(() => document.querySelectorAll('.swipe').length) === 1,
+    'внесённая оплата видна строкой',
+    await page.evaluate(() => document.querySelectorAll('.swipe').length));
+
+  const opRow = await page.locator('.swipe-face').first().boundingBox();
+  await page.touchscreen.tap(opRow.x + opRow.width / 2, opRow.y + opRow.height / 2);
+  await swipe(-120, 0);
+  const delBtn = await page.locator('.swipe-del').first().boundingBox();
+  await page.touchscreen.tap(delBtn.x + delBtn.width / 2, delBtn.y + delBtn.height / 2);
+  await page.waitForTimeout(900);
+  ok(bdb.listOps(user.id, cp).length === 0, 'смахнули — строка ушла из журнала',
+    bdb.listOps(user.id, cp).length);
+  ok(bdb.balanceOf(user.id, cp).closing === 15000,
+    'и сальдо вернулось к начальному', bdb.balanceOf(user.id, cp).closing);
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();
