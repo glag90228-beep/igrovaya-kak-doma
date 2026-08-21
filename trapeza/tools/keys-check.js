@@ -169,7 +169,8 @@ async function checkYandexVision() {
   const key = process.env.YANDEX_API_KEY;
   const folder = process.env.YANDEX_FOLDER_ID;
   if (!key || !folder) { skip('Фото: YANDEX_API_KEY или YANDEX_FOLDER_ID не заполнен'); return; }
-  const dirty = checkAscii(key, 'YANDEX_API_KEY') || checkAscii(folder, 'YANDEX_FOLDER_ID');
+  const dirty = checkAscii(key, 'YANDEX_API_KEY') || checkAscii(folder, 'YANDEX_FOLDER_ID')
+    || speech.badKey(key);
   if (dirty) { no(`Фото: ${dirty}`); return; }
   try {
     const res = await fetch('https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText', {
@@ -202,7 +203,8 @@ async function checkSpeech() {
   const key = process.env.YANDEX_API_KEY;
   const folder = process.env.YANDEX_FOLDER_ID;
   if (!key || !folder) { skip('Голос: YANDEX_API_KEY или YANDEX_FOLDER_ID не заполнен'); return; }
-  const dirty = checkAscii(key, 'YANDEX_API_KEY') || checkAscii(folder, 'YANDEX_FOLDER_ID');
+  const dirty = checkAscii(key, 'YANDEX_API_KEY') || checkAscii(folder, 'YANDEX_FOLDER_ID')
+    || speech.badKey(key);
   if (dirty) { no(`Голос: ${dirty}`); return; }
   try {
     const res = await fetch(

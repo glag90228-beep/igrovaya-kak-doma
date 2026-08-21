@@ -45,8 +45,35 @@ function speechAvailable() {
 function speechHint() {
   const p = PROVIDER();
   if (!p) return 'Распознавание речи не подключено (SPEECH_PROVIDER не задан).';
-  if (p === 'yandex') return 'Нет YANDEX_API_KEY или YANDEX_FOLDER_ID.';
+  if (p === 'yandex') {
+    const bad = badKey(process.env.YANDEX_API_KEY);
+    if (bad) return bad;
+    return 'Нет YANDEX_API_KEY или YANDEX_FOLDER_ID.';
+  }
   return `Неизвестный провайдер речи: ${p}.`;
+}
+
+/**
+ * Ключ похож на ключ?
+ *
+ * Ловим не опечатку, а склейку при копировании. С боевого сервера пришёл
+ * ключ, к которому прилипло время сообщения — «…916:49», — и SpeechKit
+ * ответил «Unknown api key». По такому ответу человек идёт перевыпускать
+ * совершенно рабочий ключ. Двоеточий и пробелов в ключах Яндекса не бывает,
+ * и это видно, не отправляя запрос.
+ */
+function badKey(key) {
+  const k = String(key || '');
+  if (!k) return '';
+  if (/[:\s]/.test(k)) {
+    return 'В YANDEX_API_KEY попал лишний текст (двоеточие или пробел) — '
+      + 'похоже, при копировании прилипло время или перенос строки. Скопируйте ключ заново.';
+  }
+  if (!/^AQVN/.test(k)) {
+    return `YANDEX_API_KEY начинается не с AQVN (а с «${k.slice(0, 4)}») — `
+      + 'это, возможно, не API-ключ, а статический ключ доступа или ID.';
+  }
+  return '';
 }
 
 /**
@@ -266,6 +293,6 @@ async function transcribe(buffer, seconds = 0) {
 }
 
 module.exports = {
-  speechAvailable, speechHint, transcribe, sniff, splitJsonStream, parseWav,
+  speechAvailable, speechHint, transcribe, sniff, splitJsonStream, parseWav, badKey,
   SYNC_LIMIT_SEC, SYNC_LIMIT_BYTES,
 };
