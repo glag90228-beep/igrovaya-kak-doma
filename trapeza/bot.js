@@ -1754,7 +1754,45 @@ async function handleFreeText(tg, chatId, user, text) {
 
   if (intent.action === 'debts') { await showDebts(tg, chatId, user); return true; }
   if (intent.action === 'unpaid') { await showUnpaid(tg, chatId, user); return true; }
+  if (intent.action === 'docs') { await showDocs(tg, chatId, user); return true; }
+  if (intent.action === 'cps') { await showCps(tg, chatId, user); return true; }
+  if (intent.action === 'org') { await showOrg(tg, chatId, user); return true; }
+  if (intent.action === 'recurring') { await showRecurring(tg, chatId, user); return true; }
+  if (intent.action === 'billing') { await showBilling(tg, chatId, user); return true; }
   if (intent.action === 'help') return false;      // помощь и так в меню
+
+  // Акт сверки собирается по конкретному контрагенту — спрашиваем, по кому.
+  if (intent.action === 'akt') {
+    const cps = bdb.listCps(user.id);
+    if (!cps.length) {
+      await tg.sendMessage(chatId, 'Сверяться пока не с кем — сначала добавьте контрагента.',
+        keyboard([[{ text: '👤 Добавить клиента', data: 'cp.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return true;
+    }
+    const found = ai.matchCp(cps, intent.who || '');
+    if (found.cp) { await askAktPeriod(tg, chatId, user, found.cp.id); return true; }
+    await tg.sendMessage(chatId, 'С кем сверяемся?',
+      keyboard([...cps.slice(0, 8).map((c) => ([{ text: c.name.slice(0, 60), data: `d.akt:${c.id}` }])),
+        [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return true;
+  }
+
+  /*
+   * Чужая работа. Налоговый учёт обязателен независимо от режима, и у
+   * предпринимателя к нему масса вопросов — но бот не видит ни банка, ни
+   * кассы, ни расходов. Совет по срокам и суммам, выданный по памяти,
+   * стоит человеку денег и штрафов, поэтому здесь мы честно отказываемся
+   * и говорим, что умеем вместо этого.
+   */
+  if (intent.action === 'outofscope') {
+    await tg.sendMessage(chatId,
+      'Налоги, взносы, КУДиР, отчётность и зарплату я не веду — для этого нужен доступ '
+      + 'к вашему банку и кассе, а у меня его нет. Подскажу неверно — вам платить штраф.\n\n'
+      + 'Что я умею: выписывать счета, акты, УПД, накладные, договоры и платёжки, вести '
+      + 'расчёты с контрагентами и собирать акт сверки.',
+      mainMenu());
+    return true;
+  }
 
   if (intent.action === 'draft') {
     const cps = bdb.listCps(user.id);
