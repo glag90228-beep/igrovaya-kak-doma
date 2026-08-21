@@ -1023,6 +1023,7 @@ lib/lock.js         замок на один экземпляр бота
 lib/platyozhka.js   платёжное поручение (форма 0401060)
 tools/schema-check.js   проверка схемы и целостности базы после развёртывания
 tools/debt-audit.js     разбор сальдо по слагаемым и уборка проводок без документа
+tools/keys-check.js     живая проверка ключей распознавания: фото, голос, фразы
 public/app/         мини-приложение: index.html, app.css, app.js
 public/index.html   конструктор заказа
 public/smeta.html   фирменная смета
