@@ -21,12 +21,41 @@
 
 const path = require('node:path');
 
-const APP = path.join(__dirname, '..');
-// Node 22 умеет читать .env сам. Под systemd переменные уже в окружении,
-// поэтому отсутствие файла — не ошибка.
-try { process.loadEnvFile(path.join(APP, '.env')); } catch (_) { /* значит уже в окружении */ }
+const fs = require('node:fs');
 
-const ok = (m) => console.log(`  ✅ ${m}`);
+const APP = path.join(__dirname, '..');
+
+/*
+ * Читаем .env сами и перекрываем окружение.
+ *
+ * Встроенный process.loadEnvFile() (как и --env-file) уже заданную
+ * переменную не трогает. А в живой сессии она почти наверняка задана: перед
+ * этим человек выполнял `set -a && . ./.env` ради curl-проверки. Потом он
+ * правит .env, запускает проверку в том же окне — и видит старые ключи.
+ * Час уходит на поиски того, чего нет.
+ *
+ * Здесь проверяется именно файл, поэтому файл и главнее. Расхождение
+ * показываем: молча подменять окружение тоже нельзя.
+ */
+const WATCH = ['ANTHROPIC_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
+  'VISION_PROVIDER', 'VISION_MODEL', 'SPEECH_PROVIDER', 'AI_ENABLED', 'AI_MODEL', 'AI_PROVIDER'];
+const shadowed = [];
+try {
+  const raw = fs.readFileSync(path.join(APP, '.env'), 'utf8');
+  for (const line of raw.split('\n')) {
+    const m = /^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$/.exec(line);
+    if (!m) continue;
+    const [, name] = m;
+    const value = m[2].trim().replace(/^["'](.*)["']$/, '$1');
+    if (WATCH.includes(name) && process.env[name] !== undefined && process.env[name] !== value) {
+      shadowed.push(name);
+    }
+    process.env[name] = value;
+  }
+} catch (_) { /* файла нет — значит переменные пришли из systemd */ }
+
+let done = 0;                       // сколько живых обращений прошло
+const ok = (m) => { console.log(`  ✅ ${m}`); done += 1; };
 const no = (m) => { console.log(`  ❌ ${m}`); bad += 1; };
 const skip = (m) => console.log(`  ·  ${m}`);
 let bad = 0;
@@ -135,6 +164,40 @@ async function checkAnthropic(model, what) {
   }
 }
 
+/** Распознавание картинки Яндексом — тот же вызов, что в lib/vision.js. */
+async function checkYandexVision() {
+  const key = process.env.YANDEX_API_KEY;
+  const folder = process.env.YANDEX_FOLDER_ID;
+  if (!key || !folder) { skip('Фото: YANDEX_API_KEY или YANDEX_FOLDER_ID не заполнен'); return; }
+  const dirty = checkAscii(key, 'YANDEX_API_KEY') || checkAscii(folder, 'YANDEX_FOLDER_ID');
+  if (dirty) { no(`Фото: ${dirty}`); return; }
+  try {
+    const res = await fetch('https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Api-Key ${key}`,
+        'x-folder-id': folder,
+        'x-data-logging-enabled': 'false',
+      },
+      body: JSON.stringify({
+        mimeType: 'image/png', languageCodes: ['ru', 'en'], model: 'page', content: PNG_1PX,
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+    const body = await res.text();
+    if (res.ok) { ok('Фото: Yandex Vision принял ключ (в пикселе текста нет — так и надо)'); return; }
+    if (/PermissionDenied|Permission to/i.test(body)) {
+      no('Фото: у сервисного аккаунта нет роли ai.vision.user в этом каталоге.\n'
+        + `      Ответ: ${body.replace(/\s+/g, ' ').slice(0, 200)}`);
+      return;
+    }
+    no(`Фото: ${why(res.status, body)}`);
+  } catch (e) {
+    no(`Фото: не достучались — ${e.message}`);
+  }
+}
+
 async function checkSpeech() {
   const key = process.env.YANDEX_API_KEY;
   const folder = process.env.YANDEX_FOLDER_ID;
@@ -186,6 +249,14 @@ const speech = require(path.join(APP, 'lib/speech'));
 const ai = require(path.join(APP, 'lib/ai-agent'));
 
 (async () => {
+  if (shadowed.length) {
+    console.log('\n  ⚠ В этой сессии остались старые значения из прошлого запуска:');
+    console.log(`      ${shadowed.join(', ')}`);
+    console.log('      Проверяю по файлу .env — он главнее. Но службы и другие');
+    console.log('      команды в этом же окне возьмут старое: откройте новое');
+    console.log('      подключение или выполните  exec bash');
+  }
+
   console.log('\n── что включено в .env ──');
   console.log(`  фото  : ${process.env.VISION_PROVIDER || 'не задан'}`
     + `  модель ${process.env.VISION_MODEL || 'claude-sonnet-5'}`);
@@ -194,23 +265,42 @@ const ai = require(path.join(APP, 'lib/ai-agent'));
     + `  модель ${process.env.AI_MODEL || ai.MODEL_DEFAULT}`);
 
   console.log('\n── модули видят настройки ──');
-  if (vision.visionAvailable()) ok('фото — готово'); else no(`фото — ${vision.visionHint()}`);
-  if (speech.speechAvailable()) ok('голос — готово'); else no(`голос — ${speech.speechHint()}`);
-  if (ai.aiAvailable()) ok('фразы — готово'); else no(`фразы — ${ai.aiHint()}`);
+  /*
+   * Выключенное намеренно — не поломка. Раньше скрипт считал ошибкой и то,
+   * что человек сознательно не включал, всегда завершался ненулевым кодом,
+   * и «Не в порядке: 3» переставало что-либо значить.
+   */
+  const state = (avail, hint, off, name) => {
+    if (avail) ok(`${name} — готово`);
+    else if (off) skip(`${name} — выключено намеренно`);
+    else no(`${name} — ${hint}`);
+  };
+  state(vision.visionAvailable(), vision.visionHint(), !process.env.VISION_PROVIDER, 'фото');
+  state(speech.speechAvailable(), speech.speechHint(), !process.env.SPEECH_PROVIDER, 'голос');
+  state(ai.aiAvailable(), ai.aiHint(), process.env.AI_ENABLED !== '1', 'фразы');
 
   console.log('\n── живые обращения к сервисам ──');
-  await checkAnthropic(process.env.VISION_MODEL || 'claude-sonnet-5', 'Фото');
-  const aiModel = process.env.AI_MODEL || ai.MODEL_DEFAULT;
-  if (aiModel === (process.env.VISION_MODEL || 'claude-sonnet-5')) {
-    skip('Фразы: та же модель и тот же ключ — проверено выше');
-  } else {
-    await checkAnthropic(aiModel, 'Фразы');
-  }
-  await checkSpeech();
+
+  // Спрашиваем ровно тот сервис, который выбран в .env. Раньше скрипт
+  // всегда ломился в Anthropic и показывал его отказ даже там, где
+  // распознавание давно переключено на Яндекс.
+  const vp = String(process.env.VISION_PROVIDER || '').toLowerCase();
+  if (vp === 'anthropic') await checkAnthropic(process.env.VISION_MODEL || 'claude-sonnet-5', 'Фото');
+  else if (vp === 'yandex') await checkYandexVision();
+  else skip('Фото: VISION_PROVIDER не задан — распознавание выключено');
+
+  const ap = String(process.env.AI_PROVIDER || 'anthropic').toLowerCase();
+  if (process.env.AI_ENABLED !== '1') skip('Фразы: AI_ENABLED не 1 — свободный ввод выключен');
+  else if (ap === 'anthropic') await checkAnthropic(process.env.AI_MODEL || ai.MODEL_DEFAULT, 'Фразы');
+  else skip(`Фразы: провайдер ${ap} — этой проверкой не покрыт`);
+
+  const sp = String(process.env.SPEECH_PROVIDER || '').toLowerCase();
+  if (sp === 'yandex') await checkSpeech();
+  else skip('Голос: SPEECH_PROVIDER не задан — распознавание речи выключено');
 
   console.log(`\n${'='.repeat(52)}`);
-  console.log(bad
-    ? `Не в порядке: ${bad}. Поправьте .env и запустите снова.`
-    : 'Всё отвечает. Присылайте боту голосовое и фото — должно работать.');
+  if (bad) console.log(`Не в порядке: ${bad}. Поправьте .env и запустите снова.`);
+  else if (!done) console.log('Проверять нечего: всё распознавание выключено в .env.');
+  else console.log('Всё отвечает. Присылайте боту голосовое и фото — должно работать.');
   process.exit(bad ? 1 : 0);
 })().catch((e) => { console.error('ПРОВЕРКА УПАЛА:', e.message); process.exit(1); });
