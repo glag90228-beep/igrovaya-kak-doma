@@ -87,7 +87,7 @@ function checkAscii(value, name) {
  */
 function why(status, body) {
   const tail = String(body || '').replace(/\s+/g, ' ').slice(0, 300);
-  if (/PermissionDenied|Permission to/i.test(tail)) {
+  if (/Permission ?denied|Permission to/i.test(tail)) {
     return `прав не хватает (${status}). Ответ сервиса:\n      ${tail}`;
   }
   if (status === 401) return `ключ не принят (401). Ответ сервиса:\n      ${tail}`;
@@ -188,7 +188,7 @@ async function checkYandexVision() {
     });
     const body = await res.text();
     if (res.ok) { ok('Фото: Yandex Vision принял ключ (в пикселе текста нет — так и надо)'); return; }
-    if (/PermissionDenied|Permission to/i.test(body)) {
+    if (/Permission ?denied|Permission to/i.test(body)) {
       no('Фото: у сервисного аккаунта нет роли ai.vision.user в этом каталоге.\n'
         + `      Ответ: ${body.replace(/\s+/g, ' ').slice(0, 200)}`);
       return;
@@ -228,7 +228,7 @@ async function checkSpeech() {
      * одному числу это читается как «ключ не тот», и человек идёт
      * перевыпускать рабочий ключ. Поэтому смотрим в текст.
      */
-    if (/PermissionDenied|Permission to/i.test(body)) {
+    if (/Permission ?denied|Permission to/i.test(body)) {
       const folder = (/resource-manager\.folder (\S+?)[,\]]/.exec(body) || [])[1];
       no('Голос: у сервисного аккаунта нет прав на распознавание речи.\n'
         + `      Каталог из ответа: ${folder || 'не разобрал'}\n`
