@@ -170,7 +170,7 @@ const PARENT = {
   letter: 'inbox', inbox: 'more', mail: 'more', bank: 'more', org: 'more',
   billing: 'more', support: 'more', help: 'more', vat: 'more', basis: 'more',
   recurring: 'more', reminders: 'more', registry: 'docs', akt: 'docs',
-  unpaid: 'docs', scan: 'docs', ops: 'cps', ask: 'home',
+  unpaid: 'home', scan: 'docs', ops: 'cps', ask: 'home',
 };
 
 function back() {
@@ -183,6 +183,13 @@ function back() {
 function reset(name, params = {}) {
   stack = [{ name, params }];
   render();
+}
+
+async function afterIssue() {
+  cache = {};
+  const st = await api('GET', '/api/state');
+  cache = st;
+  reset(st.bizType ? 'home' : 'basis');
 }
 
 function syncChrome() {
@@ -334,7 +341,7 @@ screens.home = async function home() {
       h('div', { class: `v money ${s.debts.owedByUs ? 'out' : ''}`, text: money0(s.debts.owedByUs) })),
     // «Ждут оплаты», а не «Счета»: при основании «по отгрузке» в этой
     // плитке стоят акты и накладные — счёт долга там не создаёт.
-    h('button', { class: 'stat', onclick: () => { haptic(); go('docs'); } },
+    h('button', { class: 'stat', onclick: () => { haptic(); go('unpaid'); } },
       h('div', { class: 'k', text: 'Ждут оплаты' }),
       h('div', { class: 'v money', text: money0(unpaid.sum) }))));
 
@@ -530,7 +537,7 @@ screens.docs = async function docs({ cp } = {}) {
   // Оплачен или нет — то, ради чего в журнал и заходят. Без метки строки
   // отличаются только суммой, и статус приходится помнить в голове.
   const paidBadge = (d) => (d.paidAt ? { badge: 'Оплачен', badgeTone: 'ok' }
-    : (['sch', 'schdog'].includes(d.type) ? { badge: 'Ждёт оплаты' } : {}));
+    : (['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) ? { badge: 'Ждёт оплаты' } : {}));
   box.append(h('div', { class: 'btn-wrap' },
     h('button', { class: 'btn', onclick: () => { haptic('medium'); go('new', { type: 'sch' }); } },
       'Выписать документ')));
@@ -652,7 +659,7 @@ screens.doc = async function docScreen({ id }) {
    * на сервере есть, кнопки не было. Для счёта это половина смысла карточки:
    * отметка закрывает долг в журнале и убирает документ из «не оплачено».
    */
-  if (['sch', 'schdog'].includes(d.type) && d.total) {
+  if (['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) && d.total) {
     const paid = Boolean(d.paidAt);
     box.append(h('div', { class: 'section-title', text: 'Оплата' }));
     box.append(h('div', { class: 'card' },
@@ -702,7 +709,7 @@ screens.doc = async function docScreen({ id }) {
   // главное это она; пересылка файла тогда вторична.
   box.append(h('div', { class: 'btn-wrap' },
     h('button', {
-      class: ['sch', 'schdog'].includes(d.type) && d.total && !d.paidAt ? 'btn secondary' : 'btn',
+      class: ['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) && d.total && !d.paidAt ? 'btn secondary' : 'btn',
       onclick: (e) => withBusy(e.currentTarget, async () => {
         const r = await api('POST', '/api/doc/resend', { id: d.id });
         toast('Файл отправлен в чат с ботом');
@@ -1400,7 +1407,8 @@ screens.debts = async function debts() {
   const { debtors } = await api('GET', '/api/debtors');
   const box = h('div', {}, h('h1', { text: 'Кто сколько должен' }));
   if (!debtors.length) {
-    box.append(empty('wallet', 'Долгов нет', 'Как только появятся неоплаченные счета, они окажутся здесь.'));
+    box.append(empty('wallet', 'Долгов нет',
+      'Как только появятся долги по актам или счетам — зависит от вашего дела.'));
     return box;
   }
   const them = debtors.filter((d) => d.theyOwe);
@@ -1513,8 +1521,12 @@ screens.more = async function more() {
     }),
     navRow({
       icon: 'wallet',
-      title: 'Откуда берётся долг',
-      sub: BASIS_LABEL[s.debtBasis] || '',
+      title: 'Чем занимаетесь',
+      sub: (() => {
+        const t = (s.bizTypes || []).find((x) => x.key === s.bizType);
+        const basis = BASIS_LABEL[s.debtBasis] || '';
+        return t ? `${t.name}${basis ? ` · ${basis}` : ''}` : 'чтобы долги считались верно';
+      })(),
       onclick: () => go('basis'),
     })));
 
@@ -1785,7 +1797,7 @@ screens.vat = async function vat() {
 /** Из чего возникает долг контрагента. */
 screens.basis = async function basis() {
   const s = await api('GET', '/api/state');
-  const box = h('div', {}, h('h1', { text: 'Откуда берётся долг' }));
+  const box = h('div', {}, h('h1', { text: s.bizType ? 'Откуда берётся долг' : 'Чем занимаетесь' }));
   box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
     text: 'Это про устройство вашего дела, а не про настройку. Выбор один на организацию: '
       + 'иначе долг задвоится — сначала по счёту, потом по акту на ту же сделку.' }));
@@ -2255,7 +2267,8 @@ screens.help = async function help() {
     step(1, 'Заполните свою организацию', 'Введите ИНН — название и адрес подставятся сами. '
       + 'Банк и счёт нужны, чтобы в счёте появился QR: клиент платит камерой.'),
     step(2, 'Добавьте клиента', 'Тоже по ИНН. Реквизиты и почта запомнятся.'),
-    step(3, 'Выпишите документ', 'Позиции запоминаются — в следующий раз ставятся кнопкой.')));
+    step(3, 'Нажмите «Выписать счёт»',
+      'Позиции запоминаются. Акт, УПД, накладная, договор и платёжка — плитками ниже. Сверка — в «Ещё».')));
 
   box.append(h('div', { class: 'section-title', text: 'Полезно знать' }));
   box.append(h('div', { class: 'card' },
@@ -2460,7 +2473,7 @@ screens.other = async function other({ type, cpId }) {
     haptic('medium');
     toast('Готово — файл в чате с ботом');
     download(r.file);
-    reset('docs');
+    await afterIssue();
   });
   box.append(h('div', { class: 'btn-wrap' }, make));
   return box;
@@ -2796,7 +2809,7 @@ screens.billing = async function billing() {
   if (!q.paid) {
     box.append(h('div', { class: 'section-title', text: 'Что даёт подписка' }));
     box.append(h('div', { class: 'card' },
-      ['Документы без ограничений', 'Все семь типов документов', 'Автозаполнение по ИНН и БИК', 'Поддержка в чате']
+      ['Документы без ограничений', 'Счета, акты, УПД, накладные, договоры и платёжки', 'Автозаполнение по ИНН и БИК', 'Поддержка в чате']
         .map((t) => h('div', { class: 'row' }, h('span', { class: 'icon-box ok' }, icon('check')), h('span', { class: 'grow', text: t })))));
 
     /*
@@ -3035,8 +3048,7 @@ screens.new = async function newDoc(params) {
       haptic('heavy');
       toast(r.sentToChat ? 'Готово — файл отправлен в чат' : 'Документ выписан');
       download(r.file);
-      cache = {};
-      reset('home');
+      await afterIssue();
     } catch (e) {
       if (e.payload && e.payload.reason === 'quota') { toast(e.message, true); go('billing'); return; }
       toast(e.message, true);

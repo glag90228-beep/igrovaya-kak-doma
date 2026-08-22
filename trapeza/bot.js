@@ -949,6 +949,7 @@ async function afterDoc(tg, chatId, user, cpId) {
   rows.push([{ text: '👤 Карточка клиента', data: `cp:${cpId}` }]);
   rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
   await tg.sendMessage(chatId, '<b>Готово.</b> Что дальше?', keyboard(rows));
+  if (org && !org.biz_type) await showBizType(tg, chatId, user);
 }
 
 async function finishItems(tg, chatId, user, state) {
@@ -2667,8 +2668,9 @@ async function startDoc(tg, chatId, user, type) {
   const rows = cps.slice(0, 12).map((c) => [{ text: `${c.kind === 'supplier' ? '📦' : '🧑‍💼'} ${c.name}`, data: `d.${type}:${c.id}` }]);
   rows.push([{ text: '➕ Новый клиент', data: `cp.new.${type}` }]);
   rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  const title = (ITEM_DOCS[type] || docService.ALL_DOCS[type] || { title: type === 'akt' ? 'Акт сверки' : 'Документ' }).title;
   await tg.sendMessage(chatId,
-    `<b>${esc((ITEM_DOCS[type] || {}).title || 'Документ')}</b>\nКому выписываем?`, keyboard(rows));
+    `<b>${esc(title)}</b>\nКому выписываем?`, keyboard(rows));
 }
 
 /** Выбор вида документа, когда нужен не счёт. */
@@ -2677,13 +2679,15 @@ async function chooseDoc(tg, chatId, user) {
   const rows = [
     [{ text: '🧾 Счёт на оплату', data: 'go.sch' }, { text: '📝 Счёт-договор', data: 'go.schdog' }],
     [{ text: '🧾 Акт услуг', data: 'go.usl' }, { text: '📦 УПД', data: 'go.upd' }],
-    [{ text: '🚚 ТОРГ-12', data: 'go.torg12' }],
+    [{ text: '🚚 ТОРГ-12', data: 'go.torg12' }, { text: '📝 Договор', data: 'go.dog' }],
+    [{ text: '🏦 Платёжка', data: 'go.pp' }, { text: '📄 Акт сверки', data: 'go.akt' }],
     [{ text: '⬅️ Меню', data: 'menu' }],
   ];
   await tg.sendMessage(chatId,
     '<b>Какой документ нужен?</b>\n\n'
     + '<i>Счёт — попросить оплату. Акт — подтвердить, что услуга оказана. '
-    + 'УПД и ТОРГ-12 — передать товар. Счёт-договор — счёт, который заменяет договор.</i>',
+    + 'УПД и ТОРГ-12 — передать товар. Счёт-договор — счёт вместо договора. '
+    + 'Платёжка — заплатить самому. Сверка — кто сколько должен.</i>',
     keyboard(rows));
 }
 
@@ -3064,15 +3068,11 @@ async function handleCallback(tg, cq) {
       const q = bdb.quota(user.id);
       await tg.sendMessage(chatId,
         'Как пользоваться:\n'
-        + '1) Заведите «Мою организацию» — с банком, иначе в счёте не будет QR.\n'
-        + '   Введите ИНН — название, адрес и реквизиты подставятся сами; по БИК — банк.\n'
-        + '2) Добавьте контрагента.\n'
-        + '3) Вносите операции текстом: <code>15.06 приход 94193</code>.\n'
-        + '4) Жмите нужный документ — бот пришлёт файл.\n\n'
-        + 'Номера документов бот ведёт сам, сквозным рядом по годам; перед выпуском '
-        + 'номер и дату можно поправить.\n'
-        + 'Позиции запоминаются: в следующий раз ставятся кнопкой.\n'
-        + '«Мои документы» — журнал: выслать файл заново или повторить новым номером.\n\n'
+        + '1) Нажмите <b>«Выписать счёт»</b> — спрошу название, ИНН, банк и клиента.\n'
+        + '2) Пришлите позиции, например <code>Ремонт 1 3500</code>, затем «Готово».\n'
+        + '3) Пришлю файл. Его можно сразу переслать клиенту. QR в счёте будет, если заполнен банк.\n\n'
+        + '«Другой документ» — акт, УПД, накладная, договор, платёжка, сверка.\n'
+        + 'После первого документа спрошу, чем занимаетесь — от этого зависит, когда клиент становится должен.\n\n'
         + `В этом месяце выписано: ${q.used}${q.paid ? '' : ` из ${q.limit} бесплатных`}.\n\n`
         + '/menu — вернуться в меню.', mainMenu());
       return;

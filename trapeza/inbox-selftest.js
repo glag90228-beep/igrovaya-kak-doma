@@ -240,7 +240,7 @@ async function main() {
       host: '127.0.0.1', port: 25, imapHost: '127.0.0.1', imapPort,
     });
     // Наш игрушечный сервер без TLS — подменяем настройку на открытый канал.
-    require('../trapeza/db').db.prepare('UPDATE mailboxes SET imap_port = ? WHERE user_id = ?')
+    require('./db').db.prepare('UPDATE mailboxes SET imap_port = ? WHERE user_id = ?')
       .run(imapPort, user.id);
 
     const conf = mailbox.resolveImap(user.id);

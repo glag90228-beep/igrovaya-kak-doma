@@ -1057,8 +1057,27 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(caption.includes('нет реквизитов для оплаты'),
       'бот честно предупредил, что платить некуда', caption.slice(-60));
     ok(!caption.includes('есть QR'), 'и не обещал QR, которого нет');
-    ok(nLast().includes('Что дальше'), 'после файла показан короткий выбор, а не стена кнопок',
-      nLast().slice(0, 30));
+    ok(sent.some((m) => (m.text || '').includes('Что дальше')),
+      'после файла показан короткий выбор, а не стена кнопок');
+    ok(nLast().includes('Чем занимаетесь'),
+      'после первого документа спросили про дело, а не про основание долга',
+      nLast().slice(0, 40));
+  }
+
+  console.log('\n── помощь и другой документ ──');
+  {
+    await say('/start');
+    await tap('help');
+    ok(last().includes('Выписать счёт'), 'помощь ведёт в wizard, а не в 1С-путь');
+    ok(!last().includes('15.06 приход'), 'старый путь с операциями из help убран');
+    ok(last().includes('бесплатных') || last().includes('выписано'), 'в помощи виден лимит');
+
+    await tap('go.any');
+    const lastKb = ((sent[sent.length - 1] || {}).kb || [])
+      .flat().map((b) => b.text).join('|');
+    ok(lastKb.includes('Договор'), 'в «Другой документ» есть договор', lastKb);
+    ok(lastKb.includes('Платёжка'), 'есть платёжка', lastKb);
+    ok(lastKb.includes('сверки') || lastKb.includes('Сверки'), 'есть акт сверки', lastKb);
   }
 
   console.log('\n── подписи: ИП и организация ──');
@@ -1454,9 +1473,9 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(r1.file.endsWith('.db.gz'), 'копия сжата', path.basename(r1.file));
 
     // Главное: из копии должна открываться рабочая база с теми же данными.
-    const { execSync } = require('node:child_process');
+    const zlib = require('node:zlib');
     const restored = path.join(dir, 'restored.db');
-    execSync(`gunzip -c '${r1.file}' > '${restored}'`);
+    fs.writeFileSync(restored, zlib.gunzipSync(fs.readFileSync(r1.file)));
     const { DatabaseSync } = require('node:sqlite');
     const d = new DatabaseSync(restored);
     ok(d.prepare('PRAGMA integrity_check').get().integrity_check === 'ok',
