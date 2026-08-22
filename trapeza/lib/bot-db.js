@@ -759,27 +759,47 @@ function unpaidDocs(userId, limit = 50) {
  * каждый считал сам, они расходились между собой.
  */
 const CLOSING_DOCS = ['usl', 'upd', 'torg12'];
-function dealTotals(docs) {
-  const deals = new Map();
+
+/**
+ * Пометить дубли пары прямо на документах и посчитать сделки.
+ *
+ * Считать сделки одним числом было мало: плитка на главной брала это число,
+ * а экран за ней и сводка в боте складывали список сами — и показывали
+ * вдвое больше. Человек видел «30 000», нажимал и получал «2 счёта на
+ * 60 000». Поэтому теперь отметка живёт на самом документе: у кого стоит
+ * `pair`, тот в сумму не идёт, и складывать список может кто угодно.
+ *
+ * Главный в паре — тот, что создаёт долг: при «долге по отгрузке» это акт,
+ * при «долге по счёту» — счёт. Второй его повторяет. В ручном режиме
+ * правила нет, и пары не ищем.
+ */
+function dealTotals(userId, docs) {
+  const basis = basisOf(getDefaultOrg(userId) || {});
+  const groups = new Map();
   for (const d of docs) {
+    delete d.pair;
     const key = `${d.cp_id}|${round2(Number(d.total) || 0)}`;
-    const g = deals.get(key) || { total: round2(Number(d.total) || 0), bill: 0, close: 0 };
-    if (CLOSING_DOCS.includes(d.type)) g.close += 1; else g.bill += 1;
-    deals.set(key, g);
+    if (!groups.has(key)) groups.set(key, { bills: [], closings: [] });
+    const g = groups.get(key);
+    if (CLOSING_DOCS.includes(d.type)) g.closings.push(d); else g.bills.push(d);
   }
-  let count = 0;
-  let sum = 0;
-  for (const g of deals.values()) {
-    const n = g.bill && g.close ? Math.max(g.bill, g.close) : g.bill + g.close;
-    count += n;
-    sum = round2(sum + n * g.total);
+  if (basis !== 'manual') {
+    for (const g of groups.values()) {
+      const pairs = Math.min(g.bills.length, g.closings.length);
+      const twins = basis === 'closing' ? g.bills : g.closings;
+      for (const d of twins.slice(0, pairs)) d.pair = true;
+    }
   }
-  return { count, sum };
+  const counted = docs.filter((d) => !d.pair);
+  return {
+    docs,
+    count: counted.length,
+    sum: round2(counted.reduce((s, d) => s + (Number(d.total) || 0), 0)),
+  };
 }
 
 function unpaidSummary(userId, limit = 200) {
-  const docs = unpaidDocs(userId, limit);
-  return { docs, ...dealTotals(docs) };
+  return dealTotals(userId, unpaidDocs(userId, limit));
 }
 
 /** Сальдо по контрагенту (переиспользует computeBalance из db.js) */

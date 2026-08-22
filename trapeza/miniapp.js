@@ -1104,8 +1104,18 @@ const api = {
     return { mailbox: null };
   },
 
+  /*
+   * Список отдаём целиком, но сумму и счётчик считаем здесь же — сделками.
+   * Пока экран складывал список сам, он показывал вдвое больше плитки на
+   * главной: счёт и закрывающий его акт на одну сделку шли как два долга.
+   */
   async 'GET /api/unpaid'({ user }) {
-    return { docs: bdb.unpaidDocs(user.id).map(docBrief) };
+    const s = bdb.unpaidSummary(user.id);
+    return {
+      docs: s.docs.map((d) => ({ ...docBrief(d), pair: Boolean(d.pair) })),
+      count: s.count,
+      sum: s.sum,
+    };
   },
 
   async 'GET /api/debtors'({ user }) {

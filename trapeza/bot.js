@@ -1037,7 +1037,7 @@ async function showUnpaid(tg, chatId, user) {
   const today = todayISO();
   // Сумма — сделками, а не документами: счёт и закрывающий его акт на одну
   // сделку иначе складывались, и сводка расходилась с плиткой в приложении.
-  const sum = bdb.dealTotals(list).sum;
+  const sum = bdb.dealTotals(user.id, list).sum;
   const rows = list.map((d) => {
     const cp = d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
     const days = Math.floor((new Date(today) - new Date(d.date)) / 86400000);
@@ -1976,7 +1976,7 @@ async function warnOverdue(tg, rec) {
     .filter((d) => d.cp_id === rec.cp_id && String(d.date).startsWith(month));
   if (!unpaid.length) return false;              // оплачено или счёта не было
 
-  const sum = bdb.dealTotals(unpaid).sum;
+  const sum = bdb.dealTotals(user.id, unpaid).sum;
   const list = unpaid.slice(0, 5)
     .map((d) => `• ${esc(d.title)} № ${esc(d.number)} от ${ru(d.date)} — ${formatRub(d.total)}`);
 

@@ -2225,21 +2225,28 @@ screens.ask = async function ask() {
 
 /** Счета, по которым не отметили оплату. */
 screens.unpaid = async function unpaid() {
-  const { docs: list } = await api('GET', '/api/unpaid');
+  const { docs: list, count, sum } = await api('GET', '/api/unpaid');
   const box = h('div', {}, h('h1', { text: 'Ждут оплаты' }));
   if (!list.length) {
     box.append(empty('check', 'Всё оплачено', 'Здесь появятся счета, по которым не отмечена оплата.'));
     return box;
   }
-  const sum = list.reduce((a, d) => a + (Number(d.total) || 0), 0);
+  /*
+   * Сумму и счётчик берём с сервера, а не складываем список.
+   * На одну сделку выписывают счёт и закрывающий его акт — складывая
+   * оба, экран показывал вдвое больше плитки, с которой на него пришли.
+   */
   box.append(h('div', { class: 'hero' },
     h('div', { class: 'sum money', text: money0(sum) }),
-    h('div', { class: 'sub', text: `${list.length} ${plural(list.length, 'счёт', 'счёта', 'счетов')} без отметки об оплате` })));
+    h('div', { class: 'sub', text: `${count} ${plural(count, 'документ', 'документа', 'документов')} ждут оплаты` })));
   box.append(h('div', { class: 'card' }, list.map((d) => navRow({
     icon: 'clock',
     title: `${d.title} № ${d.number}`,
-    sub: ru(d.date),
+    // Второй документ сделки показываем, но помечаем: иначе непонятно,
+    // почему пять строк складываются в сумму четырёх.
+    sub: d.pair ? `${ru(d.date)} · та же сделка` : ru(d.date),
     right: money0(d.total),
+    rightTone: d.pair ? 'muted' : '',
     onclick: () => go('doc', { id: d.id }),
   }))));
   return box;

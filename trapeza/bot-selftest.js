@@ -2258,6 +2258,51 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'на полукопейках слагаемые тоже сходятся', JSON.stringify(b5));
   }
 
+  console.log('\n── счёт и акт на одну сделку ──');
+  {
+    /*
+     * Жалоба: «акт об оказанных и счёт от одного контрагента считает как два
+     * счёта». Так и было — в сумму шли оба. Дубль определяется основанием
+     * долга: главный тот документ, который долг создаёт, второй его повторяет.
+     */
+    const bdbD = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = bdbD.getOrCreateUser(556677, 'Одна сделка').id;
+    const orgD = bdbD.createOrg(uid, { name: 'ИП Сделка', inn: '183209316100' });
+    const cpD = bdbD.createCp(uid, { name: 'ООО «Пара»', kind: 'customer', opening_date: '2026-01-01' });
+    for (const type of ['sch', 'usl']) {
+      // eslint-disable-next-line no-await-in-loop
+      await docSvc.issueDocument(uid, {
+        type, cpId: cpD, items: [{ name: 'Работа', qty: 1, price: 30000 }], skipQuota: true,
+      });
+    }
+
+    bdbD.updateOrg(uid, orgD, { debt_basis: 'closing' });
+    let s = bdbD.unpaidSummary(uid);
+    ok(s.sum === 30000 && s.count === 1, 'одна сделка, а не две', `${s.sum} / ${s.count}`);
+    ok(s.docs.length === 2, 'но оба документа видны в списке', s.docs.length);
+    ok(s.docs.find((d) => d.pair).type === 'sch',
+      'при долге по отгрузке дубль — счёт, главный акт', (s.docs.find((d) => d.pair) || {}).type);
+
+    bdbD.updateOrg(uid, orgD, { debt_basis: 'invoice' });
+    s = bdbD.unpaidSummary(uid);
+    ok(s.docs.find((d) => d.pair).type === 'usl',
+      'при долге по счёту наоборот — дубль акт', (s.docs.find((d) => d.pair) || {}).type);
+    ok(s.sum === 30000, 'сумма от смены основания не поехала', s.sum);
+
+    // Разные суммы — это разные сделки, склеивать их нельзя.
+    await docSvc.issueDocument(uid, {
+      type: 'usl', cpId: cpD, items: [{ name: 'Другое', qty: 1, price: 5000 }], skipQuota: true,
+    });
+    s = bdbD.unpaidSummary(uid);
+    ok(s.sum === 35000 && s.count === 2, 'акт на другую сумму — отдельная сделка', `${s.sum} / ${s.count}`);
+
+    bdbD.updateOrg(uid, orgD, { debt_basis: 'manual' });
+    s = bdbD.unpaidSummary(uid);
+    ok(s.count === 3 && s.sum === 65000,
+      'в ручном режиме правила нет — считаем всё как есть', `${s.sum} / ${s.count}`);
+  }
+
   console.log('\n── отменённую руками проводку пересчёт не воскрешает ──');
   {
     /*

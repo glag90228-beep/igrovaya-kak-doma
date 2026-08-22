@@ -405,6 +405,23 @@ async function main() {
       `${r.json.unpaid.sum} / ${r.json.unpaid.count} шт.`);
     ok(r.json.debts.owedToUs === 30000, 'и долг тоже один', r.json.debts.owedToUs);
 
+    /*
+     * Плитка и экран за ней обязаны показывать одно число.
+     *
+     * Плитка считала сделками, а экран складывал список сам — человек видел
+     * «30 000», нажимал и получал «2 счёта на 60 000». Оба берут сумму из
+     * одного места; список при этом остаётся полным, но второй документ
+     * сделки помечен.
+     */
+    const tile = r.json.unpaid;
+    const scr = (await call('GET', '/api/unpaid', { user: anna })).json;
+    ok(scr.sum === tile.sum && scr.count === tile.count,
+      'экран «Ждут оплаты» показывает то же, что плитка на главной',
+      `плитка ${tile.sum}/${tile.count} — экран ${scr.sum}/${scr.count}`);
+    ok(scr.docs.length === 2, 'но в списке видны оба документа', scr.docs.length);
+    ok(scr.docs.filter((d) => d.pair).length === 1,
+      'и второй помечен как та же сделка', scr.docs.filter((d) => d.pair).length);
+
     // Вид деятельности — вторая дверь к тому же правилу, что и основание.
     // Заходит в неё как раз тот, кто в основаниях не разбирается.
     await call('POST', '/api/basis', { user: anna, body: { basis: 'closing' } });
