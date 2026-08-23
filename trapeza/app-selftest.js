@@ -363,6 +363,47 @@ const ok = (c, m, extra) => {
   ok(prices.some((p) => p.text.replace(/\s/g, '').includes('2990')),
     'годовая цена на месте целиком', prices.map((p) => p.text).join(' | '));
 
+  /*
+   * Обход всех денежных экранов на узком телефоне.
+   *
+   * Точечные проверки ловят то, про что уже знаешь. А ломается вёрстка там,
+   * где длинное имя встретилось с большой суммой, — и узнаёшь об этом от
+   * человека, который смотрит на кривые цифры. Поэтому здесь не разбор
+   * конкретного экрана, а сторож на весь класс: сумма в две строки или
+   * вылезшая за край — поломка, где бы она ни случилась.
+   */
+  console.log('\n── деньги на всех экранах ──');
+  const bigCp = bdb.createCp(user.id, {
+    name: 'ООО «Производственно-торговая компания Ромашка»', kind: 'customer',
+    opening_balance: 1234567.89, opening_date: '2026-01-01',
+  });
+  bdb.addOp(user.id, bigCp, { date: '2026-03-01', kind: 'Оплата', doc: 'п/п 7', debit: 456789.01 });
+
+  const money = (name, params) => page.evaluate(([n, p]) => {
+    window.__go(n, p || {});
+    return new Promise((done) => setTimeout(() => {
+      const out = [];
+      if (document.documentElement.scrollWidth > window.innerWidth + 1) {
+        out.push(`шире экрана на ${document.documentElement.scrollWidth - window.innerWidth}px`);
+      }
+      for (const el of document.querySelectorAll('.money, .price, .sum, .v')) {
+        const text = el.textContent.trim();
+        if (!text) continue;
+        const lh = parseFloat(getComputedStyle(el).lineHeight) || 20;
+        if (Math.round(el.getBoundingClientRect().height / lh) > 1) out.push(`в две строки: «${text}»`);
+        if (el.getBoundingClientRect().right > window.innerWidth + 0.5) out.push(`за краем: «${text}»`);
+      }
+      done(out);
+    }, 500));
+  }, [name, params]);
+
+  for (const [name, params] of [['home'], ['docs'], ['cps'], ['debts'], ['unpaid'],
+    ['billing'], ['why'], ['cp', { id: bigCp }], ['ops', { cpId: bigCp }]]) {
+    // eslint-disable-next-line no-await-in-loop
+    const bad = await money(name, params);
+    ok(bad.length === 0, `«${name}»: суммы стоят ровно`, bad.join(' | '));
+  }
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();
