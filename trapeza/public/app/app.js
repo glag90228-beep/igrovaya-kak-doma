@@ -2238,7 +2238,15 @@ screens.unpaid = async function unpaid() {
    */
   box.append(h('div', { class: 'hero' },
     h('div', { class: 'sum money', text: money0(sum) }),
-    h('div', { class: 'sub', text: `${count} ${plural(count, 'документ', 'документа', 'документов')} ждут оплаты` })));
+    // Счётчик считает сделки, а строк ниже больше: подпись обязана это
+    // сказать, иначе «2 документа» над тремя строками выглядит ошибкой.
+    h('div', {
+      class: 'sub',
+      text: `${count} ${plural(count, 'сделка', 'сделки', 'сделок')} `
+        + `${plural(count, 'ждёт', 'ждут', 'ждут')} оплаты`
+        + (list.length > count
+          ? ` · ${list.length} ${plural(list.length, 'документ', 'документа', 'документов')}` : ''),
+    })));
   box.append(h('div', { class: 'card' }, list.map((d) => navRow({
     icon: 'clock',
     title: `${d.title} № ${d.number}`,
