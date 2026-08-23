@@ -71,6 +71,27 @@
   --fast: 160ms;
   --slow: 220ms;
   --ease: cubic-bezier(.22,.61,.36,1);
+
+  /*
+   * Стекло.
+   *
+   * Матовая поверхность читается стеклом только тогда, когда за ней что-то
+   * есть: размывать ровную заливку бессмысленно — получится та же заливка.
+   * Поэтому под страницей лежит мягкое цветное свечение (body::before), а
+   * карточки пропускают его сквозь себя.
+   *
+   * Плотность держим высокой — 76%, не 40. Это приложение про деньги:
+   * сумма должна читаться на ходу и при солнце, а не «смотреться».
+   * Насыщенность поднимаем: без неё размытие делает цвет под стеклом
+   * блёклым, и зелёный «нам должны» перестаёт отличаться от серого.
+   */
+  --glass: color-mix(in srgb, var(--surface) 76%, transparent);
+  --glass-strong: color-mix(in srgb, var(--surface) 88%, transparent);
+  --glass-blur: saturate(185%) blur(22px);
+  --glass-edge: inset 0 1px 0 rgba(255, 255, 255, .6);
+  --glow-a: color-mix(in srgb, var(--primary) 32%, transparent);
+  --glow-b: color-mix(in srgb, var(--money-in) 16%, transparent);
+  --glow-c: color-mix(in srgb, var(--link) 14%, transparent);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -85,6 +106,15 @@
     --success: #35d07f;
     --shadow-1: none;
     --shadow-2: none;
+
+    /* В тёмной теме блик сверху белым выглядит грязным пластиком, а не
+       стеклом: там кромку даёт едва заметная светлая линия. */
+    --glass: color-mix(in srgb, var(--surface) 68%, transparent);
+    --glass-strong: color-mix(in srgb, var(--surface) 84%, transparent);
+    --glass-edge: inset 0 1px 0 rgba(255, 255, 255, .09);
+    --glow-a: color-mix(in srgb, var(--primary) 34%, transparent);
+    --glow-b: color-mix(in srgb, var(--money-in) 16%, transparent);
+    --glow-c: color-mix(in srgb, var(--link) 26%, transparent);
   }
 }
 
@@ -93,16 +123,45 @@
 html, body {
   margin: 0;
   padding: 0;
-  background: var(--group);
   color: var(--text);
 }
 
+/* Фон держит только html. Если его продублировать на body, тот закрасит
+   свечение под собой: слой с отрицательным z-index лежит выше фона
+   корня, но ниже фона body, — и всё стекло превращается в ровную
+   заливку. Один раз уже наступили, оставляем комментарий. */
+html { background: var(--group); }
+
 body {
+  background: none;
   font: 400 16px/1.5 var(--font);
   min-height: 100dvh;
   -webkit-font-smoothing: antialiased;
   overscroll-behavior-y: none;
   touch-action: manipulation;         /* убирает задержку 300 мс */
+}
+
+/*
+ * То, что видно сквозь стекло.
+ *
+ * Два мягких пятна в цветах действия и денег — прибиты к окну (fixed), а
+ * не к странице: при прокрутке свечение стоит на месте, и карточки едут
+ * по нему, как по столу. Если прокручивать вместе — эффект пропадает,
+ * стекло начинает выглядеть просто полупрозрачным.
+ *
+ * Пятна бледные намеренно: это подложка, а не рисунок. Заметное пятно за
+ * колонкой сумм мешает их читать, а читают тут в первую очередь суммы.
+ */
+body::before {
+  content: '';
+  position: fixed;
+  inset: -20%;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(40% 26% at 12% 4%, var(--glow-a), transparent 70%),
+    radial-gradient(44% 28% at 92% 20%, var(--glow-b), transparent 72%),
+    radial-gradient(50% 30% at 50% 78%, var(--glow-c), transparent 74%);
 }
 
 #app {
@@ -140,11 +199,25 @@ h2 { font: 600 17px/1.35 var(--font); margin: 0 0 2px; }
 /* ---------- секции-карточки (идиома Telegram/iOS) ---------- */
 
 .card {
-  background: var(--surface);
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--hairline);
   border-radius: var(--r-card);
   margin: 0 12px var(--gap);
   overflow: hidden;
-  box-shadow: var(--shadow-1);
+  box-shadow: var(--shadow-1), var(--glass-edge);
+}
+
+/*
+ * Запасной путь. backdrop-filter есть не везде: старые вебвью Android и
+ * режим экономии данных его отключают. Тогда полупрозрачная карточка
+ * превращается в мутное пятно поверх свечения, и текст на ней теряется.
+ * В этом случае возвращаем плотную заливку — красиво не будет, читаемо
+ * будет.
+ */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .card, .tile, .tabs, .ask-bar, .stats { background: var(--surface); }
 }
 
 .row {
@@ -225,8 +298,13 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .hero .why { color: var(--primary); font-size: 14px; margin-top: 4px; }
 
 /* Пара «нам должны / мы должны» — один взгляд вместо двух экранов. */
-.stats { display: flex; margin: var(--gap) 12px; background: var(--surface);
-  border-radius: var(--r-card); box-shadow: var(--shadow-1); overflow: hidden; }
+.stats { display: flex; margin: var(--gap) 12px;
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-1), var(--glass-edge); overflow: hidden; }
 .stat { flex: 1; padding: 14px var(--pad); border: 0; background: none;
   color: inherit; font: inherit; text-align: left; cursor: pointer; min-height: 76px; }
 .stat + .stat { border-left: 1px solid var(--hairline); }
@@ -241,10 +319,12 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
    раньше текста, а четыре одинаковых листа бумаги выбрать не помогают. */
 .tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: var(--gap) 12px; }
 .tile {
-  background: var(--surface);
-  border: 0;
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--hairline);
   border-radius: var(--r-card);
-  box-shadow: var(--shadow-1);
+  box-shadow: var(--shadow-1), var(--glass-edge);
   padding: 16px;
   min-height: 108px;
   display: flex; flex-direction: column; gap: 10px;
@@ -536,9 +616,11 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .tabs {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
   display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
-  background: color-mix(in srgb, var(--surface) 92%, transparent);
-  backdrop-filter: blur(12px);
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
   border-top: 1px solid var(--border);
+  box-shadow: var(--glass-edge);
   padding-bottom: env(safe-area-inset-bottom);
 }
 .tab {
@@ -605,7 +687,10 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   position: fixed; left: 0; right: 0; bottom: var(--tabs-h); z-index: 41;
   display: flex; gap: 8px; align-items: center;
   padding: 10px var(--pad);
-  background: var(--bg); border-top: 1px solid var(--hairline);
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border-top: 1px solid var(--hairline);
 }
 .ask-input {
   flex: 1; min-width: 0; min-height: 44px;
@@ -628,6 +713,57 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 
 .screen { animation: enter var(--slow) var(--ease); }
 @keyframes enter { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/*
+ * Появление по очереди.
+ *
+ * Карточки выезжают не разом, а через 40 мс друг за другом — глаз успевает
+ * пройти сверху вниз в том же порядке, в каком экран задуман. Задержки
+ * короткие и конечные: пять шагов, дальше все появляются сразу. Ждать
+ * полсекунды, пока доедет восьмая карточка, — это уже не оформление, а
+ * задержка перед работой.
+ */
+.screen > .card,
+.screen > .hero,
+.screen > .tiles,
+.screen > .stats,
+.screen > .btn-wrap,
+.screen > .section-title { animation: rise var(--slow) var(--ease) both; }
+
+.screen > *:nth-child(1) { animation-delay: 0ms; }
+.screen > *:nth-child(2) { animation-delay: 40ms; }
+.screen > *:nth-child(3) { animation-delay: 80ms; }
+.screen > *:nth-child(4) { animation-delay: 120ms; }
+.screen > *:nth-child(5) { animation-delay: 160ms; }
+.screen > *:nth-child(n+6) { animation-delay: 180ms; }
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* Крупная сумма приходит чуть позже и чуть иначе: она главная на экране,
+   и взгляд должен закончить на ней, а не начать с неё. */
+.hero .sum { animation: sum-in 420ms var(--ease) both; animation-delay: 80ms; }
+@keyframes sum-in {
+  from { opacity: 0; transform: translateY(8px) scale(.97); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* Нажатие: стекло на миг «прижимается» — отклик, который чувствуется
+   пальцем раньше, чем успевает отрисоваться следующий экран. */
+.card .row:active, .tile:active, .stat:active, .btn:active, .mic:active {
+  transform: scale(.978);
+  transition: transform 90ms var(--ease);
+}
+.btn:active { filter: brightness(.96); }
+
+/* Запись голоса: пульс вокруг кнопки, пока идёт звук. */
+.mic.on { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--money-out) 45%, transparent); }
+  50%      { box-shadow: 0 0 0 10px color-mix(in srgb, var(--money-out) 0%, transparent); }
+}
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
