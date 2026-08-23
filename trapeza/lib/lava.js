@@ -95,7 +95,24 @@ function parseWebhook(body) {
     .find((v) => v && typeof v === 'object');
   const src = box ? { ...body, ...box } : body;
 
-  const externalId = first(src, FIELDS.externalId);
+  /*
+   * Ключ платежа. У разового платежа это его собственный id, и всё просто.
+   * У подписки с ежемесячным списанием сложнее: если площадка присылает
+   * только contractId — а он у всех списаний по одному договору один и тот
+   * же, — второй месяц выглядел бы повтором первого. Оплату записали бы,
+   * доступ не продлили, и человек, честно заплативший, остался бы ни с чем.
+   *
+   * Поэтому, когда собственного идентификатора платежа нет и остаётся
+   * только номер договора, приписываем к нему день. Повторная доставка
+   * того же вебхука (площадки шлют их по нескольку раз) в тот же день
+   * по-прежнему опознаётся как повтор, а списание в следующем месяце —
+   * уже как новый платёж.
+   */
+  const ownId = first(src, FIELDS.externalId.filter((k) => k !== 'contractId'));
+  const contractId = first(src, ['contractId', 'contract_id']);
+  const when = String(first(src, ['timestamp', 'createdAt', 'created_at', 'date', 'paidAt']) || '')
+    .slice(0, 10) || new Date().toISOString().slice(0, 10);
+  const externalId = ownId || (contractId ? `${contractId}:${when}` : null);
   const amount = money(first(src, FIELDS.amount));
   // eventType — главный признак у Lava; status держим отдельно для лога.
   const eventType = String(first(src, ['eventType', 'event_type', 'event', 'type']) || '').trim();

@@ -580,7 +580,9 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     amount: 390, currency: 'RUB', buyer: { email: 'Buyer@Mail.RU' },
     product: { title: 'Первичка — месяц' },
   });
-  ok(real.ok && real.payment.externalId === 'c-42' && real.payment.paid
+  // Ключ платежа — номер договора с днём: своего id в этом теле нет, а по
+  // одному договору списывают каждый месяц (пояснение в lib/lava.js).
+  ok(real.ok && /^c-42:\d{4}-\d{2}-\d{2}$/.test(real.payment.externalId) && real.payment.paid
     && real.payment.email === 'buyer@mail.ru' && real.payment.amount === 390
     && real.payment.product === 'Первичка — месяц',
     'реальный формат Lava Top (eventType/contractId/buyer.email)',
@@ -589,6 +591,30 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     eventType: 'subscription.recurring.payment.success', contractId: 'c-43',
     amount: 2990, buyer: { email: 'x@y.ru' } });
   ok(recur.ok && recur.payment.paid, 'автопродление подписки Lava — оплачено');
+
+  /*
+   * Подписка списывает деньги каждый месяц по одному договору. Если ключом
+   * платежа взять contractId, второе списание выглядит повтором первого:
+   * деньги пришли, доступ не продлён. Поэтому при отсутствии собственного
+   * id к договору приписывается день.
+   */
+  const m1 = lava.parseWebhook({
+    eventType: 'payment.success', contractId: 'c-77', amount: 390,
+    buyer: { email: 'x@y.ru' }, timestamp: '2026-08-22T10:00:00Z' });
+  const again = lava.parseWebhook({
+    eventType: 'payment.success', contractId: 'c-77', amount: 390,
+    buyer: { email: 'x@y.ru' }, timestamp: '2026-08-22T18:30:00Z' });
+  const m2 = lava.parseWebhook({
+    eventType: 'payment.success', contractId: 'c-77', amount: 390,
+    buyer: { email: 'x@y.ru' }, timestamp: '2026-09-22T10:00:00Z' });
+  ok(m1.payment.externalId === again.payment.externalId,
+    'повторная доставка того же вебхука — тот же платёж', m1.payment.externalId);
+  ok(m1.payment.externalId !== m2.payment.externalId,
+    'а списание в следующем месяце — новый платёж', `${m1.payment.externalId} / ${m2.payment.externalId}`);
+  const own = lava.parseWebhook({
+    eventType: 'payment.success', id: 'pay-1', contractId: 'c-77', amount: 390 });
+  ok(own.payment.externalId === 'pay-1',
+    'когда у платежа есть свой id — берём его, а не договор', own.payment.externalId);
   const declined = lava.parseWebhook({
     eventType: 'payment.failed', contractId: 'c-44', amount: 390, buyer: { email: 'x@y.ru' } });
   ok(declined.ok && !declined.payment.paid, 'событие payment.failed — доступ не выдан');
