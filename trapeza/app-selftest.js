@@ -331,6 +331,38 @@ const ok = (c, m, extra) => {
   });
   ok(fits, 'последний ответ виден целиком, а не под строкой ввода');
 
+  /*
+   * Цена на экране подписки.
+   *
+   * Жалоба: «очень коряво встают цифры». Так и было: «390 ₽ в месяц или
+   * 2990 ₽ в год» одной фразой рвалось посреди числа — «2990» на одной
+   * строке, «₽ в год» на другой. Цена, оторванная от знака рубля, читается
+   * как ошибка, а по ней принимают решение. Меряем прямоугольники.
+   */
+  console.log('\n── цена на экране подписки ──');
+  process.env.LAVA_PLAN_DAYS = '390:30,2990:365';
+  process.env.LAVA_DEFAULT_DAYS = '30';
+  await page.evaluate(() => window.__go('billing', {}));
+  await page.waitForSelector('.price');
+
+  const prices = await page.evaluate(() => [...document.querySelectorAll('.price')].map((el) => {
+    const r = el.getBoundingClientRect();
+    const title = el.closest('.row').querySelector('.grow div').getBoundingClientRect();
+    return {
+      text: el.textContent,
+      lines: Math.round(r.height / parseFloat(getComputedStyle(el).lineHeight || 24)),
+      overlaps: title.right > r.left,
+      inside: r.right <= el.closest('.row').getBoundingClientRect().right + 0.5,
+    };
+  }));
+  ok(prices.length === 2, 'оба тарифа показаны отдельными строками', prices.length);
+  ok(prices.every((p) => p.lines === 1), 'сумма не разорвана переносом',
+    JSON.stringify(prices.map((p) => `${p.text}:${p.lines}`)));
+  ok(prices.every((p) => !p.overlaps), 'и не налезает на название срока');
+  ok(prices.every((p) => p.inside), 'и не вылезает за строку');
+  ok(prices.some((p) => p.text.replace(/\s/g, '').includes('2990')),
+    'годовая цена на месте целиком', prices.map((p) => p.text).join(' | '));
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();

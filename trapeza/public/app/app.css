@@ -576,6 +576,11 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .toast.err { background: #8c2b23; }
 
+/* Цена в строке тарифа: крупнее обычного текста, но не как сальдо —
+   выбирают между двумя числами, и их надо сравнить одним взглядом. */
+.price { font: 700 19px/1.2 var(--font); letter-spacing: -.02em; }
+.small.ok { color: var(--money-in); }
+
 /* ---------- переписка с агентом ---------- */
 
 /* Место под строку ввода: она приклеена к низу над вкладками, и без

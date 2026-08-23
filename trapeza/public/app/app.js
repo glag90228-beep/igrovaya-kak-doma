@@ -2825,13 +2825,31 @@ screens.billing = async function billing() {
      * уйдя на сторонний сайт. Берётся из тарифов, по которым считается срок
      * доступа, поэтому разойтись с реальной ценой не может.
      */
-    if (s.price && s.price.text) {
+    /*
+     * Тарифы строками, а не фразой.
+     *
+     * Раньше здесь стояло «390 ₽ в месяц или 2990 ₽ в год» одной строкой,
+     * и справа значок выгоды. На узком экране фраза рвалась посреди числа:
+     * «2990» на одной строке, «₽ в год» на другой. Число, оторванное от
+     * знака рубля, читается как ошибка — а это цена, по ней принимают
+     * решение. Теперь у каждого срока своя строка: слева название, справа
+     * сумма, которую не разлучить переносом.
+     */
+    const list = (s.price && s.price.plans) || [];
+    if (list.length) {
+      box.append(h('div', { class: 'section-title', text: 'Сколько стоит' }));
+      box.append(h('div', { class: 'card' }, list.map((p) => {
+        const best = s.price.saving > 0 && p.days >= 350;
+        return h('div', { class: 'row' },
+          h('span', { class: 'grow' },
+            h('div', { text: p.title }),
+            best ? h('div', { class: 'small ok', text: `выгода ${money0(s.price.saving)} за год` }) : null),
+          h('span', { class: 'price money nowrap', text: money0(p.amount) }));
+      })));
+    } else if (s.price && s.price.text) {
+      // Тарифов списком нет — показываем как есть, но не выдумываем цену.
       box.append(h('div', { class: 'card' },
-        h('div', { class: 'row' },
-          h('span', { class: 'grow', text: s.price.text }),
-          s.price.saving > 0
-            ? h('span', { class: 'money ok', text: `−${money0(s.price.saving)} за год` })
-            : null)));
+        h('div', { class: 'row' }, h('span', { class: 'grow', text: s.price.text }))));
     }
 
     if (s.payUrl) {

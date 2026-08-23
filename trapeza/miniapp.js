@@ -46,7 +46,7 @@ const bizTypes = require('./lib/biz-types');
 const reqCheck = require('./lib/requisites-check');
 const { round2 } = require('./lib/money');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
-const { payLink, priceText, yearSaving } = require('./lib/lava');
+const { payLink, priceText, yearSaving, planTitle, plans: lavaPlans } = require('./lib/lava');
 const { currentYear } = require('./lib/period');
 const { Telegram } = require('./lib/tg');
 
@@ -149,7 +149,17 @@ function stateFor(user) {
     unpaid: { count: awaiting.count, sum: awaiting.sum },
     docs: bdb.listDocs(user.id, 5).map(docBrief),
     payUrl: payLink(user.tg_id),
-    price: { text: priceText(), saving: yearSaving() },
+    /*
+     * Тарифы отдаём списком, а не одной фразой. Фраза «390 ₽ в месяц или
+     * 2990 ₽ в год» на узком экране рвалась посередине числа: «2990» на
+     * одной строке, «₽ в год» на другой. Из списка приложение рисует
+     * строки, где число и знак рубля не разлучить.
+     */
+    price: {
+      text: priceText(),
+      saving: yearSaving(),
+      plans: lavaPlans().map((p) => ({ amount: p.amount, days: p.days, title: planTitle(p.days) })),
+    },
     facsimile: fxState(user.id),
     debtBasis: bdb.basisOf(org || {}),
     // Расхождение между тем, как человек работает, и тем, как считается

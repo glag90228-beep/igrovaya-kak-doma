@@ -169,14 +169,24 @@ function daysFor(payment) {
  * Цена словами: «390 ₽ в месяц или 2990 ₽ в год».
  * Пусто, если тарифы не заданы — выдумывать цену нельзя.
  */
+/** Как называется срок: «в месяц», «в год». Одно на бота и приложение. */
+function planLabel(days) {
+  if (days >= 350) return 'в год';
+  if (days >= 175) return 'за полгода';
+  if (days >= 80) return 'за квартал';
+  return 'в месяц';
+}
+
+/** То же, но заголовком строки в списке тарифов: «Месяц», «Год». */
+function planTitle(days) {
+  if (days >= 350) return 'Год';
+  if (days >= 175) return 'Полгода';
+  if (days >= 80) return 'Квартал';
+  return 'Месяц';
+}
+
 function priceText() {
-  const label = (days) => {
-    if (days >= 350) return 'в год';
-    if (days >= 175) return 'за полгода';
-    if (days >= 80) return 'за квартал';
-    return 'в месяц';
-  };
-  const parts = plans().map((p) => `${p.amount} ₽ ${label(p.days)}`);
+  const parts = plans().map((p) => `${p.amount} ₽ ${planLabel(p.days)}`);
   if (!parts.length) return '';
   return parts.join(' или ');
 }
@@ -209,4 +219,5 @@ function payLink(tgId) {
 }
 
 module.exports = {
-  plans, priceText, yearSaving, parseWebhook, daysFor, secretOk, payLink, tgIdFrom, FIELDS };
+  plans, priceText, planTitle, planLabel, yearSaving,
+  parseWebhook, daysFor, secretOk, payLink, tgIdFrom, FIELDS };
