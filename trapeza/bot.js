@@ -19,6 +19,7 @@ const { buildDogovorHtml } = require('./lib/dogovor');
 const { pdfAvailable, htmlToPdf } = require('./lib/pdf');
 const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
 const speech = require('./lib/speech');
+const office = require('./lib/office');
 const { applySetup } = require('./lib/bot-setup');
 const { acquire: acquireLock } = require('./lib/lock');
 const { supportScreen, forwardToSupport, legalLine } = require('./lib/bot-support');
@@ -1838,6 +1839,14 @@ async function handleFreeText(tg, chatId, user, text) {
       + '<i>Операция вносится текстом: <code>15.06 приход 94193</code>.</i>');
     return true;
   }
+  /*
+   * Не поняли — запоминаем фразу. По этим записям видно, что люди просят
+   * на самом деле, и чему учить агента дальше. Команды не пишем: они
+   * начинаются со слэша и ничего о живой речи не говорят.
+   */
+  if (!String(text || '').startsWith('/')) {
+    office.record({ kind: 'unknown', where: 'bot', text, userId: user.id }).catch(() => {});
+  }
   return false;
 }
 
@@ -3566,6 +3575,7 @@ async function handleCallback(tg, cq) {
   } catch (e) {
     if (e && e.blocked) throw e; // разберётся handleUpdate
     console.error('Ошибка обработки:', e.message);
+    office.record({ kind: 'crash', where: 'handleCallback', error: e.message, userId: user.id }).catch(() => {});
     await tg.sendMessage(chatId,
       '⚠️ Что-то пошло не так на этом шаге. Попробуйте ещё раз, а если повторится — '
       + 'напишите в поддержку, я посмотрю.', mainMenu());
@@ -3608,6 +3618,7 @@ async function main() {
   }
 
   const tg = new Telegram(token);
+  office.attach((chat, text) => tg.sendMessage(chat, text));
 
   /*
    * Кто мы. Пробуем несколько раз: у российского хостинга связь с
@@ -3727,7 +3738,10 @@ async function main() {
     }
     for (const u of updates) {
       offset = u.update_id + 1;
-      try { await handleUpdate(tg, u); } catch (e) { console.error('handleUpdate:', e.message); }
+      try { await handleUpdate(tg, u); } catch (e) {
+        console.error('handleUpdate:', e.message);
+        office.record({ kind: 'crash', where: 'handleUpdate', error: e.message }).catch(() => {});
+      }
     }
   }
 }
