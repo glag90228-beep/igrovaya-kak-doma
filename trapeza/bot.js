@@ -1884,6 +1884,36 @@ async function showRecurring(tg, chatId, user) {
 }
 
 /** Предложение выписать очередной документ. Отправляется раз в месяц. */
+/**
+ * Предложить напоминание по виду деятельности.
+ *
+ * У аренды каждый месяц счёт, у обслуживания — акт. Это единственное, что
+ * из вида деятельности можно вывести помимо основания долга, и предлагать
+ * это надо ровно один раз: когда человек только сказал, чем занимается.
+ *
+ * Молчим, если предлагать нечего (в подряде объём каждый раз разный),
+ * если клиентов ещё нет и если повторение уже заведено — второй раз тот же
+ * вопрос выглядит навязчивостью.
+ *
+ * @returns {Promise<boolean>} true — предложили, показывать меню не надо
+ */
+async function offerRoutine(tg, chatId, user, key) {
+  const r = bizTypes.routineOf(key);
+  if (!r) return false;
+  if (!bdb.listCps(user.id).length) return false;
+  if (recurring.list(user.id).length) return false;
+
+  await tg.sendMessage(chatId,
+    `В вашем деле каждый месяц повторяется одно и то же — <b>${esc(r.what)}</b>.\n\n`
+    + 'Могу напоминать про него в нужный день. Выписывать буду не сам: пришлю '
+    + 'напоминание с кнопкой, а документ выпустите вы.',
+    keyboard([
+      [{ text: '🔔 Напоминать каждый месяц', data: `rt.new:${key}` }],
+      [{ text: 'Не нужно', data: 'rt.no' }],
+    ]));
+  return true;
+}
+
 async function offerRecurring(tg, rec) {
   const user = bdb.userById(rec.user_id);
   if (!user || user.blocked_at) return false;
@@ -1891,14 +1921,26 @@ async function offerRecurring(tg, rec) {
   if (!kind) return false;
   const sum = rec.items.reduce((a, it) => a + round2((Number(it.qty) || 0) * (Number(it.price) || 0)), 0);
 
+  /*
+   * Повторение без позиций — это напоминание, а не готовый документ.
+   * Такое заводится из подсказки по виду деятельности, когда суммы ещё
+   * никто не называл. Выписать его «как есть» нельзя: вышел бы документ
+   * на ноль рублей с номером из сквозного ряда. Поэтому кнопка ведёт в
+   * обычный мастер с уже выбранным клиентом.
+   */
+  const empty = !rec.items.length;
   await tg.sendMessage(user.tg_id,
     `🔁 <b>Пора выставить: ${esc(kind.title)}</b>\n\n`
     + `Клиент: <b>${esc(rec.cp_name)}</b>\n`
-    + `Сумма: <b>${formatRub(sum)}</b>\n`
-    + `${rec.items.slice(0, 5).map((it) => `• ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n')}`
-    + (rec.items.length > 5 ? `\n…и ещё ${rec.items.length - 5}` : ''),
+    + (empty
+      ? '\n<i>Позиции и сумму укажете сами — я только напоминаю про срок.</i>'
+      : `Сумма: <b>${formatRub(sum)}</b>\n`
+        + `${rec.items.slice(0, 5).map((it) => `• ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n')}`
+        + (rec.items.length > 5 ? `\n…и ещё ${rec.items.length - 5}` : '')),
     keyboard([
-      [{ text: '✅ Выписать', data: `rec.go:${rec.id}` }],
+      [empty
+        ? { text: '✍️ Заполнить и выписать', data: `d.${rec.type}:${rec.cp_id}` }
+        : { text: '✅ Выписать', data: `rec.go:${rec.id}` }],
       [{ text: '⏭ Пропустить месяц', data: `rec.skip:${rec.id}` }],
       [{ text: '✖️ Больше не напоминать', data: `rec.off:${rec.id}` }],
     ]));
@@ -3134,15 +3176,60 @@ async function handleCallback(tg, cq) {
       const t = bizTypes.get(data.slice(8));
       const org = bdb.getDefaultOrg(user.id);
       if (t && org) {
-        bdb.updateOrg(user.id, org.id, { biz_type: data.slice(8), debt_basis: t.basis });
+        const key = data.slice(8);
+        bdb.updateOrg(user.id, org.id, { biz_type: key, debt_basis: t.basis });
         // Та же дверь к тому же правилу, что и basis.set — значит, и тот же
         // пересчёт. Иначе выбравший «Аренда» читает «долг по счёту», а долг
         // по уже выписанным счетам не появляется.
         const said = rebuildText(bdb.rebuildDebt(user.id));
         await tg.sendMessage(chatId,
           `<b>${esc(t.name)}</b>\n\n${esc(t.why)}${said ? `\n\n${said}` : ''}`);
+        if (await offerRoutine(tg, chatId, user, key)) return;
       }
       await showBasis(tg, chatId, user);
+      return;
+    }
+
+    /*
+     * Настройка напоминания из подсказки по виду деятельности.
+     *
+     * Три шага: клиент → число → готово. Правило заводится пустым — без
+     * позиций и сумм, их никто ещё не называл. В нужный день бот придёт с
+     * напоминанием, а документ заполнит и выпустит человек.
+     */
+    if (data === 'rt.no') {
+      await tg.sendMessage(chatId, 'Хорошо, не буду. Захотите — «Ещё» → «Повторяющиеся документы».');
+      await showBasis(tg, chatId, user);
+      return;
+    }
+    if (data.startsWith('rt.new:')) {
+      const cps = bdb.listCps(user.id);
+      const rows = cps.slice(0, 10).map((c) => ([{ text: c.name.slice(0, 60), data: `rt.cp:${data.slice(7)}:${c.id}` }]));
+      rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+      await tg.sendMessage(chatId, 'Кому напоминать выставлять?', keyboard(rows));
+      return;
+    }
+    if (data.startsWith('rt.cp:')) {
+      const [, key, cpId] = data.split(':');
+      const r = bizTypes.routineOf(key);
+      if (!r) { await tg.sendMessage(chatId, 'Не понял, что напоминать.', mainMenu()); return; }
+      const days = [1, 5, 10, 15, 20, 25].map((d) => ({ text: String(d), data: `rt.day:${key}:${cpId}:${d}` }));
+      await tg.sendMessage(chatId, 'Какого числа напоминать?',
+        keyboard([days.slice(0, 3), days.slice(3),
+          [{ text: 'Последнее число месяца', data: `rt.day:${key}:${cpId}:0` }]]));
+      return;
+    }
+    if (data.startsWith('rt.day:')) {
+      const [, key, cpId, day] = data.split(':');
+      const r = bizTypes.routineOf(key);
+      const cp = bdb.getCp(user.id, Number(cpId));
+      if (!r || !cp) { await tg.sendMessage(chatId, 'Клиент не найден.', mainMenu()); return; }
+      recurring.add(user.id, { cpId: cp.id, type: r.type, items: [], day: Number(day) });
+      await tg.sendMessage(chatId,
+        `Готово. ${Number(day) ? `${day}-го числа` : 'В последний день месяца'} напомню про `
+        + `<b>${esc(r.what)}</b> для «${esc(cp.name)}».\n\n`
+        + '<i>Выписывать буду не сам — пришлю напоминание с кнопкой.</i>',
+        mainMenu());
       return;
     }
 

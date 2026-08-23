@@ -2284,6 +2284,81 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'на полукопейках слагаемые тоже сходятся', JSON.stringify(b5));
   }
 
+  console.log('\n── напоминание по виду деятельности ──');
+  {
+    /*
+     * Безопасная автоматизация: шаблон подсказывает, повторение предлагает,
+     * выписывает человек. Проверяем и то, что предлагается, и — главное —
+     * что само ничего не выписывается.
+     */
+    const bdbR = require('./lib/bot-db');
+    const recur = require('./lib/recurring');
+    const bizT = require('./lib/biz-types');
+
+    ok(bizT.routineOf('rent').type === 'sch', 'у аренды повторяется счёт');
+    ok(bizT.routineOf('services').type === 'usl', 'у обслуживания — акт');
+    ok(bizT.routineOf('contractor') === null,
+      'у подряда ничего: объём каждый раз разный, лишний документ дороже');
+
+    const uid = fxUserId();
+    const org = bdbR.getDefaultOrg(uid);
+    const was = bdbR.basisOf(org);
+    for (const r of recur.list(uid)) recur.off(uid, r.id);   // начинаем с чистого
+    const cpR = bdbR.createCp(uid, { name: 'ООО «Арендатор Р»', kind: 'customer', opening_date: '2026-01-01' });
+
+    sent.length = 0;
+    await tap('biz.set:rent');
+    const offer = sent.map((m) => norm(m.text || '')).join(' ');
+    ok(offer.includes('счёт за аренду'), 'после выбора дела предложено напоминание', offer.slice(-80));
+    ok(offer.includes('Выписывать буду не сам'), 'и сразу сказано, что сам не выпишет');
+
+    const docsWas = bdbR.listDocs(uid, 100).length;
+    sent.length = 0;
+    await tap('rt.new:rent');
+    ok(norm(last()).includes('Кому напоминать'), 'спросил клиента', norm(last()));
+    await tap(`rt.cp:rent:${cpR}`);
+    ok(norm(last()).includes('Какого числа'), 'спросил число', norm(last()));
+    await tap(`rt.day:rent:${cpR}:5`);
+    ok(norm(last()).includes('5-го числа'), 'напоминание заведено', norm(last()));
+
+    const rules = recur.list(uid).filter((r) => r.cp_id === cpR);
+    ok(rules.length === 1 && rules[0].type === 'sch' && rules[0].day === 5,
+      'правило легло в повторения', JSON.stringify(rules.map((r) => `${r.type}:${r.day}`)));
+    ok(rules[0].items.length === 0, 'без позиций — их назовёт человек');
+    ok(bdbR.listDocs(uid, 100).length === docsWas,
+      'и ни одного документа при этом не выписано',
+      `${docsWas} → ${bdbR.listDocs(uid, 100).length}`);
+
+    // Второй раз тот же вопрос не задаётся.
+    sent.length = 0;
+    await tap('biz.set:rent');
+    ok(!sent.map((m) => m.text || '').join(' ').includes('Напоминать каждый месяц'),
+      'повторно не навязывается — правило уже есть');
+
+    /*
+     * Наступил день. Главное здесь — что бот пришёл с предложением, а
+     * документ не выписался сам: у правила нет ни позиций, ни суммы, и
+     * «выписать как есть» дало бы документ на ноль рублей с номером из
+     * сквозного ряда.
+     */
+    const { db: rawR } = require('./db');
+    rawR.prepare("UPDATE recurring SET last_offer = '2000-01', day = ? WHERE id = ?")
+      .run(new Date().getDate(), rules[0].id);
+    sent.length = 0;
+    const before2 = bdbR.listDocs(uid, 100).length;
+    await require('./bot').runDaily(tg);
+    const daily = sent.map((m) => norm(m.text || '')).join(' ');
+    const kb = sent.flatMap((m) => (m.kb || []).flat()).map((b) => b.text).join('|');
+    ok(daily.includes('Пора выставить'), 'в свой день бот напомнил', daily.slice(0, 60));
+    ok(kb.includes('Заполнить и выписать'),
+      'кнопка ведёт в мастер, а не выписывает пустой документ', kb);
+    ok(bdbR.listDocs(uid, 100).length === before2,
+      'и сам ничего не выписал', `${before2} → ${bdbR.listDocs(uid, 100).length}`);
+
+    bdbR.updateOrg(uid, org.id, { debt_basis: was });
+    bdbR.rebuildDebt(uid);
+  }
+
   console.log('\n── счёт и акт на одну сделку ──');
   {
     /*
