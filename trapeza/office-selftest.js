@@ -52,14 +52,50 @@ const ok = (c, m, extra) => {
   const b = await office.record({ kind: 'unknown', where: 'bot', text: 'сделай магию', userId: 8 });
   ok(b.sent === false && b.skipped === 'dup', 'та же фраза за час не спамит', b.skipped);
 
+  /*
+   * Разные фразы глушить нельзя — ради них журнал и заведён. Раньше проверка
+   * повтора стояла после вставки записи и находила саму себя, поэтому любая
+   * вторая фраза в течение часа считалась дублем и до офиса не доходила.
+   */
+  const before = sent.length;
+  await office.record({ kind: 'unknown', where: 'bot', text: 'посчитай зарплату', userId: 9 });
+  await office.record({ kind: 'unknown', where: 'bot', text: 'где мой счёт', userId: 10 });
+  ok(sent.length === before + 2, 'разные фразы доходят до офиса', `${sent.length - before} из 2`);
+
   const c = await office.record({ kind: 'crash', where: 'handleUpdate', error: 'boom', userId: 7 });
   ok(c.sent === true, 'падение уходит отдельно от unknown');
+
+  /*
+   * У падения текст пуст, и старая проверка повтора («есть текст И такой же
+   * текст уже был») его не ловила вовсе: одна и та же ошибка уходила в чат
+   * двадцать раз в час, пока не срабатывал общий стоп-кран.
+   */
+  const crashBefore = sent.length;
+  for (let i = 0; i < 10; i += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    await office.record({ kind: 'crash', where: 'handleUpdate', error: 'boom', userId: 7 });
+  }
+  ok(sent.length === crashBefore, 'та же ошибка десять раз — ни одного лишнего сообщения',
+    `лишних: ${sent.length - crashBefore}`);
+  const other = await office.record({ kind: 'crash', where: 'handleUpdate', error: 'бах', userId: 7 });
+  ok(other.sent === true, 'а другая ошибка того же вида — доходит');
+
+  // Обработчик ошибки не должен падать сам, чем бы в него ни бросили.
+  office.attach(async () => { throw null; });
+  const thrown = await office.record({ kind: 'other', where: 'bot', text: 'что угодно' });
+  ok(thrown.sent === false && thrown.id > 0, 'бросили не объект — record устоял', thrown.skipped);
+  office.attach(async (chat, text) => { sent.push({ chat, text }); });
 
   const phrases = office.unknownPhrases();
   ok(phrases.some((p) => p.text === 'сделай магию' && p.n >= 2), 'повторы копятся для обучения');
 
-  const listed = office.list('crash', 5);
-  ok(listed.length >= 1 && listed[0].error === 'boom', 'ошибки читаются из журнала');
+  const listed = office.list('crash', 20);
+  ok(listed.some((r) => r.error === 'boom'), 'ошибки читаются из журнала');
+  // Заглушённые повторы всё равно ложатся в журнал: в чат они не идут, но
+  // «сколько раз это упало» — как раз то, ради чего журнал читают.
+  ok(listed.filter((r) => r.error === 'boom').length === 11,
+    'заглушённые повторы всё равно записаны',
+    String(listed.filter((r) => r.error === 'boom').length));
 
   console.log(bad ? `\nофис: ${bad} провала` : '\nофис готов ✅');
   process.exit(bad ? 1 : 0);

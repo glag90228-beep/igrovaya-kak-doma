@@ -580,9 +580,9 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     amount: 390, currency: 'RUB', buyer: { email: 'Buyer@Mail.RU' },
     product: { title: 'Первичка — месяц' },
   });
-  // Ключ платежа — номер договора с днём: своего id в этом теле нет, а по
-  // одному договору списывают каждый месяц (пояснение в lib/lava.js).
-  ok(real.ok && /^c-42:\d{4}-\d{2}-\d{2}$/.test(real.payment.externalId) && real.payment.paid
+  // Ключ платежа собран из договора: своего id в этом теле нет, а по одному
+  // договору списывают каждый месяц (пояснение в lib/lava.js).
+  ok(real.ok && real.payment.externalId.startsWith('c-42:') && real.payment.paid
     && real.payment.email === 'buyer@mail.ru' && real.payment.amount === 390
     && real.payment.product === 'Первичка — месяц',
     'реальный формат Lava Top (eventType/contractId/buyer.email)',
@@ -596,21 +596,54 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
    * Подписка списывает деньги каждый месяц по одному договору. Если ключом
    * платежа взять contractId, второе списание выглядит повтором первого:
    * деньги пришли, доступ не продлён. Поэтому при отсутствии собственного
-   * id к договору приписывается день.
+   * id ключ собирается из договора, момента, статуса и суммы.
    */
-  const m1 = lava.parseWebhook({
+  const wh = (extra) => lava.parseWebhook({
     eventType: 'payment.success', contractId: 'c-77', amount: 390,
-    buyer: { email: 'x@y.ru' }, timestamp: '2026-08-22T10:00:00Z' });
-  const again = lava.parseWebhook({
-    eventType: 'payment.success', contractId: 'c-77', amount: 390,
-    buyer: { email: 'x@y.ru' }, timestamp: '2026-08-22T18:30:00Z' });
-  const m2 = lava.parseWebhook({
-    eventType: 'payment.success', contractId: 'c-77', amount: 390,
-    buyer: { email: 'x@y.ru' }, timestamp: '2026-09-22T10:00:00Z' });
-  ok(m1.payment.externalId === again.payment.externalId,
-    'повторная доставка того же вебхука — тот же платёж', m1.payment.externalId);
-  ok(m1.payment.externalId !== m2.payment.externalId,
-    'а списание в следующем месяце — новый платёж', `${m1.payment.externalId} / ${m2.payment.externalId}`);
+    buyer: { email: 'x@y.ru' }, ...extra }).payment.externalId;
+  const m1 = wh({ timestamp: '2026-08-22T10:00:00Z' });
+  ok(m1 === wh({ timestamp: '2026-08-22T10:00:00Z' }),
+    'повторная доставка того же вебхука — тот же платёж', m1);
+  ok(m1 !== wh({ timestamp: '2026-09-22T10:00:00Z' }),
+    'а списание в следующем месяце — новый платёж', m1);
+
+  /*
+   * Отказ и удачная оплата по одному договору в один день — разные платежи.
+   * Раньше ключом были договор и дата: отказ записывался первым и занимал
+   * место, а оплата через пять минут отбрасывалась как повтор. Человек,
+   * заплативший со второй попытки, оставался без доступа.
+   */
+  ok(wh({ eventType: 'payment.failed', timestamp: '2026-08-22T10:00:00Z' })
+    !== wh({ timestamp: '2026-08-22T10:05:00Z' }),
+    'отказ не занимает место удачной оплаты того же дня');
+  ok(wh({ timestamp: '2026-08-22T10:00:00Z' })
+    !== wh({ amount: 2990, timestamp: '2026-08-22T10:00:00Z' }),
+    'месяц и год в один день — два платежа, а не один');
+
+  // Время площадки приходит в трёх видах, и все три означают один момент.
+  ok(wh({ timestamp: 1755950000 }) === wh({ timestamp: 1755950000000 }),
+    'unix-время в секундах и в миллисекундах — один платёж');
+  ok(wh({ timestamp: '2026-08-22T23:30:00Z' }) === wh({ timestamp: '2026-08-23T02:30:00+03:00' }),
+    'один момент в разных поясах через полночь — тоже один');
+  // Времени может не быть вовсе: тогда ключ берём с отпечатка тела, иначе
+  // каждая повторная доставка продлевала бы доступ ещё раз.
+  ok(wh({}) === wh({}), 'без времени ключ всё равно повторяем');
+  /*
+   * Telegram-id берём только из своего параметра и только целиком. Раньше
+   * годилось любое число из пяти-пятнадцати цифр в любом поле, включая
+   * свободный комментарий плательщика: из «оплата по счёту 1234567890»
+   * доставался номер счёта, платёж уходил постороннему — и настоящий
+   * плательщик уже не мог забрать его по почте, потому что ищем только ничьи.
+   */
+  const byParam = lava.parseWebhook({
+    eventType: 'payment.success', contractId: 'c-90', amount: 390, clientUtm: '717171' });
+  ok(byParam.payment.tgId === 717171, 'Telegram-id из нашего параметра', byParam.payment.tgId);
+  const byComment = lava.parseWebhook({
+    eventType: 'payment.success', contractId: 'c-91', amount: 390,
+    comment: 'оплата по счёту 1234567890' });
+  ok(byComment.payment.tgId === null,
+    'а из комментария плательщика — не берём', byComment.payment.tgId);
+
   const own = lava.parseWebhook({
     eventType: 'payment.success', id: 'pay-1', contractId: 'c-77', amount: 390 });
   ok(own.payment.externalId === 'pay-1',
@@ -2336,6 +2369,44 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'повторно не навязывается — правило уже есть');
 
     /*
+     * Сообщение с кнопками в чате не гаснет после нажатия, и по нему можно
+     * нажать ещё раз — хоть завтра. Без проверки заводилось второе такое же
+     * правило, и в свой день приходили два одинаковых напоминания.
+     */
+    await tap(`rt.day:rent:${cpR}:5`);
+    await tap(`rt.day:rent:${cpR}:20`);
+    ok(recur.list(uid).filter((r) => r.cp_id === cpR).length === 1,
+      'повторное нажатие не заводит второе такое же правило',
+      String(recur.list(uid).filter((r) => r.cp_id === cpR).length));
+    ok(norm(last()).includes('уже настроено'), 'и человеку сказано почему', norm(last()));
+
+    /*
+     * Обещание про этот месяц надо держать. Заводя напоминание с нуля,
+     * документа не выписывают — значит, отмечать месяц отработанным нельзя,
+     * иначе бот говорит «напомню 25-го» и молчит до следующего месяца.
+     * Отмечаем только когда день уже прошёл.
+     */
+    const cpAhead = bdbR.createCp(uid, { name: 'ООО «Впереди»', kind: 'customer', opening_date: '2026-01-01' });
+    const today = new Date().getDate();
+    const ahead = Math.min(28, today + 1);
+    await tap(`rt.day:rent:${cpAhead}:${ahead}`);
+    const ruleAhead = recur.list(uid).find((r) => r.cp_id === cpAhead);
+    ok(ruleAhead && recur.isDue(ruleAhead, new Date(new Date().getFullYear(), new Date().getMonth(), ahead)),
+      'напоминание на будущее число сработает в этом же месяце',
+      ruleAhead && `last_offer=«${ruleAhead.last_offer}»`);
+
+    const cpPast = bdbR.createCp(uid, { name: 'ООО «Позади»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`rt.day:rent:${cpPast}:1`);
+    const rulePast = recur.list(uid).find((r) => r.cp_id === cpPast);
+    ok(rulePast && (today < 1 || !recur.isDue(rulePast)),
+      'а на уже прошедшее число — только в следующем месяце',
+      rulePast && `last_offer=«${rulePast.last_offer}»`);
+    for (const r of [cpAhead, cpPast]) {
+      const x = recur.list(uid).find((v) => v.cp_id === r);
+      if (x) recur.off(uid, x.id);
+    }
+
+    /*
      * Наступил день. Главное здесь — что бот пришёл с предложением, а
      * документ не выписался сам: у правила нет ни позиций, ни суммы, и
      * «выписать как есть» дало бы документ на ноль рублей с номером из
@@ -2402,6 +2473,40 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     s = bdbD.unpaidSummary(uid);
     ok(s.count === 3 && s.sum === 65000,
       'в ручном режиме правила нет — считаем всё как есть', `${s.sum} / ${s.count}`);
+
+    /*
+     * Одинаковая сумма сама по себе сделку не делает. У аренды и
+     * обслуживания счёт каждый месяц один и тот же, и без окна по датам
+     * неоплаченный январский акт склеивался с августовским счётом: два
+     * разных долга показывались как один, и человек видел половину того,
+     * что ему должны.
+     */
+    const uidW = bdbD.getOrCreateUser(556678, 'Разные месяцы').id;
+    const orgW = bdbD.createOrg(uidW, { name: 'ИП Аренда', inn: '183209316100' });
+    bdbD.updateOrg(uidW, orgW, { debt_basis: 'closing' });
+    const cpW = bdbD.createCp(uidW, { name: 'ООО «Клиент»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uidW, {
+      type: 'usl', cpId: cpW, date: '2026-01-31',
+      items: [{ name: 'Аренда', qty: 1, price: 50000 }], skipQuota: true });
+    await docSvc.issueDocument(uidW, {
+      type: 'sch', cpId: cpW, date: '2026-08-01',
+      items: [{ name: 'Аренда', qty: 1, price: 50000 }], skipQuota: true });
+    let w = bdbD.unpaidSummary(uidW);
+    ok(w.count === 2 && w.sum === 100000,
+      'акт за январь и счёт за август — два долга, а не один', `${w.sum} / ${w.count}`);
+    ok(!w.docs.some((d) => d.pair), 'и ни один не помечен «та же сделка»');
+
+    // А счёт в конце месяца и закрывающий его акт в начале следующего —
+    // всё ещё одна сделка: это обычный порядок, а не два долга.
+    await docSvc.issueDocument(uidW, {
+      type: 'sch', cpId: cpW, date: '2026-01-28',
+      items: [{ name: 'Аренда', qty: 1, price: 50000 }], skipQuota: true });
+    w = bdbD.unpaidSummary(uidW);
+    ok(w.count === 2 && w.sum === 100000,
+      'счёт 28 января и акт 31 января — одна сделка', `${w.sum} / ${w.count}`);
+    ok(w.docs.filter((d) => d.pair).length === 1 && w.docs.find((d) => d.pair).date === '2026-01-28',
+      'парой отмечен именно ближайший по дате счёт',
+      (w.docs.find((d) => d.pair) || {}).date);
   }
 
   console.log('\n── отменённую руками проводку пересчёт не воскрешает ──');
@@ -2787,6 +2892,18 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'чужое повторение выключить нельзя');
     ok(rec.get(uid, alien) === null, 'чужое повторение не отдаётся по прямому id');
     ok(!rec.list(uid).some((r) => r.id === alien), 'чужого нет в своём списке');
+
+    /*
+     * «Пропустить» — тоже действие над чужим правилом, и раньше оно было
+     * единственным среди rec.*, где владельца не проверяли. Посторонний
+     * отключал чужое напоминание на месяц: счёт за аренду не выставлялся, и
+     * человек не понимал почему.
+     */
+    require('./db').db.prepare("UPDATE recurring SET last_offer = '2000-01' WHERE id = ?").run(alien);
+    await tap(`rec.skip:${alien}`);
+    const alienRow = require('./db').db.prepare('SELECT last_offer FROM recurring WHERE id = ?').get(alien);
+    ok(alienRow.last_offer === '2000-01',
+      'чужое напоминание нельзя пропустить за владельца', `last_offer=«${alienRow.last_offer}»`);
   }
 
   console.log('\n── сигнал о просрочке ──');

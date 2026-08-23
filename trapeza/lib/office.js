@@ -26,18 +26,43 @@ const HOUR = 3600 * 1000;
 let sendFn = null;
 function attach(fn) { sendFn = typeof fn === 'function' ? fn : null; }
 
-function recentCount(kind, ms = HOUR) {
+/** Сколько сообщений этого вида реально ушло в чат за последний час. */
+function sentCount(kind, ms = HOUR) {
   const since = new Date(Date.now() - ms).toISOString();
   return db.prepare(
-    'SELECT COUNT(*) AS n FROM office_events WHERE kind = ? AND created_at >= ?',
+    'SELECT COUNT(*) AS n FROM office_events WHERE kind = ? AND sent = 1 AND created_at >= ?',
   ).get(kind, since).n;
 }
 
-function seenSame(kind, text, ms = HOUR) {
+/**
+ * Было ли ровно такое же событие за последний час.
+ *
+ * Сравниваем по содержимому целиком — и по тексту, и по ошибке. Раньше
+ * сравнивался только текст, да ещё и после вставки самой записи, поэтому
+ * условие всегда находило само себя: любая фраза после первой считалась
+ * повтором и глушила журнал на час для всех сразу. У падений текст пуст —
+ * и они не глушились вовсе, одна и та же ошибка уходила двадцать раз.
+ */
+function seenSame(kind, text, error, ms = HOUR) {
   const since = new Date(Date.now() - ms).toISOString();
   return Boolean(db.prepare(
-    'SELECT 1 FROM office_events WHERE kind = ? AND text = ? AND created_at >= ?',
-  ).get(kind, text, since));
+    'SELECT 1 FROM office_events WHERE kind = ? AND text = ? AND error = ? AND created_at >= ?',
+  ).get(kind, text, error, since));
+}
+
+/*
+ * Журнал не растёт бесконечно.
+ *
+ * Каждое непонятое сообщение любого пользователя — строка в таблице. Без
+ * уборки это несколько мегабайт в месяц на боевой базе и ничего взамен:
+ * фразы полугодичной давности нужны разве что для истории, а решения по
+ * ним принимают в ту же неделю. Чистим редко — раз на сотню записей, —
+ * чтобы не платить удалением за каждое сообщение.
+ */
+const KEEP_DAYS = 90;
+function purge(days = KEEP_DAYS) {
+  const edge = new Date(Date.now() - days * 24 * HOUR).toISOString();
+  return db.prepare('DELETE FROM office_events WHERE created_at < ?').run(edge).changes;
 }
 
 function formatEvent({ kind, where, text, error, userId }) {
@@ -59,25 +84,39 @@ async function record({ kind, where = '', text = '', error = '', userId = 0 } = 
   const e = String(error || '').slice(0, 500);
   const w = String(where || '').slice(0, 80);
   const uid = Number(userId) || 0;
+
+  // Повтор считаем ДО вставки: иначе запись находит саму себя.
+  const dup = seenSame(k, t, e);
+  const flooded = sentCount(k) >= 20;
+
   db.prepare(`
     INSERT INTO office_events(kind, where_at, text, error, user_id, sent, created_at)
     VALUES(?,?,?,?,?,0,?)`).run(k, w, t, e, uid, nowISO());
   const id = Number(db.prepare('SELECT last_insert_rowid() AS id').get().id);
+  if (id % 100 === 0) purge();
 
   const chat = OFFICE();
-  const dup = t && seenSame(k, t) && recentCount(k) > 1;
-  const flooded = recentCount(k) > 20;
-  if (!chat || !sendFn || dup || flooded) return { id, sent: false, skipped: !chat ? 'no-chat' : (dup ? 'dup' : (flooded ? 'flood' : 'no-send')) };
+  if (!chat || !sendFn || dup || flooded) {
+    return { id, sent: false, skipped: !chat ? 'no-chat' : (dup ? 'dup' : (flooded ? 'flood' : 'no-send')) };
+  }
 
   try {
     await sendFn(chat, formatEvent({ kind: k, where: w, text: t, error: e, userId: uid }));
     db.prepare('UPDATE office_events SET sent = 1 WHERE id = ?').run(id);
     return { id, sent: true };
   } catch (err) {
-    return { id, sent: false, skipped: err.message };
+    // Бросить могли что угодно, в том числе не объект: обработчик ошибки,
+    // который падает сам, — худший из возможных.
+    return { id, sent: false, skipped: String((err && err.message) || err) };
   }
 }
 
+/*
+ * Ниже — чтение журнала владельцем продукта: он видит все события всех
+ * пользователей, для того журнал и заведён. Отдавать это наружу — в бота
+ * или в мини-приложение — нельзя: там всё фильтруется по user_id, и здесь
+ * фильтра нет намеренно.
+ */
 function list(kind, limit = 30) {
   if (kind) {
     return db.prepare(
@@ -94,4 +133,4 @@ function unknownPhrases(limit = 50) {
      GROUP BY text ORDER BY n DESC, last DESC LIMIT ?`).all(limit);
 }
 
-module.exports = { attach, record, list, unknownPhrases, formatEvent, OFFICE };
+module.exports = { attach, record, list, unknownPhrases, formatEvent, purge, OFFICE };

@@ -113,14 +113,33 @@ function isOverdue(rec, date = todayDate()) {
 }
 
 /**
+ * Прошёл ли уже в этом месяце день, на который заводят напоминание.
+ *
+ * Нужно, чтобы решить, ждать ли первого напоминания в этом месяце или в
+ * следующем. Сравнение нестрогое: если правило заводят прямо в свой день,
+ * напоминать через минуту о том, что человек сейчас настраивает, незачем.
+ */
+function dayPassed(day, date = todayDate()) {
+  const d = normalizeDay(day);
+  return d === LAST_DAY ? isLastDayOfMonth(date) : date.getDate() >= d;
+}
+
+/**
  * Завести повторение.
  *
- * Текущий месяц сразу считаем отработанным: повторение заводят следом за
- * только что выписанным документом, и предлагать его второй раз в том же
- * месяце — это ровно то задвоение, от которого мы бережём.
+ * offeredThisMonth — считать ли текущий месяц отработанным. По умолчанию да:
+ * повторение обычно заводят следом за только что выписанным документом, и
+ * предлагать его второй раз в том же месяце — то самое задвоение, от
+ * которого мы бережём.
+ *
+ * Но есть и другой путь — напоминание заводят «с нуля», ничего не выписав
+ * (кнопка после выбора вида деятельности). Там отметка задним числом
+ * означала бы, что бот пообещал напомнить 24-го и промолчал до следующего
+ * месяца. Такой вызов передаёт сюда результат dayPassed().
  */
 function add(userId, {
   cpId, type, items, extra = {}, note = '', day = 1, payDay = 0, leadDays = 0,
+  offeredThisMonth = true,
 }) {
   const pay = payDay ? normalizeDay(payDay) : 0;
   const info = db.prepare(`INSERT INTO recurring(user_id, cp_id, type, day, pay_day, lead_days,
@@ -129,7 +148,7 @@ function add(userId, {
       pay, pay ? Math.min(27, Math.max(0, Math.round(Number(leadDays) || 0))) : 0,
       JSON.stringify(Array.isArray(items) ? items : []),
       JSON.stringify(extra && typeof extra === 'object' ? extra : {}),
-      String(note).slice(0, 200), monthKey(), new Date().toISOString());
+      String(note).slice(0, 200), offeredThisMonth ? monthKey() : '', new Date().toISOString());
   return Number(info.lastInsertRowid);
 }
 
@@ -189,9 +208,17 @@ function due(date = todayDate()) {
     .all().map(parse).filter((r) => isDue(r, date));
 }
 
-/** Отметить, что за этот месяц предложение отправлено. */
-function markOffered(id, date = todayDate()) {
-  db.prepare('UPDATE recurring SET last_offer = ? WHERE id = ?').run(monthKey(date), Number(id));
+/**
+ * Отметить, что за этот месяц предложение отправлено.
+ *
+ * Владельца проверяем, как и во всех остальных действиях над повторением:
+ * эту отметку ставит и кнопка «Пропустить» из чата, а номер правила в ней
+ * виден любому. Без проверки посторонний мог отключить чужое напоминание
+ * на месяц — и человек не выставил бы счёт за аренду, не поняв почему.
+ */
+function markOffered(userId, id, date = todayDate()) {
+  db.prepare('UPDATE recurring SET last_offer = ? WHERE id = ? AND user_id = ?')
+    .run(monthKey(date), Number(id), userId);
 }
 
 /**
@@ -225,6 +252,6 @@ function setSchedule(userId, id, { payDay, leadDays }) {
 module.exports = {
   add, list, get, setDay, setSchedule, off,
   due, markOffered, overdue, markDueNoticed,
-  isDue, isOverdue, offerDay, dueDate,
+  isDue, isOverdue, offerDay, dueDate, dayPassed,
   monthKey, normalizeDay, dayLabel, LAST_DAY,
 };

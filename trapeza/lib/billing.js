@@ -261,9 +261,31 @@ function findPayment(provider, externalId) {
  * Записывает платёж. Повторный вебхук с тем же идентификатором ничего
  * не меняет и возвращает duplicate — площадки повторяют доставку,
  * и второе продление подписки было бы подарком за чужой счёт.
+ *
+ * Вторая проверка — на случай, когда площадка при повторной доставке
+ * проставляет новое время: идентификатор тогда получается другой, а платёж
+ * тот же самый. Считаем повтором одинаковую пару «сумма и статус» от одного
+ * и того же плательщика за четверть часа. Разные статусы (отказ, потом
+ * оплата) и разные суммы (месяц, потом год) сюда не попадают — это ровно те
+ * случаи, ради которых идентификатор и стал точнее.
  */
+const NEAR_DUP_MS = 15 * 60 * 1000;
+
+function nearDuplicate(p) {
+  const email = norm(p.email);
+  const uid = Number(p.userId) || 0;
+  if (!email && !uid) return null;
+  const since = new Date(Date.now() - NEAR_DUP_MS).toISOString();
+  return db.prepare(`
+    SELECT * FROM payments
+     WHERE provider = ? AND amount = ? AND status = ? AND created_at >= ?
+       AND (${email ? 'email = ?' : 'user_id = ?'})
+     ORDER BY id DESC LIMIT 1`)
+    .get(p.provider || 'lava', Number(p.amount) || 0, p.status || '', since, email || uid) || null;
+}
+
 function recordPayment(p) {
-  const exists = findPayment(p.provider || 'lava', p.externalId);
+  const exists = findPayment(p.provider || 'lava', p.externalId) || nearDuplicate(p);
   if (exists) return { duplicate: true, payment: exists };
   const info = db.prepare(`
     INSERT INTO payments(external_id, provider, user_id, email, amount, currency, days, status, raw, created_at)

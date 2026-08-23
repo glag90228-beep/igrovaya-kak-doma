@@ -32,8 +32,15 @@ const FIELDS = {
   currency: ['currency', 'currencyCode', 'currency_code'],
   status: ['status', 'state', 'eventType', 'event_type', 'event', 'type'],
   product: ['productId', 'product_id', 'offerId', 'offer_id', 'productTitle', 'product.title', 'offer.name'],
+  /*
+   * Поля, куда площадка кладёт наш собственный параметр из ссылки на оплату.
+   * «comment» отсюда убран намеренно: это свободный текст, который пишет сам
+   * плательщик. Из «оплата по счёту 1234567890» доставался номер счёта, и
+   * платёж привязывался к постороннему Telegram-id — навсегда, потому что
+   * забрать его по почте после этого уже нельзя (ищем только ничьи).
+   */
   custom: ['clientUtm', 'client_utm', 'utm', 'customParam', 'custom_param', 'custom',
-    'comment', 'buyerParam', 'clientId', 'client_id', 'externalUserId', 'metadata.tg',
+    'buyerParam', 'externalUserId', 'metadata.tg',
     'parameters.tg', 'additionalFields.tg'],
 };
 
@@ -63,10 +70,37 @@ const money = (v) => {
   return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;
 };
 
-/** Из произвольного значения достаём Telegram-id, если он там есть. */
+/**
+ * Из значения нашего параметра достаём Telegram-id.
+ *
+ * Берём только то, что параметром и является: голое число либо «tg=123»,
+ * «tgid:123», «tg_id 123». Число, вырванное из середины произвольной фразы,
+ * не берём — цена ошибки здесь несимметрична: чужой id закрывает
+ * настоящему плательщику единственный запасной путь «Я оплатил + почта».
+ */
 function tgIdFrom(value) {
-  const m = /(\d{5,15})/.exec(String(value == null ? '' : value));
+  const s = String(value == null ? '' : value).trim();
+  if (!s) return null;
+  const m = /^(?:tg[_-]?id|tg|id)?\s*[:=]?\s*(\d{5,15})$/i.exec(s);
   return m ? Number(m[1]) : null;
+}
+
+/**
+ * Момент платежа в одном виде, каким бы его ни прислали.
+ *
+ * Площадки шлют время то строкой ISO, то unix-секундами, то миллисекундами,
+ * то с местным смещением. Раньше мы просто отрезали первые десять символов —
+ * и «2026-08-22T23:30:00Z» с «2026-08-23T02:30:00+03:00» (это один и тот же
+ * момент) выглядели разными платежами, а два unix-числа подряд — тоже
+ * разными, потому что отрезались до одинакового куска не всегда.
+ *
+ * @returns {string|null} момент с точностью до секунды или null, если не разобрали
+ */
+function stampOf(value) {
+  const s = String(value == null ? '' : value).trim();
+  if (!s) return null;
+  const ms = /^\d{9,14}$/.test(s) ? Number(s) * (s.length > 11 ? 1 : 1000) : Date.parse(s);
+  return Number.isFinite(ms) ? `${new Date(ms).toISOString().slice(0, 19)}Z` : null;
 }
 
 /**
@@ -95,6 +129,11 @@ function parseWebhook(body) {
     .find((v) => v && typeof v === 'object');
   const src = box ? { ...body, ...box } : body;
 
+  const amount = money(first(src, FIELDS.amount));
+  // eventType — главный признак у Lava; status держим отдельно для лога.
+  const eventType = String(first(src, ['eventType', 'event_type', 'event', 'type']) || '').trim();
+  const statusField = String(first(src, ['status', 'state']) || '').trim();
+
   /*
    * Ключ платежа. У разового платежа это его собственный id, и всё просто.
    * У подписки с ежемесячным списанием сложнее: если площадка присылает
@@ -102,21 +141,33 @@ function parseWebhook(body) {
    * же, — второй месяц выглядел бы повтором первого. Оплату записали бы,
    * доступ не продлили, и человек, честно заплативший, остался бы ни с чем.
    *
-   * Поэтому, когда собственного идентификатора платежа нет и остаётся
-   * только номер договора, приписываем к нему день. Повторная доставка
-   * того же вебхука (площадки шлют их по нескольку раз) в тот же день
-   * по-прежнему опознаётся как повтор, а списание в следующем месяце —
-   * уже как новый платёж.
+   * Поэтому, когда собственного идентификатора нет, ключ собираем из
+   * договора и всего, чем одно событие по нему отличается от другого:
+   * момента, статуса и суммы. Так повторная доставка того же вебхука
+   * (площадки шлют их по нескольку раз) остаётся повтором, а вот эти три
+   * случая — уже нет:
+   *
+   *   • отказ и удачная оплата по одному договору в один день. Раньше
+   *     ключом был договор плюс дата, отказ записывался первым и занимал
+   *     место, а оплата через пять минут отбрасывалась как повтор —
+   *     заплативший человек оставался без доступа;
+   *   • два списания в один день на разные суммы (месяц, потом год) —
+   *     второе терялось целиком;
+   *   • время без ISO-строки: unix-число или местное смещение через
+   *     полночь. Их приводит к одному виду stampOf.
+   *
+   * Времени может не быть вовсе — тогда берём отпечаток самого тела.
+   * Он одинаков у всех доставок одного события и не зависит от того,
+   * когда мы его приняли: подставлять сюда текущую дату нельзя, иначе
+   * каждая повторная доставка становилась бы новым платежом и продлевала
+   * доступ ещё раз.
    */
   const ownId = first(src, FIELDS.externalId.filter((k) => k !== 'contractId'));
   const contractId = first(src, ['contractId', 'contract_id']);
-  const when = String(first(src, ['timestamp', 'createdAt', 'created_at', 'date', 'paidAt']) || '')
-    .slice(0, 10) || new Date().toISOString().slice(0, 10);
-  const externalId = ownId || (contractId ? `${contractId}:${when}` : null);
-  const amount = money(first(src, FIELDS.amount));
-  // eventType — главный признак у Lava; status держим отдельно для лога.
-  const eventType = String(first(src, ['eventType', 'event_type', 'event', 'type']) || '').trim();
-  const statusField = String(first(src, ['status', 'state']) || '').trim();
+  const stamp = stampOf(first(src, ['timestamp', 'createdAt', 'created_at', 'date', 'paidAt']))
+    || `body-${crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex').slice(0, 12)}`;
+  const mark = [stamp, eventType || statusField || '-', amount == null ? '-' : amount].join('/');
+  const externalId = ownId || (contractId ? `${contractId}:${mark}` : null);
 
   if (!externalId) return { ok: false, reason: 'не нашёл идентификатор платежа' };
   if (amount == null) return { ok: false, reason: 'не нашёл сумму' };
@@ -220,4 +271,4 @@ function payLink(tgId) {
 
 module.exports = {
   plans, priceText, planTitle, planLabel, yearSaving,
-  parseWebhook, daysFor, secretOk, payLink, tgIdFrom, FIELDS };
+  parseWebhook, daysFor, secretOk, payLink, tgIdFrom, stampOf, FIELDS };

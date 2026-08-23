@@ -773,6 +773,27 @@ const CLOSING_DOCS = ['usl', 'upd', 'torg12'];
  * при «долге по счёту» — счёт. Второй его повторяет. В ручном режиме
  * правила нет, и пары не ищем.
  */
+/*
+ * Насколько далеко друг от друга могут стоять счёт и закрывающий его акт,
+ * чтобы считаться одной сделкой.
+ *
+ * Без этого окна одинаковая сумма склеивала что угодно: у аренды и
+ * обслуживания — тех самых дел, ради которых сделаны напоминания, — счёт
+ * каждый месяц один и тот же. Неоплаченный январский акт на 50 000 и
+ * августовский счёт на 50 000 — это два разных долга, а выглядели одной
+ * сделкой, и сводка показывала половину того, что человеку должны.
+ *
+ * Полтора месяца покрывают обычный порядок «счёт в конце месяца — акт в
+ * начале следующего» и любую нормальную отсрочку, но не сводят вместе
+ * документы из разных кварталов.
+ */
+const DEAL_WINDOW_DAYS = 45;
+
+const dayNum = (iso) => {
+  const t = Date.parse(`${String(iso || '').slice(0, 10)}T00:00:00Z`);
+  return Number.isFinite(t) ? Math.round(t / 86400000) : null;
+};
+
 function dealTotals(userId, docs) {
   const basis = basisOf(getDefaultOrg(userId) || {});
   const groups = new Map();
@@ -785,9 +806,25 @@ function dealTotals(userId, docs) {
   }
   if (basis !== 'manual') {
     for (const g of groups.values()) {
-      const pairs = Math.min(g.bills.length, g.closings.length);
-      const twins = basis === 'closing' ? g.bills : g.closings;
-      for (const d of twins.slice(0, pairs)) d.pair = true;
+      // Пару ищем ближайшую по дате: если счетов и актов несколько, склеить
+      // январский с августовским, оставив рядом стоящие непарными, — худший
+      // из возможных разборов.
+      const lead = basis === 'closing' ? g.closings : g.bills;
+      const twins = (basis === 'closing' ? g.bills : g.closings)
+        .slice().sort((a, b) => String(a.date).localeCompare(String(b.date)));
+      const taken = new Set();
+      for (const l of lead.slice().sort((a, b) => String(a.date).localeCompare(String(b.date)))) {
+        const ld = dayNum(l.date);
+        let best = null;
+        let bestGap = Infinity;
+        for (const t of twins) {
+          if (taken.has(t)) continue;
+          const td = dayNum(t.date);
+          const gap = ld === null || td === null ? 0 : Math.abs(ld - td);
+          if (gap <= DEAL_WINDOW_DAYS && gap < bestGap) { best = t; bestGap = gap; }
+        }
+        if (best) { taken.add(best); best.pair = true; }
+      }
     }
   }
   const counted = docs.filter((d) => !d.pair);

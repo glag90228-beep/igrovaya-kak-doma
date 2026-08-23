@@ -1036,21 +1036,32 @@ async function showUnpaid(tg, chatId, user) {
     return;
   }
   const today = todayISO();
-  // Сумма — сделками, а не документами: счёт и закрывающий его акт на одну
-  // сделку иначе складывались, и сводка расходилась с плиткой в приложении.
-  const sum = bdb.dealTotals(user.id, list).sum;
+  /*
+   * Сумма — сделками, а не документами: счёт и закрывающий его акт на одну
+   * сделку иначе складывались, и сводка расходилась с плиткой в приложении.
+   *
+   * Список при этом показываем целиком — человек хочет видеть оба документа.
+   * Но тогда шапка обязана объяснить, почему сумма меньше сложенных строк:
+   * без пометки «та же сделка» это выглядело ошибкой в расчётах. Приложение
+   * такую пометку рисует давно, бот — теперь тоже.
+   */
+  const { count, sum } = bdb.dealTotals(user.id, list);
   const rows = list.map((d) => {
     const cp = d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
     const days = Math.floor((new Date(today) - new Date(d.date)) / 86400000);
     return [{
-      text: `${d.title} № ${d.number} · ${cp ? cp.name : '—'} · ${formatRub(d.total).replace(/<[^>]+>/g, '')}`
-        + (days > 0 ? ` · ${days} дн.` : ''),
+      text: `${d.pair ? '↳ ' : ''}${d.title} № ${d.number} · ${cp ? cp.name : '—'} · `
+        + `${formatRub(d.total).replace(/<[^>]+>/g, '')}`
+        + (d.pair ? ' · та же сделка' : (days > 0 ? ` · ${days} дн.` : '')),
       data: `doc:${d.id}`,
     }];
   }).map((r) => [{ ...r[0], text: r[0].text.slice(0, 60) }]);
   rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  const twins = list.length - count;
   await tg.sendMessage(chatId,
-    `<b>Не оплачено: ${formatRub(sum)}</b> — ${list.length} ${plural(list.length, 'документ', 'документа', 'документов')}.`,
+    `<b>Не оплачено: ${formatRub(sum)}</b> — ${count} ${plural(count, 'сделка', 'сделки', 'сделок')}.`
+    + (twins ? `\n<i>Ниже ${list.length} документов: ${twins} из них закрывают те же сделки `
+      + 'и в сумму не идут.</i>' : ''),
     keyboard(rows));
 }
 
@@ -1960,7 +1971,7 @@ async function runDaily(tg) {
     try {
       // eslint-disable-next-line no-await-in-loop
       if (await offerRecurring(tg, rec)) sent += 1;
-      recurring.markOffered(rec.id);
+      recurring.markOffered(rec.user_id, rec.id);
     } catch (e) {
       console.error('регулярные документы:', e.message);
     }
@@ -3224,7 +3235,24 @@ async function handleCallback(tg, cq) {
       const r = bizTypes.routineOf(key);
       const cp = bdb.getCp(user.id, Number(cpId));
       if (!r || !cp) { await tg.sendMessage(chatId, 'Клиент не найден.', mainMenu()); return; }
-      recurring.add(user.id, { cpId: cp.id, type: r.type, items: [], day: Number(day) });
+      /*
+       * Сообщение с кнопками в чате не гаснет после нажатия, и по нему можно
+       * нажать ещё раз — хоть завтра, хоть трижды подряд. Без этой проверки
+       * заводилось второе такое же правило, и в свой день приходили два
+       * одинаковых напоминания, выключать которые надо по одному.
+       */
+      if (recurring.list(user.id).some((x) => x.cp_id === cp.id && x.type === r.type)) {
+        await tg.sendMessage(chatId, 'Такое напоминание уже настроено.', keyboard([
+          [{ text: '🔁 Все повторения', data: 'rec' }], [{ text: '⬅️ Меню', data: 'menu' }],
+        ]));
+        return;
+      }
+      recurring.add(user.id, {
+        cpId: cp.id, type: r.type, items: [], day: Number(day),
+        // Документа сейчас не выписывали, поэтому этот месяц отработанным
+        // считаем, только если названный день уже прошёл.
+        offeredThisMonth: recurring.dayPassed(Number(day)),
+      });
       await tg.sendMessage(chatId,
         `Готово. ${Number(day) ? `${day}-го числа` : 'В последний день месяца'} напомню про `
         + `<b>${esc(r.what)}</b> для «${esc(cp.name)}».\n\n`
@@ -3329,7 +3357,7 @@ async function handleCallback(tg, cq) {
       return;
     }
     if (data.startsWith('rec.skip:')) {
-      recurring.markOffered(Number(data.slice(9)));
+      recurring.markOffered(user.id, Number(data.slice(9)));
       await tg.sendMessage(chatId, 'Пропустил. Напомню в следующем месяце.', mainMenu());
       return;
     }
