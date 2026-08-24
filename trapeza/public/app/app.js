@@ -170,7 +170,7 @@ const PARENT = {
   letter: 'inbox', inbox: 'more', mail: 'more', bank: 'more', org: 'more',
   billing: 'more', support: 'more', help: 'more', vat: 'more', basis: 'more',
   recurring: 'more', reminders: 'more', registry: 'docs', akt: 'docs',
-  unpaid: 'home', scan: 'docs', ops: 'cps', ask: 'home',
+  unpaid: 'home', scan: 'docs', ops: 'cps', ask: 'home', bankclose: 'debts',
 };
 
 function back() {
@@ -2691,6 +2691,7 @@ function bankRows(r, cps) {
   const chosen = new Map();          // key → cpId
   const card = h('div', { class: 'card' });
   const save = h('button', { class: 'btn' }, 'Занести оплаты');
+
   const relabel = () => {
     const n = chosen.size;
     save.textContent = n
@@ -2752,11 +2753,84 @@ function bankRows(r, cps) {
     toast(res.added
       ? `Занесено ${res.added} ${plural(res.added, 'оплата', 'оплаты', 'оплат')}`
       : 'Ничего не занесено');
+    /*
+     * Деньги в журнале, но счета всё ещё висят в «не оплачено». Связь
+     * «пришло 30 000 от Зари — значит, счёт № 7 закрыт» видна из сумм, и
+     * незачем заставлять человека проходить её руками по одному документу.
+     *
+     * Показываем и ждём нажатия: закрыть долг за человека нельзя. Ошибку
+     * заметят через месяц, когда клиент не заплатит, а счёт уже помечен.
+     */
+    if (Array.isArray(res.deals) && res.deals.length) {
+      reset('bankclose', { deals: res.deals, leftovers: res.leftovers || [] });
+      return;
+    }
     reset('debts');
   });
   box.append(card, h('div', { class: 'btn-wrap' }, save));
   return box;
 }
+
+/**
+ * Второй шаг после выписки: какие счета закрыли пришедшие деньги.
+ *
+ * Отдельным экраном, а не галочками рядом с оплатами: это другое решение.
+ * Первое — «эти деньги пришли», второе — «и они закрывают вот эти счета».
+ * Смешав их в один список, мы бы получили нажатие, после которого человек
+ * не знает точно, что именно подтвердил.
+ *
+ * Экран строится из того, что уже посчитал сервер: заново он ничего не
+ * подбирает. Человек подтверждает ровно тот список, который видит.
+ */
+screens.bankclose = async function bankClose(params) {
+  const deals = Array.isArray(params.deals) ? params.deals : [];
+  const leftovers = Array.isArray(params.leftovers) ? params.leftovers : [];
+  const box = h('div', {}, h('h1', { text: 'Эти счета закрыты' }));
+  if (!deals.length) {
+    box.append(empty('check', 'Нечего закрывать',
+      'Пришедшие деньги не закрыли ни одного счёта целиком.'));
+    return box;
+  }
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Деньги уже в журнале. Осталось снять счета с ожидания — проверьте и подтвердите.' }));
+
+  /*
+   * Строки не нажимаются: это список на подтверждение, а не меню. Поэтому
+   * обычный div, а не navRow — тот рисует стрелку, а стрелка обещает
+   * переход, которого не будет.
+   */
+  const line = (ic, title, sub, right, tone) => h('div', { class: 'row' },
+    h('span', { class: `icon-box ${tone || ''}` }, icon(ic)),
+    h('span', { class: 'grow' },
+      h('div', { class: 'ellipsis', text: title }),
+      sub && h('div', { class: 'sub-line' }, h('span', { class: 'small muted', text: sub }))),
+    h('span', { class: 'money nowrap', text: right }));
+
+  box.append(h('div', { class: 'card' }, deals.map((d) => line(
+    'doc-check', d.title,
+    d.alsoTitle ? `${d.cpName} · и ${d.alsoTitle} — та же сделка` : d.cpName,
+    money0(d.total), 'ok'))));
+  if (leftovers.length) {
+    box.append(h('div', { class: 'section-title', text: 'Не легло ни на один счёт' }));
+    box.append(h('div', { class: 'card' }, leftovers.map((l) => line(
+      'wallet', l.cpName, 'счёт не выписан или оплата частичная', money0(l.amount)))));
+  }
+
+  const docs = deals.reduce((n, d) => n + (d.twinId ? 2 : 1), 0);
+  const done = h('button', { class: 'btn' }, `Отметить оплаченными (${docs})`);
+  done.onclick = () => withBusy(done, async () => {
+    const res = await api('POST', '/api/bank/close', { deals });
+    haptic('medium');
+    toast(res.docs
+      ? `Отмечено ${res.docs} ${plural(res.docs, 'документ', 'документа', 'документов')}`
+      : 'Ничего не отмечено');
+    reset('debts');
+  });
+  const skip = h('button', { class: 'btn ghost' }, 'Не сейчас');
+  skip.onclick = () => reset('debts');
+  box.append(h('div', { class: 'btn-wrap' }, done), h('div', { class: 'btn-wrap' }, skip));
+  return box;
+};
 
 screens.scan = async function scan() {
   const box = h('div', {}, h('h1', { text: 'Снимок счёта' }));

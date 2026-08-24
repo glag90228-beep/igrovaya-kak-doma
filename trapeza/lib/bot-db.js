@@ -198,6 +198,16 @@ function migrate() {
   // в минус. Ноль означает «отметки не было» или «поставлена до этой графы»,
   // и тогда в дело идёт полная сумма, как и было раньше.
   addColumn('documents', 'paid_sum', 'REAL NOT NULL DEFAULT 0');
+  /*
+   * Второй документ сделки — тот, что закрыли заодно с первым.
+   *
+   * Счёт и закрывающий его акт на одну сумму закрываются вместе, но проводка
+   * оплаты только одна, на документе-источнике долга. Без этой связи отмена
+   * оплаты снимала отметку с него одного, а второй так и оставался
+   * «оплаченным» — с долгом, который вернулся, и документом, которого нет
+   * в списке «не оплачено».
+   */
+  addColumn('documents', 'paid_with', 'INTEGER NOT NULL DEFAULT 0');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ops_doc ON operations(doc_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_cp_user ON counterparties(user_id)');
 }
@@ -382,6 +392,9 @@ function deleteOp(userId, opId) {
   if (row.doc_id && row.kind === 'Оплата') {
     db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0 WHERE id = ? AND user_id = ?")
       .run(row.doc_id, userId);
+    // И со второго документа сделки, если его закрыли заодно с этим.
+    db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0, paid_with = 0 WHERE paid_with = ? AND user_id = ?")
+      .run(row.doc_id, userId);
   }
   // Если операция пришла из выписки, забываем и отметку о загрузке: иначе
   // отменённую по ошибке оплату больше не загрузить — строка навсегда
@@ -488,6 +501,9 @@ function importBankRows(userId, rows) {
   const link = db.prepare('UPDATE bank_imports SET op_id = ? WHERE user_id = ? AND key = ?');
   let added = 0;
   let skipped = 0;
+  // Какие строки действительно легли: по ним потом предлагаем закрыть счета.
+  // Пропущенные повторы туда попадать не должны — их деньги уже в журнале.
+  const addedRows = [];
 
   db.exec('BEGIN IMMEDIATE');
   try {
@@ -498,15 +514,13 @@ function importBankRows(userId, rows) {
       if (!cp || !amount) { skipped += 1; continue; }
 
       if (!remember.run(userId, key, 0, cp.id, amount, now).changes) { skipped += 1; continue; }
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(r.date || '') ? r.date : now.slice(0, 10);
+      const doc = String(r.doc || 'Оплата по выписке').slice(0, 120);
       const opId = addOp(userId, cp.id, {
-        date: /^\d{4}-\d{2}-\d{2}$/.test(r.date || '') ? r.date : now.slice(0, 10),
-        kind: 'Оплата',
-        doc: String(r.doc || 'Оплата по выписке').slice(0, 120),
-        debit: amount,
-        credit: 0,
-        note: 'банковская выписка',
+        date, kind: 'Оплата', doc, debit: amount, credit: 0, note: 'банковская выписка',
       });
       link.run(opId, userId, key);
+      addedRows.push({ key, opId, cpId: cp.id, amount, date, doc });
       added += 1;
     }
     db.exec('COMMIT');
@@ -514,7 +528,7 @@ function importBankRows(userId, rows) {
     db.exec('ROLLBACK');
     throw e;
   }
-  return { added, skipped };
+  return { added, skipped, addedRows };
 }
 
 // ---------- связь документов с журналом ----------
@@ -715,6 +729,8 @@ function unmarkPaid(userId, docId) {
   const d = getDoc(userId, docId);
   if (!d) return false;
   db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0 WHERE id = ? AND user_id = ?").run(docId, userId);
+  db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0, paid_with = 0 WHERE paid_with = ? AND user_id = ?")
+    .run(docId, userId);
   deleteOpsOfDoc(userId, docId, 'Оплата');
   return true;
 }
@@ -837,6 +853,178 @@ function dealTotals(userId, docs) {
 
 function unpaidSummary(userId, limit = 200) {
   return dealTotals(userId, unpaidDocs(userId, limit));
+}
+
+/**
+ * Какие счета закрывают поступления из выписки.
+ *
+ * Деньги из банка попадают в журнал сами (importBankRows), но документы при
+ * этом остаются в списке «не оплачено»: связь «пришло 30 000 от Зари» →
+ * «значит, счёт № 7 закрыт» до сих пор человек делал глазами и руками. На
+ * полусотне строк это и есть та работа, ради которой заводят бухгалтера.
+ *
+ * Здесь эта связь только предполагается. Ничего не отмечаем и в журнал не
+ * лезем: возвращаем список, который бот показывает одним сообщением, а
+ * нажимает человек. Долг, закрытый по ошибке, обнаруживают через месяц —
+ * когда клиент не платит, а счёт уже помечен оплаченным.
+ *
+ * Правила подбора — намеренно осторожные:
+ *
+ *   • Считаем сделками, а не документами. Счёт и закрывающий его акт на одну
+ *     и ту же сумму — это один долг на 30 000, а не два по 30 000; закрывать
+ *     их надо вместе, а деньги списывать один раз. Пары ищет dealTotals —
+ *     тот же расчёт, что и во всех остальных местах.
+ *   • Закрываем только то, что один платёж покрывает целиком, от старых к
+ *     новым. Частично оплаченный счёт не предлагаем вовсе: пометка
+ *     «оплачен» означала бы, что пришли все деньги.
+ *   • Один платёж — один источник. Складывать два поступления, чтобы вместе
+ *     они закрыли счёт, не берёмся: угадать, что это оплата по частям, а не
+ *     две разные, отсюда нельзя.
+ *   • Остаток называем вслух: человеку надо знать, ждёт ли он ещё денег.
+ *
+ * @param {number} userId
+ * @param {Array<{key:string, opId:number, cpId:number, amount:number, date:string, doc:string}>} payments
+ * @returns {{deals:Array<object>, leftovers:Array<object>}}
+ */
+function matchPaymentsToDocs(userId, payments) {
+  const deals = [];
+  const leftovers = [];
+  const spent = new Set();               // документы, уже занятые в этом разборе
+  const cache = new Map();
+
+  for (const p of payments || []) {
+    const cpId = Number(p && p.cpId) || 0;
+    const amount = round2(Math.abs(Number(p && p.amount) || 0));
+    if (!cpId || !amount) continue;
+    const cp = getCp(userId, cpId);
+    if (!cp) continue;
+
+    if (!cache.has(cpId)) {
+      const docs = unpaidDocs(userId, 200).filter((d) => d.cp_id === cpId);
+      dealTotals(userId, docs);          // расставит pair на вторых документах сделок
+      cache.set(cpId, docs);
+    }
+    const docs = cache.get(cpId);
+    const twins = docs.filter((d) => d.pair);
+
+    let left = amount;
+    for (const lead of docs.filter((d) => !d.pair)) {
+      const total = round2(Number(lead.total) || 0);
+      if (spent.has(lead.id) || total <= 0 || total > left) continue;
+      const twin = twins.find((t) => !spent.has(t.id) && round2(Number(t.total) || 0) === total);
+      spent.add(lead.id);
+      if (twin) spent.add(twin.id);
+      left = round2(left - total);
+      deals.push({
+        opId: Number(p.opId) || 0,
+        cpId,
+        cpName: cp.name,
+        date: p.date,
+        doc: p.doc || '',
+        total,
+        leadId: lead.id,
+        twinId: twin ? twin.id : 0,
+        title: `${lead.title} № ${lead.number}`,
+        alsoTitle: twin ? `${twin.title} № ${twin.number}` : '',
+      });
+    }
+    if (left > 0) leftovers.push({ cpId, cpName: cp.name, amount: left });
+  }
+  return { deals, leftovers };
+}
+
+/**
+ * Отметить закрытыми счета, которые закрыли поступления из выписки.
+ *
+ * Деньги на этот момент уже в журнале — их занёс importBankRows отдельной
+ * строкой. Поэтому здесь не «добавить оплату», а «переставить» её: сумма
+ * сделки уходит из свободной строки выписки в строку, привязанную к
+ * документу, и общий итог по клиенту не меняется ни на копейку.
+ *
+ * Почему именно так, а не проще:
+ *
+ *   • Просто поставить «оплачено» и не трогать журнал нельзя. Пересчёт
+ *     (rebuildDebt) видит документ с отметкой и без привязанной проводки —
+ *     и добросовестно создаёт вторую. Одна оплата, посчитанная дважды.
+ *   • Просто вызвать markPaid тоже нельзя: он рассчитан на отметку руками,
+ *     когда денег в журнале ещё нет, и добавляет проводку поверх той, что
+ *     уже пришла из банка. Долг уходит в минус.
+ *
+ * Номер платёжки сохраняем: в привязанной строке остаётся тот же текст, что
+ * был в выписке, — иначе при сверке не найти, каким платежом закрыт счёт.
+ *
+ * @returns {{docs:number, deals:number}} сколько документов и сделок закрыто
+ */
+function closeDocsFromBank(userId, deals) {
+  const cut = db.prepare('UPDATE operations SET debit = ? WHERE id = ?');
+  const drop = db.prepare('DELETE FROM operations WHERE id = ?');
+  const amountOf = db.prepare('SELECT debit FROM operations WHERE id = ?');
+  const mark = db.prepare('UPDATE documents SET paid_at = ?, paid_sum = ? WHERE id = ? AND user_id = ?');
+  const markTwin = db.prepare('UPDATE documents SET paid_at = ?, paid_sum = 0 WHERE id = ? AND user_id = ?');
+  let docs = 0;
+  let done = 0;
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const d of deals || []) {
+      const lead = getDoc(userId, Number(d.leadId));
+      if (!lead || lead.paid_at) continue;
+      const when = /^\d{4}-\d{2}-\d{2}$/.test(String(d.date)) ? d.date : todayISO();
+      const total = round2(Number(d.total) || 0);
+
+      // Убираем сумму сделки из свободной строки выписки.
+      const src = d.opId ? amountOf.get(Number(d.opId)) : null;
+      let dropped = false;
+      if (src) {
+        const rest = round2((Number(src.debit) || 0) - total);
+        if (rest > 0.004) cut.run(rest, Number(d.opId));
+        else { drop.run(Number(d.opId)); dropped = true; }
+      }
+      // И кладём её же строкой, привязанной к документу.
+      addOpForDoc(userId, d.cpId, {
+        date: when, kind: 'Оплата', doc: d.doc || `${lead.title} № ${lead.number}`, debit: total,
+      }, lead.id);
+      /*
+       * Отметку о загрузке переставляем на новую строку. По ней deleteOp
+       * узнаёт, что операция пришла из выписки, и при отмене разрешает
+       * загрузить её заново. Оставь мы ссылку на удалённую строку — оплату,
+       * отменённую по ошибке, было бы уже не вернуть: файл считается
+       * загруженным навсегда.
+       */
+      if (dropped) {
+        const fresh = db.prepare(
+          "SELECT id FROM operations WHERE doc_id = ? AND kind = 'Оплата'",
+        ).get(lead.id);
+        if (fresh) {
+          db.prepare('UPDATE bank_imports SET op_id = ? WHERE user_id = ? AND op_id = ?')
+            .run(fresh.id, userId, Number(d.opId));
+        }
+      }
+
+      mark.run(when, total, lead.id, userId);
+      docs += 1;
+      /*
+       * У пары проводки нет и быть не должно — долг создаёт только один
+       * документ сделки. Отметка нужна, чтобы второй не висел в «не оплачено»
+       * уже в одиночку: без неё он остался бы там без своей половины и пошёл
+       * бы в сумму как отдельный долг на те же 30 000.
+       *
+       * Ссылка на первый — чтобы отмена оплаты сняла отметку с обоих.
+       */
+      if (d.twinId) {
+        markTwin.run(when, Number(d.twinId), userId);
+        db.prepare('UPDATE documents SET paid_with = ? WHERE id = ? AND user_id = ?')
+          .run(lead.id, Number(d.twinId), userId);
+        docs += 1;
+      }
+      done += 1;
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return { docs, deals: done };
 }
 
 /** Сальдо по контрагенту (переиспользует computeBalance из db.js) */
@@ -1173,7 +1361,8 @@ module.exports = {
   knownBankKeys, importBankRows,
   DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
   debtByDoc, rebuildDebt, restoreDebt,
-  markPaid, unmarkPaid, unpaidDocs, unpaidSummary, dealTotals, docsBetween,
+  markPaid, unmarkPaid, matchPaymentsToDocs, closeDocsFromBank,
+  unpaidDocs, unpaidSummary, dealTotals, docsBetween,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
   isSeqTaken, guardSeq,
   nextSeq, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,

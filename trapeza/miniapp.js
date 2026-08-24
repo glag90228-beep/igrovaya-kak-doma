@@ -954,7 +954,29 @@ const api = {
       date: str(r.date, 10),
       doc: str(r.doc, 120),
     })));
-    return { ...res, unpaid: bdb.debtors(user.id).length };
+    /*
+     * Заодно смотрим, какие счета эти деньги закрывают. Только предлагаем:
+     * решает человек следующим нажатием — как и в боте.
+     */
+    const { deals, leftovers } = bdb.matchPaymentsToDocs(user.id, res.addedRows);
+    return { ...res, deals, leftovers, unpaid: bdb.debtors(user.id).length };
+  },
+
+  /** Отметить закрытыми счета, которые человек подтвердил после выписки. */
+  async 'POST /api/bank/close'({ user, body }) {
+    const deals = Array.isArray(body.deals) ? body.deals.slice(0, 200) : [];
+    if (!deals.length) return { error: 'Не выбрано ни одной сделки.' };
+    const done = bdb.closeDocsFromBank(user.id, deals.map((d) => ({
+      opId: Number(d.opId) || 0,
+      cpId: Number(d.cpId),
+      leadId: Number(d.leadId),
+      twinId: Number(d.twinId) || 0,
+      total: Number(d.total),
+      date: str(d.date, 10),
+      doc: str(d.doc, 120),
+    })));
+    const left = bdb.unpaidSummary(user.id);
+    return { ...done, count: left.count, sum: left.sum };
   },
 
   /**

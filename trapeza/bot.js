@@ -2271,6 +2271,51 @@ async function handleStatement(tg, chatId, user, msg) {
 }
 
 /**
+ * Какие счета закрыли пришедшие деньги.
+ *
+ * Занести оплату в журнал — половина дела: документы после этого всё равно
+ * висят в «не оплачено», и человек идёт отмечать их по одному. Здесь бот
+ * говорит вслух то, что и так следует из сумм: «пришло 30 000 от Зари —
+ * значит, счёт № 7 закрыт», — и предлагает отметить всё разом.
+ *
+ * Предлагает, а не делает: отмечает по-прежнему человек, одним нажатием.
+ * Автоматически закрытый долг — ошибка, которую замечают через месяц, когда
+ * клиент не платит, а счёт уже помечен оплаченным.
+ *
+ * @returns {Promise<boolean>} true — предложение отправлено, своё сообщение не нужно
+ */
+async function offerClosedDocs(tg, chatId, user, rows, head) {
+  const { deals, leftovers } = bdb.matchPaymentsToDocs(user.id, rows);
+  if (!deals.length) return false;
+
+  const lines = [head, '', `<b>Эти документы закрыты (${deals.length}):</b>`];
+  for (const d of deals.slice(0, 15)) {
+    lines.push(`• ${esc(d.title)} · ${esc(d.cpName)} · <b>${formatRub(d.total)}</b>`
+      + (d.alsoTitle ? `\n  <i>и ${esc(d.alsoTitle)} — та же сделка</i>` : ''));
+  }
+  if (deals.length > 15) lines.push(`…и ещё ${deals.length - 15}`);
+
+  // Остаток называем вслух: человеку важно понять, ждёт ли он ещё денег от
+  // этого клиента, или пришло больше, чем было выставлено.
+  const spare = leftovers.filter((l) => l.amount > 0);
+  if (spare.length) {
+    lines.push('', 'Не легло ни на один счёт:');
+    for (const l of spare.slice(0, 5)) {
+      lines.push(`• ${esc(l.cpName)} — ${formatRub(l.amount)}`);
+    }
+    lines.push('<i>Либо счёт ещё не выписан, либо оплата частичная — такие не закрываю.</i>');
+  }
+
+  const count = deals.reduce((n, d) => n + (d.twinId ? 2 : 1), 0);
+  bdb.setState(user.id, 'bank-paid', { deals });
+  await tg.sendMessage(chatId, lines.join('\n'), keyboard([
+    [{ text: `✅ Отметить оплаченными (${count})`, data: 'bank:paid' }],
+    [{ text: 'Не надо', data: 'menu' }],
+  ]));
+  return true;
+}
+
+/**
  * Голосовое сообщение.
  *
  * Расшифровка — не действие, а всего лишь ввод: дальше фраза идёт ровно тем
@@ -3119,11 +3164,41 @@ async function handleCallback(tg, cq) {
         return;
       }
       const res = bdb.importBankRows(user.id, rows);
+      if (!res.added) {
+        await tg.sendMessage(chatId, 'Ничего не занёс — эти оплаты уже есть в журнале.', mainMenu());
+        return;
+      }
+      const head = `✅ Занёс ${res.added} ${plural(res.added, 'оплату', 'оплаты', 'оплат')} в журнал.`
+        + (res.skipped ? `\nПропущено (уже были): ${res.skipped}.` : '');
+      if (!(await offerClosedDocs(tg, chatId, user, res.addedRows, head))) {
+        await tg.sendMessage(chatId, head, mainMenu());
+      }
+      return;
+    }
+    /*
+     * Отметить закрытыми счета, которые закрывают пришедшие деньги.
+     *
+     * Список сложен в состоянии на предыдущем шаге и здесь только читается:
+     * заново пересчитывать нельзя — человек мог за это время что-то отметить
+     * руками, и тогда одно нажатие закрыло бы не то, что было на экране.
+     */
+    if (data === 'bank:paid') {
+      const st = bdb.getState(user.id);
+      const deals = st.state === 'bank-paid' && Array.isArray(st.data.deals) ? st.data.deals : [];
+      bdb.clearState(user.id);
+      if (!deals.length) {
+        await tg.sendMessage(chatId, 'Список уже не в работе — пришлите выписку заново.', mainMenu());
+        return;
+      }
+      const done = bdb.closeDocsFromBank(user.id, deals);
+      const s = bdb.unpaidSummary(user.id);
       await tg.sendMessage(chatId,
-        res.added
-          ? `✅ Занёс ${res.added} ${plural(res.added, 'оплату', 'оплаты', 'оплат')} в журнал.`
-            + (res.skipped ? `\nПропущено (уже были): ${res.skipped}.` : '')
-          : 'Ничего не занёс — эти оплаты уже есть в журнале.', mainMenu());
+        `✅ Отметил оплаченными: ${done.docs} ${plural(done.docs, 'документ', 'документа', 'документов')}.\n\n`
+        + (s.count
+          ? `Осталось не оплачено: <b>${formatRub(s.sum)}</b> — `
+            + `${s.count} ${plural(s.count, 'сделка', 'сделки', 'сделок')}.`
+          : 'Неоплаченных документов больше нет.'),
+        mainMenu());
       return;
     }
     if (data === 'help') {

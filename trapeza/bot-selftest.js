@@ -3022,6 +3022,149 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(last().includes('ни одной операции'), 'на посторонний файл понятный ответ', last().slice(0, 60));
   }
 
+  console.log('\n── выписка закрывает счета ──');
+  {
+    /*
+     * Занести оплату в журнал — половина дела: документы после этого всё
+     * равно висят в «не оплачено», и человек шёл отмечать их по одному.
+     * Бот говорит вслух то, что следует из сумм, и предлагает отметить всё
+     * разом — но отмечает по-прежнему человек.
+     */
+    const bdbC = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const u = bdbC.getOrCreateUser(661100, 'Сверка').id;
+    const orgC = bdbC.createOrg(u, { name: 'ИП Сверка', inn: '183209316100' });
+    bdbC.updateOrg(u, orgC, { debt_basis: 'closing' });
+    const zarya = bdbC.createCp(u, { name: 'ООО «Заря С»', kind: 'customer', opening_date: '2026-01-01' });
+    const tihiy = bdbC.createCp(u, { name: 'ООО «Тихий С»', kind: 'customer', opening_date: '2026-01-01' });
+
+    // Заря: счёт и закрывающий акт на 30 000 — одна сделка; плюс акт на 12 500.
+    await docSvc.issueDocument(u, { type: 'sch', cpId: zarya, date: '2026-08-01', items: [{ name: 'Работа', qty: 1, price: 30000 }], skipQuota: true });
+    await docSvc.issueDocument(u, { type: 'usl', cpId: zarya, date: '2026-08-05', items: [{ name: 'Работа', qty: 1, price: 30000 }], skipQuota: true });
+    await docSvc.issueDocument(u, { type: 'usl', cpId: zarya, date: '2026-08-10', items: [{ name: 'Ещё', qty: 1, price: 12500 }], skipQuota: true });
+    // Тихий: акт на 50 000, а придёт только 20 000.
+    await docSvc.issueDocument(u, { type: 'usl', cpId: tihiy, date: '2026-08-02', items: [{ name: 'Аренда', qty: 1, price: 50000 }], skipQuota: true });
+
+    const rows = [
+      { key: 'c1', cpId: zarya, amount: 30000, date: '2026-08-20', doc: 'п/п 1' },
+      { key: 'c2', cpId: tihiy, amount: 20000, date: '2026-08-21', doc: 'п/п 2' },
+    ];
+    const imported = bdbC.importBankRows(u, rows);
+    ok(imported.added === 2 && imported.addedRows.length === 2,
+      'выписка занесена и вернула, что именно легло', `${imported.added} / ${imported.addedRows.length}`);
+
+    const m = bdbC.matchPaymentsToDocs(u, imported.addedRows);
+    ok(m.deals.length === 1, 'закрыть предложено одну сделку, а не три документа',
+      m.deals.map((d) => d.title).join(', '));
+    ok(m.deals[0].twinId > 0 && m.deals[0].alsoTitle.includes('Счёт'),
+      'счёт и закрывающий его акт закрываются вместе', m.deals[0].alsoTitle);
+    /*
+     * Частичная оплата не закрывает счёт. Пометка «оплачен» означала бы, что
+     * пришли все деньги; сумму пришлось бы дописать в журнал — то есть
+     * выдумать платёж, которого не было.
+     */
+    ok(m.leftovers.some((l) => l.cpId === tihiy && l.amount === 20000),
+      '20 000 из 50 000 названы остатком, а счёт не закрыт',
+      JSON.stringify(m.leftovers));
+
+    const was = bdbC.balanceOf(u, zarya).closing;
+    const done = bdbC.closeDocsFromBank(u, m.deals);
+    ok(done.deals === 1 && done.docs === 2, 'закрыто два документа одной сделки',
+      `${done.deals} / ${done.docs}`);
+    /*
+     * Деньги уже были в журнале строкой выписки. Здесь они не добавляются, а
+     * переставляются на документ — сальдо обязано остаться прежним.
+     */
+    ok(bdbC.balanceOf(u, zarya).closing === was,
+      'сальдо от отметки не поехало — оплату не задвоили',
+      `${was} → ${bdbC.balanceOf(u, zarya).closing}`);
+    ok(bdbC.balanceOf(u, zarya).closing === 12500,
+      'у Зари остался только неоплаченный акт', bdbC.balanceOf(u, zarya).closing);
+    const opsZ = bdbC.listOps(u, zarya).filter((o) => o.kind === 'Оплата');
+    ok(opsZ.length === 1 && opsZ[0].doc === 'п/п 1',
+      'номер платёжки сохранён — иначе при сверке не найти, чем закрыт счёт',
+      opsZ.map((o) => o.doc).join(', '));
+
+    /*
+     * Пересчёт долга видит документ с отметкой и без проводки — и создаёт
+     * вторую. Проводка привязана к документу как раз для того, чтобы этого
+     * не случилось.
+     */
+    bdbC.updateOrg(u, orgC, { debt_basis: 'invoice' });
+    bdbC.updateOrg(u, orgC, { debt_basis: 'closing' });
+    ok(bdbC.balanceOf(u, zarya).closing === 12500,
+      'смена основания туда-обратно оплату не задвоила', bdbC.balanceOf(u, zarya).closing);
+
+    // Отмена возвращает всё: и долг, и возможность загрузить выписку заново.
+    bdbC.deleteOp(u, opsZ[0].id);
+    ok(bdbC.balanceOf(u, zarya).closing === 42500,
+      'отмена оплаты вернула долг', bdbC.balanceOf(u, zarya).closing);
+    ok(bdbC.unpaidDocs(u).filter((d) => d.cp_id === zarya).length === 3,
+      'и оба документа сделки снова в «не оплачено»');
+    ok(bdbC.importBankRows(u, [rows[0]]).added === 1,
+      'ту же строку выписки после отмены можно загрузить снова');
+
+    // Повторный вызов ничего не портит: документ уже отмечен.
+    const twice = bdbC.closeDocsFromBank(u, m.deals);
+    ok(twice.deals <= 1, 'повторное нажатие не закрывает второй раз', twice.deals);
+  }
+
+  console.log('\n── тот же путь кнопками в чате ──');
+  {
+    /*
+     * Главное здесь — что бот ничего не закрыл сам. После разбора выписки
+     * документы обязаны остаться в «не оплачено» до тех пор, пока человек не
+     * нажмёт кнопку: закрытый по ошибке долг обнаруживают через месяц, когда
+     * клиент не платит, а счёт уже помечен оплаченным.
+     */
+    const bdbD = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = fxUserId();
+    const org = bdbD.getDefaultOrg(uid);
+    const was = bdbD.basisOf(org);
+    bdbD.updateOrg(uid, org.id, { debt_basis: 'closing' });
+    const cpD = bdbD.createCp(uid, {
+      name: 'ООО «Платёж»', inn: '7712345678', kind: 'customer', opening_date: '2026-01-01',
+    });
+    await docSvc.issueDocument(uid, {
+      type: 'usl', cpId: cpD, date: '2026-08-03',
+      items: [{ name: 'Работа', qty: 1, price: 44000 }], skipQuota: true });
+
+    const csv = [
+      'Дата;ИНН плательщика;Плательщик;Приход;Назначение платежа',
+      '25.08.2026;7712345678;ООО "Платёж";44 000,00;Оплата по счёту',
+    ].join('\n');
+    tg.downloadFile = async () => Buffer.from(csv, 'utf8');
+    await handleUpdate(tg, {
+      message: { chat: CHAT, from: USER, document: { file_id: 'st-9', file_name: 'v.csv', file_size: csv.length } },
+    });
+    ok(bdbD.unpaidDocs(uid).some((d) => d.cp_id === cpD),
+      'после разбора документ ещё не оплачен — бот сам ничего не закрыл');
+
+    sent.length = 0;
+    await tap('bank:take');
+    const offer = norm(sent.map((m) => m.text || '').join('\n'));
+    ok(offer.includes('Эти документы закрыты'), 'бот предложил закрыть счета', offer.slice(0, 90));
+    ok(offer.includes('44 000,00'), 'и назвал сумму', offer.slice(-70));
+    ok(bdbD.unpaidDocs(uid).some((d) => d.cp_id === cpD),
+      'но до нажатия документ по-прежнему не оплачен');
+    const btns = ((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.text).join(' | ');
+    ok(btns.includes('Отметить оплаченными'), 'есть кнопка подтверждения', btns);
+    ok(btns.includes('Не надо'), 'и отказаться можно, не выходя из разговора', btns);
+
+    await tap('bank:paid');
+    ok(last().includes('Отметил оплаченными'), 'по нажатию отметил', last().slice(0, 60));
+    ok(!bdbD.unpaidDocs(uid).some((d) => d.cp_id === cpD),
+      'документ ушёл из «не оплачено»');
+    ok(bdbD.balanceOf(uid, cpD).closing === 0, 'и долг закрылся ровно',
+      bdbD.balanceOf(uid, cpD).closing);
+
+    // Кнопку можно нажать второй раз — список к тому времени уже снят.
+    await tap('bank:paid');
+    ok(last().includes('уже не в работе'), 'второе нажатие ничего не портит', last().slice(0, 60));
+    bdbD.updateOrg(uid, org.id, { debt_basis: was });
+  }
+
   console.log('\n── изоляция пользователей ──');
   const OTHER = { id: 777002, first_name: 'Чужой', username: 'other' };
   await handleUpdate(tg, { message: { chat: { id: 777002 }, from: OTHER, text: '/start' } });

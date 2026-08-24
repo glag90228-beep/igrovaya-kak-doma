@@ -705,6 +705,40 @@ async function main() {
     });
     ok(r.status === 400 && /не нашлось операций/.test(r.json.error || ''),
       'файл без операций объясняет, что не так', (r.json || {}).error);
+
+    /*
+     * Автосверка: занесённые деньги закрывают счёт, но не сами — приложение
+     * возвращает предложение, а отмечает следующий вызов, по нажатию.
+     */
+    const docSvc = require('./lib/doc-service');
+    const bdbA = require('./lib/bot-db');
+    const mid = bdbA.getOrCreateUser(MASHA.id).id;
+    const orgA = bdbA.getDefaultOrg(mid);
+    if (orgA) bdbA.updateOrg(mid, orgA.id, { debt_basis: 'closing' });
+    const cpA = bdbA.createCp(mid, { name: 'ООО «Сверка А»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(mid, {
+      type: 'usl', cpId: cpA, date: '2026-08-04',
+      items: [{ name: 'Работа', qty: 1, price: 17000 }], skipQuota: true });
+
+    r = await call('POST', '/api/bank/import', {
+      user: masha,
+      body: { rows: [{ key: 'сверка|in|17000|оплата', cpId: cpA, amount: 17000, date: '2026-08-25', doc: 'п/п 5' }] },
+    });
+    ok(r.json.added === 1 && (r.json.deals || []).length === 1,
+      'приложение предложило закрыть счёт', JSON.stringify(r.json.deals || []));
+    ok(bdbA.unpaidDocs(mid).some((d) => d.cp_id === cpA),
+      'но сам не закрыл — до нажатия документ не оплачен');
+
+    const deals = r.json.deals;
+    r = await call('POST', '/api/bank/close', { user: masha, body: { deals } });
+    ok(r.json.docs === 1, 'по подтверждению счёт закрыт', JSON.stringify(r.json));
+    ok(!bdbA.unpaidDocs(mid).some((d) => d.cp_id === cpA), 'и ушёл из «не оплачено»');
+    ok(bdbA.balanceOf(mid, cpA).closing === 0, 'долг закрылся ровно, без задвоения',
+      bdbA.balanceOf(mid, cpA).closing);
+
+    // Чужие сделки не закрываются: leadId проверяется по владельцу.
+    r = await call('POST', '/api/bank/close', { user: petya, body: { deals } });
+    ok(r.json.docs === 0, 'чужую сделку закрыть нельзя', JSON.stringify(r.json));
   }
 
   console.log('\n── свой ящик и отправка на почту ──');
