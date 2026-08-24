@@ -68,6 +68,22 @@ const ok = (c, m, extra) => {
   const ctx = await browser.newContext({
     viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, locale: 'ru-RU',
   });
+
+  /*
+   * Настоящий скрипт Telegram грузиться не должен.
+   *
+   * Страница тянет его из интернета, и он переписывает window.Telegram поверх
+   * нашей заглушки. Вне мессенджера у настоящего initData пустой, приложение
+   * честно говорит «Не удалось вас опознать» — и экрана, которого ждёт
+   * проверка, не появляется никогда.
+   *
+   * Обиднее всего, что зависит это от сети: где telegram.org недоступен,
+   * заглушка выживает и прогон зелёный, а где доступен — падает по таймауту.
+   * Проверка обязана давать один и тот же ответ в обоих случаях.
+   * (В miniapp-preview.js этот же запрет стоит с самого начала.)
+   */
+  await ctx.route('https://telegram.org/**', (route) => route.abort());
+
   await ctx.addInitScript((data) => {
     const noop = () => {};
     window.Telegram = { WebApp: {
