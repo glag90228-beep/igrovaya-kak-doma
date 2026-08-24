@@ -1050,13 +1050,21 @@ const api = {
         cpId: r.cp_id,
         cpName: r.cp_name,
         type: r.type,
-        title: (docService.ITEM_DOCS[r.type] || {}).title || r.type,
+        // У операции журнала название не из справочника документов: там её
+        // нет и быть не может. Показываем, что именно повторяется.
+        title: recurring.isOp(r)
+          ? `${r.op.kind} · ${r.op.note || 'операция журнала'}`
+          : (docService.ITEM_DOCS[r.type] || {}).title || r.type,
+        isOp: recurring.isOp(r),
+        op: recurring.isOp(r) ? r.op : null,
         day: r.day,
         dayText: r.dayText,
         offerDay: r.offerDay,
         payDay: r.pay_day,
         leadDays: r.lead_days,
-        total: round2(r.items.reduce((a, it) => a + (Number(it.qty) || 0) * (Number(it.price) || 0), 0)),
+        total: recurring.isOp(r)
+          ? r.op.amount
+          : round2(r.items.reduce((a, it) => a + (Number(it.qty) || 0) * (Number(it.price) || 0), 0)),
       })),
     };
   },

@@ -94,6 +94,7 @@ const FLOW_BUTTONS = {
   'dog:': ['dog.'],
   'fx:': ['fx.'],
   'mb:': ['mb.'],
+  'ro:': ['ro.'],
 };
 
 // ---------- меню ----------
@@ -174,6 +175,13 @@ function cpMenu(userId, cp) {
     rows.push([{ text: `🔁 Повторить: ${lastSch.title.toLowerCase()} № ${lastSch.number}`, data: `d.rep:${lastSch.id}` }]);
   }
   rows.push([{ text: '📁 Документы по контрагенту', data: `docs.cp:${cp.id}` }]);
+  // Повторяющаяся операция живёт здесь, а не в общих настройках: правило
+  // всегда про одного контрагента, и искать его больше нигде не нужно.
+  const repOp = recurring.list(userId).find((r) => r.cp_id === cp.id && recurring.isOp(r));
+  rows.push([repOp
+    ? { text: `🔁 Повторяю: ${repOp.op.kind.toLowerCase()} ${Math.round(repOp.op.amount)} ₽`
+        + (repOp.op.times ? ` (${repOp.op.done} из ${repOp.op.times})` : ''), data: 'rec' }
+    : { text: '🔁 Повторять операцию каждый месяц', data: `ro.new:${cp.id}` }]);
   rows.push([{ text: '↩️ Удалить последнюю операцию', data: `op.del:${cp.id}` }]);
   rows.push([{ text: '⬅️ К контрагентам', data: 'cps' }]);
   return { info, kb: keyboard(rows) };
@@ -1558,6 +1566,54 @@ async function mailDoc(tg, chatId, user, docId, emailOverride = null) {
     keyboard([[{ text: '↩️ К документу', data: `doc:${docId}` }], [{ text: '⬅️ Меню', data: 'menu' }]]));
 }
 
+/**
+ * Акт сверки себе на почту.
+ *
+ * Только себе, в свой же ящик. Контрагенту отсюда не уходит ничего: акт
+ * сверки — двусторонний документ, на него отвечают, и рассылка без ведома
+ * человека означала бы, что он отправил клиенту бумагу, которую не видел.
+ * Клиенту письмо уходит отдельной кнопкой, где виден текст.
+ *
+ * Собираем заново из операций: акт сверки не хранится файлом, в отличие от
+ * счетов и актов услуг, — он всегда актуален на момент сборки.
+ *
+ * Тихо не падаем: письмо здесь — приложение к операции, а не сама операция.
+ * Ящик не настроен или почта не ответила — строка в журнале всё равно
+ * должна остаться.
+ *
+ * @returns {Promise<{ok:boolean, error?:string}>}
+ */
+async function mailAktToSelf(user, cp) {
+  const box = mailbox.resolve(user.id);
+  if (!box.ok) return { ok: false, error: box.reason };
+  /*
+   * Адрес «себе» знаем только у своего ящика. Общий SMTP из окружения —
+   * это наш служебный отправитель, и куда слать копию, из него не следует.
+   * Слать на непонятно чей адрес хуже, чем не слать.
+   */
+  const to = box.own ? String(box.options.from || box.options.user || '').trim() : '';
+  if (!to) return { ok: false, error: 'Не знаю вашего адреса — подключите свой ящик.' };
+  const org = bdb.getDefaultOrg(user.id);
+  if (!org) return { ok: false, error: 'Организация не заведена.' };
+  const p = bdb.cpForPeriod(user.id, cp.id, '', '');
+  if (!p) return { ok: false, error: 'Не удалось собрать акт.' };
+
+  const buf = await buildAkt({ org: orgForAkt(org), cp: p.view, ops: p.ops });
+  return mailer.sendMail({
+    to,
+    subject: `Акт сверки с ${cp.name} на ${ru(todayISO())}`,
+    text: `Акт сверки с ${cp.name} за период ${ru(p.from)}—${ru(p.to)}.\n`
+      + `Входящее сальдо ${Math.abs(p.opening)}, исходящее ${Math.abs(p.closing)}.\n\n`
+      + 'Письмо собрано автоматически по вашему повторению. '
+      + 'Контрагенту оно не отправлялось.',
+    attachments: [{
+      filename: `Акт_сверки_${safeName(cp.name)}.xlsx`,
+      content: Buffer.from(buf),
+      contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    }],
+  }, box.options);
+}
+
 // ---------- почтовый ящик пользователя ----------
 
 /** Экран «Почта для отправки»: что подключено и как это поменять. */
@@ -1874,23 +1930,40 @@ async function showRecurring(tg, chatId, user) {
       '<b>Регулярные документы</b>\n\n'
       + 'Пока ничего не повторяется.\n\n'
       + 'Выпишите счёт или акт и нажмите «🔁 Повторять каждый месяц» — '
-      + 'в нужный день я напомню и предложу выписать такой же.', mainMenu());
+      + 'в нужный день я напомню и предложу выписать такой же.\n\n'
+      + 'А в карточке клиента есть «🔁 Повторять операцию каждый месяц» — '
+      + 'для зачётов и списаний, которых в банковской выписке не бывает.', mainMenu());
     return;
   }
+  // Подпись строки: у документа это его название, у операции — что и на
+  // сколько. Одно слово «op» в списке ничего человеку не сказало бы.
+  const label = (r) => (recurring.isOp(r)
+    ? `${r.op.kind} ${formatRub(r.op.amount).replace(/<[^>]+>/g, '')}`
+    : (docService.ITEM_DOCS[r.type] ? docService.ITEM_DOCS[r.type].title : r.type));
   const rows = list.map((r) => ([{
-    text: `✖️ ${docService.ITEM_DOCS[r.type] ? docService.ITEM_DOCS[r.type].title : r.type} · ${r.cp_name}`.slice(0, 60),
+    text: `✖️ ${label(r)} · ${r.cp_name}`.slice(0, 60),
     data: `rec.off:${r.id}`,
   }]));
   rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  const hasOps = list.some((r) => recurring.isOp(r));
   await tg.sendMessage(chatId,
-    '<b>Регулярные документы</b>\n\n'
+    '<b>Что повторяется каждый месяц</b>\n\n'
     + list.map((r) => {
-      const title = docService.ITEM_DOCS[r.type] ? docService.ITEM_DOCS[r.type].title : r.type;
+      if (recurring.isOp(r)) {
+        const left = r.op.times ? ` · осталось ${r.op.left} из ${r.op.times}` : '';
+        return `• <b>${esc(r.op.kind)} ${formatRub(r.op.amount)}</b> — ${esc(r.cp_name)}, `
+          + `${r.dayText}${left}${r.op.note ? `\n  <i>${esc(r.op.note)}</i>` : ''}`;
+      }
       const sum = r.items.reduce((a, it) => a + round2((Number(it.qty) || 0) * (Number(it.price) || 0)), 0);
-      return `• <b>${esc(title)}</b> для ${esc(r.cp_name)} — ${formatRub(sum)}, ${r.dayText}`;
+      return `• <b>${esc(label(r))}</b> для ${esc(r.cp_name)} — ${formatRub(sum)}, ${r.dayText}`;
     }).join('\n')
-    + '\n\n<i>Ничего не выписывается само: в нужный день я пришлю предложение '
-    + 'с кнопкой. Нажмите на строку ниже, чтобы перестать напоминать.</i>',
+    + '\n\n<i>Документы сами не выписываются: в нужный день придёт предложение '
+    + 'с кнопкой.</i>'
+    + (hasOps
+      ? '\n<i>Операции журнала вношу сам — они внутренние и никуда не уходят, — '
+        + 'но каждый раз сообщу и дам отменить.</i>'
+      : '')
+    + '\n\nНажмите на строку ниже, чтобы выключить.',
     keyboard(rows));
 }
 
@@ -1958,6 +2031,71 @@ async function offerRecurring(tg, rec) {
   return true;
 }
 
+/** Шаг «какого числа»: спрашивается и после подписи, и вместо неё. */
+async function askRoDay(tg, chatId, user, cpId, data) {
+  bdb.setState(user.id, `ro:day:${cpId}`, data);
+  await tg.sendMessage(chatId, 'Какого числа вносить?', keyboard([
+    [1, 5, 10, 15, 20, 25].map((d) => ({ text: String(d), data: `ro.day:${cpId}:${d}` })),
+    [{ text: 'Последнее число месяца', data: `ro.day:${cpId}:0` }],
+    [{ text: '✖️ Отмена', data: `cp:${cpId}` }],
+  ]));
+}
+
+/**
+ * Провести повторяющуюся операцию журнала.
+ *
+ * В отличие от документа, эту строку бот вносит сам — она внутренняя, не
+ * забирает номер в сквозном ряду и никуда не уходит. Но молчать при этом
+ * нельзя: сальдо изменилось, а сальдо человек показывает контрагенту.
+ * Поэтому каждый раз сообщение с суммой, счётчиком и кнопкой отмены.
+ *
+ * Порядок важен: сначала считаем счётчик, потом вносим. Если упасть между
+ * ними, лучше пропустить месяц, чем внести строку дважды — задвоенная
+ * оплата в учёте хуже ненайденной.
+ */
+async function postRecurringOp(tg, rec) {
+  const user = bdb.userById(rec.user_id);
+  if (!user || user.blocked_at) return false;
+  const cp = bdb.getCp(user.id, rec.cp_id);
+  if (!cp) return false;
+
+  const step = recurring.bumpOp(user.id, rec.id, 1);
+  if (!step) return false;
+
+  const { kind, amount, note } = rec.op;
+  const opId = bdb.addOp(user.id, cp.id, {
+    date: todayISO(),
+    kind,
+    doc: note || `${kind} по повторению`,
+    debit: kind === 'Оплата' ? amount : 0,
+    credit: kind === 'Приход' ? amount : 0,
+    note: 'по повторению',
+  });
+
+  const b = bdb.balanceOf(user.id, cp.id);
+  const counter = rec.op.times ? ` · ${step.done} из ${rec.op.times}` : '';
+  const rows = [
+    [{ text: '↩️ Отменить', data: `ro.undo:${rec.id}:${opId}` }],
+    [{ text: '📄 Акт сверки', data: `d.akt:${cp.id}` }],
+  ];
+  if (!step.finished) rows.push([{ text: '✖️ Больше не повторять', data: `rec.off:${rec.id}` }]);
+  rows.push([{ text: `👤 ${cp.name}`.slice(0, 60), data: `cp:${cp.id}` }]);
+
+  await tg.sendMessage(user.tg_id,
+    `🔁 Внёс по вашему правилу:\n<b>${esc(kind)} ${formatRub(amount)}</b>${counter}\n`
+    + `${esc(cp.name)}${note ? `\n<i>${esc(note)}</i>` : ''}\n\n`
+    + `Сальдо теперь: <b>${formatRub(Math.abs(round2(b ? b.closing : 0)))}</b>.`
+    + (step.finished ? '\n\n<i>Это был последний раз — правило выключено.</i>' : ''),
+    keyboard(rows));
+
+  // Себе на почту — если человек этого попросил при настройке. Контрагенту
+  // отсюда не уходит ничего: письмо ему человек подтверждает отдельно и
+  // видит текст (правило проекта, и оно не формальное — акт сверки
+  // двусторонний, на него отвечают).
+  if (rec.op.mailSelf) await mailAktToSelf(user, cp).catch(() => {});
+  return true;
+}
+
 /**
  * Ежедневная проверка повторений.
  *
@@ -1969,6 +2107,11 @@ async function runDaily(tg) {
   let sent = 0;
   for (const rec of recurring.due()) {
     try {
+      if (recurring.isOp(rec)) {
+        // eslint-disable-next-line no-await-in-loop
+        if (await postRecurringOp(tg, rec)) sent += 1;
+        continue;                       // счётчик двигает сам postRecurringOp
+      }
       // eslint-disable-next-line no-await-in-loop
       if (await offerRecurring(tg, rec)) sent += 1;
       recurring.markOffered(rec.user_id, rec.id);
@@ -3099,6 +3242,33 @@ async function handleMessage(tg, msg) {
       keyboard([[{ text: '✖️ Отмена', data: 'fx' }]]));
     return;
   }
+  // Настройка повторяющейся операции: сумма и примечание вводятся текстом,
+  // остальное кнопками.
+  if (state.state.startsWith('ro:amount:')) {
+    const cpId = Number(state.state.split(':')[2]);
+    const amount = parseAmount(text);
+    if (amount == null || amount <= 0) {
+      await tg.sendMessage(chatId, 'Не разобрал сумму. Напишите числом, например <code>27680</code>.');
+      return;
+    }
+    bdb.setState(user.id, `ro:note:${cpId}`, { ...state.data, amount });
+    await tg.sendMessage(chatId,
+      `Сумма: <b>${formatRub(amount)}</b>.\n\n`
+      + 'Как назвать эту операцию в журнале? Эта подпись попадёт в акт сверки, '
+      + 'и по ней контрагент поймёт, чем закрыт долг.\n\n'
+      + '<i>Например: «Зачёт встречных требований по акту № 1 от 01.07.2026».</i>',
+      keyboard([
+        [{ text: 'Без подписи', data: `ro.nonote:${cpId}` }],
+        [{ text: '✖️ Отмена', data: `cp:${cpId}` }],
+      ]));
+    return;
+  }
+  if (state.state.startsWith('ro:note:')) {
+    const cpId = Number(state.state.split(':')[2]);
+    await askRoDay(tg, chatId, user, cpId, { ...state.data, note: text.slice(0, 200) });
+    return;
+  }
+
   if (state.state.startsWith('op:')) {
     const cpId = Number(state.state.split(':')[1]);
     const op = parseOp(text);
@@ -3551,6 +3721,154 @@ async function handleCallback(tg, cq) {
     if (data.startsWith('fx.scope:')) {
       facsimile.setScope(user.id, data.split(':')[1]);
       await showFacsimile(tg, chatId, user);
+      return;
+    }
+    /*
+     * Повторяющаяся операция журнала: клиент → тип → сумма → примечание →
+     * число → сколько раз → почта. Каждый шаг показывает, что бот уже
+     * понял: правило работает само каждый месяц, и ошибка в нём повторится
+     * молча — значит, человек должен видеть её до того, как согласится.
+     */
+    if (data.startsWith('ro.new:')) {
+      const cp = bdb.getCp(user.id, Number(data.slice(7)));
+      if (!cp) { await tg.sendMessage(chatId, 'Клиент не найден.', mainMenu()); return; }
+      if (recurring.list(user.id).some((r) => r.cp_id === cp.id && recurring.isOp(r))) {
+        await tg.sendMessage(chatId, 'По этому клиенту повторение уже настроено.', keyboard([
+          [{ text: '🔁 Все повторения', data: 'rec' }], [{ text: '⬅️ Назад', data: `cp:${cp.id}` }],
+        ]));
+        return;
+      }
+      bdb.setState(user.id, `ro:kind:${cp.id}`, {});
+      await tg.sendMessage(chatId,
+        `<b>Повторять операцию каждый месяц</b>\nКлиент: ${esc(cp.name)}\n\n`
+        + 'Что повторять? <i>Оплата</i> уменьшает то, что вам должны, '
+        + '<i>приход</i> — увеличивает.',
+        keyboard([
+          [{ text: '💸 Оплата', data: `ro.kind:${cp.id}:pay` }],
+          [{ text: '📥 Приход', data: `ro.kind:${cp.id}:in` }],
+          [{ text: '✖️ Отмена', data: `cp:${cp.id}` }],
+        ]));
+      return;
+    }
+    if (data.startsWith('ro.kind:')) {
+      const [, cpIdStr, k] = data.split(':');
+      const cp = bdb.getCp(user.id, Number(cpIdStr));
+      if (!cp) { await tg.sendMessage(chatId, 'Клиент не найден.', mainMenu()); return; }
+      bdb.setState(user.id, `ro:amount:${cp.id}`, { opKind: k === 'in' ? 'Приход' : 'Оплата' });
+      await tg.sendMessage(chatId,
+        `${k === 'in' ? '📥 Приход' : '💸 Оплата'} · ${esc(cp.name)}\n\n`
+        + 'Какая сумма? Напишите числом, например <code>27680</code> или <code>27 680,50</code>.',
+        keyboard([[{ text: '✖️ Отмена', data: `cp:${cp.id}` }]]));
+      return;
+    }
+    if (data.startsWith('ro.nonote:')) {
+      const cpId = Number(data.slice(10));
+      const st = bdb.getState(user.id);
+      if (!bdb.getCp(user.id, cpId) || !st.data || !st.data.amount) {
+        await tg.sendMessage(chatId, 'Настройка потерялась — начните заново.', mainMenu());
+        return;
+      }
+      await askRoDay(tg, chatId, user, cpId, { ...st.data, note: '' });
+      return;
+    }
+    if (data.startsWith('ro.day:')) {
+      const [, cpIdStr, dayStr] = data.split(':');
+      const st = bdb.getState(user.id);
+      const cp = bdb.getCp(user.id, Number(cpIdStr));
+      if (!cp || !st.data || !st.data.amount) {
+        await tg.sendMessage(chatId, 'Настройка потерялась — начните заново.', mainMenu());
+        return;
+      }
+      bdb.setState(user.id, `ro:times:${cp.id}`, { ...st.data, day: Number(dayStr) });
+      await tg.sendMessage(chatId,
+        'Сколько раз повторить?\n\n'
+        + '<i>Когда гасите долг частями, число известно заранее — правило само '
+        + 'выключится после последнего раза и не будет списывать то, чего уже нет.</i>',
+        keyboard([
+          [{ text: '3', data: `ro.times:${cp.id}:3` }, { text: '5', data: `ro.times:${cp.id}:5` },
+            { text: '10', data: `ro.times:${cp.id}:10` }, { text: '12', data: `ro.times:${cp.id}:12` }],
+          [{ text: '♾ Без конца', data: `ro.times:${cp.id}:0` }],
+          [{ text: '✖️ Отмена', data: `cp:${cp.id}` }],
+        ]));
+      return;
+    }
+    if (data.startsWith('ro.times:')) {
+      const [, cpIdStr, timesStr] = data.split(':');
+      const st = bdb.getState(user.id);
+      const cp = bdb.getCp(user.id, Number(cpIdStr));
+      if (!cp || !st.data || !st.data.amount) {
+        await tg.sendMessage(chatId, 'Настройка потерялась — начните заново.', mainMenu());
+        return;
+      }
+      bdb.setState(user.id, `ro:mail:${cp.id}`, { ...st.data, times: Number(timesStr) });
+      const box = mailbox.resolve(user.id);
+      await tg.sendMessage(chatId,
+        'Присылать себе акт сверки на почту после каждого раза?\n\n'
+        + (box.ok
+          ? '<i>Только вам, в ваш же ящик. Контрагенту ничего не уходит — это вы '
+            + 'подтверждаете отдельно и видите текст письма.</i>'
+          : `<i>${esc(box.reason)} Пока можно без почты — включите позже.</i>`),
+        keyboard([
+          ...(box.ok ? [[{ text: '✉️ Да, присылать себе', data: `ro.save:${cp.id}:1` }]] : []),
+          [{ text: 'Не надо', data: `ro.save:${cp.id}:0` }],
+          [{ text: '✖️ Отмена', data: `cp:${cp.id}` }],
+        ]));
+      return;
+    }
+    if (data.startsWith('ro.save:')) {
+      const [, cpIdStr, mailStr] = data.split(':');
+      const st = bdb.getState(user.id);
+      const cp = bdb.getCp(user.id, Number(cpIdStr));
+      if (!cp || !st.data || !st.data.amount) {
+        await tg.sendMessage(chatId, 'Настройка потерялась — начните заново.', mainMenu());
+        return;
+      }
+      const d = st.data;
+      bdb.clearState(user.id);
+      recurring.add(user.id, {
+        cpId: cp.id,
+        type: recurring.OP_TYPE,
+        items: [],
+        day: Number(d.day),
+        // Месяц отмечаем отработанным, только если день уже прошёл: иначе
+        // бот обещает провести 1-го и молчит до следующего месяца.
+        offeredThisMonth: recurring.dayPassed(Number(d.day)),
+        extra: {
+          opKind: d.opKind,
+          amount: d.amount,
+          note: d.note || '',
+          times: Number(d.times) || 0,
+          done: 0,
+          mailSelf: mailStr === '1',
+        },
+      });
+      await tg.sendMessage(chatId,
+        `✅ Готово.\n\n<b>${esc(d.opKind)} ${formatRub(d.amount)}</b> · ${esc(cp.name)}\n`
+        + `${recurring.dayLabel(Number(d.day))}`
+        + (Number(d.times) ? ` · ${d.times} ${plural(Number(d.times), 'раз', 'раза', 'раз')}` : ' · без конца')
+        + (d.note ? `\n<i>${esc(d.note)}</i>` : '')
+        + (mailStr === '1' ? '\n✉️ Акт сверки буду присылать вам на почту.' : '')
+        + '\n\nВносить буду сам, но каждый раз сообщу и дам отменить одним нажатием.',
+        keyboard([
+          [{ text: '🔁 Все повторения', data: 'rec' }],
+          [{ text: `👤 ${cp.name}`.slice(0, 60), data: `cp:${cp.id}` }],
+        ]));
+      return;
+    }
+    /*
+     * Отмена только что внесённой строки. Возвращаем и счётчик: иначе пятая
+     * часть долга «сгорала» бы от одного случайного нажатия, а правило
+     * выключилось бы раньше времени.
+     */
+    if (data.startsWith('ro.undo:')) {
+      const [, recIdStr, opIdStr] = data.split(':');
+      const removed = bdb.deleteOp(user.id, Number(opIdStr));
+      recurring.bumpOp(user.id, Number(recIdStr), -1);
+      await tg.sendMessage(chatId,
+        removed
+          ? '↩️ Убрал операцию из журнала. Счётчик вернул назад — в следующий раз внесу снова.'
+          : 'Этой операции уже нет в журнале.',
+        mainMenu());
       return;
     }
     if (data === 'org.new') { await startForm(tg, chatId, user, 'org'); return; }

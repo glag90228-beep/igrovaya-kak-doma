@@ -26,6 +26,28 @@ const { db } = require('../db');
 const LAST_DAY = 0;
 
 /*
+ * Повторяющаяся операция журнала — второй вид правила, рядом с документами.
+ *
+ * Зачем отдельно. Выписка из банка закрывает ту часть, где двигались деньги.
+ * Но сальдо двигает и то, чего в банке не видно никогда: взаимозачёт по
+ * подписанному акту, ежемесячное списание задолженности, фиксированное
+ * начисление. Такую строку человек обязан помнить сам — и однажды забудет,
+ * а сальдо разъедется незаметно, до ближайшей сверки.
+ *
+ * Почему здесь бот вносит сам, а документ — нет. Документ забирает номер в
+ * сквозном ряду и уходит контрагенту; лишний счёт не отменить бесследно.
+ * Строка журнала внутренняя, её видит только владелец, и отмена убирает её
+ * вместе со следом в сальдо. Поэтому правило работает само, но каждый раз
+ * говорит об этом и даёт отменить в одно касание.
+ *
+ * Счётчик обязателен по той же причине. «Гашу долг пятью частями» — это
+ * ровно пять раз, а не «каждый месяц навсегда»: правило, пережившее свой
+ * долг, начнёт списывать то, чего уже нет.
+ */
+const OP_TYPE = 'op';
+const isOp = (rec) => Boolean(rec) && rec.type === OP_TYPE;
+
+/*
  * Календарь здесь московский, тот же, что у документов (lib/period.js).
  *
  * Раньше месяц брался через toISOString(), то есть по UTC, а день месяца —
@@ -169,6 +191,18 @@ function parse(row) {
   rec.dayText = row.pay_day
     ? `${dayLabel(rec.offerDay)} (оплата ${row.pay_day}-го)`
     : dayLabel(row.day);
+  if (isOp(rec)) {
+    const e = rec.extra;
+    rec.op = {
+      kind: e.opKind === 'Приход' ? 'Приход' : 'Оплата',
+      amount: Math.round((Number(e.amount) || 0) * 100) / 100,
+      note: String(e.note || ''),
+      times: Math.max(0, Math.round(Number(e.times) || 0)),   // 0 — без конца
+      done: Math.max(0, Math.round(Number(e.done) || 0)),
+      mailSelf: Boolean(e.mailSelf),
+    };
+    rec.op.left = rec.op.times ? Math.max(0, rec.op.times - rec.op.done) : 0;
+  }
   return rec;
 }
 
@@ -184,6 +218,30 @@ function get(userId, id) {
   return parse(db.prepare(`SELECT r.*, c.name AS cp_name FROM recurring r
       JOIN counterparties c ON c.id = r.cp_id
       WHERE r.id = ? AND r.user_id = ?`).get(Number(id), userId));
+}
+
+/**
+ * Отметить, что операция по правилу проведена.
+ *
+ * Счётчик и месяц двигаем одной записью: если отметить месяц, а счётчик
+ * забыть, правило будет вносить строку вечно; если наоборот — внесёт её
+ * дважды в один месяц при перезапуске обхода.
+ *
+ * Дойдя до конца, правило выключается само. Пять частей долга — это пять
+ * раз; шестая строка списала бы то, чего уже нет.
+ *
+ * @param {number} step +1 при проведении, −1 при отмене
+ * @returns {{done:number, left:number, finished:boolean}|null}
+ */
+function bumpOp(userId, id, step = 1, date = todayDate()) {
+  const rec = get(userId, id);
+  if (!isOp(rec)) return null;
+  const done = Math.max(0, rec.op.done + step);
+  const extra = { ...rec.extra, done };
+  const finished = rec.op.times > 0 && done >= rec.op.times;
+  db.prepare('UPDATE recurring SET extra = ?, last_offer = ?, active = ? WHERE id = ? AND user_id = ?')
+    .run(JSON.stringify(extra), step > 0 ? monthKey(date) : '', finished ? 0 : 1, Number(id), userId);
+  return { done, left: rec.op.times ? Math.max(0, rec.op.times - done) : 0, finished };
 }
 
 function setDay(userId, id, day) {
@@ -253,5 +311,6 @@ module.exports = {
   add, list, get, setDay, setSchedule, off,
   due, markOffered, overdue, markDueNoticed,
   isDue, isOverdue, offerDay, dueDate, dayPassed,
+  OP_TYPE, isOp, bumpOp,
   monthKey, normalizeDay, dayLabel, LAST_DAY,
 };

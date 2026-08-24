@@ -3109,6 +3109,105 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(twice.deals <= 1, 'повторное нажатие не закрывает второй раз', twice.deals);
   }
 
+  console.log('\n── повторяющаяся операция журнала ──');
+  {
+    /*
+     * Взаимозачёт, списание задолженности частями, фиксированное начисление —
+     * всё это двигает сальдо, но в банковской выписке не появляется никогда:
+     * денег-то не было. Значит, человек обязан помнить об этом сам — и
+     * однажды забудет.
+     *
+     * Здесь бот вносит строку сам, в отличие от документов. Разница
+     * намеренная: документ забирает номер в сквозном ряду и уходит
+     * контрагенту, а строка журнала внутренняя и отменяется бесследно.
+     */
+    const rec = require('./lib/recurring');
+    const bdbR = require('./lib/bot-db');
+    const { runDaily } = require('./bot.js');
+    const uid = fxUserId();
+    for (const r of rec.list(uid)) rec.off(uid, r.id);
+    const cpF = bdbR.createCp(uid, { name: 'ООО «Фабрика»', kind: 'supplier', opening_date: '2026-01-01' });
+    bdbR.addOp(uid, cpF, { date: '2026-01-01', kind: 'Приход', doc: 'Товар', credit: 138400 });
+    const startBal = bdbR.balanceOf(uid, cpF).closing;
+
+    sent.length = 0;
+    await tap(`ro.new:${cpF}`);
+    ok(norm(last()).includes('Что повторять'), 'спросил тип операции', norm(last()).slice(0, 60));
+    await tap(`ro.kind:${cpF}:pay`);
+    ok(norm(last()).includes('Какая сумма'), 'спросил сумму');
+    await say('27 680');
+    ok(norm(last()).includes('27 680,00'), 'сумму разобрал с пробелом в разрядах', norm(last()).slice(0, 60));
+    await say('Зачёт встречных требований по акту № 1 от 01.07.2026');
+    ok(norm(last()).includes('Какого числа'), 'спросил число');
+    await tap(`ro.day:${cpF}:1`);
+    ok(norm(last()).includes('Сколько раз'), 'спросил, сколько раз — правило должно кончиться');
+    await tap(`ro.times:${cpF}:5`);
+    ok(norm(last()).includes('акт сверки на почту'), 'спросил про почту себе');
+    await tap(`ro.save:${cpF}:0`);
+    ok(norm(last()).includes('Готово'), 'правило заведено', norm(last()).slice(0, 50));
+
+    const rule = rec.list(uid).find((r) => r.cp_id === cpF && rec.isOp(r));
+    ok(Boolean(rule), 'правило легло в повторения');
+    ok(rule.op.amount === 27680 && rule.op.kind === 'Оплата' && rule.op.times === 5,
+      'сумма, тип и счётчик сохранены', JSON.stringify(rule.op));
+    ok(rule.op.note.includes('Зачёт встречных требований'),
+      'подпись сохранена — она попадёт в акт сверки', rule.op.note);
+    ok(bdbR.balanceOf(uid, cpF).closing === startBal,
+      'настройка сама по себе ничего не внесла в журнал');
+
+    // Наступил день.
+    const { db: rawO } = require('./db');
+    rawO.prepare("UPDATE recurring SET last_offer = '2000-01', day = ? WHERE id = ?")
+      .run(new Date().getDate(), rule.id);
+    sent.length = 0;
+    await runDaily(tg);
+    const msg = norm(sent.map((m) => m.text || '').join('\n'));
+    ok(msg.includes('Внёс по вашему правилу'), 'бот внёс операцию и сказал об этом', msg.slice(0, 70));
+    ok(msg.includes('1 из 5'), 'и показал счётчик', msg.slice(0, 90));
+    const ops = bdbR.listOps(uid, cpF).filter((o) => o.kind === 'Оплата');
+    ok(ops.length === 1 && ops[0].debit === 27680, 'строка легла в журнал', JSON.stringify(ops.map((o) => o.debit)));
+    ok(ops[0].doc.includes('Зачёт встречных требований'),
+      'в журнале стоит подпись, а не «оплата»', ops[0].doc);
+
+    // Отмена возвращает и строку, и счётчик.
+    const undo = ((sent[sent.length - 1] || {}).kb || []).flat().find((b) => /Отменить/.test(b.text));
+    ok(Boolean(undo && undo.callback_data), 'рядом есть кнопка отмены');
+    await tap(undo.callback_data);
+    ok(bdbR.balanceOf(uid, cpF).closing === startBal, 'отмена вернула сальдо',
+      bdbR.balanceOf(uid, cpF).closing);
+    ok(rec.get(uid, rule.id).op.done === 0, 'и счётчик вернулся назад',
+      rec.get(uid, rule.id).op.done);
+
+    /*
+     * Дважды в один месяц операция не вносится: сальдо человек показывает
+     * контрагенту, и лишняя строка обнаружится на сверке, а не сразу.
+     */
+    sent.length = 0;
+    await runDaily(tg);
+    const before = bdbR.listOps(uid, cpF).length;
+    await runDaily(tg);
+    ok(bdbR.listOps(uid, cpF).length === before, 'второй обход в тот же месяц ничего не добавил',
+      `${before} → ${bdbR.listOps(uid, cpF).length}`);
+
+    // Правило выключается само, когда счётчик кончился.
+    for (let i = 0; i < 6; i += 1) {
+      rawO.prepare("UPDATE recurring SET last_offer = '2000-01' WHERE id = ?").run(rule.id);
+      // eslint-disable-next-line no-await-in-loop
+      await runDaily(tg);
+    }
+    const after = rec.get(uid, rule.id);
+    ok(after === null || after.active === 0, 'после пятого раза правило выключилось само');
+    const total = bdbR.listOps(uid, cpF).filter((o) => o.kind === 'Оплата').length;
+    ok(total === 5, 'ровно пять списаний, а не шесть и не бесконечно', total);
+    ok(Math.abs(bdbR.balanceOf(uid, cpF).closing - (startBal - 27680 * 5)) < 0.01,
+      'долг погашен ровно на пять частей', bdbR.balanceOf(uid, cpF).closing);
+
+    // Второе такое же правило по тому же клиенту не заводится.
+    await tap(`ro.new:${cpF}`);
+    ok(norm(last()).includes('уже настроено') || rec.list(uid).filter((r) => r.cp_id === cpF).length <= 1,
+      'два одинаковых правила по одному клиенту не заводятся', norm(last()).slice(0, 50));
+  }
+
   console.log('\n── тот же путь кнопками в чате ──');
   {
     /*
