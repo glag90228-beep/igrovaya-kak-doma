@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Карта сайта: три страницы, которые должны быть в поиске.
+  Карта сайта: страницы, которые должны быть в поиске.
 
   Черновика index-v2.html здесь нет намеренно — он закрыт от индексации.
   Дату lastmod правьте руками при заметных правках текста: врать роботу,
@@ -15,12 +15,6 @@
   </url>
   <url>
     <loc>https://pervichkaru.ru/oferta.html</loc>
-    <lastmod>2026-08-25</lastmod>
-    <changefreq>yearly</changefreq>
-    <priority>0.3</priority>
-  </url>
-  <url>
-    <loc>https://pervichkaru.ru/politika.html</loc>
     <lastmod>2026-08-25</lastmod>
     <changefreq>yearly</changefreq>
     <priority>0.3</priority>

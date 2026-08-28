@@ -17,6 +17,7 @@ set -euo pipefail
 
 DOMAIN="${DOMAIN:-pervichkaru.ru}"
 ROOT="${ROOT:-/var/www/pervichka}"
+MINIAPP_PORT="${MINIAPP_PORT:-8790}"   # то же, что у miniapp.js по умолчанию
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 CONF="/etc/nginx/sites-available/$DOMAIN"
 
@@ -49,10 +50,13 @@ echo "Страница разложена: $(ls -1 "$ROOT" | wc -l) файлов
 # выкладываем сайт без них.
 
 if node "$SRC/build-legal.js" "$ROOT" >/dev/null 2>&1; then
-  echo "Оферта и политика собраны."
+  # Политику по решению владельца пока не публикуем. Генератор остаётся:
+  # вернуть страницу — это убрать одну строку здесь и одну в подвале.
+  rm -f "$ROOT/politika.html"
+  echo "Оферта собрана."
 else
   echo
-  echo "⚠️  Оферта и политика НЕ собраны — не заполнены реквизиты."
+  echo "⚠️  Оферта НЕ собрана — не заполнены реквизиты."
   node "$SRC/build-legal.js" "$ROOT" 2>&1 | sed 's/^/    /' || true
   echo "    Заполните их в lib/legal.js → CONFIG и запустите этот скрипт снова."
   #
@@ -61,7 +65,7 @@ else
   # «страница не найдена» и уходит, решив, что тут всё несерьёзно.
   #
   sed -i -E '/href="\/(oferta|politika)\.html"/d' "$ROOT/index.html"
-  echo "    Ссылки на них временно убраны из подвала опубликованной страницы."
+  echo "    Ссылка на неё временно убрана из подвала опубликованной страницы."
   echo
 fi
 
@@ -86,6 +90,27 @@ server {
     location /.well-known/acme-challenge/ { root /var/www/html; }
 
     location / { try_files \$uri \$uri/ =404; }
+
+    # Мини-приложение на том же домене.
+    #
+    # Само оно живёт в miniapp.js на порту $MINIAPP_PORT и отдаёт свои файлы с
+    # корня, поэтому косая черта в конце proxy_pass обязательна: она срезает
+    # префикс /app/. Без неё приложение искало бы свои же файлы по
+    # /app/app/app.css и показывало бы пустой экран.
+    #
+    # Запросы к API идут отдельной веткой: страница обращается к ним по
+    # адресу /api/..., без префикса.
+    location /app/ {
+        proxy_pass http://127.0.0.1:$MINIAPP_PORT/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+    location /api/ {
+        proxy_pass http://127.0.0.1:$MINIAPP_PORT/api/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        client_max_body_size 4m;      # выписка и снимки счетов
+    }
 
     # Картинки и снимки экрана не меняются — пусть браузер их запоминает.
     location ~* \.(webp|png|jpg|svg|ico|woff2)\$ {
