@@ -14,6 +14,9 @@
 
 const tg = window.Telegram && window.Telegram.WebApp;
 
+// Момент запуска: от него считается, сколько заставке осталось висеть.
+const START = performance.now();
+
 // ---------- мелкие помощники ----------
 
 /** h('div', {class:'x'}, 'текст', child) → элемент. */
@@ -219,6 +222,26 @@ async function render() {
   } catch (e) {
     app.replaceChildren(errorScreen(e));
   }
+  dropSplash();
+}
+
+/**
+ * Убрать заставку, когда первый экран отрисован.
+ *
+ * Два условия сразу: экран готов И заставка показалась целиком. Только по
+ * готовности данных нельзя — на быстрой сети знак мигнёт и пропадёт, это
+ * выглядит дёрганием, а не оформлением. Только по времени тоже нельзя —
+ * на медленной сети человек досмотрит анимацию и упрётся в пустой экран.
+ *
+ * Отсчёт ведём от загрузки страницы, а не от вызова: к этому моменту
+ * анимация уже идёт, и ждать надо ровно остаток.
+ */
+const SPLASH_MS = 1220;              // столько длится анимация вместе с уходом
+function dropSplash() {
+  const el = document.getElementById('splash');
+  if (!el || el.classList.contains('gone')) return;
+  const left = Math.max(0, SPLASH_MS - (performance.now() - START));
+  setTimeout(() => el.classList.add('gone'), left);
 }
 
 function skeleton() {
@@ -3251,6 +3274,7 @@ function start() {
     app.replaceChildren(empty('warn', 'Откройте из Telegram',
       'Это приложение работает внутри Telegram: оттуда оно получает, кто вы.'));
     tabsBox.hidden = true;
+    dropSplash();            // иначе заставка останется висеть поверх ответа
     return;
   }
 
@@ -3265,6 +3289,7 @@ function start() {
     app.replaceChildren(empty('warn', 'Не удалось вас опознать',
       'Закройте приложение и откройте его заново из чата с ботом.'));
     tabsBox.hidden = true;
+    dropSplash();            // иначе заставка останется висеть поверх ответа
     return;
   }
 

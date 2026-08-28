@@ -765,10 +765,100 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   50%      { box-shadow: 0 0 0 10px color-mix(in srgb, var(--money-out) 0%, transparent); }
 }
 
+/* ---------- заставка при входе ---------- */
+
+/*
+ * Что здесь происходит по кадрам:
+ *
+ *   0—260 мс   лист поднимается и проявляется;
+ *   140—640 мс знак рубля дописывается обводкой, будто его выписывают;
+ *   200—460 мс загибается угол листа;
+ *   340 мс     проступает название;
+ *   уход       весь знак чуть подаётся вперёд и растворяется.
+ *
+ * Цвета взяты у аватара бота (brand/avatar-blue.svg), а не подобраны
+ * заново: человек видит один и тот же знак в списке чатов и при входе, и
+ * это единственное, что делает заставку узнаванием, а не задержкой.
+ *
+ * Фон свой, тёмный, независимо от темы Telegram. Заставка живёт полсекунды,
+ * и мигать белым в тёмной теме — худшее, что она может сделать.
+ */
+#splash {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  background: radial-gradient(120% 90% at 50% 40%, #1E2E4C 0%, #16233A 62%, #101A2C 100%);
+  animation: splash-out 320ms var(--ease) 900ms both;
+  /*
+   * Нажатия сквозь заставку проходят насквозь.
+   *
+   * Это не мелочь: слой лежит поверх всего экрана целую секунду, и без
+   * этой строки он съедает первые касания. Человек открывает приложение,
+   * тычет в «Выписать счёт», ничего не происходит — и он решает, что оно
+   * зависло. Поймано прогоном жестов: смахивание переставало работать.
+   */
+  pointer-events: none;
+}
+/* И совсем убираем из потока после ухода — прозрачный слой поверх экрана
+   не нужен ни браузеру, ни программе чтения с экрана. */
+#splash.gone { display: none; }
+
+#splash .sheet {
+  fill: #F5F8FF;
+  transform-origin: 50% 50%;
+  animation: sheet-in 260ms var(--ease) both;
+}
+#splash .fold {
+  fill: #4C9AFF;
+  transform-origin: 128px 24px;
+  animation: fold-in 260ms var(--ease) 200ms both;
+}
+#splash .ruble { stroke: #4C9AFF; }
+/* Длина обводки заведомо больше самой линии: точное значение зависит от
+   браузера, а всё, что нам нужно, — чтобы штрих сначала был спрятан. */
+#splash .r1 { stroke-dasharray: 200; animation: draw 380ms var(--ease) 140ms both; }
+#splash .r2 { stroke-dasharray: 40;  animation: draw 200ms var(--ease) 440ms both; }
+
+#splash .splash-name {
+  font: 600 17px/1 var(--font);
+  letter-spacing: .04em;
+  color: #C9D8F5;
+  animation: name-in 300ms var(--ease) 340ms both;
+}
+
+@keyframes sheet-in {
+  from { opacity: 0; transform: translateY(10px) scale(.94); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes fold-in {
+  from { opacity: 0; transform: scale(.2); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes draw {
+  from { stroke-dashoffset: 200; }
+  to   { stroke-dashoffset: 0; }
+}
+@keyframes name-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes splash-out {
+  from { opacity: 1; transform: scale(1); }
+  to   { opacity: 0; transform: scale(1.06); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: .01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: .01ms !important;
   }
+  /* Человеку, который просил не двигать картинку, заставка не нужна вовсе:
+     без движения это просто лишняя секунда тёмного экрана. */
+  #splash { display: none; }
 }

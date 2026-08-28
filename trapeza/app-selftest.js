@@ -132,6 +132,34 @@ const ok = (c, m, extra) => {
     await page.waitForTimeout(260);
   }
 
+  console.log('\n── заставка при входе ──');
+  {
+    /*
+     * Заставка лежит поверх всего экрана целую секунду. Если она ловит
+     * касания, человек открывает приложение, тычет в кнопку, ничего не
+     * происходит — и решает, что оно зависло. Проверка ровно об этом:
+     * под заставкой должно нажиматься то, что под ней нарисовано.
+     */
+    const splash = page.locator('#splash');
+    ok(await splash.count() === 1, 'заставка на странице есть');
+    const through = await page.evaluate(() => {
+      const s = document.getElementById('splash');
+      if (!s || getComputedStyle(s).display === 'none') return 'ушла';
+      const r = s.getBoundingClientRect();
+      const el = document.elementFromPoint(r.width / 2, r.height / 2);
+      return el && el.closest('#splash') ? 'ловит нажатия' : 'пропускает';
+    });
+    ok(through !== 'ловит нажатия', 'нажатия проходят сквозь неё', through);
+
+    // И она обязана уйти сама: заставка, оставшаяся на экране, — это
+    // приложение, которое не открылось.
+    await page.waitForFunction(() => {
+      const s = document.getElementById('splash');
+      return !s || s.classList.contains('gone');
+    }, null, { timeout: 5000 });
+    ok(true, 'и уходит сама, когда экран готов');
+  }
+
   console.log('\n── смахивание ──');
   await swipe(-120, 0);
   ok(await shiftOf() === -92, 'смахнули влево — строка открылась на ширину кнопки', await shiftOf());
