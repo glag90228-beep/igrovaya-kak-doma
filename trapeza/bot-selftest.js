@@ -2386,25 +2386,31 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
      * иначе бот говорит «напомню 25-го» и молчит до следующего месяца.
      * Отмечаем только когда день уже прошёл.
      */
-    const cpAhead = bdbR.createCp(uid, { name: 'ООО «Впереди»', kind: 'customer', opening_date: '2026-01-01' });
-    const today = new Date().getDate();
-    const ahead = Math.min(28, today + 1);
-    await tap(`rt.day:rent:${cpAhead}:${ahead}`);
-    const ruleAhead = recur.list(uid).find((r) => r.cp_id === cpAhead);
-    ok(ruleAhead && recur.isDue(ruleAhead, new Date(new Date().getFullYear(), new Date().getMonth(), ahead)),
-      'напоминание на будущее число сработает в этом же месяце',
-      ruleAhead && `last_offer=«${ruleAhead.last_offer}»`);
+    /*
+     * Само пороговое правило проверяем на явных датах, а не на сегодняшнем
+     * числе. Первая версия этого теста брала «завтра» как today + 1 и
+     * ломалась сама собой 28-го: дни 29–31 наступают не каждый месяц,
+     * normalizeDay режет их до 28, и «завтра» оказывалось сегодня.
+     */
+    const aug = (day) => new Date(2026, 7, day);
+    ok(recur.dayPassed(10, aug(15)) === true, 'день уже прошёл — месяц считаем отработанным');
+    ok(recur.dayPassed(20, aug(15)) === false, 'день ещё впереди — месяц оставляем открытым');
+    ok(recur.dayPassed(15, aug(15)) === true,
+      'в свой же день заново не напоминаем — человек как раз его и настраивает');
 
+    // А через мастер проверяем, что эта развилка вообще доходит до правила.
     const cpPast = bdbR.createCp(uid, { name: 'ООО «Позади»', kind: 'customer', opening_date: '2026-01-01' });
     await tap(`rt.day:rent:${cpPast}:1`);
+    // Первое число уже наступило в любой день месяца, поэтому здесь развилка
+    // всегда даёт «месяц отработан» — и это не зависит от того, когда прогон.
     const rulePast = recur.list(uid).find((r) => r.cp_id === cpPast);
-    ok(rulePast && (today < 1 || !recur.isDue(rulePast)),
-      'а на уже прошедшее число — только в следующем месяце',
+    ok(rulePast && rulePast.last_offer === recur.monthKey(),
+      'на уже прошедшее число месяц сразу помечен отработанным',
       rulePast && `last_offer=«${rulePast.last_offer}»`);
-    for (const r of [cpAhead, cpPast]) {
-      const x = recur.list(uid).find((v) => v.cp_id === r);
-      if (x) recur.off(uid, x.id);
-    }
+    ok(rulePast && !recur.isDue(rulePast),
+      'то есть напомним только в следующем месяце');
+    const x = recur.list(uid).find((v) => v.cp_id === cpPast);
+    if (x) recur.off(uid, x.id);
 
     /*
      * Наступил день. Главное здесь — что бот пришёл с предложением, а

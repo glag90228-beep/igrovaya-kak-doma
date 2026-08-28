@@ -61,9 +61,20 @@ const CSS = `
   @media print { body { background:#fff; } .wrap { padding:0; } }
 `;
 
-const page = (title, body) => `<!doctype html><html lang="ru"><head>
+/*
+ * Описание страницы обязательно, и не ради красоты.
+ *
+ * Без метатега description Яндекс собирает подпись в выдаче сам — из первых
+ * попавшихся слов документа. У оферты это «1. Термины и определения», у
+ * политики — «Настоящая Политика разработана в соответствии с...». Человек,
+ * ищущий, кому он платит и что с его данными, по такой подписи не поймёт
+ * ничего и не нажмёт. Вебмастер справедливо считает это недоработкой.
+ */
+const page = (title, description, body) => `<!doctype html><html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(title)}</title><meta name="robots" content="index,follow">
+<title>${esc(title)}</title>
+<meta name="description" content="${esc(description)}">
+<meta name="robots" content="index,follow">
 <style>${CSS}</style></head><body><div class="wrap">${body}</div></body></html>`;
 
 const today = () => {
@@ -161,7 +172,12 @@ function buildPolicyHtml(c = CONFIG) {
       Документ подготовлен как типовой. Перед публикацией его стоит показать юристу:
       формулировки под конкретную деятельность может потребоваться уточнить.
     </div>`;
-  return page(`Политика обработки персональных данных — ${c.product}`, body);
+  return page(
+    `Политика обработки персональных данных — ${c.product}`,
+    `Какие данные собирает «${c.product}», зачем, сколько хранит и как их удалить. `
+    + `Оператор — ${c.operator}, ИНН ${c.inn}.`,
+    body,
+  );
 }
 
 // ─────────────────────────── оферта ───────────────────────────
@@ -239,7 +255,12 @@ function buildOfertaHtml(c = CONFIG) {
       Документ подготовлен как типовой. Перед публикацией его стоит показать юристу:
       ограничение ответственности и условия платных тарифов лучше выверить.
     </div>`;
-  return page(`Публичная оферта — ${c.product}`, body);
+  return page(
+    `Публичная оферта — ${c.product}`,
+    `Условия подписки на «${c.product}»: что входит, сколько стоит, как оплатить `
+    + `и как вернуть деньги. Оферта от ${c.operator}, ИНН ${c.inn}.`,
+    body,
+  );
 }
 
 module.exports = { CONFIG, TODO, missing, buildPolicyHtml, buildOfertaHtml };
