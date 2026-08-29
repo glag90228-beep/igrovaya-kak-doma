@@ -2366,10 +2366,28 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const recur = require('./lib/recurring');
     const bizT = require('./lib/biz-types');
 
-    ok(bizT.routineOf('rent').type === 'sch', 'у аренды повторяется счёт');
-    ok(bizT.routineOf('services').type === 'usl', 'у обслуживания — акт');
-    ok(bizT.routineOf('contractor') === null,
-      'у подряда ничего: объём каждый раз разный, лишний документ дороже');
+    /*
+     * Напоминание есть у каждого дела, про которое мы хоть что-то знаем.
+     * Раньше подряд, торговля и производство были без него — из ошибочного
+     * рассуждения, будто напоминание выпишет лишний документ. Оно не
+     * выписывает: правило заводится пустым, кнопка ведёт в мастер.
+     */
+    ok(bizT.routineOf('rent').type === 'sch' && bizT.routineOf('rent').day === 1,
+      'аренда: счёт 1-го числа, вперёд за наступающий месяц');
+    ok(bizT.routineOf('services').type === 'usl', 'обслуживание: акт');
+    ok(bizT.routineOf('contractor').type === 'usl', 'подряд: акт за выполненные работы');
+    ok(bizT.routineOf('trade').type === 'upd', 'торговля: УПД по отгрузкам');
+    ok(bizT.routineOf('manufacturing').type === 'upd', 'производство: УПД по отгрузкам');
+    for (const k of ['services', 'contractor', 'trade', 'manufacturing']) {
+      ok(bizT.routineOf(k).day === 25, `${k}: закрывающий документ 25-го`, bizT.routineOf(k).day);
+    }
+    ok(bizT.routineOf('other') === null,
+      'у «другого» ничего: про это дело мы не знаем ничего, советовать нечего');
+    // Тип документа обязан быть настоящим, иначе напоминание приведёт в никуда.
+    for (const k of ['rent', 'services', 'contractor', 'trade', 'manufacturing']) {
+      ok(Boolean(require('./lib/doc-service').ITEM_DOCS[bizT.routineOf(k).type]),
+        `${k}: тип документа существует`, bizT.routineOf(k).type);
+    }
 
     const uid = fxUserId();
     const org = bdbR.getDefaultOrg(uid);
@@ -2948,6 +2966,73 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const alienRow = require('./db').db.prepare('SELECT last_offer FROM recurring WHERE id = ?').get(alien);
     ok(alienRow.last_offer === '2000-01',
       'чужое напоминание нельзя пропустить за владельца', `last_offer=«${alienRow.last_offer}»`);
+  }
+
+  console.log('\n── напоминания подряду, торговле и производству ──');
+  {
+    /*
+     * Три вида дела, у которых напоминания раньше не было. Проходим весь
+     * путь до конца, и главное здесь то же, что у аренды: в свой день бот
+     * приходит с предложением, а документ сам не выписывается. У торговли и
+     * производства это УПД — у него свой мастер, со статусом документа.
+     */
+    const rec = require('./lib/recurring');
+    const bdbN = require('./lib/bot-db');
+    const { db: rawN } = require('./db');
+    const { runDaily } = require('./bot.js');
+    const uid = fxUserId();
+
+    for (const [biz, docType, word] of [
+      ['contractor', 'usl', 'акт за выполненные работы'],
+      ['trade', 'upd', 'УПД по отгрузкам'],
+      ['manufacturing', 'upd', 'УПД по отгрузкам'],
+    ]) {
+      for (const r of rec.list(uid)) rec.off(uid, r.id);
+      const cpN = bdbN.createCp(uid, {
+        name: `ООО «${biz}»`, kind: 'customer', opening_date: '2026-01-01',
+      });
+
+      sent.length = 0;
+      // eslint-disable-next-line no-await-in-loop
+      await tap(`biz.set:${biz}`);
+      ok(norm(sent.map((m) => m.text || '').join(' ')).includes(word),
+        `${biz}: после выбора дела предложено напоминание про «${word}»`);
+
+      const docsWas = bdbN.listDocs(uid, 300).length;
+      // eslint-disable-next-line no-await-in-loop
+      await tap(`rt.new:${biz}`);
+      // eslint-disable-next-line no-await-in-loop
+      await tap(`rt.cp:${biz}:${cpN}`);
+      // eslint-disable-next-line no-await-in-loop
+      await tap(`rt.day:${biz}:${cpN}:25`);
+      const rule = rec.list(uid).find((r) => r.cp_id === cpN);
+      ok(rule && rule.type === docType && rule.day === 25,
+        `${biz}: правило заведено на ${docType} 25-го`, rule && `${rule.type}/${rule.day}`);
+      ok(rule && rule.items.length === 0, `${biz}: без позиций — их назовёт человек`);
+
+      // Наступил день. Документ обязан НЕ выписаться сам.
+      rawN.prepare("UPDATE recurring SET last_offer = '2000-01', day = ? WHERE id = ?")
+        .run(new Date().getDate(), rule.id);
+      sent.length = 0;
+      // eslint-disable-next-line no-await-in-loop
+      await runDaily(tg);
+      ok(bdbN.listDocs(uid, 300).length === docsWas,
+        `${biz}: в свой день ничего не выписалось само`,
+        `${docsWas} → ${bdbN.listDocs(uid, 300).length}`);
+      // Ищем кнопку во всех сообщениях обхода, а не только в последнем:
+      // тот же обход шлёт ещё и сигналы о просрочке, и предложение может
+      // оказаться не крайним.
+      const go = sent.flatMap((m) => (m.kb || []).flat())
+        .find((b) => /Заполнить и выписать/.test(b.text));
+      ok(Boolean(go), `${biz}: пришло предложение с кнопкой`);
+
+      // Кнопка ведёт в живой мастер, а не в никуда.
+      // eslint-disable-next-line no-await-in-loop
+      if (go) await tap(go.callback_data);
+      ok(!/не найден|Что-то пошло не так/i.test(last()),
+        `${biz}: кнопка открывает мастер`, norm(last()).slice(0, 60));
+    }
+    for (const r of rec.list(uid)) rec.off(uid, r.id);
   }
 
   console.log('\n── сигнал о просрочке ──');
