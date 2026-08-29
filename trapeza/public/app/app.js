@@ -236,7 +236,9 @@ async function render() {
  * Отсчёт ведём от загрузки страницы, а не от вызова: к этому моменту
  * анимация уже идёт, и ждать надо ровно остаток.
  */
-const SPLASH_MS = 1220;              // столько длится анимация вместе с уходом
+// Перечисление (4 × 95 мс) + знак (700 мс) + уход (320 мс). Считается тем же
+// способом, что и задержки в app.css: если поменяете --w там, поправьте здесь.
+const SPLASH_MS = 1400;
 function dropSplash() {
   const el = document.getElementById('splash');
   if (!el || el.classList.contains('gone')) return;

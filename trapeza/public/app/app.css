@@ -770,11 +770,16 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 /*
  * Что здесь происходит по кадрам:
  *
- *   0—260 мс   лист поднимается и проявляется;
- *   140—640 мс знак рубля дописывается обводкой, будто его выписывают;
- *   200—460 мс загибается угол листа;
- *   340 мс     проступает название;
- *   уход       весь знак чуть подаётся вперёд и растворяется.
+ *   0—380 мс   резко сменяются четыре слова: акты, счета, УПД, договоры;
+ *   380—600 мс лист поднимается и проявляется;
+ *   500—880 мс знак рубля дописывается обводкой, будто его выписывают;
+ *   540—760 мс загибается угол листа;
+ *   680 мс     проступает название;
+ *   1080 мс    весь знак чуть подаётся вперёд и растворяется.
+ *
+ * Всё вместе — около 1,4 секунды. Это верхняя граница: заставку человек
+ * видит каждый раз и ждать её не хочет. Если покажется долгой, режется в
+ * одном месте — --w ниже.
  *
  * Цвета взяты у аватара бота (brand/avatar-blue.svg), а не подобраны
  * заново: человек видит один и тот же знак в списке чатов и при входе, и
@@ -784,6 +789,11 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
  * и мигать белым в тёмной теме — худшее, что она может сделать.
  */
 #splash {
+  /* Сколько длится показ одного слова и всё перечисление целиком.
+     Меняется только здесь: остальные задержки считаются от --words. */
+  --w: 95ms;
+  --words: calc(var(--w) * 4);
+
   position: fixed;
   inset: 0;
   z-index: 200;
@@ -793,7 +803,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   justify-content: center;
   gap: 18px;
   background: radial-gradient(120% 90% at 50% 40%, #1E2E4C 0%, #16233A 62%, #101A2C 100%);
-  animation: splash-out 320ms var(--ease) 900ms both;
+  animation: splash-out 320ms var(--ease) calc(var(--words) + 700ms) both;
   /*
    * Нажатия сквозь заставку проходят насквозь.
    *
@@ -808,29 +818,68 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
    не нужен ни браузеру, ни программе чтения с экрана. */
 #splash.gone { display: none; }
 
+/*
+ * Перечисление документов.
+ *
+ * Слова лежат друг на друге в одной точке и сменяются мгновенно —
+ * steps(1) вместо плавности. Плавный переход здесь читался бы как
+ * «загрузка», а нужно противоположное: четыре быстрых утверждения о том,
+ * что продукт умеет.
+ *
+ * Слой выведен из потока и растянут на весь экран: место под слова не
+ * резервируется вовсе. Иначе они стояли бы над знаком, а в момент, когда
+ * перечисление кончится, вся картинка подпрыгивала бы вверх на их высоту.
+ * Так последнее слово уступает место листу ровно там же, где стояло.
+ */
+#splash .splash-words {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+#splash .splash-words b {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font: 700 22px/1 var(--font);
+  letter-spacing: -.01em;
+  color: #E7EEFC;
+  opacity: 0;
+  animation: word var(--w) steps(1, end) forwards;
+}
+#splash .splash-words b:nth-child(2) { animation-delay: var(--w); color: #9FC4FF; }
+#splash .splash-words b:nth-child(3) { animation-delay: calc(var(--w) * 2); }
+#splash .splash-words b:nth-child(4) { animation-delay: calc(var(--w) * 3); color: #9FC4FF; }
+
 #splash .sheet {
   fill: #F5F8FF;
   transform-origin: 50% 50%;
-  animation: sheet-in 260ms var(--ease) both;
+  animation: sheet-in 220ms var(--ease) var(--words) both;
 }
 #splash .fold {
   fill: #4C9AFF;
   transform-origin: 128px 24px;
-  animation: fold-in 260ms var(--ease) 200ms both;
+  animation: fold-in 220ms var(--ease) calc(var(--words) + 160ms) both;
 }
 #splash .ruble { stroke: #4C9AFF; }
 /* Длина обводки заведомо больше самой линии: точное значение зависит от
    браузера, а всё, что нам нужно, — чтобы штрих сначала был спрятан. */
-#splash .r1 { stroke-dasharray: 200; animation: draw 380ms var(--ease) 140ms both; }
-#splash .r2 { stroke-dasharray: 40;  animation: draw 200ms var(--ease) 440ms both; }
+#splash .r1 { stroke-dasharray: 200; animation: draw 320ms var(--ease) calc(var(--words) + 120ms) both; }
+#splash .r2 { stroke-dasharray: 40;  animation: draw 180ms var(--ease) calc(var(--words) + 380ms) both; }
 
 #splash .splash-name {
   font: 600 17px/1 var(--font);
   letter-spacing: .04em;
   color: #C9D8F5;
-  animation: name-in 300ms var(--ease) 340ms both;
+  animation: name-in 260ms var(--ease) calc(var(--words) + 300ms) both;
 }
 
+/* Слово живёт свой отрезок и исчезает мгновенно: steps(1) держит первое
+   значение до самого конца, а потом разом отдаёт второе. */
+@keyframes word {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
 @keyframes sheet-in {
   from { opacity: 0; transform: translateY(10px) scale(.94); }
   to   { opacity: 1; transform: none; }
