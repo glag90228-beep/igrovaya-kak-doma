@@ -635,10 +635,36 @@ async function genAktSverki(tg, chatId, user, cpId, from, to) {
     caption: `Акт сверки с <b>${esc(p.cp.name)}</b> за период ${ru(p.from)}—${ru(p.to)}.\n`
       + `Входящее сальдо ${formatRub(Math.abs(p.opening))}, исходящее ${formatRub(Math.abs(p.closing))}.`,
   });
-  bdb.saveDoc(user.id, {
+  const docId = bdb.saveDoc(user.id, {
     orgId: org.id, cpId, type: 'akt', number: String(seq), seq, date: todayISO(),
     total: Math.abs(p.closing), payload: { ops: p.ops.length, from: p.from, to: p.to },
   });
+
+  /*
+   * Предлагаем отправить сразу. Акт сверки нужен не себе, а контрагенту:
+   * искать его потом в журнале — лишний шаг ровно там, где человек уже
+   * держит документ в руках.
+   *
+   * Отправляем по нажатию, а не сами: письмо уходит другой организации от
+   * имени человека, и решение отправить — его.
+   */
+  const cp = bdb.getCp(user.id, cpId);
+  const rows = [];
+  if (mailbox.resolve(user.id).ok) {
+    rows.push([{
+      text: cp && cp.email ? `✉️ Отправить на ${cp.email}`.slice(0, 60) : '✉️ Отправить контрагенту',
+      data: `doc.mail:${docId}`,
+    }]);
+  } else {
+    rows.push([{ text: '✉️ Подключить почту и отправить', data: 'mb' }]);
+  }
+  rows.push([{ text: `👤 ${cp ? cp.name : 'Клиент'}`.slice(0, 60), data: `cp:${cpId}` }]);
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId,
+    'Отправить акт контрагенту на сверку?\n\n'
+    + '<i>В письме будет просьба сверить и ответить: подписать, если сходится, '
+    + 'или назвать строку, если нет.</i>',
+    keyboard(rows));
 }
 
 /**
@@ -1121,7 +1147,7 @@ async function showDoc(tg, chatId, user, docId) {
   const items = (d.payload.items || [])
     .map((it, i) => `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n');
   const rows = [];
-  if (d.type !== 'akt') rows.push([{ text: '📄 Прислать файл заново', data: `doc.get:${d.id}` }]);
+  rows.push([{ text: '📄 Прислать файл заново', data: `doc.get:${d.id}` }]);
   const payable = ['sch', 'usl', 'upd', 'torg12'].includes(d.type) && d.total > 0;
   if (payable) {
     rows.push([d.paid_at
@@ -1131,7 +1157,10 @@ async function showDoc(tg, chatId, user, docId) {
   // Отмену проводки надо уметь отменить. Без этой кнопки документ навсегда
   // выпадал из долга, продолжая числиться в «Ждут оплаты».
   if (d.no_debt) rows.push([{ text: '↩️ Вернуть в долг', data: `doc.debt:${d.id}` }]);
-  if (mailbox.resolve(user.id).ok && d.type !== 'akt') {
+  // Акт сверки отправляют почтой чаще всех остальных: он нужен не себе, а
+  // контрагенту — согласиться или возразить. Раньше кнопки у него не было,
+  // потому что он не умел пересобираться; теперь умеет.
+  if (mailbox.resolve(user.id).ok) {
     rows.push([{
       text: cp && cp.email ? `✉️ Отправить на ${cp.email}`.slice(0, 60) : '✉️ Отправить на почту',
       data: `doc.mail:${d.id}`,
@@ -1498,6 +1527,18 @@ function letterFor(doc, org, cp) {
   ];
   if (doc.type === 'sch') {
     lines.push('', 'В счёте есть QR-код: оплатить можно, наведя камеру в приложении банка.');
+  }
+  /*
+   * У акта сверки письмо другое по смыслу. Остальные документы отправляют,
+   * чтобы человек их получил; акт сверки — чтобы он с ним согласился или
+   * возразил. Поэтому прямо просим сверить и ответить: без этой просьбы
+   * акт кладут в папку, и расхождение всплывает через полгода.
+   */
+  if (doc.type === 'akt') {
+    lines.push('',
+      'Просьба сверить данные со своей стороны. Если расхождений нет — подпишите '
+      + 'и пришлите скан в ответ. Если что-то не сходится, напишите, по какой '
+      + 'строке, и я проверю у себя.');
   }
   lines.push('', 'С уважением,', org.name || org.full_name || '');
   return lines.join('\n');

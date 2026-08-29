@@ -1912,6 +1912,44 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(got.rcpt.includes('buh@bezadres.ru'), 'письмо ушло на указанный адрес', got.rcpt.join());
     ok(bdbR.getCp(uidM, cpNoMail).email === 'buh@bezadres.ru', 'адрес запомнился в карточке');
 
+    /*
+     * Акт сверки контрагенту.
+     *
+     * Его отправляют почтой чаще всех остальных документов: сверка нужна не
+     * себе, а другой стороне — согласиться или возразить. Кнопки у него
+     * долго не было, потому что акт не хранится файлом и не умел
+     * пересобираться: он строится из журнала операций, а не из позиций.
+     */
+    got.rcpt.length = 0; got.data = '';
+    const cpAkt = bdbR.createCp(uidM, {
+      name: 'ООО «Сверимся»', kind: 'customer', opening_date: '2026-01-01', email: 'buh@sverim.ru',
+    });
+    bdbR.addOp(uidM, cpAkt, { date: '2026-07-01', kind: 'Приход', doc: 'Акт 7', credit: 44000 });
+    bdbR.addOp(uidM, cpAkt, { date: '2026-07-20', kind: 'Оплата', doc: 'п/п 3', debit: 14000 });
+
+    sent.length = 0;
+    await tap(`d.akt:${cpAkt}`);
+    await tap(`akt.p:${cpAkt}:all`);
+    ok(files.some((f) => /Акт_сверки/.test(f.filename)), 'акт сверки выписан файлом',
+      (files[files.length - 1] || {}).filename);
+    const offer = button('Отправить на buh@sverim.ru');
+    ok(Boolean(offer), 'сразу после выписки предложено отправить контрагенту', offer);
+
+    await tap(offer);
+    ok(last().includes('Отправил'), 'акт сверки ушёл письмом', last().slice(0, 60));
+    ok(got.rcpt.includes('buh@sverim.ru'), 'на адрес контрагента', got.rcpt.join());
+    ok(/Content-Disposition: attachment/.test(got.data), 'файл приложен');
+    ok(/xlsx/i.test(got.data), 'и это Excel, а не пустое письмо');
+    /*
+     * В письме должна быть просьба сверить. Без неё акт кладут в папку, и
+     * расхождение всплывает через полгода — то есть документ отправлен, а
+     * работа не сделана.
+     */
+    const body = Buffer.from((/\r\n\r\n([A-Za-z0-9+/=\r\n]+)/.exec(got.data) || [, ''])[1] || '', 'base64')
+      .toString('utf8');
+    ok(/сверить/i.test(body) || /сверить/i.test(got.data),
+      'в письме есть просьба сверить и ответить');
+
     await tap('mb.del');
     ok(!mailbox.has(uidM), 'почту можно отключить');
 

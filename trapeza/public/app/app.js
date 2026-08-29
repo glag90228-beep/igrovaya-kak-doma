@@ -743,15 +743,26 @@ screens.doc = async function docScreen({ id }) {
       }),
     }, 'Прислать файл заново')));
 
-  // Отправка клиенту на почту — только если она настроена на сервере.
+  /*
+   * Отправка клиенту на почту — если она настроена на сервере.
+   *
+   * Акт сверки отсюда исключался, потому что не умел пересобираться: он
+   * строится из журнала операций, а не из позиций. Теперь умеет, а
+   * отправляют его чаще прочего — сверка нужна не себе, а контрагенту.
+   */
   const st = cache.features ? cache : await api('GET', '/api/state');
-  if (st.features && st.features.mail && d.type !== 'akt') {
+  if (st.features && st.features.mail) {
     const cp = cpOf || {};
     const mailField = field('email', 'Почта получателя', cp.email, {
       type: 'email', placeholder: 'buh@company.ru',
       hint: cp.email ? 'Сохранена у контрагента' : 'Запомню её для этого контрагента',
     });
     box.append(h('div', { class: 'section-title', text: 'Отправить клиенту' }));
+    if (d.type === 'akt') {
+      box.append(h('p', { class: 'small muted', style: 'margin:0 18px 8px',
+        text: 'В письме будет просьба сверить и ответить: подписать, если сходится, '
+          + 'или назвать строку, если нет.' }));
+    }
     box.append(h('div', { class: 'card' }, mailField));
     box.append(h('div', { class: 'btn-wrap' }, h('button', {
       class: 'btn secondary',

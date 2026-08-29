@@ -25,6 +25,8 @@ const { buildPlatyozhkaHtml } = require('./platyozhka');
 const { buildUpdHtml } = require('./upd');
 const { buildTorg12Html } = require('./torg12');
 const { buildDogovorHtml } = require('./dogovor');
+// Акт сверки — Excel, а не HTML: это журнал, его дополняют и считают в нём.
+const { buildAkt } = require('./xlsx-akt');
 
 /** Документы, которые состоят из позиций «наименование × количество × цена». */
 const ITEM_DOCS = {
@@ -229,12 +231,51 @@ async function rebuildDocument(userId, docId) {
   const saved = bdb.getDoc(userId, Number(docId));
   if (!saved) return fail('notfound', 'Документ не найден.');
 
+  const org0 = bdb.getOrg(userId, saved.org_id) || bdb.getDefaultOrg(userId);
+  const cp0 = bdb.getCp(userId, saved.cp_id);
+  if (!org0 || !cp0) return fail('data', 'Не хватает данных для сборки: проверьте организацию и контрагента.');
+
+  /*
+   * Акт сверки собирается иначе всех остальных: не из позиций документа, а
+   * из журнала операций за период. Позиций у него нет и не было, поэтому он
+   * долго не умел пересобираться — а значит, и уходить почтой, хотя именно
+   * его чаще всего и отправляют: сверка нужна не себе, а контрагенту.
+   *
+   * Период берём тот, за который акт выписывали (он записан в payload).
+   * Пересчёт по свежему журналу — намеренно: если после выписки внесли
+   * оплату, контрагент должен увидеть её, а не устаревшую бумагу.
+   */
+  if (saved.type === 'akt') {
+    const p = bdb.cpForPeriod(userId, saved.cp_id, saved.payload.from || '', saved.payload.to || '');
+    if (!p) return fail('data', 'Не удалось собрать акт: проверьте контрагента.');
+    const buffer = Buffer.from(await buildAkt({
+      org: {
+        brand: org0.name, org_short: org0.name, org_full: org0.full_name || org0.name,
+        org_inn: org0.inn, signer: org0.signer,
+      },
+      cp: p.view,
+      ops: p.ops,
+    }));
+    return {
+      ok: true,
+      title: 'Акт сверки',
+      doc: saved,
+      total: Math.abs(p.closing),
+      period: { from: p.from, to: p.to },
+      file: {
+        filename: `Акт_сверки_${safeName(cp0.name)}.xlsx`,
+        buffer,
+        mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        pdf: false,
+      },
+    };
+  }
+
   const kind = ALL_DOCS[saved.type];
   if (!kind) return fail('type', 'Этот документ пересобрать нельзя.');
 
-  const org = bdb.getOrg(userId, saved.org_id) || bdb.getDefaultOrg(userId);
-  const cp = bdb.getCp(userId, saved.cp_id);
-  if (!org || !cp) return fail('data', 'Не хватает данных для сборки: проверьте организацию и контрагента.');
+  const org = org0;
+  const cp = cp0;
 
   const doc = { number: saved.number, date: saved.date, ...saved.payload };
   const file = await renderFile(
