@@ -151,6 +151,28 @@ const ok = (c, m, extra) => {
     });
     ok(through !== 'ловит нажатия', 'нажатия проходят сквозь неё', through);
 
+    /*
+     * Перечисление обязано погаснуть целиком до того, как появится знак.
+     * На iPhone последнее слово оставалось висеть поверх листа: WebKit при
+     * steps() вместе с forwards держит значение последнего шага, а не
+     * конечное. Проверяем не «как отработало каждое слово», а результат —
+     * виден ли хоть один текст в момент, когда его быть уже не должно.
+     */
+    const wordsLeft = await page.evaluate(() => {
+      const box = document.querySelector('#splash .splash-words');
+      if (!box) return 'слоя нет';
+      // Перематываем на середину показа знака — слова к этому моменту ушли.
+      for (const a of document.getAnimations()) { a.pause(); a.currentTime = 700; }
+      const seen = [...box.querySelectorAll('b')]
+        .filter((b) => Number(getComputedStyle(b).opacity) > 0.01
+          && getComputedStyle(b).visibility !== 'hidden'
+          && getComputedStyle(box).visibility !== 'hidden')
+        .map((b) => b.textContent);
+      for (const a of document.getAnimations()) a.play();
+      return seen.length ? seen.join(', ') : '';
+    });
+    ok(wordsLeft === '', 'к появлению знака слова уже погасли', wordsLeft || '—');
+
     // И она обязана уйти сама: заставка, оставшаяся на экране, — это
     // приложение, которое не открылось.
     await page.waitForFunction(() => {

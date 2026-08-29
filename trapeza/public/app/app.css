@@ -835,6 +835,15 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   position: absolute;
   inset: 0;
   pointer-events: none;
+  /*
+   * Общий рубильник на весь слой.
+   *
+   * Не украшение, а страховка. На iPhone последнее слово оставалось висеть
+   * поверх знака: WebKit при steps() вместе с forwards держит значение
+   * последнего шага, а не конечное, и «Договоры» не гасли. Здесь слой
+   * убирается целиком и не зависит от того, как отработало каждое слово.
+   */
+  animation: words-gone 1ms linear var(--words) forwards;
 }
 #splash .splash-words b {
   position: absolute;
@@ -845,7 +854,13 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   letter-spacing: -.01em;
   color: #E7EEFC;
   opacity: 0;
-  animation: word var(--w) steps(1, end) forwards;
+  /*
+   * Смена мгновенная, но сделана обычными ключевыми кадрами, а не steps():
+   * 98% времени слово видно, последние 2% — уже нет. При 95 мс это два
+   * миллисекунды на переход, глаз его не увидит, зато конечное значение
+   * однозначно и одинаково во всех браузерах.
+   */
+  animation: word var(--w) linear forwards;
 }
 #splash .splash-words b:nth-child(2) { animation-delay: var(--w); color: #9FC4FF; }
 #splash .splash-words b:nth-child(3) { animation-delay: calc(var(--w) * 2); }
@@ -874,11 +889,14 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   animation: name-in 260ms var(--ease) calc(var(--words) + 300ms) both;
 }
 
-/* Слово живёт свой отрезок и исчезает мгновенно: steps(1) держит первое
-   значение до самого конца, а потом разом отдаёт второе. */
 @keyframes word {
-  from { opacity: 1; }
-  to   { opacity: 0; }
+  0%, 98% { opacity: 1; }
+  100%    { opacity: 0; }
+}
+/* Слой со словами уходит целиком. visibility, а не только opacity: нулевая
+   прозрачность оставляет элемент на экране для программ чтения. */
+@keyframes words-gone {
+  to { opacity: 0; visibility: hidden; }
 }
 @keyframes sheet-in {
   from { opacity: 0; transform: translateY(10px) scale(.94); }
