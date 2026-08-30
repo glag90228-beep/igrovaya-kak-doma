@@ -283,9 +283,20 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
      */
     const docId = Number(docBtn.split(':')[1]);
     const wasPublic = process.env.PUBLIC_URL;
+    /*
+     * Убираем оба адреса, а не один.
+     *
+     * Адрес ссылки берётся из PUBLIC_URL, а если его нет — из WEBAPP_URL:
+     * приложение и так живёт на том же домене. Первая версия этой проверки
+     * гасила только PUBLIC_URL и потому проходила лишь на машине разработки,
+     * где не задано ни то, ни другое. На боевом сервере WEBAPP_URL задан
+     * всегда, кнопка честно оставалась на месте — и падала проверка, а не код.
+     */
+    const wasApp = process.env.WEBAPP_URL;
     // button() ищет по всей переписке, поэтому перед каждой проверкой
     // очищаем её: иначе кнопка находится в карточке, показанной шагом раньше.
     delete process.env.PUBLIC_URL;
+    delete process.env.WEBAPP_URL;
     sent.length = 0;
     await tap(`doc:${docId}`);
     ok(!button('Ссылка для клиента'), 'без адреса сайта кнопки ссылки нет');
@@ -310,6 +321,8 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
 
     if (wasPublic === undefined) delete process.env.PUBLIC_URL;
     else process.env.PUBLIC_URL = wasPublic;
+    if (wasApp === undefined) delete process.env.WEBAPP_URL;
+    else process.env.WEBAPP_URL = wasApp;
   }
   await tap(`d.rep:${docBtn.split(':')[1]}`);
   ok(last().includes('Итого'), 'повтор открыл сводку с теми же позициями');
