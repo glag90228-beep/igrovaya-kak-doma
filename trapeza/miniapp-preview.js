@@ -198,6 +198,16 @@ async function main() {
     const lastDoc = bdb.listDocs(me.id, 10).find((d) => d.type === 'sch') || bdb.listDocs(me.id, 1)[0];
     const firstCp = bdb.listCps(me.id)[0];
     if (lastDoc) SHOTS.push({ name: 'kartochka-dokumenta', title: 'Карточка документа', go: ['doc', { id: lastDoc.id }] });
+    // Штампы, ссылка для клиента и отправка почтой живут в конце карточки —
+    // без прокрутки их в кадре не видно.
+    if (lastDoc) {
+      SHOTS.push({
+        name: 'kartochka-dokumenta-nizhe',
+        title: 'Карточка документа: ссылка и штампы',
+        go: ['doc', { id: lastDoc.id }],
+        scroll: 'bottom',
+      });
+    }
     if (firstCp) SHOTS.push({ name: 'kartochka-klienta', title: 'Карточка клиента', go: ['cp', { id: firstCp.id }] });
     SHOTS.push({ name: 'eshchyo', title: 'Ещё', go: ['more', {}] });
     SHOTS.push({ name: 'pochta', title: 'Почта', go: ['mail', {}] });
@@ -342,6 +352,16 @@ async function main() {
     for (const shot of SHOTS) {
       await page.goto(base, { waitUntil: 'domcontentloaded' });
       await page.waitForSelector('#app .screen', { timeout: 15000 });
+      /*
+       * Дождаться ухода заставки. Экран под ней готов почти сразу, а сама
+       * она держится около полутора секунд — и без этого ожидания все
+       * снимки до одного оказывались заставкой: витрина приложения из
+       * двадцати одинаковых картинок с логотипом.
+       */
+      // state: 'attached' — потому что ушедшая заставка это display: none,
+      // а обычное ожидание ждёт видимый элемент и не дождалось бы никогда.
+      await page.waitForSelector('#splash.gone', { state: 'attached', timeout: 15000 })
+        .catch(() => {});
       if (shot.go) {
         await page.evaluate(([name, params]) => window.__go(name, params), shot.go);
         await page.waitForTimeout(400);
