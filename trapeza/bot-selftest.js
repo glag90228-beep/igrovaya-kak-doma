@@ -3566,6 +3566,79 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(norm(last()).includes('не применяю'), 'и экран говорит текущее состояние', norm(last()).slice(0, 80));
   }
 
+  console.log('\n── фразы через YandexGPT ──');
+  {
+    /*
+     * Провайдер выбран не по качеству, а по достижимости: с боевого сервера
+     * (адрес российский) и Anthropic, и OpenRouter отвечают 403 — одинаково с
+     * ключом и без, так что дело в адресе. Yandex Cloud с той же машины
+     * отвечает.
+     *
+     * Форма запроса у него своя, и именно её тут и проверяем: модель адресом
+     * gpt://, настройки в completionOptions, текст в поле text. Ошибка в любом
+     * из трёх мест — это 400 на боевом, а не «модель не поняла».
+     */
+    const http = require('node:http');
+    let got = null; let hdr = null;
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c) => { b += c; });
+      req.on('end', () => {
+        got = JSON.parse(b); hdr = req.headers;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ result: { alternatives: [{ message: {
+          role: 'assistant',
+          text: '{"action":"draft","docType":"sch","who":"Заря"}',
+        } }] } }));
+      });
+    });
+    await new Promise((r) => srv.listen(0, r));
+
+    const was = {
+      p: process.env.AI_PROVIDER, k: process.env.YANDEX_API_KEY,
+      f: process.env.YANDEX_FOLDER_ID, m: process.env.AI_MODEL, e: process.env.AI_ENABLED,
+    };
+    process.env.AI_ENABLED = '1';
+    process.env.AI_PROVIDER = 'yandexgpt';
+    process.env.YANDEX_API_KEY = 'AQVN-test';
+    process.env.YANDEX_FOLDER_ID = 'b1gtest';
+    delete process.env.AI_MODEL;
+    const realFetch = global.fetch;
+    global.fetch = (u, o) => realFetch(
+      String(u).replace('https://llm.api.cloud.yandex.net', `http://127.0.0.1:${srv.address().port}`), o,
+    );
+
+    const aiY = require('./lib/ai-agent');
+    ok(aiY.aiAvailable(), 'с ключом и каталогом Яндекса разбор фраз доступен');
+    // Ключа мало — без каталога адрес модели не собрать, и это надо сказать.
+    delete process.env.YANDEX_FOLDER_ID;
+    ok(!aiY.aiAvailable() && aiY.aiHint().includes('YANDEX_FOLDER_ID'),
+      'без каталога честно говорим, чего не хватает', aiY.aiHint());
+    process.env.YANDEX_FOLDER_ID = 'b1gtest';
+
+    const intent = await aiY.understand('надо бы выставить Заре за аренду тридцать тысяч', 4242);
+    ok(intent.action === 'draft' && intent.who === 'Заря', 'фраза разобрана моделью',
+      JSON.stringify(intent));
+    ok(got.modelUri === 'gpt://b1gtest/yandexgpt-lite/latest',
+      'каталог подставлен в адрес модели — вписывать его дважды не нужно', got.modelUri);
+    ok(got.completionOptions.maxTokens === '400',
+      'потолок ответа ушёл строкой — числом их API его не принимает',
+      JSON.stringify(got.completionOptions.maxTokens));
+    ok(Object.prototype.hasOwnProperty.call(got.messages[1], 'text'),
+      'текст лежит в поле text, а не content');
+    ok(hdr.authorization === 'Api-Key AQVN-test' && hdr['x-folder-id'] === 'b1gtest',
+      'ключ и каталог ушли в заголовках');
+    ok(hdr['x-data-logging-enabled'] === 'false',
+      'просим не сохранять содержимое: через бота идут чужие реквизиты и суммы');
+
+    global.fetch = realFetch;
+    srv.close();
+    for (const [k, v] of [['AI_PROVIDER', was.p], ['YANDEX_API_KEY', was.k],
+      ['YANDEX_FOLDER_ID', was.f], ['AI_MODEL', was.m], ['AI_ENABLED', was.e]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+
   console.log('\n── фото через OpenRouter ──');
   {
     /*

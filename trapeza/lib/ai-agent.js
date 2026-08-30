@@ -39,21 +39,40 @@ const { db } = require('../db');
  * Сорвалась — поднимите AI_MODEL до модели поумнее, разница в деньгах на
  * нашем объёме измеряется парой сотен рублей в месяц.
  *
- * Имя написано в виде OpenRouter (провайдер/модель). При переходе на прямой
- * вызов Anthropic имя другое — без префикса и без даты в конце.
+ * Имя зависит от провайдера: у YandexGPT это «модель/версия» (мы сами
+ * достроим до gpt://<каталог>/…), у OpenRouter — «провайдер/модель», у
+ * Anthropic — просто имя без даты в конце.
  */
-const MODEL_DEFAULT = 'anthropic/claude-haiku-4.5';
+const MODEL_DEFAULT = 'yandexgpt-lite/latest';
+
+/*
+ * Почему YandexGPT, а не модель поумнее.
+ *
+ * Выбор сделан не по качеству, а по достижимости. С этого сервера (адрес
+ * российский) Anthropic отвечает 403, OpenRouter — 403 от своего Cloudflare,
+ * причём одинаково: и без ключа, и с ключом, и с внятным User-Agent. То есть
+ * дело в адресе, а не в настройках, и починить это на нашей стороне нельзя.
+ * Yandex Cloud с той же машины отвечает — на нём уже работает распознавание
+ * речи. Один поставщик, один ключ, один счёт.
+ *
+ * Ветки openrouter/anthropic оставлены: если бот когда-нибудь переедет на
+ * сервер вне России, переключение будет одной строкой в .env.
+ */
 const LIMIT_ALL = () => Number(process.env.AI_MONTHLY_LIMIT || 1000);
 const LIMIT_USER = () => Number(process.env.AI_USER_LIMIT || 30);
 
-const PROVIDER = () => String(process.env.AI_PROVIDER || 'openrouter').toLowerCase();
+const PROVIDER = () => String(process.env.AI_PROVIDER || 'yandexgpt').toLowerCase();
 const enabled = () => process.env.AI_ENABLED === '1';
+
+/** У Яндекса ключ и каталог всегда ходят парой: одного ключа мало. */
+const yandexReady = () => Boolean(process.env.YANDEX_API_KEY && process.env.YANDEX_FOLDER_ID);
 
 /** Готов ли модуль обращаться к модели. */
 function aiAvailable() {
   if (!enabled()) return false;
   const p = PROVIDER();
   if (p === 'mock') return true;
+  if (p === 'yandexgpt') return yandexReady();
   if (p === 'openrouter') return Boolean(process.env.OPENROUTER_API_KEY);
   if (p === 'anthropic') return Boolean(process.env.ANTHROPIC_API_KEY);
   if (p === 'openai') return Boolean(process.env.OPENAI_API_KEY);
@@ -63,10 +82,26 @@ function aiAvailable() {
 function aiHint() {
   if (!enabled()) return 'Свободный ввод выключен (AI_ENABLED не равен 1).';
   const p = PROVIDER();
+  if (p === 'yandexgpt' && !yandexReady()) return 'Нет YANDEX_API_KEY или YANDEX_FOLDER_ID.';
   if (p === 'openrouter' && !process.env.OPENROUTER_API_KEY) return 'Нет ключа OPENROUTER_API_KEY.';
   if (p === 'anthropic' && !process.env.ANTHROPIC_API_KEY) return 'Нет ключа ANTHROPIC_API_KEY.';
   if (p === 'openai' && !process.env.OPENAI_API_KEY) return 'Нет ключа OPENAI_API_KEY.';
   return `Неизвестный провайдер: ${p}.`;
+}
+
+/**
+ * Полное имя модели для Яндекса.
+ *
+ * Он ждёт не имя, а адрес вида gpt://<каталог>/<модель>/<версия>. Каталог в
+ * нём повторяет YANDEX_FOLDER_ID, и заставлять человека вписывать его дважды
+ * — лишний повод ошибиться. Поэтому в AI_MODEL достаточно «yandexgpt-lite/latest»,
+ * а готовый адрес мы соберём сами. Если кто-то всё же впишет полный gpt://…,
+ * возьмём как есть — он мог указать чужой каталог намеренно.
+ */
+function yandexModelUri(model) {
+  const m = String(model || MODEL_DEFAULT).trim();
+  if (m.startsWith('gpt://')) return m;
+  return `gpt://${process.env.YANDEX_FOLDER_ID}/${m}`;
 }
 
 // ---------- расход ----------
@@ -217,7 +252,40 @@ async function callModel(text) {
   const maxTokens = Number(process.env.AI_MAX_TOKENS || 400);
   const signal = AbortSignal.timeout(20000);
 
-  // Вызов через OpenRouter API (работает из РФ, обходит блокировку 403)
+  /*
+   * YandexGPT. Форма запроса своя, не как у остальных: модель задаётся
+   * адресом, настройки вынесены в completionOptions, а текст сообщения лежит
+   * в поле text, а не content.
+   *
+   * maxTokens строкой — так требует их API; число он не принимает.
+   */
+  if (p === 'yandexgpt') {
+    const res = await fetch('https://llm.api.cloud.yandex.net/foundationModels/v1/completion', {
+      method: 'POST',
+      signal,
+      headers: {
+        'content-type': 'application/json',
+        Authorization: `Api-Key ${process.env.YANDEX_API_KEY}`,
+        'x-folder-id': process.env.YANDEX_FOLDER_ID,
+        // Просим не сохранять содержимое запросов: через бота идут чужие
+        // реквизиты и суммы, и в журналах стороннего сервиса им не место.
+        'x-data-logging-enabled': 'false',
+      },
+      body: JSON.stringify({
+        modelUri: yandexModelUri(model),
+        completionOptions: { stream: false, temperature: 0.1, maxTokens: String(maxTokens) },
+        messages: [
+          { role: 'system', text: SYSTEM },
+          { role: 'user', text: String(text).slice(0, 1000) },
+        ],
+      }),
+    });
+    if (!res.ok) throw new Error(`YandexGPT ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const data = await res.json();
+    return (((data.result || {}).alternatives || [{}])[0].message || {}).text || '';
+  }
+
+  // Вызов через OpenRouter API
   if (p === 'openrouter') {
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',

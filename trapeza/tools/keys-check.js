@@ -252,6 +252,91 @@ async function checkOpenRouter(model, what) {
   }
 }
 
+/**
+ * Разбор фразы через YandexGPT — тот же вызов, что в lib/ai-agent.js.
+ *
+ * Как и у остальных, проверяем не «принял ли ключ», а весь путь: шлём живую
+ * фразу, которую местные регулярки специально не ловят, и смотрим на ответ
+ * тем же кодом, что стоит в бою.
+ */
+async function checkYandexGpt(model) {
+  const key = process.env.YANDEX_API_KEY;
+  const folder = process.env.YANDEX_FOLDER_ID;
+  if (!key || !folder) { skip('Фразы: YANDEX_API_KEY или YANDEX_FOLDER_ID не заполнен'); return; }
+  const dirty = checkAscii(key, 'YANDEX_API_KEY') || checkAscii(folder, 'YANDEX_FOLDER_ID')
+    || speech.badKey(key);
+  if (dirty) { no(`Фразы: ${dirty}`); return; }
+
+  const uri = String(model).startsWith('gpt://') ? String(model) : `gpt://${folder}/${model}`;
+  const PHRASE = 'надо бы выставить Заре за аренду тридцать тысяч';
+  try {
+    const res = await fetch('https://llm.api.cloud.yandex.net/foundationModels/v1/completion', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        Authorization: `Api-Key ${key}`,
+        'x-folder-id': folder,
+        'x-data-logging-enabled': 'false',
+      },
+      body: JSON.stringify({
+        modelUri: uri,
+        completionOptions: { stream: false, temperature: 0.1, maxTokens: '400' },
+        messages: [
+          { role: 'system', text: ai.SYSTEM },
+          { role: 'user', text: PHRASE },
+        ],
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+    const body = await res.text();
+
+    if (!res.ok) {
+      // Ключ у Яндекса прав не даёт: роль выдаётся отдельно сервисному аккаунту.
+      if (/Permission ?denied|Permission to/i.test(body)) {
+        no('Фразы: у сервисного аккаунта нет роли ai.languageModels.user в этом каталоге.\n'
+          + '      Роль выдаётся тому аккаунту, чьим ключом вы пользуетесь, и в том\n'
+          + `      каталоге, что указан в YANDEX_FOLDER_ID (${folder}).\n`
+          + `      Ответ: ${body.replace(/\s+/g, ' ').slice(0, 200)}`);
+        return;
+      }
+      if (/model|modelUri/i.test(body) && (res.status === 400 || res.status === 404)) {
+        no(`Фразы: модель «${uri}» не найдена — проверьте написание AI_MODEL.\n`
+          + `      Ответ: ${body.replace(/\s+/g, ' ').slice(0, 200)}`);
+        return;
+      }
+      no(`Фразы: ${why(res.status, body)}`);
+      return;
+    }
+
+    let reply = '';
+    try {
+      reply = (((JSON.parse(body).result || {}).alternatives || [{}])[0].message || {}).text || '';
+    } catch (_) { /* разберёмся ниже */ }
+    if (!reply) { no(`Фразы: модель ответила пусто.\n      ${body.slice(0, 200)}`); return; }
+
+    let intent = null;
+    try {
+      const m = /\{[\s\S]*\}/.exec(reply);
+      intent = ai.sanitize(m ? JSON.parse(m[0]) : null);
+    } catch (_) { intent = { action: 'unknown' }; }
+
+    if (intent.action === 'draft') {
+      ok(`Фразы: модель ${uri.split('/').slice(-2).join('/')} разобрала фразу — ${JSON.stringify(intent)}`);
+      return;
+    }
+    if (intent.action === 'unknown') {
+      no('Фразы: модель отвечает, но не по инструкции — вместо JSON пришло:\n'
+        + `      ${reply.replace(/\s+/g, ' ').slice(0, 200)}\n`
+        + '      Ключ и модель рабочие. Попробуйте модель посильнее:\n'
+        + '      AI_MODEL=yandexgpt/latest вместо yandexgpt-lite/latest.');
+      return;
+    }
+    no(`Фразы: разбор получился, но не тот — ждали «выписать документ», пришло ${JSON.stringify(intent)}`);
+  } catch (e) {
+    no(`Фразы: не достучались — ${e.message}`);
+  }
+}
+
 /** Распознавание картинки через OpenRouter — тот же вызов, что в lib/vision.js. */
 async function checkOpenRouterVision(model) {
   if (!process.env.OPENROUTER_API_KEY) { skip('Фото: OPENROUTER_API_KEY не заполнен'); return; }
@@ -432,8 +517,9 @@ const ai = require(path.join(APP, 'lib/ai-agent'));
   } else if (vp === 'yandex') await checkYandexVision();
   else skip('Фото: VISION_PROVIDER не задан — распознавание выключено');
 
-  const ap = String(process.env.AI_PROVIDER || 'anthropic').toLowerCase();
+  const ap = String(process.env.AI_PROVIDER || 'yandexgpt').toLowerCase();
   if (process.env.AI_ENABLED !== '1') skip('Фразы: AI_ENABLED не 1 — свободный ввод выключен');
+  else if (ap === 'yandexgpt') await checkYandexGpt(process.env.AI_MODEL || ai.MODEL_DEFAULT);
   else if (ap === 'anthropic') await checkAnthropic(process.env.AI_MODEL || ai.MODEL_DEFAULT, 'Фразы');
   else if (ap === 'openrouter') await checkOpenRouter(process.env.AI_MODEL || ai.MODEL_DEFAULT, 'Фразы');
   else skip(`Фразы: провайдер ${ap} — этой проверкой не покрыт`);
