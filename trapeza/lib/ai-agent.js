@@ -46,9 +46,9 @@ function aiAvailable() {
 function aiHint() {
   if (!enabled()) return 'Свободный ввод выключен (AI_ENABLED не равен 1).';
   const p = PROVIDER();
-  if (p === 'openrouter') return 'Нет ключа OPENROUTER_API_KEY.';
-  if (p === 'anthropic') return 'Нет ключа ANTHROPIC_API_KEY.';
-  if (p === 'openai') return 'Нет ключа OPENAI_API_KEY.';
+  if (p === 'openrouter' && !process.env.OPENROUTER_API_KEY) return 'Нет ключа OPENROUTER_API_KEY.';
+  if (p === 'anthropic' && !process.env.ANTHROPIC_API_KEY) return 'Нет ключа ANTHROPIC_API_KEY.';
+  if (p === 'openai' && !process.env.OPENAI_API_KEY) return 'Нет ключа OPENAI_API_KEY.';
   return `Неизвестный провайдер: ${p}.`;
 }
 
