@@ -13,13 +13,25 @@
 let _chromium; // undefined = не пробовали, null = недоступен
 let launches = 0; // сколько раз поднимали браузер
 
+/*
+ * Где искать Playwright.
+ *
+ * PLAYWRIGHT_DIR первым, потому что на сервере пакет стоит глобально, а
+ * глобальная папка модулей в обычный поиск Node не входит: require('playwright')
+ * из /opt/trapeza её не видит, хотя пакет установлен. Путь до неё знает тот,
+ * кто ставил (deploy/playwright.sh), — он его и передаёт службам.
+ *
+ * Ниже — прежние пути: обычный поиск для тех, у кого пакет в зависимостях, и
+ * жёстко прописанная глобальная папка нашего сервера как последняя попытка.
+ */
 function loadChromium() {
   if (_chromium !== undefined) return _chromium;
   const candidates = [
+    process.env.PLAYWRIGHT_DIR,
     'playwright', 'playwright-core',
     '/opt/node22/lib/node_modules/playwright',
     '/opt/node22/lib/node_modules/playwright-core',
-  ];
+  ].filter(Boolean);
   for (const p of candidates) {
     try { _chromium = require(p).chromium; return _chromium; } catch (_) { /* ignore */ }
   }
