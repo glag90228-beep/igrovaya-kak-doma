@@ -3477,7 +3477,18 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const fakedHtml = faked.file.pdf ? '' : faked.file.buffer.toString('utf8');
     ok(faked.ok && faked.stamp === null,
       'просьба проштамповать неоплаченный счёт молча отклонена');
-    if (fakedHtml) ok(!fakedHtml.includes('ОПЛАЧЕНО'), 'и в файле «ОПЛАЧЕНО» не появилось');
+    /*
+     * Ищем разметку штампа, а не слово «ОПЛАЧЕНО».
+     *
+     * Слово встречается в комментарии внутри CSS, а стиль вшит в каждый
+     * документ — так что поиск по слову находил комментарий и объявлял штамп
+     * там, где его нет. Вылезало это только без Chromium, когда документ
+     * уходит HTML: в PDF текста стилей нет, и проверка молчала.
+     */
+    if (fakedHtml) {
+      ok(!fakedHtml.includes('<div class="stamps">'), 'и штампа в файле нет');
+      ok(!fakedHtml.includes('class="doc has-stamps"'), 'и места под него не отведено');
+    }
 
     bdbS.markPaid(uid, docId, '2026-08-20');
     const stamped = await docSvc.rebuildDocument(uid, docId, { stamp: { paid: true, copy: true } });
