@@ -3566,6 +3566,60 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(norm(last()).includes('не применяю'), 'и экран говорит текущее состояние', norm(last()).slice(0, 80));
   }
 
+  console.log('\n── фото через OpenRouter ──');
+  {
+    /*
+     * Провайдер добавлен, потому что Яндекс остаётся только под звук, а
+     * Anthropic из России отвечает 403. Проверяем не «есть ли ветка в коде»,
+     * а весь путь: что уходит в запросе и что получается на выходе.
+     *
+     * Настоящий OpenRouter в прогоне не дёргаем — платно и требует сети.
+     * Поднимаем свой сервер и подменяем ему адрес: запрос собирается тем же
+     * кодом, что в бою, и мы видим его целиком.
+     */
+    const http = require('node:http');
+    let got = null;
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c) => { b += c; });
+      req.on('end', () => {
+        got = JSON.parse(b);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+          date: '2026-08-11', amount: 26496.42, docNo: '148',
+          inn: '7712345678', name: 'ООО «Заря»', text: 'Счёт № 148 от 11.08.2026',
+        }) } }] }));
+      });
+    });
+    await new Promise((r) => srv.listen(0, r));
+
+    const was = { p: process.env.VISION_PROVIDER, k: process.env.OPENROUTER_API_KEY, m: process.env.VISION_MODEL };
+    process.env.VISION_PROVIDER = 'openrouter';
+    process.env.OPENROUTER_API_KEY = 'sk-or-test';
+    process.env.VISION_MODEL = 'anthropic/claude-sonnet-4.5';
+    const realFetch = global.fetch;
+    global.fetch = (url, opts) => realFetch(
+      String(url).replace('https://openrouter.ai', `http://127.0.0.1:${srv.address().port}`), opts,
+    );
+
+    const vision = require('./lib/vision');
+    ok(vision.visionAvailable(), 'с ключом OpenRouter распознавание считается доступным');
+    const r = await vision.readInvoice(Buffer.from('фото'), 'image/jpeg');
+    ok(r.ok && r.fields.amount === 26496.42, 'сумма со снимка разобрана', r.fields && r.fields.amount);
+    ok(r.fields.inn === '7712345678', 'и ИНН поставщика');
+
+    const img = (((got.messages || [])[0] || {}).content || []).find((c) => c.type === 'image_url');
+    ok(Boolean(img) && img.image_url.url.startsWith('data:image/jpeg;base64,'),
+      'картинка ушла ссылкой data: — как ждёт OpenRouter');
+    ok(got.model === 'anthropic/claude-sonnet-4.5', 'модель взята из VISION_MODEL', got.model);
+
+    global.fetch = realFetch;
+    srv.close();
+    for (const [k, v] of [['VISION_PROVIDER', was.p], ['OPENROUTER_API_KEY', was.k], ['VISION_MODEL', was.m]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+
   console.log('\n── обещание на лендинге ──');
   {
     /*

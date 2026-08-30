@@ -252,6 +252,57 @@ async function checkOpenRouter(model, what) {
   }
 }
 
+/** Распознавание картинки через OpenRouter — тот же вызов, что в lib/vision.js. */
+async function checkOpenRouterVision(model) {
+  if (!process.env.OPENROUTER_API_KEY) { skip('Фото: OPENROUTER_API_KEY не заполнен'); return; }
+  const dirty = checkAscii(process.env.OPENROUTER_API_KEY, 'OPENROUTER_API_KEY');
+  if (dirty) { no(`Фото: ${dirty}`); return; }
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://pervichkaru.ru',
+        'X-Title': 'Pervichka App',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 16,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Ответь одним словом: ок' },
+            { type: 'image_url', image_url: { url: `data:image/png;base64,${PNG_1PX}` } },
+          ],
+        }],
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+    const body = await res.text();
+    if (res.ok) { ok(`Фото: модель ${model} принимает картинки`); return; }
+    if (res.status === 402 || /insufficient|credits?/i.test(body)) {
+      no('Фото: ключ рабочий, но на счету нет средств — пополните баланс OpenRouter');
+      return;
+    }
+    if (res.status === 404 || /not a valid model|no endpoints/i.test(body)) {
+      no(`Фото: модели «${model}» у OpenRouter нет или она недоступна.\n`
+        + '      Список: https://openrouter.ai/models — нужна с пометкой про картинки.\n'
+        + `      Ответ: ${String(body).replace(/\s+/g, ' ').slice(0, 200)}`);
+      return;
+    }
+    // Модель без зрения отвечает не 404, а спором про содержимое запроса.
+    if (/image|vision|modality/i.test(body)) {
+      no(`Фото: модель «${model}» картинки не принимает — возьмите ту, что умеет смотреть.\n`
+        + `      Ответ: ${String(body).replace(/\s+/g, ' ').slice(0, 200)}`);
+      return;
+    }
+    no(`Фото: ${why(res.status, body)}`);
+  } catch (e) {
+    no(`Фото: не достучались — ${e.message}`);
+  }
+}
+
 /** Распознавание картинки Яндексом — тот же вызов, что в lib/vision.js. */
 async function checkYandexVision() {
   const key = process.env.YANDEX_API_KEY;
@@ -376,7 +427,9 @@ const ai = require(path.join(APP, 'lib/ai-agent'));
   // распознавание давно переключено на Яндекс.
   const vp = String(process.env.VISION_PROVIDER || '').toLowerCase();
   if (vp === 'anthropic') await checkAnthropic(process.env.VISION_MODEL || 'claude-sonnet-5', 'Фото');
-  else if (vp === 'yandex') await checkYandexVision();
+  else if (vp === 'openrouter') {
+    await checkOpenRouterVision(process.env.VISION_MODEL || 'anthropic/claude-sonnet-4.5');
+  } else if (vp === 'yandex') await checkYandexVision();
   else skip('Фото: VISION_PROVIDER не задан — распознавание выключено');
 
   const ap = String(process.env.AI_PROVIDER || 'anthropic').toLowerCase();

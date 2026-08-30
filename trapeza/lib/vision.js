@@ -6,12 +6,22 @@
  * Внутри Node этого не сделать — нужен внешний сервис, поэтому провайдер
  * подключаемый и выбирается переменной окружения VISION_PROVIDER:
  *
- *   anthropic — модель со зрением, сразу отдаёт разобранные поля (точнее);
+ *   openrouter— та же модель со зрением, но через посредника: работает
+ *               оттуда, где Anthropic отвечает 403. Ключ в
+ *               OPENROUTER_API_KEY, модель в VISION_MODEL;
+ *   anthropic — модель со зрением напрямую, сразу отдаёт разобранные поля;
  *               ключ в ANTHROPIC_API_KEY;
  *   yandex    — Yandex Vision OCR: отдаёт текст, поля вытаскиваем сами
  *               регулярками; ключ в YANDEX_API_KEY, папка в YANDEX_FOLDER_ID;
  *   mock      — для прогонов: берёт ответ из VISION_MOCK;
  *   не задан   — распознавания нет, бот честно об этом говорит.
+ *
+ * Модель против OCR — это разные вещи, и выбор между ними не про цену.
+ * OCR отдаёт плоский текст, из которого поля достаются регулярками: в счёте
+ * с двумя колонками сумм он честно вернёт обе, а какая из них «итого к
+ * оплате», решает уже наш разбор — и ошибается. Модель видит бланк целиком
+ * и отвечает разобранными полями. Поэтому фото лучше отдавать модели, а OCR
+ * держать запасным вариантом.
  *
  * Разбор текста (parseInvoiceText) живёт здесь же и проверяется отдельно:
  * он нужен и для Yandex, и как запасной вариант, если модель вернула текст
@@ -23,6 +33,7 @@ const PROVIDER = () => String(process.env.VISION_PROVIDER || '').toLowerCase();
 function visionAvailable() {
   const p = PROVIDER();
   if (p === 'mock') return true;
+  if (p === 'openrouter') return Boolean(process.env.OPENROUTER_API_KEY);
   if (p === 'anthropic') return Boolean(process.env.ANTHROPIC_API_KEY);
   if (p === 'yandex') return Boolean(process.env.YANDEX_API_KEY && process.env.YANDEX_FOLDER_ID);
   return false;
@@ -31,6 +42,7 @@ function visionAvailable() {
 function visionHint() {
   const p = PROVIDER();
   if (!p) return 'Распознавание не подключено (VISION_PROVIDER не задан).';
+  if (p === 'openrouter') return 'Нет ключа OPENROUTER_API_KEY.';
   if (p === 'anthropic') return 'Нет ключа ANTHROPIC_API_KEY.';
   if (p === 'yandex') return 'Нет YANDEX_API_KEY или YANDEX_FOLDER_ID.';
   return `Неизвестный провайдер: ${p}.`;
@@ -97,6 +109,56 @@ function parseInvoiceText(text) {
 
 // ─────────────────────────── провайдеры ───────────────────────────
 
+/*
+ * Инструкция одна на всех, кто умеет смотреть.
+ *
+ * Раньше она была вписана внутрь вызова Anthropic. Со вторым провайдером
+ * это означало бы её копию, а копии текста промпта расходятся на первой же
+ * правке — и один и тот же снимок разбирался бы по-разному в зависимости от
+ * того, через кого он прошёл.
+ */
+const ASK = 'Это фотография российского счёта, акта или чека. Верни только JSON без пояснений:\n'
+  + '{"date":"ГГГГ-ММ-ДД или null","amount":число итоговой суммы к оплате или null,'
+  + '"docNo":"номер документа или пустая строка","inn":"ИНН поставщика или пустая строка",'
+  + '"name":"название поставщика или пустая строка","text":"весь распознанный текст"}\n'
+  + 'Сумма — итог к оплате, а не цена за единицу. Если чего-то не видно, ставь null или "".';
+
+/**
+ * OpenRouter: тот же разговор, но в формате OpenAI — картинка приходит
+ * ссылкой data:, а не отдельным блоком, как у Anthropic.
+ */
+async function viaOpenRouter(buffer, mime) {
+  const model = process.env.VISION_MODEL || 'anthropic/claude-sonnet-4.5';
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      'HTTP-Referer': 'https://pervichkaru.ru',
+      'X-Title': 'Pervichka App',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 800,
+      temperature: 0,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: ASK },
+          {
+            type: 'image_url',
+            image_url: { url: `data:${mime};base64,${buffer.toString('base64')}` },
+          },
+        ],
+      }],
+    }),
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!res.ok) throw new Error(`OpenRouter ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const data = await res.json();
+  return ((data.choices || [{}])[0].message || {}).content || '';
+}
+
 async function viaAnthropic(buffer, mime) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -112,14 +174,7 @@ async function viaAnthropic(buffer, mime) {
         role: 'user',
         content: [
           { type: 'image', source: { type: 'base64', media_type: mime, data: buffer.toString('base64') } },
-          {
-            type: 'text',
-            text: 'Это фотография российского счёта, акта или чека. Верни только JSON без пояснений:\n'
-              + '{"date":"ГГГГ-ММ-ДД или null","amount":число итоговой суммы к оплате или null,'
-              + '"docNo":"номер документа или пустая строка","inn":"ИНН поставщика или пустая строка",'
-              + '"name":"название поставщика или пустая строка","text":"весь распознанный текст"}\n'
-              + 'Сумма — итог к оплате, а не цена за единицу. Если чего-то не видно, ставь null или "".',
-          },
+          { type: 'text', text: ASK },
         ],
       }],
     }),
@@ -165,6 +220,7 @@ async function readInvoice(buffer, mime = 'image/jpeg') {
   try {
     let raw;
     if (p === 'mock') raw = String(process.env.VISION_MOCK || '');
+    else if (p === 'openrouter') raw = await viaOpenRouter(buffer, mime);
     else if (p === 'anthropic') raw = await viaAnthropic(buffer, mime);
     else raw = await viaYandex(buffer, mime);
 
