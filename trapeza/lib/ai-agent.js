@@ -9,45 +9,35 @@
  * сам**: самое большее — открывает обычный мастер с заполненными полями,
  * дальше человек нажимает ту же кнопку, что и всегда.
  *
- * Так сделано не из осторожности вообще, а по конкретной причине: документ
- * забирает номер в сквозном ряду. Лишний счёт нельзя тихо удалить — в
- * нумерации останется дыра, и объяснять её придётся при проверке. Модель,
- * которая ошиблась контрагентом или суммой, стоит дороже, чем сэкономленное
- * нажатие. По той же причине контрагент ищется точным совпадением: «Заря»
- * не должна молча превратиться в «Заря-Строй».
- *
  * Деньги
  * ------
- * Вызовы модели платные, и платит владелец бота, а не пользователь. Поэтому:
+ *  AI_ENABLED=1         — без этого модуль выключен, даже если ключ есть.
+ *  AI_MONTHLY_LIMIT     — предел обращений к модели в месяц на всех (1000).
+ *  AI_USER_LIMIT        — предел на одного пользователя в месяц (30).
  *
- *   AI_ENABLED=1        — без этого модуль выключен, даже если ключ есть.
- *                         Ключ в .env часто лежит ради распознавания счетов;
- *                         он не должен сам по себе включать расходы.
- *   AI_MONTHLY_LIMIT    — предел обращений к модели в месяц на всех
- *                         (по умолчанию 1000). Кончился — бот честно
- *                         говорит, что понимает только команды.
- *   AI_USER_LIMIT       — предел на одного пользователя в месяц (30):
- *                         один человек не должен съесть общий лимит.
- *
- * Сначала фраза разбирается локально, регулярками, — это бесплатно и
- * мгновенно, и покрывает большую часть обращений. К модели идём, только
- * если местный разбор не справился.
+ * Поддерживаемые провайдеры (AI_PROVIDER):
+ *  - openrouter  (рекомендуется для РФ, обходит 403, поддержка Claude / Gemini / DeepSeek)
+ *  - anthropic   (прямой вызов API Anthropic)
+ *  - openai      (прямой вызов API OpenAI)
+ *  - mock        (для автоматических тестов без сетевых запросов)
  */
 
 const { db } = require('../db');
 
-const MODEL_DEFAULT = 'claude-haiku-4-5-20251001';   // разбор фразы — простая задача
+// Дефолтная модель OpenRouter (Claude 3.5 Sonnet / Gemini Flash / Claude Haiku)
+const MODEL_DEFAULT = process.env.AI_MODEL || 'anthropic/claude-3.5-sonnet';
 const LIMIT_ALL = () => Number(process.env.AI_MONTHLY_LIMIT || 1000);
 const LIMIT_USER = () => Number(process.env.AI_USER_LIMIT || 30);
 
-const PROVIDER = () => String(process.env.AI_PROVIDER || 'anthropic').toLowerCase();
+const PROVIDER = () => String(process.env.AI_PROVIDER || 'openrouter').toLowerCase();
 const enabled = () => process.env.AI_ENABLED === '1';
 
 /** Готов ли модуль обращаться к модели. */
 function aiAvailable() {
   if (!enabled()) return false;
   const p = PROVIDER();
-  if (p === 'mock') return true;                      // для прогонов, без сети
+  if (p === 'mock') return true;
+  if (p === 'openrouter') return Boolean(process.env.OPENROUTER_API_KEY);
   if (p === 'anthropic') return Boolean(process.env.ANTHROPIC_API_KEY);
   if (p === 'openai') return Boolean(process.env.OPENAI_API_KEY);
   return false;
@@ -56,6 +46,7 @@ function aiAvailable() {
 function aiHint() {
   if (!enabled()) return 'Свободный ввод выключен (AI_ENABLED не равен 1).';
   const p = PROVIDER();
+  if (p === 'openrouter') return 'Нет ключа OPENROUTER_API_KEY в .env.';
   if (p === 'anthropic') return 'Нет ключа ANTHROPIC_API_KEY.';
   if (p === 'openai') return 'Нет ключа OPENAI_API_KEY.';
   return `Неизвестный провайдер: ${p}.`;
@@ -95,13 +86,7 @@ function budget(userId) {
   };
 }
 
-/**
- * Занять одно обращение.
- *
- * Счётчик увеличивается до вызова модели, а не после: неудачный запрос всё
- * равно оплачен, и считать только успешные — способ незаметно выйти за
- * предел в несколько раз при сетевых сбоях.
- */
+/** Занять одно обращение. */
 function spend(userId) {
   const bump = db.prepare(`INSERT INTO ai_usage(month, user_id, calls) VALUES(?,?,1)
       ON CONFLICT(month, user_id) DO UPDATE SET calls = calls + 1`);
@@ -121,20 +106,9 @@ const DOC_WORDS = {
   'договор': 'dog',
 };
 
-/*
- * Бесплатный разбор. Порядок важен: «акт сверки» должен опознаться раньше,
- * чем «акт» как документ, иначе бот полезет выписывать акт об оказании
- * услуг там, где просили сверку.
- *
- * Каждая строка здесь — это обращение, за которое не платит владелец бота.
- * Поэтому сюда добавляется всё, что люди пишут одинаково.
- */
 const QUICK = [
   { re: /^(?:кто\s+(?:мне\s+)?должен|долги|задолженност|дебиторк|сальдо)/i, intent: () => ({ action: 'debts' }) },
   { re: /^(?:что\s+умеешь|помощь|команды|help)$/i, intent: () => ({ action: 'help' }) },
-  // «что не оплачено» — так спрашивают чаще, чем «не оплачено». Якорь
-  // оставляем: без него фраза «счёт Заре не оплачен» увела бы в этот же
-  // ответ вместо выписки счёта.
   { re: /^(?:что\s+|кто\s+)?(?:не\s*оплачен|кто\s+не\s+заплатил|ждут\s+оплаты)/i, intent: () => ({ action: 'unpaid' }) },
   { re: /(?:акт\s+сверк|сверитьс|сверк[аиу])/i, intent: () => ({ action: 'akt' }) },
   { re: /^(?:документы|журнал|реестр|что\s+(?:я\s+)?выписал)/i, intent: () => ({ action: 'docs' }) },
@@ -142,16 +116,11 @@ const QUICK = [
   { re: /^(?:мои\s+реквизиты|реквизиты|моя\s+организац|подпись|печать)/i, intent: () => ({ action: 'org' }) },
   { re: /^(?:подписк|оплата\s+бота|сколько\s+стоит|тариф|цена)/i, intent: () => ({ action: 'billing' }) },
   { re: /(?:каждый\s+месяц|ежемесячн|повторя)/i, intent: () => ({ action: 'recurring' }) },
-  // Чужая работа. Ловим бесплатно и здесь: такие вопросы задают часто,
-  // а ответ на них один и тот же — и он не требует модели.
   {
     re: /(?:налог|усн|псн|ндс|ндфл|взнос|кудир|отчётност|отчетност|деклараци|зарплат|кадр|касс[аоу]|патент)/i,
     intent: () => ({ action: 'outofscope' }),
   },
   {
-    // «выставь счёт Заре», «оформи акт для ООО Ромашка».
-    // Окончание глагола — [а-яё], а не \w: \w в JavaScript кириллицу не
-    // видит, и «выставь» по нему не дочитывается.
     re: /^(?:выстав|выпиш|созда|оформ|сдела)[а-яё]*\s+(счёт-договор|счет-договор|счёт|счет|акт|упд|накладную|накладная|платёжку|платежку|договор)\s*(?:для\s+|на\s+имя\s+)?(.*)$/i,
     intent: (m) => ({ action: 'draft', docType: DOC_WORDS[m[1].toLowerCase()], who: m[2].trim() }),
   },
@@ -167,15 +136,6 @@ function quickParse(text) {
   return null;
 }
 
-/**
- * Найти контрагента по имени из фразы.
- *
- * Точное совпадение сильнее частичного, а несколько частичных — это
- * неопределённость, а не повод выбрать первого: выписать документ не тому
- * клиенту хуже, чем переспросить.
- *
- * @returns {{cp}|{choices}|{}} один контрагент, список кандидатов или пусто
- */
 function matchCp(cps, name) {
   const norm = (s) => String(s || '').toLowerCase().replace(/ё/g, 'е')
     .split(/[^\p{L}\p{N}]+/u).filter((w) => w && !/^(ооо|оао|зао|пао|ип|ао)$/.test(w)).join(' ');
@@ -189,23 +149,8 @@ function matchCp(cps, name) {
   return {};
 }
 
-// ---------- модель ----------
+// ---------- инструкция ИИ ----------
 
-/*
- * Чему агент обучен и чему намеренно не обучен.
- *
- * Список действий собран от обратного — от того, что бот действительно
- * умеет. Намерение, которому не соответствует ни один экран, хуже, чем
- * «не понял»: человек слышит «сейчас сделаю» и не получает ничего.
- *
- * Работа предпринимателя с первичкой шире, чем этот бот: налоговый учёт
- * обязателен независимо от режима, есть КУДиР, страховые взносы за себя,
- * НДФЛ и уведомления по срокам, отчётность. Ничего этого бот не ведёт и
- * вести не будет — считать чужие налоги без доступа к банку и кассе значит
- * подставить человека. Поэтому такие вопросы получают отдельное намерение
- * outofscope: агент честно говорит, чего не умеет, вместо того чтобы
- * рассуждать о сроках уплаты по памяти.
- */
 const SYSTEM = `Ты помощник в боте «Первичка»: он выписывает первичные документы и ведёт
 расчёты с контрагентами. Ты разбираешь фразу человека и отвечаешь ТОЛЬКО JSON.
 
@@ -215,7 +160,7 @@ const SYSTEM = `Ты помощник в боте «Первичка»: он в�
 Возможные ответы:
 {"action":"debts"}      — кто должен, дебиторка, сальдо, задолженность
 {"action":"unpaid"}     — что не оплачено, кто не заплатил
-{"action":"docs"}       — показать выписанные документы, журнал, реестр за период
+{"action":"docs"}        — показать выписанные документы, журнал, реестр за период
 {"action":"akt"}        — акт сверки с контрагентом
 {"action":"cps"}        — контрагенты: список, добавить, реквизиты клиента
 {"action":"org"}        — свои реквизиты, ИНН, счёт, подпись и печать
@@ -245,16 +190,43 @@ const SYSTEM = `Ты помощник в боте «Первичка»: он в�
 «когда платить взносы за себя» → {"action":"outofscope"}
 «сделай красиво» → {"action":"unknown"}`;
 
+// ---------- вызов модели ----------
+
 async function callModel(text) {
   const p = PROVIDER();
   if (p === 'mock') return String(process.env.AI_MOCK || '{"action":"unknown"}');
 
   const model = process.env.AI_MODEL || MODEL_DEFAULT;
-  // Ответ — одна строка JSON: держать потолок высоким незачем, а лишние
-  // токены оплачены.
   const maxTokens = Number(process.env.AI_MAX_TOKENS || 400);
   const signal = AbortSignal.timeout(20000);
 
+  // Вызов через OpenRouter API (работает из РФ, обходит блокировку 403)
+  if (p === 'openrouter') {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      signal,
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://pervichkaru.ru',
+        'X-Title': 'Pervichka App'
+      },
+      body: JSON.stringify({
+        model: model,
+        max_tokens: maxTokens,
+        temperature: 0.1,
+        messages: [
+          { role: 'system', content: SYSTEM },
+          { role: 'user', content: String(text).slice(0, 1000) },
+        ],
+      }),
+    });
+    if (!res.ok) throw new Error(`OpenRouter ${res.status}`);
+    const data = await res.json();
+    return ((data.choices || [{}])[0].message || {}).content || '';
+  }
+
+  // Прямой вызов Anthropic API
   if (p === 'anthropic') {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -276,13 +248,14 @@ async function callModel(text) {
     return (data.content || []).map((c) => c.text || '').join('');
   }
 
+  // Прямой вызов OpenAI API
   if (p === 'openai') {
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       signal,
       headers: {
         'content-type': 'application/json',
-        authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        'authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
       },
       body: JSON.stringify({
         model: process.env.AI_MODEL || 'gpt-4o-mini',
@@ -298,7 +271,7 @@ async function callModel(text) {
     return ((data.choices || [{}])[0].message || {}).content || '';
   }
 
-  throw new Error('Нет провайдера');
+  throw new Error('Неизвестный провайдер в AI_PROVIDER');
 }
 
 const extractJson = (raw) => {
@@ -310,21 +283,9 @@ const extractJson = (raw) => {
 
 const DOC_TYPES = new Set(['sch', 'schdog', 'usl', 'upd', 'torg12', 'pp', 'dog']);
 
-/*
- * Намерения, которые просто открывают экран. Список закрытый: за каждым
- * стоит экран, который бот действительно умеет показать. Придуманное
- * моделью действие сюда не попадёт и станет unknown.
- */
 const SHOW_ACTIONS = ['debts', 'unpaid', 'docs', 'akt', 'cps', 'org',
   'recurring', 'billing', 'help', 'outofscope'];
 
-/**
- * Привести ответ модели к тому, чему можно верить.
- *
- * Всё, что придёт от модели, — это данные из ненадёжного источника: их
- * задаёт текст пользователя. Поэтому здесь не «разбор», а проверка: чужое
- * действие, неизвестный тип документа, отрицательная цена не проходят.
- */
 function sanitize(raw) {
   if (!raw || typeof raw !== 'object') return { action: 'unknown' };
   const action = String(raw.action || '');
@@ -341,16 +302,9 @@ function sanitize(raw) {
   return { action: 'draft', docType: raw.docType, who: String(raw.who || '').trim().slice(0, 200), items };
 }
 
-/**
- * Понять фразу.
- *
- * @param {string} text фраза пользователя
- * @param {number} userId кому считать расход
- * @returns {Promise<object>} намерение; {action:'unknown'} — не поняли
- */
 async function understand(text, userId) {
   const quick = quickParse(text);
-  if (quick) return { ...quick, source: 'local' };       // бесплатно
+  if (quick) return { ...quick, source: 'local' };
   if (!aiAvailable()) return { action: 'unknown', source: 'off' };
 
   const left = budget(userId);
