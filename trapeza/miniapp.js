@@ -26,6 +26,7 @@ const path = require('node:path');
 const bdb = require('./lib/bot-db');
 const billing = require('./lib/billing');
 const docService = require('./lib/doc-service');
+const docLink = require('./lib/doc-link');
 const dadata = require('./lib/dadata');
 const facsimile = require('./lib/facsimile');
 const mailer = require('./lib/mail');
@@ -92,6 +93,37 @@ function sendJson(res, code, obj) {
  * Простое ограничение частоты на пользователя: мини-апп не должен уметь
  * положить сервер, даже если в нём заклинит кнопку. Окно — минута.
  */
+/**
+ * Ответ на нерабочую ссылку — человеческий, а не «404 Not Found».
+ *
+ * Открывает её обычно не наш пользователь, а его клиент: он получил адрес в
+ * переписке и понятия не имеет, что такое «Первичка». Поэтому объясняем
+ * простыми словами, у кого спрашивать новый, и ничего не рассказываем о
+ * самом документе — ни номера, ни суммы, ни владельца.
+ */
+function sendLinkPage(res, code, text) {
+  const body = '<!doctype html><html lang="ru"><head><meta charset="utf-8">'
+    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<meta name="robots" content="noindex,nofollow">'
+    + '<title>Документ недоступен</title><style>'
+    + 'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;'
+    + 'font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;'
+    + 'color:#14171f;background:#f4f6fc;padding:24px}'
+    + '.b{max-width:420px;text-align:center;background:#fff;border-radius:16px;padding:32px 28px;'
+    + 'box-shadow:0 2px 18px rgba(20,23,31,.08)}'
+    + 'h1{font-size:20px;margin:0 0 10px;color:#1f2760}p{margin:0;color:#5a6172}'
+    + '</style></head><body><div class="b"><h1>Документ недоступен</h1>'
+    + `<p>${text}</p><p style="margin-top:10px">Попросите отправителя прислать новую.</p>`
+    + '</div></body></html>';
+  res.writeHead(code, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+    'X-Robots-Tag': 'noindex, nofollow',
+  });
+  return res.end(body);
+}
+
 const hits = new Map();
 /**
  * Забыть счётчики. Нужно самопроверке: она делает за секунды столько
@@ -519,6 +551,40 @@ const api = {
 
     if (to !== cp.email) bdb.updateCp(user.id, cp.id, { email: to });
     return { sent: to, remembered: to !== cp.email };
+  },
+
+  /**
+   * Ссылка на документ: показать, что уже роздано.
+   *
+   * Отдельным запросом, а не в списке документов: ссылка есть у единиц, а
+   * запрос к базе шёл бы на каждую строку журнала.
+   */
+  async 'GET /api/doc/link'({ user, url }) {
+    const id = Number(url.searchParams.get('id'));
+    if (!bdb.getDoc(user.id, id)) return { error: 'Документ не найден.' };
+    return { links: docLink.listFor(user.id, id), available: docLink.available(), days: docLink.DAYS() };
+  },
+
+  /** Сделать ссылку (или вернуть уже сделанную — их не плодим). */
+  async 'POST /api/doc/link'({ user, body }) {
+    const id = Number(body.id);
+    const doc = bdb.getDoc(user.id, id);
+    if (!doc) return { error: 'Документ не найден.' };
+    if (!docLink.available()) {
+      return { error: 'Ссылки пока не работают: у приложения нет своего адреса в интернете.' };
+    }
+    // Штампы те же, что и у файла: ссылка — это тот же документ, только
+    // собираемый в момент открытия.
+    const link = docLink.create(user.id, id, { stamp: docService.stampFor(doc, wantStamp(body)) });
+    if (!link) return { error: 'Не получилось сделать ссылку.' };
+    return { link };
+  },
+
+  /** Закрыть доступ по всем ссылкам на документ. */
+  async 'POST /api/doc/link/revoke'({ user, body }) {
+    const id = Number(body.id);
+    if (!bdb.getDoc(user.id, id)) return { error: 'Документ не найден.' };
+    return { revoked: docLink.revoke(user.id, id) };
   },
 
   /** Отметить документ оплаченным или снять отметку. */
@@ -1391,6 +1457,49 @@ const server = http.createServer(async (req, res) => {
       'Cache-Control': 'no-store',
     });
     return res.end(rec.file.buffer);
+  }
+
+  /*
+   * Документ по временной ссылке — единственный адрес, который открывается
+   * без подписи Telegram. Подпись здесь и не нужна: ссылку отправляют
+   * клиенту, у которого нашего бота нет и не будет. Секрет — сам токен.
+   *
+   * Что важно на этом адресе:
+   *   • не пускать поисковики (noindex) — иначе счета клиентов окажутся
+   *     в выдаче, и об этом узнают последними;
+   *   • не кэшировать: документ собирается заново на каждое открытие, и
+   *     исправленный счёт должен приходить исправленным;
+   *   • ограничить частоту по токену — на случай, если ссылку положат
+   *     туда, откуда её начнут дёргать без остановки;
+   *   • на любую беду отвечать одинаково: «ссылка больше не работает».
+   *     Различать «истекла» и «такой не было» незачем.
+   */
+  if (pathname.startsWith('/d/')) {
+    if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); return res.end('only GET'); }
+    const token = decodeURIComponent(pathname.slice(3));
+    if (tooOften(`d:${token}`, 60)) return sendLinkPage(res, 429, 'Слишком часто. Подождите минуту и обновите страницу.');
+    const link = docLink.resolve(token);
+    if (!link) return sendLinkPage(res, 404, 'Ссылка больше не работает.');
+    let built;
+    try {
+      built = await docService.rebuildDocument(link.userId, link.docId, { stamp: link.stamp });
+    } catch (e) {
+      console.error('miniapp: ссылка на документ', e.message);
+      return sendLinkPage(res, 500, 'Не получилось собрать документ. Попробуйте позже.');
+    }
+    if (!built.ok) return sendLinkPage(res, 404, 'Ссылка больше не работает.');
+    docLink.touch(link.id);
+    res.writeHead(200, {
+      'Content-Type': built.file.mime,
+      'Content-Length': built.file.buffer.length,
+      // inline, а не attachment: человек открыл ссылку на телефоне и хочет
+      // увидеть документ, а не найти его потом в «Загрузках».
+      'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(built.file.filename)}`,
+      'Cache-Control': 'no-store',
+      'X-Robots-Tag': 'noindex, nofollow',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    return res.end(req.method === 'HEAD' ? undefined : built.file.buffer);
   }
 
   if (!pathname.startsWith('/api/')) {

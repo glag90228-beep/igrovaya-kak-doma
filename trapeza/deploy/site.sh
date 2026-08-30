@@ -111,6 +111,16 @@ server {
         proxy_set_header X-Forwarded-Proto \$scheme;
         client_max_body_size 4m;      # выписка и снимки счетов
     }
+    # Документ по временной ссылке: /d/<токен>. Открывает его клиент нашего
+    # пользователя, у которого ни Telegram-бота, ни приложения нет, — поэтому
+    # адрес отдельный и без подписи. Собирается документ на лету, отсюда и
+    # запас по времени: PDF через Chromium это около секунды.
+    location /d/ {
+        proxy_pass http://127.0.0.1:$MINIAPP_PORT/d/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 60s;
+    }
 
     # Картинки и снимки экрана не меняются — пусть браузер их запоминает.
     location ~* \.(webp|png|jpg|svg|ico|woff2)\$ {

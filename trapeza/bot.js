@@ -29,6 +29,7 @@ const dadata = require('./lib/dadata');
 const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
 const reqCheck = require('./lib/requisites-check');
 const docService = require('./lib/doc-service');
+const docLink = require('./lib/doc-link');
 const facsimile = require('./lib/facsimile');
 const mailer = require('./lib/mail');
 const mailbox = require('./lib/mailbox');
@@ -1151,6 +1152,14 @@ async function showDoc(tg, chatId, user, docId) {
   if (d.paid_at && d.type !== 'akt') {
     rows.push([{ text: '🔵 Копия со штампом «Оплачено»', data: `doc.paidcopy:${d.id}` }]);
   }
+  // Ссылка для клиента: её отправляют в переписку вместо файла. Показываем
+  // ту, что уже роздана, — чтобы не плодить адреса и было что отозвать.
+  const link = docLink.available() ? docLink.activeFor(user.id, d.id) : null;
+  if (docLink.available()) {
+    rows.push([link
+      ? { text: '🚫 Отозвать ссылку', data: `doc.unlink:${d.id}` }
+      : { text: '🔗 Ссылка для клиента', data: `doc.link:${d.id}` }]);
+  }
   const payable = ['sch', 'usl', 'upd', 'torg12'].includes(d.type) && d.total > 0;
   if (payable) {
     rows.push([d.paid_at
@@ -1179,6 +1188,8 @@ async function showDoc(tg, chatId, user, docId) {
     + (d.total ? `Сумма: <b>${formatRub(d.total)}</b>\n` : '')
     + (payable ? `Оплата: <b>${d.paid_at ? `получена ${ru(d.paid_at)}` : 'не отмечена'}</b>\n` : '')
     + (d.no_debt ? 'Долг по этому документу отменён вручную.\n' : '')
+    + (link ? `\n🔗 ${esc(link.url)}\nдействует до ${ru(link.expiresAt.slice(0, 10))}`
+      + `, ${link.opens ? `открывали ${link.opens} ${plural(link.opens, 'раз', 'раза', 'раз')}` : 'ещё не открывали'}\n` : '')
     + (items ? `\n${items}` : ''),
     keyboard(rows));
 }
@@ -4125,6 +4136,46 @@ async function handleCallback(tg, cq) {
     // счёт то уходит клиенту с отметкой об оплате, то подшивается без неё.
     if (data.startsWith('doc.paidcopy:')) {
       await resendDoc(tg, chatId, user, Number(data.slice(13)), { paid: true });
+      return;
+    }
+    /*
+     * Ссылка для клиента. Отдаём её отдельным сообщением, а не только в
+     * карточке: из чата ссылку пересылают одним нажатием, а карточку с
+     * кнопками пересылать неудобно.
+     */
+    if (data.startsWith('doc.link:')) {
+      const docId = Number(data.slice(9));
+      const d = bdb.getDoc(user.id, docId);
+      if (!d) { await tg.sendMessage(chatId, 'Документ не найден.', mainMenu()); return; }
+      const made = docLink.create(user.id, docId);
+      if (!made) {
+        await tg.sendMessage(chatId,
+          'Ссылки пока не работают: у приложения нет своего адреса в интернете.');
+        return;
+      }
+      // Кнопка «Отправить клиенту» — это встроенный в Telegram выбор чата:
+      // человек выбирает получателя и отправляет, не копируя адрес руками.
+      const share = 'https://t.me/share/url?url='
+        + `${encodeURIComponent(made.url)}&text=`
+        + encodeURIComponent(`${d.title} № ${d.number} от ${ru(d.date)}`);
+      await tg.sendMessage(chatId,
+        `🔗 Ссылка на <b>${esc(d.title)} № ${esc(d.number)}</b>:\n\n${esc(made.url)}\n\n`
+        + `Действует до ${ru(made.expiresAt.slice(0, 10))}. Отправьте её клиенту — `
+        + 'документ откроется у него в браузере, скачивать ничего не нужно. '
+        + 'Если передумаете, ссылку можно отозвать в карточке документа.',
+        keyboard([
+          [{ text: '📤 Отправить клиенту', url: share }],
+          [{ text: '↩️ К документу', data: `doc:${docId}` }],
+        ]));
+      return;
+    }
+    if (data.startsWith('doc.unlink:')) {
+      const docId = Number(data.slice(11));
+      const n = docLink.revoke(user.id, docId);
+      await tg.sendMessage(chatId, n
+        ? 'Отозвал. По старой ссылке документ больше не откроется.'
+        : 'Действующих ссылок на этот документ нет.');
+      await showDoc(tg, chatId, user, docId);
       return;
     }
     if (data.startsWith('doc.mail:')) { await mailDoc(tg, chatId, user, Number(data.slice(9))); return; }

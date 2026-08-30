@@ -275,6 +275,42 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   ok(last().includes('Доставка'), 'в карточке документа видны позиции');
   await tap(`doc.get:${docBtn.split(':')[1]}`);
   ok(files.length === 6 && files[5].caption.includes('копия'), 'файл высылается заново', files[5].filename);
+
+  {
+    /*
+     * Ссылка для клиента. Без адреса сайта её не бывает — и кнопки тоже
+     * быть не должно: обещать то, чего нет, хуже, чем не обещать.
+     */
+    const docId = Number(docBtn.split(':')[1]);
+    const wasPublic = process.env.PUBLIC_URL;
+    // button() ищет по всей переписке, поэтому перед каждой проверкой
+    // очищаем её: иначе кнопка находится в карточке, показанной шагом раньше.
+    delete process.env.PUBLIC_URL;
+    sent.length = 0;
+    await tap(`doc:${docId}`);
+    ok(!button('Ссылка для клиента'), 'без адреса сайта кнопки ссылки нет');
+
+    process.env.PUBLIC_URL = 'https://pervichkaru.ru';
+    sent.length = 0;
+    await tap(`doc:${docId}`);
+    ok(Boolean(button('Ссылка для клиента')), 'с адресом кнопка появилась');
+    await tap(`doc.link:${docId}`);
+    ok(/https:\/\/pervichkaru\.ru\/d\/[A-Za-z0-9_-]{20,}/.test(last()),
+      'бот прислал ссылку на документ', last().slice(0, 80));
+    sent.length = 0;
+    await tap(`doc:${docId}`);
+    ok(Boolean(button('Отозвать ссылку')),
+      'в карточке теперь предлагают отозвать, а не выдать ещё одну');
+    ok(last().includes('ещё не открывали'), 'и видно, открывал ли её клиент');
+    await tap(`doc.unlink:${docId}`);
+    sent.length = 0;
+    await tap(`doc:${docId}`);
+    ok(!button('Отозвать ссылку'), 'после отзыва карточка снова предлагает выдать');
+    ok(Boolean(button('Ссылка для клиента')), 'и снова предлагает выдать новую');
+
+    if (wasPublic === undefined) delete process.env.PUBLIC_URL;
+    else process.env.PUBLIC_URL = wasPublic;
+  }
   await tap(`d.rep:${docBtn.split(':')[1]}`);
   ok(last().includes('Итого'), 'повтор открыл сводку с теми же позициями');
   await tap('doc.make');

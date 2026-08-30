@@ -765,6 +765,87 @@ screens.doc = async function docScreen({ id }) {
     }
   }
 
+  /*
+   * Ссылка на документ.
+   *
+   * Счёт клиенту чаще отправляют в переписке, чем почтой, а файл в переписке
+   * живёт плохо: на телефоне открывается через раз, в общем чате теряется, а
+   * после правки у получателя остаётся старая бумага. По ссылке документ
+   * собирается заново в момент открытия — и всегда свежий.
+   *
+   * Ссылка временная и её можно отозвать: кто её получил, тот и видит
+   * реквизиты с суммами, поэтому лежать в чужом чате вечно она не должна.
+   */
+  {
+    const info = await api('GET', `/api/doc/link?id=${d.id}`);
+    const linkBox = h('div', {});
+    const drawLink = (links) => {
+      linkBox.textContent = '';
+      if (!links.length) {
+        linkBox.append(h('p', {
+          class: 'small muted',
+          style: 'margin:0 18px 8px',
+          text: `Короткий адрес на этот документ — отправить клиенту в переписку. `
+            + `Действует ${info.days} ${plural(info.days, 'день', 'дня', 'дней')}, отозвать можно в любой момент.`,
+        }));
+        linkBox.append(h('div', { class: 'btn-wrap' }, h('button', {
+          class: 'btn secondary',
+          onclick: (e) => withBusy(e.currentTarget, async () => {
+            const r = await api('POST', '/api/doc/link', { id: d.id, stamp });
+            haptic('medium');
+            drawLink([r.link]);
+          }),
+        }, 'Сделать ссылку')));
+        return;
+      }
+      const one = links[0];
+      const box2 = h('div', { class: 'card' },
+        h('div', { class: 'row' },
+          h('span', { class: 'grow ellipsis small', text: one.url })),
+        h('div', { class: 'row' },
+          h('span', { class: 'grow muted small', text: `Действует до ${ru(one.expiresAt.slice(0, 10))}` }),
+          h('span', {
+            class: 'small muted',
+            text: one.opens ? `открывали ${one.opens} ${plural(one.opens, 'раз', 'раза', 'раз')}` : 'ещё не открывали',
+          })));
+      linkBox.append(box2);
+      linkBox.append(h('div', { class: 'btn-wrap' },
+        h('button', {
+          class: 'btn secondary',
+          onclick: () => shareToTelegram(one.url,
+            `${d.title} № ${d.number} от ${ru(d.date)}`),
+        }, 'Отправить в Telegram'),
+        h('button', {
+          class: 'btn ghost',
+          onclick: async (e) => {
+            try {
+              await navigator.clipboard.writeText(one.url);
+              haptic('medium');
+              toast('Ссылка скопирована');
+            } catch (_) {
+              // Буфер даёт не всякий браузер. Выделяем — скопирует руками.
+              toast('Скопируйте адрес вручную', true);
+              e.currentTarget.blur();
+            }
+          },
+        }, 'Скопировать'),
+        h('button', {
+          class: 'btn ghost',
+          onclick: (e) => withBusy(e.currentTarget, async () => {
+            await api('POST', '/api/doc/link/revoke', { id: d.id });
+            haptic('medium');
+            toast('Ссылка больше не работает');
+            drawLink([]);
+          }),
+        }, 'Отозвать')));
+    };
+    if (info.available) {
+      box.append(h('div', { class: 'section-title', text: 'Ссылка на документ' }));
+      drawLink(info.links || []);
+      box.append(linkBox);
+    }
+  }
+
   // Главное действие на экране одно. Если у счёта не отмечена оплата —
   // главное это она; пересылка файла тогда вторична.
   box.append(h('div', { class: 'btn-wrap' },
@@ -3115,6 +3196,23 @@ function download(file) {
   document.body.append(a);
   a.click();
   a.remove();
+}
+
+/**
+ * Отправить ссылку в Telegram — выбрать чат и переслать.
+ *
+ * openTelegramLink, а не openLink: первый открывает выбор чата внутри
+ * приложения, второй уводит в браузер, где та же ссылка просто снова
+ * попросит открыть Telegram. Если ни того, ни другого нет (открыли в
+ * обычном вебе), остаётся обычный переход.
+ */
+function shareToTelegram(url, text) {
+  const share = `https://t.me/share/url?url=${encodeURIComponent(url)}`
+    + `&text=${encodeURIComponent(text || '')}`;
+  haptic('medium');
+  if (tg && typeof tg.openTelegramLink === 'function') { tg.openTelegramLink(share); return; }
+  if (tg && typeof tg.openLink === 'function') { tg.openLink(share); return; }
+  window.open(share, '_blank');
 }
 
 screens.new = async function newDoc(params) {

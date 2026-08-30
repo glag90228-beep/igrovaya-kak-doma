@@ -322,6 +322,77 @@ async function main() {
   });
   ok(r.status === 200 && r.json.stamp === null, 'мусор вместо штампов просто игнорируется');
 
+  console.log('\n── временная ссылка на документ ──');
+  {
+    const docLink = require('./lib/doc-link');
+    const wasPublic = process.env.PUBLIC_URL;
+    const wasApp = process.env.WEBAPP_URL;
+
+    // Без своего адреса в интернете ссылку делать не из чего — и об этом
+    // надо сказать, а не выдать «https://undefined/d/…».
+    delete process.env.PUBLIC_URL;
+    delete process.env.WEBAPP_URL;
+    r = await call('POST', '/api/doc/link', { user: masha, body: { id: withItems.id } });
+    ok(r.status === 400 && /адрес/.test(r.json.error || ''),
+      'без адреса сайта ссылку не обещаем', (r.json || {}).error);
+
+    process.env.PUBLIC_URL = 'https://pervichkaru.ru';
+    r = await call('POST', '/api/doc/link', { user: masha, body: { id: withItems.id } });
+    const link = r.json.link;
+    ok(r.status === 200 && /^https:\/\/pervichkaru\.ru\/d\/[A-Za-z0-9_-]{20,}$/.test(link.url),
+      'ссылка выдана и ведёт на наш домен', link && link.url);
+
+    r = await call('POST', '/api/doc/link', { user: masha, body: { id: withItems.id } });
+    ok(r.json.link.token === link.token,
+      'второе нажатие отдаёт ту же ссылку, а не плодит новые');
+
+    // Главное здесь: адрес открывается без подписи Telegram — его открывает
+    // клиент, у которого нашего бота нет.
+    const token = link.url.split('/d/')[1];
+    r = await call('GET', `/d/${token}`);
+    ok(r.status === 200, 'документ по ссылке открывается без подписи', r.status);
+    ok(/noindex/.test(r.headers.get('x-robots-tag') || ''),
+      'поисковику вход закрыт заголовком, а не только robots.txt',
+      r.headers.get('x-robots-tag'));
+    ok((r.headers.get('cache-control') || '').includes('no-store'),
+      'и не кэшируется: исправленный счёт должен приходить исправленным');
+    ok(/inline/.test(r.headers.get('content-disposition') || ''),
+      'открывается в браузере, а не падает в «Загрузки»',
+      r.headers.get('content-disposition'));
+
+    r = await call('GET', `/api/doc/link?id=${withItems.id}`, { user: masha });
+    ok(r.json.links[0] && r.json.links[0].opens === 1,
+      'открытие посчитано — владельцу видно, дошёл ли документ',
+      r.json.links[0] && r.json.links[0].opens);
+
+    r = await call('GET', '/d/этоНеТокен');
+    ok(r.status === 404 && /Документ недоступен/.test(r.text),
+      'на выдуманный токен — человеческая страница, а не голый 404', r.status);
+
+    // Чужую ссылку не отозвать: иначе любой мог бы закрыть доступ к чужому
+    // документу, зная только его номер в базе.
+    r = await call('POST', '/api/doc/link/revoke', { user: petya, body: { id: withItems.id } });
+    ok(r.status === 400, 'чужой документ не отозвать', (r.json || {}).error);
+    r = await call('GET', `/d/${token}`);
+    ok(r.status === 200, 'и ссылка после этой попытки жива');
+
+    r = await call('POST', '/api/doc/link/revoke', { user: masha, body: { id: withItems.id } });
+    ok(r.json.revoked === 1, 'владелец отзывает', JSON.stringify(r.json));
+    r = await call('GET', `/d/${token}`);
+    ok(r.status === 404, 'после отзыва документ по ссылке не открывается', r.status);
+
+    // Истёкшая ссылка мертва так же, как отозванная.
+    const fresh = docLink.create(bdb.getOrCreateUser(MASHA.id).id, withItems.id);
+    require('./db').db.prepare('UPDATE doc_links SET expires_at = ? WHERE token = ?')
+      .run('2020-01-01T00:00:00.000Z', fresh.token);
+    r = await call('GET', `/d/${fresh.token}`);
+    ok(r.status === 404, 'истёкшая ссылка тоже закрыта', r.status);
+    ok(docLink.resolve(fresh.token) === null, 'и в базе она больше не находится');
+
+    if (wasPublic === undefined) delete process.env.PUBLIC_URL; else process.env.PUBLIC_URL = wasPublic;
+    if (wasApp === undefined) delete process.env.WEBAPP_URL; else process.env.WEBAPP_URL = wasApp;
+  }
+
   console.log('\n── подсказки по реквизитам ──');
   r = await call('POST', '/api/lookup', { user: masha, body: { inn: '7712345678' } });
   ok(r.status === 200 && r.json.party && r.json.party.name === 'ООО «Ромашка»',
@@ -1029,6 +1100,14 @@ async function main() {
   const results = await Promise.all(flood);
   const limited = results.filter((x) => x.status === 429).length;
   ok(limited > 0, 'слишком частые запросы получают отказ', `${limited} из 130`);
+  /*
+   * Дальше счётчик сбрасываем. Самопроверка успевает сделать за секунду
+   * больше сотни запросов от одного пользователя — столько человек не
+   * сделает и за час, — и следующая же добавленная проверка упирается в
+   * предел, падая там, где проверяет совсем не его. Сам предел проверен
+   * прямо здесь, выше, и от сброса не страдает.
+   */
+  require('./miniapp').forgetRate();
 
   console.log('\n── разбор позиций (сервис) ──');
   const clean = docService.cleanItems([
@@ -1087,13 +1166,6 @@ async function main() {
 
   console.log('\n── акты всем должникам ──');
   {
-    /*
-     * Счётчик частоты сбрасываем: к этому месту самопроверка успевает
-     * сделать за секунду больше сотни запросов от одного пользователя, и
-     * следующая же добавленная проверка упирается в предел — падая там,
-     * где проверяет совсем не его. Сам предел проверен выше, отдельно.
-     */
-    require('./miniapp').forgetRate();
     /*
      * Этот адрес отвечал 500 с самого своего появления: в него передавали
      * row.cpId, а debtors() отдаёт row.cp. Ни один тест его не вызывал —
