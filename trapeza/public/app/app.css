@@ -465,6 +465,12 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   background: none; color: var(--text); font: 400 14px/1 var(--font);
   display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
 }
+/* Чип-переключатель: им отмечают штампы на копии документа. Нажатое
+   состояние должно читаться само, без подписи «включено» рядом. */
+.chip[aria-pressed="true"] {
+  border-color: var(--primary); color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+}
 
 .total-row {
   display: flex; justify-content: space-between; align-items: baseline;

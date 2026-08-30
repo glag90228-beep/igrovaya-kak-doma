@@ -15,6 +15,7 @@
  */
 
 const bdb = require('./bot-db');
+const { withStamps } = require('./doc-html');
 const { round2, vatTotals } = require('./money');
 const facsimile = require('./facsimile');
 const { pdfAvailable, htmlToPdf } = require('./pdf');
@@ -223,11 +224,31 @@ async function issueDocument(userId, {
 }
 
 /**
+ * Какие штампы поставить на копию — с проверкой по базе.
+ *
+ * «Оплачено» ставится только тогда, когда оплата действительно отмечена.
+ * Это не придирка: документ со штампом уходит контрагенту и в банк, и
+ * галочка в интерфейсе не должна уметь напечатать на бумаге то, чего в
+ * учёте нет. Дата берётся из базы по той же причине.
+ *
+ * @param {object} saved строка документа из журнала
+ * @param {{paid?:boolean, copy?:boolean}} want что попросили
+ */
+function stampFor(saved, want) {
+  if (!want) return null;
+  const paid = Boolean(want.paid) && Boolean(saved.paid_at);
+  const copy = Boolean(want.copy);
+  return paid || copy ? { paid, copy, paidAt: saved.paid_at || '' } : null;
+}
+
+/**
  * Пересобирает ранее выписанный документ по сохранённым данным.
  * Журнал хранит не файл, а поля — поэтому копия всегда свежая
  * и не занимает места, а номер и дата остаются прежними.
+ *
+ * @param {object} [opts] opts.stamp — {paid, copy}, см. stampFor
  */
-async function rebuildDocument(userId, docId) {
+async function rebuildDocument(userId, docId, opts = {}) {
   const saved = bdb.getDoc(userId, Number(docId));
   if (!saved) return fail('notfound', 'Документ не найден.');
 
@@ -278,15 +299,18 @@ async function rebuildDocument(userId, docId) {
   const cp = cp0;
 
   const doc = { number: saved.number, date: saved.date, ...saved.payload };
+  const stamp = stampFor(saved, opts.stamp);
   const file = await renderFile(
-    kind.build({ org: withFx(userId, org, saved.type), cp, doc }),
+    withStamps(kind.build({ org: withFx(userId, org, saved.type), cp, doc }), stamp),
     `${kind.file}_${safeName(saved.number)}_${safeName(cp.name)}`,
   );
-  return { ok: true, file, title: saved.title || kind.title, doc: saved, total: saved.total };
+  return {
+    ok: true, file, stamp, title: saved.title || kind.title, doc: saved, total: saved.total,
+  };
 }
 
 module.exports = {
   ITEM_DOCS, OTHER_DOCS, ALL_DOCS,
-  issueDocument, rebuildDocument, renderFile,
+  issueDocument, rebuildDocument, renderFile, stampFor,
   totalOf, cleanItems, safeName, todayISO,
 };

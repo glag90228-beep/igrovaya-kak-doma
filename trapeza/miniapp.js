@@ -93,6 +93,12 @@ function sendJson(res, code, obj) {
  * положить сервер, даже если в нём заклинит кнопку. Окно — минута.
  */
 const hits = new Map();
+/**
+ * Забыть счётчики. Нужно самопроверке: она делает за секунды столько
+ * запросов, сколько человек не сделает и за час, и упирается в предел там,
+ * где проверяет совсем другое. В работе не вызывается.
+ */
+function forgetRate() { hits.clear(); }
 function tooOften(userId, limit = 120) {
   const now = Date.now();
   const rec = hits.get(userId);
@@ -223,6 +229,17 @@ function docBrief(d) {
     noDebt: Boolean(d.no_debt),
     items: (d.payload && d.payload.items) || [],
   };
+}
+
+/**
+ * Какие штампы просит приложение. Пришло из браузера — значит, ничему тут
+ * верить нельзя: приводим к двум булевым и отдаём дальше, а можно ли на
+ * самом деле поставить «Оплачено», решает doc-service по базе.
+ */
+function wantStamp(body) {
+  const s = body && body.stamp;
+  if (!s || typeof s !== 'object') return null;
+  return { paid: Boolean(s.paid), copy: Boolean(s.copy) };
 }
 
 function cpBrief(userId, cp) {
@@ -471,7 +488,7 @@ const api = {
     const to = str(body.email, 254) || cp.email;
     if (!mailer.validEmail(to)) return { error: 'Укажите правильный адрес почты.' };
 
-    const built = await docService.rebuildDocument(user.id, doc.id);
+    const built = await docService.rebuildDocument(user.id, doc.id, { stamp: wantStamp(body) });
     if (!built.ok) return { error: built.message };
 
     const org = bdb.getOrg(user.id, doc.org_id) || bdb.getDefaultOrg(user.id) || {};
@@ -1270,7 +1287,7 @@ const api = {
 
   /** Прислать копию ранее выписанного. */
   async 'POST /api/doc/resend'({ user, body }) {
-    const res = await docService.rebuildDocument(user.id, Number(body.id));
+    const res = await docService.rebuildDocument(user.id, Number(body.id), { stamp: wantStamp(body) });
     if (!res.ok) return { error: res.message };
     const token = keepFile(user.id, res.file);
     if (tg) {
@@ -1280,7 +1297,10 @@ const api = {
         caption: `${res.title} № ${res.doc.number} — копия.`,
       }).catch(() => {});
     }
-    return { file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf } };
+    return {
+      file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf },
+      stamp: res.stamp || null,
+    };
   },
 };
 
@@ -1425,4 +1445,4 @@ if (require.main === module) {
   server.listen(PORT, HOST, () => console.log(`Мини-приложение слушает ${HOST}:${PORT}`));
 }
 
-module.exports = { server, api, stateFor, setTelegram };
+module.exports = { server, api, stateFor, setTelegram, forgetRate };

@@ -18,7 +18,8 @@ function ru(iso) {
 const CSS = `
   * { box-sizing: border-box; }
   body { margin: 0; font-family: Arial, "DejaVu Sans", sans-serif; color: #14171f; font-size: 12px; line-height: 1.4; }
-  .doc { padding: 4px 2px; }
+  /* position: relative нужен штампам ниже — они висят поверх бланка. */
+  .doc { padding: 4px 2px; position: relative; }
   h1 { font-size: 20px; color: #1f2760; margin: 0 0 2px; }
   h1.center, .center { text-align: center; }
   .muted { color: #5a6172; }
@@ -71,7 +72,30 @@ const CSS = `
   /* ТОРГ-12 и блок передачи УПД плотнее: там под линией сразу следующая
      графа, поэтому печать меньше и прижата ближе к линии. */
   .fx-stamp--tight { height: 78px; bottom: -46px; right: 8px; }
-  @media print { .fx { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+  /* Штампы «Оплачено» и «Копия» — оттиск в правом нижнем углу бланка.
+     Наклон и полупрозрачность не украшение: живой штамп ложится криво и
+     просвечивает бумагу под собой, а ровный непрозрачный прямоугольник
+     читается как часть бланка, а не как отметка поверх него.
+
+     Под штампы отводится место внизу листа (.has-stamps), и вот почему.
+     У правого конца линии подписи висит факсимильная печать (.fx-stamp) —
+     она уходит на 62px ниже линии, то есть ровно туда, где иначе оказался
+     бы штамп. Наложить синее «ОПЛАЧЕНО» на оттиск печати — испортить оба.
+     Поэтому штамп встаёт под подписями, а не поверх них. */
+  .doc.has-stamps { padding-bottom: 156px; }
+  .stamps { position: absolute; right: 0; bottom: 6px; display: flex;
+            flex-direction: column; align-items: flex-end; gap: 8px; }
+  .stamp { border: 2px solid currentColor; border-radius: 3px;
+           padding: 3px 12px 4px; text-align: center; opacity: .8;
+           transform: rotate(-7deg); }
+  .stamp b { display: block; font-size: 16px; letter-spacing: .09em; }
+  .stamp i { display: block; font-style: normal; font-weight: bold;
+             font-size: 10px; letter-spacing: .04em; margin-top: 1px; }
+  .stamp--paid { color: #1b56b4; }
+  .stamp--copy { color: #6a7185; }
+  @media print {
+    .fx, .stamp { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  }
 `;
 
 /**
@@ -93,6 +117,46 @@ function fxHtml(fx, opts = {}) {
     parts.push(`<img class="${cls}" src="${fx.stamp}" alt="">`);
   }
   return parts.length ? `<span class="fx-box">${parts.join('')}</span>` : '';
+}
+
+/**
+ * Штампы «Оплачено» и «Копия».
+ *
+ * Зачем. Счёт, по которому деньги пришли, и счёт, который ждёт оплаты, —
+ * это два разных документа для того, кто держит их в руках. В базе отметка
+ * об оплате есть (documents.paid_at), но в файле её не было видно, и
+ * бухгалтерия покупателя, получив копию, снова шла спрашивать, оплачено или
+ * нет. Штамп отвечает на этот вопрос с одного взгляда.
+ *
+ * Дата в штампе — та самая, что стоит в базе, а не «сегодня». Штамп с
+ * произвольной датой был бы выдумкой в документе, который уходит наружу.
+ *
+ * @param {{paid?:boolean, paidAt?:string, copy?:boolean}} stamp
+ */
+function stampsHtml(stamp) {
+  if (!stamp) return '';
+  const out = [];
+  if (stamp.paid) {
+    const when = ru(stamp.paidAt || '');
+    out.push('<span class="stamp stamp--paid"><b>ОПЛАЧЕНО</b>'
+      + (when ? `<i>${esc(when)}</i>` : '') + '</span>');
+  }
+  if (stamp.copy) out.push('<span class="stamp stamp--copy"><b>КОПИЯ</b></span>');
+  return out.length ? `<div class="stamps">${out.join('')}</div>` : '';
+}
+
+/**
+ * Вклеивает штампы в собранный бланк.
+ *
+ * Отдельной функцией, а не параметром page(), намеренно: шаблонов документов
+ * семь, и каждому пришлось бы тащить через себя поле, к содержанию документа
+ * отношения не имеющее. Штамп — это то, что делают с готовой бумагой, вот и
+ * в коде он накладывается на готовый HTML.
+ */
+function withStamps(html, stamp) {
+  const mark = stampsHtml(stamp);
+  if (!mark) return html;
+  return html.replace('<div class="doc">', `<div class="doc has-stamps">${mark}`);
 }
 
 /**
@@ -156,5 +220,6 @@ function page(title, body) {
 }
 
 module.exports = {
-  esc, ru, page, fxHtml, isIp, signRows, usnNote, formatMoney, formatRub, amountInWords,
+  esc, ru, page, fxHtml, stampsHtml, withStamps, isIp, signRows, usnNote,
+  formatMoney, formatRub, amountInWords,
 };

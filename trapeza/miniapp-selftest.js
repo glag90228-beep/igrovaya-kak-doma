@@ -302,6 +302,26 @@ async function main() {
   r = await call('POST', '/api/doc/resend', { user: petya, body: { id: docs[0].id } });
   ok(r.status === 400, 'чужой документ не пересобрать', (r.json || {}).error);
 
+  /*
+   * Штампы приходят из браузера, а значит, могут прийти любыми. Проверяем
+   * не вёрстку — её проверяет bot-selftest, — а то, что просьба напечатать
+   * «Оплачено» на неоплаченном счёте до бумаги не доходит.
+   */
+  r = await call('POST', '/api/doc/resend', {
+    user: masha, body: { id: withItems.id, stamp: { paid: true } },
+  });
+  ok(r.status === 200 && r.json.stamp === null,
+    'штамп «Оплачено» на неоплаченном документе не поставлен', JSON.stringify(r.json.stamp));
+  r = await call('POST', '/api/doc/resend', {
+    user: masha, body: { id: withItems.id, stamp: { copy: 'да' } },
+  });
+  ok(r.status === 200 && r.json.stamp && r.json.stamp.copy === true,
+    'строка вместо галочки приведена к «да», а не сломала сборку');
+  r = await call('POST', '/api/doc/resend', {
+    user: masha, body: { id: withItems.id, stamp: 'ОПЛАЧЕНО' },
+  });
+  ok(r.status === 200 && r.json.stamp === null, 'мусор вместо штампов просто игнорируется');
+
   console.log('\n── подсказки по реквизитам ──');
   r = await call('POST', '/api/lookup', { user: masha, body: { inn: '7712345678' } });
   ok(r.status === 200 && r.json.party && r.json.party.name === 'ООО «Ромашка»',
@@ -1067,6 +1087,13 @@ async function main() {
 
   console.log('\n── акты всем должникам ──');
   {
+    /*
+     * Счётчик частоты сбрасываем: к этому месту самопроверка успевает
+     * сделать за секунду больше сотни запросов от одного пользователя, и
+     * следующая же добавленная проверка упирается в предел — падая там,
+     * где проверяет совсем не его. Сам предел проверен выше, отдельно.
+     */
+    require('./miniapp').forgetRate();
     /*
      * Этот адрес отвечал 500 с самого своего появления: в него передавали
      * row.cpId, а debtors() отдаёт row.cp. Ни один тест его не вызывал —

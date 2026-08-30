@@ -730,13 +730,48 @@ screens.doc = async function docScreen({ id }) {
       h('span', { class: 'money nowrap', text: money((Number(it.qty) || 0) * (Number(it.price) || 0)) })))));
   }
 
+  /*
+   * Штампы на копии. Акт сверки сюда не попадает: он приходит таблицей
+   * Excel, а не бланком, и штамповать в нём нечего.
+   *
+   * Состояние живёт прямо здесь, а не в базе: штамп — это свойство копии,
+   * которую сейчас печатают, а не самого документа. Один и тот же счёт
+   * сегодня уходит клиенту со штампом «Оплачено», а завтра подшивается
+   * без него.
+   */
+  const stamp = { paid: false, copy: false };
+  if (d.type !== 'akt') {
+    const chip = (key, label) => {
+      const b = h('button', { class: 'chip', type: 'button', 'aria-pressed': 'false' }, label);
+      b.onclick = () => {
+        stamp[key] = !stamp[key];
+        b.setAttribute('aria-pressed', String(stamp[key]));
+        haptic('light');
+      };
+      return b;
+    };
+    const chips = [chip('copy', 'Копия')];
+    // «Оплачено» предлагаем только тогда, когда оплата отмечена в журнале.
+    // Штамп — это утверждение о деньгах, и придумывать его нельзя.
+    if (d.paidAt) chips.unshift(chip('paid', `Оплачено ${ru(d.paidAt)}`));
+    box.append(h('div', { class: 'section-title', text: 'Штамп на копии' }));
+    box.append(h('div', { class: 'chips' }, chips));
+    if (!d.paidAt && ['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) && d.total) {
+      box.append(h('p', {
+        class: 'small muted',
+        style: 'margin:-4px 18px 8px',
+        text: 'Штамп «Оплачено» появится здесь, когда вы отметите оплату.',
+      }));
+    }
+  }
+
   // Главное действие на экране одно. Если у счёта не отмечена оплата —
   // главное это она; пересылка файла тогда вторична.
   box.append(h('div', { class: 'btn-wrap' },
     h('button', {
       class: ['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) && d.total && !d.paidAt ? 'btn secondary' : 'btn',
       onclick: (e) => withBusy(e.currentTarget, async () => {
-        const r = await api('POST', '/api/doc/resend', { id: d.id });
+        const r = await api('POST', '/api/doc/resend', { id: d.id, stamp });
         toast('Файл отправлен в чат с ботом');
         haptic('medium');
         download(r.file);
@@ -770,7 +805,7 @@ screens.doc = async function docScreen({ id }) {
         clearErrors({ mailField });
         const to = mailField.input.value.trim();
         if (!to) { showError(mailField, 'Без адреса отправить некуда'); return; }
-        const r = await api('POST', '/api/doc/mail', { id: d.id, email: to });
+        const r = await api('POST', '/api/doc/mail', { id: d.id, email: to, stamp });
         toast(`Отправлено на ${r.sent}`);
         haptic('medium');
       }),

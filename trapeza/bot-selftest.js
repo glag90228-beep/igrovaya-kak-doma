@@ -3393,6 +3393,66 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     bdbD.updateOrg(uid, org.id, { debt_basis: was });
   }
 
+  console.log('\n── штампы «Оплачено» и «Копия» ──');
+  {
+    /*
+     * Штамп — это утверждение о деньгах, напечатанное на бумаге, которая
+     * уходит контрагенту. Поэтому проверяем не столько вёрстку, сколько
+     * запрет: галочка в приложении не должна уметь напечатать «Оплачено»
+     * на документе, оплата которого в журнале не отмечена.
+     */
+    const bdbS = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = bdbS.getOrCreateUser(556699, 'Штампы').id;
+    bdbS.createOrg(uid, { name: 'ИП Штамп', inn: '183209316101', signer: 'Штампов Ш.Ш.' });
+    const cpS = bdbS.createCp(uid, { name: 'ООО «Оттиск»', kind: 'customer', opening_date: '2026-01-01' });
+    const res = await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cpS, date: '2026-08-01',
+      items: [{ name: 'Работа', qty: 1, price: 1000 }], skipQuota: true,
+    });
+    const docId = res.doc.id;
+
+    ok(docSvc.stampFor({ paid_at: '' }, { paid: true }) === null,
+      'на неоплаченном документе штампа «Оплачено» не будет');
+    ok(docSvc.stampFor({ paid_at: '' }, { copy: true }).copy === true,
+      '«Копия» ставится и на неоплаченном — это не про деньги');
+    ok(docSvc.stampFor({ paid_at: '2026-08-20' }, { paid: true }).paidAt === '2026-08-20',
+      'дата в штампе берётся из журнала, а не из запроса');
+    ok(docSvc.stampFor({ paid_at: '2026-08-20' }, null) === null,
+      'без запроса штампов нет даже у оплаченного');
+
+    const plain = await docSvc.rebuildDocument(uid, docId);
+    ok(plain.ok && plain.stamp === null, 'обычная копия собирается без штампов');
+
+    const faked = await docSvc.rebuildDocument(uid, docId, { stamp: { paid: true } });
+    const fakedHtml = faked.file.pdf ? '' : faked.file.buffer.toString('utf8');
+    ok(faked.ok && faked.stamp === null,
+      'просьба проштамповать неоплаченный счёт молча отклонена');
+    if (fakedHtml) ok(!fakedHtml.includes('ОПЛАЧЕНО'), 'и в файле «ОПЛАЧЕНО» не появилось');
+
+    bdbS.markPaid(uid, docId, '2026-08-20');
+    const stamped = await docSvc.rebuildDocument(uid, docId, { stamp: { paid: true, copy: true } });
+    ok(stamped.stamp.paid && stamped.stamp.copy && stamped.stamp.paidAt === '2026-08-20',
+      'после отметки оплаты оба штампа разрешены');
+
+    // Разметку проверяем на самом шаблоне: PDF читать нечем, а вклейка
+    // штампа от типа файла не зависит.
+    const { withStamps } = require('./lib/doc-html');
+    const { buildSchetHtml } = require('./lib/schet');
+    const html = buildSchetHtml({
+      org: { name: 'ИП Штамп', inn: '183209316101', signer: 'Штампов Ш.Ш.' },
+      cp: { name: 'ООО «Оттиск»' },
+      doc: { number: '1', date: '2026-08-01', items: [{ name: 'Работа', qty: 1, price: 1000 }] },
+    });
+    const marked = withStamps(html, { paid: true, copy: true, paidAt: '2026-08-20' });
+    ok(marked.includes('ОПЛАЧЕНО'), 'штамп «Оплачено» попал в бланк');
+    ok(marked.includes('20.08.2026'), 'и дата в нём человеческая, а не ISO');
+    ok(marked.includes('КОПИЯ'), 'штамп «Копия» тоже');
+    ok(marked.includes('class="doc has-stamps"'),
+      'под штампы отведено место внизу листа — иначе они лягут на факсимиле');
+    ok(withStamps(html, null) === html, 'без штампов бланк не трогаем вовсе');
+  }
+
   console.log('\n── изоляция пользователей ──');
   const OTHER = { id: 777002, first_name: 'Чужой', username: 'other' };
   await handleUpdate(tg, { message: { chat: { id: 777002 }, from: OTHER, text: '/start' } });

@@ -1148,6 +1148,9 @@ async function showDoc(tg, chatId, user, docId) {
     .map((it, i) => `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n');
   const rows = [];
   rows.push([{ text: '📄 Прислать файл заново', data: `doc.get:${d.id}` }]);
+  if (d.paid_at && d.type !== 'akt') {
+    rows.push([{ text: '🔵 Копия со штампом «Оплачено»', data: `doc.paidcopy:${d.id}` }]);
+  }
   const payable = ['sch', 'usl', 'upd', 'torg12'].includes(d.type) && d.total > 0;
   if (payable) {
     rows.push([d.paid_at
@@ -1180,23 +1183,29 @@ async function showDoc(tg, chatId, user, docId) {
     keyboard(rows));
 }
 
-/** Повторная отправка файла по сохранённым данным. */
-async function resendDoc(tg, chatId, user, docId) {
-  const d = bdb.getDoc(user.id, docId);
-  if (!d) { await tg.sendMessage(chatId, 'Документ не найден.', mainMenu()); return; }
-  const org = bdb.getOrg(user.id, d.org_id) || bdb.getDefaultOrg(user.id);
-  const cp = bdb.getCp(user.id, d.cp_id);
-  if (!org || !cp) { await tg.sendMessage(chatId, 'Не хватает данных для сборки.', mainMenu()); return; }
-  const doc = { number: d.number, date: d.date, ...d.payload };
-  const kind = ITEM_DOCS[d.type]
-    || (d.type === 'pp' ? { build: buildPlatyozhkaHtml, file: 'Платежка' } : null)
-    || (d.type === 'dog' ? { build: buildDogovorHtml, file: 'Договор' } : null);
-  const build = kind && kind.build; const base = kind && kind.file;
-  if (!build) { await tg.sendMessage(chatId, 'Этот документ пересобрать нельзя.', mainMenu()); return; }
-  await sendGenerated(tg, chatId, {
-    html: build({ org, cp, doc }),
-    base: `${base}_${safeName(d.number)}_${safeName(cp.name)}`,
-    caption: `${esc(d.title)} № ${esc(d.number)} от ${ru(d.date)} — копия.`,
+/**
+ * Повторная отправка файла по сохранённым данным.
+ *
+ * Сборку делает doc-service — тот же код, что и в мини-приложении. Раньше
+ * здесь была своя копия сборки, и она собирала документ без факсимиле:
+ * оригинал уходил с подписью и печатью, а копия того же счёта — пустая.
+ *
+ * @param {{paid?:boolean, copy?:boolean}} [stamp] какие штампы поставить
+ */
+async function resendDoc(tg, chatId, user, docId, stamp = null) {
+  const built = await docService.rebuildDocument(user.id, docId, { stamp });
+  if (!built.ok) { await tg.sendMessage(chatId, esc(built.message), mainMenu()); return; }
+  const d = built.doc;
+  const marks = built.stamp
+    ? ` Штамп: ${[built.stamp.paid ? 'оплачено' : '', built.stamp.copy ? 'копия' : '']
+      .filter(Boolean).join(', ')}.` : '';
+  await tg.sendChatAction(chatId, 'upload_document');
+  await tg.sendDocument(chatId, {
+    filename: built.file.filename,
+    buffer: built.file.buffer,
+    caption: `${esc(built.title)} № ${esc(d.number)} от ${ru(d.date)} — копия.${marks}`
+      + (built.file.pdf ? ''
+        : '\n\n(PDF недоступен — откройте файл в браузере и распечатайте / сохраните в PDF.)'),
   });
 }
 
@@ -4112,6 +4121,12 @@ async function handleCallback(tg, cq) {
     if (data === 'docs') { await showDocs(tg, chatId, user); return; }
     if (data.startsWith('docs.cp:')) { await showDocs(tg, chatId, user, Number(data.slice(8))); return; }
     if (data.startsWith('doc.get:')) { await resendDoc(tg, chatId, user, Number(data.slice(8))); return; }
+    // Копия со штампом «Оплачено» — отдельной кнопкой, а не всегда: тот же
+    // счёт то уходит клиенту с отметкой об оплате, то подшивается без неё.
+    if (data.startsWith('doc.paidcopy:')) {
+      await resendDoc(tg, chatId, user, Number(data.slice(13)), { paid: true });
+      return;
+    }
     if (data.startsWith('doc.mail:')) { await mailDoc(tg, chatId, user, Number(data.slice(9))); return; }
     if (data.startsWith('doc.del:')) {
       bdb.deleteDoc(user.id, Number(data.slice(8)));
