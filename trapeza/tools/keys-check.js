@@ -37,7 +37,7 @@ const APP = path.join(__dirname, '..');
  * Здесь проверяется именно файл, поэтому файл и главнее. Расхождение
  * показываем: молча подменять окружение тоже нельзя.
  */
-const WATCH = ['ANTHROPIC_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
+const WATCH = ['ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
   'VISION_PROVIDER', 'VISION_MODEL', 'SPEECH_PROVIDER', 'AI_ENABLED', 'AI_MODEL', 'AI_PROVIDER'];
 const shadowed = [];
 try {
@@ -159,6 +159,94 @@ async function checkAnthropic(model, what) {
       return;
     }
     no(`${what}: ${why(res.status, body)}`);
+  } catch (e) {
+    no(`${what}: не достучались — ${e.message}`);
+  }
+}
+
+/**
+ * Разбор фразы через OpenRouter.
+ *
+ * Проверяем не «принял ли ключ», а то, ради чего всё затевалось: доходит ли
+ * до модели наша инструкция и возвращает ли она разбор, которому можно
+ * верить. Поэтому шлём настоящую фразу — такую, которую местные регулярки
+ * специально не ловят, — и смотрим на ответ глазами того же кода, что стоит
+ * в бою (ai.sanitize).
+ *
+ * Так ловится главная опасность смены модели: ключ рабочий, ответ приходит,
+ * а внутри вместо JSON — вежливое «Конечно, вот что я понял…». Бот на таком
+ * молча отвечает «не понял», и списать это на модель никто не догадается.
+ */
+async function checkOpenRouter(model, what) {
+  if (!process.env.OPENROUTER_API_KEY) { skip(`${what}: OPENROUTER_API_KEY не заполнен`); return; }
+  const dirty = checkAscii(process.env.OPENROUTER_API_KEY, 'OPENROUTER_API_KEY');
+  if (dirty) { no(`${what}: ${dirty}`); return; }
+
+  const PHRASE = 'надо бы выставить Заре за аренду тридцать тысяч';
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://pervichkaru.ru',
+        'X-Title': 'Pervichka App',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 400,
+        temperature: 0.1,
+        messages: [
+          { role: 'system', content: ai.SYSTEM },
+          { role: 'user', content: PHRASE },
+        ],
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+    const body = await res.text();
+
+    if (!res.ok) {
+      // 402 у OpenRouter — пустой баланс. Код редкий, а причина частая.
+      if (res.status === 402 || /insufficient|credits?/i.test(body)) {
+        no(`${what}: ключ рабочий, но на счету нет средств — пополните баланс OpenRouter`);
+        return;
+      }
+      if (res.status === 404 || /not a valid model|no endpoints/i.test(body)) {
+        no(`${what}: модели «${model}» у OpenRouter нет или она недоступна.\n`
+          + '      Список рабочих: https://openrouter.ai/models — возьмите id оттуда целиком.\n'
+          + `      Ответ: ${String(body).replace(/\s+/g, ' ').slice(0, 200)}`);
+        return;
+      }
+      no(`${what}: ${why(res.status, body)}`);
+      return;
+    }
+
+    let reply = '';
+    try {
+      reply = ((JSON.parse(body).choices || [{}])[0].message || {}).content || '';
+    } catch (_) { /* разберёмся ниже */ }
+    if (!reply) { no(`${what}: модель ответила пусто.\n      ${body.slice(0, 200)}`); return; }
+
+    // Тот же путь, что в бою: вытащить JSON и проверить его на допустимость.
+    let intent = null;
+    try {
+      const m = /\{[\s\S]*\}/.exec(reply);
+      intent = ai.sanitize(m ? JSON.parse(m[0]) : null);
+    } catch (_) { intent = { action: 'unknown' }; }
+
+    if (intent.action === 'draft') {
+      ok(`${what}: модель ${model} разобрала фразу — ${JSON.stringify(intent)}`);
+      return;
+    }
+    if (intent.action === 'unknown') {
+      no(`${what}: модель отвечает, но не по инструкции — вместо JSON пришло:\n`
+        + `      ${reply.replace(/\s+/g, ' ').slice(0, 200)}\n`
+        + '      Ключ и модель рабочие, но такой ответ бот понять не сможет.\n'
+        + '      Возьмите модель посильнее в AI_MODEL.');
+      return;
+    }
+    no(`${what}: разбор получился, но не тот — ждали «выписать документ», `
+      + `пришло ${JSON.stringify(intent)}`);
   } catch (e) {
     no(`${what}: не достучались — ${e.message}`);
   }
@@ -294,6 +382,7 @@ const ai = require(path.join(APP, 'lib/ai-agent'));
   const ap = String(process.env.AI_PROVIDER || 'anthropic').toLowerCase();
   if (process.env.AI_ENABLED !== '1') skip('Фразы: AI_ENABLED не 1 — свободный ввод выключен');
   else if (ap === 'anthropic') await checkAnthropic(process.env.AI_MODEL || ai.MODEL_DEFAULT, 'Фразы');
+  else if (ap === 'openrouter') await checkOpenRouter(process.env.AI_MODEL || ai.MODEL_DEFAULT, 'Фразы');
   else skip(`Фразы: провайдер ${ap} — этой проверкой не покрыт`);
 
   const sp = String(process.env.SPEECH_PROVIDER || '').toLowerCase();
