@@ -3566,6 +3566,40 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(norm(last()).includes('не применяю'), 'и экран говорит текущее состояние', norm(last()).slice(0, 80));
   }
 
+  console.log('\n── обещание на лендинге ──');
+  {
+    /*
+     * Страница обещает столько-то бесплатных документов в месяц, а выдаёт их
+     * бот. Разъезжались они молча: число в вёрстке правится руками, FREE_DOCS
+     * на сервере — переменной окружения, и ничто их не сверяло. Так и вышло —
+     * в вёрстке 5, на сервере 50. Обещать в рекламе не то, что даёшь, нельзя
+     * (ФЗ «О рекламе», ст. 5).
+     *
+     * Здесь проверяем то, что видно из репозитория: все обещания размечены и
+     * называют одно число, и это число — умолчание бота. Расхождение с живым
+     * сервером ловится при публикации (deploy/site.sh подставляет туда
+     * настоящее значение), отсюда до него не дотянуться.
+     */
+    const html = fs.readFileSync(path.join(__dirname, 'public/landing/index.html'), 'utf8');
+    const nums = [...html.matchAll(/class="[^"]*free-docs[^"]*">(\d+)</g)].map((m) => Number(m[1]));
+    ok(nums.length >= 4, 'обещания на странице размечены и находятся', nums.length);
+    ok(new Set(nums).size === 1, 'и все называют одно число', nums.join(', '));
+
+    // Сколько бот даёт по умолчанию — без переменной окружения.
+    const wasFree = process.env.FREE_DOCS;
+    delete process.env.FREE_DOCS;
+    const def = require('./lib/bot-db').quota(fxUserId()).limit;
+    if (wasFree === undefined) delete process.env.FREE_DOCS; else process.env.FREE_DOCS = wasFree;
+
+    ok(nums[0] === def, 'страница обещает ровно столько, сколько даёт бот',
+      `страница ${nums[0]}, бот ${def}`);
+
+    // Число внутри разметки, а не рядом с ней: иначе подстановка при
+    // публикации промахнётся и оставит на странице прежнее обещание.
+    ok(!/free-docs[^>]*>\s*<|free-docs[^>]*>\D/.test(html),
+      'число стоит прямо внутри разметки — подстановке есть за что взяться');
+  }
+
   console.log('\n── изоляция пользователей ──');
   const OTHER = { id: 777002, first_name: 'Чужой', username: 'other' };
   await handleUpdate(tg, { message: { chat: { id: 777002 }, from: OTHER, text: '/start' } });
