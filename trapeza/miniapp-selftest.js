@@ -42,7 +42,21 @@ const TOKEN = process.env.BOT_TOKEN;
 const bdb = require('./lib/bot-db');
 const { verifyInitData } = require('./lib/webapp-auth');
 const docService = require('./lib/doc-service');
-const { server, setTelegram } = require('./miniapp');
+const { server, setTelegram, forgetRate } = require('./miniapp');
+
+/**
+ * Заголовок раздела — и заодно сброс счётчика частоты.
+ *
+ * Предел в 120 запросов в минуту рассчитан на человека, который тычет в
+ * кнопки. Самопроверка делает столько за секунду, и очередная добавленная
+ * проверка начинает падать с 429 в разделе, который к частоте отношения не
+ * имеет. Сбрасываем на границе разделов: внутри раздела счётчик работает —
+ * там его и проверяем, залпом из 130 запросов.
+ */
+function section(name) {
+  forgetRate();
+  console.log(`\n── ${name} ──`);
+}
 
 let bad = 0;
 const ok = (cond, msg, extra) => {
@@ -95,7 +109,7 @@ async function main() {
   const masha = initDataFor(MASHA);
   const petya = initDataFor(PETYA);
 
-  console.log('\n── подпись и доступ ──');
+  section('подпись и доступ');
   let r = await call('GET', '/api/state');
   ok(r.status === 401, 'без подписи API не отвечает', r.status);
 
@@ -119,7 +133,7 @@ async function main() {
     r.json && r.json.user && r.json.user.tgId);
   ok(r.json.quota.limit === 2, 'лимит бесплатных берётся из настроек', r.json.quota.limit);
 
-  console.log('\n── организация и контрагенты ──');
+  section('организация и контрагенты');
   r = await call('POST', '/api/org', {
     user: masha,
     body: {
@@ -153,7 +167,7 @@ async function main() {
   r = await call('GET', '/api/cps', { user: masha });
   ok(r.json.cps[0].name === 'ООО «Заря»', 'название нашего контрагента не изменилось', r.json.cps[0].name);
 
-  console.log('\n── выписка документа ──');
+  section('выписка документа');
   sentToChat.length = 0;
   r = await call('POST', '/api/doc', {
     user: masha,
@@ -188,7 +202,7 @@ async function main() {
   });
   ok(r.status === 400 && /онтрагент/.test(r.json.error), 'на чужого контрагента выписать нельзя', r.json.error);
 
-  console.log('\n── лимит бесплатных ──');
+  section('лимит бесплатных');
   r = await call('POST', '/api/doc', {
     user: masha, body: { type: 'usl', cpId, items: [{ name: 'Услуга', qty: 1, price: 1000 }] },
   });
@@ -205,7 +219,7 @@ async function main() {
   });
   ok(r.status === 200 && r.json.total === 600, 'с подпиской лимит не мешает', r.json && r.json.total);
 
-  console.log('\n── код доступа ──');
+  section('код доступа');
   {
     const billing = require('./lib/billing');
     const petyaUser = bdb.getOrCreateUser(PETYA.id);
@@ -233,7 +247,7 @@ async function main() {
       r.json.error);
   }
 
-  console.log('\n── Excel: акт сверки и реестр ──');
+  section('Excel: акт сверки и реестр');
   {
     // Обе кнопки в приложении не работали: файл собирался, но уходил в
     // ссылку, которую Telegram скачать не даёт. Теперь он ещё и в чат.
@@ -259,7 +273,7 @@ async function main() {
     ok(r.status === 400, 'чужой акт сверки не собрать', (r.json || {}).error);
   }
 
-  console.log('\n── удаление документа ──');
+  section('удаление документа');
   {
     const before = (await call('GET', '/api/docs', { user: masha })).json.docs.length;
     const victim = (await call('POST', '/api/doc', {
@@ -277,7 +291,7 @@ async function main() {
   }
 
 
-  console.log('\n── журнал и копии ──');
+  section('журнал и копии');
   r = await call('GET', '/api/docs', { user: masha });
   const docs = r.json.docs;
   /*
@@ -322,7 +336,7 @@ async function main() {
   });
   ok(r.status === 200 && r.json.stamp === null, 'мусор вместо штампов просто игнорируется');
 
-  console.log('\n── временная ссылка на документ ──');
+  section('временная ссылка на документ');
   {
     const docLink = require('./lib/doc-link');
     const wasPublic = process.env.PUBLIC_URL;
@@ -393,7 +407,29 @@ async function main() {
     if (wasApp === undefined) delete process.env.WEBAPP_URL; else process.env.WEBAPP_URL = wasApp;
   }
 
-  console.log('\n── подсказки по реквизитам ──');
+  section('самозанятость и чек');
+  {
+    const unpaid = docs.find((d) => d.type === 'sch' && d.total);
+    r = await call('POST', '/api/doc/paid', { user: masha, body: { id: unpaid.id } });
+    ok(r.status === 200 && r.json.npd === null,
+      'не применяющему НПД приложение про чек не говорит', JSON.stringify(r.json.npd));
+
+    r = await call('POST', '/api/npd', { user: masha, body: { on: true } });
+    ok(r.json.npd === true, 'галочку можно поставить');
+    r = await call('GET', '/api/state', { user: masha });
+    ok(Number(r.json.org.npd) === 1, 'и приложение видит её в состоянии');
+
+    await call('POST', '/api/doc/paid', { user: masha, body: { id: unpaid.id, paid: false } });
+    r = await call('POST', '/api/doc/paid', { user: masha, body: { id: unpaid.id } });
+    ok(r.json.npd && /чек в «Моём налоге»/.test(r.json.npd.text),
+      'с галочкой — напоминание про чек', r.json.npd && r.json.npd.text.slice(0, 60));
+    ok(r.json.npd.url === 'https://lknpd.nalog.ru/',
+      'и адрес личного кабинета, а не выдуманная схема', r.json.npd.url);
+
+    await call('POST', '/api/npd', { user: masha, body: { on: false } });
+  }
+
+  section('подсказки по реквизитам');
   r = await call('POST', '/api/lookup', { user: masha, body: { inn: '7712345678' } });
   ok(r.status === 200 && r.json.party && r.json.party.name === 'ООО «Ромашка»',
     'по ИНН пришли данные организации', r.json.party && r.json.party.name);
@@ -424,7 +460,7 @@ async function main() {
   ok(r.status === 200 && r.json.fields.inn === '7707083893' && r.json.fields.bik === '044525187',
     'вставленный блок реквизитов разобран', r.json.fields && r.json.fields.bik);
 
-  console.log('\n── долг и оплата ──');
+  section('долг и оплата');
   {
     r = await call('GET', '/api/state', { user: masha });
     ok(r.json.debtBasis === 'closing', 'по умолчанию долг возникает по акту', r.json.debtBasis);
@@ -466,7 +502,7 @@ async function main() {
     await call('POST', '/api/basis', { user: masha, body: { basis: 'closing' } });
   }
 
-  console.log('\n── что показывает главный экран ──');
+  section('что показывает главный экран');
   {
     /*
      * Три жалобы, которые на этом экране сходятся в одну: «цифры врут».
@@ -593,7 +629,7 @@ async function main() {
       'и слагаемые сходятся', JSON.stringify(w));
   }
 
-  console.log('\n── переписка с агентом ──');
+  section('переписка с агентом');
   {
     /*
      * Агент в приложении отвечает намерением, а не действием: документ он
@@ -638,7 +674,7 @@ async function main() {
     ok(r.status === 200 && r.json.action === 'debts', 'у второго пользователя свой разбор');
   }
 
-  console.log('\n── начальное сальдо и период акта ──');
+  section('начальное сальдо и период акта');
   {
     // Раньше приложение не умело задать начальное сальдо вовсе: полей не
     // было, а endpoint их игнорировал. Акт открывался нулём.
@@ -686,7 +722,7 @@ async function main() {
     ok(r.status === 400, 'по чужому клиенту акт не собрать', (r.json || {}).error);
   }
 
-  console.log('\n── вид деятельности и повторения ──');
+  section('вид деятельности и повторения');
   {
     r = await call('POST', '/api/biztype', { user: masha, body: { key: 'выдумка' } });
     ok(r.status === 400, 'неизвестный вид деятельности отклонён');
@@ -737,7 +773,7 @@ async function main() {
     await call('POST', '/api/basis', { user: masha, body: { basis: 'closing' } });
   }
 
-  console.log('\n── банковская выписка ──');
+  section('банковская выписка');
   {
     // Контрагент с долгом: ровно та ситуация, ради которой выписку и грузят.
     const cpId = (await call('POST', '/api/cp', {
@@ -832,7 +868,7 @@ async function main() {
     ok(r.json.docs === 0, 'чужую сделку закрыть нельзя', JSON.stringify(r.json));
   }
 
-  console.log('\n── свой ящик и отправка на почту ──');
+  section('свой ящик и отправка на почту');
   {
     const net = require('node:net');
     const got = { rcpt: [], data: '', auth: null };
@@ -983,7 +1019,7 @@ async function main() {
     smtp.close();
   }
 
-  console.log('\n── подпись и печать ──');
+  section('подпись и печать');
   // Настоящий PNG 1×1: важно, что тип определится по байтам, а не по заголовку.
   const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
   r = await call('GET', '/api/state', { user: masha });
@@ -1077,7 +1113,7 @@ async function main() {
   r = await call('POST', '/api/facsimile/delete', { user: masha, body: { kind: 'sign' } });
   ok(r.status === 200 && r.json.facsimile.sign === null, 'подпись убирается');
 
-  console.log('\n── статика и защита ──');
+  section('статика и защита');
   r = await call('GET', '/');
   ok(r.status === 200 && /Первичка/.test(r.text), 'главная страница отдаётся');
   r = await call('GET', '/app.css');
@@ -1094,22 +1130,14 @@ async function main() {
   r = await call('POST', '/api/cp', { body: { name: 'Без подписи' } });
   ok(r.status === 401, 'POST без подписи тоже не проходит', r.status);
 
-  console.log('\n── ограничение частоты ──');
+  section('ограничение частоты');
   const flood = [];
   for (let i = 0; i < 130; i += 1) flood.push(call('GET', '/api/templates', { user: petya }));
   const results = await Promise.all(flood);
   const limited = results.filter((x) => x.status === 429).length;
   ok(limited > 0, 'слишком частые запросы получают отказ', `${limited} из 130`);
-  /*
-   * Дальше счётчик сбрасываем. Самопроверка успевает сделать за секунду
-   * больше сотни запросов от одного пользователя — столько человек не
-   * сделает и за час, — и следующая же добавленная проверка упирается в
-   * предел, падая там, где проверяет совсем не его. Сам предел проверен
-   * прямо здесь, выше, и от сброса не страдает.
-   */
-  require('./miniapp').forgetRate();
 
-  console.log('\n── разбор позиций (сервис) ──');
+  section('разбор позиций (сервис)');
   const clean = docService.cleanItems([
     { name: '  Хлеб  ', qty: '3', price: '25,5' },
     { name: '', qty: 5, price: 10 },
@@ -1124,7 +1152,7 @@ async function main() {
   ok(docService.totalOf([{ qty: 3, price: 10.005 }]) === 30.02, 'копейки округляются вверх по правилу',
     docService.totalOf([{ qty: 3, price: 10.005 }]));
 
-  console.log('\n── удаление документа и сальдо ──');
+  section('удаление документа и сальдо');
   /*
    * Удаление должно вслух сказать, что стало с долгом.
    *
@@ -1164,7 +1192,7 @@ async function main() {
     ok(r.json.delta === 0, 'и при его удалении сальдо честно не меняется', r.json.delta);
   }
 
-  console.log('\n── акты всем должникам ──');
+  section('акты всем должникам');
   {
     /*
      * Этот адрес отвечал 500 с самого своего появления: в него передавали
@@ -1184,7 +1212,7 @@ async function main() {
       'и это акт по настоящему должнику', r2.json && JSON.stringify(r2.json.items));
   }
 
-  console.log('\n── проверка подписи отдельно ──');
+  section('проверка подписи отдельно');
   ok(verifyInitData('', { token: TOKEN }).ok === false, 'пустая initData не проходит');
   ok(verifyInitData(initDataFor(MASHA), { token: TOKEN }).user.id === MASHA.id,
     'из подписанной строки достаётся тот же пользователь');

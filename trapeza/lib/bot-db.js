@@ -170,6 +170,14 @@ function migrate() {
   addColumn('orgs', 'vat_gross', 'INTEGER NOT NULL DEFAULT 0'); // 1 — цены уже с НДС
   // ОГРНИП: в УПД есть графа, а поля не было — печаталось пусто.
   addColumn('orgs', 'ogrnip', "TEXT NOT NULL DEFAULT ''");
+  /*
+   * Налог на профессиональный доход. Вывести этот режим неоткуда: по ИНН
+   * видно только, ИП это или организация, а НПД применяют и обычные
+   * физлица, и предприниматели. Значит, спрашиваем — но не у каждого, а
+   * галочкой в настройках: она нужна ровно для одного, напомнить про чек
+   * при отметке оплаты (lib/npd.js).
+   */
+  addColumn('orgs', 'npd', 'INTEGER NOT NULL DEFAULT 0');
 
   /*
    * Из чего возникает долг контрагента — свойство бизнеса, а не общее правило.
@@ -264,7 +272,7 @@ function vatOf(org) {
 function updateOrg(userId, id, fields) {
   const allowed = ['name', 'full_name', 'inn', 'kpp', 'signer', 'address',
     'bank_name', 'bik', 'acc', 'corr_acc', 'ogrnip', 'vat_rate', 'vat_gross', 'debt_basis',
-    'biz_type'];
+    'biz_type', 'npd'];
   const sets = [], vals = [];
   for (const k of allowed) if (k in fields) { sets.push(`${k} = ?`); vals.push(fields[k]); }
   if (!sets.length) return;

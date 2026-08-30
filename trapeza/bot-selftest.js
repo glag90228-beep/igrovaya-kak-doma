@@ -3489,6 +3489,59 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(withStamps(html, null) === html, 'без штампов бланк не трогаем вовсе');
   }
 
+  console.log('\n── самозанятость: напоминание про чек ──');
+  {
+    /*
+     * Самозанятому счёт и акт доход не закрывают — его закрывает чек из
+     * «Моего налога» (ФЗ № 422-ФЗ, ст. 14). Забывают об этом на безналичной
+     * оплате: деньги пришли молча, документ выписан, всё выглядит готовым.
+     * Проверяем, что напоминание приходит ровно в момент отметки оплаты и
+     * не приходит тем, кто НПД не применяет.
+     */
+    const bdbN = require('./lib/bot-db');
+    const npdLib = require('./lib/npd');
+
+    ok(npdLib.chequeDue('2026-08-20') === '2026-09-09',
+      'срок чека по переводу — 9-е число следующего месяца', npdLib.chequeDue('2026-08-20'));
+    ok(npdLib.chequeDue('2026-12-31') === '2027-01-09',
+      'декабрь переносит срок на январь следующего года', npdLib.chequeDue('2026-12-31'));
+    ok(npdLib.chequeReminder({ npd: 0 }, { paidAt: '2026-08-20' }) === null,
+      'не применяющему НПД про чек не напоминаем');
+
+    const uid = fxUserId();
+    const org = bdbN.getDefaultOrg(uid);
+    const cpN = bdbN.createCp(uid, { name: 'ООО «Чек»', kind: 'customer', opening_date: '2026-01-01' });
+    const made = await require('./lib/doc-service').issueDocument(uid, {
+      type: 'sch', cpId: cpN, date: '2026-08-01',
+      items: [{ name: 'Работа', qty: 1, price: 5000 }], skipQuota: true,
+    });
+
+    sent.length = 0;
+    await tap(`doc.paid:${made.doc.id}`);
+    ok(!norm(sent.map((m) => m.text || '').join(' ')).includes('Мой налог'),
+      'без галочки про чек молчим');
+
+    bdbN.updateOrg(uid, org.id, { npd: 1 });
+    bdbN.unmarkPaid(uid, made.doc.id);
+    sent.length = 0;
+    await tap(`doc.paid:${made.doc.id}`);
+    const said = norm(sent.map((m) => m.text || '').join(' '));
+    ok(said.includes('чек в «Моём налоге»'), 'с галочкой — напомнил про чек', said.slice(0, 90));
+    ok(said.includes('ООО «Чек»'), 'и назвал, по какому клиенту');
+    ok(said.includes('09.09.2026'), 'и назвал срок — 9 сентября', said.slice(-120));
+    const btns = sent.flatMap((m) => (m.kb || []).flat());
+    ok(btns.some((b) => b.url === 'https://lknpd.nalog.ru/'),
+      'кнопка открывает «Мой налог», а не выдуманную схему',
+      JSON.stringify(btns.map((b) => b.url || b.data)));
+
+    // Галочку надо уметь снять — иначе включивший её по ошибке получает
+    // напоминание после каждой оплаты и выключить не может.
+    sent.length = 0;
+    await tap('npd.set:0');
+    ok(!Number(bdbN.getDefaultOrg(uid).npd), 'галочку можно снять');
+    ok(norm(last()).includes('не применяю'), 'и экран говорит текущее состояние', norm(last()).slice(0, 80));
+  }
+
   console.log('\n── изоляция пользователей ──');
   const OTHER = { id: 777002, first_name: 'Чужой', username: 'other' };
   await handleUpdate(tg, { message: { chat: { id: 777002 }, from: OTHER, text: '/start' } });

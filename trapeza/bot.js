@@ -30,6 +30,7 @@ const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
 const reqCheck = require('./lib/requisites-check');
 const docService = require('./lib/doc-service');
 const docLink = require('./lib/doc-link');
+const npd = require('./lib/npd');
 const facsimile = require('./lib/facsimile');
 const mailer = require('./lib/mail');
 const mailbox = require('./lib/mailbox');
@@ -1195,6 +1196,28 @@ async function showDoc(tg, chatId, user, docId) {
 }
 
 /**
+ * Напоминание про чек «Моего налога» — только для тех, кто на НПД.
+ *
+ * Приходит сразу после отметки оплаты, и это единственный подходящий
+ * момент: деньги по переводу падают на счёт молча, документ к тому времени
+ * уже выписан, и всё выглядит законченным. А доход у самозанятого считается
+ * принятым только с чеком.
+ *
+ * Чек за человека не формируем: это заявление в налоговую от его имени.
+ * Открываем приложение и уходим — дальше он сам.
+ */
+async function remindCheque(tg, chatId, user, docId, paidAt) {
+  if (!paidAt) return;
+  const org = bdb.getDefaultOrg(user.id);
+  const d = bdb.getDoc(user.id, docId);
+  const cp = d && d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
+  const note = npd.chequeReminder(org, { paidAt, cpName: cp && cp.name });
+  if (!note) return;
+  await tg.sendMessage(chatId, `🧾 ${esc(note.text)}`,
+    keyboard([[{ text: '🧾 Открыть «Мой налог»', url: note.url }]]));
+}
+
+/**
  * Повторная отправка файла по сохранённым данным.
  *
  * Сборку делает doc-service — тот же код, что и в мини-приложении. Раньше
@@ -2304,6 +2327,33 @@ async function showVat(tg, chatId, user) {
     ]));
 }
 
+/**
+ * Экран «Самозанятость». Одна галочка — и та не про документы.
+ *
+ * Спрашиваем прямо, потому что вывести режим неоткуда: по ИНН видно только,
+ * ИП это или организация, а НПД применяют и обычные физлица, и
+ * предприниматели. Нужен признак ровно для одного — напомнить про чек,
+ * когда человек отметит оплату.
+ */
+async function showNpd(tg, chatId, user) {
+  const org = bdb.getDefaultOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  const on = npd.isNpd(org);
+  await tg.sendMessage(chatId,
+    `<b>Налог на профессиональный доход</b>\n\nСейчас: <b>${on ? 'применяю' : 'не применяю'}</b>\n\n`
+    + 'Если вы самозанятый или ИП на НПД, счёт и акт сами по себе доход не '
+    + 'закрывают: его закрывает чек из «Моего налога». Включите галочку — и '
+    + 'после каждой отметки об оплате я напомню выдать чек и открою приложение.\n\n'
+    + '<i>Сам чек не выписываю и выписывать не буду: это заявление в налоговую '
+    + 'от вашего имени, его делаете вы.</i>',
+    keyboard([
+      [{ text: on ? '✅ Применяю НПД' : 'Применяю НПД', data: 'npd.set:1' }],
+      [{ text: on ? 'Не применяю' : '✅ Не применяю', data: 'npd.set:0' }],
+      [{ text: '🧾 Открыть «Мой налог»', url: npd.LK_URL }],
+      [{ text: '⬅️ К организации', data: 'org' }],
+    ]));
+}
+
 /** Экран «Подпись и печать»: что загружено, куда ставится, как поменять. */
 async function showFacsimile(tg, chatId, user) {
   const sign = facsimile.get(user.id, 'sign');
@@ -3035,6 +3085,7 @@ async function showOrg(tg, chatId, user) {
     [{ text: '✏️ Изменить (ввести заново)', data: 'org.new' }],
     [{ text: fxLabel, data: 'fx' }],
     [{ text: `🧾 НДС: ${vatLabel(org)}`.slice(0, 60), data: 'vat' }],
+    [{ text: `💼 Самозанятость: ${npd.isNpd(org) ? 'да' : 'нет'}`, data: 'npd' }],
     [{ text: `📊 Долг: ${BASIS_LABEL[bdb.basisOf(org)]}`.slice(0, 60), data: 'basis' }],
     [{ text: mailbox.has(user.id) ? '✉️ Почта: подключена' : '✉️ Подключить почту', data: 'mb' }],
     [{ text: '⬅️ Меню', data: 'menu' }],
@@ -3430,6 +3481,13 @@ async function handleCallback(tg, cq) {
             + `${s.count} ${plural(s.count, 'сделка', 'сделки', 'сделок')}.`
           : 'Неоплаченных документов больше нет.'),
         mainMenu());
+      // Через выписку закрывают сразу пачку — и именно тут про чек забывают
+      // вернее всего: человек ничего не выписывал, он просто прислал файл.
+      const npdNote = npd.chequeReminder(bdb.getDefaultOrg(user.id), { paidAt: todayISO() });
+      if (done.docs && npdNote) {
+        await tg.sendMessage(chatId, `🧾 ${esc(npdNote.text)}`,
+          keyboard([[{ text: '🧾 Открыть «Мой налог»', url: npdNote.url }]]));
+      }
       return;
     }
     if (data === 'help') {
@@ -3677,6 +3735,7 @@ async function handleCallback(tg, cq) {
       const id = Number(data.slice(9));
       const when = bdb.markPaid(user.id, id);
       if (when) await tg.sendMessage(chatId, `✅ Отметил оплату ${ru(when)} — долг закрыт.`);
+      await remindCheque(tg, chatId, user, id, when);
       await showDoc(tg, chatId, user, id);
       return;
     }
@@ -3709,6 +3768,13 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('reg.p:')) { await sendRegistry(tg, chatId, user, data.slice(6)); return; }
     if (data === 'vat') { await showVat(tg, chatId, user); return; }
+    if (data === 'npd') { await showNpd(tg, chatId, user); return; }
+    if (data.startsWith('npd.set:')) {
+      const org = bdb.getDefaultOrg(user.id);
+      if (org) bdb.updateOrg(user.id, org.id, { npd: data.slice(8) === '1' ? 1 : 0 });
+      await showNpd(tg, chatId, user);
+      return;
+    }
     if (data.startsWith('vat.set:')) {
       const [rate, gross] = data.slice(8).split(':');
       const org = bdb.getDefaultOrg(user.id);

@@ -150,6 +150,9 @@ const TABS = [
 
 let stack = [{ name: 'home', params: {} }];
 let cache = {};          // ответ /api/state
+// Напоминание про чек «Моего налога»: сервер сказал его показать после
+// отметки оплаты, а рисует карточка документа при следующей перерисовке.
+let pendingCheque = null;
 const screens = {};      // заполняется ниже
 
 function current() { return stack[stack.length - 1]; }
@@ -672,6 +675,24 @@ screens.doc = async function docScreen({ id }) {
   const cpOf = cpsList.find((x) => x.id === d.cpId) || null;
 
   const box = h('div', {}, h('h1', { text: `${d.title} № ${d.number}` }));
+
+  /*
+   * Напоминание про чек «Моего налога». Живёт до следующего перерисовывания
+   * экрана: сообщением-всплывашкой его бы закрыли не читая, а в карточке оно
+   * остаётся на виду ровно столько, сколько человек здесь находится.
+   */
+  if (pendingCheque) {
+    const note = pendingCheque;
+    pendingCheque = null;
+    box.append(h('div', { class: 'banner info' }, icon('receipt'),
+      h('div', {},
+        h('div', { style: 'white-space:pre-line', text: note.text }),
+        h('button', {
+          class: 'btn secondary',
+          style: 'margin-top:10px',
+          onclick: () => openOutside(note.url),
+        }, 'Открыть «Мой налог»'))));
+  }
   box.append(h('div', { class: 'card' },
     cpOf ? h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Кому' }),
       h('span', { class: 'ellipsis', text: cpOf.name })) : null,
@@ -713,9 +734,13 @@ screens.doc = async function docScreen({ id }) {
     box.append(h('div', { class: 'btn-wrap' }, h('button', {
       class: paid ? 'btn ghost' : 'btn',
       onclick: (e) => withBusy(e.currentTarget, async () => {
-        await api('POST', '/api/doc/paid', { id: d.id, paid: !paid });
+        const r = await api('POST', '/api/doc/paid', { id: d.id, paid: !paid });
         haptic('medium');
         toast(paid ? 'Отметка снята' : 'Отмечено как оплаченный');
+        // Самозанятому именно сейчас надо выдать чек: счёт и акт доход не
+        // закрывают. Момент единственный — деньги переводом приходят молча,
+        // документ уже выписан, и всё выглядит законченным.
+        if (r && r.npd) pendingCheque = r.npd;
         render();
       }),
     }, paid ? 'Снять отметку об оплате' : 'Отметить оплату')));
@@ -1672,6 +1697,13 @@ screens.more = async function more() {
       onclick: () => go('vat'),
     }),
     navRow({
+      icon: 'receipt',
+      title: 'Самозанятость',
+      sub: s.org && Number(s.org.npd)
+        ? 'напомню про чек в «Моём налоге»' : 'если платите налог на профдоход',
+      onclick: () => go('npd'),
+    }),
+    navRow({
       icon: 'wallet',
       title: 'Чем занимаетесь',
       sub: (() => {
@@ -1943,6 +1975,48 @@ screens.vat = async function vat() {
     opt('10% сверху', 'льготная ставка', cur === '10' && !gross, () => pick(10, false)),
     opt('10% в том числе', 'льготная, цены с налогом', cur === '10' && gross, () => pick(10, true)),
     opt('0%', 'экспорт и особые случаи', cur === '0', () => pick(0, false))));
+  return box;
+};
+
+/**
+ * Самозанятость. Одна галочка, и та не про документы.
+ *
+ * Спрашиваем прямо, потому что вывести режим неоткуда: по ИНН видно только,
+ * ИП это или организация, а НПД применяют и физлица, и предприниматели.
+ */
+screens.npd = async function npdScreen() {
+  const s = await api('GET', '/api/state');
+  const on = Boolean(s.org && Number(s.org.npd));
+  const box = h('div', {}, h('h1', { text: 'Налог на профессиональный доход' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: 'Если вы самозанятый или ИП на НПД, счёт и акт сами по себе доход не закрывают — '
+      + 'его закрывает чек из «Моего налога». Включите, и после каждой отметки об оплате '
+      + 'я напомню его выдать.' }));
+
+  const pick = async (value) => {
+    await api('POST', '/api/npd', { on: value });
+    haptic('medium');
+    toast('Сохранено');
+    back();
+  };
+  const opt = (value, title, sub) => h('button', { class: 'row', onclick: () => pick(value) },
+    h('span', { class: `icon-box ${on === value ? 'ok' : ''}` },
+      icon(on === value ? 'check' : 'receipt')),
+    h('span', { class: 'grow' },
+      h('div', { text: title }),
+      h('div', { class: 'small muted', text: sub })));
+
+  box.append(h('div', { class: 'card' },
+    opt(true, 'Применяю НПД', 'самозанятый или ИП на НПД'),
+    opt(false, 'Не применяю', 'УСН, патент, общая система')));
+
+  box.append(h('p', { class: 'small muted', style: 'margin:12px 18px',
+    text: 'Сам чек не выписываю и выписывать не буду: это заявление в налоговую от вашего '
+      + 'имени, его делаете вы.' }));
+  box.append(h('div', { class: 'btn-wrap' }, h('button', {
+    class: 'btn secondary',
+    onclick: () => openOutside('https://lknpd.nalog.ru/'),
+  }, 'Открыть «Мой налог»')));
   return box;
 };
 
@@ -3206,6 +3280,15 @@ function download(file) {
  * попросит открыть Telegram. Если ни того, ни другого нет (открыли в
  * обычном вебе), остаётся обычный переход.
  */
+/**
+ * Открыть внешний адрес. Внутри Telegram — его же средствами: обычный
+ * window.open в мини-приложении открывает пустую вкладку и всё.
+ */
+function openOutside(url) {
+  if (tg && typeof tg.openLink === 'function') { tg.openLink(url); return; }
+  window.open(url, '_blank');
+}
+
 function shareToTelegram(url, text) {
   const share = `https://t.me/share/url?url=${encodeURIComponent(url)}`
     + `&text=${encodeURIComponent(text || '')}`;

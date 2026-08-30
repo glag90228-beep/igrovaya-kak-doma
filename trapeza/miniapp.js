@@ -27,6 +27,7 @@ const bdb = require('./lib/bot-db');
 const billing = require('./lib/billing');
 const docService = require('./lib/doc-service');
 const docLink = require('./lib/doc-link');
+const npd = require('./lib/npd');
 const dadata = require('./lib/dadata');
 const facsimile = require('./lib/facsimile');
 const mailer = require('./lib/mail');
@@ -590,13 +591,31 @@ const api = {
   /** Отметить документ оплаченным или снять отметку. */
   async 'POST /api/doc/paid'({ user, body }) {
     const id = Number(body.id);
-    if (!bdb.getDoc(user.id, id)) return { error: 'Документ не найден.' };
+    const doc = bdb.getDoc(user.id, id);
+    if (!doc) return { error: 'Документ не найден.' };
     if (body.paid === false) {
       bdb.unmarkPaid(user.id, id);
       return { doc: docBrief(bdb.getDoc(user.id, id)) };
     }
     const when = bdb.markPaid(user.id, id, str(body.date, 10));
-    return { paidAt: when, doc: docBrief(bdb.getDoc(user.id, id)) };
+    // Самозанятому в этот момент надо выдать чек: счёт и акт доход не
+    // закрывают, его закрывает чек «Моего налога» (lib/npd.js).
+    const cp = doc.cp_id ? bdb.getCp(user.id, doc.cp_id) : null;
+    return {
+      paidAt: when,
+      doc: docBrief(bdb.getDoc(user.id, id)),
+      npd: npd.chequeReminder(bdb.getDefaultOrg(user.id), {
+        paidAt: when, cpName: cp && cp.name,
+      }),
+    };
+  },
+
+  /** Признак «применяю НПД». Нужен ровно для напоминания про чек. */
+  async 'POST /api/npd'({ user, body }) {
+    const org = bdb.getDefaultOrg(user.id);
+    if (!org) return { error: 'Сначала заполните реквизиты организации.' };
+    bdb.updateOrg(user.id, org.id, { npd: body.on ? 1 : 0 });
+    return { npd: Boolean(body.on), lkUrl: npd.LK_URL };
   },
 
   /*
