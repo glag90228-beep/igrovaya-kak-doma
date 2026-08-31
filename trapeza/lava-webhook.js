@@ -85,13 +85,36 @@ const server = http.createServer((req, res) => {
   if (req.method !== 'POST') return done(405, 'only POST');
   if (url.pathname !== '/lava' && url.pathname !== '/webhook') return done(404, 'not found');
 
+  /*
+   * Кто стучался — записываем обязательно.
+   *
+   * Раньше отказ выглядел как «отказ: неверный секрет» и больше ничего. По
+   * такой строке нельзя отличить площадку от собственной проверки: мы сами
+   * шлём заведомо неверный секрет, когда проверяем, открыт ли путь. В
+   * журнале лежали отказы недельной давности, и понять, Lava это или наши
+   * же тесты, было невозможно — а от ответа зависело, где искать поломку.
+   *
+   * Адрес берём из заголовка от nginx (сам он ходит с петли, и без этого
+   * все обращения выглядели бы как 127.0.0.1). Секрет не пишем никогда:
+   * длины и способа передачи хватает, чтобы отличить «пусто» от «не тот» и
+   * от «обрезался», а в журнал он попадать не должен.
+   */
+  const from = String(req.headers['x-real-ip'] || req.headers['x-forwarded-for'] || '')
+    .split(',')[0].trim() || req.socket.remoteAddress || 'неизвестно';
+
+  const carrier = (req.headers['x-api-key'] && 'X-Api-Key')
+    || (req.headers.authorization && 'Authorization')
+    || (url.searchParams.get('secret') && 'параметр secret')
+    || '';
   const given = req.headers['x-api-key']
     || String(req.headers.authorization || '').replace(/^Bearer\s+/i, '')
     || url.searchParams.get('secret');
   if (!secretOk(given)) {
-    log('отказ: неверный секрет');
+    log(`отказ: неверный секрет | от ${from} | путь ${url.pathname}`
+      + ` | секрет ${carrier ? `в ${carrier}, длина ${String(given).length}` : 'не передан вовсе'}`);
     return done(401, 'bad secret');
   }
+  log(`принят запрос от ${from} на ${url.pathname}`);
 
   let body = '';
   let tooBig = false;
