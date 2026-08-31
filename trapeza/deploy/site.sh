@@ -18,6 +18,7 @@ set -euo pipefail
 DOMAIN="${DOMAIN:-pervichkaru.ru}"
 ROOT="${ROOT:-/var/www/pervichka}"
 MINIAPP_PORT="${MINIAPP_PORT:-8790}"   # то же, что у miniapp.js по умолчанию
+LAVA_PORT="${LAVA_PORT:-8788}"         # то же, что у lava-webhook.js по умолчанию
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 CONF="/etc/nginx/sites-available/$DOMAIN"
 
@@ -157,6 +158,32 @@ server {
         proxy_read_timeout 60s;
     }
 
+    # Уведомление об оплате от Lava.
+    #
+    # Без этого блока оплата не работает вовсе, и молча: приёмник
+    # (lava-webhook.js) слушает только петлю — снаружи к нему не достучаться,
+    # — а nginx на /lava отвечал 404 из общего правила. Площадка исправно
+    # присылала уведомление, оно не доходило, деньги списывались, доступ не
+    # включался. Именно так и вышло на первой живой покупке.
+    #
+    # Два пути, потому что приёмник понимает оба, и какой из них прописан в
+    # личном кабинете площадки — вопрос настройки, а не кода.
+    #
+    # proxy_pass без пути в конце — намеренно: адрес запроса уходит как есть,
+    # вместе с параметрами (секрет площадка может передавать и в них).
+    location /lava {
+        proxy_pass http://127.0.0.1:$LAVA_PORT;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+    location /webhook {
+        proxy_pass http://127.0.0.1:$LAVA_PORT;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+
     # Картинки и снимки экрана не меняются — пусть браузер их запоминает.
     location ~* \.(webp|png|jpg|svg|ico|woff2)\$ {
         expires 30d;
@@ -189,8 +216,28 @@ fi
 
 echo
 echo "Проверка изнутри:"
-curl -sS -o /dev/null -w '  http://127.0.0.1 → %{http_code}\n' \
+curl -sS -o /dev/null -w '  сайт          → %{http_code}\n' \
   -H "Host: $DOMAIN" http://127.0.0.1/ || true
+
+# Доходит ли уведомление об оплате до приёмника.
+#
+# Стучимся заведомо неверным секретом и ждём 401 — это ответ нашего
+# приёмника, то есть путь до него проложен. 404 означает, что запрос съел
+# nginx и оплата снова не дойдёт; 502 — что приёмник не запущен.
+#
+# Проверять это обязательно и именно так: раньше маршрута не было вовсе,
+# площадка исправно слала уведомления, они упирались в 404 — деньги
+# списывались, доступ не включался, и узнали мы об этом от покупателя.
+LAVA_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -m 10 -X POST \
+  -H "Host: $DOMAIN" -H 'X-Api-Key: заведомо-неверный' \
+  -H 'Content-Type: application/json' -d '{}' \
+  http://127.0.0.1/lava 2>/dev/null || echo 000)
+case "$LAVA_CODE" in
+  401) echo "  оплата /lava  → 401 (так и надо: приёмник ответил, путь проложен)" ;;
+  404) echo "  оплата /lava  → 404 ⚠️  запрос не доходит до приёмника — оплата работать не будет" ;;
+  502|503) echo "  оплата /lava  → $LAVA_CODE ⚠️  приёмник не отвечает: systemctl status trapeza-lava" ;;
+  *)   echo "  оплата /lava  → $LAVA_CODE (ожидался 401 — посмотрите логи trapeza-lava)" ;;
+esac
 echo
 echo "Если код 200 — сайт отдаётся. Осталось получить сертификат, один раз:"
 echo
