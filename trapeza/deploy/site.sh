@@ -123,8 +123,14 @@ if [ -f "$CONF" ]; then
   BAK="$CONF.bak.$(date +%F-%H%M%S)"
   cp "$CONF" "$BAK"
   ADDED=0
-  for LOC in lava webhook; do
-    if grep -qE "location[[:space:]]+/$LOC\b" "$CONF"; then continue; fi
+  # Шаблон учитывает и «location ^~ /lava»: после deploy/nginx-merge.sh
+  # маршруты записаны именно так, и без этого сюда добавился бы второй
+  # такой же блок — nginx отвергает конфиг с двумя одинаковыми location.
+  #
+  # /webhook отсюда убран: площадка ходит на /lava, а общий путь /webhook
+  # только собирал чужие пробы (их видно в журнале nginx).
+  for LOC in lava; do
+    if grep -qE "location[[:space:]]+(\^~[[:space:]]*)?/$LOC\b" "$CONF"; then continue; fi
     sed -i "/server_name .*$(echo "$DOMAIN" | sed 's/\./\\./g')/a\\
     location /$LOC {\\
         proxy_pass http://127.0.0.1:$LAVA_PORT;\\
