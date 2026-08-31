@@ -42,6 +42,7 @@ const TOKEN = process.env.BOT_TOKEN;
 const bdb = require('./lib/bot-db');
 const { verifyInitData } = require('./lib/webapp-auth');
 const docService = require('./lib/doc-service');
+const docSvcForAkt = docService;
 const { server, setTelegram, forgetRate } = require('./miniapp');
 
 /**
@@ -394,6 +395,27 @@ async function main() {
     ok(r.json.revoked === 1, 'владелец отзывает', JSON.stringify(r.json));
     r = await call('GET', `/d/${token}`);
     ok(r.status === 404, 'после отзыва документ по ссылке не открывается', r.status);
+
+    /*
+     * Акт сверки по ссылке должен открываться, а не скачиваться. Таблицу
+     * Excel браузер не показывает — контрагент вместо документа получал окно
+     * «Загрузить файл?» от незнакомого сайта. Для просмотра собираем
+     * печатную форму, для работы таблица остаётся.
+     */
+    const aktDoc = docs.find((d) => d.type === 'akt');
+    if (aktDoc) {
+      const byMail = await docSvcForAkt.rebuildDocument(bdb.getOrCreateUser(MASHA.id).id, aktDoc.id);
+      ok(byMail.file.filename.endsWith('.xlsx'),
+        'файлом и почтой акт сверки уходит таблицей', byMail.file.filename);
+
+      const forView = await docSvcForAkt.rebuildDocument(
+        bdb.getOrCreateUser(MASHA.id).id, aktDoc.id, { forView: true },
+      );
+      ok(!forView.file.filename.endsWith('.xlsx'),
+        'а для просмотра — печатной формой', forView.file.filename);
+      ok(forView.file.mime === 'application/pdf' || forView.file.mime.startsWith('text/html'),
+        'её браузер умеет показать', forView.file.mime);
+    }
 
     // Истёкшая ссылка мертва так же, как отозванная.
     const fresh = docLink.create(bdb.getOrCreateUser(MASHA.id).id, withItems.id);

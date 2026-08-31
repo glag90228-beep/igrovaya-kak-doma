@@ -1501,7 +1501,10 @@ const server = http.createServer(async (req, res) => {
     if (!link) return sendLinkPage(res, 404, 'Ссылка больше не работает.');
     let built;
     try {
-      built = await docService.rebuildDocument(link.userId, link.docId, { stamp: link.stamp });
+      // forView: по ссылке документ смотрят, а не считают. Для акта сверки
+      // это разные файлы — печатная форма против таблицы.
+      built = await docService.rebuildDocument(link.userId, link.docId,
+        { stamp: link.stamp, forView: true });
     } catch (e) {
       console.error('miniapp: ссылка на документ', e.message);
       return sendLinkPage(res, 500, 'Не получилось собрать документ. Попробуйте позже.');

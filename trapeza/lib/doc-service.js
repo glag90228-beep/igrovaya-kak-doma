@@ -28,6 +28,8 @@ const { buildTorg12Html } = require('./torg12');
 const { buildDogovorHtml } = require('./dogovor');
 // Акт сверки — Excel, а не HTML: это журнал, его дополняют и считают в нём.
 const { buildAkt } = require('./xlsx-akt');
+// А для просмотра — печатная форма: таблицу браузер не показывает (см. ниже).
+const { buildAktHtml } = require('./akt-html');
 
 /** Документы, которые состоят из позиций «наименование × количество × цена». */
 const ITEM_DOCS = {
@@ -246,7 +248,8 @@ function stampFor(saved, want) {
  * Журнал хранит не файл, а поля — поэтому копия всегда свежая
  * и не занимает места, а номер и дата остаются прежними.
  *
- * @param {object} [opts] opts.stamp — {paid, copy}, см. stampFor
+ * @param {object} [opts] opts.stamp — {paid, copy}, см. stampFor;
+ *        opts.forView — собрать для просмотра в браузере, а не для работы
  */
 async function rebuildDocument(userId, docId, opts = {}) {
   const saved = bdb.getDoc(userId, Number(docId));
@@ -269,23 +272,40 @@ async function rebuildDocument(userId, docId, opts = {}) {
   if (saved.type === 'akt') {
     const p = bdb.cpForPeriod(userId, saved.cp_id, saved.payload.from || '', saved.payload.to || '');
     if (!p) return fail('data', 'Не удалось собрать акт: проверьте контрагента.');
-    const buffer = Buffer.from(await buildAkt({
+    const forAkt = {
       org: {
         brand: org0.name, org_short: org0.name, org_full: org0.full_name || org0.name,
-        org_inn: org0.inn, signer: org0.signer,
+        org_inn: org0.inn, inn: org0.inn, signer: org0.signer,
       },
       cp: p.view,
       ops: p.ops,
-    }));
-    return {
+    };
+    const head = {
       ok: true,
       title: 'Акт сверки',
       doc: saved,
       total: Math.abs(p.closing),
       period: { from: p.from, to: p.to },
+    };
+
+    /*
+     * Два вида одного акта, и выбор между ними — не про красоту.
+     *
+     * Таблицу браузер не открывает: по ссылке контрагент вместо документа
+     * получал окно «Загрузить файл?» от незнакомого сайта. Поэтому для
+     * просмотра собираем печатную форму, а таблица остаётся там, где она и
+     * нужна, — файлом в чат и почтой тому, кто будет считать.
+     */
+    if (opts.forView) {
+      const file = await renderFile(buildAktHtml(forAkt), `Акт_сверки_${safeName(cp0.name)}`);
+      return { ...head, file };
+    }
+
+    return {
+      ...head,
       file: {
         filename: `Акт_сверки_${safeName(cp0.name)}.xlsx`,
-        buffer,
+        buffer: Buffer.from(await buildAkt(forAkt)),
         mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         pdf: false,
       },
