@@ -545,6 +545,55 @@ async function checkSpeech() {
   }
 }
 
+/**
+ * Второй метод распознавания — для длинных записей.
+ *
+ * Проверять надо оба, и вот почему. Быстрый метод обходится одним ключом и
+ * каталога не спрашивает; длинный ходит в другой сервис, с заголовком
+ * x-folder-id, и требует роли в этом каталоге. Пока проверялся только
+ * быстрый, отчёт показывал «голос — готово», а голосовые длиннее
+ * тридцати секунд падали с PermissionDenied — и человек в приложении видел
+ * ошибку там, где диагностика клялась, что всё хорошо.
+ */
+async function checkSpeechLong() {
+  const key = process.env.YANDEX_API_KEY;
+  const folder = process.env.YANDEX_FOLDER_ID;
+  if (!key || !folder) return;                       // о нехватке сказал быстрый метод
+  try {
+    const res = await fetch('https://stt.api.cloud.yandex.net/stt/v3/recognizeFileAsync', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Api-Key ${key}`,
+        'x-folder-id': folder,
+      },
+      body: JSON.stringify({
+        content: tone().toString('base64'),
+        recognitionModel: {
+          model: 'general',
+          audioFormat: { rawAudio: { audioEncoding: 'LINEAR16_PCM', sampleRateHertz: 16000, audioChannelCount: 1 } },
+          languageRestriction: { restrictionType: 'WHITELIST', languageCode: ['ru-RU'] },
+        },
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+    const body = await res.text();
+    if (res.ok) { ok('Голос длинный: задание принято (так и надо)'); return; }
+    if (/Permission ?denied|Permission to/i.test(body)) {
+      const f = (/resource-manager\.folder (\S+?)[,\]]/.exec(body) || [])[1];
+      no('Голос длинный: нет прав на распознавание длинных записей.\n'
+        + `      Каталог из ответа: ${f || 'не разобрал'}, в .env указан: ${folder}\n`
+        + '      Роль ai.speechkit-stt.user нужна тому аккаунту, чьим ключом вы\n'
+        + '      пользуетесь, и в том каталоге, что стоит в YANDEX_FOLDER_ID.\n'
+        + '      Короткие записи при этом работают — они каталога не спрашивают.');
+      return;
+    }
+    no(`Голос длинный: ${why(res.status, body)}`);
+  } catch (e) {
+    no(`Голос длинный: не достучались — ${e.message}`);
+  }
+}
+
 // Подключаем до вывода: ai-agent тянет базу, а она печатает предупреждение
 // про экспериментальный SQLite — пусть оно будет до отчёта, а не внутри него.
 const vision = require(path.join(APP, 'lib/vision'));
@@ -603,7 +652,7 @@ const ai = require(path.join(APP, 'lib/ai-agent'));
   else skip(`Фразы: провайдер ${ap} — этой проверкой не покрыт`);
 
   const sp = String(process.env.SPEECH_PROVIDER || '').toLowerCase();
-  if (sp === 'yandex') await checkSpeech();
+  if (sp === 'yandex') { await checkSpeech(); await checkSpeechLong(); }
   else skip('Голос: SPEECH_PROVIDER не задан — распознавание речи выключено');
 
   console.log(`\n${'='.repeat(52)}`);

@@ -40,6 +40,7 @@ const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
 const speech = require('./lib/speech');
 const ai = require('./lib/ai-agent');
 const { forwardToSupport } = require('./lib/bot-support');
+const office = require('./lib/office');
 const { formatRub } = require('./lib/money');
 const mime = require('./lib/mime');
 const bank = require('./lib/bank-statement');
@@ -1299,7 +1300,12 @@ const api = {
     const buf = Buffer.from(raw, 'base64');
     if (buf.length > 20 * 1024 * 1024) return { error: 'Запись слишком длинная.' };
     const got = await speech.transcribe(buf, Number(body.seconds) || 0);
-    if (!got.ok) return { error: got.error };
+    if (!got.ok) {
+      // Подробность — в журнал поддержки, владельцу. Пользователю она ничего
+      // не объясняет, а починить по ней может только владелец.
+      if (got.detail) office.record({ kind: 'speech', where: 'приложение', error: got.detail, userId: user.id });
+      return { error: got.error };
+    }
     const intent = await ai.understand(got.text, user.id);
     return { ...intent, heard: got.text, budget: ai.budget(user.id) };
   },
