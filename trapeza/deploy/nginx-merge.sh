@@ -26,6 +26,17 @@
 
 set -euo pipefail
 
+# Режим «приложение в корне»: bash nginx-merge.sh --app-at-root
+#
+# По умолчанию в корне лендинг, а приложение на /app/ — так посетитель
+# сайта видит рекламную страницу. Но если реклама и ссылки уже ведут на
+# корень как на приложение, менять адрес дороже, чем оставить как есть:
+# кнопка меню в Telegram хранится на их стороне, старые ссылки живут в
+# переписках. Тогда этот режим возвращает приложение в корень, а сведение
+# конфигов и маршрут оплаты остаются на месте.
+AT_ROOT=0
+[ "${1:-}" = "--app-at-root" ] && AT_ROOT=1
+
 APP="${APP:-/opt/trapeza}"
 DOMAIN="${DOMAIN:-pervichkaru.ru}"
 ROOT="${ROOT:-/var/www/pervichka}"
@@ -160,8 +171,29 @@ cat <<NGINX
         proxy_read_timeout 60s;
     }
 
+NGINX
+
+if [ "$AT_ROOT" = "1" ]; then
+cat <<NGINX
+    # Приложение в корне — по решению владельца. Лендинг при этом лежит на
+    # диске, но никому не показывается: место занято.
+    location / {
+        proxy_pass http://127.0.0.1:$MINIAPP_PORT;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Authorization \$http_authorization;
+        client_max_body_size 4m;
+    }
+NGINX
+else
+cat <<NGINX
     # Всё остальное — лендинг с диска.
     location / { try_files \$uri \$uri/ =404; }
+NGINX
+fi
+
+cat <<NGINX
 
     location ~* \.(webp|png|jpg|svg|ico|woff2)\$ {
         expires 30d;
@@ -208,6 +240,7 @@ echo "Конфиг сведён в один, nginx перезагружен."
 if [ -f "$APP/.env" ]; then
   WAS=$(sed -n 's/^WEBAPP_URL=//p' "$APP/.env" | head -1)
   WANT="https://$DOMAIN/app/"
+  [ "$AT_ROOT" = "1" ] && WANT="https://$DOMAIN/"
   if [ "$WAS" != "$WANT" ]; then
     cp "$APP/.env" "$APP/.env.bak.$STAMP"
     sed -i '/^WEBAPP_URL=/d' "$APP/.env"
@@ -215,6 +248,15 @@ if [ -f "$APP/.env" ]; then
     echo "Адрес приложения: было «${WAS:-не задано}», стало «$WANT»."
     systemctl restart trapeza-bot trapeza-miniapp
     echo "Бот и приложение перезапущены."
+    # Кнопка возле поля ввода живёт на стороне Telegram: правка .env её не
+    # меняет, её надо переставить отдельно. Иначе человек жмёт кнопку и
+    # попадает по старому адресу — и решает, что бот сломался.
+    if (cd "$APP" && node bot.js --setup >/dev/null 2>&1); then
+      echo "Кнопка меню в Telegram переставлена на новый адрес."
+    else
+      echo "⚠️  Кнопку меню переставить не вышло — сделайте вручную:"
+      echo "    cd $APP && node bot.js --setup"
+    fi
   else
     echo "Адрес приложения уже верный: $WANT"
   fi
