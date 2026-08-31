@@ -110,7 +110,42 @@ chown -R www-data:www-data "$ROOT" 2>/dev/null || true
 # ---------- 3. nginx ----------
 
 if [ -f "$CONF" ]; then
-  echo "Конфиг nginx уже есть: $CONF — не трогаю."
+  # Готовый конфиг не переписываем целиком — в него дописывает certbot, и
+  # перезапись снесла бы настройки сертификата. Но и «не трогаю» было
+  # неверно: из-за этого новые маршруты никогда не доезжали до серверов, где
+  # конфиг уже был. Так и пропала оплата — блок /lava появился в скрипте, а
+  # в боевом конфиге его не было, и узнали мы об этом от покупателя.
+  #
+  # Поэтому дописываем только недостающее и только своё. Место вставки —
+  # строка server_name с нашим доменом: она есть в каждом блоке, а после
+  # certbot их два (80 и 443), так что маршрут попадёт в оба.
+  echo "Конфиг nginx уже есть: $CONF — дописываю недостающее."
+  BAK="$CONF.bak.$(date +%F-%H%M%S)"
+  cp "$CONF" "$BAK"
+  ADDED=0
+  for LOC in lava webhook; do
+    if grep -qE "location[[:space:]]+/$LOC\b" "$CONF"; then continue; fi
+    sed -i "/server_name .*$(echo "$DOMAIN" | sed 's/\./\\./g')/a\\
+    location /$LOC {\\
+        proxy_pass http://127.0.0.1:$LAVA_PORT;\\
+        proxy_set_header Host \$host;\\
+        proxy_set_header X-Forwarded-Proto \$scheme;\\
+        proxy_set_header X-Real-IP \$remote_addr;\\
+    }" "$CONF"
+    ADDED=$((ADDED + 1))
+    echo "  добавлен маршрут /$LOC → 127.0.0.1:$LAVA_PORT"
+  done
+  if [ "$ADDED" = "0" ]; then
+    echo "  все нужные маршруты уже на месте."
+  elif ! nginx -t 2>/dev/null; then
+    # Сломать боевой nginx правкой конфига нельзя: откатываемся сразу.
+    cp "$BAK" "$CONF"
+    echo
+    echo "⚠️  После правки nginx не принял конфиг — вернул как было. Что он говорит:"
+    nginx -t 2>&1 | sed 's/^/    /'
+    echo "    Добавьте маршрут вручную: location /lava { proxy_pass http://127.0.0.1:$LAVA_PORT; }"
+    exit 1
+  fi
 else
   cat > "$CONF" <<NGINX
 # Сайт «Первички». Собран deploy/site.sh.
