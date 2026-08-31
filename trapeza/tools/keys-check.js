@@ -37,7 +37,7 @@ const APP = path.join(__dirname, '..');
  * Здесь проверяется именно файл, поэтому файл и главнее. Расхождение
  * показываем: молча подменять окружение тоже нельзя.
  */
-const WATCH = ['ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
+const WATCH = ['ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'XAI_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
   'VISION_PROVIDER', 'VISION_MODEL', 'SPEECH_PROVIDER', 'AI_ENABLED', 'AI_MODEL', 'AI_PROVIDER'];
 const shadowed = [];
 try {
@@ -337,6 +337,83 @@ async function checkYandexGpt(model) {
   }
 }
 
+/**
+ * Разбор фразы через xAI (Grok) — тот же вызов, что в lib/ai-agent.js.
+ *
+ * Проверяем весь путь, а не наличие ключа: шлём живую фразу и смотрим на
+ * ответ тем же кодом, что стоит в бою. Отдельно разобран несуществующий id
+ * модели — у xAI набор меняется, и это самая частая причина отказа.
+ */
+async function checkGrok(model) {
+  if (!process.env.XAI_API_KEY) { skip('Фразы: XAI_API_KEY не заполнен'); return; }
+  if (!model) {
+    no('Фразы: не задан AI_MODEL. Список моделей:\n'
+      + '      curl -H "Authorization: Bearer $XAI_API_KEY" https://api.x.ai/v1/models');
+    return;
+  }
+  const dirty = checkAscii(process.env.XAI_API_KEY, 'XAI_API_KEY');
+  if (dirty) { no(`Фразы: ${dirty}`); return; }
+
+  const PHRASE = 'надо бы выставить Заре за аренду тридцать тысяч';
+  try {
+    const res = await fetch('https://api.x.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${process.env.XAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 400,
+        temperature: 0.1,
+        messages: [
+          { role: 'system', content: ai.SYSTEM },
+          { role: 'user', content: PHRASE },
+        ],
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+    const body = await res.text();
+
+    if (!res.ok) {
+      if (res.status === 404 || /model/i.test(body)) {
+        no(`Фразы: модели «${model}» у xAI нет.\n`
+          + '      Список: curl -H "Authorization: Bearer $XAI_API_KEY" https://api.x.ai/v1/models\n'
+          + `      Ответ: ${body.replace(/\s+/g, ' ').slice(0, 200)}`);
+        return;
+      }
+      if (res.status === 403) {
+        no('Фразы: обращение отклонено до проверки ключа (403).\n'
+          + `      Ответ: ${body.replace(/\s+/g, ' ').slice(0, 200)}\n`
+          + '      Так отвечают на обращение оттуда, где сервис не работает.');
+        return;
+      }
+      no(`Фразы: ${why(res.status, body)}`);
+      return;
+    }
+
+    let reply = '';
+    try { reply = ((JSON.parse(body).choices || [{}])[0].message || {}).content || ''; } catch (_) { /* ниже */ }
+    if (!reply) { no(`Фразы: модель ответила пусто.\n      ${body.slice(0, 200)}`); return; }
+
+    let intent = null;
+    try {
+      const m = /\{[\s\S]*\}/.exec(reply);
+      intent = ai.sanitize(m ? JSON.parse(m[0]) : null);
+    } catch (_) { intent = { action: 'unknown' }; }
+
+    if (intent.action === 'draft') { ok(`Фразы: модель ${model} разобрала фразу — ${JSON.stringify(intent)}`); return; }
+    if (intent.action === 'unknown') {
+      no('Фразы: модель отвечает, но не по инструкции — вместо JSON пришло:\n'
+        + `      ${reply.replace(/\s+/g, ' ').slice(0, 200)}`);
+      return;
+    }
+    no(`Фразы: разбор получился, но не тот — ждали «выписать документ», пришло ${JSON.stringify(intent)}`);
+  } catch (e) {
+    no(`Фразы: не достучались — ${e.message}`);
+  }
+}
+
 /** Распознавание картинки через OpenRouter — тот же вызов, что в lib/vision.js. */
 async function checkOpenRouterVision(model) {
   if (!process.env.OPENROUTER_API_KEY) { skip('Фото: OPENROUTER_API_KEY не заполнен'); return; }
@@ -520,6 +597,7 @@ const ai = require(path.join(APP, 'lib/ai-agent'));
   const ap = String(process.env.AI_PROVIDER || 'yandexgpt').toLowerCase();
   if (process.env.AI_ENABLED !== '1') skip('Фразы: AI_ENABLED не 1 — свободный ввод выключен');
   else if (ap === 'yandexgpt') await checkYandexGpt(process.env.AI_MODEL || ai.MODEL_DEFAULT);
+  else if (ap === 'grok') await checkGrok(String(process.env.AI_MODEL || '').trim());
   else if (ap === 'anthropic') await checkAnthropic(process.env.AI_MODEL || ai.MODEL_DEFAULT, 'Фразы');
   else if (ap === 'openrouter') await checkOpenRouter(process.env.AI_MODEL || ai.MODEL_DEFAULT, 'Фразы');
   else skip(`Фразы: провайдер ${ap} — этой проверкой не покрыт`);

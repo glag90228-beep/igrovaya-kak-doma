@@ -16,15 +16,19 @@
  *  AI_USER_LIMIT        — предел на одного пользователя в месяц (30).
  *
  * Поддерживаемые провайдеры (AI_PROVIDER):
- *  - openrouter  (рекомендуется для РФ, обходит 403, поддержка Claude / Gemini / DeepSeek)
- *  - anthropic   (прямой вызов API Anthropic)
- *  - openai      (прямой вызов API OpenAI)
- *  - mock        (для автоматических тестов без сетевых запросов)
+ *  - yandexgpt   — по умолчанию: единственный, который отвечает с нашего
+ *                  сервера. Ключ YANDEX_API_KEY, каталог YANDEX_FOLDER_ID
+ *  - grok        — xAI, прямой вызов. Ключ XAI_API_KEY, модель обязательна
+ *                  в AI_MODEL
+ *  - openrouter  — ключ OPENROUTER_API_KEY. С российского адреса отвечает
+ *                  403 от своего Cloudflare (проверено на боевом сервере)
+ *  - anthropic   — ключ ANTHROPIC_API_KEY. С российского адреса тоже 403
+ *  - openai      — ключ OPENAI_API_KEY
+ *  - mock        — для прогонов, без сети
  */
 
 const { db } = require('../db');
 
-// Дефолтная модель OpenRouter (Claude 3.5 Sonnet / Gemini Flash / Claude Haiku)
 /*
  * Модель по умолчанию — маленькая, и это не экономия на спичках.
  *
@@ -67,12 +71,21 @@ const enabled = () => process.env.AI_ENABLED === '1';
 /** У Яндекса ключ и каталог всегда ходят парой: одного ключа мало. */
 const yandexReady = () => Boolean(process.env.YANDEX_API_KEY && process.env.YANDEX_FOLDER_ID);
 
+/*
+ * У xAI имя модели не угадывается: их набор меняется, и умолчание, взятое
+ * наугад, дало бы 404 в бою — там, где человек ждёт ответа бота. Поэтому
+ * модель обязательна в AI_MODEL, а список берётся у самого сервиса:
+ *   curl -H "Authorization: Bearer $XAI_API_KEY" https://api.x.ai/v1/models
+ */
+const grokReady = () => Boolean(process.env.XAI_API_KEY && String(process.env.AI_MODEL || '').trim());
+
 /** Готов ли модуль обращаться к модели. */
 function aiAvailable() {
   if (!enabled()) return false;
   const p = PROVIDER();
   if (p === 'mock') return true;
   if (p === 'yandexgpt') return yandexReady();
+  if (p === 'grok') return grokReady();
   if (p === 'openrouter') return Boolean(process.env.OPENROUTER_API_KEY);
   if (p === 'anthropic') return Boolean(process.env.ANTHROPIC_API_KEY);
   if (p === 'openai') return Boolean(process.env.OPENAI_API_KEY);
@@ -83,6 +96,8 @@ function aiHint() {
   if (!enabled()) return 'Свободный ввод выключен (AI_ENABLED не равен 1).';
   const p = PROVIDER();
   if (p === 'yandexgpt' && !yandexReady()) return 'Нет YANDEX_API_KEY или YANDEX_FOLDER_ID.';
+  if (p === 'grok' && !process.env.XAI_API_KEY) return 'Нет ключа XAI_API_KEY.';
+  if (p === 'grok') return 'Не задан AI_MODEL — имя модели у xAI меняется, угадывать его нельзя.';
   if (p === 'openrouter' && !process.env.OPENROUTER_API_KEY) return 'Нет ключа OPENROUTER_API_KEY.';
   if (p === 'anthropic' && !process.env.ANTHROPIC_API_KEY) return 'Нет ключа ANTHROPIC_API_KEY.';
   if (p === 'openai' && !process.env.OPENAI_API_KEY) return 'Нет ключа OPENAI_API_KEY.';
@@ -283,6 +298,35 @@ async function callModel(text) {
     if (!res.ok) throw new Error(`YandexGPT ${res.status}: ${(await res.text()).slice(0, 200)}`);
     const data = await res.json();
     return (((data.result || {}).alternatives || [{}])[0].message || {}).text || '';
+  }
+
+  /*
+   * xAI (Grok). Формат запроса как у OpenAI, поэтому ветка почти повторяет
+   * соседнюю — отличается только адресом и ключом. Сводить их в одну не
+   * стал: у площадок расходятся мелочи (заголовки, поля ответа, коды
+   * ошибок), и общая функция с тремя «если» читается хуже двух явных.
+   */
+  if (p === 'grok') {
+    const res = await fetch('https://api.x.ai/v1/chat/completions', {
+      method: 'POST',
+      signal,
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${process.env.XAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: maxTokens,
+        temperature: 0.1,
+        messages: [
+          { role: 'system', content: SYSTEM },
+          { role: 'user', content: String(text).slice(0, 1000) },
+        ],
+      }),
+    });
+    if (!res.ok) throw new Error(`xAI ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const data = await res.json();
+    return ((data.choices || [{}])[0].message || {}).content || '';
   }
 
   // Вызов через OpenRouter API

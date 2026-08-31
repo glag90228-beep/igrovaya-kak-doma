@@ -3566,6 +3566,64 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(norm(last()).includes('не применяю'), 'и экран говорит текущее состояние', norm(last()).slice(0, 80));
   }
 
+  console.log('\n── фразы через Grok (xAI) ──');
+  {
+    /*
+     * Провайдер добавлен на случай, если xAI отвечает с нашего адреса — в
+     * отличие от Anthropic и OpenRouter, которые отвечают 403. Проверяем
+     * форму запроса подставным сервером: она у xAI как у OpenAI, но ключ и
+     * адрес свои.
+     *
+     * Отдельно проверяем требование имени модели. Умолчания у нас нет
+     * намеренно: набор моделей у xAI меняется, и угаданное имя дало бы 404
+     * в бою — там, где человек ждёт ответа бота, а не в прогоне.
+     */
+    const http = require('node:http');
+    let got = null; let hdr = null;
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c) => { b += c; });
+      req.on('end', () => {
+        got = JSON.parse(b); hdr = req.headers;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: {
+          content: '{"action":"draft","docType":"sch","who":"Заря"}',
+        } }] }));
+      });
+    });
+    await new Promise((r) => srv.listen(0, r));
+
+    const was = { p: process.env.AI_PROVIDER, k: process.env.XAI_API_KEY, m: process.env.AI_MODEL };
+    process.env.AI_ENABLED = '1';
+    process.env.AI_PROVIDER = 'grok';
+    process.env.XAI_API_KEY = 'xai-test';
+    delete process.env.AI_MODEL;
+
+    const aiG = require('./lib/ai-agent');
+    ok(!aiG.aiAvailable() && aiG.aiHint().includes('AI_MODEL'),
+      'без имени модели не работаем и говорим почему', aiG.aiHint());
+
+    process.env.AI_MODEL = 'grok-проверочный';
+    ok(aiG.aiAvailable(), 'с ключом и моделью — готов');
+
+    const realFetch = global.fetch;
+    global.fetch = (u, o) => realFetch(
+      String(u).replace('https://api.x.ai', `http://127.0.0.1:${srv.address().port}`), o,
+    );
+    const intent = await aiG.understand('надо бы выставить Заре за аренду тридцать тысяч', 4343);
+    ok(intent.action === 'draft' && intent.who === 'Заря', 'фраза разобрана', JSON.stringify(intent));
+    ok(got.model === 'grok-проверочный', 'модель взята из AI_MODEL', got.model);
+    ok(hdr.authorization === 'Bearer xai-test', 'ключ ушёл в Bearer', hdr.authorization);
+    ok(got.messages[0].role === 'system' && typeof got.messages[1].content === 'string',
+      'формат сообщений как у OpenAI: role + content');
+
+    global.fetch = realFetch;
+    srv.close();
+    for (const [k, v] of [['AI_PROVIDER', was.p], ['XAI_API_KEY', was.k], ['AI_MODEL', was.m]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+
   console.log('\n── акт сверки: печатная форма ──');
   {
     /*
