@@ -47,7 +47,7 @@ const ai = require('./lib/ai-agent');
 // «Сегодня» и текущий год — по Москве, а не по часовому поясу сервера:
 // иначе документ, выписанный ночью, получал вчерашнюю дату, а в
 // новогоднюю ночь — ещё и номер из прошлого года. Подробности в lib/period.js.
-const { todayISO, currentYear } = period;
+const { todayISO, todayDate, currentYear } = period;
 
 /**
  * «15.06.2026» / «15.06.26» / «15.06» → ISO; иначе null.
@@ -2186,10 +2186,18 @@ async function postRecurringOp(tg, rec) {
  * Отметку «предложено» ставим сразу после отправки, а не после ответа:
  * иначе бот пришёл бы с тем же предложением и завтра, и послезавтра, пока
  * человек не нажмёт кнопку.
+ *
+ * at — момент, от которого считается «сегодня». По умолчанию настоящее время;
+ * задаётся он ровно затем же, зачем у todayISO и todayDate: чтобы поведение,
+ * привязанное к числу месяца, можно было проверить, не дожидаясь этого числа.
+ * Без такого шва проверка просрочки была неисполнима первого числа — просрочка
+ * наступает со дня после срока оплаты, а первого числа такого дня в месяце
+ * ещё не было.
  */
-async function runDaily(tg) {
+async function runDaily(tg, at = new Date()) {
+  const on = todayDate(at);
   let sent = 0;
-  for (const rec of recurring.due()) {
+  for (const rec of recurring.due(on)) {
     try {
       if (recurring.isOp(rec)) {
         // eslint-disable-next-line no-await-in-loop
@@ -2198,16 +2206,16 @@ async function runDaily(tg) {
       }
       // eslint-disable-next-line no-await-in-loop
       if (await offerRecurring(tg, rec)) sent += 1;
-      recurring.markOffered(rec.user_id, rec.id);
+      recurring.markOffered(rec.user_id, rec.id, on);
     } catch (e) {
       console.error('регулярные документы:', e.message);
     }
   }
-  for (const rec of recurring.overdue()) {
+  for (const rec of recurring.overdue(on)) {
     try {
       // eslint-disable-next-line no-await-in-loop
       if (await warnOverdue(tg, rec)) sent += 1;
-      recurring.markDueNoticed(rec.id);
+      recurring.markDueNoticed(rec.id, on);
     } catch (e) {
       console.error('просрочка:', e.message);
     }

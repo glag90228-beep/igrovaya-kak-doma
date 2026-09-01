@@ -3098,14 +3098,26 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await tap('doc.make');
     const bill = bdbO.listDocs(uid, 1)[0];
 
-    // Срок оплаты — вчера, о просрочке ещё не сообщали.
+    // Срок оплаты был вчера, о просрочке ещё не сообщали.
+    //
+    // День задаём, а не берём из календаря. Раньше он считался от «вчера», и
+    // первого числа проверка становилась неисполнимой: просрочка наступает со
+    // дня после срока оплаты, а первого числа такого дня в месяце ещё не было.
+    // Проверка при этом падала, хотя бот вёл себя правильно.
+    //
+    // Месяц остаётся настоящим: счёт выписан сегодня, а ищут его по текущему
+    // месяцу — подменять пришлось бы ещё и это.
     const id = rec.add(uid, { cpId: cpO, type: 'sch', items: [{ name: 'Аренда', qty: 1, price: 20000 }] });
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    rec.setSchedule(uid, id, { payDay: Math.max(1, Math.min(27, yesterday.getDate())), leadDays: 3 });
+    // Сдвиг берём наименьший из возможных — второе число при сроке первого.
+    // Чем дальше уехать по календарю, тем больше чужих правил в общей базе
+    // окажутся «наступившими»: на шестнадцатом числе они принялись выписывать
+    // документы и сломали проверки лимита и журнала в других разделах.
+    const now = new Date();
+    const on = new Date(now.getFullYear(), now.getMonth(), 2, 12);
+    rec.setSchedule(uid, id, { payDay: 1, leadDays: 3 });
 
     const before = sent.length;
-    await runDaily(tg);
+    await runDaily(tg, on);
     const warned = sent.slice(before).map((m) => norm(m.text)).join('\n');
     ok(/Просрочка: ООО «Должник»/.test(warned), 'бот сообщил о просрочке', warned.slice(0, 60));
     ok(/20 000,00/.test(warned), 'в сообщении сумма неоплаченного');
@@ -3552,7 +3564,16 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const said = norm(sent.map((m) => m.text || '').join(' '));
     ok(said.includes('чек в «Моём налоге»'), 'с галочкой — напомнил про чек', said.slice(0, 90));
     ok(said.includes('ООО «Чек»'), 'и назвал, по какому клиенту');
-    ok(said.includes('09.09.2026'), 'и назвал срок — 9 сентября', said.slice(-120));
+    /*
+     * Срок считается от настоящей даты отметки об оплате, поэтому зашивать
+     * сюда конкретное число нельзя: раньше здесь стояло «09.09.2026», и
+     * проверка проходила только в августе. Саму арифметику — что это 9-е
+     * число следующего месяца, с переходом через декабрь — проверяют
+     * отдельные вызовы chequeDue выше, на неподвижных датах.
+     */
+    const dueIso = npdLib.chequeDue(require('./lib/period').todayISO());
+    const dueRu = `${dueIso.slice(8)}.${dueIso.slice(5, 7)}.${dueIso.slice(0, 4)}`;
+    ok(said.includes(dueRu), 'и назвал срок — 9-е число следующего месяца', said.slice(-120));
     const btns = sent.flatMap((m) => (m.kb || []).flat());
     ok(btns.some((b) => b.url === 'https://lknpd.nalog.ru/'),
       'кнопка открывает «Мой налог», а не выдуманную схему',
