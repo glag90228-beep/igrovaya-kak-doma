@@ -3865,6 +3865,104 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await handleUpdate(tg, { callback_query: { id: 'c3', from: OTHER, data: `cp:${cpId}`, message: { chat: { id: 777002 } } } });
   ok(last().includes('не найден'), 'по прямой ссылке чужого контрагента тоже не отдаёт');
 
+  /*
+   * Ниже — проверки на дыры, найденные ревизией.
+   *
+   * Все они прошли мимо прогона, хотя он был зелёным: в нём не было ни чисел
+   * за пределом разумного, ни чужого пользователя в поле идентификатора, ни
+   * денег в нештатных статусах, ни календаря на границе месяца. Каждая
+   * проверка ниже падала на коде до правки — иначе она бесполезна.
+   */
+
+  console.log('\n── деньги: отказ, возврат, повтор ──');
+  {
+    const billing = require('./lib/billing');
+    const bdbP = require('./lib/bot-db');
+    const uid = bdbP.getOrCreateUser(779001).id;
+
+    // Срок проставляется только состоявшейся оплате, а отбор ничьих берёт
+    // лишь строки со сроком. Раньше отклонённый платёж давал полный месяц.
+    billing.recordPayment({ externalId: 'rev-f1', provider: 'lava', userId: 0,
+      email: 'otkaz@x.ru', amount: 390, currency: 'RUB', days: 0, status: 'payment.failed' });
+    ok(billing.unclaimedByEmail('otkaz@x.ru').length === 0,
+      'по отклонённой оплате доступ не забрать');
+
+    const good = billing.recordPayment({ externalId: 'rev-g1', provider: 'lava', userId: 0,
+      email: 'chestno@x.ru', amount: 390, currency: 'RUB', days: 30, status: 'payment.success' });
+    ok(billing.unclaimedByEmail('chestno@x.ru').length === 1, 'настоящая оплата ждёт владельца');
+
+    ok(billing.attachPayment(good.id, uid) === true, 'первый забрал оплату');
+    ok(billing.attachPayment(good.id, bdbP.getOrCreateUser(779002).id) === false,
+      'второму она уже не достанется — иначе один платёж давал бы два срока');
+
+    // Похожий платёж: записан со следом, но доступа не даёт. Раньше он не
+    // записывался вовсе, и разбираться с претензией было не по чему.
+    billing.recordPayment({ externalId: 'rev-n1', provider: 'lava', userId: 0,
+      email: 'dvazhdy@x.ru', amount: 390, currency: 'RUB', days: 30, status: 'payment.success' });
+    const near = billing.recordPayment({ externalId: 'rev-n2', provider: 'lava', userId: 0,
+      email: 'dvazhdy@x.ru', amount: 390, currency: 'RUB', days: 30, status: 'payment.success' });
+    ok(near.near === true, 'второй похожий платёж помечен как повтор');
+    ok(Boolean(billing.findPayment('lava', 'rev-n2')), 'но записан, а не потерян');
+    ok(billing.unclaimedByEmail('dvazhdy@x.ru').length === 1, 'и доступа по нему нет');
+  }
+
+  console.log('\n── одно число больше не вешает продукт ──');
+  {
+    const money = require('./lib/money');
+    const dsx = require('./lib/doc-service');
+    ok(money.round2(Infinity) === 0, 'бесконечность приводится к нулю, а не остаётся числом');
+    // Если бы застава не сработала, цикл деления на тысячу шёл бы вечно и
+    // прогон отсюда уже не вернулся.
+    ok(typeof money.amountInWords(Infinity) === 'string',
+      'сумма прописью от бесконечности возвращается, а не считается вечно');
+    const it = dsx.cleanItems([{ name: 'Космос', qty: 1e200, price: 1e200 }])[0];
+    ok(Number.isFinite(it.qty * it.price),
+      'произведение количества на цену остаётся конечным', it.qty * it.price);
+  }
+
+  console.log('\n── пересчёт долга не задваивает оплату ──');
+  {
+    const bdbD = require('./lib/bot-db');
+    const dsd = require('./lib/doc-service');
+    const u = bdbD.getOrCreateUser(779010);
+    bdbD.saveMyOrg(u.id, { name: 'ИП Проверка', inn: '183209316119' });
+    const orgD = bdbD.getDefaultOrg(u.id);
+    const cpD = bdbD.createCp(u.id, { name: 'ООО «Заплатил»', kind: 'customer', opening_date: '2026-01-01' });
+    const made = await dsd.issueDocument(u.id, {
+      type: 'usl', cpId: cpD, items: [{ name: 'Работа', qty: 1, price: 50000 }], skipQuota: true,
+    });
+    // Человек вносит оплату строкой в журнал, и только потом жмёт «Оплачен».
+    bdbD.addOp(u.id, cpD, { date: '2026-09-01', kind: 'Оплата', doc: 'п/п 7', debit: 50000 });
+    bdbD.markPaid(u.id, made.doc.id);
+    ok(Number(bdbD.getDoc(u.id, made.doc.id).paid_sum) === 0,
+      'отметка записала ноль: проводки не было, долг уже закрыт');
+    bdbD.rebuildDebt(u.id, orgD);
+    ok(bdbD.balanceOf(u.id, cpD).closing === 0,
+      'после пересчёта сальдо не уехало в минус', bdbD.balanceOf(u.id, cpD).closing);
+  }
+
+  console.log('\n── чужую операцию через выписку не удалить ──');
+  {
+    const bdbO = require('./lib/bot-db');
+    const dso = require('./lib/doc-service');
+    const a = bdbO.getOrCreateUser(779020);
+    const b = bdbO.getOrCreateUser(779021);
+    bdbO.saveMyOrg(a.id, { name: 'ИП Первый', inn: '183209316119' });
+    bdbO.saveMyOrg(b.id, { name: 'ИП Второй', inn: '183209316118' });
+    const cpA = bdbO.createCp(a.id, { name: 'Клиент А', kind: 'customer', opening_date: '2026-01-01' });
+    const cpB = bdbO.createCp(b.id, { name: 'Клиент Б', kind: 'customer', opening_date: '2026-01-01' });
+    const opB = bdbO.addOp(b.id, cpB, { date: '2026-09-01', kind: 'Оплата', doc: 'чужая строка', debit: 100000 });
+    const docA = await dso.issueDocument(a.id, {
+      type: 'usl', cpId: cpA, items: [{ name: 'Работа', qty: 1, price: 100000 }], skipQuota: true,
+    });
+    const beforeB = bdbO.balanceOf(b.id, cpB).closing;
+    bdbO.closeDocsFromBank(a.id, [{
+      opId: opB, cpId: cpA, leadId: docA.doc.id, total: 100000, date: '2026-09-01', doc: 'п/п 1',
+    }]);
+    ok(bdbO.balanceOf(b.id, cpB).closing === beforeB,
+      'сальдо чужого пользователя не изменилось', `${beforeB} → ${bdbO.balanceOf(b.id, cpB).closing}`);
+  }
+
   console.log('\n── общий браузер для PDF ──');
   const pdf = require('./lib/pdf');
   if (pdf.pdfAvailable()) {
