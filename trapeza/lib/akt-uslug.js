@@ -5,7 +5,7 @@
 // таблица услуг, сумма прописью, при необходимости — признание задолженности.
 
 const { esc, ru, page, fxHtml, formatMoney, amountInWords } = require('./doc-html');
-const { round2 } = require('./money');
+const { round2, vatTotals } = require('./money');
 
 function party(org) {
   const bits = [];
@@ -18,7 +18,17 @@ function party(org) {
 /** doc: { number, date, subtitle?, items:[{name,qty,unit,price}], recognizeDebt?, note? } */
 function buildAktUslugHtml({ org, cp, doc }) {
   const items = doc.items || [];
-  const total = round2(items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0));
+  /*
+   * Итог считаем через vatTotals, а не сложением произведений.
+   *
+   * Своя арифметика здесь молча расходилась с журналом: doc-service считает
+   * тот же документ с учётом ставки, а бланк печатал сумму без налога. При
+   * НДС 20% сверху контрагент подписывал акт на 100 000, а в учёте и в
+   * подписи к файлу стояло 120 000 — и долг был на 120 000. Ставка
+   * попадает сюда через extra счёта, от которого заведён ежемесячный акт.
+   */
+  const rate = doc.vatRate == null ? null : Number(doc.vatRate);
+  const total = vatTotals(items, rate, Boolean(doc.priceIncludesVat)).total;
   const ispoln = party({ ...org, full_name: (org.full_name || org.name || '').toUpperCase() });
   const zakaz = party(cp);
 

@@ -49,7 +49,14 @@ function cpTitle(cp) {
 
 async function buildAkt({ org, cp, ops }) {
   const isSupplier = cp.kind === 'supplier';
-  const orgShort = org.org_short || 'ИП Сарычева М. В.';
+  /*
+   * Запасным значением здесь стояло «ИП Сарычева М. В.» — имя из разработки.
+   * Акт сверки уходит контрагенту, и у любого, кто не заполнил эти поля,
+   * документ уезжал с чужим именем и чужим предпринимателем в шапке.
+   * Пустое поле честнее: человек увидит, что не заполнил, а контрагент не
+   * получит документ от постороннего лица.
+   */
+  const orgShort = org.org_short || org.name || '';
   const orgFull = org.org_full || orgShort;
   const orgInn = org.org_inn || '';
   const wb = new ExcelJS.Workbook();
@@ -364,7 +371,7 @@ async function buildAkt({ org, cp, ops }) {
   const rSign = rFrom + 2;
   a.mergeCells(`A${rSign}:D${rSign}`);
   a.mergeCells(`E${rSign}:H${rSign}`);
-  a.getCell(`A${rSign}`).value = `_______________ / ${org.signer || 'М. В. Сарычева'} /`;
+  a.getCell(`A${rSign}`).value = `_______________ / ${org.signer || '______________'} /`;
   a.getCell(`E${rSign}`).value = `_______________ / ${cp.signer || '______________'} /`;
   [a.getCell(`A${rSign}`), a.getCell(`E${rSign}`)].forEach((c) => { c.font = { size: 9 }; });
 

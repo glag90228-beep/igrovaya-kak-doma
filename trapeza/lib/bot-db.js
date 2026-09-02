@@ -964,9 +964,24 @@ function matchPaymentsToDocs(userId, payments) {
  * @returns {{docs:number, deals:number}} сколько документов и сделок закрыто
  */
 function closeDocsFromBank(userId, deals) {
-  const cut = db.prepare('UPDATE operations SET debit = ? WHERE id = ?');
-  const drop = db.prepare('DELETE FROM operations WHERE id = ?');
-  const amountOf = db.prepare('SELECT debit FROM operations WHERE id = ?');
+  /*
+   * Владельца операции спрашиваем, а не подразумеваем.
+   *
+   * opId приходит прямо из тела запроса приложения. leadId проверен getDoc,
+   * cpId — getCp, а этот не проверялся ничем: чужой идентификатор в поле
+   * молча удалял операцию другого человека и менял его сальдо. Следа не
+   * оставалось — строка просто исчезала из журнала, и владелец узнать об
+   * этом не мог.
+   *
+   * Операция принадлежит контрагенту, а контрагент — человеку, поэтому
+   * спрашиваем через counterparties, как это делает deleteOp. Условие
+   * повторено в трёх запросах намеренно: проверка в одном месте держится
+   * только на том, что порядок вызовов никто не переставит.
+   */
+  const own = 'cp_id IN (SELECT id FROM counterparties WHERE user_id = ?)';
+  const cut = db.prepare(`UPDATE operations SET debit = ? WHERE id = ? AND ${own}`);
+  const drop = db.prepare(`DELETE FROM operations WHERE id = ? AND ${own}`);
+  const amountOf = db.prepare(`SELECT debit FROM operations WHERE id = ? AND ${own}`);
   const mark = db.prepare('UPDATE documents SET paid_at = ?, paid_sum = ? WHERE id = ? AND user_id = ?');
   const markTwin = db.prepare('UPDATE documents SET paid_at = ?, paid_sum = 0 WHERE id = ? AND user_id = ?');
   let docs = 0;
@@ -981,12 +996,12 @@ function closeDocsFromBank(userId, deals) {
       const total = round2(Number(d.total) || 0);
 
       // Убираем сумму сделки из свободной строки выписки.
-      const src = d.opId ? amountOf.get(Number(d.opId)) : null;
+      const src = d.opId ? amountOf.get(Number(d.opId), userId) : null;
       let dropped = false;
       if (src) {
         const rest = round2((Number(src.debit) || 0) - total);
-        if (rest > 0.004) cut.run(rest, Number(d.opId));
-        else { drop.run(Number(d.opId)); dropped = true; }
+        if (rest > 0.004) cut.run(rest, Number(d.opId), userId);
+        else { drop.run(Number(d.opId), userId); dropped = true; }
       }
       // И кладём её же строкой, привязанной к документу.
       addOpForDoc(userId, d.cpId, {

@@ -103,8 +103,16 @@ function cleanItems(raw) {
     out.push({
       name,
       unit: String((it && it.unit) || 'шт.').trim().slice(0, 20) || 'шт.',
-      qty: Number.isFinite(qty) && qty > 0 ? round2(qty) : 1,
-      price: Number.isFinite(price) && price >= 0 ? round2(price) : 0,
+      /*
+       * Потолок — не придирка, а защита от переполнения. Само по себе
+       * количество конечно, но произведение количества на цену считается
+       * дальше в double: два числа по 1e200 дают бесконечность, и документ
+       * с такой позицией останавливал весь процесс. Миллиард штук по
+       * миллиарду рублей — заведомо больше всего, что бывает в первичке,
+       * и произведение таких чисел double держит с запасом.
+       */
+      qty: Number.isFinite(qty) && qty > 0 ? round2(Math.min(qty, 1e9)) : 1,
+      price: Number.isFinite(price) && price >= 0 ? round2(Math.min(price, 1e9)) : 0,
     });
   }
   return out;
