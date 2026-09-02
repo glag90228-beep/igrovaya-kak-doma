@@ -571,28 +571,62 @@ const makesDebt = (org, type) => DEBT_DOCS[basisOf(org)].includes(type);
  * @returns {{to:string, count:number, sum:number, zero:boolean}|null}
  */
 function basisMismatch(userId, org, owedToUs) {
-  const unpaid = unpaidDocs(userId, 200);
-  if (!unpaid.length) return null;
   // В ручном режиме молчим: человек сам сказал, что журнал ведёт он, и кнопка
   // рядом с подсказкой молча начала бы делать проводки за него.
   const basis = basisOf(org || {});
   if (basis === 'manual') return null;
-  const mute = unpaid.filter((d) => !DEBT_DOCS[basis].includes(d.type));
+
+  /*
+   * Берём все документы, чей вид при нынешнем основании обязательства не
+   * создаёт, — а не только неоплаченные.
+   *
+   * Раньше выборка шла по неоплаченным, и подсказка замолкала ровно тогда,
+   * когда становилась нужнее всего. Человек загружал выписку, счета
+   * помечались оплаченными и выпадали из выборки, а деньги ложились в журнал
+   * проводкой. Обязательства по ним нет — счёт его не создавал, — и сальдо
+   * уходило в минус: клиент, только что расплатившийся, показывался тем,
+   * кому должны мы. Объяснение при этом исчезало.
+   *
+   * Формально минус здесь не выдумка: деньги, полученные до закрывающего
+   * документа, — это аванс, то есть обязательство перед клиентом. Но человеку,
+   * который работает счетами, такое объяснение не нужно: ему нужно, чтобы
+   * долг считался со счёта. Об этом и говорим.
+   */
+  const rows = db.prepare(
+    'SELECT id, cp_id, type, total, paid_at FROM documents WHERE user_id = ? AND total > 0 AND no_debt = 0',
+  ).all(userId);
+  const mute = rows.filter((d) => !DEBT_DOCS[basis].includes(d.type));
   if (!mute.length) return null;
+
+  /*
+   * Говорим в двух случаях: либо такие документы висят неоплаченными и их
+   * не видно в долге, либо по ним уже пришли деньги и сальдо ушло в минус.
+   * Молчим, когда ни того, ни другого: у человека просто нет документов,
+   * которые его основание не считает, — и лезть с советом незачем.
+   */
+  const unpaidMute = mute.filter((d) => !d.paid_at);
+  const advanceCps = [...new Set(mute.map((d) => d.cp_id))]
+    .filter((id) => (balanceOf(userId, id) || {}).closing < 0);
+  const speak = unpaidMute.length ? unpaidMute
+    : mute.filter((d) => advanceCps.includes(d.cp_id));
+  if (!speak.length) return null;
   /*
    * Куда переключать — выводим из самих документов, а не подставляем «по
    * счёту» всегда. Иначе выходил замкнутый круг: у человека уже стоит «по
    * счёту», висит неоплаченный акт, экран советует включить включённое,
    * кнопка ничего не меняет и рапортует «Готово».
    */
-  const to = mute.every((d) => DEBT_DOCS.invoice.includes(d.type)) ? 'invoice'
-    : (mute.every((d) => DEBT_DOCS.closing.includes(d.type)) ? 'closing' : null);
+  const to = speak.every((d) => DEBT_DOCS.invoice.includes(d.type)) ? 'invoice'
+    : (speak.every((d) => DEBT_DOCS.closing.includes(d.type)) ? 'closing' : null);
   if (!to || to === basis) return null;
   return {
     to,
-    count: mute.length,
-    sum: round2(mute.reduce((a, d) => a + (Number(d.total) || 0), 0)),
+    count: speak.length,
+    sum: round2(speak.reduce((a, d) => a + (Number(d.total) || 0), 0)),
     zero: Number(owedToUs || 0) <= 0,
+    // Деньги уже пришли, а обязательства по ним нет — сальдо в минусе.
+    // Экран говорит об этом иначе: не «их не видно», а «показаны авансом».
+    advance: !unpaidMute.length,
   };
 }
 

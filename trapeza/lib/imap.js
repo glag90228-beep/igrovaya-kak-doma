@@ -36,6 +36,32 @@ const CRLF = '\r\n';
  */
 const MAX_RESPONSE = 25 * 1024 * 1024;
 
+/**
+ * Ошибка человеческим языком.
+ *
+ * Наружу уходило сообщение исключения как есть, и человек на экране «Входящие»
+ * читал «error:0A0000C6:SSL routines:tls_get_more_records:packet length too
+ * long» — без единой подсказки, что с этим делать. Такой текст не объясняет
+ * ничего никому, кроме того, кто писал протокол.
+ *
+ * Причина при этом почти всегда одна из трёх: не тот порт, выключенный у
+ * провайдера доступ по IMAP или недоступный сервер. О них и говорим, а
+ * исходный текст оставляем в скобках — по нему разбирается владелец, если
+ * дело окажется в чём-то ещё.
+ */
+function humanError(e) {
+  const raw = String((e && e.message) || 'неизвестная ошибка');
+  if (/SSL|TLS|packet length|wrong version/i.test(raw)) {
+    return 'Сервер ответил не по тому протоколу — обычно это не тот порт '
+      + 'или не то шифрование. Проверьте настройки ящика.';
+  }
+  if (/ENOTFOUND|EAI_AGAIN/i.test(raw)) return 'Не нашёл такой почтовый сервер — проверьте адрес.';
+  if (/ECONNREFUSED/i.test(raw)) return 'Не удалось соединиться с сервером — проверьте порт.';
+  if (/ETIMEDOUT|timeout|истекло/i.test(raw)) return 'Сервер не ответил вовремя. Попробуйте ещё раз.';
+  if (/слишком большое/i.test(raw)) return raw;
+  return raw;
+}
+
 /** Ответ сервера: строки протокола + собранные литералы. */
 class Reader {
   constructor(socket, timeout) {
@@ -224,7 +250,7 @@ async function fetchNew(config, { limit = 10, unseenOnly = true, sinceDays = 0 }
     return { ok: true, messages, total: uids.length };
   } catch (e) {
     try { await client.logout(); } catch (_) { /* уже мертво */ }
-    return { ok: false, error: e.message };
+    return { ok: false, error: humanError(e) };
   }
 }
 
