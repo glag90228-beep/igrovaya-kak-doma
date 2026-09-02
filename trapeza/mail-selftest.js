@@ -251,6 +251,25 @@ async function main() {
   ok(mail.cfg().port === 465 && mail.cfg().secure, 'SMTP_SECURE=1 переключает на 465', mail.cfg().port);
   Object.assign(process.env, keep);
 
+  console.log('\n── Reply-To не пропускает чужие заголовки ──');
+  {
+    /*
+     * Тема проходит через encodeHeader, получатели — через validEmail, и обе
+     * проверки не пропускают перевод строки. Reply-To клался в письмо сырым:
+     * значение «a@b.ru\r\nBcc: чужой@адрес» давало настоящий Bcc — скрытую
+     * копию любого документа кому угодно.
+     */
+    const build = (replyTo) => mail.buildMessage({
+      from: 'me@x.ru', fromName: 'Я', to: 'them@y.ru',
+      subject: 'Счёт', text: 'тело', replyTo,
+    });
+    const evil = build('a@b.ru\r\nBcc: leak@evil.com');
+    ok(!/^Bcc:/mi.test(evil), 'подставленный Bcc в письмо не попал');
+    ok(!/Reply-To:/i.test(evil), 'и сам испорченный адрес отброшен целиком');
+    ok(/Reply-To: otvet@x\.ru/.test(build('otvet@x.ru')),
+      'а честный адрес по-прежнему проставляется');
+  }
+
   console.log(bad ? `\nне прошло: ${bad}` : '\nотправка почты работает целиком ✅');
   process.exit(bad ? 1 : 0);
 }

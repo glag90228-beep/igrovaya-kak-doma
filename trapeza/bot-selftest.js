@@ -3963,6 +3963,112 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'сальдо чужого пользователя не изменилось', `${beforeB} → ${bdbO.balanceOf(b.id, cpB).closing}`);
   }
 
+  console.log('\n── документы: НДС, упрощёнка, чужое имя, номера ──');
+  {
+    const { buildAktUslugHtml } = require('./lib/akt-uslug');
+    const { buildDogovorHtml } = require('./lib/dogovor');
+    const { vatTotals } = require('./lib/money');
+    const items20 = [{ name: 'Работа', qty: 1, price: 100000, unit: 'шт.' }];
+
+    // Бланк акта услуг считал свою сумму мимо ставки: контрагент подписывал
+    // 100 000, а в журнале и в долге стояло 120 000.
+    const aktHtml = buildAktUslugHtml({
+      org: { name: 'ООО «Мы»', inn: '7701234567' }, cp: { name: 'ООО «Они»', inn: '7809876543' },
+      doc: { number: '1', date: '2026-09-01', items: items20, vatRate: 20, priceIncludesVat: false },
+    });
+    const want = vatTotals(items20, 20, false).total;
+    // Пробел в денежном формате неразрывный — сравнивать надо после замены,
+    // иначе проверка спорит с типографикой, а не с суммой.
+    const flat = aktHtml.replace(/ /g, ' ');
+    ok(flat.includes('120 000,00') && want === 120000,
+      'акт услуг печатает ту же сумму, что уходит в журнал', want);
+
+    // Оговорка про упрощёнку — только тому, кто на упрощёнке.
+    const dogVat = buildDogovorHtml({
+      org: { name: 'ООО «Мы»', inn: '7701234567', vat_rate: '20' },
+      cp: { name: 'ООО «Они»' }, doc: { number: '1', date: '2026-09-01', price: 50000 },
+    });
+    ok(!/упрощённой системы налогообложения/.test(dogVat),
+      'договор не объявляет упрощёнку плательщику НДС');
+    const dogUsn = buildDogovorHtml({
+      org: { name: 'ИП Мы', inn: '183209316119', vat_rate: '' },
+      cp: { name: 'ООО «Они»' }, doc: { number: '1', date: '2026-09-01', price: 50000 },
+    });
+    ok(/упрощённой системы налогообложения/.test(dogUsn),
+      'а тому, кто на упрощёнке, — объявляет');
+
+    // Имя из разработки уходило контрагенту в акте сверки.
+    // Ищем имя именно как запасное ЗНАЧЕНИЕ: в комментарии рядом оно стоит
+    // законно — там объясняется, почему его убрали.
+    const aktSrc = require('node:fs').readFileSync(require('node:path')
+      .join(__dirname, 'lib', 'xlsx-akt.js'), 'utf8');
+    ok(!/\|\|\s*'[^']*Сарычева/.test(aktSrc),
+      'чужое имя больше не подставляется запасным значением в акт сверки');
+  }
+
+  console.log('\n── номера документов не повторяются ──');
+  {
+    const bdbN = require('./lib/bot-db');
+    const dsn = require('./lib/doc-service');
+    const u = bdbN.getOrCreateUser(779030);
+    bdbN.saveMyOrg(u.id, { name: 'ООО «Нумерация»', inn: '7701234567' });
+    const cpN = bdbN.createCp(u.id, { name: 'ООО «Клиент»', kind: 'customer', opening_date: '2026-01-01' });
+    const mk = (number) => dsn.issueDocument(u.id, {
+      type: 'sch', cpId: cpN, number, items: [{ name: 'Работа', qty: 1, price: 100 }], skipQuota: true,
+    });
+    const hand = await mk('3');
+    ok(hand.ok !== false && hand.doc.number === '3', 'номер, заданный рукой, принят');
+    await mk();
+    const third = await mk();
+    ok(third.doc.number !== '3',
+      'присвоенный сам номер обошёл занятый рукой', third.doc.number);
+    const again = await mk('3');
+    ok(again.ok === false && again.reason === 'number',
+      'повторно задать тот же номер рукой нельзя', again.message);
+  }
+
+  console.log('\n── УПД: статус и ставка по режиму налога ──');
+  {
+    const bdbU = require('./lib/bot-db');
+    const dsu = require('./lib/doc-service');
+    const one = async (tgId, vat) => {
+      const u = bdbU.getOrCreateUser(tgId);
+      bdbU.saveMyOrg(u.id, { name: 'ООО «УПД»', inn: '7701234567' });
+      bdbU.updateOrg(u.id, bdbU.getDefaultOrg(u.id).id, { vat_rate: vat });
+      const cpU = bdbU.createCp(u.id, { name: 'ООО «Покупатель»', kind: 'customer', opening_date: '2026-01-01' });
+      const r = await dsu.issueDocument(u.id, {
+        type: 'upd', cpId: cpU, items: [{ name: 'Товар', qty: 1, price: 10000 }], skipQuota: true,
+      });
+      return { total: r.total, saved: bdbU.getDoc(u.id, r.doc.id).payload || {} };
+    };
+    const vat = await one(779040, '20');
+    ok(vat.total === 12000 && Number(vat.saved.status) === 1 && Number(vat.saved.vatRate) === 20,
+      'плательщику НДС — статус 1 и ставка, иначе покупателю нечего принять к вычету',
+      `${vat.total} ст.${vat.saved.status} ${vat.saved.vatRate}`);
+    const usn = await one(779041, '');
+    ok(usn.total === 10000 && Number(usn.saved.status) === 2,
+      'на упрощёнке — статус 2 без счёта-фактуры', `${usn.total} ст.${usn.saved.status}`);
+  }
+
+  console.log('\n── повторения: отмена и пропущенный день ──');
+  {
+    const rc = require('./lib/recurring');
+    const at = (s) => new Date(`${s}T12:00:00Z`);
+    const due = (day, iso2, lastOffer) => rc.isDue({ active: 1, day, last_offer: lastOffer }, at(iso2));
+    ok(due(0, '2026-08-31', '2026-07') === true, 'в последний день месяца предложение положено');
+    ok(due(0, '2026-09-01', '2026-07') === true,
+      'служба лежала в тот день — предложение догоняет, а не пропадает навсегда');
+    ok(due(0, '2026-09-01', '2026-08') === false, 'а отработанный месяц второй раз не предлагаем');
+    ok(due(0, '2026-08-30', '') === false, 'без отметки правило не срывается в любой день');
+
+    const od = (payDay, iso2, lastDue) => rc.isOverdue({ active: 1, pay_day: payDay, last_due: lastDue }, at(iso2));
+    ok(od(25, '2026-08-26', '2026-07') === true, 'на следующий день после срока — просрочка');
+    ok(od(25, '2026-09-01', '2026-07') === true, 'и первого числа про прошлый месяц скажем');
+    ok(od(25, '2026-09-01', '2026-08') === false, 'о чём уже сказали — молчим');
+    ok(od(25, '2026-09-01', '') === false,
+      'а только что заведённое правило не пугает долгом за месяц, которого не видело');
+  }
+
   console.log('\n── общий браузер для PDF ──');
   const pdf = require('./lib/pdf');
   if (pdf.pdfAvailable()) {

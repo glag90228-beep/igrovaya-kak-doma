@@ -1248,7 +1248,82 @@ async function main() {
   ok(verifyInitData(initDataFor(MASHA), { token: TOKEN }).user.id === MASHA.id,
     'из подписанной строки достаётся тот же пользователь');
 
+  section('дыры, найденные ревизией');
+  {
+    const bdbR = require('./lib/bot-db');
+    const dsr = require('./lib/doc-service');
+
+    /*
+     * Подсказка про основание долга гасла по условию owedToUs > 0, а оно
+     * глобальное — по всем контрагентам сразу. Достаточно было одного
+     * должника, чтобы неоплаченный счёт молча выпал из виду.
+     */
+    const u = bdbR.getOrCreateUser(788001);
+    bdbR.saveMyOrg(u.id, { name: 'ИП Основание', inn: '183209316119' });
+    const orgR = bdbR.getDefaultOrg(u.id);
+    const c1 = bdbR.createCp(u.id, { name: 'ООО «Счёт»', kind: 'customer', opening_date: '2026-01-01' });
+    await dsr.issueDocument(u.id, {
+      type: 'sch', cpId: c1, items: [{ name: 'Работа', qty: 1, price: 200000 }], skipQuota: true,
+    });
+    const owed0 = bdbR.debtors(u.id).filter((r) => r.theyOwe).reduce((s, r) => s + r.amount, 0);
+    const m0 = bdbR.basisMismatch(u.id, orgR, owed0);
+    ok(m0 && m0.to === 'invoice' && m0.zero === true,
+      'счёт не в долге — подсказка есть и говорит про ноль', JSON.stringify(m0));
+
+    const c2 = bdbR.createCp(u.id, { name: 'ООО «Акт»', kind: 'customer', opening_date: '2026-01-01' });
+    await dsr.issueDocument(u.id, {
+      type: 'usl', cpId: c2, items: [{ name: 'Работа', qty: 1, price: 5000 }], skipQuota: true,
+    });
+    const owed1 = bdbR.debtors(u.id).filter((r) => r.theyOwe).reduce((s, r) => s + r.amount, 0);
+    const m1 = bdbR.basisMismatch(u.id, orgR, owed1);
+    ok(m1 && m1.zero === false,
+      'и не гаснет из-за того, что кто-то другой должен', `долг ${owed1}, ${JSON.stringify(m1)}`);
+
+    /*
+     * Начало месяца для реестра считалось по поясу сервера, а конец — по
+     * Москве. Сервер в UTC: первого числа в 00:30 по Москве здесь был ещё
+     * прошлый месяц, и реестр приходил за него целиком плюс один день.
+     */
+    /*
+     * Поведением это не проверить: пояс сервера внутри уже запущенного
+     * процесса не подменить, а разница проявляется единственной ночью в
+     * месяце. Поэтому сторожим саму запись — чтобы никто не вернул расчёт
+     * по new Date(), не заметив, что «по» рядом считается по Москве.
+     */
+    const appSrc = require('node:fs').readFileSync(
+      require('node:path').join(__dirname, 'miniapp.js'), 'utf8');
+    ok(/const first = `\$\{docService\.todayISO\(\)\.slice\(0, 7\)\}-01`/.test(appSrc),
+      `начало месяца для реестра берётся по московскому календарю (${dsr.todayISO().slice(0, 7)})`);
+  }
+
+  section('чужую операцию через приложение не удалить');
+  {
+    const bdbX = require('./lib/bot-db');
+    const dsx2 = require('./lib/doc-service');
+    const victim = bdbX.getOrCreateUser(788010);
+    bdbX.saveMyOrg(victim.id, { name: 'ИП Жертва', inn: '183209316118' });
+    const cpV = bdbX.createCp(victim.id, { name: 'Клиент жертвы', kind: 'customer', opening_date: '2026-01-01' });
+    const opV = bdbX.addOp(victim.id, cpV, { date: '2026-09-01', kind: 'Оплата', doc: 'чужая', debit: 100000 });
+    const before = bdbX.balanceOf(victim.id, cpV).closing;
+
+    const mine = bdbX.getOrCreateUser(MASHA.id);
+    const cpM = bdbX.listCps(mine.id)[0];
+    const doc = await dsx2.issueDocument(mine.id, {
+      type: 'usl', cpId: cpM.id, items: [{ name: 'Работа', qty: 1, price: 100000 }], skipQuota: true,
+    });
+    await call('POST', '/api/bank/close', {
+      user: masha,
+      body: { deals: [{ opId: opV, cpId: cpM.id, leadId: doc.doc.id, total: 100000, date: '2026-09-01' }] },
+    });
+    ok(bdbX.balanceOf(victim.id, cpV).closing === before,
+      'сальдо чужого пользователя не тронуто',
+      `${before} → ${bdbX.balanceOf(victim.id, cpV).closing}`);
+  }
+
+  // Сервер держим до конца: проверки выше ходят к нему по HTTP, и закрытый
+  // раньше времени он давал ECONNREFUSED вместо внятного провала.
   await new Promise((r2) => server.close(r2));
+
   const { closePdf } = require('./lib/pdf');
   await closePdf();
 
