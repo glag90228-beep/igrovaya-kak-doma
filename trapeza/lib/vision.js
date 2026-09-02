@@ -178,6 +178,11 @@ async function viaAnthropic(buffer, mime) {
         ],
       }],
     }),
+    // Своего таймаута у fetch в Node нет. Без него зависший провайдер держал
+    // обработчик снимка навсегда: человек смотрел на «Распознаю…», а запрос
+    // не завершался ни успехом, ни отказом. У OpenRouter такой предел стоял,
+    // у этих двух — нет, хотя ходят они туда же и так же.
+    signal: AbortSignal.timeout(60000),
   });
   if (!res.ok) throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
@@ -198,6 +203,7 @@ async function viaYandex(buffer, mime) {
       mimeType: mime, languageCodes: ['ru', 'en'], model: 'page',
       content: buffer.toString('base64'),
     }),
+    signal: AbortSignal.timeout(60000),   // тот же предел, что у соседей
   });
   if (!res.ok) throw new Error(`Yandex ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
@@ -229,13 +235,29 @@ async function readInvoice(buffer, mime = 'image/jpeg') {
     // свой разбор и добираем то, чего в JSON не оказалось.
     const text = (json && json.text) || raw;
     const parsed = parseInvoiceText(text);
+    /*
+     * Поля из ответа модели подрезаем и проверяем по форме.
+     *
+     * Снимок счёта — единственное место в продукте, где в разбор попадает
+     * текст, написанный посторонним: бумагу присылает контрагент. Что модель
+     * из неё достанет, мы не выбираем, и брать её слова как есть нельзя —
+     * ИНН уходит на сравнение с картотекой контрагентов, а название и номер
+     * попадают человеку на экран. Решение всё равно за человеком, но
+     * подставлять ему в поля то, чего не бывает, незачем.
+     *
+     * Дату сверяем с тем же видом, что и свой разбор; ИНН — только десять
+     * или двенадцать цифр, иначе берём найденный своим разбором.
+     */
+    const str = (v, n) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, n);
+    const innOk = (v) => /^(\d{10}|\d{12})$/.test(String(v || '').trim());
+    const dateOk = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '').trim());
     const fields = json
       ? {
-        date: json.date || parsed.date,
+        date: dateOk(json.date) ? String(json.date).trim() : parsed.date,
         amount: Number(json.amount) > 0 ? Math.round(Number(json.amount) * 100) / 100 : parsed.amount,
-        docNo: json.docNo || parsed.docNo,
-        inn: json.inn || parsed.inn,
-        name: json.name || parsed.name,
+        docNo: str(json.docNo, 40) || parsed.docNo,
+        inn: innOk(json.inn) ? String(json.inn).trim() : parsed.inn,
+        name: str(json.name, 200) || parsed.name,
       }
       : parsed;
     return { ok: true, fields, text: String(text).slice(0, 4000) };

@@ -4050,6 +4050,31 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'на упрощёнке — статус 2 без счёта-фактуры', `${usn.total} ст.${usn.saved.status}`);
   }
 
+  console.log('\n── снимок счёта: слова модели проверяются ──');
+  {
+    const vision = require('./lib/vision');
+    const keepP = process.env.VISION_PROVIDER; const keepM = process.env.VISION_MOCK;
+    process.env.VISION_PROVIDER = 'mock';
+    /*
+     * Снимок — единственное место, где в разбор попадает текст, написанный
+     * посторонним: бумагу присылает контрагент. ИНН оттуда идёт на сравнение
+     * с картотекой, название и номер — человеку на экран, поэтому слова
+     * модели подрезаются и проверяются по форме.
+     */
+    process.env.VISION_MOCK = JSON.stringify({
+      date: 'вчера', amount: 1000, docNo: 'A'.repeat(300), inn: '77012345',
+      name: 'Х'.repeat(900), text: 'Счёт № 5 от 01.09.2026 ИНН 7701234567 Итого 1000,00',
+    });
+    const got = await vision.readInvoice(Buffer.from('x'), 'image/png');
+    const f = (got && got.fields) || {};
+    ok(f.date === '2026-09-01', 'кривую дату от модели отбросили и взяли свою', f.date);
+    ok(f.inn === '7701234567', 'ИНН не той длины отброшен', f.inn);
+    ok(String(f.docNo).length <= 40 && String(f.name).length <= 200,
+      'номер и название подрезаны', `${String(f.docNo).length} / ${String(f.name).length}`);
+    if (keepP === undefined) delete process.env.VISION_PROVIDER; else process.env.VISION_PROVIDER = keepP;
+    if (keepM === undefined) delete process.env.VISION_MOCK; else process.env.VISION_MOCK = keepM;
+  }
+
   console.log('\n── повторения: отмена и пропущенный день ──');
   {
     const rc = require('./lib/recurring');
