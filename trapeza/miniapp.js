@@ -791,8 +791,17 @@ const api = {
     const org = bdb.getDefaultOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     const iso = (v, fallback) => (/^\d{4}-\d{2}-\d{2}$/.test(v || '') ? v : fallback);
-    const now = new Date();
-    const first = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+    /*
+     * Начало месяца берём по московскому календарю, как и его конец.
+     *
+     * Здесь стоял new Date() с getFullYear и getMonth — то есть часовой пояс
+     * сервера, — а «по» ниже считалось через todayISO, то есть по Москве.
+     * Сервер живёт в UTC, поэтому первого сентября в 00:30 по Москве тут был
+     * ещё август: реестр «за текущий месяц» приходил за весь прошлый месяц
+     * плюс один день. В боте тот же расчёт давно идёт через period и такой
+     * ошибки не имеет.
+     */
+    const first = `${docService.todayISO().slice(0, 7)}-01`;
     const from = iso(url.searchParams.get('from'), first);
     const to = iso(url.searchParams.get('to'), docService.todayISO());
     const docs = bdb.docsBetween(user.id, from, to);
@@ -1371,12 +1380,34 @@ const api = {
 
   /** Выпуск документа: файл в чат + ссылка на скачивание в приложении. */
   async 'POST /api/doc'({ user, body }) {
+    /*
+     * Статус УПД и ставку НДС передаём, если приложение их прислало.
+     *
+     * Раньше extra не передавался вовсе, и lib/upd.js читал undefined как
+     * статус 2 — «передаточный документ без счёта-фактуры», где ставка
+     * принудительно пустая. Плитка при этом обещает «счёт-фактура и акт»:
+     * плательщик НДС получал бланк без шапки счёта-фактуры и с «без НДС» в
+     * налоговой графе, а покупателю нечего было принять к вычету. В боте
+     * выбор статуса и ставки есть — в приложении он терялся по дороге.
+     *
+     * Ключи ставим только те, что действительно пришли: отсутствие поля и
+     * присланный null означают разное — «решай сам» и «без НДС».
+     */
+    const extra = {};
+    if (Object.prototype.hasOwnProperty.call(body, 'status')) {
+      extra.status = Number(body.status) === 1 ? 1 : 2;
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'vatRate')) {
+      extra.vatRate = body.vatRate == null || body.vatRate === '' ? null : Number(body.vatRate);
+      extra.priceIncludesVat = Boolean(body.priceIncludesVat);
+    }
     const res = await docService.issueDocument(user.id, {
       type: str(body.type, 10),
       cpId: Number(body.cpId),
       items: body.items,
       date: str(body.date, 10),
       number: str(body.number, 40),
+      extra,
     });
     if (!res.ok) return { error: res.message, reason: res.reason, quota: res.quota };
 
