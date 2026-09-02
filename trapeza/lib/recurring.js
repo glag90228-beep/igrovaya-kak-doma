@@ -62,6 +62,12 @@ const { iso, todayDate } = require('./period');
  *  считать дни от прошлого запуска — верный способ ошибиться на границе. */
 const monthKey = (date = todayDate()) => iso(date).slice(0, 7);
 
+/** Ключ предыдущего месяца — им догоняют пропущенное, когда служба не работала. */
+const prevMonthKey = (date = todayDate()) => {
+  const d = new Date(date.getFullYear(), date.getMonth() - 1, 1, 12);
+  return iso(d).slice(0, 7);
+};
+
 function isLastDayOfMonth(date) {
   const next = new Date(date.getTime());
   next.setDate(next.getDate() + 1);
@@ -117,7 +123,30 @@ function isDue(rec, date = todayDate()) {
   if (!rec.active) return false;
   if (rec.last_offer === monthKey(date)) return false;
   const day = offerDay(rec);
-  if (day === LAST_DAY) return isLastDayOfMonth(date);
+  if (day === LAST_DAY) {
+    if (isLastDayOfMonth(date)) return true;
+    /*
+     * Догоняем пропущенный конец прошлого месяца.
+     *
+     * Обычное правило само себя догоняет условием «не раньше дня X»: не
+     * пришло пятого — придёт шестого. У «последнего дня» такого запаса нет,
+     * он выпадает ровно на один день в месяце. Служба не работала тридцать
+     * первого августа — и акт закрытия августа не предлагался уже никогда,
+     * хотя обещание в шапке этого модуля говорит обратное. Именно так и
+     * заводят акт закрытия месяца.
+     *
+     * Отличить «прошлый месяц пропустили» от «прошлый месяц отработали»
+     * позволяет сама отметка: после предложения в ней стоит тот месяц.
+     * Правило, заведённое в прошлом месяце, тоже несёт его в отметке — и
+     * это верно, за тот месяц документ уже выписан рукой человека.
+     *
+     * Пустая отметка сюда не пускается: она означает «ещё ни разу не
+     * предлагали», а не «прошлый месяц пропущен». Без этого условия правило
+     * предлагало бы себя в любой день месяца, а не в конце, — поймано
+     * прогоном на тридцатом августа.
+     */
+    return Boolean(rec.last_offer) && rec.last_offer !== prevMonthKey(date);
+  }
   return date.getDate() >= day;
 }
 
@@ -131,7 +160,23 @@ function isDue(rec, date = todayDate()) {
 function isOverdue(rec, date = todayDate()) {
   if (!rec.active || !rec.pay_day) return false;
   if (rec.last_due === monthKey(date)) return false;
-  return date.getDate() > rec.pay_day;
+  if (date.getDate() > rec.pay_day) return true;
+  /*
+   * Догоняем прошлый месяц.
+   *
+   * Условие выше живёт внутри одного месяца: срок двадцать пятого, значит с
+   * двадцать шестого и до конца месяца. Первого числа оно перестаёт быть
+   * верным навсегда — про августовскую просрочку не сказали бы уже никогда,
+   * если служба лежала с двадцать шестого.
+   *
+   * Пустая отметка сюда не пускается намеренно. Она означает «за этим
+   * правилом ещё ни разу не следили», и без этого условия только что
+   * заведённое правило первого же числа объявляло бы просрочку за месяц,
+   * которого не видело. Лучше не догнать один случай, чем напугать человека
+   * долгом, которого нет; настоящая же защита от ложной тревоги — проверка
+   * неоплаченных документов у вызывающего.
+   */
+  return Boolean(rec.last_due) && rec.last_due !== prevMonthKey(date);
 }
 
 /**
@@ -335,5 +380,5 @@ module.exports = {
   due, markOffered, overdue, markDueNoticed,
   isDue, isOverdue, offerDay, dueDate, dayPassed,
   OP_TYPE, isOp, bumpOp,
-  monthKey, normalizeDay, dayLabel, LAST_DAY,
+  monthKey, prevMonthKey, normalizeDay, dayLabel, LAST_DAY,
 };

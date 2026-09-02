@@ -2235,7 +2235,7 @@ async function runDaily(tg, at = new Date()) {
   for (const rec of recurring.overdue(on)) {
     try {
       // eslint-disable-next-line no-await-in-loop
-      if (await warnOverdue(tg, rec)) sent += 1;
+      if (await warnOverdue(tg, rec, on)) sent += 1;
       recurring.markDueNoticed(rec.id, on);
     } catch (e) {
       console.error('просрочка:', e.message);
@@ -2284,12 +2284,24 @@ async function addRecurring(tg, chatId, user, src, when) {
  * арендатором стоят дороже, чем несколько нажатий. Поэтому здесь готовый
  * текст и кнопка отправки, а не автоматическая рассылка.
  */
-async function warnOverdue(tg, rec) {
+async function warnOverdue(tg, rec, on = period.todayDate()) {
   const user = bdb.userById(rec.user_id);
   if (!user || user.blocked_at) return false;
 
-  // Счёт этого месяца этому контрагенту, по которому нет отметки об оплате.
-  const month = recurring.monthKey();
+  /*
+   * Смотрим тот месяц, чей срок оплаты прошёл, — а он не всегда текущий.
+   *
+   * Если сегодняшнее число ещё не миновало день оплаты, значит мы догоняем
+   * пропущенное: срок прошёл в прошлом месяце, а сказать об этом не успели,
+   * потому что служба не работала. Ищи мы счета текущего месяца, догон был
+   * бы пустым — их там просто нет.
+   *
+   * Отсутствие неоплаченных документов и есть настоящая защита от ложной
+   * тревоги: без счёта сообщения не будет, чем бы ни решил календарь.
+   */
+  const month = on.getDate() > rec.pay_day
+    ? recurring.monthKey(on)
+    : recurring.prevMonthKey(on);
   const unpaid = bdb.unpaidDocs(user.id, 200)
     .filter((d) => d.cp_id === rec.cp_id && String(d.date).startsWith(month));
   if (!unpaid.length) return false;              // оплачено или счёта не было
@@ -2300,7 +2312,9 @@ async function warnOverdue(tg, rec) {
 
   await tg.sendMessage(user.tg_id,
     `⏰ <b>Просрочка: ${esc(rec.cp_name)}</b>\n\n`
-    + `Срок оплаты был ${ru(recurring.dueDate(rec))}, деньги не отмечены.\n`
+    // Срок называем того месяца, о котором говорим: при догоне текущий был бы
+    // неправдой — там срок ещё и не наступал.
+    + `Срок оплаты был ${ru(`${month}-${String(rec.pay_day).padStart(2, '0')}`)}, деньги не отмечены.\n`
     + `Не оплачено: <b>${formatRub(sum)}</b>\n${list.join('\n')}\n\n`
     + '<i>Если оплата пришла — отметьте её, и напоминание исчезнет.</i>',
     keyboard([
