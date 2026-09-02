@@ -1939,6 +1939,21 @@ screens.letter = async function letter({ data }) {
       h('div', { class: 'small muted', text: `${f.kind || 'документ'} · ${Math.round(f.size / 1024)} КБ` }))))));
 
   if (l.cp) {
+    // Контрагент здесь угадан по заголовку письма, а он подделывается
+    // тривиально — ни SPF, ни DKIM не проверяются. Поддельный счёт от
+    // знакомого поставщика — самая частая схема обмана в малом бизнесе, и
+    // молчаливо подставленное имя работало на неё. Кнопку не убираем: почти
+    // всегда письмо настоящее. Но говорим правду.
+    if (l.cp.guessed) {
+      box.append(h('div', { class: 'card' },
+        h('div', { class: 'row' },
+          h('span', { class: 'icon-box warn' }, icon('warn')),
+          h('span', { class: 'grow' },
+            h('div', { text: 'Отправителя я не проверяю' }),
+            h('div', { class: 'small muted',
+              text: 'Адрес в письме подделать несложно. Перед оплатой сверьте счёт и '
+                + 'реквизиты — особенно если они изменились с прошлого раза.' })))));
+    }
     box.append(h('div', { class: 'btn-wrap' }, h('button', {
       class: 'btn', onclick: () => go('op', { cpId: l.cp.id, doc: l.subject }),
     }, `Внести операцию по ${l.cp.name}`)));

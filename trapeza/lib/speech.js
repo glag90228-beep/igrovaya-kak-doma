@@ -132,7 +132,16 @@ async function yandexSync(buffer, params = 'format=oggopus') {
     method: 'POST',
     // Папку не передаём намеренно: у ключа сервисного аккаунта она своя, а
     // явный folderId документация велит слать только пользовательскому.
-    headers: { Authorization: `Api-Key ${process.env.YANDEX_API_KEY}` },
+    //
+    // Запрет на хранение — обязателен: через бота идут чужие реквизиты и
+    // суммы, и «выставь счёт Заре на тридцать тысяч» ничем не отличается от
+    // того же текста, набранного руками. Разбор текста и снимков этот
+    // заголовок слали давно, распознавание речи — нет, хотя именно оно
+    // отправляет наружу живой голос.
+    headers: {
+      Authorization: `Api-Key ${process.env.YANDEX_API_KEY}`,
+      'x-data-logging-enabled': 'false',
+    },
     body: buffer,
     signal: AbortSignal.timeout(60000),
   });
@@ -182,6 +191,9 @@ async function yandexAsync(buffer, kind) {
     'Content-Type': 'application/json',
     Authorization: `Api-Key ${process.env.YANDEX_API_KEY}`,
     'x-folder-id': process.env.YANDEX_FOLDER_ID,
+    // Тот же запрет на хранение, что и у синхронного пути и у разбора
+    // снимков: наружу уходит голос с реквизитами и суммами.
+    'x-data-logging-enabled': 'false',
   };
 
   const started = await fetch('https://stt.api.cloud.yandex.net/stt/v3/recognizeFileAsync', {

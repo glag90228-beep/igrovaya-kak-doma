@@ -673,6 +673,13 @@ const api = {
       const parsed = mime.parseMessage(m.raw);
       const docs = parsed.attachments.filter(mime.looksLikeDocument);
       if (!docs.length) continue;
+      /*
+       * Это догадка по заголовку From, а он подделывается тривиально: ни SPF,
+       * ни DKIM мы не проверяем. Поддельный счёт от знакомого поставщика —
+       * самая частая схема обмана в малом бизнесе, и уверенно подставленное
+       * имя контрагента работало на неё. Признак guessed уходит на экран,
+       * чтобы приложение говорило то же, что и бот.
+       */
       const guess = cps.find((c) => c.email && c.email.toLowerCase() === parsed.from)
         || cps.find((c) => parsed.fromName && c.name
           && parsed.fromName.toLowerCase().includes(c.name.toLowerCase().slice(0, 8)));
@@ -681,7 +688,7 @@ const api = {
         from: parsed.from,
         fromName: parsed.fromName || '',
         subject: parsed.subject || '',
-        cp: guess ? { id: guess.id, name: guess.name } : null,
+        cp: guess ? { id: guess.id, name: guess.name, guessed: true } : null,
         files: docs.map((d) => ({
           name: d.filename,
           size: d.size,

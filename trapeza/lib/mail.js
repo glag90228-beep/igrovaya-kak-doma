@@ -125,7 +125,18 @@ function buildMessage({
   const head = [
     `From: ${addr(from, fromName)}`,
     `To: ${Array.isArray(to) ? to.join(', ') : to}`,
-    replyTo ? `Reply-To: ${replyTo}` : null,
+    /*
+     * Адрес проверяем, а не подставляем как есть.
+     *
+     * Тема проходит через encodeHeader, получатели — через validEmail, и обе
+     * проверки не пропускают перевод строки. Reply-To клался в письмо сырым,
+     * и значение вида «a@b.ru\r\nBcc: чужой@адрес» давало в письме настоящий
+     * Bcc — то есть скрытую копию любого документа кому угодно. Сегодня
+     * никто из вызывающих replyTo не передаёт, поэтому сходящегося сценария
+     * нет; но поле описано в JSDoc как часть договора и ждёт первого
+     * применения, а тогда об этой строке никто уже не вспомнит.
+     */
+    validEmail(replyTo) ? `Reply-To: ${String(replyTo).trim()}` : null,
     `Subject: ${encodeHeader(subject)}`,
     `Date: ${new Date().toUTCString()}`,
     `Message-ID: <${crypto.randomUUID()}@${String(from).split('@')[1] || 'localhost'}>`,
