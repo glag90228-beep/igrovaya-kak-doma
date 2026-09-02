@@ -4050,6 +4050,46 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'на упрощёнке — статус 2 без счёта-фактуры', `${usn.total} ст.${usn.saved.status}`);
   }
 
+  console.log('\n── переход на свой ключ почты не роняет ящики ──');
+  {
+    const mb = require('./lib/mailbox');
+    const { db: rawDb } = require('./db');
+    const keepKey = process.env.MAIL_KEY;
+    const keepTok = process.env.BOT_TOKEN;
+    // Исходное положение: своего ключа нет, шифруем ключом из токена — так
+    // продукт работает «из коробки», и так живёт большинство установок.
+    delete process.env.MAIL_KEY;
+    process.env.BOT_TOKEN = '111:СТАРЫЙ-ТОКЕН';
+    const mu = require('./lib/bot-db').getOrCreateUser(779050).id;
+    const saved = mb.save(mu, {
+      host: 'smtp.x.ru', port: 587, secure: 0, login: 'me@x.ru', pass: 'СЕКРЕТ-123',
+      from: 'me@x.ru', fromName: 'Я', imapHost: 'imap.x.ru',
+    });
+    ok(saved.ok, 'ящик подключён без своего ключа', saved.ok ? '' : saved.error);
+    const encBefore = (rawDb.prepare('SELECT pass_enc FROM mailboxes WHERE user_id = ?').get(mu) || {}).pass_enc;
+
+    /*
+     * Владелец делает то, что мы советуем, — задаёт свой ключ. Без мягкого
+     * перехода пароли всех подключённых ящиков разом перестали бы читаться,
+     * и верный совет наказывал бы того, кто ему последовал.
+     */
+    process.env.MAIL_KEY = 'своя-длинная-случайная-строка-для-прогона';
+    const got = mb.resolve(mu);
+    ok(got.ok && got.options.pass === 'СЕКРЕТ-123',
+      'после задания своего ключа пароль по-прежнему читается', got.ok ? 'да' : got.reason);
+    const encAfter = (rawDb.prepare("SELECT pass_enc FROM mailboxes WHERE user_id = ?").get(mu) || {}).pass_enc;
+    ok(encAfter !== encBefore, 'и запись перешифрована новым ключом, а не оставлена как была');
+
+    // Ради этого всё и затевалось: отзыв токена больше не ломает почту.
+    process.env.BOT_TOKEN = '222:ОТОЗВАННЫЙ-И-ЗАМЕНЁННЫЙ';
+    const after = mb.resolve(mu);
+    ok(after.ok && after.options.pass === 'СЕКРЕТ-123',
+      'и переживает отзыв токена', after.ok ? 'да' : after.reason);
+
+    if (keepKey === undefined) delete process.env.MAIL_KEY; else process.env.MAIL_KEY = keepKey;
+    process.env.BOT_TOKEN = keepTok;
+  }
+
   console.log('\n── снимок счёта: слова модели проверяются ──');
   {
     const vision = require('./lib/vision');

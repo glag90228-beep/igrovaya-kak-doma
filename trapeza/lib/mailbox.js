@@ -20,7 +20,7 @@
 
 const { db } = require('../db');
 require('./bot-db');                   // таблицы создаёт он, порядок важен
-const { seal, open, canEncrypt } = require('./crypto-box');
+const { seal, openBox, canEncrypt } = require('./crypto-box');
 const { validEmail } = require('./mail');
 
 db.exec(`
@@ -173,10 +173,33 @@ function markChecked(userId) {
  *
  * @returns {{ok:true, options:object, own:boolean}|{ok:false, reason:string}}
  */
+/*
+ * Пароль из записи — с тихим переходом на новый ключ.
+ *
+ * Когда на сервере с уже подключёнными ящиками задают свой MAIL_KEY, старые
+ * пароли зашифрованы ключом из токена. Расшифровка их всё равно прочитает
+ * (crypto-box пробует и прежний ключ), но оставлять запись в старом виде
+ * нельзя: тогда отзыв токена однажды сломает всё ровно так же, как и до
+ * перехода. Поэтому прочитанное прежним ключом сразу перекладываем нынешним.
+ *
+ * Неудача перешифровки не мешает работе: пароль мы уже прочитали, письмо
+ * уйдёт, а перевод повторится при следующем обращении.
+ */
+function passOf(m) {
+  const got = openBox(m.pass_enc);
+  if (got.value != null && got.stale && canEncrypt()) {
+    try {
+      db.prepare('UPDATE mailboxes SET pass_enc = ? WHERE user_id = ?')
+        .run(seal(got.value), m.user_id);
+    } catch (_) { /* перевести не вышло — прочитать всё равно смогли */ }
+  }
+  return got.value;
+}
+
 function resolve(userId) {
   const m = get(userId);
   if (m) {
-    const pass = open(m.pass_enc);
+    const pass = passOf(m);
     if (pass == null) {
       return { ok: false, reason: 'Пароль от ящика не читается — подключите почту заново.' };
     }
@@ -210,7 +233,7 @@ function resolveImap(userId) {
   if (!m.imap_host) {
     return { ok: false, reason: 'Для этого ящика не задан сервер входящей почты (IMAP).' };
   }
-  const pass = open(m.pass_enc);
+  const pass = passOf(m);
   if (pass == null) return { ok: false, reason: 'Пароль от ящика не читается — подключите почту заново.' };
   return {
     ok: true,

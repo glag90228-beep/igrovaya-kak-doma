@@ -34,6 +34,7 @@ const PREFIX = 'v1';
 
 let warned = false;
 
+/** Чем шифруем сейчас: свой ключ, если задан, иначе запасной из токена. */
 function keyMaterial() {
   const explicit = String(process.env.MAIL_KEY || '').trim();
   if (explicit) return `k:${explicit}`;
@@ -60,8 +61,7 @@ function keyMaterial() {
 }
 
 const cache = new Map();
-function key() {
-  const material = keyMaterial();
+function keyFrom(material) {
   if (!material) return null;
   let k = cache.get(material);
   if (!k) {
@@ -71,6 +71,32 @@ function key() {
     cache.set(material, k);
   }
   return k;
+}
+
+const key = () => keyFrom(keyMaterial());
+
+/**
+ * Чем пробуем расшифровать: сначала нынешним ключом, потом прежним.
+ *
+ * Нужно ради одного перехода — когда MAIL_KEY задают на сервере, где ящики
+ * уже подключены. Их пароли зашифрованы ключом из токена, и без этой
+ * попытки они разом перестали бы читаться: каждому клиенту пришлось бы
+ * подключать почту заново. То есть верный совет «задайте свой ключ»
+ * наказывал бы того, кто ему последовал.
+ *
+ * Перебор здесь безопасен: AES-GCM проверяет метку подлинности, поэтому
+ * чужой ключ даёт честный отказ, а не правдоподобный мусор. И порядок
+ * важен — сначала нынешний, чтобы уже переведённые записи не трогали
+ * запасной ключ лишний раз.
+ */
+function openMaterials() {
+  const now = keyMaterial();
+  const token = String(process.env.BOT_TOKEN || '').trim();
+  const legacy = token ? `t:${token}` : '';
+  const list = [];
+  if (now) list.push(now);
+  if (legacy && legacy !== now) list.push(legacy);
+  return list;
 }
 
 const canEncrypt = () => Boolean(key());
@@ -86,19 +112,32 @@ function seal(plain) {
     data.toString('base64url')].join('.');
 }
 
-/** @returns {string|null} null — если ключ сменился или значение испорчено */
-function open(sealed) {
-  const k = key();
-  if (!k || !sealed) return null;
+/**
+ * Расшифровать и заодно сказать, каким ключом получилось.
+ *
+ * @returns {{value: string|null, stale: boolean}} stale — прочитано прежним
+ *   ключом, значит запись стоит перешифровать нынешним. Без этого зависимость
+ *   от токена осталась бы навсегда, и его отзыв однажды сломал бы всё ровно
+ *   так же, как и до перехода.
+ */
+function openBox(sealed) {
+  if (!sealed) return { value: null, stale: false };
   const parts = String(sealed).split('.');
-  if (parts.length !== 4 || parts[0] !== PREFIX) return null;
-  try {
-    const d = crypto.createDecipheriv('aes-256-gcm', k, Buffer.from(parts[1], 'base64url'));
-    d.setAuthTag(Buffer.from(parts[2], 'base64url'));
-    return Buffer.concat([d.update(Buffer.from(parts[3], 'base64url')), d.final()]).toString('utf8');
-  } catch (_) {
-    return null;                       // подмена, порча или другой ключ
+  if (parts.length !== 4 || parts[0] !== PREFIX) return { value: null, stale: false };
+  const list = openMaterials();
+  for (let i = 0; i < list.length; i += 1) {
+    try {
+      const d = crypto.createDecipheriv('aes-256-gcm', keyFrom(list[i]),
+        Buffer.from(parts[1], 'base64url'));
+      d.setAuthTag(Buffer.from(parts[2], 'base64url'));
+      const v = Buffer.concat([d.update(Buffer.from(parts[3], 'base64url')), d.final()]).toString('utf8');
+      return { value: v, stale: i > 0 };
+    } catch (_) { /* не этот ключ — пробуем следующий */ }
   }
+  return { value: null, stale: false };  // подмена, порча или ключ утрачен
 }
 
-module.exports = { seal, open, canEncrypt };
+/** @returns {string|null} null — если ключ утрачен или значение испорчено */
+const open = (sealed) => openBox(sealed).value;
+
+module.exports = { seal, open, openBox, canEncrypt };
