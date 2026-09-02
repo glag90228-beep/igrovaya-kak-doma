@@ -2616,6 +2616,24 @@ async function handleVoice(tg, chatId, user, msg) {
     return;
   }
 
+  /*
+   * Распознавание речи считаем в тот же кошелёк, что и разбор текста.
+   *
+   * Своего предела у него не было вовсе: скачивался файл до 20 МБ и сразу
+   * уходил в облако, а тарифицируется он по секундам звука — это самый
+   * дорогой путь в продукте и единственный, где кран отсутствовал. Один
+   * человек с заклинившей кнопкой мог потратить месячный счёт за минуты.
+   *
+   * Заводить второй счётчик не стали: предел общий с разбором фраз, и
+   * человек видит одну понятную границу, а не две разные.
+   */
+  if (ai.budget(user.id).left <= 0) {
+    await tg.sendMessage(chatId,
+      'На этот месяц разбор голоса и фраз закончился. Напишите текстом — '
+      + 'бот поймёт так же, и это ничем не ограничено.', mainMenu());
+    return;
+  }
+
   const src = msg.voice || msg.audio || msg.video_note || {};
   if (!src.file_id) return;
   // Потолок Telegram на скачивание ботом — 20 МБ, выше него файла не будет.
@@ -2626,6 +2644,9 @@ async function handleVoice(tg, chatId, user, msg) {
   }
 
   await tg.sendMessage(chatId, '🎧 Слушаю…');
+  // Занимаем до обращения: считается попытка, а не удача. Иначе отказ
+  // провайдера ничего не стоил бы, и упереться в потолок было бы нельзя.
+  ai.spend(user.id);
   const got = await speech.transcribe(buf, Number(src.duration) || 0);
   if (!got.ok) {
     await tg.sendMessage(chatId, `Не разобрал запись: ${esc(got.error)}`, mainMenu());
@@ -2666,6 +2687,14 @@ async function handlePhoto(tg, chatId, user, msg) {
   }
   if (!fileId) return;
 
+  // Снимок счёта уходит в ту же модель и в тот же кошелёк, что голос и фразы.
+  if (ai.budget(user.id).left <= 0) {
+    await tg.sendMessage(chatId,
+      'На этот месяц разбор снимков и фраз закончился. Реквизиты и суммы '
+      + 'можно ввести руками — это ничем не ограничено.', mainMenu());
+    return;
+  }
+
   await tg.sendChatAction(chatId, 'typing');
   let buf;
   try { buf = await tg.downloadFile(fileId); } catch (e) {
@@ -2673,6 +2702,7 @@ async function handlePhoto(tg, chatId, user, msg) {
     return;
   }
 
+  ai.spend(user.id);
   const res = await readInvoice(buf, mime);
   if (!res.ok) {
     await tg.sendMessage(chatId,
