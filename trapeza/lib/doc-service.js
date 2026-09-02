@@ -200,6 +200,24 @@ async function issueDocument(userId, {
   const total = totalOf(clean, fields);
 
   /*
+   * Заданный руками номер проверяем на занятость.
+   *
+   * Уникальный индекс защищает порядковый номер, но не сам номер: его можно
+   * ввести своей рукой, и он строка. Отсюда выходило так: первый счёт с
+   * номером «3» руками, второй и третий — сами, и третий получал тот же
+   * номер 3. Два счёта с одним номером за год — вопрос от бухгалтера
+   * контрагента и повод для спора, а ряд при этом ещё и ломался: второй
+   * документ оказывался с меньшим номером, чем первый.
+   *
+   * Отказываем до сборки файла, чтобы человек не получил PDF, которого нет
+   * в журнале.
+   */
+  const wanted = number == null || number === '' ? '' : String(number).slice(0, 40);
+  if (wanted && bdb.numberTaken(userId, type, year, wanted)) {
+    return fail('number', `${kind.title} № ${wanted} за ${year} год уже выписан. Укажите другой номер.`);
+  }
+
+  /*
    * Номер берётся до сборки файла — он в нём напечатан, — а сборка PDF идёт
    * около секунды. За это время тот же номер может занять другой документ:
    * из мини-приложения, со второго нажатия, из повторной попытки. База такую
@@ -209,8 +227,18 @@ async function issueDocument(userId, {
    */
   let num; let file; let id;
   for (let attempt = 0; ; attempt += 1) {
-    const seq = bdb.nextSeq(userId, type, year);
-    num = String(number == null || number === '' ? seq : number).slice(0, 40);
+    let seq = bdb.nextSeq(userId, type, year);
+    /*
+     * Порядковый номер и номер документа — разные вещи, и совпадают они лишь
+     * пока никто не вводил номер руками. Стоит человеку выписать счёт № 3
+     * своей рукой, и присвоенная тройка через две выписки столкнётся с ним:
+     * порядковый свободен, а номер занят. Сдвигаемся до свободного — ряд от
+     * этого прерывается, но два документа с одним номером хуже пропуска.
+     */
+    if (!wanted) {
+      while (bdb.numberTaken(userId, type, year, String(seq))) seq += 1;
+    }
+    num = String(wanted || seq).slice(0, 40);
     const doc = { number: num, date: when, items: clean, ...fields };
     // eslint-disable-next-line no-await-in-loop
     file = await renderFile(

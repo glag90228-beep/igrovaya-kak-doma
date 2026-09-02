@@ -1303,6 +1303,22 @@ function guardSeq() {
 }
 guardSeq();
 
+/**
+ * Занят ли уже такой номер в этом году у этого вида документа.
+ *
+ * Уникальный индекс стоит на порядковом номере (seq), а на самом номере —
+ * ни на чём: он строка и его разрешено задавать руками. Поэтому «счёт № 3»,
+ * выписанный вручную, спокойно уживался со счётом № 3, который через две
+ * выписки присвоился сам, и в году оказывалось два документа с одним
+ * номером. Индексом это не закрыть: в базах, где повторы уже есть, он
+ * попросту не создастся, — поэтому спрашиваем перед записью.
+ */
+function numberTaken(userId, type, year, number) {
+  return Boolean(db.prepare(
+    'SELECT id FROM documents WHERE user_id = ? AND type = ? AND year = ? AND number = ? LIMIT 1',
+  ).get(userId, type, Number(year), String(number)));
+}
+
 /** Не прошла ли запись именно из-за занятого номера. */
 const isSeqTaken = (e) => /idx_doc_seq_uniq|UNIQUE constraint failed: documents/i.test(String(e && e.message));
 
@@ -1457,7 +1473,7 @@ module.exports = {
   markPaid, unmarkPaid, matchPaymentsToDocs, closeDocsFromBank,
   unpaidDocs, unpaidSummary, dealTotals, docsBetween,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
-  isSeqTaken, guardSeq,
+  isSeqTaken, guardSeq, numberTaken,
   nextSeq, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,
   quota, docsThisMonth, freePerMonth,
