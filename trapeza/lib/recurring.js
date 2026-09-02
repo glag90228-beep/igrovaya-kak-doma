@@ -239,8 +239,31 @@ function bumpOp(userId, id, step = 1, date = todayDate()) {
   const done = Math.max(0, rec.op.done + step);
   const extra = { ...rec.extra, done };
   const finished = rec.op.times > 0 && done >= rec.op.times;
-  db.prepare('UPDATE recurring SET extra = ?, last_offer = ?, active = ? WHERE id = ? AND user_id = ?')
-    .run(JSON.stringify(extra), step > 0 ? monthKey(date) : '', finished ? 0 : 1, Number(id), userId);
+
+  /*
+   * Отмена не воскрешает выключенное правило и не открывает месяц заново.
+   *
+   * Раньше active выставлялся как `finished ? 0 : 1`, то есть на откате —
+   * всегда в единицу, а last_offer обнулялся. Отсюда две беды. Человек
+   * нажимал «✖️ Больше не повторять», потом «↩️ Отменить» на том же
+   * сообщении — и правило оживало, продолжая списывать каждый месяц. А тот,
+   * кто просто отменил ошибочную строку, получал её обратно на ближайшем
+   * ночном обходе того же месяца, хотя кнопка обещает «в следующий раз».
+   *
+   * Различаем два выключения. Своё, по исчерпанию счётчика, откат обязан
+   * снять: пять частей долга внесены, шестой не будет, но если последнюю
+   * отменили — правилу снова есть что делать. Выключение рукой человека —
+   * его решение, и трогать его нечем.
+   */
+  const wasSpent = rec.op.times > 0 && rec.op.done >= rec.op.times;
+  if (step > 0) {
+    db.prepare('UPDATE recurring SET extra = ?, last_offer = ?, active = ? WHERE id = ? AND user_id = ?')
+      .run(JSON.stringify(extra), monthKey(date), finished ? 0 : 1, Number(id), userId);
+  } else {
+    const active = wasSpent && !finished ? 1 : (rec.active ? 1 : 0);
+    db.prepare('UPDATE recurring SET extra = ?, active = ? WHERE id = ? AND user_id = ?')
+      .run(JSON.stringify(extra), active, Number(id), userId);
+  }
   return { done, left: rec.op.times ? Math.max(0, rec.op.times - done) : 0, finished };
 }
 
