@@ -1313,13 +1313,34 @@ async function claimByEmail(tg, chatId, user, email) {
       keyboard([[{ text: '💬 Поддержка', data: 'support' }], [{ text: '⬅️ Подписка', data: 'billing' }]]));
     return;
   }
+  /*
+   * Дни начисляем только за те платежи, которые нам действительно достались.
+   *
+   * Бот и мини-приложение — разные процессы на одной базе, и одна и та же
+   * оплата попадала обоим: каждый привязывал её к себе и начислял дни, так
+   * что за один платёж выходило два срока. Теперь привязка отвечает, кому
+   * строка досталась, и проигравший ничего не начисляет.
+   */
   let until = '';
+  let taken = 0;
   for (const p of found) {
-    billing.attachPayment(p.id, user.id);
+    if (!billing.attachPayment(p.id, user.id)) continue;
+    taken += 1;
     until = billing.grantDays(user.id, p.days || 30);
   }
+  if (!taken) {
+    // Не «не вижу оплату»: она есть, её просто уже зачли — обычно в
+    // приложении, секундой раньше. Человеку важно, что доступ у него есть.
+    const info = billing.accessInfo(user.id);
+    await tg.sendMessage(chatId,
+      info.active
+        ? `✅ Эта оплата уже зачтена. Доступ до <b>${ru(info.until)}</b>.`
+        : 'Эту оплату уже зачли. Если доступа всё равно нет — напишите в поддержку, разберёмся.',
+      mainMenu());
+    return;
+  }
   await tg.sendMessage(chatId,
-    `✅ Нашёл ${found.length} ${plural(found.length, 'оплату', 'оплаты', 'оплат')}. `
+    `✅ Нашёл ${taken} ${plural(taken, 'оплату', 'оплаты', 'оплат')}. `
     + `Доступ до <b>${ru(until)}</b>.`, mainMenu());
 }
 

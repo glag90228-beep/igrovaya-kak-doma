@@ -297,9 +297,21 @@ function recordPayment(p) {
   return { duplicate: false, payment: findPayment(p.provider || 'lava', p.externalId), id: Number(info.lastInsertRowid) };
 }
 
+/**
+ * Привязать ничей платёж к человеку. Возвращает true, если привязка удалась.
+ *
+ * Условие `user_id = 0` и возвращаемое значение — одно средство, а не два.
+ * Бот и мини-приложение работают разными процессами на одной базе, и два
+ * почти одновременных «Я оплатил» проходили оба: строка перепривязывалась
+ * второй раз, а дни начислялись дважды за один платёж. Теперь второй
+ * заход не меняет ни строки и получает false — начислять ему нечего.
+ *
+ * @returns {boolean} досталась ли эта оплата вызывающему
+ */
 function attachPayment(paymentId, userId) {
-  db.prepare('UPDATE payments SET user_id = ?, claimed_at = ? WHERE id = ?')
+  const r = db.prepare('UPDATE payments SET user_id = ?, claimed_at = ? WHERE id = ? AND user_id = 0')
     .run(userId, new Date().toISOString(), paymentId);
+  return r.changes > 0;
 }
 
 /**

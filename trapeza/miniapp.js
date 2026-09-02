@@ -781,12 +781,21 @@ const api = {
           + 'пару минут. Если прошло больше получаса, напишите в поддержку.',
       };
     }
+    /*
+     * Считаем только те оплаты, которые достались нам. Бот и приложение —
+     * разные процессы на одной базе, и одну строку забирали оба, начисляя
+     * дни дважды за один платёж. Привязка теперь отвечает, кто первый.
+     */
     let until = '';
+    let taken = 0;
     for (const p of found) {
-      billing.attachPayment(p.id, user.id);
+      if (!billing.attachPayment(p.id, user.id)) continue;
+      taken += 1;
       until = billing.grantDays(user.id, p.days || 30);
     }
-    return { found: found.length, until };
+    // Ноль здесь — не «оплаты нет», а «её уже зачли»: показываем текущий срок.
+    if (!taken) return { found: 0, until: billing.accessInfo(user.id).until };
+    return { found: taken, until };
   },
 
   /** Реестр всех документов за период — тоже Excel. */
