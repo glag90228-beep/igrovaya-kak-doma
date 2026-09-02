@@ -205,31 +205,19 @@ function stateFor(user) {
     // Расхождение между тем, как человек работает, и тем, как считается
     // долг: счета выписаны и не оплачены, а «должны вам» — ноль. Молчать
     // об этом нельзя, человек решит, что цифра сломана.
-    basisMismatch: (() => {
-      if (owedToUs > 0 || !unpaidDocs.length) return null;
-      // В ручном режиме молчим: человек сам сказал, что журнал ведёт он, и
-      // подсказка «долг считается по актам» была бы неправдой, а кнопка
-      // рядом с ней молча начала бы делать проводки за него.
-      const basis = bdb.basisOf(org || {});
-      if (basis === 'manual') return null;
-      const types = bdb.DEBT_DOCS[basis];
-      const mute = unpaidDocs.filter((d) => !types.includes(d.type));
-      if (!mute.length) return null;
-      /*
-       * Куда переключать — выводим из самих документов, а не подставляем
-       * «по счёту» всегда. Иначе выходил замкнутый круг: у человека уже
-       * стоит «по счёту», висит неоплаченный акт, экран советует включить
-       * то, что включено, кнопка ничего не меняет и рапортует «Готово».
-       */
-      const to = mute.every((d) => bdb.DEBT_DOCS.invoice.includes(d.type)) ? 'invoice'
-        : (mute.every((d) => bdb.DEBT_DOCS.closing.includes(d.type)) ? 'closing' : null);
-      if (!to || to === basis) return null;
-      return {
-        to,
-        count: mute.length,
-        sum: round2(mute.reduce((a2, d) => a2 + (Number(d.total) || 0), 0)),
-      };
-    })(),
+    /*
+     * Условие смотрит на сами документы, а не на общую цифру.
+     *
+     * Раньше здесь стояло `owedToUs > 0 ||` — подсказка гасла, если хоть
+     * кто-то хоть что-то должен. А проверка эта глобальная, по всем
+     * контрагентам сразу: два клиента, один должен пять тысяч по акту, у
+     * второго висит неоплаченный счёт на двести — и экран молчал, хотя
+     * двести тысяч в долг по-прежнему не попадают. Подсказка работала
+     * только в идеально пустом случае, то есть почти никогда.
+     *
+     * Сам разбор переехал в bot-db: тот же вопрос задаёт бот.
+     */
+    basisMismatch: bdb.basisMismatch(user.id, org, owedToUs),
     bizType: (org && org.biz_type) || '',
     bizTypes: bizTypes.list(),
     recurring: recurring.list(user.id).length,

@@ -554,6 +554,48 @@ const DEBT_DOCS = {
 const basisOf = (org) => (DEBT_DOCS[org && org.debt_basis] ? org.debt_basis : 'closing');
 const makesDebt = (org, type) => DEBT_DOCS[basisOf(org)].includes(type);
 
+/**
+ * Расхождение между тем, как человек работает, и тем, как считается долг.
+ *
+ * Счета выписаны и не оплачены, а в долгах их не видно — потому что при
+ * основании «по отгрузке» долг создаёт акт, УПД или накладная, но не счёт.
+ * Так бывает законно, и для учёта это верно: счёт — требование оплаты, а не
+ * первичный документ. Но человеку, который работает счетами, это выглядит
+ * сломанной цифрой: он выписывает счета, а главное число не шевелится.
+ *
+ * Живёт здесь, а не в мини-приложении, потому что спрашивают оба: раньше
+ * объяснение было только на одном экране, и тот, кто смотрел долги в боте,
+ * видел ровно ноль без единого слова.
+ *
+ * @param {number} owedToUs текущая цифра «нам должны» — только для формулировки
+ * @returns {{to:string, count:number, sum:number, zero:boolean}|null}
+ */
+function basisMismatch(userId, org, owedToUs) {
+  const unpaid = unpaidDocs(userId, 200);
+  if (!unpaid.length) return null;
+  // В ручном режиме молчим: человек сам сказал, что журнал ведёт он, и кнопка
+  // рядом с подсказкой молча начала бы делать проводки за него.
+  const basis = basisOf(org || {});
+  if (basis === 'manual') return null;
+  const mute = unpaid.filter((d) => !DEBT_DOCS[basis].includes(d.type));
+  if (!mute.length) return null;
+  /*
+   * Куда переключать — выводим из самих документов, а не подставляем «по
+   * счёту» всегда. Иначе выходил замкнутый круг: у человека уже стоит «по
+   * счёту», висит неоплаченный акт, экран советует включить включённое,
+   * кнопка ничего не меняет и рапортует «Готово».
+   */
+  const to = mute.every((d) => DEBT_DOCS.invoice.includes(d.type)) ? 'invoice'
+    : (mute.every((d) => DEBT_DOCS.closing.includes(d.type)) ? 'closing' : null);
+  if (!to || to === basis) return null;
+  return {
+    to,
+    count: mute.length,
+    sum: round2(mute.reduce((a, d) => a + (Number(d.total) || 0), 0)),
+    zero: Number(owedToUs || 0) <= 0,
+  };
+}
+
 /** Операция, привязанная к документу: по ней можно отменить и не задвоить. */
 function addOpForDoc(userId, cpId, op, docId) {
   const cp = getCp(userId, cpId);
@@ -1410,7 +1452,7 @@ module.exports = {
   createCp, updateCp, listCps, getCp,
   addOp, listOps, deleteLastOp, deleteOp, balanceOf, debtors, debtBreakdown, periodBalance, cpForPeriod,
   knownBankKeys, importBankRows,
-  DEBT_DOCS, basisOf, makesDebt, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
+  DEBT_DOCS, basisOf, makesDebt, basisMismatch, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
   debtByDoc, rebuildDebt, restoreDebt,
   markPaid, unmarkPaid, matchPaymentsToDocs, closeDocsFromBank,
   unpaidDocs, unpaidSummary, dealTotals, docsBetween,

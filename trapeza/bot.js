@@ -2795,8 +2795,27 @@ const plural = (n, one, few, many) => {
 
 async function showDebts(tg, chatId, user) {
   const rows = bdb.debtors(user.id);
+  /*
+   * Прежде чем сказать «все рассчитались», убеждаемся, что это правда.
+   *
+   * При основании «по отгрузке» долг создаёт акт, УПД или накладная, но не
+   * счёт. Человек, работающий счетами, выписывал их, видел здесь ровно ноль
+   * и решал, что цифра сломана, — а объяснение было только в мини-приложении.
+   * Кто смотрел долги в боте, не получал ни слова.
+   */
+  const basis = bdb.basisMismatch(user.id, bdb.getDefaultOrg(user.id),
+    rows.filter((r) => r.theyOwe).reduce((s, r) => s + r.amount, 0));
+  const basisNote = basis
+    ? `\n\n<i>${basis.to === 'invoice'
+      ? 'Долг у вас считается по актам, а не по счетам'
+      : 'Долг у вас считается по счетам, а не по актам'}, поэтому `
+      + `${basis.count} ${plural(basis.count, 'документ', 'документа', 'документов')} `
+      + `на ${formatRub(basis.sum)} сюда не попали. Поменять — «📊 Долг» в настройках.</i>`
+    : '';
+
   if (!rows.length) {
-    await tg.sendMessage(chatId, 'Все рассчитались — незакрытых сальдо нет. 👌', mainMenu());
+    await tg.sendMessage(chatId,
+      `Все рассчитались — незакрытых сальдо нет. 👌${basisNote}`, mainMenu());
     return;
   }
   const theyOwe = rows.filter((r) => r.theyOwe);
@@ -2816,7 +2835,7 @@ async function showDebts(tg, chatId, user) {
   if (weOwe.length) {
     text += `<b>Мы должны — ${formatRub(sum(weOwe))}</b>\n${weOwe.map(line).join('\n')}\n\n`;
   }
-  text += '⚠️ — больше двух месяцев без единой операции.';
+  text += `⚠️ — больше двух месяцев без единой операции.${basisNote}`;
 
   const kb = [];
   if (theyOwe.length) {
