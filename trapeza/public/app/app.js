@@ -3069,6 +3069,9 @@ screens.bankclose = async function bankClose(params) {
     toast(res.docs
       ? `Отмечено ${res.docs} ${plural(res.docs, 'документ', 'документа', 'документов')}`
       : 'Ничего не отмечено');
+    // Через выписку закрывают сразу пачку, и про чек тут забывают вернее
+    // всего: человек ничего не выписывал, он просто прислал файл.
+    if (res && res.npd) pendingCheque = res.npd;
     reset('debts');
   });
   const skip = h('button', { class: 'btn ghost' }, 'Не сейчас');

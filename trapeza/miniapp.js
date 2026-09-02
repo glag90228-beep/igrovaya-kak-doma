@@ -1097,7 +1097,20 @@ const api = {
       doc: str(d.doc, 120),
     })));
     const left = bdb.unpaidSummary(user.id);
-    return { ...done, count: left.count, sum: left.sum };
+    /*
+     * Про чек напоминаем и здесь — как это давно делает бот.
+     *
+     * Через выписку закрывают сразу пачку, и именно тут про чек забывают
+     * вернее всего: человек ничего не выписывал, он просто прислал файл.
+     * Отметка оплаты по одному документу напоминание отдавала, а закрытие
+     * пачки — нет, то есть пропущен был ровно тот путь, который закрывает
+     * много документов молча. Для ИП на НПД это срок из статьи 14
+     * ФЗ № 422-ФЗ, а не вежливость.
+     */
+    const npdNote = done.docs
+      ? npd.chequeReminder(bdb.getDefaultOrg(user.id), { paidAt: docService.todayISO() })
+      : null;
+    return { ...done, count: left.count, sum: left.sum, npd: npdNote };
   },
 
   /**

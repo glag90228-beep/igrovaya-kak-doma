@@ -75,12 +75,25 @@ async function handlePayment(p) {
     try { user = bdb.getOrCreateUser(p.tgId); } catch (_) { user = null; }
   }
 
-  const { duplicate, payment, id } = billing.recordPayment({
+  const { duplicate, near, payment, id } = billing.recordPayment({
     externalId: p.externalId, provider: 'lava', userId: user ? user.id : 0,
     email: p.email, amount: p.amount, currency: p.currency, days,
     status: p.status, raw: p.raw,
   });
-  if (duplicate) return `повтор ${p.externalId} — пропущен`;
+  if (duplicate) {
+    /*
+     * Похожий платёж записан, но дней не даёт. Сказать об этом обязаны: под
+     * тот же признак попадает и настоящая вторая покупка — месяц себе и
+     * месяц коллеге с одной кассовой почты подряд. Раньше она пропадала
+     * молча, теперь строка есть и владелец о ней знает.
+     */
+    if (near) {
+      await notifyOwner(`⚠️ Похожий платёж ${p.amount} ${p.currency} с почты <b>${p.email || '—'}</b>.\n\n`
+        + 'Записал, но доступ по нему не выдал — он похож на повторную доставку. '
+        + 'Если это вторая настоящая покупка, выдайте доступ вручную.');
+    }
+    return `повтор ${p.externalId} — записан, доступ не выдан`;
+  }
 
   if (!p.paid) return `платёж ${p.externalId} со статусом «${p.status}» — записан, доступ не выдан`;
 

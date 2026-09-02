@@ -729,7 +729,32 @@ async function startItems(tg, chatId, user, type, cpId, extra = {}) {
   if (!(await requireQuota(tg, chatId, user))) return;
   const year = currentYear();
   const seq = bdb.nextSeq(user.id, type, year);
-  const data = { seq, number: String(seq), date: todayISO(), items: [], ask: '', doc: extra };
+
+  /*
+   * Режим НДС организации подставляем здесь, а не только при выписке.
+   *
+   * doc-service всё равно применит его сам, если ставку не назвали. Но
+   * сводка перед выпуском считает итог по тому, что лежит в состоянии, — и
+   * когда набор позиций начинали без ставки, она обещала «Итого: 100 000
+   * (без НДС)», а уходил документ на 120 000. Расхождение видел человек,
+   * уже нажавший «Сформировать».
+   *
+   * Ловилось это на трёх входах из пяти: накладная, счёт голосом или фразой
+   * и счёт сразу после заведения контрагента — то есть везде, где ставку
+   * никто не спрашивал. У накладной кнопки «НДС» в сводке нет вовсе, так
+   * что поправить расхождение было нечем.
+   *
+   * Явно переданную ставку не трогаем: проверяем наличие ключа, а не
+   * значение, потому что null означает «этот документ без налога».
+   */
+  const doc = { ...extra };
+  if (['sch', 'schdog', 'torg12', 'upd'].includes(type)
+      && !Object.prototype.hasOwnProperty.call(doc, 'vatRate')) {
+    const v = bdb.vatOf(bdb.getDefaultOrg(user.id));
+    if (v.rate != null) { doc.vatRate = v.rate; doc.priceIncludesVat = v.gross; }
+  }
+
+  const data = { seq, number: String(seq), date: todayISO(), items: [], ask: '', doc };
   bdb.setState(user.id, `items:${type}:${cpId}`, data);
   const tpl = bdb.listTemplates(user.id, 6).length
     ? '\n\nЧастые позиции — кнопками ниже, количество спрошу.' : '';

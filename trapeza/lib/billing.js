@@ -285,16 +285,40 @@ function nearDuplicate(p) {
 }
 
 function recordPayment(p) {
-  const exists = findPayment(p.provider || 'lava', p.externalId) || nearDuplicate(p);
-  if (exists) return { duplicate: true, payment: exists };
+  // Точное совпадение идентификатора — это ровно та же доставка того же
+  // платежа. Записывать нечего, и дней тоже.
+  const same = findPayment(p.provider || 'lava', p.externalId);
+  if (same) return { duplicate: true, payment: same };
+
+  /*
+   * Похожий платёж — не то же самое, что тот же самый.
+   *
+   * Признак «та же почта, та же сумма, тот же статус за четверть часа» ловит
+   * повторную доставку, при которой площадка сменила идентификатор. Но под
+   * него подходит и настоящая вторая покупка: бухгалтер берёт месяц себе и
+   * месяц коллеге с одной кассовой почты подряд. Раньше такая строка не
+   * записывалась вовсе — платёж исчезал бесследно, и разбираться с
+   * претензией было не по чему: ни суммы, ни идентификатора, только лог.
+   *
+   * Теперь она пишется всегда, но с нулевым сроком: денег по ней не выдаётся
+   * (отбор ничьих платежей берёт только строки со сроком), а след остаётся.
+   * Кто это был на самом деле — повтор доставки или вторая покупка — решает
+   * человек, и для этого ему нужно сначала увидеть строку.
+   */
+  const near = nearDuplicate(p);
+  const days = near ? 0 : (Number(p.days) || 0);
+
   const info = db.prepare(`
     INSERT INTO payments(external_id, provider, user_id, email, amount, currency, days, status, raw, created_at)
     VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
-    String(p.externalId), p.provider || 'lava', p.userId || 0, norm(p.email),
-    Number(p.amount) || 0, p.currency || 'RUB', Number(p.days) || 0,
+    String(p.externalId), p.provider || 'lava', near ? 0 : (p.userId || 0), norm(p.email),
+    Number(p.amount) || 0, p.currency || 'RUB', days,
     p.status || '', p.raw ? JSON.stringify(p.raw).slice(0, 4000) : '', new Date().toISOString(),
   );
-  return { duplicate: false, payment: findPayment(p.provider || 'lava', p.externalId), id: Number(info.lastInsertRowid) };
+  const payment = findPayment(p.provider || 'lava', p.externalId);
+  return {
+    duplicate: Boolean(near), near: Boolean(near), payment, id: Number(info.lastInsertRowid),
+  };
 }
 
 /**
