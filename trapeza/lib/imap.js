@@ -21,13 +21,39 @@ const net = require('node:net');
 
 const CRLF = '\r\n';
 
+/*
+ * Потолок одного ответа сервера.
+ *
+ * Без него Reader складывал в память всё, что присылал сервер, сколько бы
+ * тот ни прислал. Почтовый ящик читает мини-приложение — один процесс на
+ * всех, — и любой посторонний, отправивший клиенту письмо с вложением на
+ * полсотни мегабайт, заставлял этот процесс держать его целиком. Buffer.concat
+ * на каждый кусок делает это ещё и квадратично. MAX_BODY тут не защищает:
+ * он про входящие HTTP-запросы, а не про то, что мы сами читаем из сети.
+ *
+ * Двадцать пять мегабайт — заведомо больше любого счёта или акта, которые
+ * присылают контрагенты, и заведомо меньше того, чем можно уронить службу.
+ */
+const MAX_RESPONSE = 25 * 1024 * 1024;
+
 /** Ответ сервера: строки протокола + собранные литералы. */
 class Reader {
   constructor(socket, timeout) {
     this.buf = Buffer.alloc(0);
     this.waiting = null;
     this.timeout = timeout;
-    socket.on('data', (chunk) => { this.buf = Buffer.concat([this.buf, chunk]); this.check(); });
+    socket.on('data', (chunk) => {
+      this.buf = Buffer.concat([this.buf, chunk]);
+      if (this.buf.length > MAX_RESPONSE) {
+        // Рвём соединение, а не просто отказываем: сервер продолжит слать,
+        // и память будет расти дальше, пока он не закончит.
+        this.buf = Buffer.alloc(0);
+        socket.destroy();
+        this.fail(new Error('письмо слишком большое — оборвал чтение'));
+        return;
+      }
+      this.check();
+    });
     socket.on('error', (e) => this.fail(e));
     socket.on('close', () => this.fail(new Error('сервер закрыл соединение')));
   }

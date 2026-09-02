@@ -1847,7 +1847,7 @@ async function checkInbox(tg, chatId, user) {
     return;
   }
 
-  inboxCache.set(user.id, found);
+  inboxPut(user.id, found);
   const maxUid = Math.max(...found.map((f) => f.uid));
   mailbox.setLastUid(user.id, maxUid);
 
@@ -1864,12 +1864,41 @@ async function checkInbox(tg, chatId, user) {
     ]));
 }
 
-/** Разобранные письма держим в памяти до следующей проверки. */
+/*
+ * Разобранные письма держим в памяти до следующей проверки — но не вечно.
+ *
+ * В записи лежат буферы всех вложений, а класть их сюда мы обязаны: человек
+ * листает письма кнопками и нажимает «сохранить» отдельным шагом, второй раз
+ * с почты их не забрать. Беда была в том, что запись не убиралась никогда: у
+ * каждого, кто хоть раз проверил почту, содержимое писем висело в памяти
+ * бота до перезапуска, а бот один на всех.
+ *
+ * Час — с запасом на то, чтобы посмотреть письма и решить, что с ними
+ * делать. Просроченное убираем при любом обращении к кэшу, чтобы уборка не
+ * зависела от отдельного таймера, который однажды забудут завести.
+ */
+const INBOX_TTL_MS = 60 * 60 * 1000;
 const inboxCache = new Map();
+
+function inboxPut(userId, list) {
+  inboxCache.set(userId, { at: Date.now(), list });
+  inboxSweep();
+}
+
+function inboxGet(userId) {
+  inboxSweep();
+  const row = inboxCache.get(userId);
+  return row ? row.list : [];
+}
+
+function inboxSweep() {
+  const edge = Date.now() - INBOX_TTL_MS;
+  for (const [id, row] of inboxCache) if (row.at < edge) inboxCache.delete(id);
+}
 
 /** Карточка письма: от кого, что во вложении, что с этим делать. */
 async function showInboxMessage(tg, chatId, user, index) {
-  const list = inboxCache.get(user.id) || [];
+  const list = inboxGet(user.id);
   const m = list[index];
   if (!m) { await tg.sendMessage(chatId, 'Письмо уже неактуально — проверьте почту заново.', mainMenu()); return; }
 
@@ -3907,7 +3936,7 @@ async function handleCallback(tg, cq) {
     if (data === 'inbox') { await checkInbox(tg, chatId, user); return; }
     if (data.startsWith('in.m:')) { await showInboxMessage(tg, chatId, user, Number(data.slice(5))); return; }
     if (data.startsWith('in.f:')) {
-      const m = (inboxCache.get(user.id) || [])[Number(data.slice(5))];
+      const m = inboxGet(user.id)[Number(data.slice(5))];
       if (!m) { await tg.sendMessage(chatId, 'Письмо уже неактуально.', mainMenu()); return; }
       for (const d of m.docs) {
         // eslint-disable-next-line no-await-in-loop
@@ -3920,7 +3949,7 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('in.op:')) {
       const [idx, cpIdStr] = data.slice(6).split(':');
-      const m = (inboxCache.get(user.id) || [])[Number(idx)];
+      const m = inboxGet(user.id)[Number(idx)];
       if (!m) { await tg.sendMessage(chatId, 'Письмо уже неактуально.', mainMenu()); return; }
       bdb.setState(user.id, `op:${Number(cpIdStr)}`);
       await tg.sendMessage(chatId,

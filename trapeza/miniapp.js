@@ -136,9 +136,29 @@ function forgetRate() { hits.clear(); }
 function tooOften(userId, limit = 120) {
   const now = Date.now();
   const rec = hits.get(userId);
-  if (!rec || now - rec.since > 60000) { hits.set(userId, { since: now, n: 1 }); return false; }
+  if (!rec || now - rec.since > 60000) {
+    /*
+     * Уборка стоит здесь, до выхода, и убирает по возрасту, а не подчистую.
+     *
+     * Прежняя строка `if (hits.size > 5000) hits.clear()` лежала ниже — то
+     * есть срабатывала только при ПОВТОРНОМ обращении по тому же ключу.
+     * Обращения к публичному /d/<токен> кладут каждый раз новый ключ и
+     * уходят через return выше: карта росла без предела, причём от кого
+     * угодно, без всякого входа в приложение. А случись ей всё-таки
+     * сработать, она обнуляла счётчики сразу всем — то есть снимала защиту
+     * ровно в тот момент, когда обращений больше всего.
+     *
+     * Теперь просроченные окна вычищаются по ходу дела: минута прошла —
+     * запись всё равно не нужна.
+     */
+    if (hits.size > 5000) {
+      const edge = now - 60000;
+      for (const [k, v] of hits) if (v.since < edge) hits.delete(k);
+    }
+    hits.set(userId, { since: now, n: 1 });
+    return false;
+  }
   rec.n += 1;
-  if (hits.size > 5000) hits.clear(); // не растём бесконечно
   return rec.n > limit;
 }
 
