@@ -53,6 +53,28 @@ class Telegram {
        * поломок, — по ней нельзя было даже понять, куда смотреть.
        */
       const cause = e.cause && (e.cause.code || e.cause.message);
+
+      /*
+       * Не достучались до Telegram — пробуем ещё раз.
+       *
+       * С этого сервера соединение до api.telegram.org устанавливается через
+       * раз: одна и та же команда в первый раз падает с UND_ERR_CONNECT_TIMEOUT,
+       * во второй проходит. Для российского хостинга это обычное дело, и
+       * сдаваться с первой попытки значит терять сообщения на ровном месте —
+       * так у владельца пропало уведомление о платеже, пришедшем без привязки.
+       *
+       * Повторяем ТОЛЬКО отказы на подключении: соединения не случилось,
+       * значит запрос до Telegram не дошёл и повтор ничего не задвоит. Обрыв
+       * посреди ответа сюда не попадает намеренно — там сообщение могло уже
+       * уйти, и второй заход прислал бы его дважды.
+       */
+      const preSend = ['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND',
+        'EAI_AGAIN', 'ECONNRESET', 'ETIMEDOUT'].includes(cause);
+      if (preSend && attempt < 2) {
+        await new Promise((r) => setTimeout(r, (attempt + 1) * 1500));
+        return this.call(method, params, attempt + 1);
+      }
+
       const err = new Error(e.name === 'TimeoutError'
         ? `TG ${method}: Telegram не ответил вовремя`
         : `TG ${method}: ${[e.message, cause].filter(Boolean).join(' — ')}`);
