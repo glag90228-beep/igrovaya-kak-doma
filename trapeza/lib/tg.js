@@ -45,9 +45,17 @@ class Telegram {
         signal: AbortSignal.timeout(timeoutFor(params)),
       });
     } catch (e) {
+      /*
+       * «fetch failed» — всё, что Node сообщает о любой сетевой беде: не
+       * разрешилось имя, отказали в соединении, оборвалось шифрование, лёг
+       * прокси. Настоящая причина лежит в e.cause и до журнала не доходила,
+       * поэтому в нём оставалась строка, одинаковая для десятка разных
+       * поломок, — по ней нельзя было даже понять, куда смотреть.
+       */
+      const cause = e.cause && (e.cause.code || e.cause.message);
       const err = new Error(e.name === 'TimeoutError'
         ? `TG ${method}: Telegram не ответил вовремя`
-        : `TG ${method}: ${e.message}`);
+        : `TG ${method}: ${[e.message, cause].filter(Boolean).join(' — ')}`);
       err.network = true;
       throw err;
     }
