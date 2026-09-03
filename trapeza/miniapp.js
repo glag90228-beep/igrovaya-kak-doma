@@ -636,7 +636,9 @@ const api = {
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     const raw = body.rate;
     const rate = raw === null || raw === '' || raw === undefined ? '' : String(Number(raw));
-    if (!['', '0', '10', '20'].includes(rate)) return { error: 'Ставка бывает 0, 10 или 20 процентов.' };
+    if (!['', '0', '5', '7', '10', '20', '22'].includes(rate)) {
+      return { error: 'Ставка бывает 0, 5, 7, 10, 20 или 22 процента.' };
+    }
     bdb.updateOrg(user.id, org.id, { vat_rate: rate, vat_gross: body.gross ? 1 : 0 });
     return { vat: bdb.vatOf(bdb.getDefaultOrg(user.id)) };
   },

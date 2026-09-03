@@ -1570,8 +1570,9 @@ async function askUpdStatus(tg, chatId, user, cpId) {
 async function askUpdRate(tg, chatId, user, cpId) {
   await tg.sendMessage(chatId, 'Ставка НДС:',
     keyboard([
-      [{ text: '20%', data: `upd.r:${cpId}:20` }, { text: '10%', data: `upd.r:${cpId}:10` }],
-      [{ text: '0%', data: `upd.r:${cpId}:0` }],
+      [{ text: '22%', data: `upd.r:${cpId}:22` }, { text: '20%', data: `upd.r:${cpId}:20` }],
+      [{ text: '10%', data: `upd.r:${cpId}:10` }, { text: '5%', data: `upd.r:${cpId}:5` }],
+      [{ text: '7%', data: `upd.r:${cpId}:7` }, { text: '0%', data: `upd.r:${cpId}:0` }],
       [{ text: 'Без НДС (освобождение)', data: `upd.r:${cpId}:none` }],
       [{ text: '✖️ Отмена', data: `cp:${cpId}` }],
     ]));
@@ -2457,10 +2458,13 @@ async function showVat(tg, chatId, user) {
     + 'прибавится к сумме счёта.',
     keyboard([
       [{ text: 'Без НДС (упрощёнка)', data: 'vat.set:none:0' }],
+      [{ text: '22%, цены с НДС', data: 'vat.set:22:1' },
+        { text: '22% сверху', data: 'vat.set:22:0' }],
       [{ text: '20%, цены с НДС', data: 'vat.set:20:1' },
         { text: '20% сверху', data: 'vat.set:20:0' }],
       [{ text: '10%, цены с НДС', data: 'vat.set:10:1' },
         { text: '10% сверху', data: 'vat.set:10:0' }],
+      [{ text: '5% УСН', data: 'vat.set:5:0' }, { text: '7% УСН', data: 'vat.set:7:0' }],
       [{ text: '0% (экспорт)', data: 'vat.set:0:0' }],
       [{ text: '⬅️ К организации', data: 'org' }],
     ]));
@@ -3702,10 +3706,13 @@ async function handleCallback(tg, cq) {
     if (data === 'doc.vat') {
       await tg.sendMessage(chatId, 'НДС для этого счёта:', keyboard([
         [{ text: 'Без НДС', data: 'doc.vat.set:none:0' }],
+        [{ text: '22%, цены с НДС', data: 'doc.vat.set:22:1' },
+          { text: '22% сверху', data: 'doc.vat.set:22:0' }],
         [{ text: '20%, цены с НДС', data: 'doc.vat.set:20:1' },
           { text: '20% сверху', data: 'doc.vat.set:20:0' }],
         [{ text: '10%, цены с НДС', data: 'doc.vat.set:10:1' },
           { text: '10% сверху', data: 'doc.vat.set:10:0' }],
+        [{ text: '5% УСН', data: 'doc.vat.set:5:0' }, { text: '7% УСН', data: 'doc.vat.set:7:0' }],
       ]));
       return;
     }

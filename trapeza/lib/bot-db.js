@@ -166,7 +166,7 @@ function migrate() {
   // Режим НДС организации: спрашивать ставку у каждого счёта — мучение,
   // бухгалтер выписывает их десятками, а система налогообложения меняется
   // раз в год. Храним у организации, у документа можно переопределить.
-  addColumn('orgs', 'vat_rate', "TEXT NOT NULL DEFAULT ''");   // '' | '0' | '10' | '20'
+  addColumn('orgs', 'vat_rate', "TEXT NOT NULL DEFAULT ''");   // '' | '0' | '5' | '7' | '10' | '20' | '22'
   addColumn('orgs', 'vat_gross', 'INTEGER NOT NULL DEFAULT 0'); // 1 — цены уже с НДС
   // ОГРНИП: в УПД есть графа, а поля не было — печаталось пусто.
   addColumn('orgs', 'ogrnip', "TEXT NOT NULL DEFAULT ''");

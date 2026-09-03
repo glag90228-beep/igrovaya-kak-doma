@@ -168,6 +168,30 @@ async function main() {
   r = await call('GET', '/api/cps', { user: masha });
   ok(r.json.cps[0].name === 'ООО «Заря»', 'название нашего контрагента не изменилось', r.json.cps[0].name);
 
+  section('НДС: новые ставки 22%, 5%, 7%');
+  {
+    // Реформа НДС с 2026 года: общая ставка выросла до 22%, а пониженные
+    // ставки УСН без права на вычет — 5% и 7%. До этой правки /api/vat
+    // принимал только 0, 10 и 20 — новые ставки отклонялись с ошибкой,
+    // хотя lib/money.js умел считать налог по любой ставке.
+    r = await call('POST', '/api/vat', { user: masha, body: { rate: 22, gross: 1 } });
+    ok(r.status === 200 && r.json.vat.rate === 22 && r.json.vat.gross === true,
+      'ставка 22% (общая с 2026 года) принята', JSON.stringify(r.json));
+
+    r = await call('POST', '/api/vat', { user: masha, body: { rate: 5, gross: 0 } });
+    ok(r.status === 200 && r.json.vat.rate === 5, 'ставка 5% УСН принята', JSON.stringify(r.json));
+
+    r = await call('POST', '/api/vat', { user: masha, body: { rate: 7, gross: 0 } });
+    ok(r.status === 200 && r.json.vat.rate === 7, 'ставка 7% УСН принята', JSON.stringify(r.json));
+
+    r = await call('POST', '/api/vat', { user: masha, body: { rate: 15, gross: 0 } });
+    ok(r.status === 400 && Boolean(r.json.error), 'несуществующая ставка 15% всё равно отклонена',
+      JSON.stringify(r.json));
+
+    r = await call('POST', '/api/vat', { user: masha, body: { rate: null, gross: 0 } });
+    ok(r.status === 200 && r.json.vat.rate === null, 'ставка сброшена обратно на «без НДС»');
+  }
+
   section('выписка документа');
   sentToChat.length = 0;
   r = await call('POST', '/api/doc', {
