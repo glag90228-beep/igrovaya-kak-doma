@@ -248,12 +248,13 @@ npx ruflo@3.38.12 doctor --fix
   зависимость не тащить: сначала спросить у владельца проекта.
 - **Тесты лежат в корне `trapeza/`**, а не в `/tests`: `bot-selftest.js`,
   `miniapp-selftest.js`, `mail-selftest.js`, `inbox-selftest.js`,
-  `bank-selftest.js`, `app-selftest.js`. Правило Ruflo «не класть тесты в
-  корень» здесь не применяется — не переносить их.
+  `bank-selftest.js`, `app-selftest.js`, `office-selftest.js`,
+  `redteam-selftest.js`. Правило Ruflo «не класть тесты в корень» здесь не
+  применяется — не переносить их.
 - Сборки нет, `npm run build` не существует. Проверка одна:
 
   ```bash
-  cd trapeza && npm test        # ~850 проверок, все шесть прогонов
+  cd trapeza && npm test        # ~1400 проверок, все восемь прогонов
   ```
 
   Каждый прогон пишет `✅`/`❌` и возвращает ненулевой код при провале.

@@ -35,7 +35,7 @@ class Telegram {
    * На 429 Telegram сам говорит, сколько ждать, — ждём, если просят
    * по-божески, и честно сдаёмся, если речь о часах.
    */
-  async call(method, params = {}, attempt = 0) {
+  async call(method, params = {}, attempt = 0, netTry = 0) {
     let res;
     try {
       res = await fetch(`${this.base}/${method}`, {
@@ -64,15 +64,34 @@ class Telegram {
        * так у владельца пропало уведомление о платеже, пришедшем без привязки.
        *
        * Повторяем ТОЛЬКО отказы на подключении: соединения не случилось,
-       * значит запрос до Telegram не дошёл и повтор ничего не задвоит. Обрыв
-       * посреди ответа сюда не попадает намеренно — там сообщение могло уже
-       * уйти, и второй заход прислал бы его дважды.
+       * значит запрос до Telegram не дошёл и повтор ничего не задвоит.
+       *
+       * ECONNRESET и ETIMEDOUT в этом списке были и оказались ошибкой: оба
+       * приходят на любой стадии, в том числе когда запрос уже ушёл целиком,
+       * Telegram его принял и обработал, а оборвался только ответ. На стенде
+       * (сервер дочитывает тело и делает resetAndDestroy) одно сообщение
+       * уезжало трижды — то есть человек получал «Оплата получена. Доступ
+       * продлён» три раза подряд. Ровно тот случай, который комментарий выше
+       * объявлял исключённым, а список молча включал.
        */
       const preSend = ['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND',
-        'EAI_AGAIN', 'ECONNRESET', 'ETIMEDOUT'].includes(cause);
-      if (preSend && attempt < 2) {
-        await new Promise((r) => setTimeout(r, (attempt + 1) * 1500));
-        return this.call(method, params, attempt + 1);
+        'EAI_AGAIN'].includes(cause);
+      /*
+       * Счётчик у сетевого повтора свой.
+       *
+       * Раньше он был общий с повтором по 429, и два разных лимита делили
+       * одно число: после двух пауз «слишком часто» сетевой повтор не
+       * срабатывал вовсе — то есть именно при массовой рассылке, когда он
+       * нужнее всего. И наоборот, два сетевых захода урезали запас по 429
+       * с трёх до одного.
+       */
+      if (preSend && netTry < 2) {
+        // Молчащий повтор — та же слепота, от которой уходили: «моргнуло и
+        // со второй попытки прошло» не оставляло следа, и понять по журналу,
+        // что сервер отваливается через раз, было нельзя.
+        console.warn(`TG ${method}: ${cause}, повтор ${netTry + 1} из 2`);
+        await new Promise((r) => setTimeout(r, (netTry + 1) * 1500));
+        return this.call(method, params, attempt, netTry + 1);
       }
 
       const err = new Error(e.name === 'TimeoutError'
@@ -88,7 +107,7 @@ class Telegram {
     const retryAfter = ((data.parameters || {}).retry_after) || 0;
     if (code === 429 && attempt < 3 && retryAfter <= MAX_RETRY_WAIT) {
       await new Promise((r) => setTimeout(r, (retryAfter || 1) * 1000));
-      return this.call(method, params, attempt + 1);
+      return this.call(method, params, attempt + 1, netTry);
     }
     if (code === 429 && retryAfter > MAX_RETRY_WAIT) {
       const err = new Error(`TG ${method}: слишком часто, Telegram просит подождать `

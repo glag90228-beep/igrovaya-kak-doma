@@ -251,11 +251,21 @@ function yearSaving() {
   return Math.round(month.amount * 12 - year.amount);
 }
 
-/** Сверка секрета: сравнение постоянного времени, чтобы не подбирался побайтно. */
+/**
+ * Сверка секрета: сравнение постоянного времени, чтобы не подбирался побайтно.
+ *
+ * Края обрезаем с обеих сторон. Опасность не в том, что лишний пробел пришлёт
+ * площадка, — а в том, что он окажется в нашем собственном ключе: висящий \n
+ * в .env, в EnvironmentFile= у systemd или при копировании из чата — самое
+ * обычное дело. Тогда правильный ключ от Lava отвергался бы вечно, платежи не
+ * доходили, а в журнале лежала бы совершенно правдоподобная строка «неверный
+ * секрет». Пробелы по краям ключа не несут смысла ни у одной площадки, зато
+ * стоят потерянных денег.
+ */
 function secretOk(given) {
-  const want = process.env.LAVA_WEBHOOK_SECRET || '';
+  const want = String(process.env.LAVA_WEBHOOK_SECRET || '').trim();
   if (!want) return false;
-  const a = Buffer.from(String(given || ''));
+  const a = Buffer.from(String(given == null ? '' : given).trim());
   const b = Buffer.from(want);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }

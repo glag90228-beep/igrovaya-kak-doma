@@ -180,6 +180,18 @@ function readBody(req) {
   });
 }
 
+/*
+ * Ставки НДС, которые бывают, — один список на обе границы.
+ *
+ * Их две, и раньше они расходились: настройку организации (/api/vat) список
+ * прикрывал, а ставку отдельного документа (/api/doc) — нет, и туда проходило
+ * что угодно вплоть до NaN. Пустая строка в начале — это «без НДС».
+ *
+ * С 2026 года: 22% общая, 20% для переходного периода и старых договоров,
+ * 10% льготная, 5% и 7% — пониженные для УСН без права на вычет, 0% экспорт.
+ */
+const VAT_RATES = ['', '0', '5', '7', '10', '20', '22'];
+
 const str = (v, max = 300) => String(v == null ? '' : v).trim().slice(0, max);
 const ruDate = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(iso || '')
   ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : (iso || ''));
@@ -636,7 +648,7 @@ const api = {
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     const raw = body.rate;
     const rate = raw === null || raw === '' || raw === undefined ? '' : String(Number(raw));
-    if (!['', '0', '5', '7', '10', '20', '22'].includes(rate)) {
+    if (!VAT_RATES.includes(rate)) {
       return { error: 'Ставка бывает 0, 5, 7, 10, 20 или 22 процента.' };
     }
     bdb.updateOrg(user.id, org.id, { vat_rate: rate, vat_gross: body.gross ? 1 : 0 });
@@ -1452,7 +1464,24 @@ const api = {
       extra.status = Number(body.status) === 1 ? 1 : 2;
     }
     if (Object.prototype.hasOwnProperty.call(body, 'vatRate')) {
-      extra.vatRate = body.vatRate == null || body.vatRate === '' ? null : Number(body.vatRate);
+      /*
+       * Ставку у документа проверяем тем же списком, что и у организации.
+       *
+       * Раньше здесь стоял голый Number(), и что прислали, то и печаталось:
+       * 999 давало «НДС (999%)», −20 уменьшало итог, а строка «абв»
+       * превращалась в NaN и уходила на бланк как «НДС (NaN%)» — при том что
+       * в журнал ложилась сумма без налога. Собственный интерфейс приложения
+       * ставку не шлёт вовсе, так что случайно сюда не попасть, — но это
+       * граница системы, а на границе проверяют, а не надеются.
+       */
+      const raw = body.vatRate;
+      if (raw == null || raw === '') {
+        extra.vatRate = null;
+      } else if (VAT_RATES.includes(String(Number(raw)))) {
+        extra.vatRate = Number(raw);
+      } else {
+        return { error: `Ставка НДС бывает ${VAT_RATES.filter(Boolean).join(', ')} процентов.` };
+      }
       extra.priceIncludesVat = Boolean(body.priceIncludesVat);
     }
     const res = await docService.issueDocument(user.id, {

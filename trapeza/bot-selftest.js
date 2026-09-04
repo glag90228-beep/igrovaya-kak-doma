@@ -72,12 +72,41 @@ const tap = (data) => handleUpdate(tg,
 const last = () => (sent[sent.length - 1] || {}).text || '';
 /** Деньги печатаются с неразрывными пробелами — для сравнений выравниваем. */
 const norm = (s) => String(s).replace(/\s/g, ' ');
-/** Ищем кнопку по подстроке текста и возвращаем её callback_data. */
+/**
+ * Ищем кнопку по подстроке текста НА ПОСЛЕДНЕМ экране и возвращаем её
+ * callback_data.
+ *
+ * Раньше поиск шёл по всей истории прогона снизу вверх, и это тихо
+ * обесценивало проверки: кнопка, найденная в сообщении, нарисованном сотней
+ * шагов раньше, засчитывалась как кнопка текущего экрана. Ревизия показала
+ * цену — шесть проверок про новые ставки НДС остались зелёными после того,
+ * как эти кнопки из экранов убрали: «22%» находилась на соседнем экране,
+ * получившем те же кнопки, а «5%» вообще матчилась подстрокой в «5% УСН».
+ *
+ * Экран, нарисованный раньше, — это не то, что человек видит сейчас, и
+ * проверять по нему нельзя. Там, где экран состоит из нескольких сообщений
+ * (список должников — по сообщению на каждого), берут buttonSince: она
+ * смотрит только то, что нарисовало само действие, а не всю историю.
+ */
+function buttonIn(msg, sub) {
+  for (const row of (msg && msg.kb) || []) {
+    for (const b of row) if (b.text.includes(sub)) return b.callback_data;
+  }
+  return null;
+}
+
 function button(sub) {
-  for (let i = sent.length - 1; i >= 0; i--) {
-    for (const row of sent[i].kb) {
-      for (const b of row) if (b.text.includes(sub)) return b.callback_data;
-    }
+  return buttonIn(sent[sent.length - 1], sub);
+}
+
+/**
+ * Кнопка среди сообщений, нарисованных после отметки mark = sent.length.
+ * Для экранов из нескольких сообщений — и только для них.
+ */
+function buttonSince(mark, sub) {
+  for (let i = sent.length - 1; i >= mark; i--) {
+    const got = buttonIn(sent[i], sub);
+    if (got != null) return got;
   }
   return null;
 }
@@ -1779,6 +1808,25 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'НДС в том числе: 100 = 83,33 + 16,67', JSON.stringify(inc));
     ok(vatTotals([{ qty: 2, price: 50 }], null, false).vat === null, 'без НДС налог не считается');
 
+    /*
+     * Расчётные ставки — по каждой новой отдельно.
+     *
+     * Мутационная ревизия показала дыру: во всех восьми прогонах налог по
+     * новым ставкам проверялся ровно в одном месте и только для 22% «сверху».
+     * Испорченный vatSplit (налог всегда 20%) семь прогонов из восьми не
+     * замечали, а 5% и 7% не проверял никто — только запись в базу.
+     *
+     * Числа не выдуманы: 5/105 и 7/107 — расчётные ставки из п. 4 ст. 164 НК.
+     */
+    for (const [rate, net, vat] of [[22, 81.97, 18.03], [5, 95.24, 4.76], [7, 93.46, 6.54]]) {
+      const inc2 = vatTotals([{ qty: 1, price: 100 }], rate, true);
+      ok(inc2.net === net && inc2.vat === vat && inc2.total === 100,
+        `${rate}% в том числе: 100 = ${net} + ${vat}`, JSON.stringify(inc2));
+      const over = vatTotals([{ qty: 1, price: 100 }], rate, false);
+      ok(over.net === 100 && over.vat === rate && over.total === 100 + rate,
+        `${rate}% сверху: 100 + ${rate} = ${100 + rate}`, JSON.stringify(over));
+    }
+
     await tap('org');
     const vatBtn = button('НДС:');
     ok(Boolean(vatBtn), 'в карточке организации есть настройка НДС', vatBtn);
@@ -1821,9 +1869,14 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     // нельзя, хотя lib/money.js их считает без проблем: ограничение было
     // только в списке кнопок и в защите /api/vat мини-приложения.
     await tap('vat');
-    ok(button('22%') != null, 'кнопка 22% появилась в экране НДС организации', button('22%'));
-    ok(button('5% УСН') != null, 'кнопка 5% УСН появилась в экране НДС организации', button('5% УСН'));
-    ok(button('7% УСН') != null, 'кнопка 7% УСН появилась в экране НДС организации', button('7% УСН'));
+    // Сверяем не подстроку в тексте, а callback_data: «5%» матчилось на
+    // «5% УСН», «22%» — на ярлык режима «🧾 НДС: 22%» с соседнего экрана, и
+    // проверка проходила даже когда кнопки удаляли.
+    const vatKb = (sent[sent.length - 1].kb || []).flat().map((b) => b.callback_data);
+    for (const want of ['vat.set:22:1', 'vat.set:22:0', 'vat.set:5:1', 'vat.set:5:0',
+      'vat.set:7:1', 'vat.set:7:0']) {
+      ok(vatKb.includes(want), `в экране НДС организации есть ${want}`, vatKb.join(' '));
+    }
 
     await tap('vat.set:22:0');
     ok(bdb2.vatOf(bdb2.getDefaultOrg(fxUserId())).rate === 22, 'ставка 22% сохранена организации');
@@ -1843,11 +1896,10 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     // Тот же набор ставок — в УПД со статусом 1 (счёт-фактура).
     await tap(`d.upd:${cpId}`);
     await tap(`upd.s1:${cpId}`);
-    ok(button('22%') != null, 'ставка 22% доступна и при выписке УПД', button('22%'));
-    ok(button('5%') != null, 'ставка 5% доступна и при выписке УПД', button('5%'));
-    ok(button('7%') != null, 'ставка 7% доступна и при выписке УПД', button('7%'));
-    await tap(`upd.r:${cpId}:5`);
-    ok(last().includes('Ставка 5%'), 'УПД принял пониженную ставку 5%', last());
+    const updKb = (sent[sent.length - 1].kb || []).flat().map((b) => b.callback_data);
+    for (const want of [`upd.r:${cpId}:22`, `upd.r:${cpId}:5`, `upd.r:${cpId}:7`]) {
+      ok(updKb.includes(want), `при выписке УПД есть ${want}`, updKb.join(' '));
+    }
     await tap(`cp:${cpId}`);   // отменяем начатый УПД, чтобы не мешал следующим тестам
 
     await tap('vat.set:none:0');   // возвращаем как было
@@ -1970,8 +2022,12 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     });
     bdbR.addOp(uidM, cpDebt, { date: '2026-07-01', kind: 'Приход', doc: 'Акт 3', credit: 31000 });
 
+    // Экран напоминаний — сообщение на каждого должника, и наш не обязательно
+    // последний: порядок задаёт выборка. Ищем среди того, что нарисовал
+    // именно этот вызов, а не по всему прогону.
+    const remindMark = sent.length;
     await tap('debt.remind');
-    const sendBtn = button('Отправить на buh@zabyv.ru');
+    const sendBtn = buttonSince(remindMark, 'Отправить на buh@zabyv.ru');
     ok(Boolean(sendBtn), 'у должника с известной почтой есть кнопка отправки', sendBtn);
     ok(sent.some((m) => /числится задолженность/.test(m.text || '')), 'текст напоминания показан');
 
@@ -4067,10 +4123,10 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   {
     const bdbU = require('./lib/bot-db');
     const dsu = require('./lib/doc-service');
-    const one = async (tgId, vat) => {
+    const one = async (tgId, vat, npdOn = 0) => {
       const u = bdbU.getOrCreateUser(tgId);
       bdbU.saveMyOrg(u.id, { name: 'ООО «УПД»', inn: '7701234567' });
-      bdbU.updateOrg(u.id, bdbU.getDefaultOrg(u.id).id, { vat_rate: vat });
+      bdbU.updateOrg(u.id, bdbU.getDefaultOrg(u.id).id, { vat_rate: vat, npd: npdOn });
       const cpU = bdbU.createCp(u.id, { name: 'ООО «Покупатель»', kind: 'customer', opening_date: '2026-01-01' });
       const r = await dsu.issueDocument(u.id, {
         type: 'upd', cpId: cpU, items: [{ name: 'Товар', qty: 1, price: 10000 }], skipQuota: true,
@@ -4084,6 +4140,29 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const usn = await one(779041, '');
     ok(usn.total === 10000 && Number(usn.saved.status) === 2,
       'на упрощёнке — статус 2 без счёта-фактуры', `${usn.total} ст.${usn.saved.status}`);
+
+    // Упрощенец со ставкой 5% — с 2026 года плательщик НДС, счёт-фактура ему
+    // нужна: покупателю иначе нечего принять к вычету.
+    const usn5 = await one(779042, '5');
+    ok(usn5.total === 10500 && Number(usn5.saved.status) === 1 && Number(usn5.saved.vatRate) === 5,
+      'на УСН со ставкой 5% — статус 1 со счётом-фактурой',
+      `${usn5.total} ст.${usn5.saved.status} ${usn5.saved.vatRate}`);
+
+    /*
+     * Самозанятому счёт-фактуру не выписываем, даже если у него проставлена
+     * ставка.
+     *
+     * Экраны «Самозанятость» и «НДС» независимы, и поставить ставку поверх
+     * включённого НПД ничто не мешает. Прежнее правило «есть ставка → статус
+     * 1» молча выдавало такому человеку счёт-фактуру с выделенным налогом, а
+     * по п. 5 ст. 173 НК неплательщик, выставивший её, обязан уплатить весь
+     * этот НДС в бюджет и подать декларацию. Заказчик вычет при этом всё
+     * равно не получит.
+     */
+    const npdVat = await one(779043, '22', 1);
+    ok(Number(npdVat.saved.status) === 2,
+      'самозанятому со ставкой НДС счёт-фактура не выписывается',
+      `ст.${npdVat.saved.status} ставка ${npdVat.saved.vatRate}`);
   }
 
   console.log('\n── переход на свой ключ почты не роняет ящики ──');
