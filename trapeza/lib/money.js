@@ -149,8 +149,9 @@ function vatSplit(it, rate, gross) {
   const r = Number(rate) / 100;
   if (gross) {
     const total = round2(qty * price);
-    const net = round2(total / (1 + r));
-    return { unitNet: round2(price / (1 + r)), net, vat: round2(total - net), total };
+    const unitNet = round2(price / (1 + r));
+    const net = round2(unitNet * qty);
+    return { unitNet, net, vat: round2(total - net), total };
   }
   const net = round2(qty * price);
   const vat = round2(net * r);

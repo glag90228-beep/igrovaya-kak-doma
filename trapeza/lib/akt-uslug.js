@@ -5,7 +5,7 @@
 // таблица услуг, сумма прописью, при необходимости — признание задолженности.
 
 const { esc, ru, page, fxHtml, formatMoney, amountInWords } = require('./doc-html');
-const { round2, vatTotals } = require('./money');
+const { round2, vatTotals, rateLabel } = require('./money');
 
 function party(org) {
   const bits = [];
@@ -27,8 +27,12 @@ function buildAktUslugHtml({ org, cp, doc }) {
    * подписи к файлу стояло 120 000 — и долг был на 120 000. Ставка
    * попадает сюда через extra счёта, от которого заведён ежемесячный акт.
    */
+  const gross = Boolean(doc.priceIncludesVat);
   const rate = doc.vatRate == null ? null : Number(doc.vatRate);
-  const total = vatTotals(items, rate, Boolean(doc.priceIncludesVat)).total;
+  const totals = vatTotals(items, rate, gross);
+  const total = totals.total;
+  const net = totals.net;
+  const vat = totals.vat;
   const ispoln = party({ ...org, full_name: (org.full_name || org.name || '').toUpperCase() });
   const zakaz = party(cp);
 
@@ -73,11 +77,18 @@ function buildAktUslugHtml({ org, cp, doc }) {
       </tr></thead>
       <tbody>
         ${rows || '<tr><td colspan="6" class="c muted">— нет позиций —</td></tr>'}
-        <tr class="total"><td colspan="5" class="r">ИТОГО:</td><td class="r">${formatMoney(total)}</td></tr>
+        <tr class="total"><td colspan="5" class="r">Итого:</td>
+            <td class="r">${formatMoney(gross ? total : net)}</td></tr>
+        <tr><td colspan="5" class="r">${rate == null
+          ? 'Без налога (НДС):'
+          : `${gross ? 'В том числе НДС' : 'НДС'} (${rateLabel(rate)}):`}</td>
+            <td class="r">${rate == null ? '—' : formatMoney(vat)}</td></tr>
+        <tr class="total"><td colspan="5" class="r b">Всего к оплате:</td>
+            <td class="r b">${formatMoney(total)}</td></tr>
       </tbody>
     </table>
 
-    <p class="b">Всего оказано услуг на сумму: ${formatMoney(total)} руб. (${amountInWords(total)}).</p>
+    <p class="b">Всего оказано услуг на сумму: ${formatMoney(total)} руб. (${amountInWords(total)})${rate == null ? ', без НДС' : (gross ? `, в т.ч. НДС ${rateLabel(rate)} — ${formatMoney(vat)} руб.` : `, плюс НДС ${rateLabel(rate)} — ${formatMoney(vat)} руб.`)}.</p>
     <p class="note">Вышеперечисленные услуги выполнены полностью и в срок. Заказчик претензий
        по объёму, качеству и срокам оказания услуг не имеет.</p>
     ${doc.note ? `<p class="note">${esc(doc.note)}</p>` : ''}

@@ -748,7 +748,7 @@ async function startItems(tg, chatId, user, type, cpId, extra = {}) {
    * значение, потому что null означает «этот документ без налога».
    */
   const doc = { ...extra };
-  if (['sch', 'schdog', 'torg12', 'upd'].includes(type)
+  if (['sch', 'schdog', 'torg12', 'upd', 'usl'].includes(type)
       && !Object.prototype.hasOwnProperty.call(doc, 'vatRate')) {
     const v = bdb.vatOf(bdb.getDefaultOrg(user.id));
     if (v.rate != null) { doc.vatRate = v.rate; doc.priceIncludesVat = v.gross; }
@@ -2069,7 +2069,12 @@ async function handleFreeText(tg, chatId, user, text) {
       return true;
     }
 
-    await startItems(tg, chatId, user, intent.docType, found.cp.id);
+    const extra = {};
+    if (intent.vatRate !== undefined) {
+      extra.vatRate = intent.vatRate;
+      extra.priceIncludesVat = Boolean(intent.priceIncludesVat);
+    }
+    await startItems(tg, chatId, user, intent.docType, found.cp.id, extra);
     const items = docService.cleanItems(intent.items || []);
     if (items.length) {
       const st = bdb.getState(user.id);
@@ -2449,6 +2454,8 @@ async function showBizType(tg, chatId, user) {
       [{ text: '⬅️ К организации', data: 'org' }],
     ]));
 }
+
+const ALLOWED_VAT_RATES = new Set(['none', '0', '5', '7', '10', '20', '22']);
 
 /**
  * Экран выбора системы налогообложения. Спрашиваем один раз у организации,
@@ -3749,6 +3756,7 @@ async function handleCallback(tg, cq) {
       const st2 = bdb.getState(user.id);
       if (!st2 || !st2.state.startsWith('items:')) return;
       const [rate, gross] = data.slice(12).split(':');
+      if (!ALLOWED_VAT_RATES.has(rate) || !['0', '1'].includes(gross)) return;
       const dd = st2.data;
       dd.doc = dd.doc || {};
       // Именно null, а не удаление ключа: «без НДС» для этого счёта должно
@@ -4008,6 +4016,7 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('vat.set:')) {
       const [rate, gross] = data.slice(8).split(':');
+      if (!ALLOWED_VAT_RATES.has(rate) || !['0', '1'].includes(gross)) return;
       const org = bdb.getDefaultOrg(user.id);
       if (org) {
         bdb.updateOrg(user.id, org.id, {
@@ -4539,13 +4548,13 @@ async function main() {
    * будет ждать сети. Лучше подождать сами и написать понятно.
    */
   let me = null;
-  for (let attempt = 1; attempt <= 5 && !me; attempt += 1) {
+  for (let attempt = 1; attempt <= 3 && !me; attempt += 1) {
     try {
       me = await tg.call('getMe');                    // eslint-disable-line no-await-in-loop
     } catch (e) {
-      if (attempt === 5) throw e;
-      console.error(`Telegram не отвечает (${e.message}), попытка ${attempt} из 5…`);
-      await new Promise((r) => setTimeout(r, attempt * 3000));   // eslint-disable-line no-await-in-loop
+      if (attempt === 3) throw e;
+      console.error(`Telegram не отвечает (${e.message}), попытка ${attempt} из 3…`);
+      await new Promise((r) => setTimeout(r, 2000));   // eslint-disable-line no-await-in-loop
     }
   }
 
