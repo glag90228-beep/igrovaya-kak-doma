@@ -59,7 +59,7 @@ const LAND = `
 
 /**
  * @param doc {
- *   number, date, status (1|2), vatRate (20|10|0|null), priceIncludesVat,
+ *   number, date, status (1|2), vatRate (22|20|10|7|5|0|null), priceIncludesVat,
  *   items:[{name,qty,unit,price,code?,country?,countryCode?,gtd?}],
  *   basis?, transferDate?, shipper?, consignee?, payDoc?, contract?, note?
  * }

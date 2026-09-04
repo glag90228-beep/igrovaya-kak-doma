@@ -10,7 +10,7 @@ const { payQrSvg } = require('./qr-pay');
 
 /**
  * doc: { number, date, items:[{name,qty,unit,price}],
- *        vatRate (20|10|0|null — null значит «без НДС»),
+ *        vatRate (22|20|10|7|5|0|null — null значит «без НДС»),
  *        priceIncludesVat (цены уже с налогом) }
  */
 function buildSchetHtml({ org, cp, doc }) {

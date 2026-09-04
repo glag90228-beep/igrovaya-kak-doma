@@ -2748,7 +2748,7 @@ screens.other = async function other({ type, cpId }) {
       amount: field('amount', 'Сумма, ₽', '', { inputmode: 'decimal', required: true }),
       purpose: field('purpose', 'Назначение платежа', '', {
         multiline: true, required: true,
-        placeholder: 'Оплата по счёту № 12 от 01.08.2026, в том числе НДС 20%',
+        placeholder: 'Оплата по счёту № 12 от 01.08.2026, в том числе НДС 22%',
       }),
     }
     : {

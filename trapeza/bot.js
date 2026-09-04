@@ -1590,6 +1590,16 @@ async function askUpdGross(tg, chatId, user, cpId, rate) {
     await startItems(tg, chatId, user, 'upd', cpId, { status: 1, vatRate: null });
     return;
   }
+  /*
+   * При нулевой ставке спрашивать нечего: налога нет, и «выделить из суммы»
+   * с «начислить сверху» дают ровно одно и то же. Лишний вопрос на ровном
+   * месте заставляет человека гадать, есть ли между ответами разница.
+   */
+  if (String(rate) === '0') {
+    await startItems(tg, chatId, user, 'upd', cpId,
+      { status: 1, vatRate: 0, priceIncludesVat: false });
+    return;
+  }
   await tg.sendMessage(chatId,
     `Ставка ${rate}%. Цены, которые будете вводить, — с налогом или без?\n`
     + '<i>От этого зависит, что попадёт в графу 4 и в сумму налога.</i>',
@@ -1953,6 +1963,18 @@ async function showInboxMessage(tg, chatId, user, index) {
 
 const FX_NAMES = { sign: 'подпись', stamp: 'печать' };
 
+/*
+ * Ставки НДС, которые бывают. Тот же список, что и у мини-приложения.
+ *
+ * Проверять надо и здесь, хотя значение приходит из callback_data собственной
+ * кнопки: callback_data подделывается кем угодно, а «vat.set:1e9:0» уходило в
+ * настройку организации как есть и печатало в счетах «НДС 1000000000%». Своим
+ * же документам, но чинить надо не выборочно — правило проекта требует
+ * проверять вход на границе, и кнопка такая же граница, как HTTP-запрос.
+ */
+const VAT_RATES = ['0', '5', '7', '10', '20', '22'];
+const okRate = (r) => r === 'none' || VAT_RATES.includes(String(r));
+
 /** Человеческое название режима НДС организации. */
 function vatLabel(org) {
   const v = bdb.vatOf(org);
@@ -2011,6 +2033,7 @@ async function handleFreeText(tg, chatId, user, text) {
   if (intent.action === 'docs') { await showDocs(tg, chatId, user); return true; }
   if (intent.action === 'cps') { await showCps(tg, chatId, user); return true; }
   if (intent.action === 'org') { await showOrg(tg, chatId, user); return true; }
+  if (intent.action === 'vat') { await showVat(tg, chatId, user); return true; }
   if (intent.action === 'recurring') { await showRecurring(tg, chatId, user); return true; }
   if (intent.action === 'billing') { await showBilling(tg, chatId, user); return true; }
   if (intent.action === 'help') return false;      // помощь и так в меню
@@ -3749,6 +3772,7 @@ async function handleCallback(tg, cq) {
       const st2 = bdb.getState(user.id);
       if (!st2 || !st2.state.startsWith('items:')) return;
       const [rate, gross] = data.slice(12).split(':');
+      if (!okRate(rate)) return;
       const dd = st2.data;
       dd.doc = dd.doc || {};
       // Именно null, а не удаление ключа: «без НДС» для этого счёта должно
@@ -4008,6 +4032,7 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('vat.set:')) {
       const [rate, gross] = data.slice(8).split(':');
+      if (!okRate(rate)) return;
       const org = bdb.getDefaultOrg(user.id);
       if (org) {
         bdb.updateOrg(user.id, org.id, {
@@ -4325,11 +4350,13 @@ async function handleCallback(tg, cq) {
     if (data.startsWith('upd.s1:')) { await askUpdRate(tg, chatId, user, Number(data.slice(7))); return; }
     if (data.startsWith('upd.r:')) {
       const [cpIdStr, rate] = data.slice(6).split(':');
+      if (!okRate(rate)) return;
       await askUpdGross(tg, chatId, user, Number(cpIdStr), rate);
       return;
     }
     if (data.startsWith('upd.g:')) {
       const [cpIdStr, rate, gross] = data.slice(6).split(':');
+      if (!okRate(rate)) return;
       await startItems(tg, chatId, user, 'upd', Number(cpIdStr),
         { status: 1, vatRate: Number(rate), priceIncludesVat: gross === '1' });
       return;
@@ -4537,14 +4564,20 @@ async function main() {
    * api.telegram.org иногда моргает, и падать из-за этого при старте нельзя —
    * systemd поднимет заново, но в журнал ляжет трассировка, а бот всё равно
    * будет ждать сети. Лучше подождать сами и написать понятно.
+   *
+   * Попыток три, а не пять: с тех пор как lib/tg.js сам повторяет отказы на
+   * подключении, каждая попытка стоит до трёх обращений с паузами. Пять
+   * внешних заходов давали пятнадцать обращений и около трёх минут молчания
+   * вместо задуманных тридцати секунд — человек в это время видит службу,
+   * которая «висит», и не понимает, ждать ему или чинить.
    */
   let me = null;
-  for (let attempt = 1; attempt <= 5 && !me; attempt += 1) {
+  for (let attempt = 1; attempt <= 3 && !me; attempt += 1) {
     try {
       me = await tg.call('getMe');                    // eslint-disable-line no-await-in-loop
     } catch (e) {
-      if (attempt === 5) throw e;
-      console.error(`Telegram не отвечает (${e.message}), попытка ${attempt} из 5…`);
+      if (attempt === 3) throw e;
+      console.error(`Telegram не отвечает (${e.message}), попытка ${attempt} из 3…`);
       await new Promise((r) => setTimeout(r, attempt * 3000));   // eslint-disable-line no-await-in-loop
     }
   }

@@ -5,7 +5,7 @@
 // таблица услуг, сумма прописью, при необходимости — признание задолженности.
 
 const { esc, ru, page, fxHtml, formatMoney, amountInWords } = require('./doc-html');
-const { round2, vatTotals } = require('./money');
+const { round2, vatTotals, rateLabel } = require('./money');
 
 function party(org) {
   const bits = [];
@@ -27,8 +27,25 @@ function buildAktUslugHtml({ org, cp, doc }) {
    * подписи к файлу стояло 120 000 — и долг был на 120 000. Ставка
    * попадает сюда через extra счёта, от которого заведён ежемесячный акт.
    */
+  /*
+   * «Итого» обязано сходиться со столбцом «Сумма» — то же правило, что в счёте.
+   *
+   * Раньше строки печатали qty × price, а ИТОГО брало total с налогом: при
+   * ставке 22% сверху столбец давал 1 000,00, а ИТОГО — 1 220,00, и лишние
+   * 220 рублей появлялись из ниоткуда. Слова «НДС» в акте при этом не было
+   * вовсе, так что объяснить расхождение было нечем — а подписывает документ
+   * живой человек, и первым делом он складывает столбец.
+   *
+   * Раскладка та же, что в lib/schet.js:
+   *   цены с НДС  → в столбце уже полная сумма, Итого = всего;
+   *   НДС сверху  → в столбце сумма без налога, Итого = без налога,
+   *                 и налог добавляется отдельной строкой.
+   */
   const rate = doc.vatRate == null ? null : Number(doc.vatRate);
-  const total = vatTotals(items, rate, Boolean(doc.priceIncludesVat)).total;
+  const gross = Boolean(doc.priceIncludesVat);
+  const { net, vat, total } = vatTotals(items, rate, gross);
+  // Строка «Итого» под столбцом: при налоге сверху столбец — это net.
+  const column = rate == null || gross ? total : net;
   const ispoln = party({ ...org, full_name: (org.full_name || org.name || '').toUpperCase() });
   const zakaz = party(cp);
 
@@ -73,11 +90,15 @@ function buildAktUslugHtml({ org, cp, doc }) {
       </tr></thead>
       <tbody>
         ${rows || '<tr><td colspan="6" class="c muted">— нет позиций —</td></tr>'}
-        <tr class="total"><td colspan="5" class="r">ИТОГО:</td><td class="r">${formatMoney(total)}</td></tr>
+        <tr class="total"><td colspan="5" class="r">ИТОГО:</td><td class="r">${formatMoney(column)}</td></tr>
+        ${rate == null ? `
+        <tr class="total"><td colspan="5" class="r">Без налога (НДС):</td><td class="r">—</td></tr>` : `
+        <tr class="total"><td colspan="5" class="r">${gross ? 'В том числе НДС' : 'НДС'} (${esc(rateLabel(rate))}):</td><td class="r">${formatMoney(vat)}</td></tr>
+        <tr class="total"><td colspan="5" class="r b">Всего:</td><td class="r b">${formatMoney(total)}</td></tr>`}
       </tbody>
     </table>
 
-    <p class="b">Всего оказано услуг на сумму: ${formatMoney(total)} руб. (${amountInWords(total)}).</p>
+    <p class="b">Всего оказано услуг на сумму: ${formatMoney(total)} руб. (${amountInWords(total)})${rate == null ? ', без НДС' : `, в т.ч. НДС ${esc(rateLabel(rate))} — ${formatMoney(vat)} руб.`}.</p>
     <p class="note">Вышеперечисленные услуги выполнены полностью и в срок. Заказчик претензий
        по объёму, качеству и срокам оказания услуг не имеет.</p>
     ${doc.note ? `<p class="note">${esc(doc.note)}</p>` : ''}
