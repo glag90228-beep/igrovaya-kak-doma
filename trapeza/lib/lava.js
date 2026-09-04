@@ -270,6 +270,34 @@ function secretOk(given) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+/**
+ * Сверка подписи тела запроса: HMAC-SHA256 тем же секретом.
+ *
+ * Площадки передают секрет двумя способами. Либо кладут его в заголовок как
+ * есть — это secretOk выше. Либо подписывают им тело запроса и присылают
+ * подпись: тогда в заголовке лежит не ключ, а шестнадцатеричная строка, и
+ * побайтное сравнение с ключом её, разумеется, отвергает. Внешне это
+ * неотличимо от неверного ключа, и в журнале выглядит одинаково — «отказ:
+ * неверный секрет». Из-за этого можно неделями искать не там.
+ *
+ * Подпись считаем по СЫРОМУ телу, до разбора JSON: пересобранный из объекта
+ * текст отличается порядком полей и пробелами, и подпись по нему не сойдётся
+ * никогда, даже когда всё настроено верно.
+ *
+ * @param {string} given подпись из заголовка
+ * @param {string} rawBody тело запроса ровно как пришло
+ */
+function hmacOk(given, rawBody, secret) {
+  const want = String(secret || process.env.LAVA_WEBHOOK_SECRET || '').trim();
+  const sig = String(given == null ? '' : given).trim().toLowerCase()
+    .replace(/^sha256=/, '');           // некоторые площадки помечают алгоритм
+  if (!want || !sig || rawBody == null) return false;
+  const mine = crypto.createHmac('sha256', want).update(rawBody).digest('hex');
+  const a = Buffer.from(sig);
+  const b = Buffer.from(mine);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 /** Ссылка на оплату с подставленным Telegram-id. */
 function payLink(tgId) {
   const base = process.env.LAVA_OFFER_URL || '';
@@ -281,4 +309,4 @@ function payLink(tgId) {
 
 module.exports = {
   plans, priceText, planTitle, planLabel, yearSaving,
-  parseWebhook, daysFor, secretOk, payLink, tgIdFrom, stampOf, FIELDS };
+  parseWebhook, daysFor, secretOk, hmacOk, payLink, tgIdFrom, stampOf, FIELDS };

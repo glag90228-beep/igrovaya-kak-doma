@@ -743,6 +743,30 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   process.env.LAVA_WEBHOOK_SECRET = 'sekret';
   ok(lava.secretOk('sekret') && !lava.secretOk('sekret1') && !lava.secretOk(''),
     'секрет сверяется точно');
+  ok(lava.secretOk(' sekret\n'), 'края ключа обрезаются — висящий перевод строки в .env не отвергает верный ключ');
+
+  /*
+   * Второй способ подтверждения: площадка подписывает тело секретом.
+   *
+   * Тогда в заголовке лежит не ключ, а шестнадцатеричная строка, и побайтное
+   * сравнение с ключом её отвергает. В журнале это выглядит как «неверный
+   * секрет» — то есть неотличимо от чужого запроса, хотя искать надо совсем
+   * в другом месте.
+   */
+  {
+    const cryptoL = require('node:crypto');
+    const telo = '{"eventType":"payment.success","amount":390}';
+    const podpis = (key, text) => cryptoL.createHmac('sha256', key).update(text).digest('hex');
+    ok(lava.hmacOk(podpis('sekret', telo), telo), 'подпись тела принимается');
+    ok(lava.hmacOk(`sha256=${podpis('sekret', telo)}`, telo),
+      'и с пометкой алгоритма впереди — её ставят некоторые площадки');
+    ok(lava.hmacOk(podpis('sekret', telo).toUpperCase(), telo), 'регистр подписи не важен');
+    ok(!lava.hmacOk(podpis('chuzhoy', telo), telo), 'подпись чужим ключом отвергается');
+    ok(!lava.hmacOk(podpis('sekret', '{}'), telo),
+      'подпись от другого тела отвергается — иначе её можно было бы переставить на любой платёж');
+    ok(!lava.hmacOk('', telo) && !lava.hmacOk(podpis('sekret', telo), ''),
+      'пустая подпись и пустое тело ничего не открывают');
+  }
   process.env.LAVA_OFFER_URL = 'https://lava.top/x?a=1';
   ok(lava.payLink(777001).includes('clientUtm=777001'), 'ссылка на оплату несёт Telegram-id',
     lava.payLink(777001));

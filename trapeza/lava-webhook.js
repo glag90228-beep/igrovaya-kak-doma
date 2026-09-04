@@ -20,7 +20,7 @@ const path = require('node:path');
 
 const bdb = require('./lib/bot-db');
 const billing = require('./lib/billing');
-const { parseWebhook, daysFor, secretOk } = require('./lib/lava');
+const { parseWebhook, daysFor, secretOk, hmacOk } = require('./lib/lava');
 const { Telegram } = require('./lib/tg');
 
 const PORT = Number(process.env.LAVA_PORT || 8788);
@@ -176,20 +176,19 @@ const server = http.createServer((req, res) => {
   const from = String(req.headers['x-real-ip'] || req.headers['x-forwarded-for'] || '')
     .split(',')[0].trim() || req.socket.remoteAddress || 'неизвестно';
 
-  const carrier = (req.headers['x-api-key'] && 'X-Api-Key')
-    || (req.headers.authorization && 'Authorization')
-    || (url.searchParams.get('secret') && 'параметр secret')
-    || '';
-  const given = req.headers['x-api-key']
-    || String(req.headers.authorization || '').replace(/^Bearer\s+/i, '')
-    || url.searchParams.get('secret');
-  if (!secretOk(given)) {
-    log(`отказ: неверный секрет | от ${from} | путь ${url.pathname}`
-      + ` | секрет ${carrier ? `в ${carrier}, длина ${String(given).length}` : 'не передан вовсе'}`);
-    return done(401, 'bad secret');
-  }
-  log(`принят запрос от ${from} на ${url.pathname}`);
-
+  /*
+   * Тело читаем ДО проверки, а не после.
+   *
+   * Раньше сверка шла по заголовку сразу, и это закрывало второй способ
+   * подтверждения, которым площадки пользуются наравне с первым: подписать
+   * тело секретом и прислать подпись. Такая подпись — шестнадцатеричная
+   * строка, с ключом она не совпадает никогда, и в журнале это выглядело как
+   * «неверный секрет» — то есть ровно как чужой запрос. Отличить одно от
+   * другого было нельзя, а искать при этом надо в разных местах.
+   *
+   * Подпись считается по сырому телу, поэтому его нужно иметь на руках до
+   * решения. Ограничение размера при этом никуда не делось.
+   */
   let body = '';
   let tooBig = false;
   req.on('data', (chunk) => {
@@ -198,6 +197,46 @@ const server = http.createServer((req, res) => {
   });
   req.on('end', async () => {
     if (tooBig) return done(413, 'too large');
+
+    /*
+     * Кто стучался — записываем обязательно.
+     *
+     * Раньше отказ выглядел как «отказ: неверный секрет» и больше ничего. По
+     * такой строке нельзя отличить площадку от собственной проверки: мы сами
+     * шлём заведомо неверный секрет, когда проверяем, открыт ли путь. В
+     * журнале лежали отказы недельной давности, и понять, Lava это или наши
+     * же тесты, было невозможно — а от ответа зависело, где искать поломку.
+     *
+     * Адрес берём из заголовка от nginx (сам он ходит с петли, и без этого
+     * все обращения выглядели бы как 127.0.0.1). Секрет не пишем никогда:
+     * длины и способа передачи хватает, чтобы отличить «пусто» от «не тот» и
+     * от «обрезался», а в журнал он попадать не должен.
+     */
+    const carrier = (req.headers['x-api-key'] && 'X-Api-Key')
+      || (req.headers['x-signature'] && 'X-Signature')
+      || (req.headers['x-hook-signature'] && 'X-Hook-Signature')
+      || (req.headers.authorization && 'Authorization')
+      || (url.searchParams.get('secret') && 'параметр secret')
+      || (url.searchParams.get('token') && 'параметр token')
+      || '';
+    const given = req.headers['x-api-key']
+      || req.headers['x-signature']
+      || req.headers['x-hook-signature']
+      || String(req.headers.authorization || '').replace(/^Bearer\s+/i, '')
+      || url.searchParams.get('secret')
+      || url.searchParams.get('token');
+
+    // Ключ открытым текстом или подпись тела — принимаем оба способа.
+    const byKey = secretOk(given);
+    const bySig = !byKey && hmacOk(given, body);
+    if (!byKey && !bySig) {
+      log(`отказ: неверный секрет | от ${from} | путь ${url.pathname}`
+        + ` | секрет ${carrier ? `в ${carrier}, длина ${String(given).length}` : 'не передан вовсе'}`
+        + ' | ни как ключ, ни как подпись тела не подошёл');
+      return done(401, 'bad secret');
+    }
+    log(`принят запрос от ${from} на ${url.pathname} (${bySig ? 'подпись тела' : 'ключ'})`);
+
     let json;
     try { json = JSON.parse(body || '{}'); } catch (_) {
       log('не JSON:', body.slice(0, 500));
