@@ -26,8 +26,6 @@ const path = require('node:path');
 const bdb = require('./lib/bot-db');
 const billing = require('./lib/billing');
 const docService = require('./lib/doc-service');
-const docLink = require('./lib/doc-link');
-const npd = require('./lib/npd');
 const dadata = require('./lib/dadata');
 const facsimile = require('./lib/facsimile');
 const mailer = require('./lib/mail');
@@ -49,7 +47,7 @@ const bizTypes = require('./lib/biz-types');
 const reqCheck = require('./lib/requisites-check');
 const { round2 } = require('./lib/money');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
-const { payLink, priceText, yearSaving, planTitle, plans: lavaPlans } = require('./lib/lava');
+const { payLink, priceText, yearSaving } = require('./lib/lava');
 const { currentYear } = require('./lib/period');
 const { Telegram } = require('./lib/tg');
 
@@ -66,8 +64,13 @@ const MAX_BODY = 2 * 1024 * 1024;
 
 let tg = process.env.BOT_TOKEN ? new Telegram(process.env.BOT_TOKEN) : null;
 
+function bindOffice() {
+  if (tg && tg.sendMessage) office.attach((chat, text) => tg.sendMessage(chat, text));
+}
+bindOffice();
+
 /** Подменить клиента Telegram — нужно тестам, чтобы не ходить в сеть. */
-function setTelegram(client) { tg = client; }
+function setTelegram(client) { tg = client; bindOffice(); }
 
 // ---------- мелочи ----------
 
@@ -95,70 +98,13 @@ function sendJson(res, code, obj) {
  * Простое ограничение частоты на пользователя: мини-апп не должен уметь
  * положить сервер, даже если в нём заклинит кнопку. Окно — минута.
  */
-/**
- * Ответ на нерабочую ссылку — человеческий, а не «404 Not Found».
- *
- * Открывает её обычно не наш пользователь, а его клиент: он получил адрес в
- * переписке и понятия не имеет, что такое «Первичка». Поэтому объясняем
- * простыми словами, у кого спрашивать новый, и ничего не рассказываем о
- * самом документе — ни номера, ни суммы, ни владельца.
- */
-function sendLinkPage(res, code, text) {
-  const body = '<!doctype html><html lang="ru"><head><meta charset="utf-8">'
-    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
-    + '<meta name="robots" content="noindex,nofollow">'
-    + '<title>Документ недоступен</title><style>'
-    + 'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;'
-    + 'font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;'
-    + 'color:#14171f;background:#f4f6fc;padding:24px}'
-    + '.b{max-width:420px;text-align:center;background:#fff;border-radius:16px;padding:32px 28px;'
-    + 'box-shadow:0 2px 18px rgba(20,23,31,.08)}'
-    + 'h1{font-size:20px;margin:0 0 10px;color:#1f2760}p{margin:0;color:#5a6172}'
-    + '</style></head><body><div class="b"><h1>Документ недоступен</h1>'
-    + `<p>${text}</p><p style="margin-top:10px">Попросите отправителя прислать новую.</p>`
-    + '</div></body></html>';
-  res.writeHead(code, {
-    'Content-Type': 'text/html; charset=utf-8',
-    'Content-Length': Buffer.byteLength(body),
-    'Cache-Control': 'no-store',
-    'X-Robots-Tag': 'noindex, nofollow',
-  });
-  return res.end(body);
-}
-
 const hits = new Map();
-/**
- * Забыть счётчики. Нужно самопроверке: она делает за секунды столько
- * запросов, сколько человек не сделает и за час, и упирается в предел там,
- * где проверяет совсем другое. В работе не вызывается.
- */
-function forgetRate() { hits.clear(); }
 function tooOften(userId, limit = 120) {
   const now = Date.now();
   const rec = hits.get(userId);
-  if (!rec || now - rec.since > 60000) {
-    /*
-     * Уборка стоит здесь, до выхода, и убирает по возрасту, а не подчистую.
-     *
-     * Прежняя строка `if (hits.size > 5000) hits.clear()` лежала ниже — то
-     * есть срабатывала только при ПОВТОРНОМ обращении по тому же ключу.
-     * Обращения к публичному /d/<токен> кладут каждый раз новый ключ и
-     * уходят через return выше: карта росла без предела, причём от кого
-     * угодно, без всякого входа в приложение. А случись ей всё-таки
-     * сработать, она обнуляла счётчики сразу всем — то есть снимала защиту
-     * ровно в тот момент, когда обращений больше всего.
-     *
-     * Теперь просроченные окна вычищаются по ходу дела: минута прошла —
-     * запись всё равно не нужна.
-     */
-    if (hits.size > 5000) {
-      const edge = now - 60000;
-      for (const [k, v] of hits) if (v.since < edge) hits.delete(k);
-    }
-    hits.set(userId, { since: now, n: 1 });
-    return false;
-  }
+  if (!rec || now - rec.since > 60000) { hits.set(userId, { since: now, n: 1 }); return false; }
   rec.n += 1;
+  if (hits.size > 5000) hits.clear(); // не растём бесконечно
   return rec.n > limit;
 }
 
@@ -179,18 +125,6 @@ function readBody(req) {
     req.on('error', reject);
   });
 }
-
-/*
- * Ставки НДС, которые бывают, — один список на обе границы.
- *
- * Их две, и раньше они расходились: настройку организации (/api/vat) список
- * прикрывал, а ставку отдельного документа (/api/doc) — нет, и туда проходило
- * что угодно вплоть до NaN. Пустая строка в начале — это «без НДС».
- *
- * С 2026 года: 22% общая, 20% для переходного периода и старых договоров,
- * 10% льготная, 5% и 7% — пониженные для УСН без права на вычет, 0% экспорт.
- */
-const VAT_RATES = ['', '0', '5', '7', '10', '20', '22'];
 
 const str = (v, max = 300) => String(v == null ? '' : v).trim().slice(0, max);
 const ruDate = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(iso || '')
@@ -213,7 +147,7 @@ function stateFor(user) {
   return {
     user: { id: user.id, tgId: user.tg_id, name: user.name },
     org: org || null,
-    orgReady: Boolean(org && org.name && org.inn && org.acc && org.bik),
+    orgReady: Boolean(org && org.name && org.inn && org.acc && org.bik && org.corr_acc),
     quota,
     access,
     counts: { cps: bdb.listCps(user.id).length, debtors: debts.length },
@@ -221,41 +155,42 @@ function stateFor(user) {
     unpaid: { count: awaiting.count, sum: awaiting.sum },
     docs: bdb.listDocs(user.id, 5).map(docBrief),
     payUrl: payLink(user.tg_id),
-    /*
-     * Тарифы отдаём списком, а не одной фразой. Фраза «390 ₽ в месяц или
-     * 2990 ₽ в год» на узком экране рвалась посередине числа: «2990» на
-     * одной строке, «₽ в год» на другой. Из списка приложение рисует
-     * строки, где число и знак рубля не разлучить.
-     */
-    price: {
-      text: priceText(),
-      saving: yearSaving(),
-      plans: lavaPlans().map((p) => ({ amount: p.amount, days: p.days, title: planTitle(p.days) })),
-    },
+    price: { text: priceText(), saving: yearSaving() },
     facsimile: fxState(user.id),
     debtBasis: bdb.basisOf(org || {}),
     // Расхождение между тем, как человек работает, и тем, как считается
     // долг: счета выписаны и не оплачены, а «должны вам» — ноль. Молчать
     // об этом нельзя, человек решит, что цифра сломана.
-    /*
-     * Условие смотрит на сами документы, а не на общую цифру.
-     *
-     * Раньше здесь стояло `owedToUs > 0 ||` — подсказка гасла, если хоть
-     * кто-то хоть что-то должен. А проверка эта глобальная, по всем
-     * контрагентам сразу: два клиента, один должен пять тысяч по акту, у
-     * второго висит неоплаченный счёт на двести — и экран молчал, хотя
-     * двести тысяч в долг по-прежнему не попадают. Подсказка работала
-     * только в идеально пустом случае, то есть почти никогда.
-     *
-     * Сам разбор переехал в bot-db: тот же вопрос задаёт бот.
-     */
-    basisMismatch: bdb.basisMismatch(user.id, org, owedToUs),
+    basisMismatch: (() => {
+      if (owedToUs > 0 || !unpaidDocs.length) return null;
+      // В ручном режиме молчим: человек сам сказал, что журнал ведёт он, и
+      // подсказка «долг считается по актам» была бы неправдой, а кнопка
+      // рядом с ней молча начала бы делать проводки за него.
+      const basis = bdb.basisOf(org || {});
+      if (basis === 'manual') return null;
+      const types = bdb.DEBT_DOCS[basis];
+      const mute = unpaidDocs.filter((d) => !types.includes(d.type));
+      if (!mute.length) return null;
+      /*
+       * Куда переключать — выводим из самих документов, а не подставляем
+       * «по счёту» всегда. Иначе выходил замкнутый круг: у человека уже
+       * стоит «по счёту», висит неоплаченный акт, экран советует включить
+       * то, что включено, кнопка ничего не меняет и рапортует «Готово».
+       */
+      const to = mute.every((d) => bdb.DEBT_DOCS.invoice.includes(d.type)) ? 'invoice'
+        : (mute.every((d) => bdb.DEBT_DOCS.closing.includes(d.type)) ? 'closing' : null);
+      if (!to || to === basis) return null;
+      return {
+        to,
+        count: mute.length,
+        sum: round2(mute.reduce((a2, d) => a2 + (Number(d.total) || 0), 0)),
+      };
+    })(),
     bizType: (org && org.biz_type) || '',
     bizTypes: bizTypes.list(),
     recurring: recurring.list(user.id).length,
     features: { dadata: dadata.dadataAvailable(), pdf: true, mail: mailbox.resolve(user.id).ok },
     mailbox: mailbox.info(user.id),
-    aiEnabled: bdb.isAiEnabled(user.id),
   };
 }
 
@@ -284,17 +219,6 @@ function docBrief(d) {
     noDebt: Boolean(d.no_debt),
     items: (d.payload && d.payload.items) || [],
   };
-}
-
-/**
- * Какие штампы просит приложение. Пришло из браузера — значит, ничему тут
- * верить нельзя: приводим к двум булевым и отдаём дальше, а можно ли на
- * самом деле поставить «Оплачено», решает doc-service по базе.
- */
-function wantStamp(body) {
-  const s = body && body.stamp;
-  if (!s || typeof s !== 'object') return null;
-  return { paid: Boolean(s.paid), copy: Boolean(s.copy) };
 }
 
 function cpBrief(userId, cp) {
@@ -543,7 +467,7 @@ const api = {
     const to = str(body.email, 254) || cp.email;
     if (!mailer.validEmail(to)) return { error: 'Укажите правильный адрес почты.' };
 
-    const built = await docService.rebuildDocument(user.id, doc.id, { stamp: wantStamp(body) });
+    const built = await docService.rebuildDocument(user.id, doc.id);
     if (!built.ok) return { error: built.message };
 
     const org = bdb.getOrg(user.id, doc.org_id) || bdb.getDefaultOrg(user.id) || {};
@@ -557,13 +481,6 @@ const api = {
           + ` от ${ruDate(doc.date)}${doc.total ? ` на сумму ${money} руб.` : ''}.`,
         ...(doc.type === 'sch'
           ? ['', 'В счёте есть QR-код: оплатить можно, наведя камеру в приложении банка.'] : []),
-        // Акт сверки отправляют не чтобы его получили, а чтобы с ним
-        // согласились или возразили. Без прямой просьбы его кладут в папку,
-        // и расхождение всплывает через полгода.
-        ...(doc.type === 'akt'
-          ? ['', 'Просьба сверить данные со своей стороны. Если расхождений нет — '
-            + 'подпишите и пришлите скан в ответ. Если что-то не сходится, напишите, '
-            + 'по какой строке, и я проверю у себя.'] : []),
         '', 'С уважением,', org.name || org.full_name || '',
       ].join('\n'),
       attachments: [{
@@ -576,68 +493,16 @@ const api = {
     return { sent: to, remembered: to !== cp.email };
   },
 
-  /**
-   * Ссылка на документ: показать, что уже роздано.
-   *
-   * Отдельным запросом, а не в списке документов: ссылка есть у единиц, а
-   * запрос к базе шёл бы на каждую строку журнала.
-   */
-  async 'GET /api/doc/link'({ user, url }) {
-    const id = Number(url.searchParams.get('id'));
-    if (!bdb.getDoc(user.id, id)) return { error: 'Документ не найден.' };
-    return { links: docLink.listFor(user.id, id), available: docLink.available(), days: docLink.DAYS() };
-  },
-
-  /** Сделать ссылку (или вернуть уже сделанную — их не плодим). */
-  async 'POST /api/doc/link'({ user, body }) {
-    const id = Number(body.id);
-    const doc = bdb.getDoc(user.id, id);
-    if (!doc) return { error: 'Документ не найден.' };
-    if (!docLink.available()) {
-      return { error: 'Ссылки пока не работают: у приложения нет своего адреса в интернете.' };
-    }
-    // Штампы те же, что и у файла: ссылка — это тот же документ, только
-    // собираемый в момент открытия.
-    const link = docLink.create(user.id, id, { stamp: docService.stampFor(doc, wantStamp(body)) });
-    if (!link) return { error: 'Не получилось сделать ссылку.' };
-    return { link };
-  },
-
-  /** Закрыть доступ по всем ссылкам на документ. */
-  async 'POST /api/doc/link/revoke'({ user, body }) {
-    const id = Number(body.id);
-    if (!bdb.getDoc(user.id, id)) return { error: 'Документ не найден.' };
-    return { revoked: docLink.revoke(user.id, id) };
-  },
-
   /** Отметить документ оплаченным или снять отметку. */
   async 'POST /api/doc/paid'({ user, body }) {
     const id = Number(body.id);
-    const doc = bdb.getDoc(user.id, id);
-    if (!doc) return { error: 'Документ не найден.' };
+    if (!bdb.getDoc(user.id, id)) return { error: 'Документ не найден.' };
     if (body.paid === false) {
       bdb.unmarkPaid(user.id, id);
       return { doc: docBrief(bdb.getDoc(user.id, id)) };
     }
     const when = bdb.markPaid(user.id, id, str(body.date, 10));
-    // Самозанятому в этот момент надо выдать чек: счёт и акт доход не
-    // закрывают, его закрывает чек «Моего налога» (lib/npd.js).
-    const cp = doc.cp_id ? bdb.getCp(user.id, doc.cp_id) : null;
-    return {
-      paidAt: when,
-      doc: docBrief(bdb.getDoc(user.id, id)),
-      npd: npd.chequeReminder(bdb.getDefaultOrg(user.id), {
-        paidAt: when, cpName: cp && cp.name,
-      }),
-    };
-  },
-
-  /** Признак «применяю НПД». Нужен ровно для напоминания про чек. */
-  async 'POST /api/npd'({ user, body }) {
-    const org = bdb.getDefaultOrg(user.id);
-    if (!org) return { error: 'Сначала заполните реквизиты организации.' };
-    bdb.updateOrg(user.id, org.id, { npd: body.on ? 1 : 0 });
-    return { npd: Boolean(body.on), lkUrl: npd.LK_URL };
+    return { paidAt: when, doc: docBrief(bdb.getDoc(user.id, id)) };
   },
 
   /*
@@ -649,9 +514,7 @@ const api = {
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     const raw = body.rate;
     const rate = raw === null || raw === '' || raw === undefined ? '' : String(Number(raw));
-    if (!VAT_RATES.includes(rate)) {
-      return { error: 'Ставка бывает 0, 5, 7, 10, 20 или 22 процента.' };
-    }
+    if (!['', '0', '5', '7', '10', '20', '22'].includes(rate)) return { error: 'Ставка бывает 0, 5, 7, 10, 20 или 22 процента.' };
     bdb.updateOrg(user.id, org.id, { vat_rate: rate, vat_gross: body.gross ? 1 : 0 });
     return { vat: bdb.vatOf(bdb.getDefaultOrg(user.id)) };
   },
@@ -688,13 +551,6 @@ const api = {
       const parsed = mime.parseMessage(m.raw);
       const docs = parsed.attachments.filter(mime.looksLikeDocument);
       if (!docs.length) continue;
-      /*
-       * Это догадка по заголовку From, а он подделывается тривиально: ни SPF,
-       * ни DKIM мы не проверяем. Поддельный счёт от знакомого поставщика —
-       * самая частая схема обмана в малом бизнесе, и уверенно подставленное
-       * имя контрагента работало на неё. Признак guessed уходит на экран,
-       * чтобы приложение говорило то же, что и бот.
-       */
       const guess = cps.find((c) => c.email && c.email.toLowerCase() === parsed.from)
         || cps.find((c) => parsed.fromName && c.name
           && parsed.fromName.toLowerCase().includes(c.name.toLowerCase().slice(0, 8)));
@@ -703,7 +559,7 @@ const api = {
         from: parsed.from,
         fromName: parsed.fromName || '',
         subject: parsed.subject || '',
-        cp: guess ? { id: guess.id, name: guess.name, guessed: true } : null,
+        cp: guess ? { id: guess.id, name: guess.name } : null,
         files: docs.map((d) => ({
           name: d.filename,
           size: d.size,
@@ -803,29 +659,22 @@ const api = {
    */
   async 'POST /api/pay/claim'({ user, body }) {
     const email = str(body.email, 254).toLowerCase();
+    console.log(`[PAY CLAIM] user ${user.id} (@${user.username || ''}, ${user.name}, tg:${user.tg_id}) email: "${email}"`);
     if (!mailer.validEmail(email)) return { error: 'Это не похоже на почту.' };
     const found = billing.unclaimedByEmail(email);
     if (!found.length) {
+      console.log(`[PAY CLAIM] no payments found for email: "${email}"`);
       return {
         error: 'Оплату по этой почте не вижу. Деньги могли ещё не дойти — попробуйте через '
           + 'пару минут. Если прошло больше получаса, напишите в поддержку.',
       };
     }
-    /*
-     * Считаем только те оплаты, которые достались нам. Бот и приложение —
-     * разные процессы на одной базе, и одну строку забирали оба, начисляя
-     * дни дважды за один платёж. Привязка теперь отвечает, кто первый.
-     */
     let until = '';
-    let taken = 0;
     for (const p of found) {
-      if (!billing.attachPayment(p.id, user.id)) continue;
-      taken += 1;
-      until = billing.grantDays(user.id, p.days || 30);
+      billing.attachPayment(p.id, user.id);
+      until = billing.grantDays(user.id, p.days);
     }
-    // Ноль здесь — не «оплаты нет», а «её уже зачли»: показываем текущий срок.
-    if (!taken) return { found: 0, until: billing.accessInfo(user.id).until };
-    return { found: taken, until };
+    return { found: found.length, until };
   },
 
   /** Реестр всех документов за период — тоже Excel. */
@@ -833,17 +682,8 @@ const api = {
     const org = bdb.getDefaultOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     const iso = (v, fallback) => (/^\d{4}-\d{2}-\d{2}$/.test(v || '') ? v : fallback);
-    /*
-     * Начало месяца берём по московскому календарю, как и его конец.
-     *
-     * Здесь стоял new Date() с getFullYear и getMonth — то есть часовой пояс
-     * сервера, — а «по» ниже считалось через todayISO, то есть по Москве.
-     * Сервер живёт в UTC, поэтому первого сентября в 00:30 по Москве тут был
-     * ещё август: реестр «за текущий месяц» приходил за весь прошлый месяц
-     * плюс один день. В боте тот же расчёт давно идёт через period и такой
-     * ошибки не имеет.
-     */
-    const first = `${docService.todayISO().slice(0, 7)}-01`;
+    const now = new Date();
+    const first = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
     const from = iso(url.searchParams.get('from'), first);
     const to = iso(url.searchParams.get('to'), docService.todayISO());
     const docs = bdb.docsBetween(user.id, from, to);
@@ -1037,11 +877,6 @@ const api = {
     if (m[2].length > (MAX_BODY * 4) / 3) {
       return { error: `Снимок больше ${Math.round(MAX_BODY / 1024 / 1024)} МБ — сфотографируйте ближе.` };
     }
-    // Тот же кошелёк, что у голоса и разбора фраз: снимок уходит в модель.
-    if (ai.budget(user.id).left <= 0) {
-      return { error: 'На этот месяц разбор снимков и фраз закончился. Реквизиты можно ввести руками.' };
-    }
-    ai.spend(user.id);
     const res = await readInvoice(Buffer.from(m[2], 'base64'), m[1]);
     if (!res.ok) return { error: res.error };
     const f = res.fields || {};
@@ -1101,18 +936,6 @@ const api = {
         doc: t.doc,
         cp: t.cp,
         confidence: t.confidence,
-        /*
-         * Ничья доезжает до экрана.
-         *
-         * Сведение честно отмечает строку, совпавшую сразу с двумя клиентами,
-         * и бот обещает: «выберите нужного в приложении — сам не угадываю».
-         * Но эти два поля в ответ не попадали, приложение получало cp: null и
-         * показывало «клиент не найден» — неотличимо от строки, не совпавшей
-         * ни с кем. Человек выбирал вслепую из полного списка, хотя кандидаты
-         * были известны.
-         */
-        ambiguous: Boolean(t.ambiguous),
-        rivals: t.rivals || [],
         known: known.has(t.key),      // уже заносили — по умолчанию не отмечаем
       })),
     };
@@ -1129,42 +952,7 @@ const api = {
       date: str(r.date, 10),
       doc: str(r.doc, 120),
     })));
-    /*
-     * Заодно смотрим, какие счета эти деньги закрывают. Только предлагаем:
-     * решает человек следующим нажатием — как и в боте.
-     */
-    const { deals, leftovers } = bdb.matchPaymentsToDocs(user.id, res.addedRows);
-    return { ...res, deals, leftovers, unpaid: bdb.debtors(user.id).length };
-  },
-
-  /** Отметить закрытыми счета, которые человек подтвердил после выписки. */
-  async 'POST /api/bank/close'({ user, body }) {
-    const deals = Array.isArray(body.deals) ? body.deals.slice(0, 200) : [];
-    if (!deals.length) return { error: 'Не выбрано ни одной сделки.' };
-    const done = bdb.closeDocsFromBank(user.id, deals.map((d) => ({
-      opId: Number(d.opId) || 0,
-      cpId: Number(d.cpId),
-      leadId: Number(d.leadId),
-      twinId: Number(d.twinId) || 0,
-      total: Number(d.total),
-      date: str(d.date, 10),
-      doc: str(d.doc, 120),
-    })));
-    const left = bdb.unpaidSummary(user.id);
-    /*
-     * Про чек напоминаем и здесь — как это давно делает бот.
-     *
-     * Через выписку закрывают сразу пачку, и именно тут про чек забывают
-     * вернее всего: человек ничего не выписывал, он просто прислал файл.
-     * Отметка оплаты по одному документу напоминание отдавала, а закрытие
-     * пачки — нет, то есть пропущен был ровно тот путь, который закрывает
-     * много документов молча. Для ИП на НПД это срок из статьи 14
-     * ФЗ № 422-ФЗ, а не вежливость.
-     */
-    const npdNote = done.docs
-      ? npd.chequeReminder(bdb.getDefaultOrg(user.id), { paidAt: docService.todayISO() })
-      : null;
-    return { ...done, count: left.count, sum: left.sum, npd: npdNote };
+    return { ...res, unpaid: bdb.debtors(user.id).length };
   },
 
   /**
@@ -1238,21 +1026,13 @@ const api = {
         cpId: r.cp_id,
         cpName: r.cp_name,
         type: r.type,
-        // У операции журнала название не из справочника документов: там её
-        // нет и быть не может. Показываем, что именно повторяется.
-        title: recurring.isOp(r)
-          ? `${r.op.kind} · ${r.op.note || 'операция журнала'}`
-          : (docService.ITEM_DOCS[r.type] || {}).title || r.type,
-        isOp: recurring.isOp(r),
-        op: recurring.isOp(r) ? r.op : null,
+        title: (docService.ITEM_DOCS[r.type] || {}).title || r.type,
         day: r.day,
         dayText: r.dayText,
         offerDay: r.offerDay,
         payDay: r.pay_day,
         leadDays: r.lead_days,
-        total: recurring.isOp(r)
-          ? r.op.amount
-          : round2(r.items.reduce((a, it) => a + (Number(it.qty) || 0) * (Number(it.price) || 0), 0)),
+        total: round2(r.items.reduce((a, it) => a + (Number(it.qty) || 0) * (Number(it.price) || 0), 0)),
       })),
     };
   },
@@ -1332,18 +1112,8 @@ const api = {
     return { mailbox: null };
   },
 
-  /*
-   * Список отдаём целиком, но сумму и счётчик считаем здесь же — сделками.
-   * Пока экран складывал список сам, он показывал вдвое больше плитки на
-   * главной: счёт и закрывающий его акт на одну сделку шли как два долга.
-   */
   async 'GET /api/unpaid'({ user }) {
-    const s = bdb.unpaidSummary(user.id);
-    return {
-      docs: s.docs.map((d) => ({ ...docBrief(d), pair: Boolean(d.pair) })),
-      count: s.count,
-      sum: s.sum,
-    };
+    return { docs: bdb.unpaidDocs(user.id).map(docBrief) };
   },
 
   async 'GET /api/debtors'({ user }) {
@@ -1361,41 +1131,15 @@ const api = {
    * счёт нельзя тихо удалить. Приложение по ответу открывает нужный экран,
    * кнопку жмёт человек.
    */
-  async 'POST /api/user/ai'({ user, body }) {
-    const next = typeof body.enabled === 'boolean' ? body.enabled : !bdb.isAiEnabled(user.id);
-    bdb.setAiEnabled(user.id, next);
-    return { aiEnabled: next };
-  },
-
   async 'POST /api/ask'({ user, body }) {
-    if (!bdb.isAiEnabled(user.id)) {
-      return { source: 'off', error: 'ИИ-ассистент выключен. Включите его в меню «Ещё» или используйте кнопки.' };
-    }
     const text = str(body.text, 1000);
     if (!text) return { error: 'Напишите или скажите, что нужно.' };
     const intent = await ai.understand(text, user.id);
-    let cpId = null;
-    let cpName = intent.who || null;
-    if (intent.action === 'draft' && intent.who) {
-      const cps = bdb.listCps(user.id);
-      const found = ai.matchCp(cps, intent.who);
-      if (found && found.cp) {
-        cpId = found.cp.id;
-        cpName = found.cp.name;
-      } else {
-        const cleanName = intent.who.replace(/^(для|в|на|с|по)\s+/i, '').trim();
-        cpId = bdb.createCp(user.id, { name: cleanName, kind: 'customer' });
-        cpName = cleanName;
-      }
-    }
-    return { ...intent, cpId, cpName, heard: text, budget: ai.budget(user.id) };
+    return { ...intent, heard: text, budget: ai.budget(user.id) };
   },
 
   /** То же самое, но голосом: расшифровали и сразу разобрали. */
   async 'POST /api/ask/voice'({ user, body }) {
-    if (!bdb.isAiEnabled(user.id)) {
-      return { source: 'off', error: 'ИИ-ассистент выключен. Включите его в меню «Ещё» или используйте кнопки.' };
-    }
     if (!speech.speechAvailable()) return { error: speech.speechHint() };
     const raw = String(body.audio || '');
     if (!raw) return { error: 'Пустая запись.' };
@@ -1403,42 +1147,10 @@ const api = {
     // Telegram: 20 МБ, дальше это уже не голосовое сообщение.
     const buf = Buffer.from(raw, 'base64');
     if (buf.length > 20 * 1024 * 1024) return { error: 'Запись слишком длинная.' };
-    /*
-     * Кран стоит здесь, до обращения к облаку.
-     *
-     * Раньше распознавание вызывалось раньше ai.understand — то есть до
-     * единственного места, где вообще был учёт. Общий ограничитель частоты
-     * пропускает 120 запросов в минуту на человека, а запись бывает до 20 МБ
-     * и тарифицируется по секундам звука: заклинившая кнопка в приложении
-     * выедала месячный счёт быстрее, чем это можно заметить.
-     */
-    if (ai.budget(user.id).left <= 0) {
-      return { error: 'На этот месяц разбор голоса и фраз закончился. Напишите текстом — пойму так же.' };
-    }
-    ai.spend(user.id);
     const got = await speech.transcribe(buf, Number(body.seconds) || 0);
-    if (!got.ok) {
-      // Подробность — в журнал поддержки, владельцу. Пользователю она ничего
-      // не объясняет, а починить по ней может только владелец.
-      if (got.detail) office.record({ kind: 'speech', where: 'приложение', error: got.detail, userId: user.id });
-      return { error: got.error };
-    }
+    if (!got.ok) return { error: got.error };
     const intent = await ai.understand(got.text, user.id);
-    let cpId = null;
-    let cpName = intent.who || null;
-    if (intent.action === 'draft' && intent.who) {
-      const cps = bdb.listCps(user.id);
-      const found = ai.matchCp(cps, intent.who);
-      if (found && found.cp) {
-        cpId = found.cp.id;
-        cpName = found.cp.name;
-      } else {
-        const cleanName = intent.who.replace(/^(для|в|на|с|по)\s+/i, '').trim();
-        cpId = bdb.createCp(user.id, { name: cleanName, kind: 'customer' });
-        cpName = cleanName;
-      }
-    }
-    return { ...intent, cpId, cpName, heard: got.text, budget: ai.budget(user.id) };
+    return { ...intent, heard: got.text, budget: ai.budget(user.id) };
   },
 
   /** Журнал операций одного контрагента: что именно держит его сальдо. */
@@ -1487,42 +1199,10 @@ const api = {
 
   /** Выпуск документа: файл в чат + ссылка на скачивание в приложении. */
   async 'POST /api/doc'({ user, body }) {
-    /*
-     * Статус УПД и ставку НДС передаём, если приложение их прислало.
-     *
-     * Раньше extra не передавался вовсе, и lib/upd.js читал undefined как
-     * статус 2 — «передаточный документ без счёта-фактуры», где ставка
-     * принудительно пустая. Плитка при этом обещает «счёт-фактура и акт»:
-     * плательщик НДС получал бланк без шапки счёта-фактуры и с «без НДС» в
-     * налоговой графе, а покупателю нечего было принять к вычету. В боте
-     * выбор статуса и ставки есть — в приложении он терялся по дороге.
-     *
-     * Ключи ставим только те, что действительно пришли: отсутствие поля и
-     * присланный null означают разное — «решай сам» и «без НДС».
-     */
     const extra = {};
-    if (Object.prototype.hasOwnProperty.call(body, 'status')) {
-      extra.status = Number(body.status) === 1 ? 1 : 2;
-    }
+    if (Object.prototype.hasOwnProperty.call(body, 'status')) extra.status = Number(body.status);
     if (Object.prototype.hasOwnProperty.call(body, 'vatRate')) {
-      /*
-       * Ставку у документа проверяем тем же списком, что и у организации.
-       *
-       * Раньше здесь стоял голый Number(), и что прислали, то и печаталось:
-       * 999 давало «НДС (999%)», −20 уменьшало итог, а строка «абв»
-       * превращалась в NaN и уходила на бланк как «НДС (NaN%)» — при том что
-       * в журнал ложилась сумма без налога. Собственный интерфейс приложения
-       * ставку не шлёт вовсе, так что случайно сюда не попасть, — но это
-       * граница системы, а на границе проверяют, а не надеются.
-       */
-      const raw = body.vatRate;
-      if (raw == null || raw === '') {
-        extra.vatRate = null;
-      } else if (VAT_RATES.includes(String(Number(raw)))) {
-        extra.vatRate = Number(raw);
-      } else {
-        return { error: `Ставка НДС бывает ${VAT_RATES.filter(Boolean).join(', ')} процентов.` };
-      }
+      extra.vatRate = body.vatRate == null || body.vatRate === '' ? null : Number(body.vatRate);
       extra.priceIncludesVat = Boolean(body.priceIncludesVat);
     }
     const res = await docService.issueDocument(user.id, {
@@ -1536,19 +1216,19 @@ const api = {
     if (!res.ok) return { error: res.message, reason: res.reason, quota: res.quota };
 
     const token = keepFile(user.id, res.file);
-    await sendToChat(user, res).catch(() => {});
+    const sent = await sendToChat(user, res);
     return {
       doc: docBrief({ ...res.doc, cp_id: res.doc.cp.id, payload: { items: [] } }),
       total: res.total,
       quota: res.quota,
       file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf },
-      sentToChat: Boolean(tg),
+      sentToChat: sent,
     };
   },
 
   /** Прислать копию ранее выписанного. */
   async 'POST /api/doc/resend'({ user, body }) {
-    const res = await docService.rebuildDocument(user.id, Number(body.id), { stamp: wantStamp(body) });
+    const res = await docService.rebuildDocument(user.id, Number(body.id));
     if (!res.ok) return { error: res.message };
     const token = keepFile(user.id, res.file);
     if (tg) {
@@ -1558,10 +1238,7 @@ const api = {
         caption: `${res.title} № ${res.doc.number} — копия.`,
       }).catch(() => {});
     }
-    return {
-      file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf },
-      stamp: res.stamp || null,
-    };
+    return { file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf } };
   },
 };
 
@@ -1590,18 +1267,21 @@ async function sendFileToChat(user, file, caption) {
 }
 
 async function sendToChat(user, res) {
-  if (!tg) return;
+  if (!tg) return false;
   const money = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2 }).format(res.total);
+  const org = bdb.getDefaultOrg(user.id);
+  const qr = res.doc.type === 'sch' && org && org.acc && org.bik && org.corr_acc;
   try {
     await tg.sendDocument(user.tg_id, {
       filename: res.file.filename,
       buffer: res.file.buffer,
       caption: `${res.title} № ${res.doc.number} для <b>${res.doc.cp.name}</b> на ${money} ₽.`
-        + (res.doc.type === 'sch' ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.' : ''),
+        + (qr ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.' : ''),
     });
+    return true;
   } catch (e) {
     if (e && e.blocked) bdb.markBlocked(user.id);
-    throw e;
+    return false;
   }
 }
 
@@ -1611,7 +1291,10 @@ function serveStatic(req, res, pathname) {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const full = path.join(ROOT, rel);
   // За пределы папки приложения не выпускаем даже при «../» в адресе.
-  if (!full.startsWith(ROOT)) { res.writeHead(403); res.end('нельзя'); return; }
+  const root = path.resolve(ROOT) + path.sep;
+  if (path.resolve(full) !== path.resolve(ROOT) && !path.resolve(full).startsWith(root)) {
+    res.writeHead(403); res.end('нельзя'); return;
+  }
   fs.readFile(full, (err, data) => {
     if (err) {
       // Одностраничное приложение: неизвестный путь — это его внутренний
@@ -1654,52 +1337,6 @@ const server = http.createServer(async (req, res) => {
     return res.end(rec.file.buffer);
   }
 
-  /*
-   * Документ по временной ссылке — единственный адрес, который открывается
-   * без подписи Telegram. Подпись здесь и не нужна: ссылку отправляют
-   * клиенту, у которого нашего бота нет и не будет. Секрет — сам токен.
-   *
-   * Что важно на этом адресе:
-   *   • не пускать поисковики (noindex) — иначе счета клиентов окажутся
-   *     в выдаче, и об этом узнают последними;
-   *   • не кэшировать: документ собирается заново на каждое открытие, и
-   *     исправленный счёт должен приходить исправленным;
-   *   • ограничить частоту по токену — на случай, если ссылку положат
-   *     туда, откуда её начнут дёргать без остановки;
-   *   • на любую беду отвечать одинаково: «ссылка больше не работает».
-   *     Различать «истекла» и «такой не было» незачем.
-   */
-  if (pathname.startsWith('/d/')) {
-    if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); return res.end('only GET'); }
-    const token = decodeURIComponent(pathname.slice(3));
-    if (tooOften(`d:${token}`, 60)) return sendLinkPage(res, 429, 'Слишком часто. Подождите минуту и обновите страницу.');
-    const link = docLink.resolve(token);
-    if (!link) return sendLinkPage(res, 404, 'Ссылка больше не работает.');
-    let built;
-    try {
-      // forView: по ссылке документ смотрят, а не считают. Для акта сверки
-      // это разные файлы — печатная форма против таблицы.
-      built = await docService.rebuildDocument(link.userId, link.docId,
-        { stamp: link.stamp, forView: true });
-    } catch (e) {
-      console.error('miniapp: ссылка на документ', e.message);
-      return sendLinkPage(res, 500, 'Не получилось собрать документ. Попробуйте позже.');
-    }
-    if (!built.ok) return sendLinkPage(res, 404, 'Ссылка больше не работает.');
-    docLink.touch(link.id);
-    res.writeHead(200, {
-      'Content-Type': built.file.mime,
-      'Content-Length': built.file.buffer.length,
-      // inline, а не attachment: человек открыл ссылку на телефоне и хочет
-      // увидеть документ, а не найти его потом в «Загрузках».
-      'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(built.file.filename)}`,
-      'Cache-Control': 'no-store',
-      'X-Robots-Tag': 'noindex, nofollow',
-      'X-Content-Type-Options': 'nosniff',
-    });
-    return res.end(req.method === 'HEAD' ? undefined : built.file.buffer);
-  }
-
   if (!pathname.startsWith('/api/')) {
     if (req.method !== 'GET') { res.writeHead(405); return res.end('only GET'); }
     return serveStatic(req, res, pathname);
@@ -1740,6 +1377,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, out && out.error ? 400 : 200, out || {});
   } catch (e) {
     console.error('miniapp:', pathname, e.message);
+    office.record({ kind: 'crash', where: `miniapp ${pathname}`, error: e.message, userId: user && user.id }).catch(() => {});
     return sendJson(res, 500, { error: 'На сервере что-то пошло не так. Попробуйте ещё раз.' });
   }
 });
@@ -1752,4 +1390,4 @@ if (require.main === module) {
   server.listen(PORT, HOST, () => console.log(`Мини-приложение слушает ${HOST}:${PORT}`));
 }
 
-module.exports = { server, api, stateFor, setTelegram, forgetRate };
+module.exports = { server, api, stateFor, setTelegram };
