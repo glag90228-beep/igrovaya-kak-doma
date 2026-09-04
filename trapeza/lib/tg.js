@@ -17,7 +17,7 @@ const MAX_RETRY_WAIT = 20;
 function timeoutFor(params) {
   // Long polling сам ждёт params.timeout секунд — это нормально, добавляем запас.
   const poll = Number(params && params.timeout) || 0;
-  return (poll ? poll + 20 : 10) * 1000;
+  return (poll ? poll + 20 : 35) * 1000;
 }
 
 class Telegram {

@@ -786,7 +786,7 @@ async function showPreview(tg, chatId, user, state) {
       + `${extra.vatRate == null ? '' : (extra.priceIncludesVat ? ', цены с НДС' : ', НДС сверху')}` : ''}`
     : '';
   await tg.sendMessage(chatId,
-    `<b>${esc(ITEM_DOCS[type].title)} № ${esc(d.number)}</b> от ${ru(d.date)}${head}\n\n`
+    `Проверьте документ: <b>${esc(ITEM_DOCS[type].title)} № ${esc(d.number)}</b> от ${ru(d.date)}${head}\n\n`
     + (lines.join('\n') || '— пусто —')
     + (sums.vat == null
       ? `\n\nИтого: <b>${formatRub(total)}</b> (без НДС)`
@@ -2003,7 +2003,22 @@ async function showBasis(tg, chatId, user) {
  *
  * @returns {Promise<boolean>} true — ответили, меню показывать не надо
  */
+function normalizeCpName(who) {
+  let s = String(who || '').trim();
+  s = s.replace(/^(?:для|на\s+имя|в|к)\s+/i, '').replace(/[\s,]+$/, '').trim();
+  if (/[бвгджзклмнпрстфхцчшщ]е$/i.test(s) && !/^(?:кафе|кофе|билайн|мегафон)$/i.test(s)) {
+    s = s.slice(0, -1) + 'а';
+  } else if (/[бвгджзклмнпрстфхцчшщ]у$/i.test(s)) {
+    s = s.slice(0, -1);
+  }
+  if (s.length > 0) {
+    s = s[0].toUpperCase() + s.slice(1);
+  }
+  return s || 'Клиент';
+}
+
 async function handleFreeText(tg, chatId, user, text) {
+  if (!bdb.isAiEnabled(user.id)) return false;
   const intent = await ai.understand(text, user.id);
 
   if (intent.action === 'debts') { await showDebts(tg, chatId, user); return true; }
@@ -2031,13 +2046,6 @@ async function handleFreeText(tg, chatId, user, text) {
     return true;
   }
 
-  /*
-   * Чужая работа. Налоговый учёт обязателен независимо от режима, и у
-   * предпринимателя к нему масса вопросов — но бот не видит ни банка, ни
-   * кассы, ни расходов. Совет по срокам и суммам, выданный по памяти,
-   * стоит человеку денег и штрафов, поэтому здесь мы честно отказываемся
-   * и говорим, что умеем вместо этого.
-   */
   if (intent.action === 'outofscope') {
     await tg.sendMessage(chatId,
       'Налоги, взносы, КУДиР, отчётность и зарплату я не веду — для этого нужен доступ '
@@ -2049,24 +2057,36 @@ async function handleFreeText(tg, chatId, user, text) {
   }
 
   if (intent.action === 'draft') {
+    const org = await requireOrg(tg, chatId, user);
+    if (!org) return true;
+
     const cps = bdb.listCps(user.id);
-    if (!cps.length) {
-      await tg.sendMessage(chatId, 'Сначала добавьте клиента — потом выпишем документ.',
-        keyboard([[{ text: '👤 Добавить клиента', data: 'cp.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
-      return true;
-    }
-    const found = ai.matchCp(cps, intent.who);
-    if (found.choices) {
-      await tg.sendMessage(chatId, `Кого именно вы имели в виду — «${esc(intent.who)}»?`,
-        keyboard([...found.choices.map((c) => ([{ text: c.name.slice(0, 60), data: `d.${intent.docType}:${c.id}` }])),
-          [{ text: '⬅️ Меню', data: 'menu' }]]));
-      return true;
-    }
-    if (!found.cp) {
-      // Имя не опознано — не угадываем, а показываем список: выписать
-      // документ не тому клиенту хуже, чем лишнее нажатие.
+    let targetCp = null;
+
+    if (intent.who) {
+      const found = ai.matchCp(cps, intent.who);
+      if (found.choices && found.choices.length > 0) {
+        await tg.sendMessage(chatId, `Кого именно вы имели в виду — «${esc(intent.who)}»?`,
+          keyboard([...found.choices.map((c) => ([{ text: c.name.slice(0, 60), data: `d.${intent.docType}:${c.id}` }])),
+            [{ text: '⬅️ Меню', data: 'menu' }]]));
+        return true;
+      }
+      if (found.cp) {
+        targetCp = found.cp;
+      } else {
+        // Контрагента ещё нет в базе — создаём автоматически под именем из фразы
+        const cleanName = normalizeCpName(intent.who);
+        const newId = bdb.createCp(user.id, { name: cleanName, kind: 'customer' });
+        targetCp = bdb.getCp(user.id, newId);
+      }
+    } else if (cps.length === 1) {
+      targetCp = cps[0];
+    } else if (cps.length > 1) {
       await startDoc(tg, chatId, user, intent.docType);
       return true;
+    } else {
+      const newId = bdb.createCp(user.id, { name: 'Покупатель', kind: 'customer' });
+      targetCp = bdb.getCp(user.id, newId);
     }
 
     const extra = {};
@@ -2074,16 +2094,16 @@ async function handleFreeText(tg, chatId, user, text) {
       extra.vatRate = intent.vatRate;
       extra.priceIncludesVat = Boolean(intent.priceIncludesVat);
     }
-    await startItems(tg, chatId, user, intent.docType, found.cp.id, extra);
+    await startItems(tg, chatId, user, intent.docType, targetCp.id, extra);
     const items = docService.cleanItems(intent.items || []);
     if (items.length) {
       const st = bdb.getState(user.id);
-      if (st.state.startsWith('items:')) {
+      if (st && st.state.startsWith('items:')) {
         st.data.items = items;
         bdb.setState(user.id, st.state, st.data);
-        await tg.sendMessage(chatId,
-          `Записал со слов:\n${items.map((it) => `• ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n')}`
-          + '\n\n<i>Проверьте: добавьте ещё позиции или нажмите «Готово».</i>');
+        // Сразу выводим готовый предпросмотр документа с кнопкой выпуска в 1 клик
+        await showPreview(tg, chatId, user, bdb.getState(user.id));
+        return true;
       }
     }
     return true;
@@ -3316,12 +3336,15 @@ async function showOrg(tg, chatId, user) {
   const fxLabel = fxSign || fxStamp
     ? `🖊 Подпись и печать · ${[fxSign && 'подпись', fxStamp && 'печать'].filter(Boolean).join(' и ')}`
     : '🖊 Подпись и печать';
+  const aiOn = bdb.isAiEnabled(user.id);
+  const aiLabel = aiOn ? '🤖 ИИ-ассистент: Вкл ✅' : '🤖 ИИ-ассистент: Выкл ❌';
   await tg.sendMessage(chatId, txt, keyboard([
     [{ text: '✏️ Изменить (ввести заново)', data: 'org.new' }],
     [{ text: fxLabel, data: 'fx' }],
     [{ text: `🧾 НДС: ${vatLabel(org)}`.slice(0, 60), data: 'vat' }],
     [{ text: `💼 Самозанятость: ${npd.isNpd(org) ? 'да' : 'нет'}`, data: 'npd' }],
     [{ text: `📊 Долг: ${BASIS_LABEL[bdb.basisOf(org)]}`.slice(0, 60), data: 'basis' }],
+    [{ text: aiLabel, data: 'toggle.ai' }],
     [{ text: mailbox.has(user.id) ? '✉️ Почта: подключена' : '✉️ Подключить почту', data: 'mb' }],
     [{ text: '⬅️ Меню', data: 'menu' }],
   ]));
@@ -3389,6 +3412,14 @@ async function handleMessage(tg, msg) {
   if (text === '/id') {
     await tg.sendMessage(chatId, `Ваш номер: <code>${user.tg_id}</code>\n\n`
       + '<i>Нажмите на номер, чтобы скопировать, и пришлите его в поддержку.</i>');
+    return;
+  }
+  if (text === '/ai') {
+    const next = !bdb.isAiEnabled(user.id);
+    bdb.setAiEnabled(user.id, next);
+    await tg.sendMessage(chatId, next
+      ? '🤖 <b>ИИ-ассистент включён.</b>\nВы можете писать задачи своими словами, например:\n<i>«Выстави Заре счёт на 50 000 руб за разработку сайта с НДС 22%»</i>'
+      : '🤖 <b>ИИ-ассистент выключен.</b>\nТеперь создание документов происходит пошагово через меню.');
     return;
   }
   if (text === '/menu' || text === '/cancel') { bdb.clearState(user.id); await tg.sendMessage(chatId, 'Главное меню:', mainMenu()); return; }
@@ -3739,6 +3770,15 @@ async function handleCallback(tg, cq) {
       return;
     }
     if (data === 'org') { await showOrg(tg, chatId, user); return; }
+    if (data === 'toggle.ai') {
+      const next = !bdb.isAiEnabled(user.id);
+      bdb.setAiEnabled(user.id, next);
+      await tg.sendMessage(chatId, next
+        ? '🤖 <b>ИИ-ассистент включён.</b> Теперь бот понимает голосовые, фото счетов и свободные фразы вроде «Выстави Заре счёт на 50 000 руб с НДС 22%».'
+        : '🤖 <b>ИИ-ассистент выключен.</b> Документы создаются вручную через меню.');
+      await showOrg(tg, chatId, user);
+      return;
+    }
     if (data === 'doc.vat') {
       await tg.sendMessage(chatId, 'НДС для этого счёта:', keyboard([
         [{ text: 'Без НДС', data: 'doc.vat.set:none:0' }],

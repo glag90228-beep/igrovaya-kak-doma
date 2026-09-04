@@ -97,7 +97,7 @@ function aiHint() {
  * возьмём как есть — он мог указать чужой каталог намеренно.
  */
 function yandexModelUri(model) {
-  const m = String(model || MODEL_DEFAULT).trim();
+  const m = String(model || 'yandexgpt-lite/latest').trim();
   if (m.startsWith('gpt://')) return m;
   return `gpt://${process.env.YANDEX_FOLDER_ID}/${m}`;
 }
@@ -204,10 +204,31 @@ function parseDraft(docType, whoRaw, extraRaw = '') {
   }
 
   const who = cutWho(combined.replace(/^(?:для|на\s+имя)\s+/i, '').replace(/[\s,]+$/, '').trim());
-  const res = { action: 'draft', docType, who };
+  const res = { action: 'draft', docType, who, items: [] };
   if (vatRate !== undefined) {
     res.vatRate = vatRate;
     res.priceIncludesVat = priceIncludesVat;
+  }
+
+  // Извлекаем позицию и сумму, если они указаны во фразе
+  const parseSource = `${whoRaw || ''} ${extraRaw || ''}`;
+  const cleanSource = parseSource.replace(/(?:с\s+)?ндс\s*\d+\s*%?[^,]*/gi, '').trim();
+  let itemName = '';
+  const mFor = /[Зз]а\s+([^,]+?)(?:\s+на\s+\d|\s*ндс|\s*$)/i.exec(cleanSource);
+  if (mFor) {
+    itemName = mFor[1].trim().replace(/\s+на\s+\d.*$/, '').trim();
+  }
+  const mPrice = /(?:на\s+|сумм[а-я]*\s+)?(\d[\d\s]*)(?:\s*(тыс(?:яч[а-я]*)?))?\s*(?:руб[а-я]*|р\b|\$|€)?/i.exec(cleanSource);
+  if (mPrice) {
+    const rawNum = Number(mPrice[1].replace(/\s+/g, ''));
+    if (rawNum > 0) {
+      const price = mPrice[2] ? rawNum * 1000 : rawNum;
+      res.items = [{
+        name: itemName ? (itemName[0].toUpperCase() + itemName.slice(1)) : 'Оказание услуг',
+        qty: 1,
+        price,
+      }];
+    }
   }
   return res;
 }
@@ -260,6 +281,8 @@ function quickParse(text) {
   return null;
 }
 
+const stemWord = (w) => String(w || '').toLowerCase().replace(/ё/g, 'е').replace(/[аеиоуыэюяьъ]+$/i, '');
+
 function matchCp(cps, name) {
   const norm = (s) => String(s || '').toLowerCase().replace(/ё/g, 'е')
     .split(/[^\p{L}\p{N}]+/u).filter((w) => w && !/^(ооо|оао|зао|пао|ип|ао)$/.test(w)).join(' ');
@@ -269,6 +292,18 @@ function matchCp(cps, name) {
   if (exact.length === 1) return { cp: exact[0] };
   const part = cps.filter((c) => norm(c.name).includes(want) || want.includes(norm(c.name)));
   if (part.length === 1) return { cp: part[0] };
+
+  // Сравнение по корню слова: «Заре» -> «ООО Заря», «Ромашке» -> «Ромашка»
+  const wantStems = want.split(' ').map(stemWord).filter((s) => s.length >= 3);
+  if (wantStems.length) {
+    const stemMatches = cps.filter((c) => {
+      const cStems = norm(c.name).split(' ').map(stemWord).filter((s) => s.length >= 3);
+      return wantStems.some((ws) => cStems.some((cs) => cs === ws || cs.startsWith(ws) || ws.startsWith(cs)));
+    });
+    if (stemMatches.length === 1) return { cp: stemMatches[0] };
+    if (stemMatches.length > 1) return { choices: stemMatches.slice(0, 8) };
+  }
+
   if (part.length > 1) return { choices: part.slice(0, 8) };
   return {};
 }
@@ -323,7 +358,7 @@ async function callModel(text) {
   const p = PROVIDER();
   if (p === 'mock') return String(process.env.AI_MOCK || '{"action":"unknown"}');
 
-  const model = process.env.AI_MODEL || MODEL_DEFAULT;
+  const model = process.env.AI_MODEL || (p === 'yandexgpt' ? 'yandexgpt-lite/latest' : MODEL_DEFAULT);
   const maxTokens = Number(process.env.AI_MAX_TOKENS || 400);
   const signal = AbortSignal.timeout(35000);
 

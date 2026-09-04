@@ -255,6 +255,7 @@ function stateFor(user) {
     recurring: recurring.list(user.id).length,
     features: { dadata: dadata.dadataAvailable(), pdf: true, mail: mailbox.resolve(user.id).ok },
     mailbox: mailbox.info(user.id),
+    aiEnabled: bdb.isAiEnabled(user.id),
   };
 }
 
@@ -1360,15 +1361,41 @@ const api = {
    * счёт нельзя тихо удалить. Приложение по ответу открывает нужный экран,
    * кнопку жмёт человек.
    */
+  async 'POST /api/user/ai'({ user, body }) {
+    const next = typeof body.enabled === 'boolean' ? body.enabled : !bdb.isAiEnabled(user.id);
+    bdb.setAiEnabled(user.id, next);
+    return { aiEnabled: next };
+  },
+
   async 'POST /api/ask'({ user, body }) {
+    if (!bdb.isAiEnabled(user.id)) {
+      return { source: 'off', error: 'ИИ-ассистент выключен. Включите его в меню «Ещё» или используйте кнопки.' };
+    }
     const text = str(body.text, 1000);
     if (!text) return { error: 'Напишите или скажите, что нужно.' };
     const intent = await ai.understand(text, user.id);
-    return { ...intent, heard: text, budget: ai.budget(user.id) };
+    let cpId = null;
+    let cpName = intent.who || null;
+    if (intent.action === 'draft' && intent.who) {
+      const cps = bdb.listCps(user.id);
+      const found = ai.matchCp(cps, intent.who);
+      if (found && found.cp) {
+        cpId = found.cp.id;
+        cpName = found.cp.name;
+      } else {
+        const cleanName = intent.who.replace(/^(для|в|на|с|по)\s+/i, '').trim();
+        cpId = bdb.createCp(user.id, { name: cleanName, kind: 'customer' });
+        cpName = cleanName;
+      }
+    }
+    return { ...intent, cpId, cpName, heard: text, budget: ai.budget(user.id) };
   },
 
   /** То же самое, но голосом: расшифровали и сразу разобрали. */
   async 'POST /api/ask/voice'({ user, body }) {
+    if (!bdb.isAiEnabled(user.id)) {
+      return { source: 'off', error: 'ИИ-ассистент выключен. Включите его в меню «Ещё» или используйте кнопки.' };
+    }
     if (!speech.speechAvailable()) return { error: speech.speechHint() };
     const raw = String(body.audio || '');
     if (!raw) return { error: 'Пустая запись.' };
@@ -1397,7 +1424,21 @@ const api = {
       return { error: got.error };
     }
     const intent = await ai.understand(got.text, user.id);
-    return { ...intent, heard: got.text, budget: ai.budget(user.id) };
+    let cpId = null;
+    let cpName = intent.who || null;
+    if (intent.action === 'draft' && intent.who) {
+      const cps = bdb.listCps(user.id);
+      const found = ai.matchCp(cps, intent.who);
+      if (found && found.cp) {
+        cpId = found.cp.id;
+        cpName = found.cp.name;
+      } else {
+        const cleanName = intent.who.replace(/^(для|в|на|с|по)\s+/i, '').trim();
+        cpId = bdb.createCp(user.id, { name: cleanName, kind: 'customer' });
+        cpName = cleanName;
+      }
+    }
+    return { ...intent, cpId, cpName, heard: got.text, budget: ai.budget(user.id) };
   },
 
   /** Журнал операций одного контрагента: что именно держит его сальдо. */

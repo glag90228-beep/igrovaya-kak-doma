@@ -1728,6 +1728,24 @@ screens.more = async function more() {
         return t ? `${t.name}${basis ? ` · ${basis}` : ''}` : 'чтобы долги считались верно';
       })(),
       onclick: () => go('basis'),
+    }),
+    navRow({
+      icon: 'bot',
+      tone: s.aiEnabled !== false ? 'ok' : '',
+      title: 'ИИ-ассистент',
+      sub: s.aiEnabled !== false ? 'включён (понимание фраз, счетов и фото)' : 'выключен (только ручной ввод)',
+      onclick: async () => {
+        haptic('medium');
+        const next = !(s.aiEnabled !== false);
+        try {
+          await api('POST', '/api/user/ai', { enabled: next });
+          s.aiEnabled = next;
+          toast(next ? 'ИИ-ассистент включён' : 'ИИ-ассистент выключен');
+          go('more');
+        } catch (e) {
+          toast(e.message, true);
+        }
+      },
     })));
 
   box.append(h('div', { class: 'section-title', text: 'Помощь' }));
@@ -2445,8 +2463,18 @@ screens.ask = async function ask() {
 
     if (r.action === 'draft') {
       const btn = h('button', { class: 'btn' }, 'Заполнить документ');
-      btn.onclick = () => { haptic('medium'); go('new', { type: r.docType, items: r.items || [] }); };
-      say('bot', r.who ? `Готовлю документ для «${r.who}». Проверьте поля и нажмите выпуск — сам я ничего не выписываю.`
+      btn.onclick = () => {
+        haptic('medium');
+        go('new', {
+          type: r.docType,
+          cpId: r.cpId,
+          cpName: r.cpName || r.who,
+          items: r.items || [],
+          vatRate: r.vatRate,
+          priceIncludesVat: r.priceIncludesVat,
+        });
+      };
+      say('bot', (r.cpName || r.who) ? `Готовлю документ для «${r.cpName || r.who}». Проверьте поля и нажмите выпуск — сам я ничего не выписываю.`
         : 'Готовлю документ. Клиента выберете на следующем экране.', btn);
       return;
     }
@@ -2468,7 +2496,16 @@ screens.ask = async function ask() {
       return;
     }
     if (r.source === 'off') {
-      say('bot', 'Свободный ввод сейчас выключен — пользуйтесь кнопками, они умеют всё то же самое.');
+      const btn = h('button', { class: 'btn', onclick: async () => {
+        try {
+          await api('POST', '/api/user/ai', { enabled: true });
+          toast('ИИ-ассистент включён');
+          go('ask');
+        } catch (e) {
+          toast(e.message, true);
+        }
+      } }, 'Включить ИИ-ассистент');
+      say('bot', 'ИИ-ассистент выключен — включите его кнопкой ниже или пользуйтесь разделами меню.', btn);
       return;
     }
     // Отказ разбора — не то же самое, что «не понял». Раньше этой ветки не
@@ -3388,6 +3425,8 @@ screens.new = async function newDoc(params) {
     cpId: Number(params.cpId) || (cps[0] && cps[0].id) || 0,
     date: todayISO(),
     items: (params.items || []).map((it) => ({ ...it })),
+    vatRate: params.vatRate !== undefined ? params.vatRate : undefined,
+    priceIncludesVat: params.priceIncludesVat !== undefined ? params.priceIncludesVat : undefined,
   };
   if (!draft.items.length) draft.items.push({ name: '', unit: 'шт.', qty: 1, price: 0 });
 
@@ -3490,9 +3529,12 @@ screens.new = async function newDoc(params) {
     if (!items.length) { toast('Добавьте хотя бы одну позицию', true); return; }
     try {
       if (tg) tg.MainButton.showProgress();
-      const r = await api('POST', '/api/doc', {
+      const payload = {
         type, cpId: Number(cpSel.value), date: dateInput.value, items,
-      });
+      };
+      if (draft.vatRate !== undefined) payload.vatRate = draft.vatRate;
+      if (draft.priceIncludesVat !== undefined) payload.priceIncludesVat = draft.priceIncludesVat;
+      const r = await api('POST', '/api/doc', payload);
       haptic('heavy');
       toast(r.sentToChat ? 'Готово — файл отправлен в чат' : 'Документ выписан');
       download(r.file);

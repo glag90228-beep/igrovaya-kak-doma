@@ -16,8 +16,13 @@ function columns(table) {
   return db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
 }
 function addColumn(table, name, def) {
-  if (!columns(table).includes(name)) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${def}`);
+  try {
+    if (!columns(table).includes(name)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${def}`);
+    }
+  } catch (e) {
+    if (e && /duplicate column/i.test(e.message)) return;
+    throw e;
   }
 }
 
@@ -152,6 +157,7 @@ function migrate() {
   // Заблокировавшие бота: рассылать им бессмысленно, а каждая попытка —
   // ошибка в логе и лишний запрос.
   addColumn('bot_users', 'blocked_at', "TEXT NOT NULL DEFAULT ''");
+  addColumn('bot_users', 'ai_enabled', 'INTEGER NOT NULL DEFAULT 1');
 
   // расширяем контрагентов: владелец + банковские реквизиты (для счёта/платёжки)
   addColumn('counterparties', 'user_id', 'INTEGER');
@@ -248,6 +254,14 @@ function getState(userId) {
   return { state: u.state || '', data };
 }
 function clearState(userId) { setState(userId, '', null); }
+function isAiEnabled(userId) {
+  const u = db.prepare('SELECT ai_enabled FROM bot_users WHERE id = ?').get(userId);
+  return u ? Boolean(u.ai_enabled !== 0) : true;
+}
+function setAiEnabled(userId, enabled) {
+  db.prepare('UPDATE bot_users SET ai_enabled = ? WHERE id = ?').run(enabled ? 1 : 0, userId);
+  return Boolean(enabled);
+}
 
 // ---------- организации пользователя ----------
 
@@ -1497,7 +1511,7 @@ function quota(userId) {
 
 module.exports = {
   migrate,
-  getOrCreateUser, setState, getState, clearState,
+  getOrCreateUser, setState, getState, clearState, isAiEnabled, setAiEnabled,
   createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp,
   addOp, listOps, deleteLastOp, deleteOp, balanceOf, debtors, debtBreakdown, periodBalance, cpForPeriod,
