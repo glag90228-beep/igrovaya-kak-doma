@@ -1730,6 +1730,27 @@ screens.more = async function more() {
       onclick: () => go('basis'),
     })));
 
+  box.append(h('div', { class: 'section-title', text: 'Помощник' }));
+  box.append(h('div', { class: 'card' },
+    navRow({
+      icon: 'bot',
+      tone: s.aiEnabled !== false ? 'ok' : '',
+      title: 'ИИ-ассистент',
+      sub: s.aiEnabled !== false
+        ? 'понимает фразы, фото счетов и голосовые'
+        : 'выключен — только ручной ввод',
+      onclick: async () => {
+        haptic('medium');
+        const next = !(s.aiEnabled !== false);
+        try {
+          await api('POST', '/api/user/ai', { enabled: next });
+          s.aiEnabled = next;
+          toast(next ? 'ИИ-ассистент включён' : 'ИИ-ассистент выключен');
+          go('more');
+        } catch (e) { toast(e.message, true); }
+      },
+    })));
+
   box.append(h('div', { class: 'section-title', text: 'Помощь' }));
   box.append(h('div', { class: 'card' },
     navRow({
@@ -3388,6 +3409,11 @@ screens.new = async function newDoc(params) {
     cpId: Number(params.cpId) || (cps[0] && cps[0].id) || 0,
     date: todayISO(),
     items: (params.items || []).map((it) => ({ ...it })),
+    // Ставка, названную во фразе («…с НДС 22%»), доносим до выпуска. Не
+    // передали — поля не будет вовсе, и документ возьмёт ставку организации:
+    // отсутствие ключа и null означают разное.
+    vatRate: params.vatRate,
+    priceIncludesVat: params.priceIncludesVat,
   };
   if (!draft.items.length) draft.items.push({ name: '', unit: 'шт.', qty: 1, price: 0 });
 
@@ -3490,9 +3516,12 @@ screens.new = async function newDoc(params) {
     if (!items.length) { toast('Добавьте хотя бы одну позицию', true); return; }
     try {
       if (tg) tg.MainButton.showProgress();
-      const r = await api('POST', '/api/doc', {
-        type, cpId: Number(cpSel.value), date: dateInput.value, items,
-      });
+      const payload = { type, cpId: Number(cpSel.value), date: dateInput.value, items };
+      if (draft.vatRate !== undefined) {
+        payload.vatRate = draft.vatRate;
+        payload.priceIncludesVat = Boolean(draft.priceIncludesVat);
+      }
+      const r = await api('POST', '/api/doc', payload);
       haptic('heavy');
       toast(r.sentToChat ? 'Готово — файл отправлен в чат' : 'Документ выписан');
       download(r.file);

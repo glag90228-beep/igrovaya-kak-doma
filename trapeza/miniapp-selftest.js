@@ -192,6 +192,30 @@ async function main() {
     ok(r.status === 200 && r.json.vat.rate === null, 'ставка сброшена обратно на «без НДС»');
   }
 
+  section('переключатель ИИ-ассистента');
+  {
+    /*
+     * В приложении переключатель был нарисован, а на сервере его не было:
+     * экран дёргал /api/user/ai и читал aiEnabled, а miniapp.js не знал ни
+     * того, ни другого. Кнопка всегда показывала «включён» и падала с
+     * ошибкой при нажатии.
+     */
+    r = await call('GET', '/api/state', { user: masha });
+    ok(r.json.aiEnabled === true, 'по умолчанию ассистент включён', r.json.aiEnabled);
+
+    r = await call('POST', '/api/user/ai', { user: masha, body: { enabled: false } });
+    ok(r.status === 200 && r.json.aiEnabled === false, 'выключается', JSON.stringify(r.json));
+    r = await call('GET', '/api/state', { user: masha });
+    ok(r.json.aiEnabled === false, 'и состояние это помнит', r.json.aiEnabled);
+
+    r = await call('POST', '/api/user/ai', { user: petya, body: { enabled: false } });
+    r = await call('GET', '/api/state', { user: masha });
+    ok(r.json.aiEnabled === false, 'чужой переключатель на наш не влияет', r.json.aiEnabled);
+
+    r = await call('POST', '/api/user/ai', { user: masha, body: { enabled: true } });
+    ok(r.json.aiEnabled === true, 'включается обратно', JSON.stringify(r.json));
+  }
+
   section('выписка документа');
   sentToChat.length = 0;
   r = await call('POST', '/api/doc', {

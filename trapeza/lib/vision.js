@@ -28,11 +28,12 @@
  * вместо JSON.
  */
 
-const PROVIDER = () => String(process.env.VISION_PROVIDER || '').toLowerCase();
+const PROVIDER = () => String(process.env.VISION_PROVIDER || 'gemini').toLowerCase();
 
 function visionAvailable() {
   const p = PROVIDER();
   if (p === 'mock') return true;
+  if (p === 'gemini') return Boolean(process.env.GEMINI_API_KEY);
   if (p === 'openrouter') return Boolean(process.env.OPENROUTER_API_KEY);
   if (p === 'anthropic') return Boolean(process.env.ANTHROPIC_API_KEY);
   if (p === 'yandex') return Boolean(process.env.YANDEX_API_KEY && process.env.YANDEX_FOLDER_ID);
@@ -42,6 +43,7 @@ function visionAvailable() {
 function visionHint() {
   const p = PROVIDER();
   if (!p) return 'Распознавание не подключено (VISION_PROVIDER не задан).';
+  if (p === 'gemini') return 'Нет ключа GEMINI_API_KEY.';
   if (p === 'openrouter') return 'Нет ключа OPENROUTER_API_KEY.';
   if (p === 'anthropic') return 'Нет ключа ANTHROPIC_API_KEY.';
   if (p === 'yandex') return 'Нет YANDEX_API_KEY или YANDEX_FOLDER_ID.';
@@ -122,6 +124,35 @@ const ASK = 'Это фотография российского счёта, ак
   + '"docNo":"номер документа или пустая строка","inn":"ИНН поставщика или пустая строка",'
   + '"name":"название поставщика или пустая строка","text":"весь распознанный текст"}\n'
   + 'Сумма — итог к оплате, а не цена за единицу. Если чего-то не видно, ставь null или "".';
+
+async function viaGemini(buffer, mime) {
+  const baseUrl = (process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY не задан');
+  const model = process.env.VISION_MODEL || 'gemini-3.6-flash';
+
+  const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{
+        parts: [
+          { text: ASK },
+          { inline_data: { mime_type: mime, data: buffer.toString('base64') } },
+        ],
+      }],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: 1500,
+        responseMimeType: 'application/json',
+      },
+    }),
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const data = await res.json();
+  return ((((data.candidates || [])[0] || {}).content || {}).parts || [{}])[0].text || '';
+}
 
 /**
  * OpenRouter: тот же разговор, но в формате OpenAI — картинка приходит
@@ -226,6 +257,7 @@ async function readInvoice(buffer, mime = 'image/jpeg') {
   try {
     let raw;
     if (p === 'mock') raw = String(process.env.VISION_MOCK || '');
+    else if (p === 'gemini') raw = await viaGemini(buffer, mime);
     else if (p === 'openrouter') raw = await viaOpenRouter(buffer, mime);
     else if (p === 'anthropic') raw = await viaAnthropic(buffer, mime);
     else raw = await viaYandex(buffer, mime);

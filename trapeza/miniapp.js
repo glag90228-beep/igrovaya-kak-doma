@@ -212,6 +212,10 @@ function stateFor(user) {
   const unpaidDocs = awaiting.docs;
   return {
     user: { id: user.id, tgId: user.tg_id, name: user.name },
+    // Приложение рисует по нему переключатель ассистента. Раньше поля не было
+    // вовсе, приложение считало ассистента включённым всегда, а нажатие
+    // упиралось в несуществующий адрес и заканчивалось ошибкой.
+    aiEnabled: bdb.isAiEnabled(user.id),
     org: org || null,
     orgReady: Boolean(org && org.name && org.inn && org.acc && org.bik),
     quota,
@@ -347,6 +351,12 @@ async function makeAkt(user, org, p, caption) {
 
 const api = {
   async 'GET /api/state'({ user }) { return stateFor(user); },
+
+  /** Переключатель ИИ-ассистента: то же, что кнопка в боте. */
+  async 'POST /api/user/ai'({ user, body }) {
+    const on = bdb.setAiEnabled(user.id, Boolean(body && body.enabled));
+    return { aiEnabled: on };
+  },
 
   async 'GET /api/cps'({ user }) {
     return { cps: bdb.listCps(user.id).map((cp) => cpBrief(user.id, cp)) };

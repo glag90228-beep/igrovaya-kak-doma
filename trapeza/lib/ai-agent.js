@@ -16,8 +16,10 @@
  *  AI_USER_LIMIT        — предел на одного пользователя в месяц (30).
  *
  * Поддерживаемые провайдеры (AI_PROVIDER):
- *  - yandexgpt   — по умолчанию: единственный, который отвечает с нашего
- *                  сервера. Ключ YANDEX_API_KEY, каталог YANDEX_FOLDER_ID
+ *  - gemini      — по умолчанию. Ключ GEMINI_API_KEY; адрес можно увести на
+ *                  свой шлюз через GEMINI_BASE_URL
+ *  - yandexgpt   — отвечает с нашего сервера напрямую.
+ *                  Ключ YANDEX_API_KEY, каталог YANDEX_FOLDER_ID
  *  - grok        — xAI, прямой вызов. Ключ XAI_API_KEY, модель обязательна
  *                  в AI_MODEL
  *  - openrouter  — ключ OPENROUTER_API_KEY. С российского адреса отвечает
@@ -47,36 +49,17 @@ const { db } = require('../db');
  * достроим до gpt://<каталог>/…), у OpenRouter — «провайдер/модель», у
  * Anthropic — просто имя без даты в конце.
  */
-const MODEL_DEFAULT = 'yandexgpt-lite/latest';
+const MODEL_DEFAULT = 'gemini-3.6-flash';
 
-/*
- * Почему YandexGPT, а не модель поумнее.
- *
- * Выбор сделан не по качеству, а по достижимости. С этого сервера (адрес
- * российский) Anthropic отвечает 403, OpenRouter — 403 от своего Cloudflare,
- * причём одинаково: и без ключа, и с ключом, и с внятным User-Agent. То есть
- * дело в адресе, а не в настройках, и починить это на нашей стороне нельзя.
- * Yandex Cloud с той же машины отвечает — на нём уже работает распознавание
- * речи. Один поставщик, один ключ, один счёт.
- *
- * Ветки openrouter/anthropic оставлены: если бот когда-нибудь переедет на
- * сервер вне России, переключение будет одной строкой в .env.
- */
 const LIMIT_ALL = () => Number(process.env.AI_MONTHLY_LIMIT || 1000);
 const LIMIT_USER = () => Number(process.env.AI_USER_LIMIT || 30);
 
-const PROVIDER = () => String(process.env.AI_PROVIDER || 'yandexgpt').toLowerCase();
+const PROVIDER = () => String(process.env.AI_PROVIDER || 'gemini').toLowerCase();
 const enabled = () => process.env.AI_ENABLED === '1';
 
 /** У Яндекса ключ и каталог всегда ходят парой: одного ключа мало. */
 const yandexReady = () => Boolean(process.env.YANDEX_API_KEY && process.env.YANDEX_FOLDER_ID);
 
-/*
- * У xAI имя модели не угадывается: их набор меняется, и умолчание, взятое
- * наугад, дало бы 404 в бою — там, где человек ждёт ответа бота. Поэтому
- * модель обязательна в AI_MODEL, а список берётся у самого сервиса:
- *   curl -H "Authorization: Bearer $XAI_API_KEY" https://api.x.ai/v1/models
- */
 const grokReady = () => Boolean(process.env.XAI_API_KEY && String(process.env.AI_MODEL || '').trim());
 
 /** Готов ли модуль обращаться к модели. */
@@ -84,6 +67,7 @@ function aiAvailable() {
   if (!enabled()) return false;
   const p = PROVIDER();
   if (p === 'mock') return true;
+  if (p === 'gemini') return Boolean(process.env.GEMINI_API_KEY);
   if (p === 'yandexgpt') return yandexReady();
   if (p === 'grok') return grokReady();
   if (p === 'openrouter') return Boolean(process.env.OPENROUTER_API_KEY);
@@ -95,6 +79,7 @@ function aiAvailable() {
 function aiHint() {
   if (!enabled()) return 'Свободный ввод выключен (AI_ENABLED не равен 1).';
   const p = PROVIDER();
+  if (p === 'gemini' && !process.env.GEMINI_API_KEY) return 'Нет ключа GEMINI_API_KEY.';
   if (p === 'yandexgpt' && !yandexReady()) return 'Нет YANDEX_API_KEY или YANDEX_FOLDER_ID.';
   if (p === 'grok' && !process.env.XAI_API_KEY) return 'Нет ключа XAI_API_KEY.';
   if (p === 'grok') return 'Не задан AI_MODEL — имя модели у xAI меняется, угадывать его нельзя.';
@@ -114,7 +99,7 @@ function aiHint() {
  * возьмём как есть — он мог указать чужой каталог намеренно.
  */
 function yandexModelUri(model) {
-  const m = String(model || MODEL_DEFAULT).trim();
+  const m = String(model || 'yandexgpt-lite/latest').trim();
   if (m.startsWith('gpt://')) return m;
   return `gpt://${process.env.YANDEX_FOLDER_ID}/${m}`;
 }
@@ -189,17 +174,72 @@ const DOC_WORDS = {
  * Флага «без учёта регистра» здесь нарочно нет: с ним [а-яё] совпало бы и с
  * заглавной буквой, и «За Рулём» резалось бы наравне с «за монтаж» — ровно
  * то, от чего это условие и защищает. Оба написания связок перечислены руками.
- *
- * Запятая и «НДС» добавлены позже: со ставками 22/20/10/7/5 их стали называть
- * прямо во фразе. «Выпиши счёт Ромашке, НДС 5 процентов» уезжало в имя целиком,
- * и контрагент «Ромашке, НДС 5 процентов» не находился ни при каком поиске.
  */
-const CUT_WHO = /\s*,|\s+(?:[Нн]а\s+(?:\d|(?:одн|дв|тр|четыр|пят|шест|сем|восем|девят|десят|сорок|сто|тысяч|полтор))|[Зз]а\s+[а-яё]|(?:с\s+)?[Нн][Дд][Сс])/;
+/*
+ * Запятая добавлена позже: со ставками 22/20/10/7/5 их стали называть прямо
+ * во фразе, и «выпиши счёт Ромашке, НДС 5 процентов» уезжало в имя хвостом.
+ */
+const CUT_WHO = /\s*,|\s+(?:[Нн]а\s+(?:\d|(?:одн|дв|тр|четыр|пят|шест|сем|восем|девят|десят|сорок|сто|тысяч|полтор))|[Зз]а\s+[а-яё])/;
 
 function cutWho(s) {
   const t = String(s || '').trim();
   const i = t.search(CUT_WHO);
   return (i > 0 ? t.slice(0, i) : t).trim();
+}
+
+function parseDraft(docType, whoRaw, extraRaw = '') {
+  let combined = `${whoRaw || ''} ${extraRaw || ''}`.trim();
+  let vatRate;
+  let priceIncludesVat = false;
+
+  if (/(?:без\s*ндс|без\s*налога)/i.test(combined)) {
+    vatRate = null;
+    priceIncludesVat = false;
+    combined = combined.replace(/(?:без\s*ндс|без\s*налога)/gi, '');
+  } else {
+    const mVat = /(?:с\s+)?ндс\s*(\d+)\s*(?:%|процент[а-яё]*)?(?:\s*(сверху|в\s*том\s*числе|в\s*т\.?ч\.?|цены\s*с\s*ндс))?/i.exec(combined)
+      || /(\d+)\s*(?:%|процент[а-яё]*)\s*ндс(?:\s*(сверху|в\s*том\s*числе|в\s*т\.?ч\.?|цены\s*с\s*ндс))?/i.exec(combined);
+    if (mVat) {
+      vatRate = Number(mVat[1]);
+      const flag = (mVat[2] || '').toLowerCase();
+      if (/в\s*том|в\s*т|цены/.test(flag)) priceIncludesVat = true;
+      combined = combined.replace(mVat[0], '');
+    } else if (/(?:с\s+ндс|плюс\s+ндс)/i.test(combined)) {
+      combined = combined.replace(/(?:с\s+ндс|плюс\s+ндс)/gi, '');
+    }
+  }
+
+  const who = cutWho(combined.replace(/^(?:для|на\s+имя)\s+/i, '').replace(/[\s,]+$/, '').trim());
+  const res = { action: 'draft', docType, who, items: [] };
+  if (vatRate !== undefined) {
+    res.vatRate = vatRate;
+    res.priceIncludesVat = priceIncludesVat;
+  }
+
+  // Извлекаем позицию и сумму, если они указаны во фразе
+  const parseSource = `${whoRaw || ''} ${extraRaw || ''}`;
+  const cleanSource = parseSource.replace(/(?:с\s+)?ндс\s*\d+\s*%?[^,]*/gi, '').trim();
+  let itemName = '';
+  // Без флага «без учёта регистра» и с обязательной строчной буквой после
+  // «за» — по той же причине, что и в CUT_WHO выше: с /i шаблон [Зз] ничего
+  // не различает, и «ООО За Рулём» отдавало назначение «Рулём».
+  const mFor = /[Зз]а\s+([а-яё][^,]*?)(?:\s+на\s+\d|\s*[Нн][Дд][Сс]|\s*$)/.exec(cleanSource);
+  if (mFor) {
+    itemName = mFor[1].trim().replace(/\s+на\s+\d.*$/, '').trim();
+  }
+  const mPrice = /(?:на\s+|сумм[а-я]*\s+)?(\d[\d\s]*)(?:\s*(тыс(?:яч[а-я]*)?))?\s*(?:руб[а-я]*|р\b|\$|€)?/i.exec(cleanSource);
+  if (mPrice) {
+    const rawNum = Number(mPrice[1].replace(/\s+/g, ''));
+    if (rawNum > 0) {
+      const price = mPrice[2] ? rawNum * 1000 : rawNum;
+      res.items = [{
+        name: itemName ? (itemName[0].toUpperCase() + itemName.slice(1)) : 'Оказание услуг',
+        qty: 1,
+        price,
+      }];
+    }
+  }
+  return res;
 }
 
 const QUICK = [
@@ -222,47 +262,29 @@ const QUICK = [
   { re: /^(?:мои\s+реквизиты|реквизиты|моя\s+организац|подпись|печать)/i, intent: () => ({ action: 'org' }) },
   { re: /^(?:подписк|оплата\s+бота|сколько\s+стоит|тариф|цена)/i, intent: () => ({ action: 'billing' }) },
   { re: /(?:каждый\s+месяц|ежемесячн|повторя)/i, intent: () => ({ action: 'recurring' }) },
+  // Выписка документов стоит ДО outofscope: иначе «выставь счёт Заре с НДС 22%»
+  // ловилось как вопрос про налоги вместо выписки документа.
   {
-    re: /^(?:выстав|выпиш|созда|оформ|сдела)[а-яё]*\s+(счёт-договор|счет-договор|счёт|счет|акт|упд|накладную|накладная|платёжку|платежку|договор)\s*(?:для\s+|на\s+имя\s+)?(.*)$/i,
-    intent: (m) => ({ action: 'draft', docType: DOC_WORDS[m[1].toLowerCase()], who: cutWho(m[2]) }),
+    // Порядок 1: «выставь Заре счёт с НДС 22%», «сделай Ромашке акт на 5000»
+    re: /^(?:выстав|выпиш|созда|оформ|сдела)[а-яё]*\s+(?:для\s+|на\s+имя\s+)?(.+?)\s+(счёт-договор|счет-договор|счёт|счет|акт|упд|накладную|накладная|платёжку|платежку|договор)(?:\s+(.*))?$/i,
+    intent: (m) => parseDraft(DOC_WORDS[m[2].toLowerCase()], m[1].trim(), (m[3] || '').trim()),
   },
-  /*
-   * Тот же смысл, но имя стоит до названия документа: «выставь Заре счёт за
-   * аренду». Так написано и в README как пример понимания фразы — а разбор
-   * его не брал: шаблон выше требует, чтобы вид документа шёл сразу за
-   * глаголом. Фраза уходила к модели, тратила обращение, а при выключенной
-   * модели просто терялась.
-   */
   {
-    // Конец слова проверяем явно, а не через \b: в JS он считает словесными
-    // только латинские буквы, поэтому после «счёт» границы для него нет и
-    // условие не выполнялось никогда.
-    re: /^(?:выстав|выпиш|созда|оформ|сдела)[а-яё]*\s+(.+?)\s+(счёт-договор|счет-договор|счёт|счет|акт|упд|накладную|накладная|платёжку|платежку|договор)(?=\s|$|[,.;:])/i,
-    intent: (m) => ({ action: 'draft', docType: DOC_WORDS[m[2].toLowerCase()], who: cutWho(m[1]) }),
+    // Порядок 2: «выставь счёт Заре», «оформи акт для ООО Ромашка», «выставь счёт с НДС 22%»
+    re: /^(?:выстав|выпиш|созда|оформ|сдела)[а-яё]*\s+(счёт-договор|счет-договор|счёт|счет|акт|упд|накладную|накладная|платёжку|платежку|договор)\s*(?:для\s+|на\s+имя\s+)?(.*)$/i,
+    intent: (m) => parseDraft(DOC_WORDS[m[1].toLowerCase()], m[2].trim()),
   },
   /*
    * Ставка НДС — наша настройка, а не налоговый учёт.
    *
    * Она живёт в карточке организации и подставляется в документы, так что
    * «смени НДС на 5%» бот выполнить может — в отличие от «когда платить
-   * взносы». Раньше и то и другое одинаково упиралось в отказ ниже.
+   * взносы». Без этого правила обе фразы одинаково упирались в отказ ниже.
    */
   {
     re: /(?:смен|помен|измен|настро|постав|укаж|выбер|какой|какая)[а-яё]*\s+(?:у\s+меня\s+)?(?:ставк[а-яё]*\s+)?ндс|^ндс(?:$|\s)/i,
     intent: () => ({ action: 'vat' }),
   },
-  /*
-   * Чужая работа — последним правилом, а не в середине списка.
-   *
-   * Стоя выше, оно перебивало всё, что идёт после: «выставь Заре счёт на 100
-   * тысяч с НДС 22%» получало отказ «налоги я не веду», хотя это ровно тот
-   * счёт, который бот и умеет выписывать. Проверено разбором: любая фраза со
-   * словом «НДС» уходила в outofscope, включая просьбу сменить саму ставку.
-   *
-   * Пока ставка была одна и подразумевалась, вслух её не называли. Со ставками
-   * 22, 20, 10, 7, 5 «какой у тебя НДС» перестало быть очевидным, и люди
-   * начали проговаривать ставку прямо во фразе — прямо в эту дыру.
-   */
   {
     re: /(?:налог|усн|псн|ндс|ндфл|взнос|кудир|отчётност|отчетност|деклараци|зарплат|кадр|касс[аоу]|патент)/i,
     intent: () => ({ action: 'outofscope' }),
@@ -279,6 +301,8 @@ function quickParse(text) {
   return null;
 }
 
+const stemWord = (w) => String(w || '').toLowerCase().replace(/ё/g, 'е').replace(/[аеиоуыэюяьъ]+$/i, '');
+
 function matchCp(cps, name) {
   const norm = (s) => String(s || '').toLowerCase().replace(/ё/g, 'е')
     .split(/[^\p{L}\p{N}]+/u).filter((w) => w && !/^(ооо|оао|зао|пао|ип|ао)$/.test(w)).join(' ');
@@ -288,6 +312,18 @@ function matchCp(cps, name) {
   if (exact.length === 1) return { cp: exact[0] };
   const part = cps.filter((c) => norm(c.name).includes(want) || want.includes(norm(c.name)));
   if (part.length === 1) return { cp: part[0] };
+
+  // Сравнение по корню слова: «Заре» -> «ООО Заря», «Ромашке» -> «Ромашка»
+  const wantStems = want.split(' ').map(stemWord).filter((s) => s.length >= 3);
+  if (wantStems.length) {
+    const stemMatches = cps.filter((c) => {
+      const cStems = norm(c.name).split(' ').map(stemWord).filter((s) => s.length >= 3);
+      return wantStems.some((ws) => cStems.some((cs) => cs === ws || cs.startsWith(ws) || ws.startsWith(cs)));
+    });
+    if (stemMatches.length === 1) return { cp: stemMatches[0] };
+    if (stemMatches.length > 1) return { choices: stemMatches.slice(0, 8) };
+  }
+
   if (part.length > 1) return { choices: part.slice(0, 8) };
   return {};
 }
@@ -313,7 +349,7 @@ const SYSTEM = `Ты помощник в боте «Первичка»: он в�
 {"action":"vat"}        — сменить или посмотреть свою ставку НДС (это наша настройка)
 {"action":"outofscope"} — налоги, взносы, КУДиР, отчётность, НДФЛ, зарплата, кадры, касса
 {"action":"unknown"}    — непонятно или не про эту работу
-{"action":"draft","docType":"sch|schdog|usl|upd|torg12|pp|dog","who":"имя клиента","items":[{"name":"...","qty":1,"price":1000}]}
+{"action":"draft","docType":"sch|schdog|usl|upd|torg12|pp|dog","who":"имя клиента","items":[{"name":"...","qty":1,"price":1000}],"vatRate":22,"priceIncludesVat":false}
 
 Правила:
 - docType: счёт — sch, счёт-договор — schdog, акт об оказании услуг — usl,
@@ -322,20 +358,19 @@ const SYSTEM = `Ты помощник в боте «Первичка»: он в�
 - who — дословно из фразы. Имени во фразе нет — оставь пустым, не придумывай.
 - Суммы числом в рублях: «30 тысяч» → 30000, «30к» → 30000, «1,5 млн» → 1500000.
 - price — цена за единицу. Позиции не названы — items: [].
+- Запросы на выписку документа со ставкой НДС (например, «выставь счёт Заре с НДС 22%») — это draft, а НЕ outofscope. Указывай vatRate: 0, 5, 7, 10, 20, 22 или null (при «без НДС»), и priceIncludesVat: true (если цены с НДС / в т.ч.) или false.
+- outofscope ставь только на общие вопросы о налогах и учёте (сколько платить, когда отчётность, взносы, КУДиР).
 - Два намерения в одной фразе — бери первое.
 - outofscope ставь, даже если знаешь ответ: бот не ведёт налоговый учёт и не
   считает налоги, а совет по памяти в этих вопросах дороже молчания.
-- Но НДС во фразе сам по себе не делает её чужой работой. «Выставь счёт с НДС
-  22%» — это draft, «смени НДС на 5%» — это vat. outofscope здесь только про
-  налоговый учёт: как считать, когда платить, что сдавать.
 - Только JSON, одной строкой, без пояснений и без разметки.
 
 Примеры:
 «кто мне должен» → {"action":"debts"}
-«выставь счёт Заре на 30 тысяч за аренду склада» → {"action":"draft","docType":"sch","who":"Заря","items":[{"name":"Аренда склада","qty":1,"price":30000}]}
+«выставь счёт Заре на 30 тысяч за аренду склада с НДС 22%» → {"action":"draft","docType":"sch","who":"Заря","items":[{"name":"Аренда склада","qty":1,"price":30000}],"vatRate":22,"priceIncludesVat":false}
+«выставь Заре счёт с НДС 22%» → {"action":"draft","docType":"sch","who":"Заря","items":[],"vatRate":22,"priceIncludesVat":false}
 «сверимся с Ромашкой за квартал» → {"action":"akt"}
 «когда платить взносы за себя» → {"action":"outofscope"}
-«выставь Заре счёт на 100 тысяч с НДС 22%» → {"action":"draft","docType":"sch","who":"Заря","items":[{"name":"Услуги","qty":1,"price":100000}]}
 «смени НДС на 5 процентов» → {"action":"vat"}
 «сделай красиво» → {"action":"unknown"}`;
 
@@ -345,9 +380,34 @@ async function callModel(text) {
   const p = PROVIDER();
   if (p === 'mock') return String(process.env.AI_MOCK || '{"action":"unknown"}');
 
-  const model = process.env.AI_MODEL || MODEL_DEFAULT;
+  const model = process.env.AI_MODEL || (p === 'yandexgpt' ? 'yandexgpt-lite/latest' : MODEL_DEFAULT);
   const maxTokens = Number(process.env.AI_MAX_TOKENS || 400);
-  const signal = AbortSignal.timeout(20000);
+  const signal = AbortSignal.timeout(35000);
+
+  if (p === 'gemini') {
+    const baseUrl = (process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error('GEMINI_API_KEY не задан');
+    const geminiModel = process.env.AI_MODEL || 'gemini-3.6-flash';
+
+    const res = await fetch(`${baseUrl}/v1beta/models/${geminiModel}:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      signal,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: SYSTEM }] },
+        contents: [{ parts: [{ text: String(text).slice(0, 1000) }] }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: Math.max(maxTokens, 1500),
+          responseMimeType: 'application/json',
+        },
+      }),
+    });
+    if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const data = await res.json();
+    return ((((data.candidates || [])[0] || {}).content || {}).parts || [{}])[0].text || '';
+  }
 
   /*
    * YandexGPT. Форма запроса своя, не как у остальных: модель задаётся
@@ -510,7 +570,12 @@ function sanitize(raw) {
     price: Math.min(1e9, Math.max(0, Number((it && it.price) || 0))),
   })).filter((it) => it.name);
 
-  return { action: 'draft', docType: raw.docType, who: String(raw.who || '').trim().slice(0, 200), items };
+  const res = { action: 'draft', docType: raw.docType, who: String(raw.who || '').trim().slice(0, 200), items };
+  if (raw.vatRate !== undefined) {
+    res.vatRate = raw.vatRate == null ? null : Number(raw.vatRate);
+    res.priceIncludesVat = Boolean(raw.priceIncludesVat);
+  }
+  return res;
 }
 
 async function understand(text, userId) {

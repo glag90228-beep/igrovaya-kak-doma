@@ -90,15 +90,28 @@ function buildAktUslugHtml({ org, cp, doc }) {
       </tr></thead>
       <tbody>
         ${rows || '<tr><td colspan="6" class="c muted">— нет позиций —</td></tr>'}
-        <tr class="total"><td colspan="5" class="r">ИТОГО:</td><td class="r">${formatMoney(column)}</td></tr>
+        <tr class="total"><td colspan="5" class="r">Итого:</td><td class="r">${formatMoney(column)}</td></tr>
         ${rate == null ? `
         <tr class="total"><td colspan="5" class="r">Без налога (НДС):</td><td class="r">—</td></tr>` : `
         <tr class="total"><td colspan="5" class="r">${gross ? 'В том числе НДС' : 'НДС'} (${esc(rateLabel(rate))}):</td><td class="r">${formatMoney(vat)}</td></tr>
-        <tr class="total"><td colspan="5" class="r b">Всего:</td><td class="r b">${formatMoney(total)}</td></tr>`}
+        <tr class="total"><td colspan="5" class="r b">Всего к оплате:</td><td class="r b">${formatMoney(total)}</td></tr>`}
       </tbody>
     </table>
 
-    <p class="b">Всего оказано услуг на сумму: ${formatMoney(total)} руб. (${amountInWords(total)})${rate == null ? ', без НДС' : `, в т.ч. НДС ${esc(rateLabel(rate))} — ${formatMoney(vat)} руб.`}.</p>
+    ${/*
+       * «В том числе» и «плюс» — не одно и то же, и путать их нельзя.
+       *
+       * При ценах с налогом он уже внутри суммы, при налоге сверху — прибавлен
+       * к ней. Я в первой редакции писал «в т.ч.» в обоих случаях: в акте на
+       * 1 220 руб. с налогом сверху это утверждало, что 220 рублей сидят
+       * внутри тысячи, и подписант читал прямую неправду. Разделение взято из
+       * ветки, собранной на сервере, — там это заметили раньше меня.
+       */''}
+    <p class="b">Всего оказано услуг на сумму: ${formatMoney(total)} руб. (${amountInWords(total)})${rate == null
+      ? ', без НДС'
+      : (gross
+        ? `, в т.ч. НДС ${esc(rateLabel(rate))} — ${formatMoney(vat)} руб.`
+        : `, плюс НДС ${esc(rateLabel(rate))} — ${formatMoney(vat)} руб.`)}.</p>
     <p class="note">Вышеперечисленные услуги выполнены полностью и в срок. Заказчик претензий
        по объёму, качеству и срокам оказания услуг не имеет.</p>
     ${doc.note ? `<p class="note">${esc(doc.note)}</p>` : ''}
