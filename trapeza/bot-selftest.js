@@ -4243,6 +4243,42 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       `ст.${npdVat.saved.status} ставка ${npdVat.saved.vatRate}`);
   }
 
+  console.log('\n── названный клиент, которого нет ──');
+  {
+    /*
+     * Имя во фразе есть, а клиента такого нет.
+     *
+     * Молча заводить его нельзя: разбор отдаёт имя в том падеже, в каком его
+     * произнесли, и в базе появился бы «Заре» без ИНН и реквизитов — рядом с
+     * настоящей «ООО Заря». Но и делать вид, что имени не слышали, плохо.
+     * Поэтому предлагаем завести именно его, а решает человек.
+     */
+    const bdbN = require('./lib/bot-db');
+    const before = bdbN.listCps(fxUserId()).length;
+
+    await say('выставь Незнакомой Фирме счёт на 5000');
+    ok(/Незнакомой Фирме/.test(last()) && /пока нет/.test(last()),
+      'бот говорит, что такого клиента нет, и называет его', last().slice(0, 90));
+    ok(bdbN.listCps(fxUserId()).length === before,
+      'и НЕ заводит его молча', bdbN.listCps(fxUserId()).length);
+
+    const addBtn = button('Завести');
+    ok(Boolean(addBtn), 'есть кнопка завести именно этого клиента', addBtn);
+
+    await tap(addBtn);
+    ok(/Завожу клиента/.test(last()) || /ИНН/.test(last()),
+      'по кнопке открывается форма, а не пустое место', last().slice(0, 80));
+
+    // Имя подставлено: шаг «краткое имя» пропущен, спрашивают уже про ИНН.
+    const st = bdbN.getState(fxUserId());
+    ok(st.state === 'form:cp' && st.data.values.name === 'Незнакомой Фирме',
+      'имя из фразы подставлено в форму', JSON.stringify(st.data.values));
+    ok(st.data.values.__then === 'sch',
+      'и бот помнит, ради какого документа всё начиналось', st.data.values.__then);
+
+    bdbN.clearState(fxUserId());
+  }
+
   console.log('\n── акт услуг: столбец сходится с итогом ──');
   {
     /*

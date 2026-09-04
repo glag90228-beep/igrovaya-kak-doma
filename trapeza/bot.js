@@ -451,8 +451,22 @@ async function applyFormValue(tg, chatId, user, state, rawValue) {
   // поиск по ИНН/БИК — если подключён справочник.
   if (step.auto && value) {
     await tg.sendChatAction(chatId, 'typing');
+    /*
+     * Имя, услышанное во фразе, — только заглушка, и справочник вправе её
+     * перебить.
+     *
+     * Разбор даёт имя в том падеже, в каком его произнесли: «выпиши счёт
+     * Заре» — «Заре». Обычно fill() бережёт уже заполненные поля, и клиент
+     * так и остался бы «Заре» при живом реестре, знающем «ООО „Заря“».
+     * Поэтому на время автозаполнения заглушку убираем, а если справочник
+     * промолчал — возвращаем: пусть лучше падеж не тот, чем пустое имя.
+     */
+    const guess = values.__guessedName ? values.name : '';
+    if (guess) delete values.name;
     let res = { value: null, note: '', warn: '' };
     try { res = await runAuto(step.auto, rawValue, values); } catch (e) { res = { value: null, note: '', warn: e.message }; }
+    if (guess && !values.name) values.name = guess;
+    if (values.name && values.name !== guess) delete values.__guessedName;
     if (res.value != null && res.value !== '') values[step.key] = res.value; // в поле кладём разобранный ИНН/БИК
     if (res.note) await tg.sendMessage(chatId, `✅ ${res.note}`);
     if (res.warn) await tg.sendMessage(chatId, `⚠️ ${esc(res.warn)}`);
@@ -1914,6 +1928,32 @@ function inboxSweep() {
   for (const [id, row] of inboxCache) if (row.at < edge) inboxCache.delete(id);
 }
 
+/*
+ * Имя клиента, названное вслух, но не найденное в списке.
+ *
+ * Держим его до нажатия «Добавить», чтобы подставить в форму. В callback_data
+ * имя не кладём: там 64 байта на всё, а название вроде
+ * «ООО Производственно-торговая компания „Заря“» и двоеточия внутри разнесут
+ * разбор, который у нас везде идёт по двоеточиям.
+ *
+ * Четверть часа — с запасом на «отвлёкся и вернулся», но без вечной памяти:
+ * подставить позавчерашнее имя в сегодняшнюю форму хуже, чем спросить заново.
+ */
+const PENDING_CP_TTL_MS = 15 * 60 * 1000;
+const pendingCpName = new Map();
+
+function pendingCpPut(userId, name) {
+  pendingCpName.set(userId, { at: Date.now(), name });
+  const edge = Date.now() - PENDING_CP_TTL_MS;
+  for (const [id, row] of pendingCpName) if (row.at < edge) pendingCpName.delete(id);
+}
+
+function pendingCpGet(userId) {
+  const row = pendingCpName.get(userId);
+  if (!row || row.at < Date.now() - PENDING_CP_TTL_MS) { pendingCpName.delete(userId); return ''; }
+  return row.name;
+}
+
 /** Карточка письма: от кого, что во вложении, что с этим делать. */
 async function showInboxMessage(tg, chatId, user, index) {
   const list = inboxGet(user.id);
@@ -2089,8 +2129,35 @@ async function handleFreeText(tg, chatId, user, text) {
       return true;
     }
     if (!found.cp) {
-      // Имя не опознано — не угадываем, а показываем список: выписать
-      // документ не тому клиенту хуже, чем лишнее нажатие.
+      /*
+       * Имя названо, но такого клиента нет.
+       *
+       * Заводить его молча нельзя: разбор даёт имя в том падеже, в каком его
+       * произнесли, и в базе появился бы «Заре» или выправленная «Зара» рядом
+       * с настоящей «ООО Заря» — без ИНН, без реквизитов, документ такому не
+       * выписать. Плюс любая опечатка оставляла бы мусорную запись навсегда.
+       *
+       * Показывать один голый список тоже плохо: человек назвал имя, а бот
+       * делает вид, что не слышал. Поэтому предлагаем добавить именно его —
+       * имя подставится в форму, а решает по-прежнему человек.
+       */
+      if (intent.who) {
+        pendingCpPut(user.id, intent.who);
+        const others = cps.slice(0, 6).map((c) => ([{
+          text: c.name.slice(0, 60), data: `d.${intent.docType}:${c.id}`,
+        }]));
+        await tg.sendMessage(chatId,
+          `Клиента «${esc(intent.who)}» у вас пока нет.\n\n`
+          + '<i>Могу завести его — имя подставлю, останется ИНН и реквизиты. '
+          + 'Или выберите из списка, если это кто-то из них.</i>',
+          keyboard([
+            [{ text: `➕ Завести «${intent.who}»`.slice(0, 60), data: `cp.pre:${intent.docType}` }],
+            ...others,
+            [{ text: '⬅️ Меню', data: 'menu' }],
+          ]));
+        return true;
+      }
+      // Имени во фразе не было вовсе — показываем список, гадать не о чем.
       await startDoc(tg, chatId, user, intent.docType);
       return true;
     }
@@ -4297,6 +4364,32 @@ async function handleCallback(tg, cq) {
     if (data === 'org.new') { await startForm(tg, chatId, user, 'org'); return; }
     if (data === 'cps') { await showCps(tg, chatId, user); return; }
     if (data === 'cp.new') { await startForm(tg, chatId, user, 'cp'); return; }
+    /*
+     * «Завести клиента с этим именем и вернуться к документу».
+     *
+     * Имя кладём в values формы: advanceForm пропускает заполненные шаги, так
+     * что вопрос «краткое имя» не задаётся — человек сразу отвечает про ИНН.
+     * __then возвращает его к тому документу, ради которого всё начиналось,
+     * тем же путём, каким это уже работает у справочника реквизитов.
+     */
+    if (data.startsWith('cp.pre:')) {
+      const type = data.slice(7);
+      const name = pendingCpGet(user.id);
+      if (!name) {
+        // Память о разговоре истекла — переспрашиваем, а не подставляем пустое.
+        await tg.sendMessage(chatId, 'Забыл, о ком речь — заведём клиента с начала.');
+        await startForm(tg, chatId, user, 'cp');
+        return;
+      }
+      // __guessedName помечает имя как услышанное, а не введённое: справочник
+      // по ИНН вправе заменить его настоящим названием из реестра.
+      const values = { name, __guessedName: true };
+      if (ITEM_DOCS[type]) values.__then = type;
+      await tg.sendMessage(chatId, `Завожу клиента <b>${esc(name)}</b>. `
+        + 'Имя подставил из вашей фразы — если укажете ИНН, поправлю на название из реестра.');
+      await advanceForm(tg, chatId, user, 'cp', values, 0);
+      return;
+    }
     // Проводник: «выписать счёт» с любого места, недостающее спросим по пути.
     if (data === 'go.any') { await chooseDoc(tg, chatId, user); return; }
     if (data.startsWith('go.')) { await startDoc(tg, chatId, user, data.slice(3)); return; }
