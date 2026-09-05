@@ -26,6 +26,8 @@ const { buildPlatyozhkaHtml } = require('./platyozhka');
 const { buildUpdHtml } = require('./upd');
 const { buildTorg12Html } = require('./torg12');
 const { buildDogovorHtml } = require('./dogovor');
+const { buildAvansHtml } = require('./avans');
+const { buildKsfHtml } = require('./ksf');
 const { isNpd } = require('./npd');
 // Акт сверки — Excel, а не HTML: это журнал, его дополняют и считают в нём.
 const { buildAkt } = require('./xlsx-akt');
@@ -45,12 +47,22 @@ const ITEM_DOCS = {
 const OTHER_DOCS = {
   pp: { title: 'Платёжное поручение', build: buildPlatyozhkaHtml, file: 'Платежка' },
   dog: { title: 'Договор', build: buildDogovorHtml, file: 'Договор' },
+  // Счёт-фактура на предоплату: позиций нет, есть полученная сумма.
+  avans: { title: 'Счёт-фактура на аванс', build: buildAvansHtml, file: 'СФ_аванс' },
+  // Корректировочный: строки парные «было/стало», обычными позициями не лягут.
+  ksf: { title: 'Корректировочный счёт-фактура', build: buildKsfHtml, file: 'КСФ' },
 };
 
 const ALL_DOCS = { ...ITEM_DOCS, ...OTHER_DOCS };
 
 // «Сегодня» — по Москве, а не по поясу сервера (пояснение в lib/period.js).
 const { todayISO } = require('./period');
+
+/** ДД.ММ.ГГГГ — так дата пишется во всех наших бланках. */
+const ruDate = (iso) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
+  return m ? `${m[3]}.${m[2]}.${m[1]}` : String(iso || '');
+};
 
 /** Имя файла: кириллицу оставляем, всё остальное — в подчёркивания. */
 const safeName = (s) => String(s)
@@ -208,6 +220,26 @@ async function issueDocument(userId, {
     fields = { ...fields, status: payer ? 1 : 2 };
   }
 
+  /*
+   * Строка 5б: чем закрываем ранее полученный аванс.
+   *
+   * С 1 апреля 2026 года (постановление № 26 от 23.01.2026) отгрузочный
+   * счёт-фактура обязан ссылаться на авансовый, если отгрузка идёт в счёт
+   * предоплаты. Ссылку не выдумываем: берём номера и даты счетов-фактур на
+   * аванс, выписанных этому же контрагенту и ещё не закрытых. Их может быть
+   * несколько — тогда через «;», как требует форма.
+   *
+   * Явно переданный advDoc сильнее: человек мог указать, какой именно аванс
+   * закрывает эта отгрузка, и наша догадка не должна его перебивать.
+   */
+  if (type === 'upd' && Number(fields.status) === 1
+      && !Object.prototype.hasOwnProperty.call(fields, 'advDoc')) {
+    const open = bdb.openAdvances(userId, Number(cpId));
+    if (open.length) {
+      fields = { ...fields, advDoc: open.map((a) => `№ ${a.number} от ${ruDate(a.date)}`).join('; ') };
+    }
+  }
+
   const quota = bdb.quota(userId);
   if (!skipQuota && !quota.allowed) {
     return { ...fail('quota', `Бесплатные документы на этот месяц закончились (${quota.limit}).`), quota };
@@ -311,6 +343,92 @@ async function issueDocument(userId, {
  * @param {object} saved строка документа из журнала
  * @param {{paid?:boolean, copy?:boolean}} want что попросили
  */
+/**
+ * Выпуск документа, у которого нет позиций: счёт-фактура на аванс и
+ * корректировочный.
+ *
+ * Отдельно от issueDocument, потому что у тех вся суть в позициях —
+ * количество на цену, потолки, шаблоны, память о введённом. Здесь этого нет:
+ * у аванса одна полученная сумма, у корректировочного — парные строки
+ * «было/стало», которые обычным списком позиций не лягут. Общими остаются
+ * нумерация, квота и запись в журнал, и их мы честно повторяем, а не обходим:
+ * два счёта-фактуры с одним номером за год — спор с контрагентом.
+ *
+ * Долг эти документы не создают. Аванс — деньги уже пришли, и приход по нему
+ * заводит платёж, а не счёт-фактура. Корректировочный меняет сумму прежней
+ * отгрузки, и трогать журнал за неё он не вправе.
+ *
+ * @returns {{ok:true, doc, file, total, title}|{ok:false, reason, message}}
+ */
+async function issueFlat(userId, {
+  type, cpId, date, number, payload = {}, total = 0, skipQuota = false,
+}) {
+  const kind = OTHER_DOCS[type];
+  if (!kind || !['avans', 'ksf'].includes(type)) {
+    return fail('type', 'Такой документ выписать нельзя.');
+  }
+  const org = bdb.getDefaultOrg(userId);
+  if (!org) return fail('org', 'Сначала заполните реквизиты своей организации.');
+  const cp = bdb.getCp(userId, Number(cpId));
+  if (!cp) return fail('cp', 'Контрагент не найден.');
+
+  /*
+   * Счёт-фактуру не выписывает тот, кто не плательщик НДС.
+   *
+   * У самозанятого это прямо запрещено (422-ФЗ), и последствие описано выше
+   * у статуса УПД: выставил с выделенным налогом — обязан уплатить его в
+   * бюджет. У остальных без ставки счёт-фактура бессмыслен: нечего в него
+   * писать.
+   */
+  if (isNpd(org)) {
+    return fail('npd', 'Самозанятый не может выставлять счета-фактуры: он не плательщик НДС.');
+  }
+  if (payload.vatRate == null) {
+    return fail('vat', 'Счёт-фактура выставляется со ставкой НДС. Выберите её в разделе «НДС».');
+  }
+
+  const quota = bdb.quota(userId);
+  if (!skipQuota && !quota.allowed) {
+    return { ...fail('quota', `Бесплатные документы на этот месяц закончились (${quota.limit}).`), quota };
+  }
+
+  const when = /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? String(date) : todayISO();
+  const year = Number(when.slice(0, 4));
+  const wanted = number == null || number === '' ? '' : String(number).slice(0, 40);
+  if (wanted && bdb.numberTaken(userId, type, year, wanted)) {
+    return fail('number', `${kind.title} № ${wanted} за ${year} год уже выписан. Укажите другой номер.`);
+  }
+
+  let num; let file; let id;
+  for (let attempt = 0; ; attempt += 1) {
+    let seq = bdb.nextSeq(userId, type, year);
+    if (!wanted) {
+      while (bdb.numberTaken(userId, type, year, String(seq))) seq += 1;
+    }
+    num = String(wanted || seq).slice(0, 40);
+    const doc = { number: num, date: when, ...payload };
+    // eslint-disable-next-line no-await-in-loop
+    file = await renderFile(
+      kind.build({ org: withFx(userId, org, type), cp, doc }),
+      `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
+    );
+    try {
+      id = bdb.saveDoc(userId, {
+        orgId: org.id, cpId: cp.id, type, number: num, seq, date: when,
+        total: round2(total), payload,
+      });
+      break;
+    } catch (e) {
+      if (!bdb.isSeqTaken(e) || attempt >= 2) throw e;
+    }
+  }
+
+  return {
+    ok: true, total: round2(total), title: kind.title, file,
+    doc: bdb.getDoc(userId, id),
+  };
+}
+
 function stampFor(saved, want) {
   if (!want) return null;
   const paid = Boolean(want.paid) && Boolean(saved.paid_at);
@@ -406,6 +524,6 @@ async function rebuildDocument(userId, docId, opts = {}) {
 
 module.exports = {
   ITEM_DOCS, OTHER_DOCS, ALL_DOCS,
-  issueDocument, rebuildDocument, renderFile, stampFor,
+  issueDocument, issueFlat, rebuildDocument, renderFile, stampFor,
   totalOf, cleanItems, safeName, todayISO,
 };

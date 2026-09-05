@@ -326,6 +326,32 @@ function saveMyOrg(userId, fields) {
 
 // ---------- контрагенты пользователя ----------
 
+/**
+ * Незакрытые авансовые счета-фактуры контрагента.
+ *
+ * «Незакрытые» — те, на которые ещё не сослалась ни одна отгрузка в строке
+ * 5б. Ссылка живёт в payload отгрузочного документа, поэтому и ищем по нему:
+ * отдельной таблицы связей заводить не стали — на объёмах малого бизнеса это
+ * лишняя сущность, которую надо чинить при каждом удалении документа.
+ *
+ * Порядок — от старых к новым: закрывают предоплаты в порядке получения.
+ */
+function openAdvances(userId, cpId) {
+  const all = db.prepare(`
+    SELECT id, number, date, payload FROM documents
+     WHERE user_id = ? AND cp_id = ? AND type = 'avans'
+     ORDER BY date, id`).all(userId, Number(cpId));
+  if (!all.length) return [];
+
+  const used = db.prepare(`
+    SELECT payload FROM documents
+     WHERE user_id = ? AND cp_id = ? AND type = 'upd'`).all(userId, Number(cpId))
+    .map((r) => { try { return JSON.parse(r.payload || '{}').advDoc || ''; } catch (_) { return ''; } })
+    .join(' | ');
+
+  return all.filter((a) => !used.includes(`№ ${a.number} `));
+}
+
 function createCp(userId, fields) {
   const cols = ['name', 'full_name', 'inn', 'kpp', 'extra', 'kind', 'contract',
     'opening_balance', 'opening_date', 'period_end', 'signer',
@@ -1513,7 +1539,7 @@ module.exports = {
   migrate,
   getOrCreateUser, setState, getState, clearState, isAiEnabled, setAiEnabled,
   createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
-  createCp, updateCp, listCps, getCp,
+  createCp, updateCp, listCps, getCp, openAdvances,
   addOp, listOps, deleteLastOp, deleteOp, balanceOf, debtors, debtBreakdown, periodBalance, cpForPeriod,
   knownBankKeys, importBankRows,
   DEBT_DOCS, basisOf, makesDebt, basisMismatch, addOpForDoc, opsOfDoc, deleteOpsOfDoc,

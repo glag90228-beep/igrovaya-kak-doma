@@ -4414,6 +4414,149 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     bdbN.clearState(fxUserId());
   }
 
+  console.log('\n── авансы, корректировки, книга продаж ──');
+  {
+    const bdbK = require('./lib/bot-db');
+    const dsK = require('./lib/doc-service');
+    const { advanceVat } = require('./lib/avans');
+    const { correctionRow, correctionTotals } = require('./lib/ksf');
+    const { bookRow, buildKnigaProdazh } = require('./lib/xlsx-kniga');
+    const { vatMismatch } = require('./lib/nds-text');
+
+    /*
+     * Расчётная ставка — не «сумма × ставку».
+     *
+     * 22% сверху от 100 000 это 22 000 налога, а из полученных 100 000
+     * расчётной ставкой 22/122 — 18 032,79. Перепутать значит завысить налог
+     * почти на пятую часть и подарить разницу бюджету.
+     */
+    ok(advanceVat(100000, 22).vat === 18032.79, 'аванс: 22/122 от 100 000 = 18 032,79',
+      advanceVat(100000, 22).vat);
+    ok(advanceVat(105000, 5).vat === 5000, 'аванс: 5/105 от 105 000 = ровно 5 000',
+      advanceVat(105000, 5).vat);
+    ok(advanceVat(107000, 7).vat === 7000, 'аванс: 7/107 от 107 000 = ровно 7 000',
+      advanceVat(107000, 7).vat);
+    ok(advanceVat(100000, null).vat === 0, 'без ставки налога в авансе нет');
+
+    // Корректировка: было 10×1000, стало 8×900 при ставке 22% сверху.
+    const cr = correctionRow({ qty: 10, price: 1000 }, { qty: 8, price: 900 }, 22, false);
+    ok(cr.before.total === 12200 && cr.after.total === 8784 && cr.diff.total === -3416,
+      'корректировка считает «было / стало / разница»', JSON.stringify(cr.diff));
+    const ct = correctionTotals([cr]);
+    ok(ct.down.total === 3416 && ct.up.total === 0,
+      'уменьшение и увеличение разведены — это разные книги', JSON.stringify(ct));
+
+    // --- цепочка целиком ---
+    const uK = bdbK.getOrCreateUser(880101);
+    bdbK.saveMyOrg(uK.id, { name: 'ООО «Книга»', inn: '7701234567' });
+    bdbK.updateOrg(uK.id, bdbK.getDefaultOrg(uK.id).id, { vat_rate: '22' });
+    const cpK = bdbK.createCp(uK.id, { name: 'ООО «Покупатель»', inn: '7707654321', kind: 'customer', opening_date: '2026-01-01' });
+
+    const av = await dsK.issueFlat(uK.id, {
+      type: 'avans', cpId: cpK, date: '2026-09-01', skipQuota: true, total: 100000,
+      payload: { sum: 100000, vatRate: 22, subject: 'Предоплата', payDoc: '№ 55 от 01.09.2026' },
+    });
+    ok(av.ok, 'счёт-фактура на аванс выписывается', av.message);
+
+    /*
+     * Строка 5б подтягивается сама — ради этого связь и заводилась.
+     * С 1 апреля 2026 отгрузочный счёт-фактура обязан ссылаться на авансовый
+     * (постановление № 26 от 23.01.2026).
+     */
+    const shK = await dsK.issueDocument(uK.id, {
+      type: 'upd', cpId: cpK, date: '2026-09-05', skipQuota: true,
+      items: [{ name: 'Монтаж', qty: 1, price: 150000 }],
+    });
+    const pK = bdbK.getDoc(uK.id, shK.doc.id).payload;
+    ok(pK.advDoc === `№ ${av.doc.number} от 01.09.2026`,
+      'отгрузка сама сослалась на аванс в строке 5б', pK.advDoc);
+
+    // Второй раз тот же аванс закрывать нельзя — он уже закрыт.
+    ok(bdbK.openAdvances(uK.id, cpK).length === 0,
+      'закрытый аванс больше не предлагается', bdbK.openAdvances(uK.id, cpK).length);
+
+    const ksfK = await dsK.issueFlat(uK.id, {
+      type: 'ksf', cpId: cpK, date: '2026-09-10', skipQuota: true, total: 20000,
+      payload: { vatRate: 22, base: { number: shK.doc.number, date: '2026-09-05' },
+        reason: 'Соглашение № 3',
+        lines: [{ name: 'Монтаж', before: { qty: 1, price: 150000 }, after: { qty: 1, price: 130000 } }] },
+    });
+    ok(ksfK.ok, 'корректировочный счёт-фактура выписывается', ksfK.message);
+
+    // --- книга продаж ---
+    const docsK = bdbK.listDocs(uK.id, 50)
+      .map((d) => ({ ...d, cpName: 'ООО «Покупатель»', cpInn: '7707654321' }));
+    const rows = docsK.map(bookRow).filter(Boolean);
+    ok(rows.length === 2, 'в книгу продаж пошли ровно два документа', rows.length);
+    ok(rows.some((r) => r.code === '01' && r.vat === 33000), 'отгрузка — код 01',
+      JSON.stringify(rows.find((r) => r.code === '01')));
+    ok(rows.some((r) => r.code === '02' && r.vat === 18032.79), 'аванс — код 02',
+      JSON.stringify(rows.find((r) => r.code === '02')));
+    ok(!rows.some((r) => r.code === '18'),
+      'корректировка на УМЕНЬШЕНИЕ в книгу продаж не идёт — её место в книге покупок');
+
+    // Корректировка на увеличение — наоборот, идёт, кодом 18.
+    const upRow = bookRow({ type: 'ksf', number: '2', date: '2026-09-11',
+      payload: { vatRate: 22, lines: [{ before: { qty: 1, price: 100 }, after: { qty: 1, price: 200 } }] } });
+    ok(upRow && upRow.code === '18' && upRow.vat === 22, 'корректировка на увеличение — код 18',
+      JSON.stringify(upRow));
+
+    const bufK = await buildKnigaProdazh({
+      org: bdbK.getDefaultOrg(uK.id), docs: docsK, from: '2026-09-01', to: '2026-09-30',
+    });
+    ok(bufK.length > 4000, 'файл книги продаж собирается', `${Math.round(bufK.length / 1024)} КБ`);
+
+    /*
+     * И она доступна человеку из бота, а не только из кода.
+     *
+     * Ставку тестовому пользователю ставим явно: у него она сброшена в «без
+     * НДС» предыдущим разделом, а книга продаж неплательщику не положена — бот
+     * в этом случае честно отказывает, и проверять надо не отказ.
+     */
+    const orgFx = bdbK.getDefaultOrg(fxUserId());
+    bdbK.updateOrg(fxUserId(), orgFx.id, { vat_rate: '22' });
+    files.length = 0;
+    await tap('reg');
+    ok(button('Книга продаж') === 'kniga.p:quarter', 'в отчётах есть книга продаж',
+      button('Книга продаж'));
+    await tap('kniga.p:quarter');
+    ok(files.length === 1 && /Книга_продаж/.test(files[0].filename),
+      'и она приходит файлом', files.length ? files[0].filename : '—');
+    ok(/Счетов-фактур/.test((files[0] || {}).caption || ''), 'с итогом по налогу в подписи',
+      ((files[0] || {}).caption || '').slice(0, 60));
+
+    // Неплательщику книга не положена — и бот объясняет почему, а не молчит.
+    bdbK.updateOrg(fxUserId(), orgFx.id, { vat_rate: '' });
+    files.length = 0;
+    await tap('kniga.p:quarter');
+    ok(files.length === 0 && /без НДС/.test(last()),
+      'на «без НДС» книга не собирается, и сказано почему', last().slice(0, 70));
+
+    // Счёт-фактуру не выписывает тот, кто не плательщик НДС.
+    bdbK.updateOrg(uK.id, bdbK.getDefaultOrg(uK.id).id, { npd: 1 });
+    const npdTry = await dsK.issueFlat(uK.id, { type: 'avans', cpId: cpK, skipQuota: true,
+      total: 1000, payload: { sum: 1000, vatRate: 22 } });
+    ok(!npdTry.ok && npdTry.reason === 'npd',
+      'самозанятому счёт-фактуру на аванс не выписать', npdTry.message);
+    bdbK.updateOrg(uK.id, bdbK.getDefaultOrg(uK.id).id, { npd: 0 });
+
+    // --- назначение платежа против ставки документа ---
+    ok(/20%.*22%/.test(vatMismatch('Оплата по счёту 5, в том числе НДС 20%', { rate: 22, vat: 27000 })),
+      'прошлогодний НДС в назначении замечен',
+      vatMismatch('Оплата по счёту 5, в том числе НДС 20%', { rate: 22, vat: 27000 }));
+    ok(vatMismatch('Оплата по счёту 5, в том числе НДС 22%', { rate: 22, vat: 27000 }) === '',
+      'совпадающая ставка не тревожит зря');
+    ok(vatMismatch('Оплата по счёту 5', { rate: 22, vat: 27000 }) === '',
+      'про налог не написано — молчим');
+    ok(/без НДС/.test(vatMismatch('Оплата, без НДС', { rate: 22, vat: 27000 })),
+      '«без НДС» при ставке в документе — расхождение');
+    ok(/НДС 22%.*без НДС/.test(vatMismatch('Оплата, НДС 22%', { rate: null, vat: null })),
+      'и наоборот тоже', vatMismatch('Оплата, НДС 22%', { rate: null, vat: null }));
+    ok(/сумма НДС/.test(vatMismatch('Оплата, в т.ч. НДС 22% - 1000,00', { rate: 22, vat: 27000 })),
+      'разошлась сумма налога — тоже видно',
+      vatMismatch('Оплата, в т.ч. НДС 22% - 1000,00', { rate: 22, vat: 27000 }));
+  }
+
   console.log('\n── акт услуг: столбец сходится с итогом ──');
   {
     /*

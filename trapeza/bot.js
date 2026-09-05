@@ -10,6 +10,7 @@ const bdb = require('./lib/bot-db');
 const { formatRub, formatMoney, amountInWords, round2, vatTotals } = require('./lib/money');
 const { buildAkt } = require('./lib/xlsx-akt');
 const { buildRegistry } = require('./lib/xlsx-registry');
+const { buildKnigaProdazh, bookRow } = require('./lib/xlsx-kniga');
 const { buildAktUslugHtml } = require('./lib/akt-uslug');
 const { buildSchetHtml } = require('./lib/schet');
 const { buildPlatyozhkaHtml } = require('./lib/platyozhka');
@@ -1081,6 +1082,41 @@ function periodOf(name) {
 }
 
 /** Реестр выписанного за период — то, чем закрывают месяц. */
+/**
+ * Книга продаж за период — налоговый регистр, а не список для себя.
+ *
+ * Отдельно от реестра намеренно: в реестр идёт всё выписанное, в книгу —
+ * только счета-фактуры, и именно её данные сверяет АСК НДС-2 с книгой покупок
+ * контрагента. Расхождение здесь оборачивается требованием обеим сторонам.
+ */
+async function sendKniga(tg, chatId, user, periodName) {
+  const org = bdb.getDefaultOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  if (bdb.vatOf(org).rate == null) {
+    await tg.sendMessage(chatId,
+      'Книга продаж ведётся плательщиками НДС. У вас выбрано «без НДС» — '
+      + 'счетов-фактур нет, и книге неоткуда взяться.',
+      keyboard([[{ text: '🧾 Настроить НДС', data: 'vat' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+  const { from, to, title } = periodOf(periodName);
+  const docs = bdb.docsBetween(user.id, from, to)
+    .map((d) => ({ ...d, cpName: (bdb.getCp(user.id, d.cp_id) || {}).name || '', cpInn: (bdb.getCp(user.id, d.cp_id) || {}).inn || '' }));
+
+  await tg.sendChatAction(chatId, 'upload_document');
+  const buf = await buildKnigaProdazh({ org, docs, from, to });
+  const rows = docs.map(bookRow).filter(Boolean);
+  const vat = round2(rows.reduce((a2, r) => a2 + (Number(r.vat) || 0), 0));
+
+  await tg.sendDocument(chatId, {
+    filename: `Книга_продаж_${from}_${to}.xlsx`,
+    buffer: buf,
+    caption: `Книга продаж за ${esc(title)} (${ru(from)}—${ru(to)}).\n`
+      + `Счетов-фактур: <b>${rows.length}</b>, НДС к начислению: <b>${formatRub(vat)}</b>.\n\n`
+      + '<i>Выгрузка для сверки: книга ведётся нарастающим итогом за квартал и подписывается.</i>',
+  });
+}
+
 async function sendRegistry(tg, chatId, user, periodName) {
   const org = bdb.getDefaultOrg(user.id);
   if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
@@ -4242,11 +4278,13 @@ async function handleCallback(tg, cq) {
       await tg.sendMessage(chatId, 'Реестр за какой период?', keyboard([
         [{ text: 'Текущий месяц', data: 'reg.p:month' }, { text: 'Прошлый месяц', data: 'reg.p:prev' }],
         [{ text: 'Квартал', data: 'reg.p:quarter' }, { text: 'Год', data: 'reg.p:year' }],
+        [{ text: '📕 Книга продаж за квартал', data: 'kniga.p:quarter' }],
         [{ text: '⬅️ К документам', data: 'docs' }],
       ]));
       return;
     }
     if (data.startsWith('reg.p:')) { await sendRegistry(tg, chatId, user, data.slice(6)); return; }
+    if (data.startsWith('kniga.p:')) { await sendKniga(tg, chatId, user, data.slice(8)); return; }
     if (data === 'vat') { await showVat(tg, chatId, user); return; }
     if (data === 'npd') { await showNpd(tg, chatId, user); return; }
     if (data.startsWith('npd.set:')) {
