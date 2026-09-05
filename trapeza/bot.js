@@ -11,6 +11,8 @@ const { formatRub, formatMoney, amountInWords, round2, vatTotals } = require('./
 const { buildAkt } = require('./lib/xlsx-akt');
 const { buildRegistry } = require('./lib/xlsx-registry');
 const { buildKnigaProdazh, bookRow } = require('./lib/xlsx-kniga');
+const { advanceVat } = require('./lib/avans');
+const { correctionRow, correctionTotals } = require('./lib/ksf');
 const { buildAktUslugHtml } = require('./lib/akt-uslug');
 const { buildSchetHtml } = require('./lib/schet');
 const { buildPlatyozhkaHtml } = require('./lib/platyozhka');
@@ -98,6 +100,10 @@ const FLOW_BUTTONS = {
   'fx:': ['fx.'],
   'mb:': ['mb.'],
   'ro:': ['ro.'],
+  // Оба сценария ждут только текста; своих кнопок внутри у них нет, и любая
+  // нажатая кнопка означает «передумал» — состояние сбрасывается.
+  'av:': [],
+  'ksf:': ['ksf.b'],
 };
 
 // ---------- меню ----------
@@ -173,6 +179,16 @@ function cpMenu(userId, cp) {
     [{ text: '📦 УПД', data: `d.upd:${cp.id}` }, { text: '🚚 ТОРГ-12', data: `d.torg12:${cp.id}` }],
     [{ text: '📝 Договор', data: `d.dog:${cp.id}` }],
   ];
+  /*
+   * Счета-фактуры показываем только плательщику НДС. Неплательщику они не
+   * положены, и кнопка, ведущая к отказу, — плохая кнопка: человек решит,
+   * что продукт сломан, а не что так нельзя.
+   */
+  if (bdb.vatOf(bdb.getDefaultOrg(userId)).rate != null
+      && !npd.isNpd(bdb.getDefaultOrg(userId))) {
+    rows.push([{ text: '💵 СФ на аванс', data: `d.av:${cp.id}` },
+      { text: '✏️ Корректировка', data: `d.ksf:${cp.id}` }]);
+  }
   const lastSch = bdb.listDocs(userId, 1, cp.id).find((d) => ITEM_DOCS[d.type]);
   if (lastSch) {
     rows.push([{ text: `🔁 Повторить: ${lastSch.title.toLowerCase()} № ${lastSch.number}`, data: `d.rep:${lastSch.id}` }]);
@@ -1225,6 +1241,19 @@ async function showDoc(tg, chatId, user, docId) {
     .map((it, i) => `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n');
   const rows = [];
   rows.push([{ text: '📄 Прислать файл заново', data: `doc.get:${d.id}` }]);
+  /*
+   * Исправление — только для счёта-фактуры и только у плательщика НДС.
+   *
+   * Пересобирает тот же документ по текущим данным: поправили ИНН клиента в
+   * карточке — исправление выйдет с верным. Номер и дата остаются прежними,
+   * добавляется пометка «ИСПРАВЛЕНИЕ № N». Для изменения стоимости по
+   * договорённости это не годится — там корректировочный, и это разные вещи.
+   */
+  if (d.type === 'upd' && Number((d.payload || {}).status) === 1) {
+    const fixNo = Number(((d.payload || {}).fix || {}).no || 0);
+    rows.push([{ text: fixNo ? `✏️ Исправление № ${fixNo + 1}` : '✏️ Выставить исправление',
+      data: `doc.fix:${d.id}` }]);
+  }
   if (d.paid_at && d.type !== 'akt') {
     rows.push([{ text: '🔵 Копия со штампом «Оплачено»', data: `doc.paidcopy:${d.id}` }]);
   }
@@ -3496,6 +3525,220 @@ const ru = (iso) => (iso && /^\d{4}-\d{2}-\d{2}$/.test(iso) ? `${iso.slice(8, 10
  * Здесь наоборот: жмём «Выписать счёт», а недостающее спрашиваем по дороге
  * и сразу возвращаемся к начатому делу.
  */
+/*
+ * ---------- счета-фактуры: аванс, корректировка, исправление ----------
+ *
+ * Три документа, которых до сих пор не было ни в одном экране, хотя формы и
+ * расчёты уже готовы. Все три — про НДС, поэтому неплательщику они не
+ * показываются вовсе: счёт-фактуру он выставлять не вправе, и предлагать её
+ * значит подталкивать к нарушению.
+ */
+
+/** Плательщик ли НДС и можно ли ему счёт-фактуру. Ответ словами, если нельзя. */
+function sfBlocked(org) {
+  if (npd.isNpd(org)) {
+    return 'Самозанятый не выставляет счета-фактуры: он не плательщик НДС (422-ФЗ). '
+      + 'Если вы с НПД снялись — выключите галочку в разделе «Самозанятость».';
+  }
+  if (bdb.vatOf(org).rate == null) {
+    return 'Счёт-фактура выставляется со ставкой НДС, а у вас выбрано «без НДС». '
+      + 'Поменять можно в разделе «НДС».';
+  }
+  return '';
+}
+
+/** Счёт-фактура на полученную предоплату: сумма → платёжка → за что. */
+async function startAvans(tg, chatId, user, cpId) {
+  if (!(await requireQuota(tg, chatId, user))) return;
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  const no = sfBlocked(org);
+  if (no) {
+    await tg.sendMessage(chatId, no, keyboard([[{ text: '🧾 НДС', data: 'vat' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+  const rate = bdb.vatOf(org).rate;
+  bdb.setState(user.id, `av:${cpId}`, { step: 'sum', rate });
+  await tg.sendMessage(chatId,
+    `<b>Счёт-фактура на аванс</b>, ставка ${rate}%.\n\n`
+    + 'Сколько денег пришло? Введите сумму <b>целиком, как получили</b> — налог в ней уже сидит, '
+    + `я выделю его расчётной ставкой ${rate}/${100 + rate}.`);
+}
+
+async function handleAvansText(tg, chatId, user, state, text) {
+  const cpId = Number(state.state.split(':')[1]);
+  const d = state.data;
+
+  if (d.step === 'sum') {
+    const a = parseAmount(text);
+    if (a == null || a <= 0) { await tg.sendMessage(chatId, 'Нужна сумма числом, напр. 100000:'); return; }
+    const { vat, label } = advanceVat(a, d.rate);
+    bdb.setState(user.id, `av:${cpId}`, { ...d, step: 'payDoc', sum: a });
+    await tg.sendMessage(chatId,
+      `Из ${formatRub(a)} налог по ставке ${label} — <b>${formatRub(vat)}</b>.\n\n`
+      + 'Теперь <b>номер и дата платёжного поручения</b>, которым пришли деньги '
+      + '(напр. «№ 55 от 01.09.2026»). Это обязательный реквизит строки 5 — '
+      + 'без него налоговая не свяжет счёт-фактуру с поступлением.');
+    return;
+  }
+
+  if (d.step === 'payDoc') {
+    bdb.setState(user.id, `av:${cpId}`, { ...d, step: 'subject', payDoc: String(text).trim().slice(0, 200) });
+    await tg.sendMessage(chatId,
+      'За что предоплата? Одной строкой, как в договоре (напр. «Монтаж по договору № 7»).\n\n'
+      + '<i>Или «-», и напишу «Предварительная оплата по договору».</i>');
+    return;
+  }
+
+  // subject — последний шаг, выпускаем
+  const subject = String(text).trim() === '-' ? '' : String(text).trim().slice(0, 300);
+  bdb.clearState(user.id);
+  const res = await docService.issueFlat(user.id, {
+    type: 'avans', cpId, total: d.sum,
+    payload: { sum: d.sum, vatRate: d.rate, payDoc: d.payDoc, subject },
+  });
+  if (!res.ok) { await tg.sendMessage(chatId, res.message, mainMenu()); return; }
+  const { vat, label } = advanceVat(d.sum, d.rate);
+  await tg.sendDocument(chatId, {
+    filename: res.file.filename,
+    buffer: res.file.buffer,
+    caption: `Счёт-фактура на аванс № ${esc(res.doc.number)} — ${formatRub(d.sum)}, `
+      + `в том числе НДС ${esc(label)} — <b>${formatRub(vat)}</b>.\n\n`
+      + '<i>При отгрузке сошлюсь на него в строке 5б — это обязательно с 1 апреля 2026 года.</i>',
+  });
+  await tg.sendMessage(chatId, 'Готово.', mainMenu());
+}
+
+/** Корректировочный: выбрать исходный документ, потом ввести новые строки. */
+async function startKsf(tg, chatId, user, cpId) {
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  const no = sfBlocked(org);
+  if (no) { await tg.sendMessage(chatId, no, mainMenu()); return; }
+
+  // Корректировать можно только то, что было счётом-фактурой.
+  const base = bdb.listDocs(user.id, 20, cpId)
+    .filter((x) => x.type === 'upd' && Number((x.payload || {}).status) === 1);
+  if (!base.length) {
+    await tg.sendMessage(chatId,
+      'Корректировать нечего: по этому клиенту нет ни одного УПД со счётом-фактурой.\n\n'
+      + '<i>Корректировочный выставляют к уже выданному счёту-фактуре, когда стороны '
+      + 'договорились об изменении стоимости.</i>', mainMenu());
+    return;
+  }
+  await tg.sendMessage(chatId, 'К какому счёту-фактуре корректировка?',
+    keyboard([...base.slice(0, 8).map((x) => ([{
+      text: `${x.title} № ${x.number} от ${ru(x.date)}`.slice(0, 60), data: `ksf.b:${x.id}`,
+    }])), [{ text: '⬅️ Отмена', data: `cp:${cpId}` }]]));
+}
+
+async function askKsfLines(tg, chatId, user, docId) {
+  const src = bdb.getDoc(user.id, docId);
+  if (!src) { await tg.sendMessage(chatId, 'Документ не найден.', mainMenu()); return; }
+  const items = (src.payload || {}).items || [];
+  bdb.setState(user.id, `ksf:${src.cp_id}`, { step: 'lines', baseId: docId });
+  await tg.sendMessage(chatId,
+    `<b>Корректировка к № ${esc(src.number)} от ${ru(src.date)}</b>\n\n`
+    + 'Было:\n'
+    + items.map((it) => `• ${esc(it.name)}; ${it.qty}; ${it.price}`).join('\n')
+    + '\n\nПришлите строки в том же виде, но с <b>новыми</b> количеством и ценой — '
+    + 'по строке на позицию, в том же порядке.\n\n'
+    + '<i>Например: Монтаж; 8; 900</i>');
+}
+
+async function handleKsfText(tg, chatId, user, state, text) {
+  const d = state.data;
+  const src = bdb.getDoc(user.id, d.baseId);
+  if (!src) { bdb.clearState(user.id); await tg.sendMessage(chatId, 'Исходный документ пропал.', mainMenu()); return; }
+
+  if (d.step === 'lines') {
+    // Разбираем построчно тем же разбором, что и позиции документа: человек
+    // уже знает этот формат, и второй придумывать незачем.
+    const after = String(text).split('\n').map((l) => parseItemLine(l.trim())).filter(Boolean);
+    const before = (src.payload || {}).items || [];
+    if (!after.length) { await tg.sendMessage(chatId, 'Не разобрал строки. Формат: <code>Монтаж; 8; 900</code>'); return; }
+    if (after.length !== before.length) {
+      await tg.sendMessage(chatId,
+        `В исходном документе ${before.length} ${plural(before.length, 'позиция', 'позиции', 'позиций')}, `
+        + `а прислано ${after.length}. Строки должны идти в том же порядке и в том же количестве — `
+        + 'иначе непонятно, что с чем сравнивать.');
+      return;
+    }
+    bdb.setState(user.id, state.state, { ...d, step: 'reason', after });
+    await tg.sendMessage(chatId,
+      'На каком основании меняем? Договор, соглашение или иной документ '
+      + '(напр. «Соглашение № 3 от 04.09.2026»).\n\n'
+      + '<i>Реквизит обязательный: без основания корректировочный недействителен.</i>');
+    return;
+  }
+
+  // reason — выпускаем
+  const p = src.payload || {};
+  const before = p.items || [];
+  const lines = before.map((it, i) => ({
+    name: it.name, unit: it.unit,
+    before: { qty: it.qty, price: it.price },
+    after: { qty: d.after[i].qty, price: d.after[i].price },
+  }));
+  const rate = p.vatRate == null ? null : Number(p.vatRate);
+  const rows = lines.map((l) => correctionRow(l.before, l.after, rate, Boolean(p.priceIncludesVat)));
+  const { up, down } = correctionTotals(rows);
+  bdb.clearState(user.id);
+
+  const res = await docService.issueFlat(user.id, {
+    type: 'ksf', cpId: src.cp_id, total: up.total || down.total,
+    payload: { vatRate: rate, priceIncludesVat: Boolean(p.priceIncludesVat),
+      base: { number: src.number, date: src.date }, reason: String(text).trim().slice(0, 300), lines },
+  });
+  if (!res.ok) { await tg.sendMessage(chatId, res.message, mainMenu()); return; }
+
+  await tg.sendDocument(chatId, {
+    filename: res.file.filename,
+    buffer: res.file.buffer,
+    caption: `Корректировочный № ${esc(res.doc.number)} к № ${esc(src.number)}.\n`
+      + (up.total ? `Увеличение: <b>${formatRub(up.total)}</b>, налог ${formatRub(up.vat)}.\n` : '')
+      + (down.total ? `Уменьшение: <b>${formatRub(down.total)}</b>, налог ${formatRub(down.vat)}.\n` : '')
+      + `\n<i>${up.total ? 'Увеличение идёт в книгу продаж. ' : ''}`
+      + `${down.total ? 'Уменьшение — в книгу покупок, это ваш вычет.' : ''}</i>`,
+  });
+  await tg.sendMessage(chatId, 'Готово.', mainMenu());
+}
+
+/**
+ * Исправление: тот же счёт-фактура, тот же номер и дата, но заново собранный
+ * по текущим данным и с пометкой «ИСПРАВЛЕНИЕ № N».
+ *
+ * Это не корректировка: ничего не менялось по договорённости, документ просто
+ * был неверен — не тот ИНН, не та ставка. Поэтому номер и дата остаются
+ * прежними, а исправлению даётся свой порядковый номер.
+ */
+async function makeFix(tg, chatId, user, docId) {
+  const src = bdb.getDoc(user.id, docId);
+  if (!src) { await tg.sendMessage(chatId, 'Документ не найден.', mainMenu()); return; }
+  const p = src.payload || {};
+  if (src.type !== 'upd' || Number(p.status) !== 1) {
+    await tg.sendMessage(chatId,
+      'Исправление выставляют к счёту-фактуре. Этот документ им не является.', mainMenu());
+    return;
+  }
+  const no = sfBlocked(bdb.getDefaultOrg(user.id));
+  if (no) { await tg.sendMessage(chatId, no, mainMenu()); return; }
+
+  const fixNo = Number(p.fix && p.fix.no ? p.fix.no : 0) + 1;
+  const res = await docService.rebuildDocument(user.id, docId, {
+    extra: { fix: { no: fixNo, date: todayISO() } },
+  });
+  if (!res || !res.ok) {
+    await tg.sendMessage(chatId, (res && res.message) || 'Не получилось собрать исправление.', mainMenu());
+    return;
+  }
+  await tg.sendDocument(chatId, {
+    filename: res.file.filename,
+    buffer: res.file.buffer,
+    caption: `Исправление № ${fixNo} к счёту-фактуре № ${esc(src.number)} от ${ru(src.date)}.\n\n`
+      + '<i>Номер и дата исходного счёта-фактуры не меняются — так и должно быть. '
+      + 'Передайте этот экземпляр покупателю взамен прежнего.</i>',
+  });
+}
+
 async function startDoc(tg, chatId, user, type) {
   const org = bdb.getDefaultOrg(user.id);
   if (!org || !org.name) {
@@ -3768,6 +4011,8 @@ async function handleMessage(tg, msg) {
     return;
   }
   if (state.state.startsWith('pp:')) { await handlePpText(tg, chatId, user, state, text); return; }
+  if (state.state.startsWith('av:')) { await handleAvansText(tg, chatId, user, state, text); return; }
+  if (state.state.startsWith('ksf:')) { await handleKsfText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('dog:')) { await handleDogText(tg, chatId, user, state, text); return; }
   if (state.state === 'support') { await handleSupportText(tg, chatId, user, text); return; }
   if (state.state.startsWith('rm:')) {
@@ -4669,6 +4914,10 @@ async function handleCallback(tg, cq) {
     if (data.startsWith('d.torg12:')) { await startItems(tg, chatId, user, 'torg12', Number(data.slice(9))); return; }
     if (data.startsWith('d.dog:')) { await startDogovor(tg, chatId, user, Number(data.slice(6))); return; }
     if (data.startsWith('d.pp:')) { await startPp(tg, chatId, user, Number(data.slice(5))); return; }
+    if (data.startsWith('d.av:')) { await startAvans(tg, chatId, user, Number(data.slice(5))); return; }
+    if (data.startsWith('d.ksf:')) { await startKsf(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('ksf.b:')) { await askKsfLines(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('doc.fix:')) { await makeFix(tg, chatId, user, Number(data.slice(8))); return; }
     if (data === 'items.done') {
       const state = bdb.getState(user.id);
       if (!state.state.startsWith('items:')) return;

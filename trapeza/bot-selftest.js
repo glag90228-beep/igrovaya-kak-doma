@@ -4557,6 +4557,113 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       vatMismatch('Оплата, в т.ч. НДС 22% - 1000,00', { rate: 22, vat: 27000 }));
   }
 
+  console.log('\n── экраны счетов-фактур в боте ──');
+  {
+    /*
+     * Проверяем путь, каким его проходит человек, а не только расчёт: до сих
+     * пор формы и книга существовали, а нажать было негде.
+     */
+    const bdbE = require('./lib/bot-db');
+    const uidE = fxUserId();
+    const orgE = bdbE.getDefaultOrg(uidE);
+    bdbE.updateOrg(uidE, orgE.id, { vat_rate: '22', npd: 0 });
+    const cpE = bdbE.createCp(uidE, { name: 'ООО «Экранов»', inn: '7707654321', kind: 'customer', opening_date: '2026-01-01' });
+
+    // --- аванс ---
+    await tap(`cp:${cpE}`);
+    ok(button('СФ на аванс') === `d.av:${cpE}`, 'в карточке клиента есть кнопка аванса', button('СФ на аванс'));
+
+    files.length = 0;
+    await tap(`d.av:${cpE}`);
+    ok(/расчётной ставкой 22\/122/.test(last()), 'бот сразу объясняет про расчётную ставку', last().slice(0, 90));
+    await say('100000');
+    ok(norm(last()).includes('18 032,79'), 'и показывает выделенный налог до выпуска', norm(last()).slice(0, 80));
+    ok(/строки 5/.test(last()), 'тут же просит платёжку и говорит зачем', last().slice(-90));
+    await say('№ 55 от 01.09.2026');
+    ok(/За что предоплата/.test(last()), 'потом спрашивает назначение', last().slice(0, 60));
+    await say('Монтаж по договору 7');
+    ok(files.length === 1 && /СФ_аванс/.test(files[0].filename), 'счёт-фактура на аванс пришёл файлом',
+      files.length ? files[0].filename : '—');
+    ok(/18 032,79/.test(norm(files[0].caption || '')), 'в подписи — сумма налога',
+      norm(files[0].caption || '').slice(0, 70));
+
+    // --- отгрузка подхватывает аванс в строку 5б ---
+    const docsBeforeShip = bdbE.listDocs(uidE, 200).length;
+    await tap(`d.upd:${cpE}`);
+    await tap(`upd.s1:${cpE}`);
+    await tap(`upd.r:${cpE}:22`);
+    await tap(`upd.g:${cpE}:22:0`);
+    await say('Монтаж; 1; 150000');
+    await tap('items.done');
+    await tap('doc.make');
+    ok(bdbE.listDocs(uidE, 200).length === docsBeforeShip + 1, 'УПД выписан');
+    const shipE = bdbE.listDocs(uidE, 1)[0];
+    // Дата в ссылке — та, которой выписан аванс (сегодня), а не выдуманная:
+    // проверяем сам факт ссылки и её вид, а не конкретное число.
+    ok(/^№ \d+ от \d{2}\.\d{2}\.\d{4}$/.test(String((shipE.payload || {}).advDoc || '')),
+      'строка 5б заполнилась сама ссылкой на аванс', (shipE.payload || {}).advDoc);
+
+    // --- исправление ---
+    await tap(`doc:${shipE.id}`);
+    ok(button('исправление') || button('Исправление'), 'у счёта-фактуры есть кнопка исправления',
+      button('исправление') || button('Исправление'));
+    files.length = 0;
+    await tap(`doc.fix:${shipE.id}`);
+    ok(files.length === 1, 'исправление пришло файлом', files.length);
+    // Файл выходит PDF, и искать текст в нём ненадёжно. Пометку проверяем на
+    // самом бланке — это тот же код, которым его собрали.
+    const { buildUpdHtml } = require('./lib/upd');
+    const fixHtml = buildUpdHtml({
+      org: { name: 'ООО «Мы»', inn: '7701234567' }, cp: { name: 'ООО «Они»', inn: '7707654321' },
+      doc: { number: '7', date: '2026-09-05', status: 1, vatRate: 22,
+        items: [{ name: 'Т', qty: 1, price: 100 }], fix: { no: 1, date: '2026-09-05' } },
+    });
+    ok(/ИСПРАВЛЕНИЕ № 1 от 05\.09\.2026/.test(fixHtml), 'в бланке печатается пометка исправления',
+      (fixHtml.match(/ИСПРАВЛЕНИЕ[^<]*/) || [])[0]);
+    ok(!/ИСПРАВЛЕНИЕ/.test(buildUpdHtml({
+      org: { name: 'ООО «Мы»', inn: '7701234567' }, cp: { name: 'ООО «Они»', inn: '7707654321' },
+      doc: { number: '7', date: '2026-09-05', status: 1, vatRate: 22, items: [{ name: 'Т', qty: 1, price: 100 }] },
+    })), 'а у обычного счёта-фактуры её нет');
+    const afterFix = bdbE.getDoc(uidE, shipE.id);
+    ok(Number(((afterFix.payload || {}).fix || {}).no) === 1,
+      'документ запомнил, что был исправлен', JSON.stringify((afterFix.payload || {}).fix));
+    ok(afterFix.number === shipE.number && afterFix.date === shipE.date,
+      'номер и дата счёта-фактуры при исправлении НЕ меняются');
+
+    // --- корректировочный ---
+    files.length = 0;
+    await tap(`d.ksf:${cpE}`);
+    ok(button(`№ ${shipE.number}`) === `ksf.b:${shipE.id}`, 'предлагает выбрать исходный счёт-фактуру',
+      button(`№ ${shipE.number}`));
+    await tap(`ksf.b:${shipE.id}`);
+    ok(/Было:/.test(last()) && /150000/.test(last()), 'показывает, что было', last().slice(0, 90));
+    await say('Монтаж; 1; 130000');
+    ok(/основании/.test(last()), 'спрашивает основание изменения', last().slice(0, 60));
+    await say('Соглашение № 3 от 04.09.2026');
+    ok(files.length === 1 && /КСФ/.test(files[0].filename), 'корректировочный пришёл файлом',
+      files.length ? files[0].filename : '—');
+    ok(/книгу покупок/.test(files[0].caption || ''),
+      'и сказано, что уменьшение идёт в книгу покупок', (files[0].caption || '').slice(-60));
+
+    // Число строк должно совпадать — иначе непонятно, что с чем сравнивать.
+    await tap(`d.ksf:${cpE}`);
+    await tap(`ksf.b:${shipE.id}`);
+    await say('Монтаж; 1; 130000\nЛишняя; 1; 100');
+    ok(/в том же порядке/.test(last()), 'лишняя строка отклоняется с объяснением', last().slice(0, 80));
+    await tap('menu');
+
+    // --- неплательщику ничего этого не показывается ---
+    bdbE.updateOrg(uidE, orgE.id, { vat_rate: '' });
+    await tap(`cp:${cpE}`);
+    ok(!button('СФ на аванс'), 'на «без НДС» кнопок счетов-фактур нет вовсе');
+    bdbE.updateOrg(uidE, orgE.id, { vat_rate: '22' });
+
+    bdbE.updateOrg(uidE, orgE.id, { npd: 1 });
+    await tap(`d.av:${cpE}`);
+    ok(/Самозанятый/.test(last()), 'самозанятому объясняют, почему нельзя', last().slice(0, 70));
+    bdbE.updateOrg(uidE, orgE.id, { npd: 0, vat_rate: '' });
+  }
+
   console.log('\n── акт услуг: столбец сходится с итогом ──');
   {
     /*

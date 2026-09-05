@@ -21,6 +21,7 @@
 
 const { esc, ru, page, fxHtml, isIp, usnNote, formatMoney, amountInWords } = require('./doc-html');
 const { round2, vatSplit, rateLabel } = require('./money');
+const { fixNote } = require('./ksf');
 
 /** Коды единиц измерения по ОКЕИ — самые ходовые. */
 const OKEI = {
@@ -256,6 +257,13 @@ function buildUpdHtml({ org, cp, doc }) {
       <div style="flex:1">
         <div class="brand">Универсальный передаточный документ</div>
         <h1 style="margin-top:4px">№ ${esc(doc.number || '1')} от ${ru(doc.date)}</h1>
+        ${/*
+           * Пометка исправления. Номер и дата самого счёта-фактуры при этом
+           * НЕ меняются — в этом и разница с корректировочным: там был новый
+           * документ, здесь тот же самый, просто выданный заново без ошибки.
+           * У исправления свой сквозной номер по этому счёту-фактуре.
+           */''}
+        ${fixNote(doc.fix) ? `<p class="center b" style="margin:2px 0">${esc(fixNote(doc.fix))}</p>` : ''}
         ${status === 1 ? `<div class="small muted">Счёт-фактура № ${esc(doc.number || '1')} от ${ru(doc.date)}
           <span class="n">(1)</span> · Исправление № — от — <span class="n">(1а)</span></div>` : ''}
       </div>

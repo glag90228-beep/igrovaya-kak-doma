@@ -336,6 +336,18 @@ function saveMyOrg(userId, fields) {
  *
  * Порядок — от старых к новым: закрывают предоплаты в порядке получения.
  */
+/**
+ * Дописывает поля в payload уже выписанного документа.
+ *
+ * Нужна ровно для пометки исправления: сам документ при этом не меняется —
+ * ни номер, ни дата, ни суммы, — но он должен помнить, что исправление было,
+ * иначе следующее снова окажется первым.
+ */
+function updateDocPayload(userId, docId, payload) {
+  return db.prepare('UPDATE documents SET payload = ? WHERE id = ? AND user_id = ?')
+    .run(JSON.stringify(payload), Number(docId), userId).changes > 0;
+}
+
 function openAdvances(userId, cpId) {
   const all = db.prepare(`
     SELECT id, number, date, payload FROM documents
@@ -1539,7 +1551,7 @@ module.exports = {
   migrate,
   getOrCreateUser, setState, getState, clearState, isAiEnabled, setAiEnabled,
   createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
-  createCp, updateCp, listCps, getCp, openAdvances,
+  createCp, updateCp, listCps, getCp, openAdvances, updateDocPayload,
   addOp, listOps, deleteLastOp, deleteOp, balanceOf, debtors, debtBreakdown, periodBalance, cpForPeriod,
   knownBankKeys, importBankRows,
   DEBT_DOCS, basisOf, makesDebt, basisMismatch, addOpForDoc, opsOfDoc, deleteOpsOfDoc,

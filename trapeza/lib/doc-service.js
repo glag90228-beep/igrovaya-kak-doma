@@ -511,7 +511,18 @@ async function rebuildDocument(userId, docId, opts = {}) {
   const org = org0;
   const cp = cp0;
 
-  const doc = { number: saved.number, date: saved.date, ...saved.payload };
+  /*
+   * opts.extra — то, что добавляется к сохранённому документу при пересборке.
+   *
+   * Нужен ровно для исправления счёта-фактуры: номер и дата остаются
+   * прежними, а к ним добавляется пометка «ИСПРАВЛЕНИЕ № N». Пометку
+   * сохраняем обратно в payload, иначе следующее исправление снова окажется
+   * первым, а сам документ забудет, что был исправлен.
+   */
+  const doc = { number: saved.number, date: saved.date, ...saved.payload, ...(opts.extra || {}) };
+  if (opts.extra && Object.keys(opts.extra).length) {
+    bdb.updateDocPayload(userId, saved.id, { ...saved.payload, ...opts.extra });
+  }
   const stamp = stampFor(saved, opts.stamp);
   const file = await renderFile(
     withStamps(kind.build({ org: withFx(userId, org, saved.type), cp, doc }), stamp),
