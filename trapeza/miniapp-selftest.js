@@ -192,6 +192,70 @@ async function main() {
     ok(r.status === 200 && r.json.vat.rate === null, 'ставка сброшена обратно на «без НДС»');
   }
 
+  section('чат называет клиента — открывается он же');
+  {
+    /*
+     * Ошибка, которую поймал владелец: чат писал «Готовлю документ для
+     * „Заря“», а на экране стоял совсем другой контрагент.
+     *
+     * Виноваты были два звена сразу: /api/ask отдавал только имя словами и
+     * не искал по нему клиента, а экран черновика при отсутствии cpId молча
+     * подставлял ПЕРВОГО из списка. Выписать документ не тому клиенту — из
+     * тех ошибок, что замечают у контрагента, а не у себя.
+     */
+    process.env.AI_ENABLED = '1';
+    process.env.AI_PROVIDER = 'mock';
+
+    r = await call('POST', '/api/ask', { user: masha, body: { text: 'выставь Заре счёт на 1000' } });
+    ok(r.json.action === 'draft', 'фраза разобрана как черновик', JSON.stringify(r.json).slice(0, 120));
+    ok(Number(r.json.cpId) === cpId && r.json.cpName === 'ООО «Заря»',
+      'сервер сам нашёл контрагента по имени и вернул его id',
+      `${r.json.cpId} / ${r.json.cpName}`);
+
+    r = await call('POST', '/api/ask', { user: masha, body: { text: 'выставь Неизвестному Клиенту счёт на 1000' } });
+    ok(r.json.cpMissing === true && !r.json.cpId,
+      'ненайденный клиент помечен, а чужой id не подставлен', JSON.stringify(r.json).slice(0, 140));
+
+    delete process.env.AI_PROVIDER;
+    delete process.env.AI_ENABLED;
+  }
+
+  section('оплата словами в приложении');
+  {
+    /*
+     * Тот же путь, что в боте, но через приложение: фраза внутрь — изменённый
+     * журнал наружу. Раньше действия «внести оплату» не существовало вовсе,
+     * и фраза уходила в пустоту.
+     */
+    process.env.AI_ENABLED = '1';
+    process.env.AI_PROVIDER = 'mock';
+    const bdbA = require('./lib/bot-db');
+    const mashaId2 = bdbA.getOrCreateUser(MASHA.id).id;
+    const cpPay = bdbA.createCp(mashaId2, { name: 'ООО «Оплата»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbA.addOp(mashaId2, cpPay, { date: '2026-08-01', kind: 'Приход', credit: 40000 });
+
+    r = await call('POST', '/api/ask', { user: masha, body: { text: 'проведи оплату по Оплата 10000' } });
+    ok(r.json.action === 'pay' && Number(r.json.cpId) === cpPay && r.json.amount === 10000,
+      'фраза разобрана как оплата и клиент найден', JSON.stringify(r.json).slice(0, 130));
+
+    r = await call('POST', '/api/pay', { user: masha, body: { cpId: cpPay, amount: 10000 } });
+    ok(r.status === 200 && r.json.balance === 30000,
+      'проводка внесена, сальдо 40 000 − 10 000', JSON.stringify(r.json));
+
+    r = await call('POST', '/api/op/delete', { user: masha, body: { id: r.json.id, cpId: cpPay } });
+    ok(r.status === 200, 'и её можно отменить тем же путём, что рисует кнопка', r.status);
+    ok(bdbA.balanceOf(mashaId2, cpPay).closing === 40000, 'сальдо вернулось');
+
+    r = await call('POST', '/api/pay', { user: petya, body: { cpId: cpPay, amount: 5 } });
+    ok(r.status === 400, 'по чужому контрагенту проводку не внести', r.status);
+
+    r = await call('POST', '/api/pay', { user: masha, body: { cpId: cpPay, amount: 0 } });
+    ok(r.status === 400, 'нулевая сумма отклоняется', (r.json || {}).error);
+
+    delete process.env.AI_PROVIDER;
+    delete process.env.AI_ENABLED;
+  }
+
   section('переключатель ИИ-ассистента');
   {
     /*

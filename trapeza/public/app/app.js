@@ -1089,11 +1089,15 @@ function clearErrors(fields) {
   }
 }
 
-screens.cp = async function cpScreen({ id }) {
+screens.cp = async function cpScreen({ id, name }) {
   let cp = {};
   if (id) {
     const { cps: list } = await api('GET', '/api/cps');
     cp = list.find((x) => x.id === Number(id)) || {};
+  } else if (name) {
+    // Имя, названное в чате. Подставляем как заготовку — заводит запись
+    // всё равно человек, нажав «Сохранить».
+    cp = { name: String(name) };
   }
   const f = {
     name: field('name', 'Краткое название', cp.name, { required: true, placeholder: 'ООО «Заря»' }),
@@ -2436,6 +2440,24 @@ screens.ask = async function ask() {
   const box = h('div', {}, h('h1', { text: 'Спросить' }));
   const log = h('div', { class: 'chat' });
 
+  /* Вносит проводку и показывает, что получилось, с отменой в одно нажатие. */
+  const doPay = async (cpId, cpName, amount, kind) => {
+    try {
+      const res = await api('POST', '/api/pay', { cpId, amount, kind });
+      haptic('heavy');
+      const undo = h('button', { class: 'btn secondary' }, 'Отменить проводку');
+      undo.onclick = async () => {
+        await api('POST', '/api/op/delete', { id: res.id, cpId });
+        haptic('medium');
+        say('bot', 'Проводка убрана.');
+      };
+      const left = Number(res.balance) || 0;
+      say('bot', `Внёс: ${res.kind} ${money(res.sum)} по «${res.cpName}». `
+        + (left > 0 ? `Остаток долга ${money(left)}.`
+          : left < 0 ? `Переплата ${money(Math.abs(left))}.` : 'Расчёты закрыты.'), undo);
+    } catch (e) { say('bot', e.message); }
+  };
+
   const say = (who, text, action) => {
     const bubble = h('div', { class: `bubble ${who}` }, h('div', { text }));
     if (action) bubble.append(h('div', { class: 'btn-wrap' }, action));
@@ -2460,15 +2482,80 @@ screens.ask = async function ask() {
   const field = h('input', { class: 'ask-input', type: 'text', placeholder: 'Что нужно сделать?',
     enterkeyhint: 'send', autocomplete: 'off' });
 
-  const answer = (r) => {
+  // Асинхронный: оплату ассистент вносит сам, а это обращение к серверу.
+  const answer = async (r) => {
     if (r.heard) say('me', r.heard);
     if (r.error) { say('bot', r.error); return; }
 
     if (r.action === 'draft') {
+      const open = (extra) => () => {
+        haptic('medium');
+        go('new', {
+          type: r.docType,
+          items: r.items || [],
+          vatRate: r.vatRate,
+          priceIncludesVat: r.priceIncludesVat,
+          ...extra,
+        });
+      };
+
+      // Несколько похожих — спрашиваем, кого именно, а не берём наугад.
+      if (r.cpChoices && r.cpChoices.length) {
+        const box2 = h('div', { class: 'btn-wrap' },
+          r.cpChoices.map((c) => h('button', { class: 'btn secondary', onclick: open({ cpId: c.id }) }, c.name)));
+        say('bot', `Кого именно вы имели в виду — «${r.who}»? `
+          + 'Выберите — покажу документ на проверку, сам я ничего не выписываю.', box2);
+        return;
+      }
+      // Названного клиента нет: заводить молча нельзя, но и промолчать плохо.
+      if (r.cpMissing) {
+        const add = h('button', { class: 'btn' }, `Завести «${r.who}»`);
+        add.onclick = () => { haptic('medium'); go('cp', { name: r.who }); };
+        // Обещание «сам я ничего не выписываю» повторяем и здесь: оно должно
+        // звучать на каждой ветке, а не только когда всё сошлось.
+        say('bot', `Клиента «${r.who}» у вас пока нет. Могу завести — имя подставлю, `
+          + 'останется ИНН и реквизиты. А сам я ничего не выписываю — '
+          + 'документ выпустите вы кнопкой.', add);
+        return;
+      }
       const btn = h('button', { class: 'btn' }, 'Заполнить документ');
-      btn.onclick = () => { haptic('medium'); go('new', { type: r.docType, items: r.items || [] }); };
-      say('bot', r.who ? `Готовлю документ для «${r.who}». Проверьте поля и нажмите выпуск — сам я ничего не выписываю.`
+      btn.onclick = open(r.cpId ? { cpId: r.cpId } : {});
+      say('bot', r.cpName
+        ? `Готовлю документ для «${r.cpName}». Проверьте поля и нажмите выпуск — сам я ничего не выписываю.`
         : 'Готовлю документ. Клиента выберете на следующем экране.', btn);
+      return;
+    }
+    /*
+     * Оплата — ассистент вносит её сам, а не отправляет в карточку клиента.
+     * Ровно то, ради чего его и включают.
+     */
+    if (r.action === 'pay') {
+      if (r.cpChoices && r.cpChoices.length) {
+        const pick = h('div', { class: 'btn-wrap' }, r.cpChoices.map((c) => h('button', {
+          class: 'btn secondary',
+          onclick: () => doPay(c.id, c.name, r.amount, r.kind),
+        }, c.name)));
+        say('bot', `По кому вносим — «${r.who}»?`, pick);
+        return;
+      }
+      if (r.cpMissing || !r.cpId) {
+        say('bot', r.who
+          ? `Клиента «${r.who}» у вас нет — по кому вносить оплату, непонятно.`
+          : 'По кому вносим? Назовите клиента, например «проведи оплату по Заре 50000».');
+        return;
+      }
+      if (!r.amount) {
+        const owed = Number(r.balance) || 0;
+        if (owed <= 0) {
+          say('bot', `За «${r.cpName}» долга сейчас нет. Назовите сумму — «оплата 50000».`);
+          return;
+        }
+        const yes = h('button', { class: 'btn' }, `Внести ${money(owed)}`);
+        yes.onclick = () => doPay(r.cpId, r.cpName, owed, r.kind);
+        say('bot', `За «${r.cpName}» числится ${money(owed)}. Внести эту сумму?`, yes);
+        return;
+      }
+      await doPay(r.cpId, r.cpName, r.amount, r.kind);
       return;
     }
     if (r.action === 'outofscope') {
@@ -2507,7 +2594,7 @@ screens.ask = async function ask() {
     const text = field.value.trim();
     if (!text) return;
     field.value = '';
-    try { answer(await api('POST', '/api/ask', { text })); } catch (e) { say('bot', e.message); }
+    try { await answer(await api('POST', '/api/ask', { text })); } catch (e) { say('bot', e.message); }
   };
   field.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); send(); } };
 
@@ -2521,7 +2608,7 @@ screens.ask = async function ask() {
       const { audio, seconds } = await r.stop();
       if (!seconds) { say('bot', 'Запись пустая — кажется, микрофон не слышит.'); return; }
       say('bot', '🎧 Слушаю…');
-      try { answer(await api('POST', '/api/ask/voice', { audio, seconds })); } catch (e) { say('bot', e.message); }
+      try { await answer(await api('POST', '/api/ask/voice', { audio, seconds })); } catch (e) { say('bot', e.message); }
       return;
     }
     try {
@@ -3406,7 +3493,16 @@ screens.new = async function newDoc(params) {
   ]);
 
   const draft = {
-    cpId: Number(params.cpId) || (cps[0] && cps[0].id) || 0,
+    /*
+     * Первого из списка подставляем, ТОЛЬКО если он там один.
+     *
+     * Раньше подставлялся всегда: экран, открытый без cpId, молча выбирал
+     * cps[0]. Из чата это выглядело так — бот пишет «Готовлю документ для
+     * „Заря“», а в поле «Кому» стоит совсем другая фирма, и человек этого не
+     * ждёт и не перепроверяет. Когда клиент один, выбирать не из чего;
+     * когда их несколько — пусть лучше поле будет пустым и потребует ответа.
+     */
+    cpId: Number(params.cpId) || (cps.length === 1 ? cps[0].id : 0),
     date: todayISO(),
     items: (params.items || []).map((it) => ({ ...it })),
     // Ставка, названную во фразе («…с НДС 22%»), доносим до выпуска. Не
@@ -3427,6 +3523,7 @@ screens.new = async function newDoc(params) {
   }
 
   const cpSel = h('select', { id: 'f-cp' },
+    draft.cpId ? [] : [h('option', { value: '', selected: true }, '— выберите клиента —')],
     cps.map((cp) => h('option', { value: cp.id, selected: cp.id === draft.cpId }, cp.name)));
   const dateInput = h('input', { id: 'f-date', type: 'date', value: draft.date });
 
@@ -3514,6 +3611,7 @@ screens.new = async function newDoc(params) {
   const issue = async () => {
     const items = draft.items.filter((it) => it.name.trim());
     if (!items.length) { toast('Добавьте хотя бы одну позицию', true); return; }
+    if (!Number(cpSel.value)) { toast('Выберите, кому выписываем', true); cpSel.focus(); return; }
     try {
       if (tg) tg.MainButton.showProgress();
       const payload = { type, cpId: Number(cpSel.value), date: dateInput.value, items };

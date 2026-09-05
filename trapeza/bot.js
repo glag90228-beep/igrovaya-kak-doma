@@ -7,7 +7,7 @@
 
 const { Telegram, keyboard } = require('./lib/tg');
 const bdb = require('./lib/bot-db');
-const { formatRub, amountInWords, round2, vatTotals } = require('./lib/money');
+const { formatRub, formatMoney, amountInWords, round2, vatTotals } = require('./lib/money');
 const { buildAkt } = require('./lib/xlsx-akt');
 const { buildRegistry } = require('./lib/xlsx-registry');
 const { buildAktUslugHtml } = require('./lib/akt-uslug');
@@ -2065,6 +2065,55 @@ async function showBasis(tg, chatId, user) {
  *
  * @returns {Promise<boolean>} true — ответили, меню показывать не надо
  */
+/**
+ * Вносит оплату (или приход) и отчитывается, что сделал.
+ *
+ * Сумма не названа — не гадаем: показываем долг из журнала и предлагаем
+ * внести его целиком одной кнопкой. Внесённое сразу можно отменить: раз
+ * проводку сделал бот, у человека должен быть способ убрать её тем же
+ * количеством нажатий, каким она появилась.
+ */
+async function recordPay(tg, chatId, user, cpId, amount, kind) {
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+  const isIncome = kind === 'Приход';
+  const sum = round2(Number(amount) || 0);
+
+  if (!sum) {
+    const bal = bdb.balanceOf(user.id, cpId);
+    const owed = round2(Math.abs(bal.closing));
+    if (!owed || bal.closing <= 0) {
+      await tg.sendMessage(chatId,
+        `За «${esc(cp.name)}» сейчас долга нет. Напишите сумму — например «оплата 50000».`,
+        keyboard([[{ text: `📂 Карточка «${cp.name}»`.slice(0, 60), data: `cp:${cpId}` }],
+          [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
+    await tg.sendMessage(chatId,
+      `За «${esc(cp.name)}» числится <b>${formatRub(owed)}</b>. Внести эту сумму как оплату?`,
+      keyboard([
+        [{ text: `✅ Да, ${formatMoney(owed)}`, data: `pay.cp:${cpId}:${owed}:o` }],
+        [{ text: '⬅️ Меню', data: 'menu' }],
+      ]));
+    return;
+  }
+
+  const op = { date: todayISO(), kind: isIncome ? 'Приход' : 'Оплата' };
+  if (isIncome) op.credit = sum; else op.debit = sum;
+  const opId = bdb.addOp(user.id, cpId, op);
+  const bal = bdb.balanceOf(user.id, cpId);
+  const closing = round2(bal.closing);
+  await tg.sendMessage(chatId,
+    `✅ Внёс: <b>${op.kind} ${formatRub(sum)}</b> по «${esc(cp.name)}» за ${ru(op.date)}.\n\n`
+    + (closing > 0 ? `Остаток долга: <b>${formatRub(closing)}</b>.`
+      : closing < 0 ? `Переплата: <b>${formatRub(Math.abs(closing))}</b>.`
+        : 'Расчёты закрыты — долга нет.'),
+    keyboard([
+      [{ text: '↩️ Отменить проводку', data: `pay.undo:${cpId}:${opId}` }],
+      [{ text: `📂 Карточка «${cp.name}»`.slice(0, 60), data: `cp:${cpId}` }],
+    ]));
+}
+
 async function handleFreeText(tg, chatId, user, text) {
   // Выключенный ассистент не должен ни разбирать фразы, ни ходить к модели:
   // человек выключил его именно чтобы бот не угадывал за него.
@@ -2077,6 +2126,40 @@ async function handleFreeText(tg, chatId, user, text) {
   if (intent.action === 'cps') { await showCps(tg, chatId, user); return true; }
   if (intent.action === 'org') { await showOrg(tg, chatId, user); return true; }
   if (intent.action === 'vat') { await showVat(tg, chatId, user); return true; }
+
+  /*
+   * Оплата по фразе — ассистент вносит её сам.
+   *
+   * Ради этого переключатель и заводился: включён — бот делает, а не готовит
+   * человеку форму, которую тот и так умеет открыть руками. Проводка для
+   * этого подходит лучше всего: она обратима одной кнопкой, в отличие от
+   * выписанного документа с номером в сквозном ряду.
+   *
+   * Чего не хватает — спрашиваем, а не выдумываем. Не назван клиент — даём
+   * список; не названа сумма — показываем ту, что числится за ним в журнале,
+   * и предлагаем нажать. «Проведи оплату, я всё получил» — обычная фраза, и
+   * ответ на неё в журнале есть.
+   */
+  if (intent.action === 'pay') {
+    const cps = bdb.listCps(user.id);
+    if (!cps.length) {
+      await tg.sendMessage(chatId, 'Сначала добавьте клиента — потом внесём оплату.',
+        keyboard([[{ text: '👤 Добавить клиента', data: 'cp.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return true;
+    }
+    const found = intent.who ? ai.matchCp(cps, intent.who) : {};
+    const cp = found.cp || (cps.length === 1 ? cps[0] : null);
+    if (!cp) {
+      const rows = (found.choices || cps).slice(0, 8)
+        .map((c) => ([{ text: c.name.slice(0, 60), data: `pay.cp:${c.id}:${intent.amount || 0}:${intent.kind === 'Приход' ? 'p' : 'o'}` }]));
+      await tg.sendMessage(chatId,
+        intent.who ? `Кого именно вы имели в виду — «${esc(intent.who)}»?` : 'По кому вносим?',
+        keyboard([...rows, [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return true;
+    }
+    await recordPay(tg, chatId, user, cp.id, intent.amount, intent.kind);
+    return true;
+  }
   if (intent.action === 'recurring') { await showRecurring(tg, chatId, user); return true; }
   if (intent.action === 'billing') { await showBilling(tg, chatId, user); return true; }
   if (intent.action === 'help') return false;      // помощь и так в меню
@@ -4364,6 +4447,22 @@ async function handleCallback(tg, cq) {
     if (data === 'org.new') { await startForm(tg, chatId, user, 'org'); return; }
     if (data === 'cps') { await showCps(tg, chatId, user); return; }
     if (data === 'cp.new') { await startForm(tg, chatId, user, 'cp'); return; }
+    // Выбор клиента и суммы для проводки, начатой фразой.
+    if (data.startsWith('pay.cp:')) {
+      const [cpIdStr, sumStr, kindFlag] = data.slice(7).split(':');
+      await recordPay(tg, chatId, user, Number(cpIdStr), Number(sumStr), kindFlag === 'p' ? 'Приход' : 'Оплата');
+      return;
+    }
+    if (data.startsWith('pay.undo:')) {
+      const [cpIdStr, opIdStr] = data.slice(9).split(':');
+      const gone = bdb.deleteOp(user.id, Number(opIdStr));
+      const bal = bdb.balanceOf(user.id, Number(cpIdStr));
+      await tg.sendMessage(chatId, gone
+        ? `↩️ Проводка убрана. Сальдо: <b>${formatRub(Math.abs(round2(bal.closing)))}</b>.`
+        : 'Эта проводка уже убрана.',
+      keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
     /*
      * «Завести клиента с этим именем и вернуться к документу».
      *

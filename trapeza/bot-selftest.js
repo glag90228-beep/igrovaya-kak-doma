@@ -4243,6 +4243,67 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       `ст.${npdVat.saved.status} ставка ${npdVat.saved.vatRate}`);
   }
 
+  console.log('\n── оплата словами: путь целиком ──');
+  {
+    /*
+     * Проверка идёт по всей цепочке, а не по кускам.
+     *
+     * Владелец написал «проведи оплату по этому контрагенту» и не получил
+     * ничего: действия «внести оплату» в разборе не существовало вовсе, и
+     * фраза уходила в пустоту. Куски при этом были все — и разбор, и addOp, и
+     * сальдо. Поэтому здесь проверяется именно путь: фраза внутрь, изменённый
+     * журнал наружу, отмена возвращает как было.
+     */
+    const bdbP = require('./lib/bot-db');
+    const { round2 } = require('./lib/money');
+    const uidP = fxUserId();
+    const cpP = bdbP.createCp(uidP, { name: 'ООО «Платёжкин»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbP.addOp(uidP, cpP, { date: '2026-08-01', kind: 'Приход', doc: 'Акт 9', credit: 80000 });
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 80000, 'за клиентом числится 80 000');
+
+    await say('проведи оплату по Платёжкин 30000');
+    ok(/Внёс/.test(last()) && norm(last()).includes('30 000,00'),
+      'бот отчитался, что внёс оплату', norm(last()).slice(0, 80));
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 50000,
+      'и сальдо действительно изменилось: 80 000 − 30 000',
+      bdbP.balanceOf(uidP, cpP).closing);
+    ok(norm(last()).includes('50 000,00'), 'остаток долга назван в ответе', norm(last()).slice(-60));
+
+    // Отмена одним нажатием — раз проводку сделал бот, убрать её должно быть
+    // так же просто, как она появилась.
+    const undo = button('Отменить проводку');
+    ok(Boolean(undo), 'есть кнопка отмены', undo);
+    await tap(undo);
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 80000,
+      'отмена вернула сальдо как было', bdbP.balanceOf(uidP, cpP).closing);
+
+    // Сумму не назвали — бот берёт её из журнала и спрашивает, а не гадает.
+    await say('проведи оплату по Платёжкин, я всё получил');
+    ok(norm(last()).includes('80 000,00') && /Внести эту сумму/.test(last()),
+      'без суммы бот показывает долг из журнала и предлагает его', norm(last()).slice(0, 90));
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 80000,
+      'и НИЧЕГО не вносит, пока не нажали', bdbP.balanceOf(uidP, cpP).closing);
+
+    const yes = button('Да,');
+    ok(Boolean(yes), 'кнопка подтверждения есть', yes);
+    await tap(yes);
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 0,
+      'после нажатия расчёты закрыты', bdbP.balanceOf(uidP, cpP).closing);
+
+    // Приход — вторая сторона: он увеличивает долг, а не гасит его.
+    await say('проведи приход по Платёжкин 15000');
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 15000,
+      '«приход» двигает сальдо в другую сторону, чем «оплата»',
+      bdbP.balanceOf(uidP, cpP).closing);
+
+    // При выключенном ассистенте фраза не делает ничего.
+    bdbP.setAiEnabled(uidP, false);
+    await say('проведи оплату по Платёжкин 15000');
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 15000,
+      'выключенный ассистент в журнал не лезет', bdbP.balanceOf(uidP, cpP).closing);
+    bdbP.setAiEnabled(uidP, true);
+  }
+
   console.log('\n── названный клиент, которого нет ──');
   {
     /*

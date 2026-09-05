@@ -199,6 +199,24 @@ const ruDate = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(iso || '')
 // ---------- сборка данных для экранов ----------
 
 /** Всё, что нужно главному экрану, одним запросом — меньше походов по сети. */
+function withCp(user, intent) {
+  if (!intent || (intent.action !== 'draft' && intent.action !== 'pay')) return intent;
+  const cps = bdb.listCps(user.id);
+  if (!intent.who) return { ...intent, cpChoices: cps.length === 1 ? undefined : [] };
+  const found = ai.matchCp(cps, intent.who);
+  if (found.cp) {
+    const out = { ...intent, cpId: found.cp.id, cpName: found.cp.name };
+    // Для оплаты сразу отдаём долг из журнала: если сумму не назвали, именно
+    // её приложение и предложит внести — гадать не придётся.
+    if (intent.action === 'pay') out.balance = round2(bdb.balanceOf(user.id, found.cp.id).closing);
+    return out;
+  }
+  if (found.choices) {
+    return { ...intent, cpChoices: found.choices.map((c) => ({ id: c.id, name: c.name })) };
+  }
+  return { ...intent, cpMissing: true };
+}
+
 function stateFor(user) {
   const org = bdb.getDefaultOrg(user.id);
   const quota = bdb.quota(user.id);
@@ -351,6 +369,26 @@ async function makeAkt(user, org, p, caption) {
 
 const api = {
   async 'GET /api/state'({ user }) { return stateFor(user); },
+
+  /**
+   * Оплата по фразе — вносим, а не отправляем человека в карточку.
+   *
+   * Ради этого ассистент и включают: он должен делать, а не готовить экран,
+   * который человек и сам умеет открыть. Проводка обратима, поэтому её можно
+   * доверить фразе; выписку документа — нет, там номер в сквозном ряду.
+   */
+  async 'POST /api/pay'({ user, body }) {
+    const cpId = Number(body.cpId);
+    const cp = bdb.getCp(user.id, cpId);
+    if (!cp) return { error: 'Контрагент не найден.' };
+    const sum = round2(Number(body.amount) || 0);
+    if (sum <= 0) return { error: 'Сумма должна быть больше нуля.' };
+    const isIncome = body.kind === 'Приход';
+    const op = { date: str(body.date, 10) || docService.todayISO(), kind: isIncome ? 'Приход' : 'Оплата' };
+    if (isIncome) op.credit = sum; else op.debit = sum;
+    const id = bdb.addOp(user.id, cpId, op);
+    return { id, kind: op.kind, sum, cpName: cp.name, balance: round2(bdb.balanceOf(user.id, cpId).closing) };
+  },
 
   /** Переключатель ИИ-ассистента: то же, что кнопка в боте. */
   async 'POST /api/user/ai'({ user, body }) {
@@ -1370,11 +1408,23 @@ const api = {
    * счёт нельзя тихо удалить. Приложение по ответу открывает нужный экран,
    * кнопку жмёт человек.
    */
+  /*
+   * Имя из фразы превращаем в конкретного контрагента прямо здесь.
+   *
+   * Раньше наружу уходило только «who» — имя словами. Приложение открывало
+   * черновик, не передавая никакого cpId, а тот молча подставлял ПЕРВОГО
+   * контрагента из списка. Бот при этом писал «Готовлю документ для „Заря“»,
+   * и человек видел на экране совсем другую фирму. Выписать документ не тому
+   * клиенту — из тех ошибок, что замечают у контрагента, а не у себя.
+   *
+   * Поиск тот же, что в боте (ai.matchCp): одно совпадение — берём, несколько
+   * — отдаём выбор, ни одного — честно говорим, что такого клиента нет.
+   */
   async 'POST /api/ask'({ user, body }) {
     const text = str(body.text, 1000);
     if (!text) return { error: 'Напишите или скажите, что нужно.' };
     const intent = await ai.understand(text, user.id);
-    return { ...intent, heard: text, budget: ai.budget(user.id) };
+    return { ...withCp(user, intent), heard: text, budget: ai.budget(user.id) };
   },
 
   /** То же самое, но голосом: расшифровали и сразу разобрали. */
@@ -1407,7 +1457,7 @@ const api = {
       return { error: got.error };
     }
     const intent = await ai.understand(got.text, user.id);
-    return { ...intent, heard: got.text, budget: ai.budget(user.id) };
+    return { ...withCp(user, intent), heard: got.text, budget: ai.budget(user.id) };
   },
 
   /** Журнал операций одного контрагента: что именно держит его сальдо. */
