@@ -2115,9 +2115,18 @@ async function recordPay(tg, chatId, user, cpId, amount, kind) {
 }
 
 async function handleFreeText(tg, chatId, user, text) {
-  // Выключенный ассистент не должен ни разбирать фразы, ни ходить к модели:
-  // человек выключил его именно чтобы бот не угадывал за него.
-  if (!bdb.isAiEnabled(user.id)) return false;
+  /*
+   * Тумблер решает не «понимать или нет», а «делать или показать кнопку».
+   *
+   * Включён — ассистент выписывает документ сам и отдаёт файл: человек
+   * попросил словами, это и есть его нажатие. Выключен — тот же разбор, но в
+   * конце предпросмотр и кнопка: «я подготовил, выпускайте вы».
+   *
+   * Первая редакция просто отключала разбор целиком, и получалось, что
+   * выключенный ассистент делает вид, будто не слышал вопроса. Это не то, что
+   * от него хотели: не доверяют ему выписку, а не понимание.
+   */
+  const auto = bdb.isAiEnabled(user.id);
   const intent = await ai.understand(text, user.id);
 
   if (intent.action === 'debts') { await showDebts(tg, chatId, user); return true; }
@@ -2155,6 +2164,23 @@ async function handleFreeText(tg, chatId, user, text) {
       await tg.sendMessage(chatId,
         intent.who ? `Кого именно вы имели в виду — «${esc(intent.who)}»?` : 'По кому вносим?',
         keyboard([...rows, [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return true;
+    }
+    if (!auto) {
+      const sum = round2(Number(intent.amount) || 0);
+      const bal = round2(Math.abs(bdb.balanceOf(user.id, cp.id).closing));
+      const use = sum || bal;
+      if (!use) {
+        await tg.sendMessage(chatId, `За «${esc(cp.name)}» долга нет. Напишите сумму.`, mainMenu());
+        return true;
+      }
+      await tg.sendMessage(chatId,
+        `Подготовил: <b>${intent.kind} ${formatRub(use)}</b> по «${esc(cp.name)}».\n\n`
+        + '<i>Сам я ничего не провожу — нажмите, и внесу.</i>',
+        keyboard([
+          [{ text: `✅ Внести ${formatMoney(use)}`, data: `pay.cp:${cp.id}:${use}:${intent.kind === 'Приход' ? 'p' : 'o'}` }],
+          [{ text: '⬅️ Меню', data: 'menu' }],
+        ]));
       return true;
     }
     await recordPay(tg, chatId, user, cp.id, intent.amount, intent.kind);
@@ -2266,9 +2292,18 @@ async function handleFreeText(tg, chatId, user, text) {
       if (st && st.state.startsWith('items:')) {
         st.data.items = items;
         bdb.setState(user.id, st.state, st.data);
-        // Показываем сразу готовый документ с кнопкой выпуска, а не список
-        // записанного: позиции уже разобраны, и лишний шаг «нажмите Готово»
-        // ничего не проверяет — человек всё равно смотрит на итог.
+        /*
+         * Включённый ассистент доводит дело до файла.
+         *
+         * Просьба словами — это и есть нажатие: человек сказал, что ему
+         * нужно, и ждёт документ, а не форму. Выписанное при этом не
+         * бесследно: документ виден в журнале и удаляется оттуда, а бот
+         * сразу говорит, что именно выписал.
+         */
+        if (auto) {
+          await finishItems(tg, chatId, user, bdb.getState(user.id));
+          return true;
+        }
         await showPreview(tg, chatId, user, bdb.getState(user.id));
         return true;
       }

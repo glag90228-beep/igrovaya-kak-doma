@@ -368,6 +368,13 @@ const ok = (c, m, extra) => {
     hello.slice(0, 60));
   ok(await page.evaluate(() => Boolean(document.querySelector('.mic'))), 'кнопка записи на месте');
 
+  /*
+   * Обещание «сам я ничего не выписываю» верно ровно в одном режиме — когда
+   * тумблер ассистента выключен. Включённый ассистент, наоборот, обязан
+   * довести дело до файла: ради этого тумблер и заведён. Поэтому проверяем в
+   * выключенном положении, а не «вообще».
+   */
+  bdb.setAiEnabled(user.id, false);
   const docsWas = bdb.listDocs(user.id, 50).length;
   await page.locator('.ask-input').fill('выставь счёт Заре');
   await page.locator('.ask-input').press('Enter');
@@ -375,9 +382,10 @@ const ok = (c, m, extra) => {
   const replies = await page.evaluate(() => [...document.querySelectorAll('.bubble')].map((b) => b.textContent));
   ok(replies.some((t) => /Заре/.test(t)), 'услышанное показано в переписке', replies.length);
   ok(replies.some((t) => /сам я ничего не выписываю/.test(t)),
-    'и сказано прямо: сам не выписывает');
+    'с выключенным тумблером сказано прямо: сам не выписывает');
   ok(bdb.listDocs(user.id, 50).length === docsWas,
-    'документ действительно не выписан', `${docsWas} → ${bdb.listDocs(user.id, 50).length}`);
+    'и документ действительно не выписан', `${docsWas} → ${bdb.listDocs(user.id, 50).length}`);
+  bdb.setAiEnabled(user.id, true);
 
   await page.locator('.ask-input').fill('когда платить взносы за себя');
   await page.locator('.ask-input').press('Enter');

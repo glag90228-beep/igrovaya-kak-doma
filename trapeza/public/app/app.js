@@ -2504,7 +2504,8 @@ screens.ask = async function ask() {
         const box2 = h('div', { class: 'btn-wrap' },
           r.cpChoices.map((c) => h('button', { class: 'btn secondary', onclick: open({ cpId: c.id }) }, c.name)));
         say('bot', `Кого именно вы имели в виду — «${r.who}»? `
-          + 'Выберите — покажу документ на проверку, сам я ничего не выписываю.', box2);
+          + (r.auto ? 'Выберите — и выпишу.'
+            : 'Выберите — покажу документ на проверку, сам я ничего не выписываю.'), box2);
         return;
       }
       // Названного клиента нет: заводить молча нельзя, но и промолчать плохо.
@@ -2514,14 +2515,41 @@ screens.ask = async function ask() {
         // Обещание «сам я ничего не выписываю» повторяем и здесь: оно должно
         // звучать на каждой ветке, а не только когда всё сошлось.
         say('bot', `Клиента «${r.who}» у вас пока нет. Могу завести — имя подставлю, `
-          + 'останется ИНН и реквизиты. А сам я ничего не выписываю — '
-          + 'документ выпустите вы кнопкой.', add);
+          + 'останется ИНН и реквизиты.'
+          + (r.auto ? '' : ' А сам я ничего не выписываю — документ выпустите вы кнопкой.'), add);
+        return;
+      }
+      /*
+       * Включённый ассистент доводит до файла сам, выключенный — открывает
+       * форму с кнопкой. В этом и весь смысл тумблера; текст поэтому зависит
+       * от режима, а не прибит гвоздями.
+       */
+      if (r.auto && r.cpId && (r.items || []).length) {
+        try {
+          const payload = {
+            type: r.docType, cpId: r.cpId, date: todayISO(),
+            items: r.items,
+          };
+          if (r.vatRate !== undefined) {
+            payload.vatRate = r.vatRate;
+            payload.priceIncludesVat = Boolean(r.priceIncludesVat);
+          }
+          const made = await api('POST', '/api/doc', payload);
+          haptic('heavy');
+          const openDoc = h('button', { class: 'btn secondary' }, 'Открыть документ');
+          openDoc.onclick = () => { haptic(); download(made.file); };
+          say('bot', `Выписал: ${made.doc.title} № ${made.doc.number} для «${r.cpName}» `
+            + `на ${money(made.total)}. Файл в чате с ботом; отсюда — кнопкой ниже. `
+            + 'Ненужное удаляется из журнала смахиванием.', openDoc);
+          download(made.file);
+        } catch (e) { say('bot', e.message); }
         return;
       }
       const btn = h('button', { class: 'btn' }, 'Заполнить документ');
       btn.onclick = open(r.cpId ? { cpId: r.cpId } : {});
       say('bot', r.cpName
-        ? `Готовлю документ для «${r.cpName}». Проверьте поля и нажмите выпуск — сам я ничего не выписываю.`
+        ? `Готовлю документ для «${r.cpName}». Проверьте поля и нажмите выпуск`
+          + (r.auto ? '.' : ' — сам я ничего не выписываю.')
         : 'Готовлю документ. Клиента выберете на следующем экране.', btn);
       return;
     }
@@ -2553,6 +2581,13 @@ screens.ask = async function ask() {
         const yes = h('button', { class: 'btn' }, `Внести ${money(owed)}`);
         yes.onclick = () => doPay(r.cpId, r.cpName, owed, r.kind);
         say('bot', `За «${r.cpName}» числится ${money(owed)}. Внести эту сумму?`, yes);
+        return;
+      }
+      if (!r.auto) {
+        const go2 = h('button', { class: 'btn' }, `Внести ${money(r.amount)}`);
+        go2.onclick = () => doPay(r.cpId, r.cpName, r.amount, r.kind);
+        say('bot', `Подготовил: ${r.kind} ${money(r.amount)} по «${r.cpName}». `
+          + 'Сам я ничего не провожу — нажмите, и внесу.', go2);
         return;
       }
       await doPay(r.cpId, r.cpName, r.amount, r.kind);

@@ -1424,7 +1424,7 @@ const api = {
     const text = str(body.text, 1000);
     if (!text) return { error: 'Напишите или скажите, что нужно.' };
     const intent = await ai.understand(text, user.id);
-    return { ...withCp(user, intent), heard: text, budget: ai.budget(user.id) };
+    return { ...withCp(user, intent), heard: text, auto: bdb.isAiEnabled(user.id), budget: ai.budget(user.id) };
   },
 
   /** То же самое, но голосом: расшифровали и сразу разобрали. */
@@ -1457,7 +1457,7 @@ const api = {
       return { error: got.error };
     }
     const intent = await ai.understand(got.text, user.id);
-    return { ...withCp(user, intent), heard: got.text, budget: ai.budget(user.id) };
+    return { ...withCp(user, intent), heard: got.text, auto: bdb.isAiEnabled(user.id), budget: ai.budget(user.id) };
   },
 
   /** Журнал операций одного контрагента: что именно держит его сальдо. */

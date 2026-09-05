@@ -2332,15 +2332,23 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(intent.source === 'limit', 'личный предел останавливает расход', intent.source);
     delete process.env.AI_USER_LIMIT;
 
-    // Через бота: фраза открывает мастер, но документ не выписывается.
+    /*
+     * Через бота — и здесь всё решает тумблер.
+     *
+     * Выключен: фраза разбирается, мастер открывается с подставленными
+     * позициями, но документ не выписывается — «я подготовил, выпускайте вы».
+     * Включён: ассистент доводит до файла сам.
+     */
     const cpA = bdbA.createCp(uid, { name: 'ООО «Тюльпан»', kind: 'customer', opening_date: '2026-01-01' });
     process.env.AI_MOCK = JSON.stringify({
       action: 'draft', docType: 'sch', who: 'Тюльпан',
       items: [{ name: 'Обслуживание', qty: 1, price: 12000 }],
     });
+
+    bdbA.setAiEnabled(uid, false);
     const docsBefore = bdbA.listDocs(uid, 99).length;
     await say('надо выписать Тюльпану за обслуживание');
-    ok(bdbA.listDocs(uid, 99).length === docsBefore, 'документ сам не выписался',
+    ok(bdbA.listDocs(uid, 99).length === docsBefore, 'с выключенным тумблером документ сам не выписался',
       bdbA.listDocs(uid, 99).length - docsBefore);
     const st = bdbA.getState(uid);
     ok(st.state === `items:sch:${cpA}`, 'открыт обычный мастер с этим клиентом', st.state);
@@ -2349,6 +2357,13 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(norm(last()).includes('Проверьте'), 'бот просит проверить, а не отчитывается о выписке',
       norm(last()).slice(0, 60));
     await tap('menu');
+
+    bdbA.setAiEnabled(uid, true);
+    const docsOn = bdbA.listDocs(uid, 99).length;
+    await say('надо выписать Тюльпану за обслуживание');
+    ok(bdbA.listDocs(uid, 99).length === docsOn + 1,
+      'с включённым — выписал сам, без второго нажатия',
+      `${docsOn} → ${bdbA.listDocs(uid, 99).length}`);
 
     delete process.env.AI_ENABLED;
     delete process.env.AI_PROVIDER;
@@ -4302,6 +4317,65 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 15000,
       'выключенный ассистент в журнал не лезет', bdbP.balanceOf(uidP, cpP).closing);
     bdbP.setAiEnabled(uidP, true);
+  }
+
+  console.log('\n── тумблер: включён делает, выключен готовит ──');
+  {
+    /*
+     * Ради этого тумблер и заводился, и проверять надо именно переключение.
+     *
+     * Включён — ассистент доводит дело до файла: человек попросил словами, и
+     * это его нажатие. Выключен — тот же разбор, но в конце предпросмотр и
+     * кнопка. Первая редакция обещала «сам я ничего не выписываю» в обоих
+     * режимах, то есть тумблер не переключал ничего.
+     */
+    const bdbT = require('./lib/bot-db');
+    const { round2 } = require('./lib/money');
+    const uidT = fxUserId();
+    const cpT = bdbT.createCp(uidT, { name: 'ООО «Тумблер»', kind: 'customer', opening_date: '2026-01-01' });
+
+    // --- включён: документ выписывается сам ---
+    bdbT.setAiEnabled(uidT, true);
+    const wasOn = bdbT.listDocs(uidT, 200).length;
+    files.length = 0;
+    await say('выставь Тумблер счёт на 12000 за монтаж');
+    ok(bdbT.listDocs(uidT, 200).length === wasOn + 1,
+      'включённый ассистент выписал документ сам',
+      `${wasOn} → ${bdbT.listDocs(uidT, 200).length}`);
+    ok(files.length === 1, 'и отдал файл человеку', files.length);
+    ok(!/сам я ничего не выписываю/i.test(last()),
+      'и не обещает обратного', last().slice(0, 70));
+
+    // --- выключен: только подготовка ---
+    bdbT.setAiEnabled(uidT, false);
+    const wasOff = bdbT.listDocs(uidT, 200).length;
+    files.length = 0;
+    await say('выставь Тумблер счёт на 7000 за монтаж');
+    ok(bdbT.listDocs(uidT, 200).length === wasOff,
+      'выключенный — ничего не выписал', bdbT.listDocs(uidT, 200).length);
+    ok(files.length === 0, 'и файла не прислал', files.length);
+    ok(button('Сформировать') === 'doc.make',
+      'но показал предпросмотр с кнопкой выпуска', button('Сформировать'));
+
+    // и фразу он по-прежнему понимает — выключали выписку, а не слух
+    ok(norm(last()).includes('7 000,00') || norm(last()).includes('Монтаж'),
+      'разбор фразы работает и с выключенным тумблером', norm(last()).slice(0, 90));
+    // Незакрытый черновик перехватывает следующие фразы как позиции — это
+    // верное поведение бота, но дальше мы проверяем другое.
+    await tap('menu');
+
+    // --- оплата: те же два режима ---
+    bdbT.addOp(uidT, cpT, { date: '2026-08-01', kind: 'Приход', credit: 20000 });
+    const balBefore = round2(bdbT.balanceOf(uidT, cpT).closing);
+    await say('проведи оплату по Тумблер 5000');
+    ok(round2(bdbT.balanceOf(uidT, cpT).closing) === balBefore,
+      'выключенный ассистент оплату не провёл', bdbT.balanceOf(uidT, cpT).closing);
+    ok(/нажмите/i.test(last()), 'а предложил нажать', last().slice(0, 80));
+
+    bdbT.setAiEnabled(uidT, true);
+    await say('проведи оплату по Тумблер 5000');
+    ok(round2(bdbT.balanceOf(uidT, cpT).closing) === round2(balBefore - 5000),
+      'включённый — провёл сам', bdbT.balanceOf(uidT, cpT).closing);
   }
 
   console.log('\n── названный клиент, которого нет ──');
