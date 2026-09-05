@@ -558,6 +558,9 @@ screens.docs = async function docs({ cp } = {}) {
   // Сервер умеет отдавать журнал по одному клиенту — в приложении этим
   // никто не пользовался, хотя из его карточки это первое, что нужно.
   const { docs: list } = await api('GET', `/api/docs${cp ? `?cp=${cp}` : ''}`);
+  // Режим НДС нужен, чтобы решить, показывать ли счета-фактуры. Кэш может
+  // быть пуст, если на этот экран пришли сразу по ссылке.
+  const st = cache.org ? cache : await api('GET', '/api/state');
   const box = h('div', {}, h('h1', { text: 'Документы' }));
   if (!list.length) {
     /*
@@ -585,6 +588,18 @@ screens.docs = async function docs({ cp } = {}) {
   box.append(h('div', { class: 'btn-wrap' },
     h('button', { class: 'btn', onclick: () => { haptic('medium'); go('new', { type: 'sch' }); } },
       'Выписать документ')));
+  /*
+   * Счета-фактуры — отдельным рядом и только плательщику НДС. Кнопка, ведущая
+   * к отказу, хуже отсутствующей: человек решит, что сломано, а не что нельзя.
+   */
+  if (cp && st.org && st.org.vat_rate && !Number(st.org.npd)) {
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn secondary', onclick: () => { haptic('medium'); go('avans', { cpId: cp }); } },
+        'СФ на аванс'),
+      h('button', { class: 'btn secondary', onclick: () => { haptic('medium'); go('ksf', { cpId: cp }); } },
+        'Корректировка')));
+  }
+
   box.append(h('div', { class: 'card' }, list.map((d) => swipeToDelete(
     navRow({
       icon: 'doc',
@@ -899,6 +914,32 @@ screens.doc = async function docScreen({ id }) {
         download(r.file);
       }),
     }, 'Прислать файл заново')));
+
+  /*
+   * Исправление — только у счёта-фактуры (УПД со статусом 1).
+   *
+   * Пересобирает тот же документ по текущим данным: поправили ИНН клиента в
+   * карточке — исправление выйдет с верным. Номер и дата остаются прежними.
+   * Для изменения стоимости по договорённости это не годится: там
+   * корректировочный, и это другой документ.
+   */
+  if (d.type === 'upd' && d.status === 1) {
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', {
+        class: 'btn secondary',
+        onclick: (e) => withBusy(e.currentTarget, async () => {
+          try {
+            const r = await api('POST', '/api/doc/fix', { id: d.id });
+            haptic('medium');
+            toast(`Исправление № ${r.no} готово`);
+            download(r.file);
+          } catch (err) { toast(err.message, true); }
+        }),
+      }, d.fixNo ? `Исправление № ${d.fixNo + 1}` : 'Выставить исправление')));
+    box.append(h('p', { class: 'small muted', style: 'margin:4px 18px',
+      text: 'Номер и дата счёта-фактуры не изменятся — так и должно быть. '
+        + 'Если меняется стоимость по договорённости, нужен корректировочный.' }));
+  }
 
   /*
    * Отправка клиенту на почту — если она настроена на сервере.
@@ -3519,6 +3560,162 @@ function shareToTelegram(url, text) {
   if (tg && typeof tg.openLink === 'function') { tg.openLink(share); return; }
   window.open(share, '_blank');
 }
+
+/*
+ * ---------- счета-фактуры: аванс и корректировка ----------
+ *
+ * Отдельными экранами, а не строкой в общем мастере: у аванса нет позиций, у
+ * корректировки строки парные «было/стало». Ни то, ни другое обычной таблицей
+ * позиций не набирается.
+ */
+
+/** Счёт-фактура на полученную предоплату. */
+screens.avans = async function avansScreen(params) {
+  const s = await api('GET', '/api/state');
+  const org = s.org || {};
+  const rate = org.vat_rate ? Number(org.vat_rate) : null;
+  const box = h('div', {}, h('h1', { text: 'Счёт-фактура на аванс' }));
+
+  // Неплательщику этот документ не положен — говорим прямо, а не показываем
+  // форму, которая закончится отказом.
+  if (rate == null || Number(org.npd)) {
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+      text: Number(org.npd)
+        ? 'Самозанятый не выставляет счета-фактуры: он не плательщик НДС (422-ФЗ).'
+        : 'Счёт-фактура выставляется со ставкой НДС, а у вас выбрано «без НДС».' }));
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn', onclick: () => go(Number(org.npd) ? 'npd' : 'vat') }, 'Открыть настройку')));
+    return box;
+  }
+
+  const { cps } = await api('GET', '/api/cps');
+  const cpSel = h('select', { id: 'a-cp' },
+    cps.map((c) => h('option', { value: c.id, selected: c.id === Number(params.cpId) }, c.name)));
+  const sum = field('sum', 'Получено, ₽', '', { inputmode: 'decimal', required: true,
+    hint: 'Введите сумму целиком, как пришла: налог в ней уже сидит' });
+  const payDoc = field('payDoc', 'Платёжное поручение', '', {
+    placeholder: '№ 55 от 01.09.2026',
+    hint: 'Обязательный реквизит: по нему налоговая свяжет счёт-фактуру с деньгами',
+  });
+  const subject = field('subject', 'За что', '', { placeholder: 'Монтаж по договору № 7' });
+
+  // Налог показываем сразу, пока человек печатает: ошибку видно там, где её
+  // ещё можно исправить, а не в готовом документе.
+  const calc = h('p', { class: 'small muted', style: 'margin:4px 18px' });
+  const recalc = () => {
+    const v = Number(String(sum.input.value).replace(',', '.')) || 0;
+    const vat = v > 0 ? Math.round((v * rate) / (100 + rate) * 100) / 100 : 0;
+    calc.textContent = v > 0
+      ? `Расчётная ставка ${rate}/${100 + rate}: налог ${money(vat)} из ${money(v)}`
+      : `Ставка ${rate}% — налог выделю расчётным путём, ${rate}/${100 + rate}`;
+  };
+  sum.input.oninput = recalc;
+  recalc();
+
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'field' }, h('label', { for: 'a-cp', text: 'От кого' }), cpSel),
+    sum, payDoc, subject));
+  box.append(calc);
+
+  const btn = h('button', { class: 'btn' }, 'Выписать');
+  btn.onclick = () => withBusy(btn, async () => {
+    try {
+      const r = await api('POST', '/api/doc/avans', {
+        cpId: Number(cpSel.value),
+        sum: Number(String(sum.input.value).replace(',', '.')),
+        payDoc: payDoc.input.value,
+        subject: subject.input.value,
+      });
+      haptic('heavy');
+      toast(`Выписан № ${r.doc.number}, налог ${money(r.vat)}`);
+      download(r.file);
+      go('docs');
+    } catch (e) { toast(e.message, true); }
+  });
+  box.append(h('div', { class: 'btn-wrap' }, btn));
+  return box;
+};
+
+/** Корректировочный счёт-фактура: выбрать исходный, ввести новые строки. */
+screens.ksf = async function ksfScreen(params) {
+  const box = h('div', {}, h('h1', { text: 'Корректировочный счёт-фактура' }));
+  const { docs } = await api('GET', `/api/doc/correctable?cpId=${Number(params.cpId) || 0}`);
+
+  if (!docs.length) {
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+      text: 'Корректировать нечего: по этому клиенту нет ни одного счёта-фактуры. '
+        + 'Корректировочный выставляют к уже выданному, когда стороны договорились '
+        + 'об изменении стоимости.' }));
+    return box;
+  }
+
+  // Шаг 1 — какой документ правим.
+  if (!params.baseId) {
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+      text: 'К какому счёту-фактуре корректировка?' }));
+    box.append(h('div', { class: 'card' }, docs.map((d) => navRow({
+      icon: 'doc',
+      title: `№ ${d.number} от ${ru(d.date)}`,
+      sub: money(d.total),
+      onclick: () => go('ksf', { cpId: params.cpId, baseId: d.id }),
+    }))));
+    return box;
+  }
+
+  // Шаг 2 — новые значения, строка в строку.
+  const base = docs.find((d) => d.id === Number(params.baseId));
+  if (!base) { box.append(h('p', { class: 'small muted', text: 'Документ не найден.' })); return box; }
+
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    text: `К счёту-фактуре № ${base.number} от ${ru(base.date)}. Укажите, что стало — `
+      + 'строки идут в том же порядке.' }));
+
+  // Идентификаторы полей — по номеру строки: в названии позиции бывают
+  // пробелы и кавычки, а из них выходит невалидный id.
+  const rows = base.items.map((it, i) => ({
+    it,
+    q: field(`ksfq${i}`, `${it.name} — количество`, it.qty, { inputmode: 'decimal' }),
+    pr: field(`ksfp${i}`, `${it.name} — цена`, it.price, { inputmode: 'decimal' }),
+  }));
+  const card = h('div', { class: 'card' });
+  for (const r of rows) {
+    card.append(h('p', { class: 'small muted', style: 'margin:10px 14px 0',
+      text: `Было: ${r.it.qty} × ${money(r.it.price)}` }));
+    card.append(r.q, r.pr);
+  }
+  box.append(card);
+
+  const reason = field('reason', 'Основание изменения', '', {
+    required: true, placeholder: 'Соглашение № 3 от 04.09.2026',
+    hint: 'Без основания корректировочный недействителен',
+  });
+  box.append(h('div', { class: 'card' }, reason));
+
+  const btn = h('button', { class: 'btn' }, 'Выписать корректировочный');
+  btn.onclick = () => withBusy(btn, async () => {
+    try {
+      const r = await api('POST', '/api/doc/ksf', {
+        baseId: base.id,
+        reason: reason.input.value,
+        lines: rows.map((x) => ({
+          name: x.it.name,
+          qty: Number(String(x.q.input.value).replace(',', '.')),
+          price: Number(String(x.pr.input.value).replace(',', '.')),
+        })),
+      });
+      haptic('heavy');
+      const up = (r.up || {}).total || 0;
+      const down = (r.down || {}).total || 0;
+      toast(up ? `Увеличение ${money(up)}` : `Уменьшение ${money(down)}`);
+      download(r.file);
+      go('docs');
+    } catch (e) { toast(e.message, true); }
+  });
+  box.append(h('div', { class: 'btn-wrap' }, btn));
+  box.append(h('p', { class: 'small muted', style: 'margin:8px 18px',
+    text: 'Увеличение попадёт в книгу продаж, уменьшение — в книгу покупок: это ваш вычет.' }));
+  return box;
+};
 
 screens.new = async function newDoc(params) {
   const TITLES = {

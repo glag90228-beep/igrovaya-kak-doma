@@ -256,6 +256,88 @@ async function main() {
     delete process.env.AI_ENABLED;
   }
 
+  section('счета-фактуры в приложении');
+  {
+    /*
+     * Те же три документа, что в боте, но через приложение — путь целиком:
+     * запрос внутрь, файл и запись в журнале наружу.
+     */
+    /*
+     * Отдельный пользователь, а не Маша.
+     *
+     * Здесь выписывается пять документов подряд, а бесплатных в месяц два —
+     * и выдача Маше доступа ломала бы соседние проверки, которые как раз на
+     * этот лимит и рассчитаны. Свой человек со своим доступом никому не мешает.
+     */
+    const SF = { id: 500404, first_name: 'Сергей', username: 'sf' };
+    const sfUser = initDataFor(SF);
+    const bdbS = require('./lib/bot-db');
+    const mid = bdbS.getOrCreateUser(SF.id).id;
+    bdbS.saveMyOrg(mid, { name: 'ООО «СФ»', inn: '7701234567', acc: '40702810900000000001', bik: '044525974' });
+    const orgS = bdbS.getDefaultOrg(mid);
+    bdbS.updateOrg(mid, orgS.id, { vat_rate: '22', npd: 0 });
+    require('./lib/billing').grantDays(mid, 30);
+    const cpS = bdbS.createCp(mid, { name: 'ООО «Покупатель СФ»', inn: '7707654321', kind: 'customer', opening_date: '2026-01-01' });
+
+    // --- аванс ---
+    r = await call('POST', '/api/doc/avans', { user: sfUser, body: {
+      cpId: cpS, sum: 100000, payDoc: '№ 55 от 01.09.2026', subject: 'Монтаж' } });
+    ok(r.status === 200 && r.json.vat === 18032.79,
+      'аванс выписан, налог по расчётной ставке', JSON.stringify(r.json && r.json.vat));
+    ok(r.json.file && /СФ_аванс/.test(r.json.file.name), 'и файл отдан приложению',
+      (r.json.file || {}).name);
+
+    r = await call('POST', '/api/doc/avans', { user: sfUser, body: { cpId: cpS, sum: 0 } });
+    ok(r.status === 400, 'нулевая предоплата отклоняется', (r.json || {}).error);
+
+    // --- отгрузка со ссылкой на аванс ---
+    r = await call('POST', '/api/doc', { user: sfUser, body: {
+      type: 'upd', cpId: cpS, items: [{ name: 'Монтаж', qty: 1, price: 150000 }], vatRate: 22, status: 1 } });
+    const shipId = r.json.doc.id;
+    ok(r.status === 200, 'УПД выписан через приложение', (r.json || {}).error);
+    ok(/^№ \d+ от /.test(String((bdbS.getDoc(mid, shipId).payload || {}).advDoc || '')),
+      'строка 5б заполнилась сама', (bdbS.getDoc(mid, shipId).payload || {}).advDoc);
+
+    // --- что можно корректировать ---
+    r = await call('GET', `/api/doc/correctable?cpId=${cpS}`, { user: sfUser });
+    ok(r.json.docs.some((d) => d.id === shipId), 'счёт-фактура предлагается к корректировке',
+      r.json.docs.length);
+
+    // --- корректировка ---
+    r = await call('POST', '/api/doc/ksf', { user: sfUser, body: {
+      baseId: shipId, reason: 'Соглашение № 3',
+      lines: [{ name: 'Монтаж', qty: 1, price: 130000 }] } });
+    ok(r.status === 200 && (r.json.down || {}).total === 24400,
+      'корректировка на уменьшение посчитана',
+      `${r.status} ${JSON.stringify(r.json).slice(0, 160)}`);
+
+    r = await call('POST', '/api/doc/ksf', { user: sfUser, body: {
+      baseId: shipId, reason: 'X', lines: [{ name: 'A', qty: 1, price: 1 }, { name: 'B', qty: 1, price: 2 }] } });
+    ok(r.status === 400 && /столько же строк/.test((r.json || {}).error || ''),
+      'лишняя строка отклоняется с объяснением', (r.json || {}).error);
+
+    r = await call('POST', '/api/doc/ksf', { user: sfUser, body: {
+      baseId: shipId, lines: [{ name: 'Монтаж', qty: 1, price: 130000 }] } });
+    ok(r.status === 400 && /основания/.test((r.json || {}).error || ''),
+      'без основания корректировочный не выписать', (r.json || {}).error);
+
+    // --- исправление ---
+    r = await call('POST', '/api/doc/fix', { user: sfUser, body: { id: shipId } });
+    ok(r.status === 200 && r.json.no === 1, 'исправление № 1 выписано', JSON.stringify(r.json && r.json.no));
+    r = await call('POST', '/api/doc/fix', { user: sfUser, body: { id: shipId } });
+    ok(r.json.no === 2, 'следующее — № 2, документ помнит предыдущее', r.json.no);
+    const afterFix = bdbS.getDoc(mid, shipId);
+    ok(afterFix.number === bdbS.getDoc(mid, shipId).number,
+      'номер счёта-фактуры при исправлении не меняется');
+
+    // --- неплательщику нельзя ---
+    bdbS.updateOrg(mid, orgS.id, { npd: 1 });
+    r = await call('POST', '/api/doc/avans', { user: sfUser, body: { cpId: cpS, sum: 1000 } });
+    ok(r.status === 400 && /Самозанятый/.test((r.json || {}).error || ''),
+      'самозанятому счёт-фактуру не выписать и через приложение', (r.json || {}).error);
+    bdbS.updateOrg(mid, orgS.id, { npd: 0, vat_rate: '' });
+  }
+
   section('переключатель ИИ-ассистента');
   {
     /*

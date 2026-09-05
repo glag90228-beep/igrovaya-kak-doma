@@ -48,6 +48,8 @@ const recurring = require('./lib/recurring');
 const bizTypes = require('./lib/biz-types');
 const reqCheck = require('./lib/requisites-check');
 const { round2 } = require('./lib/money');
+const { advanceVat } = require('./lib/avans');
+const { correctionRow, correctionTotals } = require('./lib/ksf');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
 const { payLink, priceText, yearSaving, planTitle, plans: lavaPlans } = require('./lib/lava');
 const { currentYear } = require('./lib/period');
@@ -303,6 +305,10 @@ function docBrief(d) {
     // Долг по документу отменён руками — приложению это надо показать и дать
     // обратный ход, иначе отмена выходит дорогой в один конец.
     noDebt: Boolean(d.no_debt),
+    // Статус УПД и номер уже сделанного исправления: по ним приложение решает,
+    // показывать ли кнопку исправления и какой номер на ней написать.
+    status: Number((d.payload || {}).status) || 0,
+    fixNo: Number((((d.payload || {}).fix) || {}).no) || 0,
     items: (d.payload && d.payload.items) || [],
   };
 }
@@ -1563,6 +1569,125 @@ const api = {
       file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf },
       sentToChat: Boolean(tg),
     };
+  },
+
+  /*
+   * Счёт-фактура на аванс.
+   *
+   * Сумма приходит ЦЕЛИКОМ, как её получили: налог сидит внутри и выделяется
+   * расчётной ставкой. Проверка на плательщика НДС — в issueFlat, одна на бот
+   * и приложение: расходиться им нельзя.
+   */
+  async 'POST /api/doc/avans'({ user, body }) {
+    const org = bdb.getDefaultOrg(user.id);
+    if (!org) return { error: 'Сначала заполните реквизиты организации.' };
+    const sum = round2(Number(body.sum) || 0);
+    if (sum <= 0) return { error: 'Укажите полученную сумму.' };
+    const rate = bdb.vatOf(org).rate;
+    const res = await docService.issueFlat(user.id, {
+      type: 'avans', cpId: Number(body.cpId), date: str(body.date, 10), total: sum,
+      payload: {
+        sum, vatRate: rate,
+        payDoc: str(body.payDoc, 200),
+        subject: str(body.subject, 300),
+      },
+    });
+    if (!res.ok) return { error: res.message, reason: res.reason };
+    const token = keepFile(user.id, res.file);
+    await sendToChat(user, res).catch(() => {});
+    const { vat, label } = advanceVat(sum, rate);
+    return {
+      doc: { id: res.doc.id, number: res.doc.number, title: res.title },
+      sum, vat, label,
+      file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf },
+    };
+  },
+
+  /** Какие счета-фактуры этого клиента можно корректировать. */
+  async 'GET /api/doc/correctable'({ user, url }) {
+    const cpId = Number(url.searchParams.get('cpId'));
+    const list = bdb.listDocs(user.id, 20, cpId)
+      .filter((d) => d.type === 'upd' && Number((d.payload || {}).status) === 1)
+      .map((d) => ({
+        id: d.id, number: d.number, date: d.date, total: d.total,
+        items: ((d.payload || {}).items || []).map((it) => ({ name: it.name, qty: it.qty, price: it.price })),
+      }));
+    return { docs: list };
+  },
+
+  /*
+   * Корректировочный счёт-фактура.
+   *
+   * Строк должно прийти столько же, сколько было в исходном: они сравниваются
+   * попарно и по порядку. Меньше или больше — сравнивать не с чем, и молча
+   * взять первые попавшиеся значит выписать неверный документ.
+   */
+  async 'POST /api/doc/ksf'({ user, body }) {
+    const src = bdb.getDoc(user.id, Number(body.baseId));
+    if (!src) return { error: 'Исходный счёт-фактура не найден.' };
+    const p = src.payload || {};
+    if (src.type !== 'upd' || Number(p.status) !== 1) {
+      return { error: 'Корректировочный выставляют к счёту-фактуре.' };
+    }
+    const before = p.items || [];
+    const after = docService.cleanItems(body.lines);
+    if (after.length !== before.length) {
+      return { error: `В исходном документе ${before.length} позиц. — пришлите столько же строк, в том же порядке.` };
+    }
+    const reason = str(body.reason, 300);
+    if (!reason) return { error: 'Без основания изменения корректировочный недействителен.' };
+
+    const rate = p.vatRate == null ? null : Number(p.vatRate);
+    const lines = before.map((it, i) => ({
+      name: it.name, unit: it.unit,
+      before: { qty: it.qty, price: it.price },
+      after: { qty: after[i].qty, price: after[i].price },
+    }));
+    const rows = lines.map((l) => correctionRow(l.before, l.after, rate, Boolean(p.priceIncludesVat)));
+    const { up, down } = correctionTotals(rows);
+
+    const res = await docService.issueFlat(user.id, {
+      type: 'ksf', cpId: src.cp_id, total: up.total || down.total,
+      payload: {
+        vatRate: rate, priceIncludesVat: Boolean(p.priceIncludesVat),
+        base: { number: src.number, date: src.date }, reason, lines,
+      },
+    });
+    if (!res.ok) return { error: res.message, reason: res.reason };
+    const token = keepFile(user.id, res.file);
+    await sendToChat(user, res).catch(() => {});
+    return {
+      doc: { id: res.doc.id, number: res.doc.number, title: res.title },
+      up, down,
+      file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf },
+    };
+  },
+
+  /*
+   * Исправление счёта-фактуры: тот же номер и дата, пересобранный документ
+   * с пометкой «ИСПРАВЛЕНИЕ № N». Не путать с корректировочным — там меняется
+   * стоимость по согласию сторон, здесь исправляется ошибка.
+   */
+  async 'POST /api/doc/fix'({ user, body }) {
+    const src = bdb.getDoc(user.id, Number(body.id));
+    if (!src) return { error: 'Документ не найден.' };
+    const p = src.payload || {};
+    if (src.type !== 'upd' || Number(p.status) !== 1) {
+      return { error: 'Исправление выставляют к счёту-фактуре.' };
+    }
+    const no = Number(p.fix && p.fix.no ? p.fix.no : 0) + 1;
+    const res = await docService.rebuildDocument(user.id, Number(body.id), {
+      extra: { fix: { no, date: docService.todayISO() } },
+    });
+    if (!res.ok) return { error: res.message };
+    const token = keepFile(user.id, res.file);
+    if (tg) {
+      await tg.sendDocument(user.tg_id, {
+        filename: res.file.filename, buffer: res.file.buffer,
+        caption: `Исправление № ${no} к счёту-фактуре № ${src.number}.`,
+      }).catch(() => {});
+    }
+    return { no, file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf } };
   },
 
   /** Прислать копию ранее выписанного. */

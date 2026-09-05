@@ -647,7 +647,18 @@ function basisMismatch(userId, org, owedToUs) {
   const rows = db.prepare(
     'SELECT id, cp_id, type, total, paid_at FROM documents WHERE user_id = ? AND total > 0 AND no_debt = 0',
   ).all(userId);
-  const mute = rows.filter((d) => !DEBT_DOCS[basis].includes(d.type));
+  /*
+   * Счета-фактуры на аванс и корректировочные исключаем из этого разбора.
+   *
+   * Они не закрывают реализацию ни при каком основании и потому попадали в
+   * «непосчитанные» всегда: подсказка начинала звать переключить основание из-
+   * за документа, который к основанию отношения не имеет. Аванс выставляется
+   * на уже полученные деньги, а корректировочный меняет сумму прежней
+   * отгрузки — обязательство создаёт она, а не он.
+   */
+  const OUT_OF_BASIS = ['avans', 'ksf'];
+  const mute = rows.filter((d) => !DEBT_DOCS[basis].includes(d.type)
+    && !OUT_OF_BASIS.includes(d.type));
   if (!mute.length) return null;
 
   /*
