@@ -478,6 +478,43 @@ const ok = (c, m, extra) => {
     ok(bad.length === 0, `«${name}»: суммы стоят ровно`, bad.join(' | '));
   }
 
+  /*
+   * Цена на лендинге лежит в двух почти одинаковых файлах.
+   *
+   * Поправить в одном и забыть про второй — самый вероятный способ начать
+   * обещать одну цену и брать другую, а это уже не опечатка, а реклама
+   * (ФЗ «О рекламе», ст. 5). Сравниваем файлы между собой, а заодно
+   * проверяем, что выгода за год не выдумана, а равна разнице.
+   */
+  {
+    const fsL = require('node:fs');
+    const num = (s) => Number(String(s).replace(/[^\d]/g, ''));
+    /*
+     * Берём только тарифный блок, а не все числа со знаком рубля: на
+     * странице есть демонстрационный счёт на 45 000,00 ₽, и он к цене
+     * подписки отношения не имеет.
+     */
+    const priceOf = (file) => {
+      const html = fsL.readFileSync(path.join(APP, 'public/landing', file), 'utf8');
+      const month = html.match(/class="big">([\d  ]+)\s*₽/);
+      const year = html.match(/Или\s+([\d  ]+)\s*₽\s*за год\s*—\s*выгода\s+([\d  ]+)\s*₽/);
+      return {
+        month: month ? num(month[1]) : 0,
+        year: year ? num(year[1]) : 0,
+        saving: year ? num(year[2]) : 0,
+      };
+    };
+    const a = priceOf('index.html');
+    const b = priceOf('index-v2.html');
+    ok(a.month > 0 && a.year > 0, 'тариф на лендинге читается', JSON.stringify(a));
+    ok(JSON.stringify(a) === JSON.stringify(b),
+      'обе версии лендинга обещают одну и ту же цену',
+      `${JSON.stringify(a)} против ${JSON.stringify(b)}`);
+    ok(a.month * 12 - a.year === a.saving,
+      'выгода за год равна разнице, а не взята с потолка',
+      `${a.month} × 12 − ${a.year} = ${a.month * 12 - a.year}, обещано ${a.saving}`);
+  }
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();
