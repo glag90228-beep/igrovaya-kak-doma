@@ -3664,7 +3664,16 @@ async function handleAvansText(tg, chatId, user, state, text) {
   }
 
   if (d.step === 'payDoc') {
-    bdb.setState(user.id, `av:${cpId}`, { ...d, step: 'subject', payDoc: String(text).trim().slice(0, 200) });
+    // Пропустить нельзя: без строки 5 авансовый счёт-фактура недействителен,
+    // и лучше переспросить здесь, чем отказать в самом конце.
+    const pd = String(text).trim().slice(0, 200);
+    if (!pd || pd === '-' || pd === '—') {
+      await tg.sendMessage(chatId,
+        'Без платёжного поручения авансовый счёт-фактура недействителен — покупатель не '
+        + 'примет налог к вычету. Пришлите номер и дату, например «№ 55 от 01.09.2026».');
+      return;
+    }
+    bdb.setState(user.id, `av:${cpId}`, { ...d, step: 'subject', payDoc: pd });
     await tg.sendMessage(chatId,
       'За что предоплата? Одной строкой, как в договоре (напр. «Монтаж по договору № 7»).\n\n'
       + '<i>Или «-», и напишу «Предварительная оплата по договору».</i>');

@@ -29,6 +29,10 @@ const MAX_BODY = 256 * 1024;
 
 const tg = process.env.BOT_TOKEN ? new Telegram(process.env.BOT_TOKEN) : null;
 
+/** Чужой текст в сообщении владельцу: Telegram разбирает его как HTML. */
+const escHtml = (s) => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
 function log(...parts) {
   const line = `${new Date().toISOString()} ${parts.join(' ')}`;
   console.log(line);
@@ -89,7 +93,7 @@ async function handlePayment(p) {
      */
     if (near) {
       // Тоже не ждём: ответ площадке важнее скорости нашего уведомления.
-      notifyOwner(`⚠️ Похожий платёж ${p.amount} ${p.currency} с почты <b>${p.email || '—'}</b>.\n\n`
+      notifyOwner(`⚠️ Похожий платёж ${p.amount} ${p.currency} с почты <b>${escHtml(p.email) || '—'}</b>.\n\n`
         + 'Записал, но доступ по нему не выдал — он похож на повторную доставку. '
         + 'Если это вторая настоящая покупка, выдайте доступ вручную.').catch(() => {});
     }
@@ -109,7 +113,7 @@ async function handlePayment(p) {
      * и вспомнить почту с кассы, он не мог. Деньги у нас, доступа у него нет,
      * и никто об этом не знает. Именно так выглядело обращение в поддержку.
      */
-    notifyOwner(`💰 Оплата ${p.amount} ${p.currency} с почты <b>${p.email || '—'}</b> `
+    notifyOwner(`💰 Оплата ${p.amount} ${p.currency} с почты <b>${escHtml(p.email) || '—'}</b> `
       + 'пришла без привязки к человеку.\n\nОн получит доступ, только если сам нажмёт '
       + '«Я оплатил» и введёт эту почту. Если не пишет — напишите ему первым.').catch(() => {});
     return `платёж ${p.externalId} без Telegram-id — ждёт, пока владелец почты ${p.email || '—'} заберёт его в боте`;
@@ -267,7 +271,11 @@ const server = http.createServer((req, res) => {
         + `<b>${parsed.reason}</b>.\n\nПлощадка считает его доставленным и второй раз не пришлёт. `
         + 'Деньги у вас, а доступ по нему никому не выдан — посмотрите оплату в кассе '
         + 'и выдайте доступ вручную: <code>/grant номер 30</code>.\n\n'
-        + `<code>${body2.slice(0, 600)}</code>`)
+        // Экранируем: тело идёт в <code> при parse_mode HTML, и один «<»
+        // в нём заставил бы Telegram отклонить сообщение целиком. А это
+        // единственная ветка, где платёж теряется навсегда, — уведомление
+        // отвалилось бы ровно тогда, когда оно и нужно.
+        + `<code>${escHtml(body2.slice(0, 600))}</code>`)
         .catch(() => {});
       return done(200, 'stored');
     }

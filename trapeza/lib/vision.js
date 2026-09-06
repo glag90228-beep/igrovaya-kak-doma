@@ -131,9 +131,11 @@ async function viaGemini(buffer, mime) {
   if (!apiKey) throw new Error('GEMINI_API_KEY не задан');
   const model = process.env.VISION_MODEL || 'gemini-3.6-flash';
 
-  const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent?key=${apiKey}`, {
+  // Ключ заголовком, а не в адресе: строка запроса оседает в логах прокси
+  // и посредников, а это ключ от нашей квоты.
+  const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
     body: JSON.stringify({
       contents: [{
         parts: [
