@@ -3989,7 +3989,27 @@ async function handleMessage(tg, msg) {
 
   if (isOwner(from.id) && await ownerCommand(tg, chatId, text)) return;
 
-  if (text === '/start') { bdb.clearState(user.id); await tg.sendMessage(chatId, greeting(), mainMenu()); return; }
+  /*
+   * `/start` с меткой — это человек с рекламы, а не мусор.
+   *
+   * Telegram присылает переход по ссылке t.me/бот?start=МЕТКА обычным
+   * сообщением «/start МЕТКА». Точное сравнение его не ловило: приветствие
+   * не показывалось, и фраза проваливалась дальше — в разбор ИИ, который
+   * честно отвечал «не понял». То есть каждый, кто пришёл по объявлению,
+   * первым делом получал отказ, а откуда он пришёл, мы не узнавали.
+   *
+   * Метку запоминаем при первой встрече и больше не трогаем: интересно,
+   * откуда человек пришёл ИЗНАЧАЛЬНО, а не какую ссылку он открыл последней.
+   */
+  if (text === '/start' || text.startsWith('/start ')) {
+    bdb.clearState(user.id);
+    const label = text.slice(6).trim().slice(0, 64);
+    if (label && !user.source) {
+      try { bdb.setSource(user.id, label); } catch (_) { /* метка не важнее приветствия */ }
+    }
+    await tg.sendMessage(chatId, greeting(), mainMenu());
+    return;
+  }
   // Свой номер нужен, чтобы владелец выдал доступ: имя в Telegram есть не у
   // всех и меняется, номер — нет.
   if (text === '/id') {

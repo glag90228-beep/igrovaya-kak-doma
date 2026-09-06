@@ -172,6 +172,31 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   console.log('\n── старт и организация ──');
   await say('/start');
   ok(last().includes('Первичка'), 'бот поздоровался и показал меню');
+
+  /*
+   * Переход по рекламной ссылке — тоже /start.
+   *
+   * Telegram присылает t.me/бот?start=МЕТКА обычным сообщением «/start МЕТКА».
+   * Точное сравнение его не ловило: приветствие не показывалось, фраза
+   * проваливалась в разбор ИИ и человек с объявления первым делом получал
+   * «не понял», а источник мы не узнавали вовсе.
+   */
+  {
+    const bdbS = require('./lib/bot-db');
+    const uS = bdbS.getOrCreateUser(USER.id);
+    require('./db').db.prepare("UPDATE bot_users SET source = '' WHERE id = ?").run(uS.id);
+    await say('/start reels_qr');
+    ok(last().includes('Первичка'), 'по ссылке с меткой бот тоже здоровается', last().slice(0, 40));
+    const withLabel = require('./db').db.prepare('SELECT source FROM bot_users WHERE id = ?').get(uS.id);
+    ok(withLabel.source === 'reels_qr', 'метка источника запомнена', withLabel.source);
+
+    // Второй переход по другой ссылке источник не перебивает: интересно,
+    // откуда человек пришёл изначально, а не что открыл последним.
+    await say('/start kwork_sellers');
+    const after = require('./db').db.prepare('SELECT source FROM bot_users WHERE id = ?').get(uS.id);
+    ok(after.source === 'reels_qr', 'повторный переход первую метку не затирает', after.source);
+    ok(!last().includes('не понял'), 'и в разбор ИИ команда больше не проваливается');
+  }
   await tap('org.new');
   /*
    * Ручной путь: ИНН вводим (справочник в прогоне не подключён — автозаполнения

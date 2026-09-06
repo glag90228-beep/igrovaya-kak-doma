@@ -158,6 +158,9 @@ function migrate() {
   // ошибка в логе и лишний запрос.
   addColumn('bot_users', 'blocked_at', "TEXT NOT NULL DEFAULT ''");
   addColumn('bot_users', 'ai_enabled', 'INTEGER NOT NULL DEFAULT 1');
+  // Откуда человек пришёл: метка из ссылки t.me/бот?start=МЕТКА. Без неё
+  // нельзя понять, какая реклама привела платящих, а какая — только шум.
+  addColumn('bot_users', 'source', "TEXT NOT NULL DEFAULT ''");
 
   // расширяем контрагентов: владелец + банковские реквизиты (для счёта/платёжки)
   addColumn('counterparties', 'user_id', 'INTEGER');
@@ -261,6 +264,21 @@ function isAiEnabled(userId) {
 function setAiEnabled(userId, enabled) {
   db.prepare('UPDATE bot_users SET ai_enabled = ? WHERE id = ?').run(enabled ? 1 : 0, userId);
   return Boolean(enabled);
+}
+
+/**
+ * Запоминает, откуда человек пришёл. Пишем ТОЛЬКО в пустое поле.
+ *
+ * Первая метка — настоящая: она отвечает, какая реклама его привела. Если
+ * перезаписывать, любой повторный переход по свежей ссылке затрёт источник,
+ * и окажется, что всех привёл последний баннер.
+ */
+function setSource(userId, label) {
+  const clean = String(label || '').trim().slice(0, 64);
+  if (!clean) return '';
+  db.prepare("UPDATE bot_users SET source = ? WHERE id = ? AND source = ''").run(clean, userId);
+  const row = db.prepare('SELECT source FROM bot_users WHERE id = ?').get(userId) || {};
+  return row.source || '';
 }
 
 // ---------- организации пользователя ----------
@@ -1614,7 +1632,7 @@ function quota(userId) {
 
 module.exports = {
   migrate,
-  getOrCreateUser, setState, getState, clearState, isAiEnabled, setAiEnabled,
+  getOrCreateUser, setState, getState, clearState, isAiEnabled, setAiEnabled, setSource,
   createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp, openAdvances, updateDocPayload,
   addOp, listOps, deleteLastOp, deleteOp, balanceOf, debtors, debtBreakdown, periodBalance, cpForPeriod,
