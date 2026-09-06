@@ -41,6 +41,17 @@ async function query(url, value) {
     const hit = map[digits(value)];
     return hit ? { suggestions: [{ data: hit }] } : { suggestions: [] };
   }
+  /*
+   * Таймаут здесь важнее, чем кажется.
+   *
+   * У fetch в Node своего таймаута нет, а бот разбирает обновления строго по
+   * одному в цикле. Значит, пока DaData держит соединение и молчит, стоит не
+   * один этот человек, а весь бот — и не отвиснет сам никогда, до перезапуска
+   * службы. Восемь секунд — как у соседей: lib/vision.js, lib/speech.js,
+   * lib/tg.js.
+   */
+  // e.message отсюда уходит человеку в подсказку под полем (bot.js:429), а
+  // TimeoutError говорит по-английски. Переводим на месте.
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -49,6 +60,12 @@ async function query(url, value) {
       Authorization: `Token ${process.env.DADATA_TOKEN}`,
     },
     body: JSON.stringify({ query: digits(value), count: 1 }),
+    signal: AbortSignal.timeout(8000),
+  }).catch((e) => {
+    if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
+      throw new Error('справочник не ответил за восемь секунд — заполните поля вручную');
+    }
+    throw new Error('не дозвониться до справочника — заполните поля вручную');
   });
   if (!res.ok) {
     // «DaData 403» ничего не объясняет ни пользователю, ни владельцу бота.

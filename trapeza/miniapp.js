@@ -129,6 +129,9 @@ function sendLinkPage(res, code, text) {
 }
 
 const hits = new Map();
+// Потолок для карты счётчиков: выше неё она не растёт ни при каком потоке.
+const MAX_HITS = 20000;
+let lastSweep = 0;
 /**
  * Забыть счётчики. Нужно самопроверке: она делает за секунды столько
  * запросов, сколько человек не сделает и за час, и упирается в предел там,
@@ -153,9 +156,28 @@ function tooOften(userId, limit = 120) {
      * Теперь просроченные окна вычищаются по ходу дела: минута прошла —
      * запись всё равно не нужна.
      */
-    if (hits.size > 5000) {
+    /*
+     * Уборки по возрасту мало, и звать её на каждый запрос нельзя.
+     *
+     * При быстром потоке новых ключей записей старше минуты просто нет:
+     * удалять нечего, карта растёт дальше, а полный обход по ней выполняется
+     * на КАЖДОМ следующем обращении — стоимость выходит квадратичной. Замер
+     * до правки: 20 000 ключей — 2,2 с, 60 000 — 23,5 с, и память вверх.
+     *
+     * Поэтому две отдельные вещи. Обход по возрасту — не чаще раза в десять
+     * секунд: за это время просрочиться успеет достаточно, а на горячем пути
+     * его нет. И жёсткий потолок: Map хранит ключи в порядке вставки, так что
+     * лишние снимаются с начала — это самые старые окна, и стоит это столько
+     * же, сколько лишних записей, то есть при потоке ровно одну.
+     */
+    if (hits.size > 5000 && now - lastSweep > 10000) {
+      lastSweep = now;
       const edge = now - 60000;
       for (const [k, v] of hits) if (v.since < edge) hits.delete(k);
+    }
+    if (hits.size >= MAX_HITS) {
+      let extra = hits.size - MAX_HITS + 1;
+      for (const k of hits.keys()) { hits.delete(k); extra -= 1; if (extra <= 0) break; }
     }
     hits.set(userId, { since: now, n: 1 });
     return false;
@@ -857,28 +879,62 @@ const api = {
   async 'POST /api/pay/claim'({ user, body }) {
     const email = str(body.email, 254).toLowerCase();
     if (!mailer.validEmail(email)) return { error: 'Это не похоже на почту.' };
-    const found = billing.unclaimedByEmail(email);
-    if (!found.length) {
+
+    /*
+     * Одной почты мало.
+     *
+     * Lava не возвращает Telegram-id, поэтому ничьим приходит каждый платёж,
+     * и раньше достаточно было назвать чужой адрес с кассы, чтобы забрать
+     * чужую подписку: ни кода, ни срока, ни счётчика попыток. Теперь на
+     * адрес из платежа уходит код, и доступ выдаёт только он.
+     */
+    if (!mailer.mailAvailable()) {
       return {
-        error: 'Оплату по этой почте не вижу. Деньги могли ещё не дойти — попробуйте через '
-          + 'пару минут. Если прошло больше получаса, напишите в поддержку.',
+        error: 'Проверить почту сейчас нечем. Напишите в поддержку — доступ выдадут вручную.',
       };
     }
+    const r = billing.startEmailClaim(user.id, email);
+    if (!r.ok && r.error === 'много-попыток') {
+      return { error: 'Сегодня код запрашивали слишком много раз. Попробуйте завтра или напишите в поддержку.' };
+    }
+    if (r.ok) {
+      await mailer.sendMail({
+        to: email,
+        subject: `Код подтверждения ${r.code} — Первичка`,
+        text: `Код подтверждения: ${r.code}\n\n`
+          + 'Введите его в приложении, чтобы получить доступ за свою оплату.\n'
+          + 'Код действует 30 минут.\n\n'
+          + 'Если вы ничего не оплачивали и не запрашивали код — просто не вводите его. '
+          + 'Без кода доступ по вашей оплате никто не получит.',
+      }).catch(() => {});
+    }
     /*
-     * Считаем только те оплаты, которые достались нам. Бот и приложение —
-     * разные процессы на одной базе, и одну строку забирали оба, начисляя
-     * дни дважды за один платёж. Привязка теперь отвечает, кто первый.
+     * Ответ одинаков и когда оплата нашлась, и когда нет.
+     *
+     * Иначе форма становится проверялкой: перебором адресов посторонний
+     * узнал бы, кто у нас платил. Плательщику это не мешает — он знает свой
+     * адрес и получит письмо.
      */
-    let until = '';
-    let taken = 0;
-    for (const p of found) {
-      if (!billing.attachPayment(p.id, user.id)) continue;
-      taken += 1;
-      until = billing.grantDays(user.id, p.days || 30);
+    return { sent: true };
+  },
+
+  /** «Я оплатил», шаг второй: код из письма. */
+  async 'POST /api/pay/claim/confirm'({ user, body }) {
+    const code = str(body.code, 16).replace(/\D/g, '');
+    if (code.length !== 6) return { error: 'Код — это шесть цифр из письма.' };
+    const r = billing.confirmEmailClaim(user.id, code);
+    if (!r.ok) {
+      return {
+        error: {
+          'нет-заявки': 'Заявки нет — начните заново, с кнопки «Я оплатил».',
+          просрочен: 'Код устарел, ему больше 30 минут. Запросите новый.',
+          'много-ошибок': 'Код вводили неверно пять раз. Запросите новый.',
+        }[r.error] || `Код не подошёл. Осталось попыток: ${r.left}.`,
+      };
     }
     // Ноль здесь — не «оплаты нет», а «её уже зачли»: показываем текущий срок.
-    if (!taken) return { found: 0, until: billing.accessInfo(user.id).until };
-    return { found: taken, until };
+    if (!r.taken) return { found: 0, until: billing.accessInfo(user.id).until };
+    return { found: r.taken, until: r.until };
   },
 
   /** Реестр всех документов за период — тоже Excel. */
@@ -1345,7 +1401,7 @@ const api = {
     const email = str(body.email, 254).toLowerCase();
     if (!mailer.validEmail(email)) return { error: 'Адрес почты выглядит неправильно.' };
     const preset = mailbox.PRESETS[str(body.preset, 12)] ? str(body.preset, 12) : mailbox.guessPreset(email);
-    const saved = mailbox.save(user.id, {
+    const saved = await mailbox.save(user.id, {
       preset,
       login: email,
       from: email,
@@ -1808,15 +1864,19 @@ const server = http.createServer(async (req, res) => {
    *     в выдаче, и об этом узнают последними;
    *   • не кэшировать: документ собирается заново на каждое открытие, и
    *     исправленный счёт должен приходить исправленным;
-   *   • ограничить частоту по токену — на случай, если ссылку положат
-   *     туда, откуда её начнут дёргать без остановки;
+   *   • ограничить частоту по ТОМУ, КТО ПРИШЁЛ, а не по токену: считая по
+   *     токену, счётчик обнулялся сменой токена в адресе — то есть защиты
+   *     не было вовсе, а карта счётчиков росла от каждого нового ключа;
    *   • на любую беду отвечать одинаково: «ссылка больше не работает».
    *     Различать «истекла» и «такой не было» незачем.
    */
   if (pathname.startsWith('/d/')) {
     if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); return res.end('only GET'); }
     const token = decodeURIComponent(pathname.slice(3));
-    if (tooOften(`d:${token}`, 60)) return sendLinkPage(res, 429, 'Слишком часто. Подождите минуту и обновите страницу.');
+    const who = String(req.headers['x-real-ip'] || '').trim()
+      || String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+      || (req.socket && req.socket.remoteAddress) || 'нет-адреса';
+    if (tooOften(`d:${who}`, 60)) return sendLinkPage(res, 429, 'Слишком часто. Подождите минуту и обновите страницу.');
     const link = docLink.resolve(token);
     if (!link) return sendLinkPage(res, 404, 'Ссылка больше не работает.');
     let built;

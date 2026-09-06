@@ -200,6 +200,9 @@ async function main() {
   console.log('\n── бот забирает письма ──');
   {
     process.env.MAIL_KEY = 'test-key';
+    // Игрушечные SMTP и IMAP живут на 127.0.0.1, а обычно туда ходить нельзя:
+    // адрес сервера вводит человек, и без запрета это сканер внутренней сети.
+    process.env.MAIL_ALLOW_LOCAL = '1';
     process.env.TRAPEZA_DB = process.env.TRAPEZA_DB || '/tmp/inbox-test.db';
     const bdb = require('./lib/bot-db');
     const mailbox = require('./lib/mailbox');
@@ -235,7 +238,7 @@ async function main() {
     ok(last().includes('Почта не подключена') || last().includes('не задан сервер'),
       'без подключённой почты бот честно отказывается', last().slice(0, 50));
 
-    mailbox.save(user.id, {
+    await mailbox.save(user.id, {
       preset: 'custom', login: 'buh@mycompany.ru', pass: 'пароль-приложения',
       host: '127.0.0.1', port: 25, imapHost: '127.0.0.1', imapPort,
     });

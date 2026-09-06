@@ -24,6 +24,10 @@ process.env.FREE_DOCS = process.env.FREE_DOCS || '1000';
 // падает не по своей вине. Задаём тестовый ключ, чтобы прогон не зависел
 // от того, что оказалось в окружении запускающего.
 process.env.MAIL_KEY = process.env.MAIL_KEY || 'selftest-mail-key';
+// Игрушечный SMTP этого прогона слушает 127.0.0.1 на случайном порту, а
+// обычно ящик на внутреннем адресе заводить нельзя — иначе поле «сервер»
+// превращается в сканер нашей же сети. Сам запрет проверяется в mail-selftest.
+process.env.MAIL_ALLOW_LOCAL = '1';
 
 const { handleUpdate, parseOp, parseItemLine } = require('./bot');
 const { htmlToPng } = require('./lib/pdf');
@@ -845,10 +849,64 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await tap('pay.claim');
   await say('не-почта');
   ok(last().includes('не похоже на почту'), 'кривой адрес отклоняется');
+
+  /*
+   * Одной почты мало — нужен код из письма.
+   *
+   * Раньше доступ выдавался сразу по названному адресу. А ничьим приходит
+   * КАЖДЫЙ боевой платёж (Lava не возвращает Telegram-id), так что знания
+   * чужой почты с кассы хватало, чтобы забрать чужую подписку: ни кода, ни
+   * срока, ни счётчика попыток. Проверяем весь путь и саму дыру.
+   */
+  const mailerMod = require('./lib/mail');
+  const realSend = mailerMod.sendMail;
+  let sentTo = '';
+  let sentText = '';
+  mailerMod.sendMail = async (letter) => { sentTo = letter.to; sentText = letter.text || ''; return { ok: true }; };
+  process.env.SMTP_HOST = 'smtp.test';
+  process.env.SMTP_FROM = 'bot@test';
+
   await tap('pay.claim');
   await say('nobody@mail.ru');
-  ok(last().includes('Нашёл'), 'оплата по почте найдена и привязана', last().slice(0, 40));
+  ok(last().includes('код'), 'на почту обещан код, а не мгновенный доступ', last().slice(0, 50));
+  ok(sentTo === 'nobody@mail.ru', 'код ушёл на адрес из платежа', sentTo);
+  const claimCode = ((sentText.match(/(\d{6})/) || [])[1]) || '';
+  ok(claimCode.length === 6, 'в письме шесть цифр', claimCode);
+  ok(!last().includes(claimCode), 'кода в чате нет — иначе он бессмысленен');
+  ok(bill.unclaimedByEmail('nobody@mail.ru').length === 1, 'до ввода кода платёж ещё ничей');
+
+  // Не тот код — доступа нет, и попытки считаются.
+  const wrong = String((Number(claimCode) + 1) % 1000000).padStart(6, '0');
+  await say(wrong);
+  ok(last().includes('не подошёл'), 'неверный код отклоняется', last().slice(0, 40));
+  ok(bill.unclaimedByEmail('nobody@mail.ru').length === 1, 'и платёж по-прежнему ничей');
+
+  // Правильный код — доступ.
+  await say(claimCode);
+  ok(last().includes('Нашёл'), 'по верному коду оплата привязана', last().slice(0, 40));
   ok(bill.unclaimedByEmail('nobody@mail.ru').length === 0, 'платёж больше не ничей');
+
+  /*
+   * Собственно та дыра, из-за которой всё затевалось: посторонний, знающий
+   * чужую почту, не должен получить ничего.
+   */
+  await handlePayment({ externalId: 'inv-12', amount: 349, currency: 'RUB', status: 'paid',
+    email: 'victim@mail.ru', tgId: null, paid: true, raw: {} });
+  const bdbClaim = require('./lib/bot-db');
+  const thief = bdbClaim.getOrCreateUser(777044, 'Посторонний', 'thief');
+  bill.revokeAccess(thief.id);
+  const started = bill.startEmailClaim(thief.id, 'victim@mail.ru');
+  ok(started.ok, 'заявка заводится — по ответу не понять, есть ли такая оплата');
+  ok(!bill.accessInfo(thief.id).active, 'но доступа без кода посторонний не получил');
+  ok(bill.unclaimedByEmail('victim@mail.ru').length === 1, 'и оплата жертвы осталась ничьей');
+  for (let i = 0; i < 5; i += 1) bill.confirmEmailClaim(thief.id, '000000');
+  const sixth = bill.confirmEmailClaim(thief.id, started.code);
+  ok(!sixth.ok && sixth.error === 'много-ошибок', 'после пяти ошибок код перестаёт приниматься', sixth.error);
+  ok(bill.unclaimedByEmail('victim@mail.ru').length === 1, 'перебором оплату не увели');
+
+  mailerMod.sendMail = realSend;
+  delete process.env.SMTP_HOST;
+  delete process.env.SMTP_FROM;
 
   console.log('\n── команды владельца ──');
   process.env.SUPPORT_CHAT_ID = String(CHAT.id);
@@ -4744,7 +4802,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     delete process.env.MAIL_KEY;
     process.env.BOT_TOKEN = '111:СТАРЫЙ-ТОКЕН';
     const mu = require('./lib/bot-db').getOrCreateUser(779050).id;
-    const saved = mb.save(mu, {
+    const saved = await mb.save(mu, {
       host: 'smtp.x.ru', port: 587, secure: 0, login: 'me@x.ru', pass: 'СЕКРЕТ-123',
       from: 'me@x.ru', fromName: 'Я', imapHost: 'imap.x.ru',
     });

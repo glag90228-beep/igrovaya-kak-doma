@@ -21,6 +21,10 @@ process.env.ENFORCE_LIMIT = '1';
 // так прогон проверяет и разбор ответа, а не только факт вызова.
 // Данные выдуманные: настоящих организаций и людей в тестах не держим.
 process.env.MAIL_KEY = 'test-mail-key';
+// Игрушечный SMTP этого прогона слушает 127.0.0.1 на случайном порту, а
+// обычно ящик на внутреннем адресе заводить нельзя: поле «сервер» иначе
+// превращается в сканер нашей сети. Сам запрет проверяется в mail-selftest.
+process.env.MAIL_ALLOW_LOCAL = '1';
 process.env.DADATA_MOCK = JSON.stringify({
   7712345678: {
     name: { short_with_opf: 'ООО «Ромашка»', full_with_opf: 'Общество с ограниченной ответственностью «Ромашка»' },
@@ -1512,6 +1516,67 @@ async function main() {
     ok(bdbX.balanceOf(victim.id, cpV).closing === before,
       'сальдо чужого пользователя не тронуто',
       `${before} → ${bdbX.balanceOf(victim.id, cpV).closing}`);
+  }
+
+  section('оплата по почте: чужую не отдаём');
+  {
+    /*
+     * Ничьим приходит КАЖДЫЙ боевой платёж: Lava не возвращает Telegram-id.
+     * Значит «Я оплатил» — дорога к доступу для всех, кто платит, и раньше
+     * она открывалась одним лишь знанием чужого адреса с кассы. Проверяем,
+     * что теперь нужен код из письма.
+     */
+    const billX = require('./lib/billing');
+    const bdbP = require('./lib/bot-db');
+    const mailerX = require('./lib/mail');
+    const realSendX = mailerX.sendMail;
+    let toX = '';
+    let textX = '';
+    mailerX.sendMail = async (l) => { toX = l.to; textX = l.text || ''; return { ok: true }; };
+    process.env.SMTP_HOST = 'smtp.test';
+    process.env.SMTP_FROM = 'bot@test';
+
+    const { handlePayment } = require('./lava-webhook');
+    await handlePayment({ externalId: 'mini-1', amount: 349, currency: 'RUB', status: 'paid',
+      email: 'payer@mail.ru', tgId: null, paid: true, raw: {} });
+
+    const mashaU = bdbP.getOrCreateUser(MASHA.id);
+    const petyaU = bdbP.getOrCreateUser(PETYA.id);
+    billX.revokeAccess(mashaU.id);
+    billX.revokeAccess(petyaU.id);
+
+    // Пётр знает чужой адрес и пробует забрать оплату себе.
+    const rq = await call('POST', '/api/pay/claim', { user: petya, body: { email: 'payer@mail.ru' } });
+    ok(rq.json && rq.json.sent === true, 'приложение отвечает «код выслан», а не выдаёт доступ',
+      JSON.stringify(rq.json));
+    ok(!billX.accessInfo(petyaU.id).active, 'постороннему доступ не выдан');
+    ok(billX.unclaimedByEmail('payer@mail.ru').length === 1, 'оплата осталась ничьей');
+    ok(!JSON.stringify(rq.json).includes(((textX.match(/(\d{6})/) || [])[1]) || 'нет-кода'),
+      'кода в ответе API нет');
+
+    // Ответ одинаков и для адреса, по которому оплаты нет: иначе перебором
+    // видно, кто у нас платил.
+    const rq2 = await call('POST', '/api/pay/claim', { user: petya, body: { email: 'nikto@mail.ru' } });
+    ok(JSON.stringify(rq2.json) === JSON.stringify(rq.json),
+      'по несуществующей оплате ответ тот же — перебором плательщиков не найти',
+      JSON.stringify(rq2.json));
+
+    const rbad = await call('POST', '/api/pay/claim/confirm', { user: petya, body: { code: '123' } });
+    ok(rbad.json && /шесть цифр/.test(rbad.json.error || ''), 'короткий код отклоняется',
+      JSON.stringify(rbad.json));
+
+    // А владелец почты вводит код из письма и получает доступ.
+    await call('POST', '/api/pay/claim', { user: masha, body: { email: 'payer@mail.ru' } });
+    ok(toX === 'payer@mail.ru', 'письмо ушло на адрес из платежа', toX);
+    const codeX = ((textX.match(/(\d{6})/) || [])[1]) || '';
+    const rok = await call('POST', '/api/pay/claim/confirm', { user: masha, body: { code: codeX } });
+    ok(rok.json && rok.json.found === 1, 'по верному коду оплата зачтена', JSON.stringify(rok.json));
+    ok(billX.accessInfo(mashaU.id).active, 'и доступ включился');
+    ok(billX.unclaimedByEmail('payer@mail.ru').length === 0, 'ничьих оплат по этому адресу не осталось');
+
+    mailerX.sendMail = realSendX;
+    delete process.env.SMTP_HOST;
+    delete process.env.SMTP_FROM;
   }
 
   // Сервер держим до конца: проверки выше ходят к нему по HTTP, и закрытый

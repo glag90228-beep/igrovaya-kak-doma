@@ -1351,8 +1351,19 @@ async function resendDoc(tg, chatId, user, docId, stamp = null) {
 
 // ---------- подписка ----------
 
-const isOwner = (chatId) => Boolean(process.env.SUPPORT_CHAT_ID)
-  && String(chatId) === String(process.env.SUPPORT_CHAT_ID);
+/*
+ * Владелец — это ЧЕЛОВЕК, а не чат.
+ *
+ * Раньше сверялся chat.id. В личной переписке это одно и то же число, и
+ * разницы не видно. Но стоит поставить в SUPPORT_CHAT_ID групповой чат
+ * поддержки — а так делают, когда обращения смотрят вдвоём, — и владельцем
+ * становится каждый участник группы: команды начинаются со слэша, значит
+ * доходят до бота при любых настройках приватности. Любой из них выдал бы
+ * себе подписку на десять лет, снял доступ другому и выгрузил список
+ * платящих клиентов с их номерами.
+ */
+const isOwner = (fromId) => Boolean(process.env.SUPPORT_CHAT_ID)
+  && String(fromId) === String(process.env.SUPPORT_CHAT_ID);
 
 async function showBilling(tg, chatId, user) {
   bdb.clearState(user.id);
@@ -1398,8 +1409,30 @@ async function showBilling(tg, chatId, user) {
 }
 
 /**
- * «Я оплатил»: площадка не всегда возвращает наш параметр, и тогда платёж
- * приходит ничей. Ищем его по почте, которую человек указал на кассе.
+ * Письмо с кодом подтверждения на адрес из платежа.
+ *
+ * Уходит с НАШЕГО служебного ящика (SMTP_* в окружении), а не с ящика
+ * пользователя: тот подключается для писем контрагентам и к подписке
+ * отношения не имеет.
+ */
+async function sendClaimCode(email, code) {
+  return mailer.sendMail({
+    to: email,
+    subject: `Код подтверждения ${code} — Первичка`,
+    text: `Код подтверждения: ${code}\n\n`
+      + 'Введите его в боте, чтобы получить доступ за свою оплату.\n'
+      + 'Код действует 30 минут.\n\n'
+      + 'Если вы ничего не оплачивали и не запрашивали код — просто не вводите его. '
+      + 'Без кода доступ по вашей оплате никто не получит.',
+  });
+}
+
+/**
+ * «Я оплатил», шаг первый: приняли почту, выслали на неё код.
+ *
+ * Раньше здесь доступ выдавался сразу. Но Lava не возвращает Telegram-id, и
+ * ничьим приходит каждый платёж — значит достаточно было знать чужой адрес с
+ * кассы, чтобы забрать чужую подписку. Владение почтой теперь доказывается.
  */
 async function claimByEmail(tg, chatId, user, email) {
   bdb.clearState(user.id);
@@ -1409,30 +1442,79 @@ async function claimByEmail(tg, chatId, user, email) {
       keyboard([[{ text: '⬅️ Подписка', data: 'billing' }]]));
     return;
   }
-  const found = billing.unclaimedByEmail(clean);
-  if (!found.length) {
+
+  /*
+   * Без служебной почты подтвердить владение нечем.
+   *
+   * Выдавать доступ «пока без проверки» тут нельзя — это ровно та дыра,
+   * которую закрываем. Поэтому зовём владельца: он видит платёж и человека и
+   * выдаёт доступ вручную. Деньги при этом не теряются, а сама оплата уже
+   * лежит в базе.
+   */
+  if (!mailer.mailAvailable()) {
+    const found = billing.unclaimedByEmail(clean);
+    const owner = process.env.SUPPORT_CHAT_ID || '';
+    if (found.length && owner) {
+      await tg.sendMessage(owner,
+        `🔐 ${esc(user.name || 'Пользователь')} (<code>${user.tg_id}</code>) просит доступ `
+        + `за оплату с почты <b>${esc(clean)}</b>, но служебная почта не настроена — `
+        + 'код выслать нечем. Проверьте и выдайте доступ вручную.').catch(() => {});
+    }
     await tg.sendMessage(chatId,
-      'Оплату по этой почте не вижу. Деньги могли ещё не дойти — попробуйте через пару минут. '
-      + 'Если прошло больше получаса, напишите в поддержку, разберёмся вручную.',
+      'Проверить почту сейчас нечем — я передал вашу просьбу владельцу, он выдаст доступ вручную. '
+      + 'Обычно это занимает недолго.',
+      keyboard([[{ text: '💬 Поддержка', data: 'support' }], [{ text: '⬅️ Подписка', data: 'billing' }]]));
+    return;
+  }
+
+  const r = billing.startEmailClaim(user.id, clean);
+  if (!r.ok && r.error === 'много-попыток') {
+    await tg.sendMessage(chatId,
+      'Сегодня код запрашивали слишком много раз. Попробуйте завтра или напишите в поддержку.',
       keyboard([[{ text: '💬 Поддержка', data: 'support' }], [{ text: '⬅️ Подписка', data: 'billing' }]]));
     return;
   }
   /*
-   * Дни начисляем только за те платежи, которые нам действительно достались.
+   * «Оплаты нет» и «код выслан» отвечают одинаково.
    *
-   * Бот и мини-приложение — разные процессы на одной базе, и одна и та же
-   * оплата попадала обоим: каждый привязывал её к себе и начислял дни, так
-   * что за один платёж выходило два срока. Теперь привязка отвечает, кому
-   * строка досталась, и проигравший ничего не начисляет.
+   * Иначе форма превращается в проверялку: перебирая адреса, посторонний
+   * узнавал бы, кто у нас платил. Настоящему плательщику это не мешает — он
+   * знает свой адрес и получит письмо.
    */
-  let until = '';
-  let taken = 0;
-  for (const p of found) {
-    if (!billing.attachPayment(p.id, user.id)) continue;
-    taken += 1;
-    until = billing.grantDays(user.id, p.days || 30);
+  if (r.ok) {
+    await sendClaimCode(clean, r.code).catch(() => {});
+    bdb.setState(user.id, 'claim-code', {});
   }
-  if (!taken) {
+  await tg.sendMessage(chatId,
+    `Если оплата с адреса <b>${esc(clean)}</b> у меня есть, я выслал туда код из шести цифр. `
+    + 'Пришлите его сюда — код действует 30 минут.\n\n'
+    + '<i>Письма нет? Загляните в «Спам». Адрес мог быть другим — попробуйте ещё раз.</i>',
+    keyboard([[{ text: '✅ Я оплатил', data: 'pay.claim' }],
+      [{ text: '💬 Поддержка', data: 'support' }], [{ text: '⬅️ Подписка', data: 'billing' }]]));
+}
+
+/** «Я оплатил», шаг второй: проверяем код и выдаём доступ. */
+async function claimByCode(tg, chatId, user, code) {
+  const clean = String(code).replace(/\D/g, '');
+  if (clean.length !== 6) {
+    await tg.sendMessage(chatId, 'Код — это шесть цифр из письма. Пришлите его целиком.',
+      keyboard([[{ text: '⬅️ Подписка', data: 'billing' }]]));
+    return;
+  }
+  const r = billing.confirmEmailClaim(user.id, clean);
+  if (!r.ok) {
+    const said = {
+      'нет-заявки': 'Заявки нет — начните с кнопки «Я оплатил».',
+      просрочен: 'Код устарел, ему больше 30 минут. Запросите новый.',
+      'много-ошибок': 'Код вводили неверно пять раз. Запросите новый.',
+    }[r.error] || `Код не подошёл. Осталось попыток: ${r.left}.`;
+    if (r.error !== 'не-тот-код') bdb.clearState(user.id);
+    await tg.sendMessage(chatId, said,
+      keyboard([[{ text: '✅ Я оплатил', data: 'pay.claim' }], [{ text: '⬅️ Подписка', data: 'billing' }]]));
+    return;
+  }
+  bdb.clearState(user.id);
+  if (!r.taken) {
     // Не «не вижу оплату»: она есть, её просто уже зачли — обычно в
     // приложении, секундой раньше. Человеку важно, что доступ у него есть.
     const info = billing.accessInfo(user.id);
@@ -1444,8 +1526,8 @@ async function claimByEmail(tg, chatId, user, email) {
     return;
   }
   await tg.sendMessage(chatId,
-    `✅ Нашёл ${taken} ${plural(taken, 'оплату', 'оплаты', 'оплат')}. `
-    + `Доступ до <b>${ru(until)}</b>.`, mainMenu());
+    `✅ Нашёл ${r.taken} ${plural(r.taken, 'оплату', 'оплаты', 'оплат')}. `
+    + `Доступ до <b>${ru(r.until)}</b>.`, mainMenu());
 }
 
 /** Кого имел в виду владелец: номер, @имя или пересланное сообщение. */
@@ -3881,7 +3963,7 @@ async function handleMessage(tg, msg) {
   bdb.markActive(user.id); // писал — значит не заблокирован
   const text = msg.text.trim();
 
-  if (isOwner(chatId) && await ownerCommand(tg, chatId, text)) return;
+  if (isOwner(from.id) && await ownerCommand(tg, chatId, text)) return;
 
   if (text === '/start') { bdb.clearState(user.id); await tg.sendMessage(chatId, greeting(), mainMenu()); return; }
   // Свой номер нужен, чтобы владелец выдал доступ: имя в Telegram есть не у
@@ -4026,6 +4108,7 @@ async function handleMessage(tg, msg) {
     return;
   }
   if (state.state === 'claim') { await claimByEmail(tg, chatId, user, text); return; }
+  if (state.state === 'claim-code') { await claimByCode(tg, chatId, user, text); return; }
   if (state.state === 'promo') { await redeemPromo(tg, chatId, user, text); return; }
   if (state.state === 'mb:email') {
     const addr = text.trim().toLowerCase();
@@ -4080,7 +4163,7 @@ async function handleMessage(tg, msg) {
   }
   if (state.state === 'mb:pass') {
     const { email, preset, host, port, secure } = state.data;
-    const saved = mailbox.save(user.id, {
+    const saved = await mailbox.save(user.id, {
       preset, login: email, pass: text, from: email, host, port, secure,
     });
     bdb.clearState(user.id);

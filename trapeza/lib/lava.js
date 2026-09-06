@@ -112,9 +112,20 @@ function stampOf(value) {
 function isPaid(eventType, status, amount) {
   const et = String(eventType || '');
   const st = String(status || '');
-  if (/fail|cancel|refund|error|decline/i.test(et) || /fail|cancel|refund|decline/i.test(st)) return false;
-  if (/success|completed|paid|active/i.test(et)) return true;
-  if (!et && /success|completed|paid|active/i.test(st)) return true;
+  /*
+   * Границы слова обязательны.
+   *
+   * Без них «unpaid» содержит «paid», а «inactive» содержит «active», и
+   * подстрочный поиск читал неоплаченный платёж как оплаченный: отсев по
+   * fail|cancel|refund|decline эти два слова не ловит. Итог — подписка за
+   * непрошедшую оплату. Латиница, поэтому \b здесь работает (на кириллице
+   * в JS он бесполезен — см. предупреждения в lib/ai-agent.js).
+   */
+  const good = /\b(success|completed|succeeded|paid|active)\b/i;
+  const bad = /\b(fail|failed|cancel|cancelled|canceled|refund|refunded|error|declined?|unpaid|expired|inactive)\b/i;
+  if (bad.test(et) || bad.test(st)) return false;
+  if (good.test(et)) return true;
+  if (!et && good.test(st)) return true;
   return !et && !st && Number(amount) > 0;
 }
 

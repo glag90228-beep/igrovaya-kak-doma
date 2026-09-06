@@ -55,6 +55,29 @@ function migrate() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_pay_ext ON payments(provider, external_id);
     CREATE INDEX IF NOT EXISTS idx_pay_email ON payments(email);
   `);
+  /*
+   * Заявка на получение чужой… то есть своей оплаты по почте.
+   *
+   * Зачем отдельная таблица. Lava не возвращает Telegram-id, поэтому КАЖДЫЙ
+   * боевой платёж ложится ничьим, и «Я оплатил» — основная дорога к доступу
+   * для всех, кто платит. Раньше она открывалась одним лишь знанием почты:
+   * назвал адрес с кассы — забрал чужую подписку. Ни кода, ни срока, ни
+   * счётчика попыток, а настоящий плательщик потом видел «оплату не вижу».
+   *
+   * Теперь на адрес из платежа уходит код. Прочитать его может только тот,
+   * у кого этот ящик, — то есть тот, кто платил.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS pay_claims (
+      user_id    INTEGER PRIMARY KEY,
+      email      TEXT    NOT NULL,
+      code_hash  TEXT    NOT NULL,
+      tries      INTEGER NOT NULL DEFAULT 0,
+      sent_today INTEGER NOT NULL DEFAULT 0,
+      sent_date  TEXT    NOT NULL DEFAULT '',
+      expires_at TEXT    NOT NULL
+    );
+  `);
 }
 migrate();
 
@@ -355,6 +378,98 @@ function unclaimedByEmail(email) {
     .all(norm(email));
 }
 
+// ---------- подтверждение владения почтой ----------
+
+const CLAIM_TTL_MIN = 30;      // столько живёт код
+const CLAIM_TRIES = 5;         // столько раз можно ошибиться
+const CLAIM_SENDS_PER_DAY = 5; // столько раз в сутки можно запросить код
+
+const hashCode = (code) => crypto.createHash('sha256')
+  .update(`${String(code).trim()}|${process.env.BOT_TOKEN || 'нет-токена'}`).digest('hex');
+
+/**
+ * Заводит заявку и возвращает код, который надо отправить на почту.
+ *
+ * Код возвращается ВЫЗЫВАЮЩЕМУ, а не пользователю: отправить письмо — дело
+ * бота и приложения, здесь только учёт. Наружу код не показывать никогда,
+ * иначе весь замок теряет смысл.
+ *
+ * @returns {{ok:boolean, code?:string, count?:number, error?:string}}
+ */
+function startEmailClaim(userId, email) {
+  const clean = norm(email);
+  const found = unclaimedByEmail(clean);
+  // «Оплаты нет» и «оплата есть, но код не выслан» снаружи должны выглядеть
+  // одинаково, иначе форма превращается в проверялку «кто у вас платил».
+  if (!found.length) return { ok: false, error: 'нет-оплаты' };
+
+  const today = todayISO();
+  const prev = db.prepare('SELECT * FROM pay_claims WHERE user_id = ?').get(userId);
+  const sent = (prev && prev.sent_date === today) ? prev.sent_today : 0;
+  if (sent >= CLAIM_SENDS_PER_DAY) return { ok: false, error: 'много-попыток' };
+
+  // Шесть цифр, из crypto, а не из Math.random: подобрать за пять попыток
+  // шанса нет, а угадать закономерность генератора — тем более.
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  const expires = new Date(Date.now() + CLAIM_TTL_MIN * 60000).toISOString();
+  db.prepare(`
+    INSERT INTO pay_claims (user_id, email, code_hash, tries, sent_today, sent_date, expires_at)
+    VALUES (?, ?, ?, 0, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      email = excluded.email, code_hash = excluded.code_hash, tries = 0,
+      sent_today = excluded.sent_today, sent_date = excluded.sent_date,
+      expires_at = excluded.expires_at
+  `).run(userId, clean, hashCode(code), sent + 1, today, expires);
+  return { ok: true, code, count: found.length };
+}
+
+/**
+ * Проверяет код и, если он верен, привязывает оплаты и начисляет дни.
+ *
+ * @returns {{ok:boolean, until?:string, taken?:number, error?:string, left?:number}}
+ */
+function confirmEmailClaim(userId, code) {
+  const row = db.prepare('SELECT * FROM pay_claims WHERE user_id = ?').get(userId);
+  if (!row) return { ok: false, error: 'нет-заявки' };
+  if (Date.parse(row.expires_at) < Date.now()) {
+    db.prepare('DELETE FROM pay_claims WHERE user_id = ?').run(userId);
+    return { ok: false, error: 'просрочен' };
+  }
+  if (row.tries >= CLAIM_TRIES) return { ok: false, error: 'много-ошибок' };
+
+  const given = hashCode(code);
+  const a = Buffer.from(given, 'hex');
+  const b = Buffer.from(String(row.code_hash), 'hex');
+  // Сравнение постоянного времени: длины совпадают всегда (оба sha256), но
+  // проверку оставляем — timingSafeEqual бросает на разной длине.
+  const same = a.length === b.length && crypto.timingSafeEqual(a, b);
+  if (!same) {
+    db.prepare('UPDATE pay_claims SET tries = tries + 1 WHERE user_id = ?').run(userId);
+    return { ok: false, error: 'не-тот-код', left: Math.max(0, CLAIM_TRIES - row.tries - 1) };
+  }
+
+  // Код верен — забираем оплаты той почты, на которую он уходил, а не той,
+  // что пришла сейчас: иначе подтверждение одним адресом открывало бы любой.
+  const found = unclaimedByEmail(row.email);
+  let until = '';
+  let taken = 0;
+  for (const p of found) {
+    if (!attachPayment(p.id, userId)) continue;
+    taken += 1;
+    until = grantDays(userId, p.days || 30);
+  }
+  db.prepare('DELETE FROM pay_claims WHERE user_id = ?').run(userId);
+  if (!taken) return { ok: true, taken: 0, until: accessInfo(userId).until };
+  return { ok: true, taken, until };
+}
+
+/** Ждёт ли этот человек ввода кода — и на какую почту тот ушёл. */
+function pendingClaim(userId) {
+  const row = db.prepare('SELECT * FROM pay_claims WHERE user_id = ?').get(userId);
+  if (!row || Date.parse(row.expires_at) < Date.now()) return null;
+  return { email: row.email, left: Math.max(0, CLAIM_TRIES - row.tries) };
+}
+
 function paymentsOf(userId, limit = 10) {
   return db.prepare('SELECT * FROM payments WHERE user_id = ? ORDER BY id DESC LIMIT ?')
     .all(userId, limit);
@@ -363,6 +478,7 @@ function paymentsOf(userId, limit = 10) {
 module.exports = {
   accessInfo, grantDays, revokeAccess, paidUsers,
   recordPayment, findPayment, attachPayment, unclaimedByEmail, paymentsOf,
+  startEmailClaim, confirmEmailClaim, pendingClaim,
   createCodes, getCode, redeemCode, revokeCode, listCodes, codeUsers, usedCodes,
   normCode, looksLikeCode: (s) => new RegExp(`^${PREFIX}[-\\s]?[A-Z0-9]`, 'i').test(String(s || '').trim()),
 };

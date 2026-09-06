@@ -270,6 +270,47 @@ async function main() {
       'а честный адрес по-прежнему проставляется');
   }
 
+  console.log('\n── ящик только на внешнем сервере ──');
+  {
+    /*
+     * Адрес почтового сервера вводит человек — иначе никак, ящики у всех
+     * разные. Но без запрета это готовый сканер внутренней сети: подставив
+     * 127.0.0.1 и перебирая порты, посторонний по разнице ответа выяснял,
+     * что крутится на нашей машине, а ответившая строкой служба возвращала
+     * свой баннер прямо в ошибке API.
+     */
+    process.env.MAIL_KEY = process.env.MAIL_KEY || 'test-key';
+    delete process.env.MAIL_ALLOW_LOCAL;
+    const mb = require('./lib/mailbox');
+    const uid = 900901;
+    const try1 = async (host, port, imapHost) => (await mb.save(uid, {
+      preset: 'custom', login: 'a@b.ru', from: 'a@b.ru', pass: 'x', host, port, imapHost,
+    }));
+
+    for (const [host, why] of [
+      ['127.0.0.1', 'петля'],
+      ['10.1.2.3', 'частная сеть 10/8'],
+      ['192.168.0.1', 'домашняя сеть'],
+      ['172.16.5.5', 'частная сеть 172.16/12'],
+      ['169.254.169.254', 'метаданные облака'],
+      ['[::1]', 'петля IPv6'],
+    ]) {
+      const r = await try1(host, 465, '');
+      ok(!r.ok && /внутренн/i.test(r.error || ''), `внутрь не пускает: ${why}`, `${host} → ${r.error}`);
+    }
+
+    const rp = await try1('smtp.yandex.ru', 3000, '');
+    ok(!rp.ok && /[Пп]орт/.test(rp.error || ''), 'непочтовый порт отклоняется', rp.error);
+
+    const ri = await try1('smtp.yandex.ru', 465, '127.0.0.1');
+    ok(!ri.ok && /внутренн/i.test(ri.error || ''), 'сервер входящей почты проверяется тоже', ri.error);
+
+    // И наоборот: обычный внешний ящик по-прежнему сохраняется.
+    const rok = await try1('smtp.yandex.ru', 465, 'imap.yandex.ru');
+    ok(rok.ok, 'настоящий почтовый сервер принимается', JSON.stringify(rok));
+    require('./db').db.prepare('DELETE FROM mailboxes WHERE user_id = ?').run(uid);
+  }
+
   console.log(bad ? `\nне прошло: ${bad}` : '\nотправка почты работает целиком ✅');
   process.exit(bad ? 1 : 0);
 }

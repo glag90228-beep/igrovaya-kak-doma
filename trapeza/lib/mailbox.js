@@ -18,10 +18,82 @@
  * посмотреть — нет.
  */
 
+const dns = require('node:dns').promises;
+const net = require('node:net');
+
 const { db } = require('../db');
 require('./bot-db');                   // таблицы создаёт он, порядок важен
 const { seal, openBox, canEncrypt } = require('./crypto-box');
 const { validEmail } = require('./mail');
+
+/*
+ * Куда разрешено ходить за почтой.
+ *
+ * Адрес сервера человек вводит сам — по-другому нельзя, ящики у всех разные.
+ * Но без проверки это готовый сканер: подставив 127.0.0.1 и перебирая порты,
+ * посторонний по разнице ответа («соединение отвергнуто» за 4 мс против
+ * «сервер не отвечает» за 3 с) вычислял, что крутится на нашей машине, а
+ * ответившая строкой служба возвращала ему свой баннер прямо в ошибке API.
+ *
+ * Поэтому: только почтовые порты и только внешние адреса.
+ */
+const MAIL_PORTS = new Set([25, 143, 465, 587, 993, 2525]);
+
+/** Внутренний ли адрес: петля, частные сети, link-local, свои IPv6. */
+function isPrivateIp(ip) {
+  const v = String(ip || '');
+  if (net.isIPv4(v)) {
+    const [a, b] = v.split('.').map(Number);
+    return a === 10 || a === 127 || a === 0
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || (a === 169 && b === 254)
+      || (a === 100 && b >= 64 && b <= 127)   // CGNAT
+      || a >= 224;                            // multicast и выше
+  }
+  const low = v.toLowerCase().replace(/^\[|\]$/g, '');
+  if (low === '::1' || low === '::' || low.startsWith('fe80:')) return true;
+  if (/^f[cd][0-9a-f]{2}:/.test(low)) return true;          // уникальные локальные
+  const m = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(low);      // IPv4 в обёртке IPv6
+  return m ? isPrivateIp(m[1]) : false;
+}
+
+/**
+ * Пускать ли к этому серверу. Резолвим имя: проверять одну лишь строку
+ * бессмысленно — «localtest.me» и свой домен с записью на 127.0.0.1 обойдут
+ * любой список запрещённых слов.
+ *
+ * @returns {Promise<{ok:true}|{ok:false, error:string}>}
+ */
+async function hostAllowed(host, port) {
+  const h = String(host || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h) return { ok: false, error: 'Не указан адрес почтового сервера.' };
+  /*
+   * Калитка только для прогонов: inbox-selftest поднимает игрушечные SMTP и
+   * IMAP на 127.0.0.1 со случайным портом. В окружении боевого сервера этой
+   * переменной нет и быть не должно — с ней проверка выключается целиком.
+   */
+  if (process.env.MAIL_ALLOW_LOCAL === '1') return { ok: true };
+  if (port != null && !MAIL_PORTS.has(Number(port))) {
+    return { ok: false, error: `Порт ${port} для почты не используется. Обычно это 465, 587 или 993.` };
+  }
+  if (net.isIP(h)) {
+    return isPrivateIp(h)
+      ? { ok: false, error: 'Это адрес внутренней сети — почтовый сервер должен быть внешним.' }
+      : { ok: true };
+  }
+  let addrs = [];
+  try {
+    addrs = await dns.lookup(h, { all: true });
+  } catch (_) {
+    return { ok: false, error: `Не нашёл сервер ${host} — проверьте адрес.` };
+  }
+  if (!addrs.length) return { ok: false, error: `Не нашёл сервер ${host} — проверьте адрес.` };
+  if (addrs.some((a) => isPrivateIp(a.address))) {
+    return { ok: false, error: 'Этот адрес ведёт во внутреннюю сеть — почтовый сервер должен быть внешним.' };
+  }
+  return { ok: true };
+}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS mailboxes (
@@ -123,8 +195,13 @@ function info(userId) {
   };
 }
 
-/** @returns {{ok:true}|{ok:false, error:string}} */
-function save(userId, {
+/**
+ * Асинхронный, потому что адрес сервера приходится резолвить: строку
+ * проверять бесполезно, имя может указывать куда угодно, в том числе внутрь.
+ *
+ * @returns {Promise<{ok:true}|{ok:false, error:string}>}
+ */
+async function save(userId, {
   preset, host, port, secure, login, pass, from, fromName, imapHost, imapPort,
 }) {
   if (!canEncrypt()) {
@@ -137,6 +214,16 @@ function save(userId, {
   if (!useHost) return { ok: false, error: 'Не указан адрес SMTP-сервера.' };
   if (!String(pass || '')) return { ok: false, error: 'Не указан пароль.' };
 
+  const usePort = Number(port || p.port) || 465;
+  const useImap = String(imapHost || p.imapHost || '').trim();
+  const useImapPort = Number(imapPort || p.imapPort) || 993;
+  const okSmtp = await hostAllowed(useHost, usePort);
+  if (!okSmtp.ok) return okSmtp;
+  if (useImap) {
+    const okImap = await hostAllowed(useImap, useImapPort);
+    if (!okImap.ok) return okImap;
+  }
+
   db.prepare(`
     INSERT INTO mailboxes(user_id, host, port, secure, login, pass_enc, from_addr,
                           from_name, imap_host, imap_port, created_at)
@@ -145,12 +232,11 @@ function save(userId, {
       secure=excluded.secure, login=excluded.login, pass_enc=excluded.pass_enc,
       from_addr=excluded.from_addr, from_name=excluded.from_name,
       imap_host=excluded.imap_host, imap_port=excluded.imap_port, checked_at=''
-  `).run(userId, useHost, Number(port || p.port) || 465,
+  `).run(userId, useHost, usePort,
     (secure == null ? p.secure : Boolean(secure)) ? 1 : 0,
     String(login || addr).trim(), seal(String(pass)), addr,
     String(fromName || '').trim(),
-    String(imapHost || p.imapHost || '').trim(),
-    Number(imapPort || p.imapPort) || 993,
+    useImap, useImapPort,
     new Date().toISOString());
   return { ok: true };
 }

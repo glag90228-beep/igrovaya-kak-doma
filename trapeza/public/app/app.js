@@ -3455,8 +3455,35 @@ screens.billing = async function billing() {
        */
       const paid = field('paidmail', 'Почта, указанная при оплате', '', {
         type: 'email', placeholder: 'vy@mail.ru',
-        hint: 'По ней найду ваш платёж и включу подписку',
+        hint: 'Вышлю на неё код подтверждения',
       });
+      /*
+       * Второй шаг — код из письма.
+       *
+       * Одного адреса мало: ничьим приходит каждый платёж, и раньше знания
+       * чужой почты хватало, чтобы забрать чужую подписку. Поле кода скрыто,
+       * пока письмо не ушло, чтобы человек не гадал, что сюда вводить.
+       */
+      const codeF = field('paidcode', 'Код из письма', '', {
+        inputmode: 'numeric', placeholder: '123456',
+        hint: 'Шесть цифр, действует 30 минут',
+      });
+      const codeBox = h('div', { hidden: true }, h('div', { class: 'card' }, codeF),
+        h('div', { class: 'btn-wrap' }, h('button', {
+          class: 'btn',
+          onclick: (e) => withBusy(e.currentTarget, async () => {
+            clearErrors({ codeF });
+            const code = codeF.input.value.replace(/\D/g, '');
+            if (code.length !== 6) { showError(codeF, 'Код — шесть цифр из письма'); return; }
+            const r = await api('POST', '/api/pay/claim/confirm', { code });
+            haptic('medium');
+            toast(r.found
+              ? `Нашёл ${r.found} ${plural(r.found, 'оплату', 'оплаты', 'оплат')} — доступ до ${ru(r.until)}`
+              : `Эта оплата уже зачтена — доступ до ${ru(r.until)}`);
+            render();
+          }),
+        }, 'Подтвердить')));
+
       const claim = h('button', { class: 'btn secondary' }, 'Я оплатил');
       const claimBox = h('div', { hidden: true }, h('div', { class: 'card' }, paid),
         h('div', { class: 'btn-wrap' }, h('button', {
@@ -3465,12 +3492,14 @@ screens.billing = async function billing() {
             clearErrors({ paid });
             const mail = paid.input.value.trim();
             if (!mail) { showError(paid, 'Без адреса платёж не найти'); return; }
-            const r = await api('POST', '/api/pay/claim', { email: mail });
+            await api('POST', '/api/pay/claim', { email: mail });
             haptic('medium');
-            toast(`Нашёл ${r.found} ${plural(r.found, 'оплату', 'оплаты', 'оплат')} — доступ до ${ru(r.until)}`);
-            render();
+            // Одинаковый ответ на «нашлась» и «не нашлась» — намеренно: иначе
+            // перебором адресов видно, кто у нас платил.
+            toast('Если оплата с этого адреса есть, код уже в письме');
+            codeBox.hidden = false;
           }),
-        }, 'Найти мой платёж')));
+        }, 'Выслать код')), codeBox);
       claim.onclick = () => { claimBox.hidden = !claimBox.hidden; haptic(); };
       box.append(h('div', { class: 'btn-wrap', style: 'padding-top:0' }, claim), claimBox);
     }
