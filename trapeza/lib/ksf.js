@@ -136,8 +136,12 @@ function buildKsfHtml({ org, cp, doc }) {
        в книге покупок (п. 13 ст. 171, п. 10 ст. 172 НК). Исходный счёт-фактура
        остаётся действующим: он верно описывал то, что было на его дату.</p>
 
-    ${signRows(org)}
-    ${fxHtml(org)}
+    <div class="sign">
+      ${signRows(org, (o) => fxHtml(org.fx, o))
+        .map((r) => `<div style="flex:1;max-width:46%">${esc(r.title)}`
+          + `<div class="line">${r.html}</div></div>`)
+        .join('')}
+    </div>
   `;
   return page(`Корректировочный счёт-фактура № ${doc.number || '1'}`, body);
 }

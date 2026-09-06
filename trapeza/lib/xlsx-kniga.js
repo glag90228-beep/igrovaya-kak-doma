@@ -13,7 +13,9 @@
  * Что сюда попадает:
  *   • отгрузочные счета-фактуры (у нас это УПД со статусом 1) — код 01;
  *   • авансовые счета-фактуры на полученную предоплату — код 02;
- *   • корректировочные счета-фактуры на УВЕЛИЧЕНИЕ стоимости — код 18.
+ *   • корректировочные счета-фактуры на УВЕЛИЧЕНИЕ стоимости — тоже код 01:
+ *     код 18 в перечне ФНС означает уменьшение, и у продавца такая запись идёт
+ *     в книгу покупок, а не сюда.
  *
  * Чего сюда НЕ попадает и почему:
  *   • корректировочные на УМЕНЬШЕНИЕ — они идут в книгу ПОКУПОК, потому что
@@ -42,6 +44,18 @@ const ru = (iso) => {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
   return m ? `${m[3]}.${m[2]}.${m[1]}` : String(iso || '');
 };
+
+/**
+ * Номер колонки → буква Excel (1 → A, 27 → AA).
+ *
+ * Нужна потому, что число граф книги плавает: под каждую встретившуюся за
+ * период ставку заводится своя пара колонок. Все объединения и формулы итога
+ * считают правый край через неё, иначе шапка обрежется на десятой колонке, а
+ * итоги не накроют графы последней ставки.
+ */
+const letterOf = (i) => (i <= 26
+  ? String.fromCharCode(64 + i)
+  : String.fromCharCode(64 + Math.floor((i - 1) / 26)) + String.fromCharCode(65 + ((i - 1) % 26)));
 
 function box(cell) {
   cell.border = {
@@ -82,7 +96,19 @@ function bookRow(doc) {
     const { up } = correctionTotals(rows);
     // Только увеличение: уменьшение — это вычет, ему место в книге покупок.
     if (!up.total) return null;
-    return { code: '18', net: up.net, vat: up.vat, total: up.total, rate };
+    /*
+     * Код 01, а не 18.
+     *
+     * 18 в перечне ФНС (приказ от 14.03.2016 № ММВ-7-3/136@) — это
+     * корректировка в сторону УМЕНЬШЕНИЯ, и у продавца такая запись идёт в
+     * книгу ПОКУПОК. Корректировочный на увеличение продавец регистрирует в
+     * книге продаж с кодом 01 — тем же, что и обычную отгрузку.
+     *
+     * Ошибка здесь не косметическая: код уходит в раздел 9 декларации, а
+     * покупатель по тому же документу поставит 01. АСК НДС-2 сводит пары по
+     * коду — пара не сойдётся, и требование пояснений придёт обеим сторонам.
+     */
+    return { code: '01', net: up.net, vat: up.vat, total: up.total, rate };
   }
 
   // Отгрузка. Счётом-фактурой у нас работает только УПД со статусом 1.
@@ -106,27 +132,58 @@ async function buildKnigaProdazh({ org, docs, from, to }) {
   wb.creator = 'Первичка';
   const ws = wb.addWorksheet('Книга продаж');
 
-  ws.mergeCells('A1:J1');
+  /*
+   * Раскладка сумм по ставкам, а не одной колонкой.
+   *
+   * В книге продаж нет графы «ставка»: ставка выражается тем, в КАКУЮ графу
+   * попала сумма. Отдельные графы заведены под 22%, под 20/18%, под 10%, под
+   * 5% и 7% (для УСН) и под 0%. Прежняя редакция клала любую ставку в графы
+   * 22-й — то есть выручку упрощенца по 5% отправляла в графу для 22%. Файл
+   * при этом приглашал сверяться по номерам граф, так что бухгалтер перенёс
+   * бы это в декларацию как есть.
+   */
+  const RATE_COL = {
+    22: { net: 'Стоимость продаж без НДС, 22%', vat: 'Сумма НДС, 22%', netNo: '14', vatNo: '17' },
+    20: { net: 'Стоимость продаж без НДС, 20%', vat: 'Сумма НДС, 20%', netNo: '14а', vatNo: '17а' },
+    10: { net: 'Стоимость продаж без НДС, 10%', vat: 'Сумма НДС, 10%', netNo: '15', vatNo: '18' },
+    7: { net: 'Стоимость продаж без НДС, 7%', vat: 'Сумма НДС, 7%', netNo: '15б', vatNo: '18б' },
+    5: { net: 'Стоимость продаж без НДС, 5%', vat: 'Сумма НДС, 5%', netNo: '15а', vatNo: '18а' },
+    0: { net: 'Стоимость продаж, 0%', vat: '', netNo: '16', vatNo: '' },
+  };
+  // Какие ставки реально встретились за период — под них и заводим графы,
+  // иначе лист расползается на два десятка пустых колонок.
+  const seen = [...new Set(docs.map(bookRow).filter(Boolean).map((x) => x.rate))]
+    .filter((x) => RATE_COL[x]).sort((a2, b2) => b2 - a2);
+
+  const cols = [
+    ['№ п/п', 6, '1'],
+    ['Код вида операции', 10, '2'],
+    ['Номер и дата счёта-фактуры', 22, '3'],
+    // Строка 5б отгрузочного счёта-фактуры переносится сюда: это машинная
+    // пара к графе 7а книги покупок покупателя, ради неё всё и затевалось.
+    ['Номер и дата СФ на аванс', 20, '11а'],
+    ['Наименование покупателя', 30, '7'],
+    ['ИНН/КПП покупателя', 18, '8'],
+    ['Номер и дата документа об оплате', 20, '11'],
+    ['Валюта', 10, '12'],
+    ['Стоимость продаж с НДС', 18, '13б'],
+    ...seen.flatMap((rt) => (RATE_COL[rt].vat
+      ? [[RATE_COL[rt].net, 20, RATE_COL[rt].netNo], [RATE_COL[rt].vat, 16, RATE_COL[rt].vatNo]]
+      : [[RATE_COL[rt].net, 20, RATE_COL[rt].netNo]])),
+  ];
+  // Шапку объединяем уже зная, сколько колонок получилось: при двух ставках
+  // их четырнадцать, и заголовок, обрезанный по J, оставлял хвост непокрытым.
+  const last = letterOf(cols.length);
+
+  ws.mergeCells(`A1:${last}1`);
   const title = ws.getCell('A1');
   title.value = `Книга продаж: ${org.full_name || org.name}, ИНН ${org.inn || '—'}`;
   title.font = { bold: true, size: 13, color: { argb: HEAD } };
 
-  ws.mergeCells('A2:J2');
+  ws.mergeCells(`A2:${last}2`);
   ws.getCell('A2').value = `Период: ${ru(from)} — ${ru(to)}`;
   ws.getCell('A2').font = { size: 10, color: { argb: 'FF666666' } };
 
-  const cols = [
-    ['№ п/п', 6],
-    ['Код вида операции', 10],
-    ['Номер и дата счёта-фактуры', 22],
-    ['Наименование покупателя', 30],
-    ['ИНН/КПП покупателя', 18],
-    ['Валюта', 10],
-    ['Стоимость продаж с НДС', 18],
-    ['Ставка', 8],
-    ['Стоимость продаж без НДС', 20],
-    ['Сумма НДС', 14],
-  ];
   const head = ws.getRow(4);
   cols.forEach(([name, width], i) => {
     const c = head.getCell(i + 1);
@@ -140,9 +197,10 @@ async function buildKnigaProdazh({ org, docs, from, to }) {
   head.height = 34;
 
   // Номера граф официальной формы — отдельной строкой, как в бланке: по ним
-  // бухгалтер сверяется с приложением 5 к постановлению № 1137.
+  // бухгалтер сверяется с приложением 5 к постановлению № 1137. Берём их из
+  // того же списка колонок, чтобы номер и колонка не разъехались.
   const nums = ws.getRow(5);
-  ['1', '2', '3', '7', '8', '11', '13б', '14а', '14', '17'].forEach((n, i) => {
+  cols.map(([, , no]) => no).forEach((n, i) => {
     const c = nums.getCell(i + 1);
     c.value = n;
     c.font = { size: 8, italic: true, color: { argb: 'FF888888' } };
@@ -158,18 +216,25 @@ async function buildKnigaProdazh({ org, docs, from, to }) {
     if (!row) continue;
     n += 1;
     const line = ws.getRow(r);
+    const p2 = doc.payload || {};
     line.getCell(1).value = n;
     line.getCell(2).value = row.code;
     line.getCell(3).value = `${doc.number} от ${ru(doc.date)}`;
-    line.getCell(4).value = doc.cpName || '—';
-    line.getCell(5).value = doc.cpInn || '—';
-    line.getCell(6).value = 'руб.';
-    line.getCell(7).value = row.total;
-    line.getCell(8).value = `${row.rate}%`;
-    line.getCell(9).value = row.net;      // у аванса пусто — стоимости ещё нет
-    line.getCell(10).value = row.vat;
-    for (const i of [7, 9, 10]) line.getCell(i).numFmt = MONEY;
-    for (let i = 1; i <= 10; i += 1) {
+    line.getCell(4).value = p2.advDoc || '';        // 11а — ссылка на аванс
+    line.getCell(5).value = doc.cpName || '—';
+    line.getCell(6).value = doc.cpInn || '—';
+    line.getCell(7).value = p2.payDoc || '';        // 11 — документ об оплате
+    line.getCell(8).value = 'руб.';
+    line.getCell(9).value = row.total;
+    line.getCell(9).numFmt = MONEY;
+    // Суммы — строго в графы своей ставки: остальные остаются пустыми.
+    const at = 10 + seen.indexOf(row.rate) * 2;
+    if (row.net != null) { line.getCell(at).value = row.net; line.getCell(at).numFmt = MONEY; }
+    if (RATE_COL[row.rate] && RATE_COL[row.rate].vat) {
+      line.getCell(at + 1).value = row.vat;
+      line.getCell(at + 1).numFmt = MONEY;
+    }
+    for (let i = 1; i <= cols.length; i += 1) {
       box(line.getCell(i));
       if (n % 2 === 0) {
         line.getCell(i).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: CREAM } };
@@ -182,7 +247,7 @@ async function buildKnigaProdazh({ org, docs, from, to }) {
   }
 
   if (!n) {
-    ws.mergeCells(`A${r}:J${r}`);
+    ws.mergeCells(`A${r}:${last}${r}`);
     ws.getCell(`A${r}`).value = 'За период не выписано ни одного счёта-фактуры.';
     ws.getCell(`A${r}`).font = { italic: true, color: { argb: 'FF888888' } };
     r += 1;
@@ -192,21 +257,24 @@ async function buildKnigaProdazh({ org, docs, from, to }) {
     const tot = ws.getRow(r);
     tot.getCell(1).value = 'Всего';
     tot.getCell(1).font = { bold: true };
-    for (const [col, letter] of [[7, 'G'], [9, 'I'], [10, 'J']]) {
-      const c = tot.getCell(col);
-      c.value = { formula: `SUM(${letter}6:${letter}${r - 1})` };
+    // Колонки берём по факту: их число зависит от того, сколько разных ставок
+    // встретилось за период.
+    for (let i = 9; i <= cols.length; i += 1) {
+      const c = tot.getCell(i);
+      c.value = { formula: `SUM(${letterOf(i)}6:${letterOf(i)}${r - 1})` };
       c.numFmt = MONEY;
       c.font = { bold: true };
     }
-    for (let i = 1; i <= 10; i += 1) box(tot.getCell(i));
+    for (let i = 1; i <= cols.length; i += 1) box(tot.getCell(i));
     r += 1;
   }
 
   r += 1;
-  ws.mergeCells(`A${r}:J${r + 2}`);
+  ws.mergeCells(`A${r}:${last}${r + 2}`);
   const note = ws.getCell(`A${r}`);
-  note.value = 'Коды: 01 — отгрузка, 02 — полученная предоплата, 18 — корректировка на увеличение.\n'
-    + 'Корректировки на уменьшение сюда не входят: они отражаются в книге покупок (п. 13 ст. 171 НК).\n'
+  note.value = 'Коды: 01 — отгрузка и корректировка на увеличение, 02 — полученная предоплата.\n'
+    + 'Корректировки на уменьшение сюда не входят: у продавца это вычет, он отражается\n'
+    + 'в книге покупок с кодом 18 (п. 13 ст. 171, п. 10 ст. 172 НК).\n'
     + 'Выгрузка для сверки: книга ведётся нарастающим итогом за квартал и подписывается.';
   note.font = { size: 9, color: { argb: 'FF666666' } };
   note.alignment = { wrapText: true, vertical: 'top' };

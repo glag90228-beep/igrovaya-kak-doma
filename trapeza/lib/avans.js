@@ -124,8 +124,12 @@ function buildAvansHtml({ org, cp, doc }) {
        получения предоплаты отгрузки ещё не было (постановление № 1137, правила
        заполнения счёта-фактуры).</p>
 
-    ${signRows(org)}
-    ${fxHtml(org)}
+    <div class="sign">
+      ${signRows(org, (o) => fxHtml(org.fx, o))
+        .map((r) => `<div style="flex:1;max-width:46%">${esc(r.title)}`
+          + `<div class="line">${r.html}</div></div>`)
+        .join('')}
+    </div>
   `;
   return page(`Счёт-фактура на аванс № ${doc.number || '1'}`, body);
 }
