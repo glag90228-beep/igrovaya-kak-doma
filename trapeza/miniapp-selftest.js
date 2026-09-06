@@ -1546,6 +1546,42 @@ async function main() {
       `${before} → ${bdbX.balanceOf(victim.id, cpV).closing}`);
   }
 
+  section('главный экран: имя и повтор счёта');
+  {
+    /*
+     * Имя в Telegram пишет сам человек, и там бывает что угодно. «Здравствуйте,
+     * ;)» выглядит как поломка интерфейса, а не как обращение, — поэтому в
+     * приветствие идут только настоящие имена. Логика живёт в app.js
+     * (greetName), здесь проверяем то же правило на тех же случаях: файл
+     * приложения в прогоне не исполняется, а правило должно быть одно.
+     */
+    const greetName = (raw) => {
+      const first = String(raw || '').trim().split(/\s+/)[0] || '';
+      return (first.match(/\p{L}/gu) || []).length >= 2 ? `Здравствуйте, ${first}` : 'Здравствуйте';
+    };
+    const src = require('node:fs').readFileSync('./public/app/app.js', 'utf8');
+    ok(/letters >= 2 \? `Здравствуйте, \$\{first\}`/.test(src),
+      'приложение здоровается по тому же правилу, что и прогон');
+    for (const [raw, want] of [
+      ['Мария Сарычева', 'Здравствуйте, Мария'],
+      [';)', 'Здравствуйте'],
+      ['🙂', 'Здравствуйте'],
+      ['.', 'Здравствуйте'],
+      ['', 'Здравствуйте'],
+      ['Ян', 'Здравствуйте, Ян'],
+    ]) ok(greetName(raw) === want, `имя «${raw || 'пусто'}» → «${want}»`, greetName(raw));
+
+    // Кнопка повтора подписывается именем клиента — значит оно должно
+    // приезжать в сводке документа. Без него было бы «Повторить: последний
+    // счёт», то есть кнопка без ответа на «кому».
+    const mashaU = require('./lib/bot-db').getOrCreateUser(MASHA.id);
+    const stateR = await call('GET', '/api/state', { user: masha });
+    const withName = (stateR.json.docs || []).find((d) => d.cpName);
+    ok(Boolean(withName), 'в сводке документа приезжает имя клиента',
+      JSON.stringify((stateR.json.docs || [])[0] || {}).slice(0, 80));
+    ok(mashaU.id > 0, 'пользователь на месте');
+  }
+
   section('обращение в поддержку');
   {
     /*

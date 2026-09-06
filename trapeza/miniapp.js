@@ -290,7 +290,13 @@ function stateFor(user) {
     counts: { cps: bdb.listCps(user.id).length, debtors: debts.length },
     debts: { owedToUs, owedByUs },
     unpaid: { count: awaiting.count, sum: awaiting.sum },
-    docs: bdb.listDocs(user.id, 5).map(docBrief),
+    docs: (() => {
+      // Имена берём одним проходом по списку контрагентов, а не запросом на
+      // каждый документ: их пять, но привычка запрашивать в цикле разъезжается
+      // в сотню запросов на экране журнала.
+      const byId = new Map(bdb.listCps(user.id).map((c) => [c.id, c.name]));
+      return bdb.listDocs(user.id, 5).map((d) => docBrief(d, byId.get(d.cp_id) || ''));
+    })(),
     payUrl: payLink(user.tg_id),
     /*
      * Тарифы отдаём списком, а не одной фразой. Фраза «390 ₽ в месяц или
@@ -345,10 +351,13 @@ function fxState(userId) {
   };
 }
 
-function docBrief(d) {
+function docBrief(d, cpName = '') {
   return {
     id: d.id, type: d.type, title: d.title, number: d.number, date: d.date,
     total: d.total, cpId: d.cp_id, paidAt: d.paid_at || '',
+    // Имя клиента: на главной по нему подписана кнопка повтора, а список
+    // документов без него читается как «Счёт № 4» без ответа на «кому».
+    cpName,
     // Долг по документу отменён руками — приложению это надо показать и дать
     // обратный ход, иначе отмена выходит дорогой в один конец.
     noDebt: Boolean(d.no_debt),

@@ -253,15 +253,41 @@ const ok = (c, m, extra) => {
   console.log('\n── из чего сумма на главной ──');
   await page.evaluate(() => window.__go('home', {}));
   await page.waitForSelector('.hero .sum');
-  ok(await page.evaluate(() => document.querySelector('.hero .sum').textContent.replace(/\s/g, ''))
-    === '15000₽', 'на главной видно сальдо контрагента',
-  await page.evaluate(() => document.querySelector('.hero .sum').textContent));
 
+  /*
+   * Ведущее число — то, что человек пришёл узнать: сколько ему должны
+   * ПРЯМО СЕЙЧАС. Раньше сверху стояло «должны вам» по выбранному
+   * основанию, и при «долге по отгрузке» оно показывало ноль, хотя счета
+   * выписаны и не оплачены. Три сигнала об одних деньгах спорили между
+   * собой, и человек не понимал, должны ему или нет.
+   */
+  const heroSum = await page.evaluate(() => document.querySelector('.hero .sum').textContent.replace(/\s/g, ''));
+  ok(heroSum !== '0₽', 'сверху не ноль, когда счета не оплачены', heroSum);
+  ok(await page.evaluate(() => Boolean(document.querySelector('.hero .sub.wait'))),
+    'ожидание оплаты помечено янтарным, а не зелёным');
+
+  // Касание по числу ведёт к тем самым счетам, а не к общему разбору:
+  // сверху стоит их сумма, и логично показать именно их.
   const hero = await page.locator('.hero .tap').boundingBox();
   await page.touchscreen.tap(hero.x + hero.width / 2, hero.y + 20);
   await page.waitForTimeout(700);
   ok(await page.evaluate(() => document.querySelector('h1') && document.querySelector('h1').textContent)
-    === 'Из чего эта сумма', 'нажатие на цифру ведёт к разбору',
+    === 'Ждут оплаты', 'нажатие на цифру ведёт к неоплаченным счетам',
+  await page.evaluate(() => document.querySelector('h1') && document.querySelector('h1').textContent));
+
+  /*
+   * А разбор «из чего сумма» никуда не делся — он открывается плашкой
+   * способа подсчёта. Жалоба «счета удаляю, а сумма прежняя» законна: при
+   * основании «по отгрузке» счёт долга не создаёт, и всю сумму держит
+   * начальное сальдо. Пока цифра молчит, это неотличимо от поломки.
+   */
+  await page.evaluate(() => window.__go('home', {}));
+  await page.waitForSelector('.chip-basis');
+  const chip = await page.locator('.chip-basis').boundingBox();
+  await page.touchscreen.tap(chip.x + chip.width / 2, chip.y + chip.height / 2);
+  await page.waitForTimeout(700);
+  ok(await page.evaluate(() => document.querySelector('h1') && document.querySelector('h1').textContent)
+    === 'Из чего эта сумма', 'плашка способа подсчёта ведёт к разбору',
   await page.evaluate(() => document.querySelector('h1') && document.querySelector('h1').textContent));
 
   const rows = await page.evaluate(() => [...document.querySelectorAll('.card .row .ellipsis')]

@@ -46,6 +46,9 @@
      этого мало: «нам должны» и «мы должны» человек должен различать
      боковым зрением, не читая подписи. */
   --money-in: #0f9d58;
+  /* Ожидание оплаты. Не зелёный (это «получено») и не красный (это «мы
+     должны»): у ожидания свой смысл, и свой цвет ему нужен отдельный. */
+  --wait: #b8730a;
   --money-out: #e5484d;
   --success: #0f9d58;
 
@@ -102,6 +105,8 @@
     --text: var(--tg-theme-text-color, #f1f4f7);
     --muted: var(--tg-theme-hint-color, #8fa1b3);
     --money-in: #35d07f;
+    /* На тёмном b8730a почти не читается — берём светлее. */
+    --wait: #f5a524;
     --money-out: #ff6369;
     --success: #35d07f;
     --shadow-1: none;
@@ -296,6 +301,41 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   background: none; color: inherit; font: inherit; cursor: pointer; }
 .hero .tap:active { opacity: .6; }
 .hero .why { color: var(--primary); font-size: 14px; margin-top: 4px; }
+
+/* Ожидание оплаты — янтарным, и это не вкусовщина.
+   Зелёный в приложении означает «деньги получены» (--money-in), красный —
+   «мы должны». Счёт, который ждут, не то и не другое: если красить его
+   зелёным, полученное и обещанное сливаются в один сигнал. */
+.hero .sub.wait { color: var(--wait); font-weight: 600; }
+
+/* Способ подсчёта — спокойная плашка, а не алый баннер.
+   Раньше расхождение оснований объявлялось красной панелью с восклицательным
+   знаком: она спорила с крупной цифрой за внимание и читалась как поломка,
+   хотя описывает настройку. Разбор с пересчётом открывается по нажатию. */
+.chip-basis {
+  display: inline-block; margin-top: 10px; padding: 5px 12px;
+  border: 0; border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 12%, transparent);
+  color: var(--muted); font: 500 13px/1.2 var(--font); cursor: pointer;
+}
+.chip-basis:active { opacity: .6; }
+
+/* Строка фразы: один вход вместо двух равнозначных карточек.
+   Пример пишем прямо в ней — человек видит, ЧТО говорить, а не гадает. */
+.prompt {
+  display: flex; align-items: center; gap: 12px; width: calc(100% - 24px);
+  margin: var(--gap) 12px 0; padding: 12px var(--pad);
+  background: var(--surface); border: 0; border-radius: var(--radius);
+  color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.prompt:active { transform: scale(.985); transition: transform 90ms var(--ease); }
+.prompt .grow { min-width: 0; }
+.prompt-go {
+  display: flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; flex: none; border-radius: 50%;
+  background: var(--primary); color: #fff;
+}
+.prompt-go .icon { width: 18px; height: 18px; }
 
 /* Пара «нам должны / мы должны» — один взгляд вместо двух экранов. */
 .stats { display: flex; margin: var(--gap) 12px;
