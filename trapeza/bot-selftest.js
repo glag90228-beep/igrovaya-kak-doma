@@ -858,6 +858,40 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(days === 30, 'выдано ровно 30 календарных дней', `${pr.todayISO()} → ${until1} = ${days}`);
     ok(until2.slice(0, 4).length === 4 && until2 > until1, 'и продление считается от той же даты');
   }
+  /*
+   * Подписка КОНЧАЕТСЯ. Проверяем именно это, а не только выдачу.
+   *
+   * Дыру нашла мутационная проверка: если убрать из accessInfo сравнение
+   * с сегодняшней датой (`until >= todayISO()`), весь прогон оставался
+   * зелёным. То есть каждый, кто когда-либо платил, пользовался бы продуктом
+   * вечно, а платить перестал бы — и ни один тест об этом не сказал бы.
+   * Проверялись выдача и продление, а окончание срока — нет.
+   */
+  {
+    const rawDb2 = require('./db').db;
+    const yesterday = (n) => {
+      const d = new Date(Date.now() - n * 86400000);
+      return d.toISOString().slice(0, 10);
+    };
+    const setUntil = (v) => rawDb2.prepare('UPDATE bot_users SET access_until = ? WHERE id = ?')
+      .run(v, meUser.id);
+
+    setUntil(yesterday(1));
+    const past = bill.accessInfo(meUser.id);
+    ok(!past.active, 'вчерашняя дата окончания — доступа нет', JSON.stringify(past));
+    ok(past.left === 0, 'и дней не осталось', String(past.left));
+
+    setUntil(yesterday(0));
+    const today2 = bill.accessInfo(meUser.id);
+    ok(today2.active, 'последний день подписки ещё рабочий', JSON.stringify(today2));
+
+    setUntil(yesterday(-3));
+    const soon = bill.accessInfo(meUser.id);
+    ok(soon.active && soon.left === 3, 'до конца трое суток', JSON.stringify(soon));
+
+    setUntil('');
+    ok(!bill.accessInfo(meUser.id).active, 'без даты доступа нет вовсе');
+  }
   bill.revokeAccess(meUser.id);
 
   const { handlePayment } = require('./lava-webhook');
