@@ -770,6 +770,35 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'подпись от другого тела отвергается — иначе её можно было бы переставить на любой платёж');
     ok(!lava.hmacOk('', telo) && !lava.hmacOk(podpis('sekret', telo), ''),
       'пустая подпись и пустое тело ничего не открывают');
+
+    /*
+     * Секрет в строке адреса больше не принимается.
+     *
+     * Адреса оседают в access-логе nginx, который читают и ротируют как
+     * обычный лог: ключ, дающий выдачу подписок, лежал бы там открытым
+     * текстом. Lava присылает его заголовком, так что рабочему пути это не
+     * мешает. Проверяем по-настоящему, через HTTP, а не по коду.
+     */
+    const { server: hookServer } = require('./lava-webhook');
+    await new Promise((r) => hookServer.listen(0, '127.0.0.1', r));
+    const hookPort = hookServer.address().port;
+    const post = async (path2, headers) => {
+      const res = await fetch(`http://127.0.0.1:${hookPort}${path2}`, {
+        method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: telo,
+      });
+      return res.status;
+    };
+    delete process.env.LAVA_ALLOW_URL_SECRET;
+    ok(await post('/lava?secret=sekret', {}) === 401,
+      'верный ключ в адресе не пускает — он утёк бы в лог nginx');
+    ok(await post('/lava?token=sekret', {}) === 401, 'и через token тоже');
+    ok(await post('/lava', { 'x-api-key': 'sekret' }) !== 401,
+      'а заголовком тот же ключ работает — рабочий путь цел');
+    process.env.LAVA_ALLOW_URL_SECRET = '1';
+    ok(await post('/lava?secret=sekret', {}) !== 401,
+      'старый способ доступен, только если его включили явно');
+    delete process.env.LAVA_ALLOW_URL_SECRET;
+    await new Promise((r) => hookServer.close(r));
   }
   process.env.LAVA_OFFER_URL = 'https://lava.top/x?a=1';
   ok(lava.payLink(777001).includes('clientUtm=777001'), 'ссылка на оплату несёт Telegram-id',

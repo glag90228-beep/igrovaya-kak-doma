@@ -33,11 +33,28 @@ const tg = process.env.BOT_TOKEN ? new Telegram(process.env.BOT_TOKEN) : null;
 const escHtml = (s) => String(s == null ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+/*
+ * Журнал с потолком.
+ *
+ * Путь /lava открыт наружу, ограничения частоты на нём нет, а строка
+ * пишется на КАЖДЫЙ запрос, включая отказы. Поток мусора забивал бы диск —
+ * тот самый, на котором лежит база с документами. Поэтому при переполнении
+ * старое уезжает в .1, а новый файл начинается с чистого листа: две
+ * последние порции всегда под рукой, и больше двух потолков журнал не
+ * занимает никогда.
+ */
+const LOG_MAX = Number(process.env.LAVA_LOG_MAX || 5 * 1024 * 1024);
+
 function log(...parts) {
   const line = `${new Date().toISOString()} ${parts.join(' ')}`;
   console.log(line);
   try {
     fs.mkdirSync(path.dirname(LOG), { recursive: true });
+    let size = 0;
+    try { size = fs.statSync(LOG).size; } catch (_) { size = 0; }
+    if (size + line.length > LOG_MAX) {
+      try { fs.renameSync(LOG, `${LOG}.1`); } catch (_) { /* некуда — просто пишем дальше */ }
+    }
     fs.appendFileSync(LOG, line + '\n');
   } catch (_) { /* лог не критичен */ }
 }
@@ -216,19 +233,30 @@ const server = http.createServer((req, res) => {
      * длины и способа передачи хватает, чтобы отличить «пусто» от «не тот» и
      * от «обрезался», а в журнал он попадать не должен.
      */
+    /*
+     * Секрет в строке адреса — по умолчанию больше не принимается.
+     *
+     * Адреса оседают в access-логе nginx, который читают и ротируют как
+     * обычный лог: секрет, дающий выдачу подписок, лежал бы там открытым
+     * текстом. Lava присылает ключ заголовком X-Api-Key, так что рабочему
+     * пути это не мешает. Кому нужен старый способ — LAVA_ALLOW_URL_SECRET=1,
+     * но лучше перенести секрет в заголовок.
+     */
+    const urlSecret = () => (process.env.LAVA_ALLOW_URL_SECRET === '1'
+      ? (url.searchParams.get('secret') || url.searchParams.get('token') || '')
+      : '');
+
     const carrier = (req.headers['x-api-key'] && 'X-Api-Key')
       || (req.headers['x-signature'] && 'X-Signature')
       || (req.headers['x-hook-signature'] && 'X-Hook-Signature')
       || (req.headers.authorization && 'Authorization')
-      || (url.searchParams.get('secret') && 'параметр secret')
-      || (url.searchParams.get('token') && 'параметр token')
+      || (urlSecret() && 'параметр в адресе')
       || '';
     const given = req.headers['x-api-key']
       || req.headers['x-signature']
       || req.headers['x-hook-signature']
       || String(req.headers.authorization || '').replace(/^Bearer\s+/i, '')
-      || url.searchParams.get('secret')
-      || url.searchParams.get('token');
+      || urlSecret();
 
     // Ключ открытым текстом или подпись тела — принимаем оба способа.
     const byKey = secretOk(given);
