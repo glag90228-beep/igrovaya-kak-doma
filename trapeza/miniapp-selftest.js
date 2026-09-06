@@ -1546,6 +1546,29 @@ async function main() {
       `${before} → ${bdbX.balanceOf(victim.id, cpV).closing}`);
   }
 
+  section('обращение в поддержку');
+  {
+    /*
+     * Отсюда сообщение уходит прямо в чат владельца, а общий ограничитель
+     * пропускает 120 запросов в минуту — по две тысячи символов сто двадцать
+     * раз подряд. Настоящее обращение в таком потоке потерялось бы.
+     */
+    const podderzhka = initDataFor({ id: 500404, first_name: 'Жалобщик', username: 'zhaloba' });
+    const short2 = await call('POST', '/api/support', { user: podderzhka, body: { text: 'ой' } });
+    ok(/пары слов мало/.test((short2.json || {}).error || ''), 'слишком короткое обращение отклонено',
+      JSON.stringify(short2.json));
+    const codes2 = [];
+    for (let i = 0; i < 8; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      const one = await call('POST', '/api/support', {
+        user: podderzhka, body: { text: `Не открывается счёт номер ${i}` },
+      });
+      codes2.push(one.json && one.json.error ? 'стоп' : 'ушло');
+    }
+    ok(codes2.slice(0, 5).every((c) => c === 'ушло'), 'первые обращения доходят', codes2.join(','));
+    ok(codes2.slice(-1)[0] === 'стоп', 'поток в чат владельца останавливается', codes2.join(','));
+  }
+
   section('оплата по почте: чужую не отдаём');
   {
     /*
