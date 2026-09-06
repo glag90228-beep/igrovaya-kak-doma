@@ -348,20 +348,71 @@ function updateDocPayload(userId, docId, payload) {
     .run(JSON.stringify(payload), Number(docId), userId).changes > 0;
 }
 
+/**
+ * Авансы этого контрагента, ещё не закрытые отгрузкой, — с остатком.
+ *
+ * Раньше здесь было два изъяна, и оба тихие.
+ *
+ * Первый: закрытость определялась поиском подстроки `№ N ` в склеенных
+ * строках 5б всех отгрузок. Нумерация у нас сквозная ПО ГОДАМ, поэтому
+ * аванс № 1 за 2025 год гасился отгрузкой, сославшейся на № 1 за 2026-й, —
+ * и переставал предлагаться, хотя закрыт не был. Теперь ссылка разбирается
+ * на номер и дату, и год сверяется.
+ *
+ * Второй: зачёт был «всё или ничего». Отгрузили на 60 000 в счёт аванса на
+ * 100 000 — аванс считался закрытым целиком, и оставшиеся 40 000 из строки
+ * 5б следующей отгрузки пропадали. По ним НДС с аванса не принимался к
+ * вычету (п. 8 ст. 171, п. 6 ст. 172 НК), то есть налог оставался
+ * переплаченным. Теперь считается остаток: отгрузки разносятся по авансам
+ * в порядке дат, каждая закрывает не больше, чем в ней есть.
+ *
+ * @returns {Array<{id, number, date, year, sum, left}>} left — сколько ещё не закрыто
+ */
 function openAdvances(userId, cpId) {
   const all = db.prepare(`
-    SELECT id, number, date, payload FROM documents
+    SELECT id, number, date, year, total, payload FROM documents
      WHERE user_id = ? AND cp_id = ? AND type = 'avans'
      ORDER BY date, id`).all(userId, Number(cpId));
   if (!all.length) return [];
 
-  const used = db.prepare(`
-    SELECT payload FROM documents
-     WHERE user_id = ? AND cp_id = ? AND type = 'upd'`).all(userId, Number(cpId))
-    .map((r) => { try { return JSON.parse(r.payload || '{}').advDoc || ''; } catch (_) { return ''; } })
-    .join(' | ');
+  const advances = all.map((a) => {
+    let sum = 0;
+    try { sum = Number(JSON.parse(a.payload || '{}').sum) || 0; } catch (_) { sum = 0; }
+    if (!sum) sum = Number(a.total) || 0;
+    return { id: a.id, number: a.number, date: a.date, year: a.year, sum, left: sum };
+  });
 
-  return all.filter((a) => !used.includes(`№ ${a.number} `));
+  // Ссылка в строке 5б выглядит как «№ 7 от 01.09.2026», несколько — через «;».
+  const refsOf = (payload) => {
+    let adv = '';
+    try { adv = JSON.parse(payload || '{}').advDoc || ''; } catch (_) { adv = ''; }
+    return String(adv).split(';')
+      .map((s) => /№\s*(\S+)\s+от\s+(\d{2})\.(\d{2})\.(\d{4})/.exec(s.trim()))
+      .filter(Boolean)
+      .map((m) => ({ number: m[1], year: Number(m[4]) }));
+  };
+
+  const ships = db.prepare(`
+    SELECT total, payload FROM documents
+     WHERE user_id = ? AND cp_id = ? AND type = 'upd'
+     ORDER BY date, id`).all(userId, Number(cpId));
+
+  for (const s of ships) {
+    // Отгрузка закрывает не больше, чем сама стоит: остаток сверх авансов —
+    // обычная реализация, чужие авансы он не трогает.
+    let rest = Number(s.total) || 0;
+    for (const ref of refsOf(s.payload)) {
+      const a = advances.find((x) => String(x.number) === String(ref.number)
+        && Number(x.year) === ref.year && x.left > 0);
+      if (!a) continue;
+      const take = Math.min(a.left, rest);
+      a.left = Math.round((a.left - take) * 100) / 100;
+      rest = Math.round((rest - take) * 100) / 100;
+      if (rest <= 0) break;
+    }
+  }
+
+  return advances.filter((a) => a.left > 0.005);
 }
 
 function createCp(userId, fields) {

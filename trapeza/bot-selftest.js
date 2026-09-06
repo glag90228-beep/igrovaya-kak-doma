@@ -4612,6 +4612,57 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(bdbK.openAdvances(uK.id, cpK).length === 0,
       'закрытый аванс больше не предлагается', bdbK.openAdvances(uK.id, cpK).length);
 
+    /*
+     * Частичный зачёт и год в номере.
+     *
+     * Зачёт был «всё или ничего»: отгрузка на 60 000 в счёт аванса на
+     * 100 000 закрывала его целиком, и остаток 40 000 из строки 5б следующей
+     * отгрузки пропадал — НДС с этой части не принимался к вычету (п. 8
+     * ст. 171 НК), то есть налог оставался переплаченным.
+     *
+     * А закрытость искалась подстрокой «№ N » без года, хотя нумерация
+     * сквозная ПО ГОДАМ: аванс № 1 за прошлый год гасился отгрузкой,
+     * сославшейся на № 1 за нынешний.
+     */
+    const uP = bdbK.getOrCreateUser(880303);
+    bdbK.saveMyOrg(uP.id, { name: 'ООО «Часть»', inn: '7701234567' });
+    bdbK.updateOrg(uP.id, bdbK.getDefaultOrg(uP.id).id, { vat_rate: '22' });
+    const cpP = bdbK.createCp(uP.id, { name: 'ООО «Пок»', inn: '7707654321', kind: 'customer', opening_date: '2025-01-01' });
+
+    const avP = await dsK.issueFlat(uP.id, {
+      type: 'avans', cpId: cpP, date: '2026-03-01', skipQuota: true, total: 100000,
+      payload: { sum: 100000, vatRate: 22, subject: 'Предоплата', payDoc: '№ 9 от 01.03.2026' },
+    });
+    ok(avP.ok, 'аванс на 100 000 выписан', avP.message);
+    const openP = bdbK.openAdvances(uP.id, cpP);
+    ok(openP.length === 1 && openP[0].left === 100000, 'весь аванс пока открыт',
+      JSON.stringify(openP.map((x) => x.left)));
+
+    // Отгружаем на 60 000 в счёт этого аванса.
+    await dsK.issueDocument(uP.id, {
+      type: 'upd', cpId: cpP, date: '2026-03-10', skipQuota: true,
+      items: [{ name: 'Часть работ', qty: 1, price: 60000, unit: 'шт' }],
+      extra: { status: 1, vatRate: null, advDoc: `№ ${avP.doc.number} от 01.03.2026` },
+    });
+    const afterP = bdbK.openAdvances(uP.id, cpP);
+    ok(afterP.length === 1 && afterP[0].left === 40000,
+      'после частичной отгрузки в авансе осталось 40 000',
+      JSON.stringify(afterP.map((x) => x.left)));
+
+    // И ссылка на номер другого года чужой аванс не гасит.
+    const avOld = await dsK.issueFlat(uP.id, {
+      type: 'avans', cpId: cpP, date: '2025-05-01', skipQuota: true, total: 7000,
+      payload: { sum: 7000, vatRate: 22, subject: 'Прошлогодний', payDoc: '№ 1 от 01.05.2025' },
+    });
+    if (avOld.ok) {
+      const openBoth = bdbK.openAdvances(uP.id, cpP);
+      ok(openBoth.some((x) => x.year === 2025 && x.left === 7000),
+        'прошлогодний аванс живёт своей жизнью и не гасится номером этого года',
+        JSON.stringify(openBoth.map((x) => `${x.year}:${x.number}:${x.left}`)));
+    } else {
+      ok(false, 'прошлогодний аванс выписывается', avOld.message);
+    }
+
     const ksfK = await dsK.issueFlat(uK.id, {
       type: 'ksf', cpId: cpK, date: '2026-09-10', skipQuota: true, total: 20000,
       payload: { vatRate: 22, base: { number: shK.doc.number, date: '2026-09-05' },
