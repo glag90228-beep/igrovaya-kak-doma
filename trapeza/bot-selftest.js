@@ -4517,6 +4517,58 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(av.ok, 'счёт-фактура на аванс выписывается', av.message);
 
     /*
+     * Бланк и долг обязаны говорить одно и то же.
+     *
+     * При статусе 2 ставка принудительно обнулялась в lib/upd.js: документ
+     * печатал «без НДС» и 100 000, а в журнале и в долге лежало 122 000 —
+     * итог считается по настоящей ставке. Расхождение ровно на сумму налога:
+     * человек показывал клиенту одну бумагу, а требовал другую сумму.
+     *
+     * Статус 2 — это «передаточный документ БЕЗ счёта-фактуры», а не
+     * «поставка без налога»: счёт-фактура выставляется отдельно, но должен
+     * покупатель всё равно с налогом.
+     */
+    const { buildUpdHtml } = require('./lib/upd');
+    const s2 = await dsK.issueDocument(uK.id, {
+      type: 'upd', cpId: cpK, date: '2026-09-20', skipQuota: true,
+      items: [{ name: 'Работы', qty: 1, price: 100000, unit: 'шт' }],
+      extra: { status: 2, advDoc: '' },
+    });
+    ok(s2.ok, 'УПД статуса 2 выписывается плательщиком НДС', s2.message);
+    const s2doc = bdbK.getDoc(uK.id, s2.doc.id);
+    ok(s2doc.total === 122000, 'в журнале лежит сумма с налогом', String(s2doc.total));
+    const s2html = buildUpdHtml({
+      org: bdbK.getDefaultOrg(uK.id),
+      cp: bdbK.getCp(uK.id, cpK),
+      doc: { ...s2doc.payload, number: s2doc.number, date: s2doc.date },
+    });
+    const noSpace = (s) => s.replace(/[\s  ]/g, '');
+    ok(noSpace(s2html).includes('122000,00'), 'и ровно она напечатана на бланке');
+    ok(noSpace(s2html).includes('22000,00'), 'сумма налога в бланке выделена');
+    ok(!/без НДС/.test(s2html), 'и «без НДС» у плательщика больше не печатается');
+
+    /*
+     * А самозанятому налог не выделяется вовсе — и в долг он тоже не идёт.
+     * Ставку он мог выбрать: экраны «Самозанятость» и «НДС» независимы.
+     */
+    const npdU = bdbK.getOrCreateUser(880202);
+    bdbK.saveMyOrg(npdU.id, { name: 'ИП Петров', inn: '770123456789' });
+    const npdOrg = bdbK.getDefaultOrg(npdU.id);
+    bdbK.updateOrg(npdU.id, npdOrg.id, { vat_rate: '22', npd: 1 });
+    const npdCp = bdbK.createCp(npdU.id, { name: 'ООО «Заказчик»', inn: '7707654321', kind: 'customer', opening_date: '2026-01-01' });
+    const npdDoc = await dsK.issueDocument(npdU.id, {
+      type: 'upd', cpId: npdCp, date: '2026-09-20', skipQuota: true,
+      items: [{ name: 'Работы', qty: 1, price: 100000, unit: 'шт' }],
+    });
+    if (npdDoc.ok) {
+      const nd = bdbK.getDoc(npdU.id, npdDoc.doc.id);
+      ok(nd.total === 100000, 'самозанятому налог в долг не приписан', String(nd.total));
+      ok(nd.payload.vatRate == null, 'и ставка в документе обнулена', String(nd.payload.vatRate));
+    } else {
+      ok(false, 'УПД самозанятого выписывается', npdDoc.message);
+    }
+
+    /*
      * Без платёжки авансового счёта-фактуры не бывает.
      *
      * Строка 5 обязательна (п. 5.1 ст. 169 НК): документ выставляется на

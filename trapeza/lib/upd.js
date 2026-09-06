@@ -67,7 +67,23 @@ const LAND = `
  */
 function buildUpdHtml({ org, cp, doc }) {
   const status = Number(doc.status) === 1 ? 1 : 2;
-  const rate = status === 1 ? (doc.vatRate == null ? null : Number(doc.vatRate)) : null;
+  /*
+   * Ставка не зависит от статуса.
+   *
+   * Раньше при статусе 2 она принудительно обнулялась: бланк печатал «без
+   * НДС» и 100 000, тогда как в журнале и в долге у контрагента лежало
+   * 122 000 — итог считается по настоящей ставке. Расхождение ровно на сумму
+   * налога, и человек видел одно, а требовал другое.
+   *
+   * Статус 2 означает «передаточный документ БЕЗ счёта-фактуры», а не
+   * «поставка без налога». Плательщик НДС, выбравший двойку, выставляет
+   * счёт-фактуру отдельно, но покупатель всё равно должен ему сумму с
+   * налогом — как в ТОРГ-12 и в акте, где «в том числе НДС» есть всегда.
+   *
+   * Того, кому налог выделять нельзя (самозанятый), сюда не пускает
+   * doc-service: он обнуляет ставку вместе с назначением статуса.
+   */
+  const rate = doc.vatRate == null ? null : Number(doc.vatRate);
   const gross = Boolean(doc.priceIncludesVat);
   const items = doc.items || [];
 
@@ -151,8 +167,8 @@ function buildUpdHtml({ org, cp, doc }) {
       <td class="c">${esc(it.qty ?? '')}</td>
       <td class="r">${formatMoney(it.price)}</td>
       <td class="r">${formatMoney(s.net)}</td>
-      <td class="c">без НДС</td>
-      <td class="c">—</td>
+      <td class="c">${rate == null ? 'без НДС' : esc(rateLabel(rate))}</td>
+      <td class="r">${s.vat == null ? '—' : formatMoney(s.vat)}</td>
       <td class="r">${formatMoney(s.total)}</td>
     </tr>`;
   }).join('');
@@ -169,7 +185,8 @@ function buildUpdHtml({ org, cp, doc }) {
     : `<tr class="total">
         <td colspan="6" class="r">Всего к оплате:</td>
         <td class="r">${formatMoney(totalNet)}</td>
-        <td class="c">—</td><td class="c">—</td>
+        <td class="c">—</td>
+        <td class="r">${totalVat == null ? 'без НДС' : formatMoney(totalVat)}</td>
         <td class="r">${formatMoney(totalAll)}</td>
       </tr>`;
 
