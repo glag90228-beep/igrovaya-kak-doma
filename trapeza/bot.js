@@ -2425,10 +2425,25 @@ async function handleFreeText(tg, chatId, user, text) {
      * никуда не шла: документ брал ставку организации, и человек, назвавший
      * другую вслух, получал не то, что просил, без единого слова об этом.
      */
+    /*
+     * Ставку из разбора фразы проверяем по тому же списку, что и кнопки.
+     *
+     * intent приходит из ответа модели, а он не обязан быть осмысленным:
+     * отменённая с 2019 года 18, строка «22%», просто число 999 — всё это
+     * молча уходило в документ, и получался бланк с несуществующей ставкой.
+     * null здесь — законное значение, «без НДС», его и пропускаем отдельно.
+     */
     const extra = {};
     if (intent.vatRate !== undefined) {
-      extra.vatRate = intent.vatRate;
-      extra.priceIncludesVat = Boolean(intent.priceIncludesVat);
+      const asked = intent.vatRate;
+      if (asked === null || okRate(String(asked))) {
+        extra.vatRate = asked === null ? null : Number(asked);
+        extra.priceIncludesVat = Boolean(intent.priceIncludesVat);
+      } else {
+        await tg.sendMessage(chatId,
+          `Ставки ${esc(String(asked))}% нет. Возьму ставку из ваших настроек — `
+          + 'поменять можно в разделе «НДС».');
+      }
     }
     await startItems(tg, chatId, user, intent.docType, found.cp.id, extra);
     const items = docService.cleanItems(intent.items || []);

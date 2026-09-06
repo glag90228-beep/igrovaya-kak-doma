@@ -4620,6 +4620,38 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     });
     ok(ksfK.ok, 'корректировочный счёт-фактура выписывается', ksfK.message);
 
+    /*
+     * Реквизиты бланка КСФ. Адресов сторон в нём не было вовсе, хотя строки
+     * 2а и 6а обязательны, а налоговая сверяет корректировочный с исходным:
+     * расхождение по составу реквизитов — повод для требования пояснений
+     * обеим сторонам. Заодно следим за шириной строк: колонки добавлялись,
+     * и разъехавшаяся таблица — первое, что при этом ломается.
+     */
+    const { buildKsfHtml } = require('./lib/ksf');
+    bdbK.updateOrg(uK.id, bdbK.getDefaultOrg(uK.id).id, { address: 'Москва, ул. Ленина, 1' });
+    bdbK.updateCp(uK.id, cpK, { address: 'Тула, ул. Мира, 5' });
+    const ksfHtml = buildKsfHtml({
+      org: bdbK.getDefaultOrg(uK.id),
+      cp: bdbK.getCp(uK.id, cpK),
+      doc: { number: '1', date: '2026-09-10', vatRate: 22, reason: 'Соглашение № 3',
+        lines: [{ name: 'Монтаж', unit: 'усл.', before: { qty: 1, price: 150000 }, after: { qty: 1, price: 130000 } }] },
+    });
+    ok(/Москва, ул\. Ленина, 1/.test(ksfHtml), 'адрес продавца в КСФ есть');
+    ok(/Тула, ул\. Мира, 5/.test(ksfHtml), 'адрес покупателя в КСФ есть');
+    ok(/усл\./.test(ksfHtml), 'единица измерения в строке есть');
+    {
+      const head = (ksfHtml.match(/<thead>[\s\S]*?<\/thead>/) || [''])[0];
+      const wide = (head.match(/<th[ >]/g) || []).length;
+      const body = (ksfHtml.match(/<tbody>[\s\S]*?<\/tbody>/) || [''])[0];
+      const bad = (body.match(/<tr[\s\S]*?<\/tr>/g) || []).filter((tr) => {
+        const cells = (tr.match(/<td/g) || []).length;
+        const span = Number((tr.match(/colspan="(\d+)"/) || [])[1] || 1);
+        return cells + span - 1 !== wide;
+      });
+      ok(wide === 9 && !bad.length, 'все строки таблицы КСФ одной ширины',
+        `шапка ${wide}, кривых строк ${bad.length}`);
+    }
+
     // --- книга продаж ---
     const docsK = bdbK.listDocs(uK.id, 50)
       .map((d) => ({ ...d, cpName: 'ООО «Покупатель»', cpInn: '7707654321' }));

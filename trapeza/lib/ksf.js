@@ -82,6 +82,7 @@ function buildKsfHtml({ org, cp, doc }) {
     const cell = (which, side) => `
       <tr>
         <td>${which === 'before' ? esc(l.name) : ''}</td>
+        <td class="c">${which === 'before' ? esc(l.unit || 'шт.') : ''}</td>
         <td class="c small">${which === 'before' ? 'до изменения' : 'после изменения'}</td>
         <td class="c">${side.qty == null ? '—' : esc(String(side.qty))}</td>
         <td class="r">${money(side.unitNet)}</td>
@@ -100,32 +101,50 @@ function buildKsfHtml({ org, cp, doc }) {
        от ${ru((doc.base || {}).date)}</p>
     <hr class="rule">
 
+    ${/*
+       * Адреса сторон в бланке обязательны — строки 2а и 6а формы.
+       *
+       * Их тут не было вовсе, а корректировочный счёт-фактура сверяется
+       * налоговой с исходным: расхождение по составу реквизитов — повод для
+       * требования пояснений обеим сторонам. Номера строк проставлены по той
+       * же причине, что и в остальных бланках: по ним бухгалтер сверяется
+       * с формой, а не по названиям колонок.
+       */''}
     <table class="reqs">
-      <tr><td class="k">Продавец</td><td colspan="3">${esc(org.full_name || org.name)}</td></tr>
-      <tr><td class="k">ИНН/КПП продавца</td>
+      <tr><td class="k">Продавец <span class="n">(2)</span></td>
+          <td colspan="3">${esc(org.full_name || org.name)}</td></tr>
+      <tr><td class="k">Адрес <span class="n">(2а)</span></td>
+          <td colspan="3">${esc(org.address || '—')}</td></tr>
+      <tr><td class="k">ИНН/КПП продавца <span class="n">(2б)</span></td>
           <td colspan="3">${esc(org.inn || '—')}${org.kpp ? ` / ${esc(org.kpp)}` : ' / —'}</td></tr>
-      <tr><td class="k">Покупатель</td><td colspan="3">${esc(cp.full_name || cp.name)}</td></tr>
-      <tr><td class="k">ИНН/КПП покупателя</td>
+      <tr><td class="k">Покупатель <span class="n">(6)</span></td>
+          <td colspan="3">${esc(cp.full_name || cp.name)}</td></tr>
+      <tr><td class="k">Адрес <span class="n">(6а)</span></td>
+          <td colspan="3">${esc(cp.address || '—')}</td></tr>
+      <tr><td class="k">ИНН/КПП покупателя <span class="n">(6б)</span></td>
           <td colspan="3">${esc(cp.inn || '—')}${cp.kpp ? ` / ${esc(cp.kpp)}` : ' / —'}</td></tr>
       <tr><td class="k">Основание изменения</td>
           <td colspan="3">${esc(doc.reason || '—')}</td></tr>
-      <tr><td class="k">Валюта: наименование, код</td><td colspan="3">Российский рубль, 643</td></tr>
+      <tr><td class="k">Валюта: наименование, код <span class="n">(7)</span></td>
+          <td colspan="3">Российский рубль, 643</td></tr>
     </table>
 
     <table class="items">
       <thead><tr>
-        <th>Наименование</th><th style="width:88px">Показатель</th>
+        <th>Наименование <div class="gr">1а</div></th>
+        <th style="width:44px">Ед. <div class="gr">2а</div></th>
+        <th style="width:88px">Показатель</th>
         <th style="width:52px">Кол-во</th><th style="width:72px">Цена</th>
         <th style="width:84px">Без налога</th><th style="width:52px">Ставка</th>
         <th style="width:84px">Налог</th><th style="width:92px">С налогом</th>
       </tr></thead>
       <tbody>
-        ${rows || '<tr><td colspan="8" class="c muted">— нет строк —</td></tr>'}
-        <tr class="total"><td colspan="4" class="r b">Всего увеличение (доплата):</td>
+        ${rows || '<tr><td colspan="9" class="c muted">— нет строк —</td></tr>'}
+        <tr class="total"><td colspan="5" class="r b">Всего увеличение (доплата):</td>
             <td class="r b">${formatMoney(up.net)}</td><td></td>
             <td class="r b">${rate == null ? '—' : formatMoney(up.vat)}</td>
             <td class="r b">${formatMoney(up.total)}</td></tr>
-        <tr class="total"><td colspan="4" class="r b">Всего уменьшение:</td>
+        <tr class="total"><td colspan="5" class="r b">Всего уменьшение:</td>
             <td class="r b">${formatMoney(down.net)}</td><td></td>
             <td class="r b">${rate == null ? '—' : formatMoney(down.vat)}</td>
             <td class="r b">${formatMoney(down.total)}</td></tr>
