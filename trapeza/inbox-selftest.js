@@ -267,6 +267,14 @@ async function main() {
       mime.documentKind(word.attachments[0].filename, word.subject));
     ok(mime.documentKind('Счет_148.pdf') === 'Счёт', 'счёт остаётся счётом');
     ok(mime.documentKind('Актуальный прайс.xlsx') === '', 'прайс не выдаётся за акт');
+    /*
+     * «чек» проверялся через \bчек\b — а граница слова в JS определена по
+     * латинице, и на кириллице не срабатывает никогда: правило было мёртвым.
+     * Ровно эта ловушка в проекте уже ловилась, потому и закрепляем.
+     */
+    ok(mime.documentKind('чек.pdf') === 'Квитанция', 'чек распознаётся');
+    ok(mime.documentKind('Чек об оплате') === 'Квитанция', 'и с большой буквы тоже');
+    ok(mime.documentKind('Чеканка металла.pdf') === '', 'а «чеканка» за чек не выдаётся');
     ok(!mime.looksLikeDocument({ filename: 'logo.png', contentType: 'image/png', size: 4000 }),
       'логотип из подписи письма документом не считается');
 

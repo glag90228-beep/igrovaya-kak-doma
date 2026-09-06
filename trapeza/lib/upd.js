@@ -283,8 +283,18 @@ function buildUpdHtml({ org, cp, doc }) {
            * У исправления свой сквозной номер по этому счёту-фактуре.
            */''}
         ${fixNote(doc.fix) ? `<p class="center b" style="margin:2px 0">${esc(fixNote(doc.fix))}</p>` : ''}
+        ${/*
+           * Строка 1а — место самого исправления, а не прочерков.
+           *
+           * Раньше здесь всегда стояло «Исправление № — от —», даже когда
+           * исправление есть: бланк одновременно печатал пометку выше и
+           * отрицал её здесь. Для налоговой значение имеет именно строка 1а
+           * счёта-фактуры, так что прочерк в ней означал «исправлений нет».
+           */''}
         ${status === 1 ? `<div class="small muted">Счёт-фактура № ${esc(doc.number || '1')} от ${ru(doc.date)}
-          <span class="n">(1)</span> · Исправление № — от — <span class="n">(1а)</span></div>` : ''}
+          <span class="n">(1)</span> · Исправление ${doc.fix && doc.fix.no
+    ? `№ ${esc(String(doc.fix.no))} от ${ru(doc.fix.date)}`
+    : '№ — от —'} <span class="n">(1а)</span></div>` : ''}
       </div>
       <div class="upd-status">
         <b>Статус: ${status}</b>
