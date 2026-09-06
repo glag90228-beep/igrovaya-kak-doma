@@ -679,6 +679,34 @@ async function main() {
   r = await call('POST', '/api/lookup', { user: masha, body: {} });
   ok(r.status === 400, 'запрос без ИНН и БИК отклонён');
 
+  /*
+   * Дневной предел на человека: квота DaData общая на весь продукт.
+   *
+   * Раньше здесь стоял только общий ограничитель в 120 запросов в минуту —
+   * один пользователь выедал дневной лимит справочника примерно за полтора
+   * часа, и ИНН переставал подставляться у ВСЕХ до полуночи.
+   */
+  {
+    const wasLimit = process.env.LOOKUPS_PER_DAY;
+    process.env.LOOKUPS_PER_DAY = '3';
+    // Считаем и удачные, и неудачные: в квоту DaData уходят оба.
+    const codes = [];
+    for (let i = 0; i < 6; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      const one = await call('POST', '/api/lookup', { user: petya, body: { inn: '7712345678' } });
+      codes.push(one.status);
+    }
+    ok(codes.slice(0, 3).every((c) => c === 200), 'первые запросы проходят', codes.join(','));
+    ok(codes.slice(-1)[0] === 400, 'сверх дневного предела справочник не дёргается', codes.join(','));
+    // Сосед берётся свежий: у Маши выше по прогону запросы уже были, и на
+    // пределе в три штуки она бы упёрлась не из-за общей квоты, а по-своему.
+    const sosed = initDataFor({ id: 500303, first_name: 'Сосед', username: 'sosed' });
+    const other = await call('POST', '/api/lookup', { user: sosed, body: { inn: '7712345678' } });
+    ok(other.status === 200, 'предел считается по человеку, а не общий на всех', String(other.status));
+    if (wasLimit === undefined) delete process.env.LOOKUPS_PER_DAY;
+    else process.env.LOOKUPS_PER_DAY = wasLimit;
+  }
+
   r = await call('POST', '/api/parse', {
     user: masha,
     body: {
