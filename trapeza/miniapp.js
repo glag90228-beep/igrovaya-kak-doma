@@ -84,6 +84,7 @@ const MIME = {
   '.png': 'image/png',
   '.ico': 'image/x-icon',
   '.json': 'application/json; charset=utf-8',
+  '.woff2': 'font/woff2',
 };
 
 function sendJson(res, code, obj) {
@@ -1952,12 +1953,19 @@ function serveStatic(req, res, pathname) {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
       return res.end('мини-приложение не собрано');
     }
-    const type = MIME[path.extname(full).toLowerCase()] || 'application/octet-stream';
+    const ext = path.extname(full).toLowerCase();
+    const type = MIME[ext] || 'application/octet-stream';
+    /*
+     * Шрифт — исключение из «не кэшировать».
+     *
+     * Разметку и скрипты кэшировать надолго нельзя: обновление должно
+     * доезжать до людей сразу. Но шрифт не меняется никогда — он либо тот же,
+     * либо приезжает под другим именем. Пересогласовывать его на каждом
+     * открытии значит откладывать самое крупное на экране: сумму.
+     */
     res.writeHead(200, {
       'Content-Type': type,
-      // Статику приложения кэшировать нельзя надолго: обновление должно
-      // доезжать до людей сразу, файлы крошечные.
-      'Cache-Control': 'no-cache',
+      'Cache-Control': ext === '.woff2' ? 'public, max-age=31536000, immutable' : 'no-cache',
       'X-Content-Type-Options': 'nosniff',
     });
     return res.end(data);
