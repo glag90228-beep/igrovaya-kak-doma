@@ -26,6 +26,9 @@ const path = require('node:path');
 const bdb = require('./lib/bot-db');
 const billing = require('./lib/billing');
 const docService = require('./lib/doc-service');
+// Платёжный QR по ГОСТ Р 56042: тот же модуль, что рисует его в самом счёте,
+// — иначе код на превью и код в PDF однажды разойдутся.
+const { payQrSvg, payProblems } = require('./lib/qr-pay');
 const docLink = require('./lib/doc-link');
 const npd = require('./lib/npd');
 const dadata = require('./lib/dadata');
@@ -1720,6 +1723,34 @@ const api = {
       sum, vat, label,
       file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf },
     };
+  },
+
+  /*
+   * Платёжный QR документа — до отправки, а не только внутри PDF.
+   *
+   * Смысл в том, чтобы человек увидел код своими глазами прежде, чем отдаст
+   * счёт клиенту: наведя на него камеру банка, он за секунду проверит, те ли
+   * реквизиты и та ли сумма. Ошибку в счёте дешевле находить здесь.
+   *
+   * Когда реквизитов не хватает, отдаём не пустоту, а список недостающего.
+   * Обещать QR, которого не существует, нельзя: код по ГОСТ Р 56042 требует
+   * названия, счёта, банка, БИК и корр. счёта — без них его просто нет.
+   */
+  async 'GET /api/doc/qr'({ user, url }) {
+    const d = bdb.getDoc(user.id, Number(url.searchParams.get('id')));
+    if (!d) return { error: 'Документ не найден.' };
+    const org = bdb.getDefaultOrg(user.id);
+    if (!org) return { problems: ['реквизиты организации не заполнены'] };
+    const cp = bdb.getCp(user.id, d.cp_id);
+    const problems = payProblems({ org });
+    if (problems.length) return { problems };
+    const svg = payQrSvg({
+      org,
+      sum: d.total,
+      payer: cp ? (cp.full_name || cp.name) : '',
+      purpose: `Оплата по счёту № ${d.number} от ${ruDate(d.date)}`,
+    }, { size: 200 });
+    return svg ? { svg } : { problems: ['не удалось собрать код'] };
   },
 
   /** Какие счета-фактуры этого клиента можно корректировать. */

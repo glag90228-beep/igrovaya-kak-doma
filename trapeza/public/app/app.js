@@ -798,6 +798,44 @@ screens.doc = async function docScreen({ id }) {
       h('span', { class: 'money', text: money(d.total) })) : null));
 
   /*
+   * Платёжный QR — видно до того, как счёт уйдёт клиенту.
+   *
+   * Раньше код жил только внутри PDF: чтобы его увидеть, надо было открыть
+   * файл. А это ровно та секунда, когда ошибку в реквизитах или сумме ещё
+   * дёшево исправить — наведя камеру банка на собственный экран.
+   *
+   * Если реквизитов не хватает, честно говорим, каких именно, вместо пустого
+   * места: кода по ГОСТ Р 56042 без счёта, БИК и корр. счёта не существует, и
+   * обещать его нельзя.
+   */
+  if (['sch', 'schdog'].includes(d.type) && d.total) {
+    const qrCard = h('div', { class: 'card qr-card' },
+      h('div', { class: 'muted small', text: 'Загружаю код…' }));
+    box.append(h('div', { class: 'section-title', text: 'Оплата по QR' }), qrCard);
+    api('GET', `/api/doc/qr?id=${d.id}`).then((r) => {
+      qrCard.textContent = '';
+      if (r.svg) {
+        const wrap = h('div', { class: 'qr-wrap' });
+        // Код приходит готовым SVG с сервера — тем же, что рисуется в PDF,
+        // чтобы превью и файл не разошлись.
+        wrap.innerHTML = r.svg;
+        qrCard.append(wrap, h('div', { class: 'small muted center',
+          text: 'Клиент наводит камеру в приложении банка — платёжка заполнится сама' }));
+        return;
+      }
+      const why = (r.problems || []).join(', ');
+      qrCard.append(h('div', { class: 'row' },
+        h('span', { class: 'icon-box warn' }, icon('warn')),
+        h('span', { class: 'grow' },
+          h('div', { text: 'QR пока не собрать' }),
+          h('div', { class: 'small muted', text: why ? `Не хватает: ${why}.` : 'Не хватает реквизитов.' }))),
+        h('div', { class: 'btn-wrap' }, h('button', {
+          class: 'btn secondary', onclick: () => { haptic(); go('org'); },
+        }, 'Заполнить реквизиты')));
+    }).catch(() => { qrCard.textContent = ''; qrCard.append(h('div', { class: 'muted small', text: 'Код не загрузился.' })); });
+  }
+
+  /*
    * Оплата. В боте отметить её было можно, а в приложении — нет: обработчик
    * на сервере есть, кнопки не было. Для счёта это половина смысла карточки:
    * отметка закрывает долг в журнале и убирает документ из «не оплачено».
@@ -3846,21 +3884,131 @@ screens.new = async function newDoc(params) {
 
   const box = h('div', {}, h('h1', { text: TITLES[type] }));
 
-  if (!cps.length) {
-    box.append(empty('users', 'Сначала добавьте контрагента',
-      'Документ выписывается на кого-то — укажите заказчика или поставщика.',
-      h('div', { class: 'btn-wrap' }, h('button', { class: 'btn', onclick: () => go('cp', {}) }, 'Добавить контрагента'))));
-    return box;
+  /*
+   * Форма открывается ВСЕГДА, даже когда клиентов ещё нет.
+   *
+   * Раньше здесь стоял экран-заглушка «Сначала добавьте контрагента»: человек
+   * нажимал «Выписать счёт», а попадал в справочник — то есть в работу, о
+   * которой не просил, и до счёта доходил не каждый. Клиент теперь заводится
+   * не вместо счёта, а по дороге, в том же поле «Кому».
+   *
+   * Заводится с подтверждением, а не молча. Это сознательное отступление от
+   * исходного замысла «создавать на лету»: тихо появившийся дубль «ООО Заря»
+   * рядом с «ООО «Заря»» потом расходится по документам и разъезжается в акте
+   * сверки, а найти его человек не может — он не знал, что что-то создалось.
+   */
+  const dateInput = h('input', { id: 'f-date', type: 'date', value: draft.date });
+  const cpField = h('div', { class: 'field' });
+  box.append(h('div', { class: 'card' }, cpField,
+    h('div', { class: 'field' }, h('label', { for: 'f-date', text: 'Дата' }), dateInput)));
+
+  // Список пополняется прямо здесь, поэтому держим свою копию: перерисовывать
+  // весь экран ради одной новой строки незачем.
+  const known = cps.slice();
+  const found = h('div', { class: 'cp-found', hidden: true });
+  const search = h('input', {
+    id: 'f-cp', autocomplete: 'off',
+    placeholder: 'Название или ИНН', 'aria-label': 'Кому выписываем',
+  });
+  const chosenName = () => (known.find((c) => c.id === draft.cpId) || {}).name || '';
+
+  function drawCp() {
+    cpField.textContent = '';
+    if (draft.cpId) {
+      // Выбранного показываем строкой, а не полем: главное здесь — увидеть,
+      // ЧТО выбрано. Ошибка в получателе документа дороже лишнего нажатия.
+      const chip = h('button', { class: 'cp-chip' },
+        h('span', { class: 'grow ellipsis', text: chosenName() }),
+        h('span', { class: 'small muted nowrap', text: 'изменить' }));
+      chip.onclick = () => { haptic(); draft.cpId = 0; search.value = ''; drawCp(); };
+      cpField.append(h('label', { text: 'Кому' }), chip);
+      return;
+    }
+    cpField.append(h('label', { for: 'f-cp', text: 'Кому' }), search, found);
   }
 
-  const cpSel = h('select', { id: 'f-cp' },
-    draft.cpId ? [] : [h('option', { value: '', selected: true }, '— выберите клиента —')],
-    cps.map((cp) => h('option', { value: cp.id, selected: cp.id === draft.cpId }, cp.name)));
-  const dateInput = h('input', { id: 'f-date', type: 'date', value: draft.date });
+  /** Совпадения среди своих — и по названию, и по ИНН. */
+  function matches(q) {
+    const s = q.trim().toLowerCase();
+    if (!s) return known.slice(0, 6);
+    return known.filter((c) => String(c.name || '').toLowerCase().includes(s)
+      || String(c.inn || '').includes(s)).slice(0, 6);
+  }
 
-  box.append(h('div', { class: 'card' },
-    h('div', { class: 'field' }, h('label', { for: 'f-cp', text: 'Кому' }), cpSel),
-    h('div', { class: 'field' }, h('label', { for: 'f-date', text: 'Дата' }), dateInput)));
+  function pick(cp) {
+    draft.cpId = cp.id;
+    found.hidden = true;
+    haptic();
+    drawCp();
+    recalc();
+  }
+
+  let lookupTimer = 0;
+  async function suggest() {
+    const q = search.value;
+    const digits = q.replace(/\D/g, '');
+    const list = matches(q);
+    found.textContent = '';
+    for (const c of list) {
+      const row = h('button', { class: 'cp-opt' },
+        h('span', { class: 'grow ellipsis', text: c.name }),
+        c.inn ? h('span', { class: 'small muted nowrap', text: `ИНН ${c.inn}` }) : null);
+      row.onclick = () => pick(c);
+      found.append(row);
+    }
+
+    /*
+     * ИНН — заодно способ завести клиента, не уходя с формы.
+     *
+     * Десять цифр у организации, двенадцать у ИП. Справочник спрашиваем,
+     * только когда своих совпадений нет: иначе каждый ввод тратил бы общую
+     * квоту, а человек всего лишь искал того, кто у него уже есть.
+     */
+    if ((digits.length === 10 || digits.length === 12) && !list.length) {
+      const wait = h('div', { class: 'cp-opt muted small', text: 'Ищу в реестре…' });
+      found.append(wait);
+      found.hidden = false;
+      try {
+        const r = await api('POST', '/api/lookup', { inn: digits });
+        const p = r.party;
+        wait.remove();
+        if (!p || !p.name) throw new Error('не нашлось');
+        const add = h('button', { class: 'cp-opt ok' },
+          h('span', { class: 'grow' },
+            h('div', { class: 'ellipsis', text: p.name }),
+            h('div', { class: 'small muted ellipsis',
+              text: `ИНН ${digits}${p.address ? ` · ${p.address}` : ''}` })),
+          h('span', { class: 'badge ok nowrap', text: 'в ЕГРЮЛ' }));
+        add.onclick = () => withBusy(add, async () => {
+          const made = await api('POST', '/api/cp', {
+            name: p.name, full_name: p.full_name || '', inn: digits, kpp: p.kpp || '',
+            address: p.address || '', kind: 'customer',
+          });
+          const cp = made.cp || made;
+          const row = { id: cp.id, name: cp.name || p.name, inn: digits };
+          known.push(row);
+          toast(`Добавил ${row.name}`);
+          pick(row);
+        });
+        found.append(add);
+      } catch (_) {
+        wait.textContent = 'В реестре не нашёл — заведите клиента вручную.';
+      }
+      return;
+    }
+    found.hidden = !list.length;
+  }
+
+  search.addEventListener('input', () => {
+    draft.cpId = 0;
+    clearTimeout(lookupTimer);
+    // Пауза перед обращением в справочник: без неё десять цифр ИНН — это до
+    // десяти запросов к общей квоте вместо одного.
+    lookupTimer = setTimeout(suggest, 260);
+    recalc();
+  });
+  search.addEventListener('focus', suggest);
+  drawCp();
 
   // --- позиции ---
   const itemsCard = h('div', { class: 'card' });
@@ -3870,7 +4018,9 @@ screens.new = async function newDoc(params) {
     const sum = draft.items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0);
     totalEl.textContent = money(sum);
     if (tg) {
-      const ready = sum > 0 && draft.items.some((it) => it.name.trim());
+      // Клиент — часть готовности, а не отдельная проверка после нажатия.
+      // Активная кнопка, которая в ответ говорит «выберите, кому», обманывает.
+      const ready = sum > 0 && draft.cpId > 0 && draft.items.some((it) => it.name.trim());
       tg.MainButton.setParams({ text: `Выписать на ${money(sum)}`, is_active: ready });
       if (ready) tg.MainButton.show(); else tg.MainButton.hide();
     }
@@ -3942,10 +4092,10 @@ screens.new = async function newDoc(params) {
   const issue = async () => {
     const items = draft.items.filter((it) => it.name.trim());
     if (!items.length) { toast('Добавьте хотя бы одну позицию', true); return; }
-    if (!Number(cpSel.value)) { toast('Выберите, кому выписываем', true); cpSel.focus(); return; }
+    if (!draft.cpId) { toast('Выберите, кому выписываем', true); search.focus(); return; }
     try {
       if (tg) tg.MainButton.showProgress();
-      const payload = { type, cpId: Number(cpSel.value), date: dateInput.value, items };
+      const payload = { type, cpId: draft.cpId, date: dateInput.value, items };
       if (draft.vatRate !== undefined) {
         payload.vatRate = draft.vatRate;
         payload.priceIncludesVat = Boolean(draft.priceIncludesVat);

@@ -467,6 +467,44 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 
 .field:focus-within { box-shadow: inset 3px 0 0 var(--primary); }
 
+/* Выбор клиента прямо в форме счёта.
+   Раньше здесь стоял выпадающий список, а до него — экран-заглушка «сначала
+   добавьте контрагента»: человек шёл выписывать счёт и попадал в справочник.
+   Теперь поле ищет среди своих по названию и ИНН, а по ИНН умеет предложить
+   и того, кого в справочнике ещё нет. */
+.cp-chip {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 6px 0; border: 0; background: none; color: inherit;
+  font: 500 17px/1.4 var(--font); text-align: left; cursor: pointer;
+}
+.cp-chip:active { opacity: .6; }
+
+.cp-found {
+  margin-top: 8px; border-top: 1px solid var(--hairline);
+  max-height: 260px; overflow-y: auto;
+}
+.cp-opt {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 10px 0; border: 0; border-bottom: 1px solid var(--hairline);
+  background: none; color: inherit; font: 400 16px/1.35 var(--font);
+  text-align: left; cursor: pointer;
+}
+.cp-opt:last-child { border-bottom: 0; }
+.cp-opt:active { opacity: .6; }
+/* Найденное в реестре выделяем: это не «ещё один из списка», а новое имя,
+   которое сейчас появится в справочнике, — и человек должен это заметить. */
+.cp-opt.ok { align-items: flex-start; }
+
+/* Платёжный QR на карточке документа.
+   Белая подложка обязательна и в тёмной теме: код читается только как
+   тёмное на светлом, инверсия ломает распознавание камерой. */
+.qr-card { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.qr-wrap {
+  background: #fff; padding: 10px; border-radius: 12px; line-height: 0;
+}
+.qr-wrap svg { display: block; width: 200px; height: 200px; }
+.center { text-align: center; }
+
 /* Видимая обводка фокуса обязательна: ей пользуются с клавиатуры. */
 :focus-visible { outline: 2px solid var(--link); outline-offset: 2px; border-radius: 4px; }
 

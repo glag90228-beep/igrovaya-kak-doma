@@ -699,6 +699,56 @@ async function main() {
     await call('POST', '/api/npd', { user: masha, body: { on: false } });
   }
 
+  section('платёжный QR до отправки');
+  {
+    /*
+     * Код показывается на карточке документа, чтобы человек проверил его
+     * камерой банка ДО того, как счёт уйдёт клиенту: там ошибка в реквизитах
+     * или сумме ещё стоит одну правку, а не разговор с бухгалтерией.
+     *
+     * И главное — когда реквизитов не хватает, отдаём не пустоту, а список
+     * недостающего. Кода по ГОСТ Р 56042 без счёта, БИК и корр. счёта не
+     * существует, и обещать его на экране нельзя.
+     */
+    const bdbQ = require('./lib/bot-db');
+    const uq = bdbQ.getOrCreateUser(500505, 'Пётр QR', 'qr');
+    require('./lib/billing').grantDays(uq.id, 30);
+    const qrUser = initDataFor({ id: 500505, first_name: 'Пётр QR', username: 'qr' });
+    bdbQ.saveMyOrg(uq.id, { name: 'ИП Петров', inn: '183209316119' });
+    const cpq = bdbQ.createCp(uq.id, { name: 'ООО «Клиент»', kind: 'customer', opening_date: '2026-01-01' });
+    const made = await call('POST', '/api/doc', {
+      user: qrUser,
+      body: { type: 'sch', cpId: cpq, items: [{ name: 'Услуга', qty: 1, price: 1000 }] },
+    });
+    ok(made.status === 200, 'счёт выписан', JSON.stringify(made.json).slice(0, 60));
+    const docId = made.json.doc.id;
+
+    // Реквизитов ещё нет — значит и кода нет, и мы говорим, чего не хватает.
+    const bad = await call('GET', `/api/doc/qr?id=${docId}`, { user: qrUser });
+    ok(!bad.json.svg, 'без реквизитов кода не отдаём');
+    ok((bad.json.problems || []).length > 0, 'зато перечислено, чего не хватает',
+      (bad.json.problems || []).join(', '));
+    ok((bad.json.problems || []).some((p) => /счёт/i.test(p)),
+      'и расчётный счёт назван прямо', (bad.json.problems || []).join(', '));
+
+    // Заполняем — код появляется.
+    const orgQ = bdbQ.getDefaultOrg(uq.id);
+    bdbQ.updateOrg(uq.id, orgQ.id, {
+      bank_name: 'АО «Тестбанк»', bik: '044525999',
+      acc: '40802810500000000123', corr_acc: '30101810400000000999',
+    });
+    const good = await call('GET', `/api/doc/qr?id=${docId}`, { user: qrUser });
+    ok(typeof good.json.svg === 'string' && good.json.svg.includes('<svg'),
+      'с реквизитами приходит настоящий SVG', String(good.json.svg).slice(0, 30));
+    ok(!(good.json.problems || []).length, 'и жалоб больше нет');
+
+    // Чужой документ по прямому адресу не отдаётся: это тот же рубеж, что и
+    // у остальных эндпоинтов, и проверять его надо на каждом новом.
+    const alien = await call('GET', `/api/doc/qr?id=${docId}`, { user: petya });
+    ok(!alien.json.svg && /не найден/i.test(alien.json.error || ''),
+      'чужой документ кода не отдаёт', JSON.stringify(alien.json));
+  }
+
   section('подсказки по реквизитам');
   r = await call('POST', '/api/lookup', { user: masha, body: { inn: '7712345678' } });
   ok(r.status === 200 && r.json.party && r.json.party.name === 'ООО «Ромашка»',
