@@ -380,10 +380,27 @@ screens.home = async function home() {
      */);
   sumBtn.onclick = () => { haptic(); go(unpaid.count ? 'unpaid' : 'why'); };
 
+  /*
+   * Сумма живёт в карточке и по центру, а не текстом на фоне.
+   *
+   * Голое число, прижатое влево, читалось как заголовок раздела: взгляд
+   * скользил по нему вниз, к кнопкам, вместо того чтобы на нём остановиться.
+   * Карточка отделяет «сколько мне должны» от всего остального экрана, а
+   * центр даёт числу вес — так это и было задумано в макете.
+   *
+   * Приветствие и остаток бесплатных документов остаются НАД карточкой: это
+   * не про деньги, и внутрь они бы шумели.
+   */
+  const q0 = s.quota || {};
   box.append(h('div', { class: 'hero' },
-    h('div', { class: 'greet', text: greetName(s.user.name) }),
-    sumBtn,
-    basisChip(s)));
+    h('div', { class: 'greet-row' },
+      h('span', { class: 'greet ellipsis', text: greetName(s.user.name) }),
+      h('span', { class: `badge ${q0.paid ? 'ok' : ''}`,
+        text: q0.paid ? 'подписка' : `${q0.left ?? 0}/${q0.limit ?? 0} бесплатно` })),
+    h('div', { class: 'hero-card' },
+      h('div', { class: 'cap', text: 'К получению' }),
+      sumBtn,
+      basisChip(s))));
 
   /*
    * Один вход вместо двух равнозначных.

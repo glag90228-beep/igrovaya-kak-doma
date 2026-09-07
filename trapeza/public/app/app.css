@@ -337,8 +337,34 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 
 /* ---------- шапка: сумма крупнее всего на экране ---------- */
 
-.hero { padding: 10px var(--pad) 2px; }
-.hero .greet { color: var(--muted); font-size: 15px; }
+.hero { padding: 10px 12px 2px; }
+
+/* Приветствие и остаток бесплатных — над карточкой, в одну строку:
+   это не про деньги, внутри карточки они бы спорили с числом. */
+.greet-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 6px 8px;
+}
+.greet-row .greet { color: var(--muted); font-size: 15px; flex: 1; min-width: 0; }
+
+/*
+ * Карточка суммы.
+ *
+ * Голое число на фоне, прижатое влево, читалось как заголовок раздела:
+ * взгляд скользил по нему дальше вниз, вместо того чтобы остановиться.
+ * Карточка отделяет главный вопрос — «сколько мне должны» — от остального
+ * экрана, а центр даёт числу вес.
+ */
+.hero-card {
+  background: var(--surface);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-1);
+  padding: 16px var(--pad) 18px;
+  text-align: center;
+}
+.hero-card .cap {
+  color: var(--muted); font-size: 14px; font-weight: 500;
+}
 .hero .sum {
   font: 800 clamp(34px, 11.5vw, 46px)/1.05 var(--font-num);
   letter-spacing: -.035em;
@@ -349,7 +375,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 /* Сумма нажимается: под ней разбор по источникам. Кнопка выглядит как текст,
    иначе шапка превратится в панель управления, — но это настоящая кнопка,
    а не div с обработчиком: по мёртвой на вид цифре никто не тыкает. */
-.hero .tap { display: block; width: 100%; text-align: left; border: 0; padding: 0;
+.hero .tap { display: block; width: 100%; text-align: center; border: 0; padding: 0;
   background: none; color: inherit; font: inherit; cursor: pointer; }
 .hero .tap:active { opacity: .6; }
 .hero .why { color: var(--primary); font-size: 14px; margin-top: 4px; }
@@ -376,9 +402,17 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
    Пример пишем прямо в ней — человек видит, ЧТО говорить, а не гадает. */
 .prompt {
   display: flex; align-items: center; gap: 12px; width: calc(100% - 24px);
-  margin: var(--gap) 12px 0; padding: 12px var(--pad);
-  background: var(--surface); border: 0; border-radius: var(--radius);
+  /* Снизу — обычный шаг сетки, а не ноль: с нулём карточка фразы слипалась
+     с кнопкой ниже в один блок с двухпиксельным швом. Это читается как
+     ошибка вёрстки, а не как связь между ними. */
+  margin: var(--gap) 12px var(--gap); padding: 12px var(--pad);
+  background: var(--surface); border: 0;
+  /* Именно --r-card. Здесь стояло var(--radius) — такого токена в проекте
+     нет, свойство молча отбрасывалось, и у карточки не было скругления
+     вовсе: единственный острый угол на всём экране. */
+  border-radius: var(--r-card);
   color: inherit; font: inherit; text-align: left; cursor: pointer;
+  box-shadow: var(--shadow-1);
 }
 .prompt:active { transform: scale(.985); transition: transform 90ms var(--ease); }
 .prompt .grow { min-width: 0; }
@@ -461,7 +495,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .cta {
   display: flex; align-items: center; gap: 14px;
   width: calc(100% - 24px);
-  margin: 2px 12px var(--gap);
+  margin: 0 12px var(--gap);
   min-height: 64px;
   padding: 0 18px;
   border: 0; border-radius: var(--r-card);
