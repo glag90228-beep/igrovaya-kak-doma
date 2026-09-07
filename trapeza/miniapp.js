@@ -1852,15 +1852,53 @@ async function sendFileToChat(user, file, caption) {
   }
 }
 
+/*
+ * Имя клиента уходит в подпись при parse_mode HTML: один «<» в названии —
+ * и Telegram отклонит сообщение целиком, то есть документ не придёт вовсе.
+ * «ООО "Рога & Копыта"» — не выдуманный случай.
+ */
+const escTg = (s) => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
 async function sendToChat(user, res) {
   if (!tg) return;
   const money = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2 }).format(res.total);
+
+  /*
+   * Имя клиента добывается из двух разных форм — и это не придирка.
+   *
+   * issueDocument отдаёт doc.cp = {id, name}, а issueFlat (аванс и
+   * корректировочный) — сырую строку из базы, где есть только cp_id. Здесь
+   * стояло res.doc.cp.name, то есть на счетах-фактурах падало на undefined.
+   * Вызов обёрнут в .catch(() => {}), поэтому падение было БЕЗМОЛВНЫМ:
+   * человек выписывал аванс в приложении, и в чат не приходило ничего.
+   */
+  const cpName = (res.doc.cp && res.doc.cp.name)
+    || (res.doc.cp_id ? ((bdb.getCp(user.id, res.doc.cp_id) || {}).name || '') : '');
+
+  /*
+   * Кнопки под файлом. Без них документ — тупик: человек получил PDF и не
+   * знает, что дальше, а нужное ему лежит в боте, куда он не пойдёт.
+   *
+   * «Переслать клиенту» ведёт в doc.link — тот делает публичную ссылку и
+   * даёт родной выбор чата в Telegram. Через switch_inline_query было бы
+   * короче, но inline-режим у бота включать отдельно в BotFather, и без
+   * него кнопка просто не работает — а эта работает всегда.
+   */
+  const buttons = [
+    [{ text: '📤 Переслать клиенту', data: `doc.link:${res.doc.id}` }],
+    [{ text: '✅ Оплачено', data: `doc.paid:${res.doc.id}` },
+      { text: '✏️ Открыть', data: `doc:${res.doc.id}` }],
+  ];
+
   try {
     await tg.sendDocument(user.tg_id, {
       filename: res.file.filename,
       buffer: res.file.buffer,
-      caption: `${res.title} № ${res.doc.number} для <b>${res.doc.cp.name}</b> на ${money} ₽.`
+      caption: `${res.title} № ${res.doc.number}${cpName ? ` для <b>${escTg(cpName)}</b>` : ''}`
+        + ` на ${money} ₽.`
         + (res.doc.type === 'sch' ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.' : ''),
+      buttons,
     });
   } catch (e) {
     if (e && e.blocked) bdb.markBlocked(user.id);

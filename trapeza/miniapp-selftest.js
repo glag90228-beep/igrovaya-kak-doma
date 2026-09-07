@@ -90,7 +90,10 @@ const ANNA = { id: 500303, first_name: 'Анна', username: 'anna' };
 // Телеграм подменяем: файлы «отправляются», но в сеть никто не идёт.
 const sentToChat = [];
 setTelegram({
-  async sendDocument(chatId, { filename, caption }) { sentToChat.push({ chatId, filename, caption }); return {}; },
+  async sendDocument(chatId, { filename, caption, buttons }) {
+    sentToChat.push({ chatId, filename, caption, buttons: buttons || [] });
+    return {};
+  },
 });
 
 let base = '';
@@ -284,12 +287,26 @@ async function main() {
     const cpS = bdbS.createCp(mid, { name: 'ООО «Покупатель СФ»', inn: '7707654321', kind: 'customer', opening_date: '2026-01-01' });
 
     // --- аванс ---
+    sentToChat.length = 0;
     r = await call('POST', '/api/doc/avans', { user: sfUser, body: {
       cpId: cpS, sum: 100000, payDoc: '№ 55 от 01.09.2026', subject: 'Монтаж' } });
     ok(r.status === 200 && r.json.vat === 18032.79,
       'аванс выписан, налог по расчётной ставке', JSON.stringify(r.json && r.json.vat));
     ok(r.json.file && /СФ_аванс/.test(r.json.file.name), 'и файл отдан приложению',
       (r.json.file || {}).name);
+
+    /*
+     * Аванс тоже обязан прийти в чат.
+     *
+     * Здесь была тихая поломка: sendToChat читал res.doc.cp.name, а issueFlat
+     * (аванс и корректировочный) отдаёт сырую строку из базы, где есть только
+     * cp_id. Обращение к undefined.name падало, вызов обёрнут в
+     * .catch(() => {}) — и человек выписывал счёт-фактуру, а в чат не
+     * приходило НИЧЕГО. Ни ошибки, ни следа.
+     */
+    ok(sentToChat.length === 1, 'счёт-фактура на аванс дошёл до чата', sentToChat.length);
+    ok(/Покупатель СФ/.test((sentToChat[0] || {}).caption || ''),
+      'и в подписи назван клиент, а не пустое место', (sentToChat[0] || {}).caption);
 
     r = await call('POST', '/api/doc/avans', { user: sfUser, body: { cpId: cpS, sum: 0 } });
     ok(r.status === 400, 'нулевая предоплата отклоняется', (r.json || {}).error);
@@ -393,6 +410,30 @@ async function main() {
   ok(r.json.doc.number === '1', 'номер присвоен сам', r.json.doc.number);
   ok(sentToChat.length === 1 && sentToChat[0].chatId === MASHA.id,
     'файл ушёл в чат владельцу', sentToChat.length && sentToChat[0].chatId);
+
+  /*
+   * Файл без кнопок — тупик.
+   *
+   * Человек получал PDF и дальше не знал, что делать: переслать клиенту,
+   * отметить оплату и открыть карточку можно было только разыскав документ
+   * в меню бота, куда из шторки приложения никто не идёт.
+   *
+   * «Переслать клиенту» ведёт в doc.link — тот делает публичную ссылку и
+   * даёт родной выбор чата. Через switch_inline_query вышло бы короче, но
+   * inline-режим включается отдельно в BotFather, и без него такая кнопка
+   * молча не работает.
+   */
+  {
+    const flat = (sentToChat[0].buttons || []).flat();
+    const dataOf = (re) => (flat.find((b) => re.test(b.text)) || {}).data || '';
+    ok(flat.length === 3, 'под файлом три кнопки', flat.map((b) => b.text).join(' | '));
+    ok(dataOf(/Переслать/) === `doc.link:${r.json.doc.id}`, 'переслать клиенту — через ссылку',
+      dataOf(/Переслать/));
+    ok(dataOf(/Оплачено/) === `doc.paid:${r.json.doc.id}`, 'отметка оплаты на месте', dataOf(/Оплачено/));
+    ok(dataOf(/Открыть/) === `doc:${r.json.doc.id}`, 'карточка документа открывается', dataOf(/Открыть/));
+    ok(!flat.some((b) => b.data && !/^doc[.:]/.test(b.data)),
+      'все кнопки ведут в существующие обработчики бота');
+  }
   ok(/\.(pdf|html)$/.test(r.json.file.name), 'файл получил имя', r.json.file.name);
 
   const fileUrl = r.json.file.url;

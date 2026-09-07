@@ -145,10 +145,22 @@ class Telegram {
   }
 
   /** Отправка файла: { filename, buffer (Buffer|ArrayBuffer|Uint8Array), caption } */
-  async sendDocument(chatId, { filename, buffer, caption }) {
+  /**
+   * @param {object} p
+   * @param {Array} [p.buttons] строки кнопок в том же виде, что у keyboard():
+   *   документ без кнопок — это тупик. Человек получает файл и дальше не
+   *   знает, что с ним делать: переслать клиенту, отметить оплату и открыть
+   *   карточку он должен уметь прямо отсюда, не разыскивая документ в меню.
+   */
+  async sendDocument(chatId, { filename, buffer, caption, buttons }) {
     const form = new FormData();
     form.append('chat_id', String(chatId));
     if (caption) { form.append('caption', caption); form.append('parse_mode', 'HTML'); }
+    // multipart принимает разметку только строкой — объект в FormData
+    // превратился бы в «[object Object]», и Telegram отверг бы запрос.
+    if (buttons && buttons.length) {
+      form.append('reply_markup', JSON.stringify(keyboard(buttons).reply_markup));
+    }
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     form.append('document', new Blob([bytes]), filename);
     // Документ бывает на несколько мегабайт — даём больше времени, чем
