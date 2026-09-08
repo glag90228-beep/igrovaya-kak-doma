@@ -108,13 +108,47 @@ function bookRow(doc) {
      * покупатель по тому же документу поставит 01. АСК НДС-2 сводит пары по
      * коду — пара не сойдётся, и требование пояснений придёт обеим сторонам.
      */
-    return { code: '01', net: up.net, vat: up.vat, total: up.total, rate };
+    /*
+     * Номер и дата корректировочного идут в графу 5, а не в графу 3.
+     *
+     * В приложении 5 к постановлению № 1137 это разные графы: 3 — номер и
+     * дата счёта-фактуры продавца, 5 — корректировочного. Мы же писали номер
+     * любого документа в графу 3, и корректировочный ложился туда, где
+     * инспекция ждёт обычный счёт-фактуру. АСК НДС-2 сводит пары по этим
+     * графам: у покупателя корректировочный стоит в своей, у продавца — в
+     * чужой, пара не сходится, и требование пояснений приходит обеим
+     * сторонам. В графу 3 при этом идёт исходный счёт-фактура — тот, что
+     * корректируем: он в payload как base.
+     */
+    const base = p.base || {};
+    return {
+      code: '01',
+      net: up.net,
+      vat: up.vat,
+      total: up.total,
+      rate,
+      sfNo: base.number ? `${base.number} от ${ru(base.date)}` : '',
+      ksfNo: `${doc.number} от ${ru(doc.date)}`,
+    };
   }
 
   // Отгрузка. Счётом-фактурой у нас работает только УПД со статусом 1.
   if (doc.type === 'upd' && Number(p.status) === 1 && rate != null) {
     const t = vatTotals(p.items || [], rate, Boolean(p.priceIncludesVat));
-    return { code: '01', net: t.net, vat: t.vat, total: t.total, rate };
+    /*
+     * Графа 4 — номер и дата ИСПРАВЛЕНИЯ счёта-фактуры. Исправление не
+     * заводит новый документ: номер и дата остаются прежними, к ним лишь
+     * добавляется своё (п. 7 приложения 1 к № 1137), — поэтому оно и живёт
+     * отдельной графой рядом с исходной, а не вместо неё.
+     */
+    return {
+      code: '01',
+      net: t.net,
+      vat: t.vat,
+      total: t.total,
+      rate,
+      fixNo: p.fix && p.fix.no ? `${p.fix.no} от ${ru(p.fix.date)}` : '',
+    };
   }
 
   return null;
@@ -159,6 +193,8 @@ async function buildKnigaProdazh({ org, docs, from, to }) {
     ['№ п/п', 6, '1'],
     ['Код вида операции', 10, '2'],
     ['Номер и дата счёта-фактуры', 22, '3'],
+    ['Номер и дата исправления', 20, '4'],
+    ['Номер и дата корректировочного', 22, '5'],
     // Строка 5б отгрузочного счёта-фактуры переносится сюда: это машинная
     // пара к графе 7а книги покупок покупателя, ради неё всё и затевалось.
     ['Номер и дата СФ на аванс', 20, '11а'],
@@ -167,10 +203,17 @@ async function buildKnigaProdazh({ org, docs, from, to }) {
     ['Номер и дата документа об оплате', 20, '11'],
     ['Валюта', 10, '12'],
     ['Стоимость продаж с НДС', 18, '13б'],
-    ...seen.flatMap((rt) => (RATE_COL[rt].vat
-      ? [[RATE_COL[rt].net, 20, RATE_COL[rt].netNo], [RATE_COL[rt].vat, 16, RATE_COL[rt].vatNo]]
-      : [[RATE_COL[rt].net, 20, RATE_COL[rt].netNo]])),
   ];
+  /*
+   * Колонки ставок идут после постоянных, и начало этого блока считаем, а не
+   * пишем числом. Раньше здесь стояло «10», и первая же новая графа в
+   * постоянной части увела бы суммы на соседнюю колонку — молча, потому что
+   * в Excel любое число ляжет в любую ячейку.
+   */
+  const FIXED = cols.length;
+  cols.push(...seen.flatMap((rt) => (RATE_COL[rt].vat
+    ? [[RATE_COL[rt].net, 20, RATE_COL[rt].netNo], [RATE_COL[rt].vat, 16, RATE_COL[rt].vatNo]]
+    : [[RATE_COL[rt].net, 20, RATE_COL[rt].netNo]])));
   // Шапку объединяем уже зная, сколько колонок получилось: при двух ставках
   // их четырнадцать, и заголовок, обрезанный по J, оставлял хвост непокрытым.
   const last = letterOf(cols.length);
@@ -219,16 +262,20 @@ async function buildKnigaProdazh({ org, docs, from, to }) {
     const p2 = doc.payload || {};
     line.getCell(1).value = n;
     line.getCell(2).value = row.code;
-    line.getCell(3).value = `${doc.number} от ${ru(doc.date)}`;
-    line.getCell(4).value = p2.advDoc || '';        // 11а — ссылка на аванс
-    line.getCell(5).value = doc.cpName || '—';
-    line.getCell(6).value = doc.cpInn || '—';
-    line.getCell(7).value = p2.payDoc || '';        // 11 — документ об оплате
-    line.getCell(8).value = 'руб.';
-    line.getCell(9).value = row.total;
-    line.getCell(9).numFmt = MONEY;
+    // Графа 3 — обычный счёт-фактура; у корректировочного здесь исходный,
+    // а сам он уходит в графу 5. Графа 4 — исправление, если оно было.
+    line.getCell(3).value = row.ksfNo ? row.sfNo : `${doc.number} от ${ru(doc.date)}`;
+    line.getCell(4).value = row.fixNo || '';        // 4 — исправление СФ
+    line.getCell(5).value = row.ksfNo || '';        // 5 — корректировочный СФ
+    line.getCell(6).value = p2.advDoc || '';        // 11а — ссылка на аванс
+    line.getCell(7).value = doc.cpName || '—';
+    line.getCell(8).value = doc.cpInn || '—';
+    line.getCell(9).value = p2.payDoc || '';        // 11 — документ об оплате
+    line.getCell(10).value = 'руб.';
+    line.getCell(11).value = row.total;
+    line.getCell(11).numFmt = MONEY;
     // Суммы — строго в графы своей ставки: остальные остаются пустыми.
-    const at = 10 + seen.indexOf(row.rate) * 2;
+    const at = FIXED + 1 + seen.indexOf(row.rate) * 2;
     if (row.net != null) { line.getCell(at).value = row.net; line.getCell(at).numFmt = MONEY; }
     if (RATE_COL[row.rate] && RATE_COL[row.rate].vat) {
       line.getCell(at + 1).value = row.vat;
