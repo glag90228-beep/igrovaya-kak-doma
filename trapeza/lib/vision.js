@@ -57,17 +57,37 @@ const MONTHS = {
   июл: '07', август: '08', сентябр: '09', октябр: '10', ноябр: '11', декабр: '12',
 };
 
+/**
+ * Дата существует на самом деле, а не просто похожа на дату.
+ *
+ * Мы собирали ISO-строку из того, что попалось в тексте, и ни разу не
+ * спрашивали, бывает ли такой день. Распознавание по фотографии ошибается
+ * именно так: «31.02.2026», «11.13.2026», день и месяц местами. Дальше эта
+ * строка уходила в операцию и в шапку акта сверки — «по 31.02.2026», —
+ * а такой документ клиенту не подпишешь.
+ *
+ * Проверка та же, что у parseDay в lib/period.js: собрали Date и убедились,
+ * что он не переехал на соседний месяц.
+ */
+function realDate(y, mon, day) {
+  const d = new Date(Number(y), Number(mon) - 1, Number(day));
+  if (d.getFullYear() !== Number(y) || d.getMonth() !== Number(mon) - 1
+      || d.getDate() !== Number(day)) return null;
+  return `${y}-${String(mon).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
 /** «11.08.2026», «11 августа 2026» → ISO. */
 function findDate(text) {
   const num = /(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})/.exec(text);
   if (num) {
     const y = num[3].length === 2 ? `20${num[3]}` : num[3];
-    return `${y}-${num[2].padStart(2, '0')}-${num[1].padStart(2, '0')}`;
+    const got = realDate(y, num[2], num[1]);
+    if (got) return got;
   }
   const word = /(\d{1,2})\s+([а-яё]{3,})\s+(\d{4})/i.exec(text);
   if (word) {
     const key = Object.keys(MONTHS).find((k) => word[2].toLowerCase().startsWith(k));
-    if (key) return `${word[3]}-${MONTHS[key]}-${word[1].padStart(2, '0')}`;
+    if (key) return realDate(word[3], MONTHS[key], word[1]);
   }
   return null;
 }
@@ -284,7 +304,12 @@ async function readInvoice(buffer, mime = 'image/jpeg') {
      */
     const str = (v, n) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, n);
     const innOk = (v) => /^(\d{10}|\d{12})$/.test(String(v || '').trim());
-    const dateOk = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '').trim());
+    // Вид проверяем и существование тоже: модель охотно возвращает
+    // «2026-02-31» — по виду ISO, а такого дня нет.
+    const dateOk = (v) => {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v || '').trim());
+      return Boolean(m) && realDate(m[1], m[2], m[3]) !== null;
+    };
     const fields = json
       ? {
         date: dateOk(json.date) ? String(json.date).trim() : parsed.date,

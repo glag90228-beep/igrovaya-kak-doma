@@ -1112,7 +1112,7 @@ async function repeatDoc(tg, chatId, user, docId) {
     await tg.sendMessage(chatId, 'Такой документ повторить нельзя.', mainMenu());
     return;
   }
-  const { items = [], ...extra } = src.payload || {};
+  const { items, extra } = docService.reusablePayload(src.payload);
   const year = currentYear();
   const seq = bdb.nextSeq(user.id, src.type, year);
   const data = { seq, number: String(seq), date: todayISO(), items, ask: '', doc: extra };
@@ -2803,7 +2803,7 @@ async function runDaily(tg, at = new Date()) {
 
 /** Завести повторение по уже выписанному документу и рассказать, что будет. */
 async function addRecurring(tg, chatId, user, src, when) {
-  const { items = [], ...extra } = src.payload || {};
+  const { items, extra } = docService.reusablePayload(src.payload);
   const id = recurring.add(user.id, {
     cpId: src.cp_id, type: src.type, items, extra, ...when,
   });

@@ -558,8 +558,34 @@ async function rebuildDocument(userId, docId, opts = {}) {
   };
 }
 
+/**
+ * Что из старого документа можно взять в новый — при повторе и при
+ * ежемесячном повторении.
+ *
+ * Раньше в оба места payload уезжал целиком, минус позиции. Настройки так и
+ * надо переносить: ставка НДС, статус УПД, договор — человек их уже задал.
+ * Но два поля описывают одно-единственное событие и в новом документе
+ * означают неправду:
+ *
+ *   fix    — отметка «Исправление № N от такого-то числа». Повтор родился бы
+ *            уже исправлением документа, к которому не имеет отношения.
+ *   advDoc — строка 5а УПД, ссылка на счёт-фактуру по авансу, который эта
+ *            отгрузка закрывает. Она уходит в книгу продаж (графа 11а), и
+ *            повтор закрывал бы тот же аванс второй раз: у покупателя стоит
+ *            один вычет, а у продавца две записи, и АСК НДС-2 сводит их в
+ *            расхождение. Убираем — и doc-service подставит ссылку заново,
+ *            по тем авансам, что открыты на самом деле.
+ *
+ * @param {object} payload сохранённый payload документа
+ * @returns {{items:Array, extra:object}}
+ */
+function reusablePayload(payload) {
+  const { items = [], fix, advDoc, ...extra } = payload || {};
+  return { items, extra };
+}
+
 module.exports = {
   ITEM_DOCS, OTHER_DOCS, ALL_DOCS,
   issueDocument, issueFlat, rebuildDocument, renderFile, stampFor,
-  totalOf, cleanItems, safeName, todayISO,
+  totalOf, cleanItems, safeName, todayISO, reusablePayload,
 };

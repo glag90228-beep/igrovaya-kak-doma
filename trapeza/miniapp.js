@@ -1478,7 +1478,7 @@ const api = {
   async 'POST /api/recurring'({ user, body }) {
     const src = bdb.getDoc(user.id, Number(body.docId));
     if (!src || !docService.ITEM_DOCS[src.type]) return { error: 'Такой документ повторять нельзя.' };
-    const { items = [], ...extra } = src.payload || {};
+    const { items, extra } = docService.reusablePayload(src.payload);
     if (!items.length) return { error: 'В документе нет позиций.' };
     // payDay задан — это цикл аренды: платят к числу договора, счёт уходит
     // заранее, а на следующий день после срока приходит сигнал о просрочке.
