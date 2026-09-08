@@ -178,8 +178,15 @@ async function issueDocument(userId, {
   // УПД добавлен в этот список по той же причине, что накладная до него: без
   // него мини-приложение выписывало его всегда без налога, хотя ставка у
   // организации задана.
+  //
+  // Акт услуг — третий по тому же счёту, и он был хуже прочих. В боте `usl`
+  // в этом списке БЫЛ (bot.js, startItems), здесь его не было: один и тот же
+  // акт выходил из бота на 122 000, а из приложения на 100 000. Заказчик
+  // подписывал документ, заниженный ровно на налог, долг в журнале занижался
+  // тоже, а ставка undefined уезжала в payload — то есть «Повторить» и
+  // ежемесячное повторение этого акта оставались без налога навсегда.
   let fields = extra;
-  if (['sch', 'schdog', 'torg12', 'upd'].includes(type)
+  if (['sch', 'schdog', 'torg12', 'upd', 'usl'].includes(type)
       && !Object.prototype.hasOwnProperty.call(extra, 'vatRate')) {
     const v = bdb.vatOf(org);
     if (v.rate != null) fields = { ...extra, vatRate: v.rate, priceIncludesVat: v.gross };

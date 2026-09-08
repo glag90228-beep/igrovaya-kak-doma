@@ -16,6 +16,8 @@
 
 const ExcelJS = require('exceljs');
 const { round2, vatTotals } = require('./money');
+const { advanceVat } = require('./avans');
+const { correctionRow, correctionTotals } = require('./ksf');
 
 const BROWN = 'FF2E3A8C';
 const CREAM = 'FFF4F6FC';
@@ -34,6 +36,48 @@ function box(cell) {
     bottom: { style: 'thin', color: { argb: 'FFC3C9DC' } },
     right: { style: 'thin', color: { argb: 'FFC3C9DC' } },
   };
+}
+
+/**
+ * Разложить документ на «без НДС» и «НДС» — по тому, как он устроен.
+ *
+ * Раньше здесь на все документы шёл один vatTotals(payload.items). У аванса и
+ * корректировочного позиций нет вовсе, vatTotals отдавал нули, и графа «Без
+ * НДС» падала на запасной d.total — то есть полученная предоплата в 100 000
+ * попадала в реестр как 100 000 без налога и прочерк вместо НДС, хотя внутри
+ * неё сидит 18 032,79 по расчётной ставке 22/122. Бухгалтер закрывает месяц
+ * именно этим файлом и сверяет его с декларацией: база оказывалась завышена
+ * на весь налог, а сам налог — потерян.
+ *
+ * @returns {{net:number, vat:number|null}}
+ */
+function splitOf(d) {
+  const p = d.payload || {};
+  const rate = p.vatRate == null ? null : Number(p.vatRate);
+
+  // Аванс: налог сидит ВНУТРИ полученной суммы, поэтому расчётная ставка
+  // (п. 4 ст. 164 НК), а не привычное «сумма × ставку».
+  if (d.type === 'avans') {
+    const a = advanceVat(p.sum != null ? p.sum : d.total, rate);
+    return { net: a.net, vat: rate == null ? null : a.vat };
+  }
+
+  // Корректировочный: суммы живут в парах «было/стало». В реестр идёт
+  // модуль изменения — тот же, что записан в d.total при выписке.
+  if (d.type === 'ksf') {
+    const rows = (p.lines || []).map((l) => correctionRow(
+      l.before || { qty: 0, price: 0 }, l.after || { qty: 0, price: 0 },
+      rate, Boolean(p.priceIncludesVat),
+    ));
+    const { up, down } = correctionTotals(rows);
+    const box = up.total ? up : down;
+    return { net: box.net, vat: rate == null ? null : box.vat };
+  }
+
+  const t = vatTotals(p.items || [], rate, Boolean(p.priceIncludesVat));
+  // Позиций может не быть у документа, сохранённого другим путём: тогда
+  // честнее показать весь итог без налога, чем ноль.
+  return { net: t.net || d.total || 0, vat: t.vat };
 }
 
 /**
@@ -92,15 +136,13 @@ async function buildRegistry({ org, docs, from, to }) {
 
   let r = 6;
   for (const d of docs) {
-    const payload = d.payload || {};
-    const rate = payload.vatRate == null ? null : Number(payload.vatRate);
-    const sums = vatTotals(payload.items || [], rate, Boolean(payload.priceIncludesVat));
+    const sums = splitOf(d);
     const row = s.getRow(r);
     row.getCell(1).value = ru(d.date);
     row.getCell(2).value = d.title || d.type;
     row.getCell(3).value = String(d.number || '');
     row.getCell(4).value = d.cpName || '';
-    row.getCell(5).value = round2(sums.net || d.total || 0);
+    row.getCell(5).value = round2(sums.net || 0);
     row.getCell(6).value = sums.vat == null ? '—' : round2(sums.vat);
     row.getCell(7).value = round2(d.total || 0);
     row.getCell(8).value = d.paid_at ? 'оплачен' : 'не оплачен';
