@@ -3873,10 +3873,12 @@ screens.new = async function newDoc(params) {
     upd: 'УПД', torg12: 'Товарная накладная ТОРГ-12',
   };
   const type = TITLES[params.type] ? params.type : 'sch';
-  const [{ cps }, { templates }] = await Promise.all([
+  const [{ cps }, { templates }, st] = await Promise.all([
     api('GET', '/api/cps'),
     api('GET', '/api/templates').catch(() => ({ templates: [] })),
+    api('GET', '/api/state').catch(() => ({})),
   ]);
+  const myOrg = (st && st.org) || {};
 
   const draft = {
     /*
@@ -4031,8 +4033,45 @@ screens.new = async function newDoc(params) {
   const itemsCard = h('div', { class: 'card' });
   const totalEl = h('span', { class: 'money', text: money(0) });
 
+  /*
+   * Ставка, по которой выйдет документ: названная во фразе — если назвали,
+   * иначе своя, из настроек организации. Ровно тот же порядок, что в
+   * lib/doc-service.js: отсутствие ключа и null означают разное.
+   */
+  const docRate = () => {
+    if (draft.vatRate !== undefined) return draft.vatRate == null ? null : Number(draft.vatRate);
+    return myOrg.vat_rate ? Number(myOrg.vat_rate) : null;
+  };
+  const docGross = () => (draft.vatRate !== undefined
+    ? Boolean(draft.priceIncludesVat) : Boolean(myOrg.vat_gross));
+
+  /*
+   * Кнопка обязана называть ту сумму, что выйдет в документе.
+   *
+   * Считалось количество на цену — и всё. При ставке «сверху» кнопка обещала
+   * «Выписать на 100 000», а счёт выходил на 122 000: человек отправлял
+   * клиенту документ на другие деньги, чем собирался, и узнавал об этом от
+   * клиента. Наценка налога — не мелочь в подписи.
+   *
+   * Складываем по позициям и округляем каждую отдельно — как это делает
+   * vatSplit в lib/money.js. Одним умножением итога вышло бы на копейку
+   * иначе, и подпись снова разошлась бы с документом.
+   */
+  const r2 = (v) => Math.round((v + Number.EPSILON) * 100) / 100;
+  function draftTotal() {
+    const rate = docRate();
+    const gross = docGross();
+    let sum = 0;
+    for (const it of draft.items) {
+      const line = r2((Number(it.qty) || 0) * (Number(it.price) || 0));
+      // При ценах «с НДС» налог уже внутри строки, добавлять нечего.
+      sum += rate == null || gross ? line : r2(line + r2(line * (rate / 100)));
+    }
+    return r2(sum);
+  }
+
   function recalc() {
-    const sum = draft.items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0);
+    const sum = draftTotal();
     totalEl.textContent = money(sum);
     if (tg) {
       // Клиент — часть готовности, а не отдельная проверка после нажатия.

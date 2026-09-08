@@ -541,6 +541,38 @@ const ok = (c, m, extra) => {
       `${a.month} × 12 − ${a.year} = ${a.month * 12 - a.year}, обещано ${a.saving}`);
   }
 
+  /*
+   * Кнопка внизу формы обязана называть ту сумму, что выйдет в документе.
+   *
+   * Считалось количество на цену — и всё, без налога. У плательщика со
+   * ставкой «сверху» кнопка обещала «Выписать на 100 000», а счёт выходил на
+   * 122 000: человек отправлял клиенту документ на другие деньги, чем
+   * собирался, и узнавал об этом от клиента.
+   */
+  console.log('\n── подпись кнопки не расходится с документом ──');
+  {
+    bdb.updateOrg(user.id, bdb.getDefaultOrg(user.id).id, { vat_rate: '22', vat_gross: 0 });
+    await page.evaluate((cpId) => window.__go('new', { type: 'sch', cpId }), cp);
+    await page.waitForSelector('.item input.name');
+    await page.locator('.item input.name').first().fill('Услуга');
+    await page.locator('.item [aria-label="Цена"]').first().fill('100000');
+    await page.waitForTimeout(300);
+
+    const shown = await page.evaluate(() => {
+      const el = document.querySelector('.total-row .money');
+      return el ? el.textContent.replace(/[^\d,]/g, '') : '';
+    });
+    ok(shown === '122000,00', 'в форме стоит сумма с налогом, а не голая цена', shown);
+
+    // И то же число — в самом документе, выписанном теми же позициями.
+    const issued = await docService.issueDocument(user.id, {
+      type: 'sch', cpId: cp, items: [{ name: 'Услуга', qty: 1, price: 100000 }], skipQuota: true,
+    });
+    ok(issued.ok !== false && issued.total === 122000,
+      'и документ выходит ровно на неё', issued.total);
+    bdb.updateOrg(user.id, bdb.getDefaultOrg(user.id).id, { vat_rate: '', vat_gross: 0 });
+  }
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();
