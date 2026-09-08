@@ -1752,6 +1752,31 @@ async function main() {
     ok(billX.accessInfo(mashaU.id).active, 'и доступ включился');
     ok(billX.unclaimedByEmail('payer@mail.ru').length === 0, 'ничьих оплат по этому адресу не осталось');
 
+    /*
+     * Упавшая отправка кода не теряется — как и в боте.
+     *
+     * Стоял .catch(() => {}): почта легла, приложение отвечало «код выслан»,
+     * человек ждал письма, которого не было, и на каждый заход тратил одну из
+     * пяти суточных попыток. Ответ ему менять нельзя (выдаст, кто платил), а
+     * вот в журнал офиса запись нужна, и попытку надо вернуть.
+     */
+    await handlePayment({ externalId: 'mini-2', amount: 349, currency: 'RUB', status: 'paid',
+      email: 'down@mail.ru', tgId: null, paid: true, raw: {} });
+    const officeX = require('./lib/office');
+    const wasX = officeX.list('claim-mail').length;
+    mailerX.sendMail = async () => { throw new Error('SMTP 421'); };
+    billX.revokeAccess(petyaU.id);
+    const sentWas = (billX.pendingClaim(petyaU.id) || {}).sentToday || 0;
+    const rdown = await call('POST', '/api/pay/claim', { user: petya, body: { email: 'down@mail.ru' } });
+    ok(JSON.stringify(rdown.json) === JSON.stringify(rq.json),
+      'при упавшей почте ответ прежний — иначе видно, кто платил', JSON.stringify(rdown.json));
+    const evX = officeX.list('claim-mail');
+    ok(evX.length > wasX && evX[0].text === 'down@mail.ru',
+      'но в журнале офиса запись есть', `${evX.length} шт., первое: ${evX[0] && evX[0].text}`);
+    const pcX = billX.pendingClaim(petyaU.id);
+    ok(pcX && pcX.sentToday === sentWas, 'и сгоревшая впустую попытка возвращена',
+      `${sentWas} → ${pcX && pcX.sentToday}`);
+
     mailerX.sendMail = realSendX;
     delete process.env.SMTP_HOST;
     delete process.env.SMTP_FROM;

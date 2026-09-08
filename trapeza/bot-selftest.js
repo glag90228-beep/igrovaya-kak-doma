@@ -661,6 +661,26 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   ok(limLast().includes('бесплатных'), 'на третьем документе бот показал лимит', limLast().slice(0, 50));
   ok(files.length === filesBefore, 'третий документ не выпущен без подписки');
   // выдаём подписку — лимит снимается
+  /*
+   * Задним числом лимит не обходится.
+   *
+   * Квота раньше считала документы по дате НА документе, а её ставит человек.
+   * Значит бесплатный порог снимался одним движением: поставил в форме
+   * прошлый месяц — и выписывай сколько угодно, счётчик текущего месяца не
+   * шелохнётся. Продавать при таком счётчике нечего.
+   */
+  {
+    const bdbQ = require('./lib/bot-db');
+    const uq = bdbQ.getOrCreateUser(LIM.id);
+    const wasUsed = bdbQ.quota(uq.id).used;
+    const orgQ = bdbQ.getDefaultOrg(uq.id);
+    bdbQ.saveDoc(uq.id, { orgId: orgQ.id, cpId: limCp, type: 'sch',
+      number: 'ЗАД-1', seq: 90001, date: '2020-01-15', total: 100, payload: {} });
+    ok(bdbQ.quota(uq.id).used === wasUsed + 1,
+      'документ прошлым числом всё равно съедает бесплатный лимит',
+      `${wasUsed} → ${bdbQ.quota(uq.id).used}`);
+  }
+
   require('./lib/billing').grantDays(require('./lib/bot-db').getOrCreateUser(LIM.id).id, 30);
   await mk();
   ok(files.length === filesBefore + 1, 'с подпиской документ выписывается сверх лимита');
@@ -991,6 +1011,41 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   const sixth = bill.confirmEmailClaim(thief.id, started.code);
   ok(!sixth.ok && sixth.error === 'много-ошибок', 'после пяти ошибок код перестаёт приниматься', sixth.error);
   ok(bill.unclaimedByEmail('victim@mail.ru').length === 1, 'перебором оплату не увели');
+
+  /*
+   * Упавшая отправка не должна теряться.
+   *
+   * Раньше стоял .catch(() => {}): почта легла — человек, который уже
+   * заплатил, слышал «код выслан», ждал письма, которого не было, и на
+   * каждый заход сжигал одну из пяти суточных попыток. В журнале при этом не
+   * оставалось ничего, так что поддержке было не за что зацепиться.
+   * Сказать ему прямо нельзя: такой ответ приходил бы только на адрес
+   * плательщика и выдавал бы, кто у нас платил.
+   */
+  {
+    await handlePayment({ externalId: 'inv-13', amount: 349, currency: 'RUB', status: 'paid',
+      email: 'smtpdown@mail.ru', tgId: null, paid: true, raw: {} });
+    const officeMod = require('./lib/office');
+    const wasEvents = officeMod.list('claim-mail').length;
+    mailerMod.sendMail = async () => { throw new Error('SMTP 421'); };
+
+    const faller = bdbClaim.getOrCreateUser(777045, 'Плательщик', 'payer');
+    await handleUpdate(tg, { callback_query: { id: 'f', from: { id: 777045, first_name: 'Плательщик' },
+      data: 'pay.claim', message: { chat: { id: 777045 } } } });
+    await handleUpdate(tg, { message: { chat: { id: 777045 },
+      from: { id: 777045, first_name: 'Плательщик' }, text: 'smtpdown@mail.ru' } });
+
+    const events = officeMod.list('claim-mail');
+    ok(events.length > wasEvents && events[0].text === 'smtpdown@mail.ru',
+      'упавшая отправка кода записана в журнал офиса',
+      `${events.length} шт., первое: ${events[0] && events[0].text}`);
+    ok(last().includes('код'), 'а человеку ответ прежний — иначе форма выдаст, кто платил',
+      last().slice(0, 40));
+    const claimRow = bill.pendingClaim(faller.id);
+    ok(claimRow && claimRow.sentToday === 0,
+      'сгоревшая впустую попытка возвращена', claimRow && claimRow.sentToday);
+    mailerMod.sendMail = async (letter) => { sentTo = letter.to; sentText = letter.text || ''; return { ok: true }; };
+  }
 
   mailerMod.sendMail = realSend;
   delete process.env.SMTP_HOST;

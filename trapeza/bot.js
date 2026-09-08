@@ -1513,8 +1513,23 @@ async function claimByEmail(tg, chatId, user, email) {
    * знает свой адрес и получит письмо.
    */
   if (r.ok) {
-    await sendClaimCode(clean, r.code).catch(() => {});
-    bdb.setState(user.id, 'claim-code', {});
+    /*
+     * Письмо не ушло — это надо знать нам, а не человеку.
+     *
+     * Сказать ему «отправка не удалась» нельзя: такой ответ приходил бы
+     * только на адрес, с которого была оплата, и форма снова превращается в
+     * проверялку «кто у вас платил» — ровно то, от чего защищает одинаковый
+     * ответ выше. Поэтому пишем в журнал офиса и возвращаем попытку: иначе
+     * человек, который УЖЕ заплатил, молча сидит без доступа, ждёт письма,
+     * которого не было, и сжигает пять попыток в сутки на пустые отправки.
+     */
+    const posted = await sendClaimCode(clean, r.code).then(() => true).catch((e) => {
+      office.record({ kind: 'claim-mail', where: 'claimByEmail', text: clean,
+        error: e && e.message ? e.message : String(e), userId: user.id }).catch(() => {});
+      billing.refundClaimSend(user.id);
+      return false;
+    });
+    if (posted) bdb.setState(user.id, 'claim-code', {});
   }
   await tg.sendMessage(chatId,
     `Если оплата с адреса <b>${esc(clean)}</b> у меня есть, я выслал туда код из шести цифр. `

@@ -424,6 +424,20 @@ function startEmailClaim(userId, email) {
 }
 
 /**
+ * Вернуть попытку отправки, когда письмо с кодом не ушло.
+ *
+ * Пять отправок в сутки — защита от рассылки чужими руками, и тратить их на
+ * письма, которых не было, нечестно: доступ ждёт человек, который уже
+ * заплатил. Саму заявку не трогаем — код в ней ещё живой, и если письмо
+ * всё-таки дошло вторым заходом, он подойдёт.
+ */
+function refundClaimSend(userId) {
+  db.prepare(
+    'UPDATE pay_claims SET sent_today = MAX(0, sent_today - 1) WHERE user_id = ?',
+  ).run(userId);
+}
+
+/**
  * Проверяет код и, если он верен, привязывает оплаты и начисляет дни.
  *
  * @returns {{ok:boolean, until?:string, taken?:number, error?:string, left?:number}}
@@ -467,7 +481,8 @@ function confirmEmailClaim(userId, code) {
 function pendingClaim(userId) {
   const row = db.prepare('SELECT * FROM pay_claims WHERE user_id = ?').get(userId);
   if (!row || Date.parse(row.expires_at) < Date.now()) return null;
-  return { email: row.email, left: Math.max(0, CLAIM_TRIES - row.tries) };
+  // sentToday нужен, чтобы видеть возврат сгоревшей впустую отправки.
+  return { email: row.email, left: Math.max(0, CLAIM_TRIES - row.tries), sentToday: row.sent_today };
 }
 
 function paymentsOf(userId, limit = 10) {
@@ -478,7 +493,7 @@ function paymentsOf(userId, limit = 10) {
 module.exports = {
   accessInfo, grantDays, revokeAccess, paidUsers,
   recordPayment, findPayment, attachPayment, unclaimedByEmail, paymentsOf,
-  startEmailClaim, confirmEmailClaim, pendingClaim,
+  startEmailClaim, confirmEmailClaim, pendingClaim, refundClaimSend,
   createCodes, getCode, redeemCode, revokeCode, listCodes, codeUsers, usedCodes,
   normCode, looksLikeCode: (s) => new RegExp(`^${PREFIX}[-\\s]?[A-Z0-9]`, 'i').test(String(s || '').trim()),
 };
