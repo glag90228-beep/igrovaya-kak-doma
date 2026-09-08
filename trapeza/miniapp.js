@@ -246,6 +246,27 @@ function readBody(req) {
 const VAT_RATES = ['', '0', '5', '7', '10', '20', '22'];
 
 const str = (v, max = 300) => String(v == null ? '' : v).trim().slice(0, max);
+
+/*
+ * Числовые реквизиты режем по ЦИФРАМ, а не по знакам.
+ *
+ * Раньше здесь стоял общий str(): «ИНН 7707083893» проходил проверку
+ * контрольной суммы (она сама выбрасывает всё нецифровое) и после этого
+ * ложился в базу как «ИНН 77070838» — двенадцать знаков, из них восемь цифр.
+ * То есть проверялось одно значение, а сохранялось другое, и в счетах,
+ * накладных и УПД печатался ИНН, которого не существует. А счёт, набранный
+ * с пробелами по четыре — «4070 2810 4000 0000 1234», как его и копируют из
+ * банка, — обрезался до шестнадцати цифр и отклонялся по контрольной сумме,
+ * хотя с ним всё было в порядке.
+ *
+ * Поэтому сначала оставляем цифры, потом отрезаем длину — и проверяем ровно
+ * то, что уйдёт в базу.
+ */
+const digits = (v, max) => String(v == null ? '' : v).replace(/\D/g, '').slice(0, max);
+
+/** КПП — исключение: пятый и шестой знаки бывают буквами (приказ ФНС). */
+const kppOf = (v) => String(v == null ? '' : v).toUpperCase().replace(/[^0-9A-Z]/g, '').slice(0, 9);
+
 const ruDate = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(iso || '')
   ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : (iso || ''));
 
@@ -472,14 +493,14 @@ const api = {
     const fields = {
       name,
       full_name: str(body.full_name, 400),
-      inn: str(body.inn, 12),
-      kpp: str(body.kpp, 9),
+      inn: digits(body.inn, 12),
+      kpp: kppOf(body.kpp),
       kind: body.kind === 'supplier' ? 'supplier' : 'customer',
       address: str(body.address, 400),
       bank_name: str(body.bank_name, 300),
-      bik: str(body.bik, 9),
-      acc: str(body.acc, 20),
-      corr_acc: str(body.corr_acc, 20),
+      bik: digits(body.bik, 9),
+      acc: digits(body.acc, 20),
+      corr_acc: digits(body.corr_acc, 20),
       contract: str(body.contract, 200),
       email: str(body.email, 254),
     };
@@ -505,7 +526,9 @@ const api = {
       const d = str(body.opening_date, 10);
       fields.opening_date = /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : '';
     }
-    const wrong = reqCheck.checkRequisites(body);
+    // Проверяем то, что уйдёт в базу, а не то, что пришло: иначе контрольная
+    // сумма считается по одному значению, а печатается другое.
+    const wrong = reqCheck.checkRequisites(fields);
     if (wrong.length) return { error: wrong[0].error, field: wrong[0].field };
     const id = Number(body.id) || 0;
     if (id) {
@@ -526,25 +549,27 @@ const api = {
   async 'POST /api/org'({ user, body }) {
     const name = str(body.name, 200);
     if (!name) return { error: 'Укажите название организации.' };
-    // Контрольные суммы: счёт с опечаткой в реквизитах бесполезен, а
-    // проверяется это арифметикой за миллисекунду.
-    const bad = reqCheck.checkRequisites(body);
-    if (bad.length) return { error: bad[0].error, field: bad[0].field };
-    bdb.saveMyOrg(user.id, {
+    const mine = {
       name,
       full_name: str(body.full_name, 400),
-      inn: str(body.inn, 12),
-      kpp: str(body.kpp, 9),
+      inn: digits(body.inn, 12),
+      kpp: kppOf(body.kpp),
       // ОГРНИП печатается в УПД. Через приложение он не сохранялся вовсе:
       // поле в форме появилось, а до базы не доезжало.
-      ogrnip: str(body.ogrnip, 15),
+      ogrnip: digits(body.ogrnip, 15),
       signer: str(body.signer, 200),
       address: str(body.address, 400),
       bank_name: str(body.bank_name, 300),
-      bik: str(body.bik, 9),
-      acc: str(body.acc, 20),
-      corr_acc: str(body.corr_acc, 20),
-    });
+      bik: digits(body.bik, 9),
+      acc: digits(body.acc, 20),
+      corr_acc: digits(body.corr_acc, 20),
+    };
+    // Контрольные суммы: счёт с опечаткой в реквизитах бесполезен, а
+    // проверяется это арифметикой за миллисекунду. Считаем по нормализованным
+    // значениям — по тем самым, что уйдут в базу и на бумагу.
+    const bad = reqCheck.checkRequisites(mine);
+    if (bad.length) return { error: bad[0].error, field: bad[0].field };
+    bdb.saveMyOrg(user.id, mine);
     return { org: bdb.getDefaultOrg(user.id) };
   },
 

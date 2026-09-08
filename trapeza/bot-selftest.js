@@ -1828,6 +1828,30 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       last().slice(0, 45));
     await say('40702810900000012344');
     ok(!last().includes('не сходится'), 'верный счёт принят');
+
+    /*
+     * Реквизит запоминается цифрами, как его набрали.
+     *
+     * Контрольная сумма сама выбрасывает нецифровое, поэтому счёт,
+     * скопированный из банка по четыре цифры, проверку проходил — и в этом
+     * же виде печатался в счёте и уезжал в платёжный QR. А по ГОСТ Р 56042 в
+     * поле PersonalAcc ровно двадцать цифр, пробелам там места нет.
+     */
+    const bdbR = require('./lib/bot-db');
+    const uidR = fxUserId();
+    await tap('cps'); await tap('cp.new');
+    await say('7707083893');
+    await say('ООО Пробелы'); await say('-'); await say('-'); await say('-');
+    await tap('fb:customer');
+    await say('-'); await say('0'); await say('01.01.2026');
+    await say('БИК 044525225');
+    await say('-'); await say('-');
+    await say('4070 2810 9000 0001 2344');
+    const spaced = bdbR.listCps(uidR).find((c) => c.name === 'ООО Пробелы');
+    ok(spaced && spaced.acc === '40702810900000012344',
+      'счёт с пробелами лёг двадцатью цифрами', spaced && spaced.acc);
+    ok(spaced && spaced.bik === '044525225',
+      'и БИК без слова «БИК» перед ним', spaced && spaced.bik);
   }
 
   console.log('\n── номера документов не задваиваются ──');

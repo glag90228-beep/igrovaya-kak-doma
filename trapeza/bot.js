@@ -531,6 +531,23 @@ async function applyFormValue(tg, chatId, user, state, rawValue) {
    * только пока человек ещё смотрит на это поле: через неделю в выписанном
    * счёте он ошибку не найдёт.
    */
+  /*
+   * Перед проверкой числовые реквизиты приводим к цифрам.
+   *
+   * Проверка контрольной суммы сама выбрасывает всё нецифровое, а в базу
+   * значение шло как набрали. Счёт, скопированный из банка по четыре цифры
+   * («4070 2810 4000 0000 1234»), сходился по контрольной сумме и в этом же
+   * виде печатался в счёте и уезжал в платёжный QR — а по ГОСТ Р 56042 в
+   * поле PersonalAcc двадцать цифр, без пробелов. У КПП пятый и шестой знаки
+   * бывают буквами (приказ ФНС), поэтому ему своё правило.
+   */
+  if (values[step.key] && ['inn', 'bik', 'acc', 'corr_acc', 'ogrnip'].includes(step.key)) {
+    values[step.key] = String(values[step.key]).replace(/\D/g, '');
+  }
+  if (values.kpp && step.key === 'kpp') {
+    values.kpp = String(values.kpp).toUpperCase().replace(/[^0-9A-Z]/g, '');
+  }
+
   const checked = values[step.key];
   if (checked && ['inn', 'kpp', 'bik', 'acc', 'corr_acc'].includes(step.key)) {
     const bik = step.key === 'bik' ? checked : values.bik;
