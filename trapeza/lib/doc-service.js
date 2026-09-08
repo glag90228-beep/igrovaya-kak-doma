@@ -140,12 +140,12 @@ function fail(reason, message) {
  * Добавляет к организации подпись и печать для этого типа документа.
  * Шаблоны про базу ничего не знают — получают готовые картинки в org.fx.
  *
- * Платёжное поручение и договор сюда не попадают намеренно: платёжку
- * подписывают в банке живой подписью, а факсимиле на договоре по статье
- * 160 ГК допустимо только если стороны об этом заранее договорились.
+ * Платёжка, договор и счета-фактуры сюда не попадают намеренно — что и
+ * почему, перечислено в NEVER и appliesTo в lib/facsimile.js. Сам документ
+ * передаём туда же: у УПД решение зависит от статуса, а он лежит в doc.
  */
-function withFx(userId, org, docType) {
-  return { ...org, fx: facsimile.forDocument(userId, docType) };
+function withFx(userId, org, docType, doc) {
+  return { ...org, fx: facsimile.forDocument(userId, docType, doc) };
 }
 
 /**
@@ -304,7 +304,7 @@ async function issueDocument(userId, {
     const doc = { number: num, date: when, items: clean, ...fields };
     // eslint-disable-next-line no-await-in-loop
     file = await renderFile(
-      kind.build({ org: withFx(userId, org, type), cp, doc }),
+      kind.build({ org: withFx(userId, org, type, doc), cp, doc }),
       `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
     );
     try {
@@ -434,7 +434,7 @@ async function issueFlat(userId, {
     const doc = { number: num, date: when, ...payload };
     // eslint-disable-next-line no-await-in-loop
     file = await renderFile(
-      kind.build({ org: withFx(userId, org, type), cp, doc }),
+      kind.build({ org: withFx(userId, org, type, doc), cp, doc }),
       `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
     );
     try {
@@ -550,7 +550,7 @@ async function rebuildDocument(userId, docId, opts = {}) {
   }
   const stamp = stampFor(saved, opts.stamp);
   const file = await renderFile(
-    withStamps(kind.build({ org: withFx(userId, org, saved.type), cp, doc }), stamp),
+    withStamps(kind.build({ org: withFx(userId, org, saved.type, doc), cp, doc }), stamp),
     `${kind.file}_${safeName(saved.number)}_${safeName(cp.name)}`,
   );
   return {
