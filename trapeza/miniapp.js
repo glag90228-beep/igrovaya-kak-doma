@@ -473,7 +473,7 @@ async function makeAkt(user, org, p, caption) {
     buffer: Buffer.from(buf),
     mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   };
-  const seq = bdb.nextSeq(user.id, 'akt', currentYear());
+  const seq = bdb.nextSeqForOrg(org.id, 'akt', currentYear());
   bdb.saveDoc(user.id, {
     orgId: org.id, cpId: p.cp.id, type: 'akt', number: String(seq), seq,
     date: docService.todayISO(), total: Math.abs(p.closing),
@@ -1147,7 +1147,7 @@ const api = {
     const when = /^\d{4}-\d{2}-\d{2}$/.test(String(body.date)) ? String(body.date) : docService.todayISO();
     const year = Number(when.slice(0, 4));
     const amount = Math.abs(Number(body.amount) || 0);
-    const seq = bdb.nextSeq(user.id, type, year);
+    const seq = bdb.nextSeqForOrg(org.id, type, year);
     const number = str(body.number, 40) || String(seq);
 
     const doc = type === 'pp'

@@ -2039,17 +2039,45 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const dbx = require('./db').db;
     const bdb = require('./lib/bot-db');
     const uidN = fxUserId();
-    const doc = (seq) => dbx.prepare(`
+    // Ряд номеров принадлежит организации, поэтому вставляем с её id.
+    const orgN = bdb.getDefaultOrg(uidN);
+    const doc = (seq, orgId = orgN.id) => dbx.prepare(`
       INSERT INTO documents(user_id, org_id, cp_id, type, number, seq, year, date, total, payload, created_at)
-      VALUES(?,0,0,'sch',?,?,2031,'2031-03-01',100,'','2031-03-01')`).run(uidN, String(seq), seq);
+      VALUES(?,?,0,'sch',?,?,2031,'2031-03-01',100,'','2031-03-01')`).run(uidN, orgId, String(seq), seq);
 
     doc(1);
     let blocked = false;
     try { doc(1); } catch (e) { blocked = require('./lib/bot-db').isSeqTaken(e); }
     ok(blocked, 'второй документ с тем же номером база не принимает');
     doc(2);
-    ok(bdb.nextSeq(uidN, 'sch', 2031) === 3, 'следующий номер считается от занятых',
-      bdb.nextSeq(uidN, 'sch', 2031));
+    ok(bdb.nextSeqForOrg(orgN.id, 'sch', 2031) === 3, 'следующий номер считается от занятых',
+      bdb.nextSeqForOrg(orgN.id, 'sch', 2031));
+
+    /*
+     * Вторая организация ведёт СВОЙ ряд и начинает с единицы.
+     *
+     * Раньше ряд был общий на человека: MAX(seq) WHERE user_id, а уникальность
+     * стояла на (user_id, type, year, seq). Значит вторая фирма не могла иметь
+     * свой счёт № 1 — база его не принимала, — а её первый счёт продолжал
+     * чужой ряд и выходил, скажем, третьим. Куда делись первые два, объяснять
+     * инспекции пришлось бы владельцу: сквозная нумерация ведётся юрлицом, и
+     * дыра в ней — это вопрос к нему, а не к нам.
+     */
+    const org2 = bdb.createOrg(uidN, { name: 'ООО «Вторая»', inn: '7707083893' });
+    ok(bdb.nextSeqForOrg(org2, 'sch', 2031) === 1,
+      'у второй организации свой ряд — начинается с единицы',
+      bdb.nextSeqForOrg(org2, 'sch', 2031));
+    let secondOk = true;
+    try { doc(1, org2); } catch (_) { secondOk = false; }
+    ok(secondOk, 'и её счёт № 1 база принимает, хотя единица у первой уже занята');
+    ok(bdb.nextSeqForOrg(orgN.id, 'sch', 2031) === 3,
+      'при этом ряд первой организации не сдвинулся',
+      bdb.nextSeqForOrg(orgN.id, 'sch', 2031));
+
+    // Занятость номера тоже спрашивается по организации: «счёт № 2» у одной
+    // фирмы ничем не мешает счёту № 2 у другой.
+    ok(bdb.numberTakenInOrg(orgN.id, 'sch', 2031, '2'), 'номер занят у той, кто его выписал');
+    ok(!bdb.numberTakenInOrg(org2, 'sch', 2031, '2'), 'и свободен у соседней организации');
 
     // Выписка двух документов одновременно: номер берётся до сборки файла,
     // и раньше оба получали одинаковый. Теперь второй пересобирается.

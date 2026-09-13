@@ -708,7 +708,7 @@ async function genAktSverki(tg, chatId, user, cpId, from, to) {
   const p = bdb.cpForPeriod(user.id, cpId, from, to);
   if (!p) return;
   const buf = await buildAkt({ org: orgForAkt(org), cp: p.view, ops: p.ops });
-  const seq = bdb.nextSeq(user.id, 'akt', currentYear());
+  const seq = bdb.nextSeqForOrg(org.id, 'akt', currentYear());
   await sendGenerated(tg, chatId, {
     xlsxBuffer: Buffer.from(buf), base: `Акт_сверки_${safeName(p.cp.name)}`,
     caption: `Акт сверки с <b>${esc(p.cp.name)}</b> за период ${ru(p.from)}—${ru(p.to)}.\n`
@@ -805,7 +805,14 @@ function itemsKb(user, data) {
 async function startItems(tg, chatId, user, type, cpId, extra = {}) {
   if (!(await requireQuota(tg, chatId, user))) return;
   const year = currentYear();
-  const seq = bdb.nextSeq(user.id, type, year);
+  /*
+   * Номер здесь — только показать человеку в сводке; настоящий берёт
+   * doc-service при выписке. Но показанный обязан совпадать с будущим, иначе
+   * человек увидит в предпросмотре один номер, а в файле другой. Считаем по
+   * той же организации, по которой его посчитает doc-service.
+   */
+  const orgForSeq = bdb.getDefaultOrg(user.id);
+  const seq = bdb.nextSeqForOrg(orgForSeq ? orgForSeq.id : 0, type, year);
 
   /*
    * Режим НДС организации подставляем здесь, а не только при выписке.
@@ -1110,9 +1117,22 @@ async function repeatDoc(tg, chatId, user, docId) {
     await tg.sendMessage(chatId, 'Такой документ повторить нельзя.', mainMenu());
     return;
   }
-  const { items = [], ...extra } = src.payload || {};
+  /*
+   * reusablePayload, а не разбор payload вручную.
+   *
+   * Ручной вариант тащит в новый документ fix и advDoc — отметку исправления
+   * и ссылку на закрытый аванс. Почему это дорого, написано у самой функции
+   * в lib/doc-service.js: повтор рождается исправлением чужого документа, а
+   * строка 5б закрывает тот же аванс второй раз, и АСК НДС-2 разводит это в
+   * расхождение обеим сторонам сделки.
+   */
+  const { items, extra } = docService.reusablePayload(src.payload);
   const year = currentYear();
-  const seq = bdb.nextSeq(user.id, src.type, year);
+  /*
+   * Ряд номеров продолжаем ТОТ ЖЕ, в котором выписан исходный документ:
+   * повтор счёта фирмы «А» не должен получить номер из ряда фирмы «Б».
+   */
+  const seq = bdb.nextSeqForOrg(src.org_id, src.type, year);
   const data = { seq, number: String(seq), date: todayISO(), items, ask: '', doc: extra };
   bdb.setState(user.id, `items:${src.type}:${src.cp_id}`, data);
   await tg.sendMessage(chatId,
@@ -3625,7 +3645,7 @@ async function startDogovor(tg, chatId, user, cpId) {
   if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
   const cp = bdb.getCp(user.id, cpId); if (!cp) return;
-  const seq = bdb.nextSeq(user.id, 'dog', currentYear());
+  const seq = bdb.nextSeqForOrg(org.id, 'dog', currentYear());
   bdb.setState(user.id, `dog:${cpId}`, { i: 0, seq, number: String(seq), date: todayISO(), values: {} });
   await tg.sendMessage(chatId,
     `Договор № ${seq} с <b>${esc(cp.name)}</b>. Реквизиты обеих сторон подставлю сам — `
@@ -3679,7 +3699,7 @@ async function handleDogText(tg, chatId, user, state, text) {
 async function startPp(tg, chatId, user, cpId) {
   if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
-  const seq = bdb.nextSeq(user.id, 'pp', currentYear());
+  const seq = bdb.nextSeqForOrg(org.id, 'pp', currentYear());
   bdb.setState(user.id, `pp:${cpId}`, { step: 'amount', seq, number: String(seq), date: todayISO() });
   await tg.sendMessage(chatId, `Платёжное поручение № ${seq}. Введите <b>сумму</b>, руб.:`);
 }

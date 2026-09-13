@@ -275,7 +275,7 @@ async function issueDocument(userId, {
    * в журнале.
    */
   const wanted = number == null || number === '' ? '' : String(number).slice(0, 40);
-  if (wanted && bdb.numberTaken(userId, type, year, wanted)) {
+  if (wanted && bdb.numberTakenInOrg(org.id, type, year, wanted)) {
     return fail('number', `${kind.title} № ${wanted} за ${year} год уже выписан. Укажите другой номер.`);
   }
 
@@ -289,7 +289,7 @@ async function issueDocument(userId, {
    */
   let num; let file; let id;
   for (let attempt = 0; ; attempt += 1) {
-    let seq = bdb.nextSeq(userId, type, year);
+    let seq = bdb.nextSeqForOrg(org.id, type, year);
     /*
      * Порядковый номер и номер документа — разные вещи, и совпадают они лишь
      * пока никто не вводил номер руками. Стоит человеку выписать счёт № 3
@@ -298,7 +298,7 @@ async function issueDocument(userId, {
      * этого прерывается, но два документа с одним номером хуже пропуска.
      */
     if (!wanted) {
-      while (bdb.numberTaken(userId, type, year, String(seq))) seq += 1;
+      while (bdb.numberTakenInOrg(org.id, type, year, String(seq))) seq += 1;
     }
     num = String(wanted || seq).slice(0, 40);
     const doc = { number: num, date: when, items: clean, ...fields };
@@ -420,15 +420,15 @@ async function issueFlat(userId, {
   const when = /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? String(date) : todayISO();
   const year = Number(when.slice(0, 4));
   const wanted = number == null || number === '' ? '' : String(number).slice(0, 40);
-  if (wanted && bdb.numberTaken(userId, type, year, wanted)) {
+  if (wanted && bdb.numberTakenInOrg(org.id, type, year, wanted)) {
     return fail('number', `${kind.title} № ${wanted} за ${year} год уже выписан. Укажите другой номер.`);
   }
 
   let num; let file; let id;
   for (let attempt = 0; ; attempt += 1) {
-    let seq = bdb.nextSeq(userId, type, year);
+    let seq = bdb.nextSeqForOrg(org.id, type, year);
     if (!wanted) {
-      while (bdb.numberTaken(userId, type, year, String(seq))) seq += 1;
+      while (bdb.numberTakenInOrg(org.id, type, year, String(seq))) seq += 1;
     }
     num = String(wanted || seq).slice(0, 40);
     const doc = { number: num, date: when, ...payload };

@@ -1571,10 +1571,25 @@ const DOC_TITLES = {
  * Нумерация у каждого пользователя своя и не зависит от контрагента —
  * так требует практика: сквозной ряд по журналу, а не по клиентам.
  */
-function nextSeq(userId, type, year) {
+/**
+ * Следующий порядковый номер — в ряду ОРГАНИЗАЦИИ, а не человека.
+ *
+ * Раньше ряд был общий на аккаунт: MAX(seq) WHERE user_id. Пока организация
+ * одна, разницы нет, но как только их две, это уже ошибка учёта. Сквозная
+ * нумерация ведётся юридическим лицом: у каждого свой ряд, начинающийся с
+ * единицы. Общий ряд означал бы, что первый счёт второй фирмы выходит,
+ * скажем, сорок восьмым — а куда делись сорок семь предыдущих, объяснять
+ * инспекции будет владелец.
+ *
+ * Функция переименована намеренно, а не просто получила другой аргумент.
+ * И организация, и человек — целые числа: подставь по недосмотру не тот id,
+ * и номер молча посчитается по чужому ряду. Переименование превращает такой
+ * недосмотр в понятную ошибку «нет такой функции» ещё на прогоне.
+ */
+function nextSeqForOrg(orgId, type, year) {
   const row = db.prepare(
-    'SELECT COALESCE(MAX(seq), 0) AS n FROM documents WHERE user_id = ? AND type = ? AND year = ?',
-  ).get(userId, type, year);
+    'SELECT COALESCE(MAX(seq), 0) AS n FROM documents WHERE org_id = ? AND type = ? AND year = ?',
+  ).get(Number(orgId) || 0, type, year);
   return row.n + 1;
 }
 
@@ -1589,14 +1604,46 @@ function nextSeq(userId, type, year) {
  *
  * В старых базах дубли уже могли появиться — тогда индекс не создастся, и это
  * не повод падать при запуске: остальное продолжает работать.
+ *
+ * Сторожим по организации, а не по человеку. Прежний индекс на
+ * (user_id, type, year, seq) не просто лишний — он МЕШАЕТ: не давал второй
+ * организации завести свой номер 1, потому что единица в этом году у
+ * человека уже занята первой фирмой.
+ *
+ * Порядок перехода: сначала достраиваем org_id там, где его нет, потом
+ * создаём новый индекс и только при его успехе убираем старый. Наоборот
+ * нельзя: если новый не построится из-за повторов, база останется вовсе без
+ * сторожа, и два счёта с одним номером пройдут молча.
  */
 function guardSeq() {
+  /*
+   * Документы без организации. В боевой базе таких нет, но чужая может
+   * приехать любой: строки с org_id = 0 от РАЗНЫХ людей схлопнулись бы в
+   * один ряд и подрались за номера. Ставим организацию по умолчанию, а нет
+   * её — любую из заведённых этим человеком.
+   */
   try {
-    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_seq_uniq ON documents(user_id, type, year, seq)');
-    return true;
+    db.exec(`
+      UPDATE documents SET org_id = COALESCE(
+        (SELECT id FROM orgs WHERE orgs.user_id = documents.user_id AND is_default = 1 LIMIT 1),
+        (SELECT id FROM orgs WHERE orgs.user_id = documents.user_id ORDER BY id LIMIT 1),
+        0)
+      WHERE org_id = 0 OR org_id IS NULL
+    `);
+  } catch (_) { /* не вышло — ниже честно не создастся индекс */ }
+
+  let built = false;
+  try {
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_seq_org ON documents(org_id, type, year, seq)');
+    built = true;
   } catch (_) {
-    return false;                       // в базе уже есть повторы номеров
+    built = false;                      // в базе уже есть повторы номеров
   }
+  // Старый сторож убираем, только когда новый точно встал на его место.
+  if (built) {
+    try { db.exec('DROP INDEX IF EXISTS idx_doc_seq_uniq'); } catch (_) { /* переживём */ }
+  }
+  return built;
 }
 guardSeq();
 
@@ -1609,15 +1656,21 @@ guardSeq();
  * выписки присвоился сам, и в году оказывалось два документа с одним
  * номером. Индексом это не закрыть: в базах, где повторы уже есть, он
  * попросту не создастся, — поэтому спрашиваем перед записью.
+ *
+ * Спрашиваем по организации — из тех же соображений, что и nextSeqForOrg:
+ * «счёт № 3» у одной фирмы ничем не мешает счёту № 3 у другой, это разные
+ * ряды. Переименована по той же причине: перепутать id организации с id
+ * человека молча нельзя.
  */
-function numberTaken(userId, type, year, number) {
+function numberTakenInOrg(orgId, type, year, number) {
   return Boolean(db.prepare(
-    'SELECT id FROM documents WHERE user_id = ? AND type = ? AND year = ? AND number = ? LIMIT 1',
-  ).get(userId, type, Number(year), String(number)));
+    'SELECT id FROM documents WHERE org_id = ? AND type = ? AND year = ? AND number = ? LIMIT 1',
+  ).get(Number(orgId) || 0, type, Number(year), String(number)));
 }
 
 /** Не прошла ли запись именно из-за занятого номера. */
-const isSeqTaken = (e) => /idx_doc_seq_uniq|UNIQUE constraint failed: documents/i.test(String(e && e.message));
+const isSeqTaken = (e) => /idx_doc_seq_org|idx_doc_seq_uniq|UNIQUE constraint failed: documents/i
+  .test(String(e && e.message));
 
 /** Документ сохраняется данными; файл всегда пересобирается заново. */
 function saveDoc(userId, { orgId, cpId, type, number, seq, date, total, payload }) {
@@ -1779,8 +1832,8 @@ module.exports = {
   markPaid, unmarkPaid, matchPaymentsToDocs, closeDocsFromBank,
   unpaidDocs, unpaidSummary, dealTotals, docsBetween,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
-  isSeqTaken, guardSeq, numberTaken,
-  nextSeq, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
+  isSeqTaken, guardSeq, numberTakenInOrg,
+  nextSeqForOrg, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,
   quota, docsThisMonth, freePerMonth,
 };
