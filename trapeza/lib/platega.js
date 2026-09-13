@@ -1,0 +1,286 @@
+'use strict';
+
+/**
+ * Платёжный шлюз Platega.io (СБП по QR-коду, карты РФ/МИР, международный эквайринг).
+ *
+ * Официальная документация API: https://platega-io.gitbook.io/platega.io-api-dokumentaciya
+ * Личный кабинет мерчанта: https://my.platega.io
+ *
+ * Переменные окружения:
+ *   PLATEGA_MERCHANT_ID — UUID мерчанта из раздела настроек Platega;
+ *   PLATEGA_SECRET      — секретный API-ключ (Secret);
+ *   PLATEGA_API_URL     — базовый URL API (по умолчанию https://app.platega.io);
+ *   PLATEGA_PLAN_DAYS   — тарифная сетка «сумма:дни», например «349:30,3490:365»;
+ *   PLATEGA_DEFAULT_DAYS— срок по умолчанию (30 дней).
+ */
+
+const crypto = require('node:crypto');
+
+const API_BASE = () => (process.env.PLATEGA_API_URL || 'https://app.platega.io').replace(/\/+$/, '');
+const MERCHANT_ID = () => String(process.env.PLATEGA_MERCHANT_ID || '').trim();
+const SECRET = () => String(process.env.PLATEGA_SECRET || '').trim();
+
+/** Настроен ли платёжный шлюз (заданы ли обязательные ключи). */
+function isConfigured() {
+  return Boolean(MERCHANT_ID() && SECRET());
+}
+
+/**
+ * Тарифы: сумма платежа → сколько дней доступа.
+ * Считывается из PLATEGA_PLAN_DAYS или LAVA_PLAN_DAYS (если настроена общая),
+ * иначе дефолт: 349 ₽ (30 дней), 3 490 ₽ (365 дней).
+ */
+function plans() {
+  const raw = process.env.PLATEGA_PLAN_DAYS || process.env.LAVA_PLAN_DAYS || '349:30,3490:365';
+  return String(raw).trim().split(',')
+    .map((pair) => {
+      const [sum, days] = pair.split(':').map((x) => Number(String(x).trim()));
+      return { amount: sum, days };
+    })
+    .filter((p) => Number.isFinite(p.amount) && Number.isFinite(p.days) && p.days > 0)
+    .sort((a, b) => a.days - b.days);
+}
+
+/** Сколько дней даёт этот платёж. */
+function daysFor(payment) {
+  const amt = Number((payment && payment.amount) || 0);
+  for (const p of plans()) {
+    if (Math.abs(p.amount - amt) < 0.01) return p.days;
+  }
+  return Number(process.env.PLATEGA_DEFAULT_DAYS || process.env.LAVA_DEFAULT_DAYS || 30);
+}
+
+function planLabel(days) {
+  if (days >= 350) return 'в год';
+  if (days >= 175) return 'за полгода';
+  if (days >= 80) return 'за квартал';
+  return 'в месяц';
+}
+
+function planTitle(days) {
+  if (days >= 350) return 'Год';
+  if (days >= 175) return 'Полгода';
+  if (days >= 80) return 'Квартал';
+  return 'Месяц';
+}
+
+function priceText() {
+  const parts = plans().map((p) => `${p.amount} ₽ ${planLabel(p.days)}`);
+  if (!parts.length) return '';
+  return parts.join(' или ');
+}
+
+/** Сравнение строк постоянного времени (timing-safe). */
+function safeEqual(a, b) {
+  const bufA = Buffer.from(String(a == null ? '' : a).trim());
+  const bufB = Buffer.from(String(b == null ? '' : b).trim());
+  if (bufA.length === 0 || bufB.length === 0) return false;
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Проверка аутентичности входящего запроса от Platega.io.
+ * Мерчант передаёт X-MerchantId и X-Secret в заголовках вебхука.
+ */
+function secretOk(givenMerchantId, givenSecret) {
+  const wantMerchant = MERCHANT_ID();
+  const wantSecret = SECRET();
+  if (!wantMerchant || !wantSecret) return false;
+
+  const mOk = safeEqual(givenMerchantId, wantMerchant);
+  const sOk = safeEqual(givenSecret, wantSecret);
+  return mOk && sOk;
+}
+
+/**
+ * Парсинг полезной нагрузки (payload) из транзакции или вебхука.
+ * Возвращает объект с userId, tgId, plan и т.д.
+ */
+function parsePayload(rawPayload) {
+  if (!rawPayload) return {};
+  if (typeof rawPayload === 'object') return rawPayload;
+  try {
+    return JSON.parse(String(rawPayload));
+  } catch (_) {
+    const res = {};
+    const parts = String(rawPayload).split(/[,;&]+/);
+    for (const part of parts) {
+      const [k, v] = part.split(/[:=]/).map((s) => s.trim());
+      if (k && v) res[k] = v;
+    }
+    return res;
+  }
+}
+
+/**
+ * Разбор входящего callback-вебхука от Platega.io.
+ */
+function parseWebhook(body) {
+  if (!body || typeof body !== 'object') {
+    return { ok: false, reason: 'тело не объект' };
+  }
+
+  const externalId = body.id || body.transactionId || body.orderId;
+  if (!externalId) {
+    return { ok: false, reason: 'нет идентификатора платежа (id)' };
+  }
+
+  const amount = Number(String(body.amount != null ? body.amount : (body.paymentDetails && body.paymentDetails.amount)).replace(',', '.'));
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return { ok: false, reason: 'некорректная сумма' };
+  }
+
+  const currency = String(body.currency || (body.paymentDetails && body.paymentDetails.currency) || 'RUB').toUpperCase();
+  const status = String(body.status || '').toUpperCase();
+  const paid = status === 'CONFIRMED';
+
+  const payload = parsePayload(body.payload);
+  const userId = Number(payload.userId || payload.user_id || payload.uid) || 0;
+  const tgId = Number(payload.tgId || payload.tg_id || payload.tg) || 0;
+  const email = String(payload.email || body.email || '').trim().toLowerCase();
+
+  return {
+    ok: true,
+    payment: {
+      externalId: String(externalId),
+      amount: Math.round(amount * 100) / 100,
+      currency,
+      status,
+      paid,
+      userId,
+      tgId,
+      email,
+      paymentMethod: body.paymentMethod != null ? Number(body.paymentMethod) : null,
+      raw: JSON.stringify(body),
+    },
+  };
+}
+
+/**
+ * Создание платёжной транзакции через REST API Platega.
+ */
+async function createTransaction(opts = {}) {
+  const merchantId = MERCHANT_ID();
+  const secret = SECRET();
+
+  if (!merchantId || !secret) {
+    return { ok: false, error: 'Platega не настроена (отсутствует PLATEGA_MERCHANT_ID или PLATEGA_SECRET)' };
+  }
+
+  const amount = Number(opts.amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return { ok: false, error: 'Некорректная сумма платежа' };
+  }
+
+  const id = opts.transactionId || (crypto.randomUUID ? crypto.randomUUID() : `plt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+  const payloadData = {
+    userId: opts.userId || 0,
+    tgId: opts.tgId || 0,
+    plan: opts.plan || 'subscription',
+    ts: Date.now(),
+  };
+
+  const bodyData = {
+    paymentMethod: opts.paymentMethod !== undefined ? opts.paymentMethod : 2, // по умолчанию СБП QR
+    id,
+    paymentDetails: {
+      amount: Math.round(amount * 100) / 100,
+      currency: 'RUB',
+    },
+    description: opts.description || `Подписка Первичка (${amount} ₽)`,
+    return: opts.returnUrl || 'https://t.me/pervichka_app_bot?start=pay_success',
+    failedUrl: opts.failedUrl || 'https://t.me/pervichka_app_bot?start=pay_failed',
+    payload: JSON.stringify(payloadData),
+  };
+
+  const url = `${API_BASE()}/transaction/process`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-MerchantId': merchantId,
+        'X-Secret': secret,
+      },
+      body: JSON.stringify(bodyData),
+    });
+
+    const json = await res.json().catch(() => null);
+    if (!res.ok || !json) {
+      const errMsg = (json && (json.message || json.error)) || `HTTP ${res.status}`;
+      return { ok: false, error: `Ошибка API Platega: ${errMsg}` };
+    }
+
+    return {
+      ok: true,
+      id: json.id || id,
+      redirect: json.redirect || json.url || '',
+      qr: json.qr || null,
+      status: json.status || 'PENDING',
+      expiresIn: json.expiresIn || null,
+      raw: json,
+    };
+  } catch (err) {
+    return { ok: false, error: `Сетевая ошибка Platega: ${err.message}` };
+  }
+}
+
+/**
+ * Получение актуального статуса транзакции из API Platega.
+ */
+async function getTransactionStatus(id) {
+  const merchantId = MERCHANT_ID();
+  const secret = SECRET();
+
+  if (!merchantId || !secret) {
+    return { ok: false, error: 'Platega не настроена' };
+  }
+
+  const url = `${API_BASE()}/transaction/${encodeURIComponent(String(id).trim())}`;
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'X-MerchantId': merchantId,
+        'X-Secret': secret,
+      },
+    });
+
+    const json = await res.json().catch(() => null);
+    if (!res.ok || !json) {
+      const errMsg = (json && (json.message || json.error)) || `HTTP ${res.status}`;
+      return { ok: false, error: `Ошибка API Platega: ${errMsg}` };
+    }
+
+    const payload = parsePayload(json.payload);
+    return {
+      ok: true,
+      id: json.id || id,
+      status: String(json.status || '').toUpperCase(),
+      amount: Number(json.paymentDetails && json.paymentDetails.amount) || Number(json.amount) || 0,
+      currency: String((json.paymentDetails && json.paymentDetails.currency) || json.currency || 'RUB').toUpperCase(),
+      paid: String(json.status || '').toUpperCase() === 'CONFIRMED',
+      userId: Number(payload.userId || payload.user_id) || 0,
+      tgId: Number(payload.tgId || payload.tg_id) || 0,
+      raw: json,
+    };
+  } catch (err) {
+    return { ok: false, error: `Сетевая ошибка Platega: ${err.message}` };
+  }
+}
+
+module.exports = {
+  isConfigured,
+  plans,
+  daysFor,
+  planTitle,
+  planLabel,
+  priceText,
+  secretOk,
+  parseWebhook,
+  createTransaction,
+  getTransactionStatus,
+  MERCHANT_ID,
+  SECRET,
+};

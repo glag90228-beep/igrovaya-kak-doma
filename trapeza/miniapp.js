@@ -55,6 +55,7 @@ const { advanceVat } = require('./lib/avans');
 const { correctionRow, correctionTotals } = require('./lib/ksf');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
 const { payLink, priceText, yearSaving, planTitle, plans: lavaPlans } = require('./lib/lava');
+const platega = require('./lib/platega');
 const { currentYear } = require('./lib/period');
 const { Telegram } = require('./lib/tg');
 
@@ -291,6 +292,37 @@ function withCp(user, intent) {
   return { ...intent, cpMissing: true };
 }
 
+function formatAiReply(intent, withCpRes, auto) {
+  if (!intent) return 'Не понял. Попробуйте сказать иначе.';
+  if (intent.source === 'limit') return 'Разбор фраз на этот месяц исчерпан. Кнопки и команды работают как обычно.';
+  if (intent.source === 'off') return 'Свободный ввод сейчас выключен — пользуйтесь кнопками.';
+  if (intent.source === 'error') return 'Разбор фраз сейчас не отвечает — попробуйте позже.';
+  if (intent.action === 'debts') return 'Открываю список долгов.';
+  if (intent.action === 'unpaid') return 'Открываю неоплаченные счета.';
+  if (intent.action === 'docs') return 'Открываю раздел документов.';
+  if (intent.action === 'cps') return 'Открываю список контрагентов.';
+  if (intent.action === 'org') return 'Открываю реквизиты организации.';
+  if (intent.action === 'vat') return 'Открываю настройки НДС.';
+  if (intent.action === 'outofscope') return 'Налоги, взносы, отчётность и зарплату я не веду. Могу выписать счёт, акт, УПД или показать долги.';
+  if (intent.action === 'draft') {
+    if (withCpRes && withCpRes.cpChoices && withCpRes.cpChoices.length) return `Уточните клиента: «${intent.who}»?`;
+    if (withCpRes && withCpRes.cpMissing) return `Клиента «${intent.who}» пока нет в базе.`;
+    if (withCpRes && withCpRes.cpName) {
+      return auto
+        ? `Выписываю документ для «${withCpRes.cpName}».`
+        : `Подготовил документ для «${withCpRes.cpName}». Проверьте и нажмите выпуск.`;
+    }
+    return 'Готовлю документ. Выберите клиента.';
+  }
+  if (intent.action === 'pay') {
+    if (withCpRes && withCpRes.cpChoices && withCpRes.cpChoices.length) return `По кому вносим оплату: «${intent.who}»?`;
+    if (withCpRes && withCpRes.cpMissing) return `Клиента «${intent.who}» нет в базе.`;
+    if (withCpRes && withCpRes.cpName) return `Вношу оплату по «${withCpRes.cpName}».`;
+    return 'По кому вносим оплату? Назовите клиента.';
+  }
+  return 'Не понял. Скажите иначе — например: «кто мне должен» или «выставь счёт Заре на 30 тысяч».';
+}
+
 function stateFor(user) {
   const org = bdb.getDefaultOrg(user.id);
   const quota = bdb.quota(user.id);
@@ -323,6 +355,7 @@ function stateFor(user) {
       return bdb.listDocs(user.id, 5).map((d) => docBrief(d, byId.get(d.cp_id) || ''));
     })(),
     payUrl: payLink(user.tg_id),
+    plategaConfigured: platega.isConfigured(),
     /*
      * Тарифы отдаём списком, а не одной фразой. Фраза «390 ₽ в месяц или
      * 2990 ₽ в год» на узком экране рвалась посередине числа: «2990» на
@@ -984,7 +1017,6 @@ const api = {
           + 'Введите его в приложении, чтобы получить доступ за свою оплату.\n'
           + 'Код действует 30 минут.\n\n'
           + 'Если вы ничего не оплачивали и не запрашивали код — просто не вводите его. '
-          + 'Без кода доступ по вашей оплате никто не получит.',
       }).catch((e) => {
         /*
          * Молча проглотить нельзя: человек уже заплатил, ждёт письма,
@@ -1025,6 +1057,37 @@ const api = {
     // Ноль здесь — не «оплаты нет», а «её уже зачли»: показываем текущий срок.
     if (!r.taken) return { found: 0, until: billing.accessInfo(user.id).until };
     return { found: r.taken, until: r.until };
+  },
+
+  /** Создание платёжной транзакции Platega (СБП / карты РФ). */
+  async 'POST /api/pay/create'({ user, body }) {
+    const amount = Number(body && body.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return { error: 'Некорректная сумма платежа.' };
+    }
+    const plan = str((body && body.plan) || 'month', 20);
+    const method = (body && body.paymentMethod != null) ? Number(body.paymentMethod) : 2; // 2 = СБП
+
+    if (platega.isConfigured()) {
+      const res = await platega.createTransaction({
+        amount,
+        userId: user.id,
+        tgId: user.tg_id,
+        paymentMethod: method,
+        plan,
+        description: `Подписка Первичка (${amount} ₽)`,
+      });
+      if (res.ok) {
+        return { ok: true, redirect: res.redirect, qr: res.qr, id: res.id, provider: 'platega' };
+      }
+    }
+
+    // Запасной путь: ссылка Lava Top
+    const fallback = payLink(user.tg_id);
+    if (fallback) {
+      return { ok: true, redirect: fallback, provider: 'lava' };
+    }
+    return { ok: false, error: 'Оплата временно недоступна. Напишите нам в поддержку.' };
   },
 
   /** Реестр всех документов за период — тоже Excel. */
@@ -1588,8 +1651,16 @@ const api = {
   async 'POST /api/ask'({ user, body }) {
     const text = str(body.text, 1000);
     if (!text) return { error: 'Напишите или скажите, что нужно.' };
+    bdb.saveAiMessage({ userId: user.id, source: 'miniapp', role: 'user', type: 'text', text });
     const intent = await ai.understand(text, user.id);
-    return { ...withCp(user, intent), heard: text, auto: bdb.isAiEnabled(user.id), budget: ai.budget(user.id) };
+    const enriched = withCp(user, intent);
+    const auto = bdb.isAiEnabled(user.id);
+    const replyText = formatAiReply(intent, enriched, auto);
+    bdb.saveAiMessage({
+      userId: user.id, source: 'miniapp', role: 'assistant', type: 'text',
+      text: replyText, intent, action: intent.action,
+    });
+    return { ...enriched, heard: text, replyText, auto, budget: ai.budget(user.id) };
   },
 
   /** То же самое, но голосом: расшифровали и сразу разобрали. */
@@ -1614,15 +1685,42 @@ const api = {
       return { error: 'На этот месяц разбор голоса и фраз закончился. Напишите текстом — пойму так же.' };
     }
     ai.spend(user.id);
-    const got = await speech.transcribe(buf, Number(body.seconds) || 0);
+    const seconds = Number(body.seconds) || 0;
+    const got = await speech.transcribe(buf, seconds);
     if (!got.ok) {
       // Подробность — в журнал поддержки, владельцу. Пользователю она ничего
       // не объясняет, а починить по ней может только владелец.
       if (got.detail) office.record({ kind: 'speech', where: 'приложение', error: got.detail, userId: user.id });
       return { error: got.error };
     }
+    bdb.saveAiMessage({
+      userId: user.id, source: 'miniapp', role: 'user', type: 'voice',
+      text: got.text, audioSeconds: seconds,
+    });
     const intent = await ai.understand(got.text, user.id);
-    return { ...withCp(user, intent), heard: got.text, auto: bdb.isAiEnabled(user.id), budget: ai.budget(user.id) };
+    const enriched = withCp(user, intent);
+    const auto = bdb.isAiEnabled(user.id);
+    const replyText = formatAiReply(intent, enriched, auto);
+    bdb.saveAiMessage({
+      userId: user.id, source: 'miniapp', role: 'assistant', type: 'text',
+      text: replyText, intent, action: intent.action,
+    });
+    return { ...enriched, heard: got.text, replyText, auto, budget: ai.budget(user.id) };
+  },
+
+  /** История диалога с ИИ-ассистентом для отображения в чате. */
+  async 'GET /api/ask/history'({ user, url }) {
+    const limit = Number(url.searchParams.get('limit')) || 50;
+    const messages = bdb.listAiMessages(user.id, limit);
+    return { ok: true, messages };
+  },
+
+  /** Выгрузка датасета для анализа и обучения модели. */
+  async 'GET /api/ask/dataset'({ user, url }) {
+    const limit = Number(url.searchParams.get('limit')) || 1000;
+    const type = url.searchParams.get('type') || null;
+    const dataset = bdb.getAiDataset({ limit, type });
+    return { ok: true, count: dataset.length, dataset };
   },
 
   /** Журнал операций одного контрагента: что именно держит его сальдо. */
@@ -1720,7 +1818,7 @@ const api = {
     if (!res.ok) return { error: res.message, reason: res.reason, quota: res.quota };
 
     const token = keepFile(user.id, res.file);
-    await sendToChat(user, res).catch(() => {});
+    await sendToChatSafe(user, res);
     return {
       doc: docBrief({ ...res.doc, cp_id: res.doc.cp.id, payload: { items: [] } }),
       total: res.total,
@@ -1753,7 +1851,7 @@ const api = {
     });
     if (!res.ok) return { error: res.message, reason: res.reason };
     const token = keepFile(user.id, res.file);
-    await sendToChat(user, res).catch(() => {});
+    await sendToChatSafe(user, res);
     const { vat, label } = advanceVat(sum, rate);
     return {
       doc: { id: res.doc.id, number: res.doc.number, title: res.title },
@@ -1842,7 +1940,7 @@ const api = {
     });
     if (!res.ok) return { error: res.message, reason: res.reason };
     const token = keepFile(user.id, res.file);
-    await sendToChat(user, res).catch(() => {});
+    await sendToChatSafe(user, res);
     return {
       doc: { id: res.doc.id, number: res.doc.number, title: res.title },
       up, down,
@@ -1929,8 +2027,15 @@ const escTg = (s) => String(s == null ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 async function sendToChat(user, res) {
-  if (!tg) return;
-  const money = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2 }).format(res.total);
+  if (!tg || !user || !res || !res.doc || !res.file) return;
+  const total = Number((res.total !== undefined ? res.total : (res.doc && res.doc.total)) || 0);
+  const money = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2 }).format(total);
+  const docType = (res.doc && res.doc.type) || '';
+  const title = res.title
+    || (res.doc && res.doc.title)
+    || (docService.ALL_DOCS[docType] && docService.ALL_DOCS[docType].title)
+    || 'Документ';
+  const docNumber = (res.doc && res.doc.number) || '';
 
   /*
    * Имя клиента добывается из двух разных форм — и это не придирка.
@@ -1963,21 +2068,46 @@ async function sendToChat(user, res) {
     await tg.sendDocument(user.tg_id, {
       filename: res.file.filename,
       buffer: res.file.buffer,
-      caption: `${res.title} № ${res.doc.number}${cpName ? ` для <b>${escTg(cpName)}</b>` : ''}`
+      caption: `${title} № ${docNumber}${cpName ? ` для <b>${escTg(cpName)}</b>` : ''}`
         + ` на ${money} ₽.`
-        + (res.doc.type === 'sch' ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.' : ''),
+        + (docType === 'sch' ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.' : ''),
       buttons,
     });
   } catch (e) {
     if (e && e.blocked) bdb.markBlocked(user.id);
+    console.error('sendToChat error:', e && (e.message || e));
     throw e;
+  }
+}
+
+/**
+ * Безопасная неблокирующая доставка в Telegram:
+ * если сетевой вызов к Telegram API висит дольше timeoutMs,
+ * мы не задерживаем HTTP-ответ клиенту в Mini App.
+ */
+async function sendToChatSafe(user, res, timeoutMs = 2000) {
+  if (!tg) return false;
+  try {
+    const sendPromise = sendToChat(user, res);
+    sendPromise.catch(() => {});
+    await Promise.race([
+      sendPromise,
+      new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+    return true;
+  } catch (err) {
+    console.error('sendToChatSafe error:', err && err.message);
+    return false;
   }
 }
 
 // ---------- статика ----------
 
 function serveStatic(req, res, pathname) {
-  const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  let rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  if (rel === 'terms' || rel === 'legal' || rel === 'oferta') rel = 'terms.html';
+  if (rel === 'privacy') rel = 'privacy.html';
+  if (rel === 'tariffs') rel = 'tariffs.html';
   const full = path.join(ROOT, rel);
   // За пределы папки приложения не выпускаем даже при «../» в адресе.
   if (!full.startsWith(ROOT)) { res.writeHead(403); res.end('нельзя'); return; }
@@ -2132,4 +2262,4 @@ if (require.main === module) {
   server.listen(PORT, HOST, () => console.log(`Мини-приложение слушает ${HOST}:${PORT}`));
 }
 
-module.exports = { server, api, stateFor, setTelegram, forgetRate };
+module.exports = { server, api, stateFor, setTelegram, forgetRate, sendToChat, sendToChatSafe };

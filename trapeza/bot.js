@@ -25,9 +25,13 @@ const speech = require('./lib/speech');
 const office = require('./lib/office');
 const { applySetup } = require('./lib/bot-setup');
 const { acquire: acquireLock } = require('./lib/lock');
-const { supportScreen, forwardToSupport, legalLine } = require('./lib/bot-support');
+const {
+  supportScreen, legalScreen, forwardToSupport, legalLine,
+  OFERTA, POLICY, TARIFFS, CHECK_CODE,
+} = require('./lib/bot-support');
 const billing = require('./lib/billing');
 const { payLink, daysFor, priceText, yearSaving } = require('./lib/lava');
+const platega = require('./lib/platega');
 const dadata = require('./lib/dadata');
 const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
 const reqCheck = require('./lib/requisites-check');
@@ -143,11 +147,8 @@ function webAppUrl() {
 function mainMenu() {
   const app = webAppUrl();
   return keyboard([
+    [{ text: '🧾 Выписать счёт за 1 мин', data: 'go.sch' }],
     ...(app ? [[{ text: '📱 Открыть приложение', webApp: app }]] : []),
-    // Первой строкой — то, зачем человек пришёл. Без неё меню предлагает
-    // разделы и ни одного действия: новичок не понимает, что документы живут
-    // внутри карточки контрагента, и уходит.
-    [{ text: '🧾 Выписать счёт', data: 'go.sch' }],
     [{ text: '💸 Кто должен', data: 'debts' }, { text: '⏳ Не оплачено', data: 'unpaid' }],
     [{ text: '📁 Документы', data: 'docs' }, { text: '⚙️ Ещё', data: 'more' }],
   ]);
@@ -163,8 +164,9 @@ function moreMenu() {
     // Почта — ежедневная работа, а не настройка, поэтому она первой строкой
     // среди прочего, а не последней.
     [{ text: '✉️ Почта', data: 'mb' }],
-    [{ text: '⭐ Подписка', data: 'billing' }],
+    [{ text: '⭐ Подписка и тарифы', data: 'billing' }],
     [{ text: '❓ Помощь', data: 'help' }, { text: '💬 Поддержка', data: 'support' }],
+    [{ text: '📄 Документы и правила', data: 'legal' }],
     [{ text: '⬅️ Меню', data: 'menu' }],
   ]);
 }
@@ -178,14 +180,13 @@ function moreMenu() {
  * а разбор фразы у нас работает и голосом тоже.
  */
 const GREETING =
-  '<b>Первичка</b> — счета, акты и платёжки за минуту.\n\n'
-  + 'Нажмите <b>«Выписать счёт»</b> — я задам пару вопросов и пришлю готовый '
-  + 'файл, который можно сразу отправить клиенту.\n\n'
-  + 'Или просто скажите словами, голосом или текстом:\n'
-  + '<code>Выстави счёт ООО Заря на 45 000 за банкет</code>\n\n'
-  + '<i>Ещё умею: акт, УПД, накладную, договор, акт сверки в Excel, '
-  + 'счёт с QR для оплаты камерой, отправку с вашей почты и учёт долгов. '
-  + 'Первые 5 документов в месяц — бесплатно.</i>';
+  '<b>Первичка</b> — счета, акты и УПД с печатью и ГОСТ QR за 1 минуту со смартфона.\n\n'
+  + '👇 <b>Как быстрее всего сделать счёт:</b>\n'
+  + '1. Нажмите кнопку <b>«Выписать счёт за 1 мин»</b> ниже.\n'
+  + '2. Или просто <b>отправьте голосовое или текст</b>:\n'
+  + '   <code>Выстави счёт ООО Заря на 50 000 руб за оказание услуг</code>\n\n'
+  + '<i>Счёт сразу с факсимиле, печатью и QR-кодом для быстрой оплаты клиентом через банковское приложение. '
+  + 'Первые 5 документов в месяц — бесплатно. Без 1С и бухгалтера.</i>';
 
 function greeting() {
   const legal = legalLine();
@@ -528,9 +529,6 @@ async function applyFormValue(tg, chatId, user, state, rawValue) {
    * Проверка тут не ради строгости. Опечатка в расчётном счёте — это
    * платёж, который не пройдёт, а опечатка в ИНН — документ, который
    * вернёт бухгалтер контрагента. И то и другое ловится арифметикой, но
-   * только пока человек ещё смотрит на это поле: через неделю в выписанном
-   * счёте он ошибку не найдёт.
-   */
   /*
    * Перед проверкой числовые реквизиты приводим к цифрам.
    *
@@ -1112,7 +1110,7 @@ async function repeatDoc(tg, chatId, user, docId) {
     await tg.sendMessage(chatId, 'Такой документ повторить нельзя.', mainMenu());
     return;
   }
-  const { items, extra } = docService.reusablePayload(src.payload);
+  const { items = [], ...extra } = src.payload || {};
   const year = currentYear();
   const seq = bdb.nextSeq(user.id, src.type, year);
   const data = { seq, number: String(seq), date: todayISO(), items, ask: '', doc: extra };
@@ -1435,17 +1433,31 @@ async function showBilling(tg, chatId, user) {
     const save = yearSaving();
     if (save > 0) lines.push(`<i>За год — выгода ${formatRub(save)}.</i>`);
   }
-  if (!link) {
+  const hasPlatega = platega.isConfigured();
+  if (!link && !hasPlatega) {
     lines.push('');
     lines.push('<i>Оплата пока не подключена. Напишите в поддержку — выдадим доступ вручную.</i>');
   }
+  lines.push('');
+  lines.push(`<i>Проверочный код: ${CHECK_CODE}</i>`);
 
   const rows = [];
+  if (hasPlatega) {
+    rows.push([
+      { text: '⚡ Оплатить СБП (349 ₽)', data: 'pay.plt:month' },
+      { text: '⭐ Год (3 490 ₽)', data: 'pay.plt:year' },
+    ]);
+  }
   if (link) rows.push([{ text: a.active ? '⭐ Продлить' : '⭐ Оформить подписку', url: link }]);
-  if (link) rows.push([{ text: '✅ Я оплатил', data: 'pay.claim' }]);
+  if (link || hasPlatega) rows.push([{ text: '✅ Я оплатил', data: 'pay.claim' }]);
   // Код доступа показываем всегда: им пользуются и до подключения оплаты,
   // и когда доступ дают за отзыв, тест или взамен сорвавшегося платежа.
   rows.push([{ text: '🎟 У меня есть код', data: 'promo' }]);
+  rows.push([
+    { text: '📄 Оферта', url: OFERTA() },
+    { text: '🔒 Конфиденциальность', url: POLICY() },
+  ]);
+  rows.push([{ text: '⭐ Тарифы сервиса', url: TARIFFS() }]);
   const history = billing.paymentsOf(user.id, 3);
   if (history.length) {
     lines.push('');
@@ -1751,6 +1763,12 @@ async function redeemPromo(tg, chatId, user, text) {
 async function showSupport(tg, chatId, user) {
   bdb.clearState(user.id);
   const { text, rows } = supportScreen();
+  await tg.sendMessage(chatId, text, keyboard(rows));
+}
+
+async function showLegal(tg, chatId, user) {
+  bdb.clearState(user.id);
+  const { text, rows } = legalScreen();
   await tg.sendMessage(chatId, text, keyboard(rows));
 }
 
@@ -2324,7 +2342,10 @@ async function recordPay(tg, chatId, user, cpId, amount, kind) {
     ]));
 }
 
-async function handleFreeText(tg, chatId, user, text) {
+async function handleFreeText(tg, chatId, user, text, opts = {}) {
+  if (!opts.isVoice) {
+    bdb.saveAiMessage({ userId: user.id, source: 'bot', role: 'user', type: 'text', text });
+  }
   /*
    * Тумблер решает не «понимать или нет», а «делать или показать кнопку».
    *
@@ -2338,13 +2359,19 @@ async function handleFreeText(tg, chatId, user, text) {
    */
   const auto = bdb.isAiEnabled(user.id);
   const intent = await ai.understand(text, user.id);
+  const logAiReply = (reply) => {
+    bdb.saveAiMessage({
+      userId: user.id, source: 'bot', role: 'assistant', type: 'text',
+      text: reply || intent.action || '', intent, action: intent.action || '',
+    });
+  };
 
-  if (intent.action === 'debts') { await showDebts(tg, chatId, user); return true; }
-  if (intent.action === 'unpaid') { await showUnpaid(tg, chatId, user); return true; }
-  if (intent.action === 'docs') { await showDocs(tg, chatId, user); return true; }
-  if (intent.action === 'cps') { await showCps(tg, chatId, user); return true; }
-  if (intent.action === 'org') { await showOrg(tg, chatId, user); return true; }
-  if (intent.action === 'vat') { await showVat(tg, chatId, user); return true; }
+  if (intent.action === 'debts') { logAiReply('Показываю долги'); await showDebts(tg, chatId, user); return true; }
+  if (intent.action === 'unpaid') { logAiReply('Показываю неоплаченные счета'); await showUnpaid(tg, chatId, user); return true; }
+  if (intent.action === 'docs') { logAiReply('Показываю документы'); await showDocs(tg, chatId, user); return true; }
+  if (intent.action === 'cps') { logAiReply('Показываю контрагентов'); await showCps(tg, chatId, user); return true; }
+  if (intent.action === 'org') { logAiReply('Показываю организацию'); await showOrg(tg, chatId, user); return true; }
+  if (intent.action === 'vat') { logAiReply('Показываю НДС'); await showVat(tg, chatId, user); return true; }
 
   /*
    * Оплата по фразе — ассистент вносит её сам.
@@ -2396,12 +2423,13 @@ async function handleFreeText(tg, chatId, user, text) {
     await recordPay(tg, chatId, user, cp.id, intent.amount, intent.kind);
     return true;
   }
-  if (intent.action === 'recurring') { await showRecurring(tg, chatId, user); return true; }
-  if (intent.action === 'billing') { await showBilling(tg, chatId, user); return true; }
+  if (intent.action === 'recurring') { logAiReply('Показываю регулярные счета'); await showRecurring(tg, chatId, user); return true; }
+  if (intent.action === 'billing') { logAiReply('Показываю тарифы и оплату'); await showBilling(tg, chatId, user); return true; }
   if (intent.action === 'help') return false;      // помощь и так в меню
 
   // Акт сверки собирается по конкретному контрагенту — спрашиваем, по кому.
   if (intent.action === 'akt') {
+    logAiReply('Сверка расчётов');
     const cps = bdb.listCps(user.id);
     if (!cps.length) {
       await tg.sendMessage(chatId, 'Сверяться пока не с кем — сначала добавьте контрагента.',
@@ -2424,6 +2452,7 @@ async function handleFreeText(tg, chatId, user, text) {
    * и говорим, что умеем вместо этого.
    */
   if (intent.action === 'outofscope') {
+    logAiReply('Вне компетенции (налоги, зарплата)');
     await tg.sendMessage(chatId,
       'Налоги, взносы, КУДиР, отчётность и зарплату я не веду — для этого нужен доступ '
       + 'к вашему банку и кассе, а у меня его нет. Подскажу неверно — вам платить штраф.\n\n'
@@ -2434,6 +2463,7 @@ async function handleFreeText(tg, chatId, user, text) {
   }
 
   if (intent.action === 'draft') {
+    logAiReply(`Подготовка документа: ${intent.docType || 'документ'}`);
     const cps = bdb.listCps(user.id);
     if (!cps.length) {
       await tg.sendMessage(chatId, 'Сначала добавьте клиента — потом выпишем документ.',
@@ -2537,6 +2567,7 @@ async function handleFreeText(tg, chatId, user, text) {
   }
 
   if (intent.source === 'limit') {
+    logAiReply('Разбор фраз на этот месяц исчерпан');
     await tg.sendMessage(chatId,
       'Разбор фраз на этот месяц исчерпан — понимаю пока только команды и кнопки.\n\n'
       + '<i>Операция вносится текстом: <code>15.06 приход 94193</code>.</i>');
@@ -2553,11 +2584,13 @@ async function handleFreeText(tg, chatId, user, text) {
    * поддержки, хотя разбор его честно возвращает.
    */
   if (intent.source === 'off') {
+    logAiReply('Разбор фраз выключен');
     await tg.sendMessage(chatId,
       'Разбор фраз сейчас выключен — кнопки и команды работают как обычно.', mainMenu());
     return true;
   }
   if (intent.source === 'error') {
+    logAiReply('Сервис разбора фраз недоступен');
     // Подробность — владельцу в журнал поддержки: чинить по ней может только
     // он, а человеку она ничего не объясняет.
     office.record({ kind: 'ai', where: 'бот', error: String(intent.error || ''), userId: user.id });
@@ -2573,6 +2606,7 @@ async function handleFreeText(tg, chatId, user, text) {
    * начинаются со слэша и ничего о живой речи не говорят.
    */
   if (!String(text || '').startsWith('/')) {
+    logAiReply('Не понял');
     office.record({ kind: 'unknown', where: 'bot', text, userId: user.id }).catch(() => {});
   }
   return false;
@@ -3252,7 +3286,11 @@ async function handleVoice(tg, chatId, user, msg) {
   }
 
   await tg.sendMessage(chatId, `Услышал: «${esc(got.text)}»`);
-  const answered = await handleFreeText(tg, chatId, user, got.text);
+  bdb.saveAiMessage({
+    userId: user.id, source: 'bot', role: 'user', type: 'voice',
+    text: got.text, audioSeconds: Number(src.duration) || 0,
+  });
+  const answered = await handleFreeText(tg, chatId, user, got.text, { isVoice: true });
   if (!answered) {
     await tg.sendMessage(chatId,
       'Не понял, что с этим сделать. Скажите иначе — например: «выставь счёт Заре на 30 тысяч» '
@@ -4067,12 +4105,53 @@ async function handleMessage(tg, msg) {
    * Метку запоминаем при первой встрече и больше не трогаем: интересно,
    * откуда человек пришёл ИЗНАЧАЛЬНО, а не какую ссылку он открыл последней.
    */
-  if (text === '/start' || text.startsWith('/start ')) {
+  const startMatch = /^\/start(?:@\w+)?(?:\s+(.+))?$/i.exec(text);
+  if (startMatch) {
     bdb.clearState(user.id);
-    const label = text.slice(6).trim().slice(0, 64);
-    if (label && !user.source) {
-      try { bdb.setSource(user.id, label); } catch (_) { /* метка не важнее приветствия */ }
+    const rawPayload = (startMatch[1] || '').trim();
+    const payload = rawPayload.slice(0, 64);
+
+    // 1. Активация промокода: /start promo_PRV123 или /start promo-PRV123
+    if (/^promo[_-]/i.test(payload)) {
+      const code = payload.replace(/^promo[_-]/i, '');
+      if (!user.source) {
+        try { user.source = bdb.setSource(user.id, payload); } catch (_) {}
+      }
+      await redeemPromo(tg, chatId, user, code);
+      return;
     }
+
+    // 2. Открытие карточки документа: /start doc_123 или /start doc-123
+    if (/^doc[_-]/i.test(payload)) {
+      const docId = Number(payload.replace(/^doc[_-]/i, ''));
+      if (Number.isFinite(docId) && docId > 0) {
+        await showDoc(tg, chatId, user, docId);
+        return;
+      }
+      // Невалидный docId — не падаем в AI, показываем приветствие
+      await tg.sendMessage(chatId, greeting(), mainMenu());
+      return;
+    }
+
+    // 3. Реферальная ссылка: /start ref_12345 или /start ref-12345
+    if (/^ref[_-]/i.test(payload)) {
+      if (!user.source) {
+        try { user.source = bdb.setSource(user.id, payload); } catch (_) {}
+      }
+      await tg.sendMessage(chatId, greeting(), mainMenu());
+      return;
+    }
+
+    // 4. Любая другая метка (e.g. utm_* или reels_qr)
+    if (payload) {
+      if (!user.source) {
+        try { user.source = bdb.setSource(user.id, payload); } catch (_) {}
+      }
+      await tg.sendMessage(chatId, greeting(), mainMenu());
+      return;
+    }
+
+    // 5. Обычный /start без параметров
     await tg.sendMessage(chatId, greeting(), mainMenu());
     return;
   }
@@ -4096,7 +4175,8 @@ async function handleMessage(tg, msg) {
   // Команды из меню Telegram — те же экраны, что и кнопки. Если человек
   // выбрал команду в середине формы, шаг сбрасываем: он передумал.
   const SLASH = { '/org': 'org', '/cps': 'cps', '/debts': 'debts', '/docs': 'docs',
-    '/help': 'help', '/support': 'support', '/subscription': 'billing' };
+    '/help': 'help', '/support': 'support', '/subscription': 'billing',
+    '/legal': 'legal', '/terms': 'legal', '/privacy': 'legal', '/tariffs': 'legal', '/oferta': 'legal' };
   if (SLASH[text]) {
     bdb.clearState(user.id);
     await handleCallback(tg, {
@@ -5167,6 +5247,44 @@ async function handleCallback(tg, cq) {
     if (data.startsWith('ph.cp:')) { await photoPickKind(tg, chatId, user, Number(data.slice(6))); return; }
     if (data.startsWith('ph.k:')) { await photoSaveOp(tg, chatId, user, data.slice(5)); return; }
     if (data === 'billing') { await showBilling(tg, chatId, user); return; }
+    if (data.startsWith('pay.plt:')) {
+      const plan = data.slice(8);
+      const amount = plan === 'year' ? 3490 : 349;
+      if (platega.isConfigured()) {
+        const res = await platega.createTransaction({
+          amount,
+          userId: user.id,
+          tgId: user.tg_id,
+          paymentMethod: 2,
+          plan,
+          description: `Подписка Первичка на ${plan === 'year' ? '1 год' : '1 месяц'}`,
+        });
+        if (res.ok && res.redirect) {
+          await tg.sendMessage(chatId,
+            `💳 <b>Оплата подписки (${amount} ₽)</b>\n\n`
+            + 'Оплата через Систему быстрых платежей (СБП) или карту любого банка РФ.\n'
+            + 'После завершения платежа доступ продлится автоматически.',
+            keyboard([
+              [{ text: `⚡ Оплатить ${amount} ₽ (СБП / Карты)`, url: res.redirect }],
+              [{ text: '⬅️ Назад к подписке', data: 'billing' }],
+            ]));
+          return;
+        }
+      }
+      const fallback = payLink(user.tg_id);
+      if (fallback) {
+        await tg.sendMessage(chatId, `Оформить подписку (${amount} ₽):`,
+          keyboard([
+            [{ text: `⭐ Оплатить ${amount} ₽`, url: fallback }],
+            [{ text: '⬅️ Назад к подписке', data: 'billing' }],
+          ]));
+        return;
+      }
+      await tg.sendMessage(chatId,
+        'Оплата временно недоступна. Напишите нам в поддержку — подключим доступ вручную.',
+        keyboard([[{ text: '💬 Написать в поддержку', data: 'support' }]]));
+      return;
+    }
     if (data === 'pay.claim') {
       bdb.setState(user.id, 'claim', {});
       await tg.sendMessage(chatId, 'Пришлите почту, которую указывали при оплате:',
@@ -5182,6 +5300,7 @@ async function handleCallback(tg, cq) {
       return;
     }
     if (data === 'support') { await showSupport(tg, chatId, user); return; }
+    if (['legal', 'terms', 'privacy', 'tariffs'].includes(data)) { await showLegal(tg, chatId, user); return; }
     if (data === 'sup.write') {
       bdb.setState(user.id, 'support', {});
       await tg.sendMessage(chatId, 'Опишите, что случилось. Одним сообщением — я передам целиком.',
