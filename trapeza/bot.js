@@ -1652,6 +1652,7 @@ const OWNER_HELP = [
   '<code>/grant 123456789 30</code> — выдать 30 дней по номеру',
   '<code>/grant @ivanov 30</code> — то же по имени (если он уже запускал бота)',
   '<code>/ungrant @ivanov</code> — снять доступ (пригодится, чтобы посмотреть, как выглядит бесплатный режим)',
+  '<code>/orgs @ivanov 1</code> — открыть место под ещё одну организацию (в тариф входит две)',
   '<code>/who</code> — у кого сейчас есть доступ',
   '',
   '<b>Коды доступа</b> — когда номера человека нет',
@@ -1690,6 +1691,31 @@ async function ownerCommand(tg, chatId, text) {
     await tg.sendMessage(chatId, `Выдал ${days} ${plural(days, 'день', 'дня', 'дней')} пользователю ${esc(target.name || who)} — до ${ru(until)}.`);
     try {
       await tg.sendMessage(target.tg_id, `✅ Доступ продлён до <b>${ru(until)}</b>.`);
+    } catch (e) { if (e && e.blocked) bdb.markBlocked(target.id); }
+    return true;
+  }
+
+  /*
+   * Место под ещё одну организацию — после доплаты.
+   *
+   * Отдельной командой, а не автоматом по платежу: сумма за место в тарифах
+   * не описана, и выдумывать её код не должен. Владелец получил деньги —
+   * владелец и открывает место.
+   */
+  const orgGrant = /^\/orgs\s+(\S+)(?:\s+(\d+))?/.exec(text);
+  if (orgGrant) {
+    const target = findTarget(orgGrant[1].replace(/^@/, ''));
+    if (!target) { await tg.sendMessage(chatId, `Не нашёл пользователя ${esc(orgGrant[1])}.`); return true; }
+    const n = Number(orgGrant[2] || 1);
+    const now = bdb.grantOrgSlots(target.id, n);
+    const q = bdb.orgQuota(target.id);
+    await tg.sendMessage(chatId,
+      `Открыл ${n} ${plural(n, 'место', 'места', 'мест')} пользователю ${esc(target.name || orgGrant[1])}.\n`
+      + `Теперь у него ${q.used} из ${q.limit} организаций (сверх тарифа — ${now}).`);
+    try {
+      await tg.sendMessage(target.tg_id,
+        `✅ Открыл место под ещё ${n === 1 ? 'одну организацию' : `${n} организации`}. `
+        + 'Завести — в разделе «Моя организация».');
     } catch (e) { if (e && e.blocked) bdb.markBlocked(target.id); }
     return true;
   }
@@ -4075,6 +4101,19 @@ async function showOrgPick(tg, chatId, user) {
  * реквизитам в ближайшем счёте.
  */
 async function startAddOrg(tg, chatId, user) {
+  const q = bdb.orgQuota(user.id);
+  if (!q.canAdd) {
+    await tg.sendMessage(chatId,
+      `В тариф входит ${q.limit === 1 ? 'одна организация' : `${q.limit} организации`}, `
+      + 'и они уже заведены.\n\n'
+      + 'Нужна ещё — напишите в поддержку, откроем место за доплату. '
+      + 'Ничего при этом не отключится: всё заведённое остаётся на месте.',
+      keyboard([
+        [{ text: '💬 Написать в поддержку', data: 'support' }],
+        [{ text: '⬅️ К организации', data: 'org' }],
+      ]));
+    return;
+  }
   const id = bdb.createOrg(user.id, { name: '' });
   bdb.setActiveOrg(user.id, id);
   await tg.sendMessage(chatId,

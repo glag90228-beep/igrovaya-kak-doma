@@ -2297,6 +2297,34 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(balA !== 60000 && balB !== 60000,
       'и ни одна не видит общие 60 000 — а увидела бы, будь журнал общим',
       `${balA} и ${balB}`);
+
+    /*
+     * Предел организаций: две в тарифе, дальше по доплате.
+     *
+     * Две даём и тем, кто не платит: разница между бесплатным и платным в
+     * числе документов, а не в числе фирм. Иначе главное отличие продукта —
+     * что он не путает два юрлица — человек увидел бы только после оплаты.
+     *
+     * Упёршемуся не даём завести следующую, а не пускаем с обещанием счёта:
+     * заведённое потом пришлось бы отключать за неоплату, то есть запирать
+     * чужой учёт.
+     */
+    const qS = bdbO.orgQuota(uS.id);
+    ok(qS.used === 2 && qS.limit === 2 && !qS.canAdd,
+      'две организации заведены — предел достигнут', JSON.stringify(qS));
+
+    const uFree = bdbO.getOrCreateUser(779091, 'Бесплатный');
+    bdbO.saveMyOrg(uFree.id, { name: 'ООО «Одна»', inn: '7701234567' });
+    const qFree = bdbO.orgQuota(uFree.id);
+    ok(qFree.limit === 2 && qFree.canAdd,
+      'неплатящему тоже положены две — иначе он не увидит, ради чего платить',
+      JSON.stringify(qFree));
+
+    bdbO.grantOrgSlots(uS.id, 1);
+    const qMore = bdbO.orgQuota(uS.id);
+    ok(qMore.limit === 3 && qMore.canAdd,
+      'после доплаты место открылось', JSON.stringify(qMore));
+    ok(qMore.used === 2, 'а уже заведённое никуда не делось', qMore.used);
   }
 
   console.log('\n── номера документов не задваиваются ──');

@@ -194,6 +194,15 @@ function migrate() {
    * молча возвращается к умолчанию, а не роняет экран.
    */
   addColumn('bot_users', 'active_org_id', 'INTEGER NOT NULL DEFAULT 0');
+  /*
+   * Сколько организаций сверх тарифа человек оплатил.
+   *
+   * В тариф входят две — и платящему, и нет: разница между бесплатным и
+   * платным в числе документов, а не в числе фирм. Иначе главное отличие
+   * продукта — что он не путает два юрлица — человек увидел бы только после
+   * оплаты и мог решить, что продукт ему не подходит.
+   */
+  addColumn('bot_users', 'orgs_extra', 'INTEGER NOT NULL DEFAULT 0');
   // Откуда человек пришёл: метка из ссылки t.me/бот?start=МЕТКА. Без неё
   // нельзя понять, какая реклама привела платящих, а какая — только шум.
   addColumn('bot_users', 'source', "TEXT NOT NULL DEFAULT ''");
@@ -2119,6 +2128,37 @@ function forgetTemplate(userId, id) {
 // при каждом вызове, чтобы число/режим можно было менять без перезапуска
 // и переопределять в прогоне: FREE_DOCS — сколько бесплатных, ENFORCE_LIMIT=0
 // снова открывает всем.
+/**
+ * Сколько организаций входит в тариф. Меняется окружением, чтобы цену можно
+ * было пересмотреть без выкладки кода.
+ */
+const orgsIncluded = () => Math.max(1, Number(process.env.ORGS_INCLUDED || 2));
+
+/**
+ * Можно ли завести ещё одну организацию.
+ *
+ * Упёршемуся не даём завести следующую — так решил владелец, и это самый
+ * честный из вариантов: ничего не отключается задним числом, данные не
+ * зависают в недоступном состоянии, а человек видит предел до того, как
+ * начал заполнять анкету. Разрешать заводить, а потом выставлять счёт значит
+ * однажды запереть чужой учёт за неоплату.
+ */
+function orgQuota(userId) {
+  const u = db.prepare('SELECT orgs_extra FROM bot_users WHERE id = ?').get(userId) || {};
+  const limit = orgsIncluded() + (Number(u.orgs_extra) || 0);
+  const used = db.prepare('SELECT COUNT(*) AS n FROM orgs WHERE user_id = ?').get(userId).n;
+  return { used, limit, canAdd: used < limit, extra: Number(u.orgs_extra) || 0 };
+}
+
+/** Открыть место под ещё одну организацию — после оплаты. */
+function grantOrgSlots(userId, n = 1) {
+  const add = Math.max(1, Math.round(Number(n) || 1));
+  const u = db.prepare('SELECT orgs_extra FROM bot_users WHERE id = ?').get(userId) || {};
+  const next = (Number(u.orgs_extra) || 0) + add;
+  db.prepare('UPDATE bot_users SET orgs_extra = ? WHERE id = ?').run(next, userId);
+  return next;
+}
+
 const freePerMonth = () => Number(process.env.FREE_DOCS || 5);
 const enforceLimit = () => String(process.env.ENFORCE_LIMIT || '1') !== '0';
 
@@ -2170,6 +2210,7 @@ module.exports = {
   unpaidDocs, unpaidSummary, dealTotals, docsBetween,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
   isSeqTaken, guardSeq, numberTakenInOrg, currentOrgId, currentOrg, setActiveOrg,
+  orgQuota, grantOrgSlots,
   openingFor, setOpeningFor, cpOrgs,
   nextSeqForOrg, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,

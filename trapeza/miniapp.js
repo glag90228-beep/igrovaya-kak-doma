@@ -631,6 +631,15 @@ const api = {
    * ею старую — заметил бы по чужим реквизитам в ближайшем счёте.
    */
   async 'POST /api/org/add'({ user }) {
+    const q = bdb.orgQuota(user.id);
+    if (!q.canAdd) {
+      return {
+        error: `В тариф входит ${q.limit === 1 ? 'одна организация' : `${q.limit} организации`}, `
+          + 'и они уже заведены. Напишите в поддержку — откроем место за доплату.',
+        reason: 'orgs',
+        quota: q,
+      };
+    }
     const id = bdb.createOrg(user.id, { name: '' });
     bdb.setActiveOrg(user.id, id);
     return { active: id };

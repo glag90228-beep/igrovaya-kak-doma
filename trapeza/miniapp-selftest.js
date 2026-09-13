@@ -205,6 +205,38 @@ async function main() {
     // Чужую не подсунуть.
     const alien = await call('POST', '/api/org/use', { user: petya, body: { id: firstId } });
     ok(alien.status === 400, 'на чужую организацию переключиться нельзя', alien.status);
+
+    /*
+     * Третью не заводим: в тариф входит две.
+     *
+     * Отказываем ДО анкеты, а не после. Пустить и выставить счёт потом
+     * значит однажды отключить фирму за неоплату — то есть запереть чужой
+     * учёт вместе с её документами.
+     */
+    const third = await call('POST', '/api/org/add', { user: masha });
+    ok(third.status === 400 && third.json.reason === 'orgs',
+      'третья организация не заводится — предел тарифа', JSON.stringify(third.json));
+    ok(/поддержку/.test(third.json.error || ''),
+      'и сказано, куда идти за местом', third.json.error);
+    const still = await call('GET', '/api/orgs', { user: masha });
+    ok(still.json.orgs.length === 2, 'а две уже заведённые на месте', still.json.orgs.length);
+
+    // После доплаты место открывается, и заведённое не трогается.
+    const bdbQ = require('./lib/bot-db');
+    bdbQ.grantOrgSlots(bdbQ.getOrCreateUser(MASHA.id).id, 1);
+    const paid = await call('POST', '/api/org/add', { user: masha });
+    ok(paid.status === 200, 'с оплаченным местом третья заводится', JSON.stringify(paid.json));
+
+    /*
+     * Прибираем за собой: третью убираем, возвращаемся на первую.
+     *
+     * Проверки ниже смотрят список контрагентов, а он теперь сортируется
+     * «свои выше чужих». Оставшись на свежей фирме, где своих нет вовсе, мы
+     * поменяли бы порядок списка — и уронили бы соседнюю проверку не своей
+     * ошибкой, а мусором в состоянии.
+     */
+    require('./db').db.prepare('DELETE FROM orgs WHERE id = ?').run(paid.json.active);
+    await call('POST', '/api/org/use', { user: masha, body: { id: firstId } });
   }
 
   /*
