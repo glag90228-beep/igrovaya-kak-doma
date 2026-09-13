@@ -324,7 +324,7 @@ function formatAiReply(intent, withCpRes, auto) {
 }
 
 function stateFor(user) {
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   const quota = bdb.quota(user.id);
   const access = billing.accessInfo(user.id);
   const debts = bdb.debtors(user.id);
@@ -588,6 +588,39 @@ const api = {
     return { cp: cpBrief(user.id, bdb.getCp(user.id, newId)) };
   },
 
+  /** Мои организации и та, от лица которой работаю сейчас. */
+  async 'GET /api/orgs'({ user }) {
+    const active = bdb.currentOrgId(user.id);
+    return {
+      active,
+      orgs: bdb.listOrgs(user.id).map((o) => ({
+        id: o.id, name: o.name, inn: o.inn, active: o.id === active,
+      })),
+    };
+  },
+
+  /** Переключиться на другую свою организацию. */
+  async 'POST /api/org/use'({ user, body }) {
+    if (!bdb.setActiveOrg(user.id, Number(body && body.id))) {
+      return { error: 'Такой организации у вас нет.' };
+    }
+    const org = bdb.currentOrg(user.id);
+    return { active: org.id, name: org.name };
+  },
+
+  /**
+   * Завести ещё одну организацию.
+   *
+   * Переключаемся на неё сразу: POST /api/org правит ТЕКУЩУЮ, и не
+   * переключившись, человек заполнил бы анкету новой фирмы, а переписал бы
+   * ею старую — заметил бы по чужим реквизитам в ближайшем счёте.
+   */
+  async 'POST /api/org/add'({ user }) {
+    const id = bdb.createOrg(user.id, { name: '' });
+    bdb.setActiveOrg(user.id, id);
+    return { active: id };
+  },
+
   async 'POST /api/org'({ user, body }) {
     const name = str(body.name, 200);
     if (!name) return { error: 'Укажите название организации.' };
@@ -612,7 +645,7 @@ const api = {
     const bad = reqCheck.checkRequisites(mine);
     if (bad.length) return { error: bad[0].error, field: bad[0].field };
     bdb.saveMyOrg(user.id, mine);
-    return { org: bdb.getDefaultOrg(user.id) };
+    return { org: bdb.currentOrg(user.id) };
   },
 
   /**
@@ -742,7 +775,7 @@ const api = {
     const built = await docService.rebuildDocument(user.id, doc.id, { stamp: wantStamp(body) });
     if (!built.ok) return { error: built.message };
 
-    const org = bdb.getOrg(user.id, doc.org_id) || bdb.getDefaultOrg(user.id) || {};
+    const org = bdb.getOrg(user.id, doc.org_id) || bdb.currentOrg(user.id) || {};
     const money = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2 }).format(doc.total || 0);
     const res = await mailer.sendMail({
       to,
@@ -822,7 +855,7 @@ const api = {
     return {
       paidAt: when,
       doc: docBrief(bdb.getDoc(user.id, id)),
-      npd: npd.chequeReminder(bdb.getDefaultOrg(user.id), {
+      npd: npd.chequeReminder(bdb.currentOrg(user.id), {
         paidAt: when, cpName: cp && cp.name,
       }),
     };
@@ -830,7 +863,7 @@ const api = {
 
   /** Признак «применяю НПД». Нужен ровно для напоминания про чек. */
   async 'POST /api/npd'({ user, body }) {
-    const org = bdb.getDefaultOrg(user.id);
+    const org = bdb.currentOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     bdb.updateOrg(user.id, org.id, { npd: body.on ? 1 : 0 });
     return { npd: Boolean(body.on), lkUrl: npd.LK_URL };
@@ -841,7 +874,7 @@ const api = {
    * приложения молча уходили без налога у тех, кто на общей системе.
    */
   async 'POST /api/vat'({ user, body }) {
-    const org = bdb.getDefaultOrg(user.id);
+    const org = bdb.currentOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     const raw = body.rate;
     const rate = raw === null || raw === '' || raw === undefined ? '' : String(Number(raw));
@@ -849,7 +882,7 @@ const api = {
       return { error: 'Ставка бывает 0, 5, 7, 10, 20 или 22 процента.' };
     }
     bdb.updateOrg(user.id, org.id, { vat_rate: rate, vat_gross: body.gross ? 1 : 0 });
-    return { vat: bdb.vatOf(bdb.getDefaultOrg(user.id)) };
+    return { vat: bdb.vatOf(bdb.currentOrg(user.id)) };
   },
 
   /** Проверочное письмо самому себе: убедиться, что пароль принят. */
@@ -932,7 +965,7 @@ const api = {
 
   /** Акт сверки в Excel — по журналу операций контрагента. */
   async 'GET /api/akt'({ user, url }) {
-    const org = bdb.getDefaultOrg(user.id);
+    const org = bdb.currentOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     const iso0 = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(v || '') ? v : '');
     const p = bdb.cpForPeriod(user.id, Number(url.searchParams.get('cp')),
@@ -961,7 +994,7 @@ const api = {
    * несколько файлов по ссылкам нельзя, а в переписке они остаются.
    */
   async 'GET /api/akt/all'({ user }) {
-    const org = bdb.getDefaultOrg(user.id);
+    const org = bdb.currentOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     const rows = bdb.debtors(user.id).filter((d) => d.theyOwe);
     if (!rows.length) return { error: 'Должников нет — сверять не с кем.' };
@@ -1101,7 +1134,7 @@ const api = {
 
   /** Реестр всех документов за период — тоже Excel. */
   async 'GET /api/registry'({ user, url }) {
-    const org = bdb.getDefaultOrg(user.id);
+    const org = bdb.currentOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     const iso = (v, fallback) => (/^\d{4}-\d{2}-\d{2}$/.test(v || '') ? v : fallback);
     /*
@@ -1143,7 +1176,7 @@ const api = {
     const kind = docService.OTHER_DOCS[type];
     if (!kind) return { error: 'Такой документ выписать нельзя.' };
 
-    const org = bdb.getDefaultOrg(user.id);
+    const org = bdb.currentOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     const cp = bdb.getCp(user.id, Number(body.cpId));
     if (!cp) return { error: 'Контрагент не найден.' };
@@ -1196,7 +1229,7 @@ const api = {
    * отправит его сам, от своего имени.
    */
   async 'GET /api/reminders'({ user }) {
-    const org = bdb.getDefaultOrg(user.id) || {};
+    const org = bdb.currentOrg(user.id) || {};
     const rows = bdb.debtors(user.id).filter((r) => r.theyOwe);
     const bank = org.acc
       ? `\n\nРеквизиты для оплаты:\n${org.bank_name || ''}\nБИК ${org.bik || '—'}\nР/с ${org.acc}`
@@ -1245,7 +1278,7 @@ const api = {
     const text = str(body.text, 4000);
     if (text.length < 20) return { error: 'Текст напоминания пустой.' };
 
-    const org = bdb.getDefaultOrg(user.id) || {};
+    const org = bdb.currentOrg(user.id) || {};
     const b = bdb.balanceOf(user.id, cp.id);
 
     /*
@@ -1348,7 +1381,7 @@ const api = {
     const raw = m ? m[2] : String(body.base64 || '');
     if (!raw) return { error: 'Пришлите файл выписки: CSV, TXT из Клиент-Банка или OFX.' };
 
-    const org = bdb.getDefaultOrg(user.id);
+    const org = bdb.currentOrg(user.id);
     const { format, rows } = bank.parseStatement(Buffer.from(raw, 'base64'), {
       ownAccounts: [org && org.acc].filter(Boolean),
     });
@@ -1446,7 +1479,7 @@ const api = {
      * ФЗ № 422-ФЗ, а не вежливость.
      */
     const npdNote = done.docs
-      ? npd.chequeReminder(bdb.getDefaultOrg(user.id), { paidAt: docService.todayISO() })
+      ? npd.chequeReminder(bdb.currentOrg(user.id), { paidAt: docService.todayISO() })
       : null;
     return { ...done, count: left.count, sum: left.sum, npd: npdNote };
   },
@@ -1484,7 +1517,7 @@ const api = {
   async 'POST /api/basis'({ user, body }) {
     const basis = str(body.basis, 10);
     if (!bdb.DEBT_DOCS[basis]) return { error: 'Неизвестное основание.' };
-    const org = bdb.getDefaultOrg(user.id);
+    const org = bdb.currentOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     bdb.updateOrg(user.id, org.id, { debt_basis: basis });
     // Пересобираем журнал под новое правило: иначе переключение меняет
@@ -1503,7 +1536,7 @@ const api = {
     const key = str(body.key, 20);
     const t = bizTypes.get(key);
     if (!t) return { error: 'Неизвестный вид деятельности.' };
-    const org = bdb.getDefaultOrg(user.id);
+    const org = bdb.currentOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     bdb.updateOrg(user.id, org.id, { biz_type: key, debt_basis: t.basis });
     // Пересчёт нужен ровно так же, как в /api/basis: это вторая дверь к тому
@@ -1845,7 +1878,7 @@ const api = {
    * и приложение: расходиться им нельзя.
    */
   async 'POST /api/doc/avans'({ user, body }) {
-    const org = bdb.getDefaultOrg(user.id);
+    const org = bdb.currentOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     const sum = round2(Number(body.sum) || 0);
     if (sum <= 0) return { error: 'Укажите полученную сумму.' };
@@ -1883,7 +1916,7 @@ const api = {
   async 'GET /api/doc/qr'({ user, url }) {
     const d = bdb.getDoc(user.id, Number(url.searchParams.get('id')));
     if (!d) return { error: 'Документ не найден.' };
-    const org = bdb.getDefaultOrg(user.id);
+    const org = bdb.currentOrg(user.id);
     if (!org) return { problems: ['реквизиты организации не заполнены'] };
     const cp = bdb.getCp(user.id, d.cp_id);
     const problems = payProblems({ org });

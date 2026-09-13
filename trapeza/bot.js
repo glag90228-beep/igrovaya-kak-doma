@@ -216,8 +216,8 @@ function cpMenu(userId, cp) {
    * положены, и кнопка, ведущая к отказу, — плохая кнопка: человек решит,
    * что продукт сломан, а не что так нельзя.
    */
-  if (bdb.vatOf(bdb.getDefaultOrg(userId)).rate != null
-      && !npd.isNpd(bdb.getDefaultOrg(userId))) {
+  if (bdb.vatOf(bdb.currentOrg(userId)).rate != null
+      && !npd.isNpd(bdb.currentOrg(userId))) {
     rows.push([{ text: '💵 СФ на аванс', data: `d.av:${cp.id}` },
       { text: '✏️ Корректировка', data: `d.ksf:${cp.id}` }]);
   }
@@ -668,7 +668,7 @@ async function sendGenerated(tg, chatId, { html, xlsxBuffer, base, caption }) {
 }
 
 async function requireOrg(tg, chatId, user) {
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   if (!org) {
     await tg.sendMessage(chatId, 'Сначала заведите свою организацию.', mainMenu());
     return null;
@@ -811,7 +811,7 @@ async function startItems(tg, chatId, user, type, cpId, extra = {}) {
    * человек увидит в предпросмотре один номер, а в файле другой. Считаем по
    * той же организации, по которой его посчитает doc-service.
    */
-  const orgForSeq = bdb.getDefaultOrg(user.id);
+  const orgForSeq = bdb.currentOrg(user.id);
   const seq = bdb.nextSeqForOrg(orgForSeq ? orgForSeq.id : 0, type, year);
 
   /*
@@ -834,7 +834,7 @@ async function startItems(tg, chatId, user, type, cpId, extra = {}) {
   const doc = { ...extra };
   if (['sch', 'schdog', 'torg12', 'upd', 'usl'].includes(type)
       && !Object.prototype.hasOwnProperty.call(doc, 'vatRate')) {
-    const v = bdb.vatOf(bdb.getDefaultOrg(user.id));
+    const v = bdb.vatOf(bdb.currentOrg(user.id));
     if (v.rate != null) { doc.vatRate = v.rate; doc.priceIncludesVat = v.gross; }
   }
 
@@ -1040,7 +1040,7 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
   }
 
   const cp = bdb.getCp(user.id, cpId);
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   const q = res.quota;
   const tail = q.paid ? '' : `\n<i>Выписано в этом месяце: ${q.used} из ${q.limit} бесплатных.</i>`;
   // Проводка в журнал — вещь неочевидная, о ней надо сказать прямо,
@@ -1075,7 +1075,7 @@ const payable = (org) => Boolean(org && org.acc && org.bik && org.corr_acc);
  * по счёту некуда, самое полезное сейчас — дозаполнить банк.
  */
 async function afterDoc(tg, chatId, user, cpId) {
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   const last = bdb.listDocs(user.id, 1)[0];
   const rows = [];
   if (last) {
@@ -1172,7 +1172,7 @@ function periodOf(name) {
  * контрагента. Расхождение здесь оборачивается требованием обеим сторонам.
  */
 async function sendKniga(tg, chatId, user, periodName) {
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
   if (bdb.vatOf(org).rate == null) {
     await tg.sendMessage(chatId,
@@ -1200,7 +1200,7 @@ async function sendKniga(tg, chatId, user, periodName) {
 }
 
 async function sendRegistry(tg, chatId, user, periodName) {
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
   const { from, to, title } = periodOf(periodName);
   const docs = bdb.docsBetween(user.id, from, to);
@@ -1378,7 +1378,7 @@ async function showDoc(tg, chatId, user, docId) {
  */
 async function remindCheque(tg, chatId, user, docId, paidAt) {
   if (!paidAt) return;
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   const d = bdb.getDoc(user.id, docId);
   const cp = d && d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
   const note = npd.chequeReminder(org, { paidAt, cpName: cp && cp.name });
@@ -1949,7 +1949,7 @@ async function mailDoc(tg, chatId, user, docId, emailOverride = null) {
   const built = await docService.rebuildDocument(user.id, docId);
   if (!built.ok) { await tg.sendMessage(chatId, esc(built.message), mainMenu()); return; }
 
-  const org = bdb.getOrg(user.id, d.org_id) || bdb.getDefaultOrg(user.id) || {};
+  const org = bdb.getOrg(user.id, d.org_id) || bdb.currentOrg(user.id) || {};
   const res = await mailer.sendMail({
     to,
     subject: `${d.title} № ${d.number} от ${ru(d.date)}`,
@@ -2003,7 +2003,7 @@ async function mailAktToSelf(user, cp) {
    */
   const to = box.own ? String(box.options.from || box.options.user || '').trim() : '';
   if (!to) return { ok: false, error: 'Не знаю вашего адреса — подключите свой ящик.' };
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   if (!org) return { ok: false, error: 'Организация не заведена.' };
   const p = bdb.cpForPeriod(user.id, cp.id, '', '');
   if (!p) return { ok: false, error: 'Не удалось собрать акт.' };
@@ -2281,7 +2281,7 @@ const BASIS_LABEL = {
  * поэтому объясняем на примерах, а не терминами.
  */
 async function showBasis(tg, chatId, user) {
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
   const now = bdb.basisOf(org);
   await tg.sendMessage(chatId,
@@ -2944,7 +2944,7 @@ async function warnOverdue(tg, rec, on = period.todayDate()) {
  * выводится само.
  */
 async function showBizType(tg, chatId, user) {
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
   await tg.sendMessage(chatId,
     '<b>Чем занимаетесь?</b>\n\n'
@@ -2962,7 +2962,7 @@ async function showBizType(tg, chatId, user) {
  * раз в год. У конкретного документа его всё равно можно переопределить.
  */
 async function showVat(tg, chatId, user) {
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
   /*
    * Самозанятому говорим прямо, и до кнопок, а не после.
@@ -3014,7 +3014,7 @@ async function showVat(tg, chatId, user) {
  * когда человек отметит оплату.
  */
 async function showNpd(tg, chatId, user) {
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
   const on = npd.isNpd(org);
   await tg.sendMessage(chatId,
@@ -3137,7 +3137,7 @@ async function handleStatement(tg, chatId, user, msg) {
   await tg.sendChatAction(chatId, 'typing');
 
   const buf = await tg.downloadFile(doc.file_id, 2 * 1024 * 1024);
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   const { format, rows } = bank.parseStatement(buf, { ownAccounts: [org && org.acc].filter(Boolean) });
   if (!rows.length) {
     await tg.sendMessage(chatId,
@@ -3459,7 +3459,7 @@ async function showDebts(tg, chatId, user) {
    * и решал, что цифра сломана, — а объяснение было только в мини-приложении.
    * Кто смотрел долги в боте, не получал ни слова.
    */
-  const basis = bdb.basisMismatch(user.id, bdb.getDefaultOrg(user.id),
+  const basis = bdb.basisMismatch(user.id, bdb.currentOrg(user.id),
     rows.filter((r) => r.theyOwe).reduce((s, r) => s + r.amount, 0));
   const basisNote = basis
     ? `\n\n<i>${basis.to === 'invoice'
@@ -3553,7 +3553,7 @@ function reminderText(org, r) {
  * увидев текст. Чего по-прежнему не бывает — писем без нажатия.
  */
 async function debtReminder(tg, chatId, user) {
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   const rows = bdb.debtors(user.id).filter((r) => r.theyOwe);
   if (!rows.length) { await tg.sendMessage(chatId, 'Должников нет.', mainMenu()); return; }
   const canMail = mailbox.has(user.id);
@@ -3588,7 +3588,7 @@ async function sendReminderMail(tg, chatId, user, cpId, email) {
   }
   const row = bdb.debtors(user.id).find((d) => d.cp.id === cpId);
   if (!row) { await tg.sendMessage(chatId, 'Долга за этим клиентом нет.', mainMenu()); return; }
-  const org = bdb.getDefaultOrg(user.id) || {};
+  const org = bdb.currentOrg(user.id) || {};
 
   await tg.sendChatAction(chatId, 'typing');
   /*
@@ -3673,7 +3673,7 @@ async function handleDogText(tg, chatId, user, state, text) {
     return;
   }
 
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   const cp = bdb.getCp(user.id, cpId);
   bdb.clearState(user.id);
   if (!org || !cp) { await tg.sendMessage(chatId, 'Не хватает данных.', mainMenu()); return; }
@@ -3949,7 +3949,7 @@ async function makeFix(tg, chatId, user, docId) {
       'Исправление выставляют к счёту-фактуре. Этот документ им не является.', mainMenu());
     return;
   }
-  const no = sfBlocked(bdb.getDefaultOrg(user.id));
+  const no = sfBlocked(bdb.currentOrg(user.id));
   if (no) { await tg.sendMessage(chatId, no, mainMenu()); return; }
 
   const fixNo = Number(p.fix && p.fix.no ? p.fix.no : 0) + 1;
@@ -3970,7 +3970,7 @@ async function makeFix(tg, chatId, user, docId) {
 }
 
 async function startDoc(tg, chatId, user, type) {
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   if (!org || !org.name) {
     // Реквизиты нужны не «для порядка», а чтобы клиенту было куда платить, —
     // так и объясняем, иначе форма выглядит бюрократией на ровном месте.
@@ -4038,8 +4038,44 @@ async function showCps(tg, chatId, user) {
   await tg.sendMessage(chatId, 'Ваши контрагенты:', keyboard(rows));
 }
 
+/** Список своих организаций: от какой работаем. */
+async function showOrgPick(tg, chatId, user) {
+  const orgs = bdb.listOrgs(user.id);
+  const cur = bdb.currentOrgId(user.id);
+  const rows = orgs.map((o) => [{
+    text: `${o.id === cur ? '● ' : '○ '}${o.name}${o.inn ? ` · ИНН ${o.inn}` : ''}`.slice(0, 60),
+    data: `org.use:${o.id}`,
+  }]);
+  rows.push([{ text: '➕ Добавить организацию', data: 'org.add' }]);
+  rows.push([{ text: '⬅️ К организации', data: 'org' }]);
+  await tg.sendMessage(chatId,
+    '<b>От какой фирмы работаем</b>\n\n'
+    + 'Выбор запоминается: документы, долги и отчёты дальше будут её. '
+    + 'У каждой фирмы свой ряд номеров и своё сальдо с клиентами — '
+    + 'смешать их нельзя, это разные юрлица.',
+    keyboard(rows));
+}
+
+/**
+ * Завести ещё одну организацию.
+ *
+ * Переключаемся на неё ДО формы, а не после: форма сохраняет реквизиты через
+ * saveMyOrg, а он правит текущую. Не переключившись, человек заполнил бы
+ * анкету новой фирмы, а переписал бы ею старую — и заметил бы это по чужим
+ * реквизитам в ближайшем счёте.
+ */
+async function startAddOrg(tg, chatId, user) {
+  const id = bdb.createOrg(user.id, { name: '' });
+  bdb.setActiveOrg(user.id, id);
+  await tg.sendMessage(chatId,
+    'Заводим ещё одну организацию. Отвечайте по порядку — реквизиты те же, '
+    + 'что и у первой.\n\n'
+    + '<i>Прежняя фирма никуда не денется: между ними можно переключаться.</i>');
+  await startForm(tg, chatId, user, 'org');
+}
+
 async function showOrg(tg, chatId, user) {
-  const org = bdb.getDefaultOrg(user.id);
+  const org = bdb.currentOrg(user.id);
   if (!org) {
     await tg.sendMessage(chatId, 'Организация ещё не заведена.', keyboard([[{ text: '➕ Завести организацию', data: 'org.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
     return;
@@ -4055,8 +4091,23 @@ async function showOrg(tg, chatId, user) {
   const fxLabel = fxSign || fxStamp
     ? `🖊 Подпись и печать · ${[fxSign && 'подпись', fxStamp && 'печать'].filter(Boolean).join(' и ')}`
     : '🖊 Подпись и печать';
+  /*
+   * Переключатель показываем, только когда фирм больше одной.
+   *
+   * У подавляющего большинства она одна, и кнопка «Сменить организацию» на
+   * экране с единственной организацией — это вопрос без ответа: человек
+   * жмёт, видит список из одной строки и не понимает, что от него хотели.
+   * Зато «Добавить организацию» нужна всегда — иначе второй фирме взяться
+   * неоткуда.
+   */
+  const orgs = bdb.listOrgs(user.id);
+  const rows = [[{ text: '✏️ Изменить (ввести заново)', data: 'org.new' }]];
+  if (orgs.length > 1) {
+    rows.push([{ text: `🔀 Сейчас: ${org.name}`.slice(0, 60), data: 'org.pick' }]);
+  }
+  rows.push([{ text: '➕ Добавить организацию', data: 'org.add' }]);
   await tg.sendMessage(chatId, txt, keyboard([
-    [{ text: '✏️ Изменить (ввести заново)', data: 'org.new' }],
+    ...rows,
     [{ text: fxLabel, data: 'fx' }],
     [{ text: `🧾 НДС: ${vatLabel(org)}`.slice(0, 60), data: 'vat' }],
     [{ text: `💼 Самозанятость: ${npd.isNpd(org) ? 'да' : 'нет'}`, data: 'npd' }],
@@ -4537,7 +4588,7 @@ async function handleCallback(tg, cq) {
         mainMenu());
       // Через выписку закрывают сразу пачку — и именно тут про чек забывают
       // вернее всего: человек ничего не выписывал, он просто прислал файл.
-      const npdNote = npd.chequeReminder(bdb.getDefaultOrg(user.id), { paidAt: todayISO() });
+      const npdNote = npd.chequeReminder(bdb.currentOrg(user.id), { paidAt: todayISO() });
       if (done.docs && npdNote) {
         await tg.sendMessage(chatId, `🧾 ${esc(npdNote.text)}`,
           keyboard([[{ text: '🧾 Открыть «Мой налог»', url: npdNote.url }]]));
@@ -4601,7 +4652,7 @@ async function handleCallback(tg, cq) {
     }
     if (data === 'basis') { await showBasis(tg, chatId, user); return; }
     if (data.startsWith('basis.set:')) {
-      const org = bdb.getDefaultOrg(user.id);
+      const org = bdb.currentOrg(user.id);
       if (org) {
         bdb.updateOrg(user.id, org.id, { debt_basis: data.slice(10) });
         // Пересобираем журнал под новое правило. Без этого переключение
@@ -4618,7 +4669,7 @@ async function handleCallback(tg, cq) {
     if (data === 'biz') { await showBizType(tg, chatId, user); return; }
     if (data.startsWith('biz.set:')) {
       const t = bizTypes.get(data.slice(8));
-      const org = bdb.getDefaultOrg(user.id);
+      const org = bdb.currentOrg(user.id);
       if (t && org) {
         const key = data.slice(8);
         bdb.updateOrg(user.id, org.id, { biz_type: key, debt_basis: t.basis });
@@ -4841,7 +4892,7 @@ async function handleCallback(tg, cq) {
     if (data === 'vat') { await showVat(tg, chatId, user); return; }
     if (data === 'npd') { await showNpd(tg, chatId, user); return; }
     if (data.startsWith('npd.set:')) {
-      const org = bdb.getDefaultOrg(user.id);
+      const org = bdb.currentOrg(user.id);
       if (org) bdb.updateOrg(user.id, org.id, { npd: data.slice(8) === '1' ? 1 : 0 });
       await showNpd(tg, chatId, user);
       return;
@@ -4849,7 +4900,7 @@ async function handleCallback(tg, cq) {
     if (data.startsWith('vat.set:')) {
       const [rate, gross] = data.slice(8).split(':');
       if (!okRate(rate)) return;
-      const org = bdb.getDefaultOrg(user.id);
+      const org = bdb.currentOrg(user.id);
       if (org) {
         bdb.updateOrg(user.id, org.id, {
           vat_rate: rate === 'none' ? '' : rate,
@@ -5071,6 +5122,19 @@ async function handleCallback(tg, cq) {
       return;
     }
     if (data === 'org.new') { await startForm(tg, chatId, user, 'org'); return; }
+    if (data === 'org.pick') { await showOrgPick(tg, chatId, user); return; }
+    if (data === 'org.add') { await startAddOrg(tg, chatId, user); return; }
+    if (data.startsWith('org.use:')) {
+      const okSwitch = bdb.setActiveOrg(user.id, Number(data.slice(8)));
+      if (!okSwitch) { await tg.sendMessage(chatId, 'Такой организации у вас нет.', mainMenu()); return; }
+      const now = bdb.currentOrg(user.id);
+      await tg.sendMessage(chatId,
+        `Работаем от <b>${esc(now.name)}</b>.\n\n`
+        + '<i>Документы, долги и отчёты дальше — её. У каждой фирмы свои номера '
+        + 'и своё сальдо с клиентами.</i>');
+      await showOrg(tg, chatId, user);
+      return;
+    }
     if (data === 'cps') { await showCps(tg, chatId, user); return; }
     if (data === 'cp.new') { await startForm(tg, chatId, user, 'cp'); return; }
     // Выбор клиента и суммы для проводки, начатой фразой.
@@ -5188,7 +5252,7 @@ async function handleCallback(tg, cq) {
     if (data.startsWith('d.usl:')) { await startItems(tg, chatId, user, 'usl', Number(data.slice(6))); return; }
     if (data.startsWith('d.schdog:')) {
       // Счёт-договор — тот же счёт по сути, ставку НДС берём так же.
-      const org = bdb.getDefaultOrg(user.id);
+      const org = bdb.currentOrg(user.id);
       const v = org ? bdb.vatOf(org) : { rate: null, gross: false };
       await startItems(tg, chatId, user, 'schdog', Number(data.slice(9)),
         v.rate == null ? {} : { vatRate: v.rate, priceIncludesVat: v.gross });
@@ -5197,7 +5261,7 @@ async function handleCallback(tg, cq) {
     if (data.startsWith('d.sch:')) {
       // Ставку не спрашиваем — берём режим организации; у документа его
       // можно поменять кнопкой в сводке перед выпуском.
-      const org = bdb.getDefaultOrg(user.id);
+      const org = bdb.currentOrg(user.id);
       const v = org ? bdb.vatOf(org) : { rate: null, gross: false };
       await startItems(tg, chatId, user, 'sch', Number(data.slice(6)),
         v.rate == null ? {} : { vatRate: v.rate, priceIncludesVat: v.gross });

@@ -182,6 +182,18 @@ function migrate() {
   // ошибка в логе и лишний запрос.
   addColumn('bot_users', 'blocked_at', "TEXT NOT NULL DEFAULT ''");
   addColumn('bot_users', 'ai_enabled', 'INTEGER NOT NULL DEFAULT 1');
+  /*
+   * От лица какой организации человек работает прямо сейчас.
+   *
+   * Хранится у человека, а не в состоянии экрана: выбор должен пережить и
+   * закрытое приложение, и перезапуск бота. Иначе тот, кто ведёт две фирмы,
+   * каждое утро начинал бы с чужой и замечал это по выписанному документу.
+   *
+   * Ноль значит «не выбирал» — тогда берём организацию по умолчанию. Так же
+   * ведёт себя и запись, которая указывает на удалённую организацию: выбор
+   * молча возвращается к умолчанию, а не роняет экран.
+   */
+  addColumn('bot_users', 'active_org_id', 'INTEGER NOT NULL DEFAULT 0');
   // Откуда человек пришёл: метка из ссылки t.me/бот?start=МЕТКА. Без неё
   // нельзя понять, какая реклама привела платящих, а какая — только шум.
   addColumn('bot_users', 'source', "TEXT NOT NULL DEFAULT ''");
@@ -501,8 +513,35 @@ function setDefaultOrg(userId, id) {
  * @returns {number} id организации; 0 — организаций нет вовсе
  */
 function currentOrgId(userId) {
+  const u = db.prepare('SELECT active_org_id FROM bot_users WHERE id = ?').get(userId);
+  const picked = u && Number(u.active_org_id);
+  if (picked) {
+    // Проверяем, что выбранная всё ещё существует и всё ещё наша. Указатель
+    // на удалённую организацию не должен ронять экран — тихо берём умолчание.
+    const own = db.prepare('SELECT id FROM orgs WHERE id = ? AND user_id = ?').get(picked, userId);
+    if (own) return own.id;
+  }
   const org = getDefaultOrg(userId);
   return org ? org.id : 0;
+}
+
+/** Организация, от лица которой работаем, целиком — не только id. */
+function currentOrg(userId) {
+  const id = currentOrgId(userId);
+  return id ? db.prepare('SELECT * FROM orgs WHERE id = ?').get(id) : undefined;
+}
+
+/**
+ * Переключиться на другую свою организацию.
+ *
+ * Чужую не принимаем: id приходит из кнопки, а кнопку видно в переписке.
+ * @returns {boolean} удалось ли переключиться
+ */
+function setActiveOrg(userId, orgId) {
+  const own = db.prepare('SELECT id FROM orgs WHERE id = ? AND user_id = ?').get(Number(orgId) || 0, userId);
+  if (!own) return false;
+  db.prepare('UPDATE bot_users SET active_org_id = ? WHERE id = ?').run(own.id, userId);
+  return true;
 }
 
 /**
@@ -512,12 +551,24 @@ function currentOrgId(userId) {
  * обновляем организацию по умолчанию на месте и убираем дубликаты.
  */
 function saveMyOrg(userId, fields) {
-  const def = getDefaultOrg(userId);
-  if (def) {
-    updateOrg(userId, def.id, fields);
-    db.prepare('DELETE FROM orgs WHERE user_id = ? AND id <> ?').run(userId, def.id);
-    db.prepare('UPDATE orgs SET is_default = 1 WHERE id = ?').run(def.id);
-    return def.id;
+  /*
+   * Правим ТЕКУЩУЮ организацию и не трогаем остальные.
+   *
+   * Здесь стояло «обновить умолчание и удалить все прочие». Появилось это от
+   * старой беды: каждая правка реквизитов заводила ещё одну организацию, а
+   * бот продолжал брать самую первую, и человеку казалось, что изменения не
+   * применяются. Дубликаты убирали заодно с правкой.
+   *
+   * С несколькими организациями то же удаление стало прямой потерей: завёл
+   * вторую фирму, зашёл поправить реквизиты первой — и второй больше нет, а
+   * её документы остались ссылаться на несуществующую строку. Причина, по
+   * которой дубликаты вообще заводились, давно устранена: правка идёт в
+   * updateOrg по конкретному id, новых строк она не создаёт.
+   */
+  const cur = currentOrg(userId);
+  if (cur) {
+    updateOrg(userId, cur.id, fields);
+    return cur.id;
   }
   return createOrg(userId, fields);
 }
@@ -1091,7 +1142,7 @@ function addOpForDoc(userId, cpId, op, docId) {
  * его решение — не то же самое, что «мы ещё не создали».
  */
 function rebuildDebt(userId) {
-  const org = getDefaultOrg(userId);
+  const org = currentOrg(userId);
   const types = DEBT_DOCS[basisOf(org || {})];
   const docs = db.prepare(
     'SELECT id, cp_id, type, date, total, number, paid_at, paid_sum, no_debt FROM documents WHERE user_id = ? AND total > 0',
@@ -1207,7 +1258,7 @@ function markPaid(userId, docId, date) {
   // оплаты без встречной реализации увела бы сальдо в минус — вышло бы,
   // что это мы должны контрагенту. Отметку об оплате при этом сохраняем:
   // она нужна списку «Не оплачено» и живёт отдельно от журнала.
-  const org = getDefaultOrg(userId);
+  const org = currentOrg(userId);
   if (basisOf(org || {}) === 'manual') return when;
   /*
    * Проводку оплаты делаем только по тому документу, который создаёт долг.
@@ -1343,7 +1394,7 @@ const dayNum = (iso) => {
 };
 
 function dealTotals(userId, docs) {
-  const basis = basisOf(getDefaultOrg(userId) || {});
+  const basis = basisOf(currentOrg(userId) || {});
   const groups = new Map();
   for (const d of docs) {
     delete d.pair;
@@ -2083,7 +2134,8 @@ module.exports = {
   markPaid, unmarkPaid, matchPaymentsToDocs, closeDocsFromBank,
   unpaidDocs, unpaidSummary, dealTotals, docsBetween,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
-  isSeqTaken, guardSeq, numberTakenInOrg, currentOrgId, openingFor, setOpeningFor, cpOrgs,
+  isSeqTaken, guardSeq, numberTakenInOrg, currentOrgId, currentOrg, setActiveOrg,
+  openingFor, setOpeningFor, cpOrgs,
   nextSeqForOrg, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,
   quota, docsThisMonth, freePerMonth,

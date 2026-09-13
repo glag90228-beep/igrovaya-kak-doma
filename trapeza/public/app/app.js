@@ -1453,6 +1453,46 @@ screens.org = async function orgScreen() {
     corr_acc: field('corr_acc', 'Корр. счёт', o.corr_acc, { inputmode: 'numeric' }),
   };
 
+  /*
+   * Переключатель фирм — только когда их несколько.
+   *
+   * У подавляющего большинства организация одна, и выпадающий список из
+   * одной строки на видном месте — это вопрос без ответа: человек не
+   * понимает, что от него хотят. Кнопка «Добавить организацию» нужна всегда:
+   * иначе второй фирме взяться неоткуда.
+   */
+  const { orgs = [], active } = await api('GET', '/api/orgs').catch(() => ({ orgs: [] }));
+  const orgPicker = h('div');
+  if (orgs.length > 1) {
+    const sel = h('select', { id: 'f-active-org' },
+      orgs.map((x) => h('option', { value: x.id, selected: x.id === active }, x.name || 'без названия')));
+    sel.onchange = async () => {
+      try {
+        await api('POST', '/api/org/use', { id: Number(sel.value) });
+        cache.org = null;                    // реквизиты на экранах теперь другие
+        haptic('medium');
+        toast('Работаем от другой фирмы');
+        go('org');
+      } catch (e) { toast(e.message, true); }
+    };
+    orgPicker.append(h('div', { class: 'field' },
+      h('label', { for: 'f-active-org', text: 'Работаем от' }), sel,
+      h('div', {
+        class: 'hint',
+        text: 'У каждой фирмы свой ряд номеров и своё сальдо с клиентами — '
+          + 'смешать их нельзя, это разные юрлица.',
+      })));
+  }
+  orgPicker.append(h('div', { class: 'btn-wrap' }, h('button', {
+    class: 'btn secondary',
+    onclick: (e) => withBusy(e.currentTarget, async () => {
+      await api('POST', '/api/org/add');
+      cache.org = null;
+      toast('Заполните реквизиты новой организации');
+      go('org');
+    }),
+  }, '➕ Добавить организацию')));
+
   const paste = h('textarea', {
     id: 'f-paste', placeholder: 'Вставьте блок реквизитов из письма или договора целиком',
   });
@@ -1505,6 +1545,10 @@ screens.org = async function orgScreen() {
   const box = h('div', {}, h('h1', { text: 'Моя организация' }));
   box.append(h('div', { class: 'banner info' }, icon('help'),
     h('div', { text: 'Эти реквизиты подставляются во все документы. Заполняются один раз.' })));
+
+  // Выбор фирмы — выше реквизитов: сначала «чьи», потом «какие».
+  if (orgs.length > 1) box.append(h('div', { class: 'section-title', text: 'Фирма' }));
+  box.append(orgs.length > 1 ? h('div', { class: 'card' }, orgPicker) : orgPicker);
 
   box.append(h('div', { class: 'section-title', text: 'Быстрый ввод' }));
   box.append(h('div', { class: 'card' },

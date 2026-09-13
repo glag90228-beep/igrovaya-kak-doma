@@ -160,7 +160,7 @@ async function issueDocument(userId, {
   const kind = ITEM_DOCS[type];
   if (!kind) return fail('type', 'Такой документ выписать нельзя.');
 
-  const org = bdb.getDefaultOrg(userId);
+  const org = bdb.currentOrg(userId);
   if (!org) return fail('org', 'Сначала заполните реквизиты своей организации.');
 
   const cp = bdb.getCp(userId, Number(cpId));
@@ -379,7 +379,7 @@ async function issueFlat(userId, {
   if (!kind || !['avans', 'ksf'].includes(type)) {
     return fail('type', 'Такой документ выписать нельзя.');
   }
-  const org = bdb.getDefaultOrg(userId);
+  const org = bdb.currentOrg(userId);
   if (!org) return fail('org', 'Сначала заполните реквизиты своей организации.');
   const cp = bdb.getCp(userId, Number(cpId));
   if (!cp) return fail('cp', 'Контрагент не найден.');
@@ -473,7 +473,7 @@ async function rebuildDocument(userId, docId, opts = {}) {
   const saved = bdb.getDoc(userId, Number(docId));
   if (!saved) return fail('notfound', 'Документ не найден.');
 
-  const org0 = bdb.getOrg(userId, saved.org_id) || bdb.getDefaultOrg(userId);
+  const org0 = bdb.getOrg(userId, saved.org_id) || bdb.currentOrg(userId);
   const cp0 = bdb.getCp(userId, saved.cp_id);
   if (!org0 || !cp0) return fail('data', 'Не хватает данных для сборки: проверьте организацию и контрагента.');
 

@@ -166,6 +166,47 @@ async function main() {
   r = await call('POST', '/api/cp', { user: masha, body: { name: '' } });
   ok(r.status === 400, 'контрагент без названия отклонён');
 
+  {
+    /*
+     * Несколько организаций на одном аккаунте.
+     *
+     * Приложение обязано не только уметь переключаться, но и заводить новую
+     * так, чтобы она не перезаписала старую: POST /api/org правит ТЕКУЩУЮ,
+     * поэтому /api/org/add сперва переключается на свежую. Без этого человек
+     * заполнил бы анкету второй фирмы, а переписал бы ею первую — и заметил
+     * бы по чужим реквизитам в ближайшем счёте.
+     */
+    const one = await call('GET', '/api/orgs', { user: masha });
+    ok(one.status === 200 && one.json.orgs.length === 1,
+      'пока организация одна', one.json && one.json.orgs.length);
+    const firstId = one.json.active;
+    const firstName = one.json.orgs[0].name;
+
+    const added = await call('POST', '/api/org/add', { user: masha });
+    ok(added.status === 200 && added.json.active !== firstId,
+      'новая организация заведена и стала текущей', JSON.stringify(added.json));
+
+    await call('POST', '/api/org', {
+      user: masha, body: { name: 'ООО «Вторая»', inn: '7707083893' },
+    });
+    const two = await call('GET', '/api/orgs', { user: masha });
+    ok(two.json.orgs.length === 2, 'организаций стало две', two.json.orgs.length);
+    ok((two.json.orgs.find((o) => o.id === firstId) || {}).name === firstName,
+      'и первая не перезаписана второй', JSON.stringify(two.json.orgs.map((o) => o.name)));
+
+    // Переключение туда и обратно.
+    const back = await call('POST', '/api/org/use', { user: masha, body: { id: firstId } });
+    ok(back.status === 200 && back.json.active === firstId,
+      'переключились обратно на первую', JSON.stringify(back.json));
+    const st = await call('GET', '/api/state', { user: masha });
+    ok(st.json.org && st.json.org.id === firstId,
+      'и главный экран показывает её реквизиты', st.json.org && st.json.org.name);
+
+    // Чужую не подсунуть.
+    const alien = await call('POST', '/api/org/use', { user: petya, body: { id: firstId } });
+    ok(alien.status === 400, 'на чужую организацию переключиться нельзя', alien.status);
+  }
+
   /*
    * Числовые реквизиты режутся по цифрам, а не по знакам.
    *

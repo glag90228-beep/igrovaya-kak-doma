@@ -2138,6 +2138,51 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const single = bdbO.listCps(fxUserId());
     ok(single.every((c) => c.mine), 'при одной организации чужих не бывает — метки не видно',
       single.filter((c) => !c.mine).length);
+
+    /*
+     * Переключатель: выбор запоминается и переживает перезапуск.
+     *
+     * Хранится он у человека, а не в состоянии экрана: иначе тот, кто ведёт
+     * две фирмы, каждое утро начинал бы с чужой и замечал это уже по
+     * выписанному документу.
+     */
+    ok(bdbO.currentOrgId(uO.id) === orgA, 'по умолчанию работаем от первой фирмы');
+    ok(bdbO.setActiveOrg(uO.id, orgB), 'переключение принято');
+    ok(bdbO.currentOrgId(uO.id) === orgB, 'и запомнилось', bdbO.currentOrgId(uO.id));
+    ok(bdbO.currentOrg(uO.id).name === 'ООО «Вторая»',
+      'currentOrg отдаёт именно её', bdbO.currentOrg(uO.id).name);
+
+    // Чужую организацию не подсунуть: id приходит из кнопки, а кнопку видно.
+    const alien = bdbO.getOrCreateUser(779081, 'Чужой');
+    bdbO.saveMyOrg(alien.id, { name: 'ООО «Чужая»', inn: '7701234567' });
+    const alienOrg = bdbO.getDefaultOrg(alien.id).id;
+    ok(!bdbO.setActiveOrg(uO.id, alienOrg), 'на чужую организацию переключиться нельзя');
+    ok(bdbO.currentOrgId(uO.id) === orgB, 'и текущая от этого не сменилась');
+
+    /*
+     * Правка реквизитов НЕ удаляет остальные организации.
+     *
+     * В saveMyOrg стояло «обновить умолчание и удалить все прочие» — наследие
+     * старой беды, когда каждая правка заводила ещё одну организацию. С двумя
+     * фирмами это стало прямой потерей: зашёл поправить реквизиты — и второй
+     * фирмы больше нет, а её документы ссылаются на несуществующую строку.
+     */
+    const before = bdbO.listOrgs(uO.id).length;
+    bdbO.saveMyOrg(uO.id, { name: 'ООО «Вторая»', inn: '7707083893', address: 'Ижевск' });
+    const after = bdbO.listOrgs(uO.id);
+    ok(after.length === before, 'правка реквизитов не убила соседнюю организацию',
+      `${before} → ${after.length}`);
+    ok(after.some((o) => o.id === orgA), 'первая фирма на месте');
+    ok((after.find((o) => o.id === orgB) || {}).address === 'Ижевск',
+      'а правка легла именно в текущую');
+
+    // Указатель на удалённую организацию не роняет экран, а тихо возвращает
+    // к умолчанию: иначе человек упёрся бы в ошибку на ровном месте.
+    bdbO.setActiveOrg(uO.id, orgB);
+    require('./db').db.prepare('DELETE FROM orgs WHERE id = ?').run(orgB);
+    ok(bdbO.currentOrgId(uO.id) === orgA,
+      'выбор удалённой фирмы возвращается к умолчанию, а не ломается',
+      bdbO.currentOrgId(uO.id));
   }
 
   console.log('\n── номера документов не задваиваются ──');
