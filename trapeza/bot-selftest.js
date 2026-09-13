@@ -2229,6 +2229,74 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(shown(orgA) === 15000 && shown(orgB) === 0,
       'карточка покажет разное начальное сальдо разным фирмам',
       `${shown(orgA)} и ${shown(orgB)}`);
+
+    /*
+     * Сводная проверка блока: две фирмы не смешиваются нигде.
+     *
+     * Проходим путь целиком на чистом человеке — завести две фирмы, выписать
+     * от каждой, посмотреть журнал, отчёт и долги. Проверки выше ловят каждую
+     * часть по отдельности; эта ловит то, что между ними: место, где одна
+     * правильная функция зовётся с чужой организацией.
+     */
+    const uS = bdbO.getOrCreateUser(779090, 'Сводный');
+    bdbO.saveMyOrg(uS.id, { name: 'ООО «Альфа»', inn: '7701234567' });
+    const sA = bdbO.getDefaultOrg(uS.id).id;
+    const sB = bdbO.createOrg(uS.id, { name: 'ООО «Бета»', inn: '7707083893' });
+    const cpS = bdbO.createCp(uS.id, { name: 'ООО «Покупатель»', kind: 'customer', opening_date: '2026-01-01' });
+
+    const issueFrom = async (orgId, price) => {
+      bdbO.setActiveOrg(uS.id, orgId);
+      return dsO.issueDocument(uS.id, {
+        type: 'sch', cpId: cpS, date: '2026-09-20',
+        items: [{ name: 'Работа', qty: 1, price }], skipQuota: true,
+      });
+    };
+    const d1 = await issueFrom(sA, 10000);
+    const d2 = await issueFrom(sB, 20000);
+    const d3 = await issueFrom(sA, 30000);
+
+    // 1. Номера: у каждой фирмы свой ряд с единицы.
+    ok(d1.doc.number === '1' && d2.doc.number === '1' && d3.doc.number === '2',
+      'номера идут своим рядом у каждой фирмы',
+      `Альфа: ${d1.doc.number}, ${d3.doc.number} | Бета: ${d2.doc.number}`);
+
+    // 2. Журнал: видно только свои документы.
+    bdbO.setActiveOrg(uS.id, sA);
+    const jA = bdbO.listDocs(uS.id, 50);
+    bdbO.setActiveOrg(uS.id, sB);
+    const jB = bdbO.listDocs(uS.id, 50);
+    ok(jA.length === 2 && jB.length === 1,
+      'в журнале у каждой фирмы только её документы', `${jA.length} и ${jB.length}`);
+
+    // 3. Отчёт за период: то же самое.
+    bdbO.setActiveOrg(uS.id, sA);
+    const rA = bdbO.docsBetween(uS.id, '2026-09-01', '2026-09-30');
+    bdbO.setActiveOrg(uS.id, sB);
+    const rB = bdbO.docsBetween(uS.id, '2026-09-01', '2026-09-30');
+    ok(rA.length === 2 && rB.length === 1,
+      'реестр собирается по одной фирме, а не по обеим сразу', `${rA.length} и ${rB.length}`);
+    ok(rA.reduce((x, d) => x + d.total, 0) === 40000
+      && rB.reduce((x, d) => x + d.total, 0) === 20000,
+      'и суммы в отчётах не сложились в одну',
+      `${rA.reduce((x, d) => x + d.total, 0)} и ${rB.reduce((x, d) => x + d.total, 0)}`);
+
+    /*
+     * 4. Долги. Ставим обеим фирмам основание «долг по счёту» — тогда
+     * выписанные счета создают проводки, и есть что складывать. С основанием
+     * по умолчанию («по акту») счета долга не создают вовсе, и проверка
+     * получилась бы пустой: два нуля совпадают и при полностью сломанном
+     * разделении.
+     */
+    bdbO.updateOrg(uS.id, sA, { debt_basis: 'invoice' });
+    bdbO.updateOrg(uS.id, sB, { debt_basis: 'invoice' });
+    bdbO.rebuildDebt(uS.id);
+    const balA = r2o(bdbO.balanceOf(uS.id, cpS, sA).closing);
+    const balB = r2o(bdbO.balanceOf(uS.id, cpS, sB).closing);
+    ok(balA === 40000, 'Альфе должны ровно её 10 000 и 30 000', balA);
+    ok(balB === 20000, 'Бете — ровно её 20 000', balB);
+    ok(balA !== 60000 && balB !== 60000,
+      'и ни одна не видит общие 60 000 — а увидела бы, будь журнал общим',
+      `${balA} и ${balB}`);
   }
 
   console.log('\n── номера документов не задваиваются ──');

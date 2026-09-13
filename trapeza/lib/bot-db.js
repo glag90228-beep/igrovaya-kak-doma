@@ -1336,12 +1336,22 @@ function unmarkPaid(userId, docId) {
 }
 
 /** Документы за период — для реестра. Имя контрагента подставляем сразу. */
-function docsBetween(userId, from, to, cpId = null) {
+/**
+ * Документы за период — ОДНОЙ организации.
+ *
+ * Реестр и книга продаж, собранные сразу по двум юрлицам, негодны для того,
+ * ради чего их и собирают: сверки с декларацией. У каждой фирмы своя
+ * декларация, свой ряд номеров и свой НДС, а в одном файле это превращается
+ * в кашу, которую бухгалтер разберёт только вручную — если вообще заметит,
+ * что там две фирмы.
+ */
+function docsBetween(userId, from, to, cpId = null, orgId = null) {
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
   const rows = cpId
-    ? db.prepare(`SELECT * FROM documents WHERE user_id = ? AND date >= ? AND date <= ?
-                    AND cp_id = ? ORDER BY date, id`).all(userId, from, to, cpId)
-    : db.prepare(`SELECT * FROM documents WHERE user_id = ? AND date >= ? AND date <= ?
-                    ORDER BY date, id`).all(userId, from, to);
+    ? db.prepare(`SELECT * FROM documents WHERE user_id = ? AND org_id = ? AND date >= ? AND date <= ?
+                    AND cp_id = ? ORDER BY date, id`).all(userId, org, from, to, cpId)
+    : db.prepare(`SELECT * FROM documents WHERE user_id = ? AND org_id = ? AND date >= ? AND date <= ?
+                    ORDER BY date, id`).all(userId, org, from, to);
   const names = new Map();
   return rows.map(withPayload).map((d) => {
     if (d.cp_id && !names.has(d.cp_id)) {
@@ -2003,13 +2013,21 @@ function saveDoc(userId, { orgId, cpId, type, number, seq, date, total, payload 
   return Number(info.lastInsertRowid);
 }
 
-function listDocs(userId, limit = 10, cpId = null) {
+/**
+ * Журнал документов — текущей организации.
+ *
+ * Список из двух фирм вперемешку читается как ошибка нумерации: подряд идут
+ * «Счёт № 4» и «Счёт № 4», и понять, что это разные юрлица, по строке
+ * невозможно. Пока фирма одна, отбор ничего не меняет.
+ */
+function listDocs(userId, limit = 10, cpId = null, orgId = null) {
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
   const sql = cpId
-    ? 'SELECT * FROM documents WHERE user_id = ? AND cp_id = ? ORDER BY id DESC LIMIT ?'
-    : 'SELECT * FROM documents WHERE user_id = ? ORDER BY id DESC LIMIT ?';
+    ? 'SELECT * FROM documents WHERE user_id = ? AND org_id = ? AND cp_id = ? ORDER BY id DESC LIMIT ?'
+    : 'SELECT * FROM documents WHERE user_id = ? AND org_id = ? ORDER BY id DESC LIMIT ?';
   const rows = cpId
-    ? db.prepare(sql).all(userId, cpId, limit)
-    : db.prepare(sql).all(userId, limit);
+    ? db.prepare(sql).all(userId, org, cpId, limit)
+    : db.prepare(sql).all(userId, org, limit);
   return rows.map(withPayload);
 }
 
