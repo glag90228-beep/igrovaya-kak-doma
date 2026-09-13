@@ -126,6 +126,30 @@ function migrate() {
       created_at TEXT    NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_rec_user ON recurring(user_id, active);
+
+    -- Переписка с ассистентом: что человек сказал и что ассистент ответил.
+    --
+    -- Нужна для двух вещей. Первая видна человеку: приложение открывает чат
+    -- с историей, а не с чистого листа, — иначе непонятно, слышал ли тебя
+    -- бот вчера. Вторая — для владельца: по этим строкам видно, какие фразы
+    -- ассистент не понял, и есть на чём его улучшать.
+    --
+    -- intent храним целиком в JSON, а не разложенным по колонкам: разбор
+    -- меняется чаще, чем схема, и добавленное в нём поле не должно требовать
+    -- миграции.
+    CREATE TABLE IF NOT EXISTS ai_messages (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id       INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+      source        TEXT    NOT NULL DEFAULT '',   -- bot | miniapp
+      role          TEXT    NOT NULL DEFAULT '',   -- user | assistant
+      type          TEXT    NOT NULL DEFAULT 'text', -- text | voice
+      text          TEXT    NOT NULL DEFAULT '',
+      intent        TEXT    NOT NULL DEFAULT '',   -- JSON разбора, как есть
+      action        TEXT    NOT NULL DEFAULT '',
+      audio_seconds REAL    NOT NULL DEFAULT 0,
+      created_at    TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ai_user ON ai_messages(user_id, id);
   `);
 
   /*
@@ -264,6 +288,110 @@ function isAiEnabled(userId) {
 function setAiEnabled(userId, enabled) {
   db.prepare('UPDATE bot_users SET ai_enabled = ? WHERE id = ?').run(enabled ? 1 : 0, userId);
   return Boolean(enabled);
+}
+
+/**
+ * Записать реплику диалога с ассистентом.
+ *
+ * Зовут её из семи мест бота и приложения, и ни одно из них не проверяет
+ * результат: запись переписки — дело служебное, и ронять из-за неё ответ
+ * человеку нельзя. Отсюда try/catch: диалог важнее журнала диалога.
+ *
+ * Ошибку глотаем не молча, а в консоль. Тихо потерянная история — это
+ * пустой чат в приложении и «ассистент меня не помнит» в поддержке, и
+ * искать причину тогда неоткуда.
+ *
+ * @param {object} m
+ * @param {number} m.userId
+ * @param {string} m.source 'bot' | 'miniapp'
+ * @param {string} m.role   'user' | 'assistant'
+ * @param {string} m.type   'text' | 'voice'
+ * @param {string} m.text
+ * @param {object} [m.intent] разбор целиком — ляжет в JSON
+ * @param {string} [m.action]
+ * @param {number} [m.audioSeconds]
+ */
+function saveAiMessage({
+  userId, source = '', role = '', type = 'text', text = '',
+  intent = null, action = '', audioSeconds = 0,
+} = {}) {
+  const uid = Number(userId) || 0;
+  if (!uid) return 0;
+  let intentJson = '';
+  try {
+    intentJson = intent ? JSON.stringify(intent).slice(0, 4000) : '';
+  } catch (_) {
+    // Разбор мог прийти с циклической ссылкой — тогда просто без него.
+    intentJson = '';
+  }
+  try {
+    const info = db.prepare(`
+      INSERT INTO ai_messages(user_id, source, role, type, text, intent, action, audio_seconds, created_at)
+      VALUES(?,?,?,?,?,?,?,?,?)`).run(
+      uid,
+      String(source || '').slice(0, 20),
+      String(role || '').slice(0, 20),
+      String(type || 'text').slice(0, 20),
+      String(text == null ? '' : text).slice(0, 4000),
+      intentJson,
+      String(action || '').slice(0, 40),
+      Number.isFinite(Number(audioSeconds)) ? Math.max(0, Number(audioSeconds)) : 0,
+      new Date().toISOString(),
+    );
+    return Number(info.lastInsertRowid);
+  } catch (e) {
+    console.error('saveAiMessage:', e.message);
+    return 0;
+  }
+}
+
+/**
+ * История диалога — старые сверху, как её рисует приложение.
+ *
+ * Берём последние `limit` записей и разворачиваем: если читать сразу по
+ * возрастанию, при длинной переписке в чат попадёт её начало, а не конец,
+ * и человек увидит позапрошлый месяц вместо вчерашнего разговора.
+ */
+function listAiMessages(userId, limit = 50) {
+  const n = Math.min(Math.max(Number(limit) || 50, 1), 500);
+  const rows = db.prepare(
+    'SELECT * FROM ai_messages WHERE user_id = ? ORDER BY id DESC LIMIT ?',
+  ).all(userId, n);
+  return rows.reverse().map((r) => ({
+    id: r.id,
+    source: r.source,
+    role: r.role,
+    type: r.type,
+    text: r.text,
+    action: r.action,
+    audioSeconds: r.audio_seconds,
+    createdAt: r.created_at,
+  }));
+}
+
+/**
+ * Выгрузка для разбора: какие фразы ассистент понял, а какие нет.
+ *
+ * Без user_id и без чьих-либо имён: смотреть тут надо на формулировки, а не
+ * на то, кто их написал. Отдаём только реплики человека — ответы ассистента
+ * в обучении бесполезны, он их сам и породил.
+ */
+function getAiDataset({ limit = 1000, type = null } = {}) {
+  const n = Math.min(Math.max(Number(limit) || 1000, 1), 5000);
+  const rows = type
+    ? db.prepare(
+      "SELECT text, intent, action, type, created_at FROM ai_messages"
+      + " WHERE role = 'user' AND type = ? ORDER BY id DESC LIMIT ?",
+    ).all(String(type), n)
+    : db.prepare(
+      "SELECT text, intent, action, type, created_at FROM ai_messages"
+      + " WHERE role = 'user' ORDER BY id DESC LIMIT ?",
+    ).all(n);
+  return rows.map((r) => {
+    let intent = null;
+    try { intent = r.intent ? JSON.parse(r.intent) : null; } catch (_) { intent = null; }
+    return { text: r.text, type: r.type, action: r.action, intent, createdAt: r.created_at };
+  });
 }
 
 /**
@@ -1641,6 +1769,7 @@ function quota(userId) {
 module.exports = {
   migrate,
   getOrCreateUser, setState, getState, clearState, isAiEnabled, setAiEnabled, setSource,
+  saveAiMessage, listAiMessages, getAiDataset,
   createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp, openAdvances, updateDocPayload,
   addOp, listOps, deleteLastOp, deleteOp, balanceOf, debtors, debtBreakdown, periodBalance, cpForPeriod,
