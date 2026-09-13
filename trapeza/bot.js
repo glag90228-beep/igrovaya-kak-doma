@@ -869,8 +869,18 @@ async function showPreview(tg, chatId, user, state) {
       ? `, НДС ${extra.vatRate == null ? 'не облагается' : `${extra.vatRate}%`}`
       + `${extra.vatRate == null ? '' : (extra.priceIncludesVat ? ', цены с НДС' : ', НДС сверху')}` : ''}`
     : '';
+  /*
+   * От какой фирмы выписываем — пишем прямо в сводке, но только когда их
+   * несколько. Ошибиться организацией здесь дороже всего: документ уйдёт
+   * клиенту с чужими реквизитами и чужим номером, а заметят это уже у него.
+   * При одной фирме строка была бы лишним шумом в каждом предпросмотре.
+   */
+  const myOrgs = bdb.listOrgs(user.id);
+  const from = myOrgs.length > 1
+    ? `От: <b>${esc((bdb.currentOrg(user.id) || {}).name || '—')}</b>\n` : '';
   await tg.sendMessage(chatId,
-    `Проверьте документ: <b>${esc(ITEM_DOCS[type].title)} № ${esc(d.number)}</b> от ${ru(d.date)}${head}\n\n`
+    `Проверьте документ: <b>${esc(ITEM_DOCS[type].title)} № ${esc(d.number)}</b> от ${ru(d.date)}${head}\n`
+    + from + '\n'
     + (lines.join('\n') || '— пусто —')
     + (sums.vat == null
       ? `\n\nИтого: <b>${formatRub(total)}</b> (без НДС)`

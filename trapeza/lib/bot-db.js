@@ -1142,10 +1142,27 @@ function addOpForDoc(userId, cpId, op, docId) {
  * его решение — не то же самое, что «мы ещё не создали».
  */
 function rebuildDebt(userId) {
-  const org = currentOrg(userId);
-  const types = DEBT_DOCS[basisOf(org || {})];
+  /*
+   * Основание долга — у каждой организации своё.
+   *
+   * Здесь брали основание текущей фирмы и применяли ко всем документам
+   * человека. Пока фирма одна, это то же самое; с двумя — нет. У подрядчика
+   * долг возникает по акту, у арендодателя по счёту, и человек, ведущий обе,
+   * получил бы пересчёт, который для половины документов заводит проводки не
+   * по тому правилу: у одной фирмы долг задвоится, у другой исчезнет.
+   *
+   * Поэтому правило берём у организации самого документа.
+   */
+  const basisCache = new Map();
+  const typesFor = (orgId) => {
+    if (!basisCache.has(orgId)) {
+      const o = orgId ? db.prepare('SELECT * FROM orgs WHERE id = ?').get(orgId) : null;
+      basisCache.set(orgId, DEBT_DOCS[basisOf(o || currentOrg(userId) || {})]);
+    }
+    return basisCache.get(orgId);
+  };
   const docs = db.prepare(
-    'SELECT id, cp_id, type, date, total, number, paid_at, paid_sum, no_debt FROM documents WHERE user_id = ? AND total > 0',
+    'SELECT id, cp_id, org_id, type, date, total, number, paid_at, paid_sum, no_debt FROM documents WHERE user_id = ? AND total > 0',
   ).all(userId);
 
   let added = 0;
@@ -1162,7 +1179,7 @@ function rebuildDebt(userId) {
     for (const d of docs) {
       if (!d.cp_id) continue;
       const title = DOC_TITLES[d.type] || d.type;
-      const should = types.includes(d.type) && !d.no_debt;
+      const should = typesFor(d.org_id).includes(d.type) && !d.no_debt;
 
       if (should && !hasOp(d.id, 'Реализация')) {
         if (addOpForDoc(userId, d.cp_id, {

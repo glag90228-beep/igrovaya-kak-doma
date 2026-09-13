@@ -2183,6 +2183,52 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(bdbO.currentOrgId(uO.id) === orgA,
       'выбор удалённой фирмы возвращается к умолчанию, а не ломается',
       bdbO.currentOrgId(uO.id));
+
+    /*
+     * Основание долга — у каждой фирмы своё.
+     *
+     * Пересчёт брал основание текущей организации и применял ко всем
+     * документам человека. У подрядчика долг возникает по акту, у
+     * арендодателя по счёту; ведущий обе фирмы получил бы пересчёт, где у
+     * одной долг задвоился, а у другой исчез.
+     */
+    const uB = bdbO.getOrCreateUser(779082, 'Двабазиса');
+    bdbO.saveMyOrg(uB.id, { name: 'ООО «По акту»', inn: '7701234567' });
+    const bA = bdbO.getDefaultOrg(uB.id).id;
+    bdbO.updateOrg(uB.id, bA, { debt_basis: 'closing' });   // долг с акта
+    const bB = bdbO.createOrg(uB.id, { name: 'ООО «По счёту»', inn: '7707083893' });
+    bdbO.updateOrg(uB.id, bB, { debt_basis: 'invoice' });   // долг со счёта
+    const cpB = bdbO.createCp(uB.id, { name: 'ООО «Клиент»', kind: 'customer', opening_date: '2026-01-01' });
+
+    // Счёт от «По счёту» долг создаёт, счёт от «По акту» — нет.
+    bdbO.setActiveOrg(uB.id, bB);
+    await dsO.issueDocument(uB.id, {
+      type: 'sch', cpId: cpB, items: [{ name: 'Аренда', qty: 1, price: 1000 }], skipQuota: true,
+    });
+    bdbO.setActiveOrg(uB.id, bA);
+    await dsO.issueDocument(uB.id, {
+      type: 'sch', cpId: cpB, items: [{ name: 'Работа', qty: 1, price: 2000 }], skipQuota: true,
+    });
+    bdbO.rebuildDebt(uB.id);
+    const debtInvoice = bdbO.listOps(uB.id, cpB, bB).filter((o) => o.kind === 'Реализация');
+    const debtClosing = bdbO.listOps(uB.id, cpB, bA).filter((o) => o.kind === 'Реализация');
+    ok(debtInvoice.length === 1,
+      'у фирмы «долг по счёту» счёт создал проводку', debtInvoice.length);
+    ok(debtClosing.length === 0,
+      'а у фирмы «долг по акту» тот же счёт проводки не создал — правило её, а не соседкино',
+      debtClosing.length);
+
+    /*
+     * Начальное сальдо в карточке показывается от текущей фирмы.
+     *
+     * Считается оно уже по паре, и если рисовать поле контрагента, экран
+     * разошёлся бы с цифрой долга: карточка показывала бы 15 000, а сальдо
+     * начиналось бы с нуля.
+     */
+    const shown = (orgId) => bdbO.openingFor(cpOpen, orgId).opening_balance;
+    ok(shown(orgA) === 15000 && shown(orgB) === 0,
+      'карточка покажет разное начальное сальдо разным фирмам',
+      `${shown(orgA)} и ${shown(orgB)}`);
   }
 
   console.log('\n── номера документов не задваиваются ──');

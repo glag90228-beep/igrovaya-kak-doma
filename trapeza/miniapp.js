@@ -342,6 +342,13 @@ function stateFor(user) {
     aiEnabled: bdb.isAiEnabled(user.id),
     org: org || null,
     orgReady: Boolean(org && org.name && org.inn && org.acc && org.bik),
+    /*
+     * Сколько у человека фирм. Экранам это нужно ровно для одного: решить,
+     * показывать ли «выписываем от такой-то». При одной организации такая
+     * строка — шум в каждой форме, при двух — защита от самой дорогой
+     * ошибки: документа, ушедшего клиенту от не той фирмы.
+     */
+    orgs: bdb.listOrgs(user.id).map((o) => ({ id: o.id, name: o.name })),
     quota,
     access,
     counts: { cps: bdb.listCps(user.id).length, debtors: debts.length },
@@ -446,8 +453,16 @@ function cpBrief(userId, cp) {
     id: cp.id, name: cp.name, full_name: cp.full_name, inn: cp.inn, kpp: cp.kpp,
     kind: cp.kind, address: cp.address, bank_name: cp.bank_name, bik: cp.bik,
     acc: cp.acc, corr_acc: cp.corr_acc, contract: cp.contract, email: cp.email,
-    opening_balance: round2(Number(cp.opening_balance) || 0),
-    opening_date: cp.opening_date || '',
+    /*
+     * Начальное сальдо показываем ТЕКУЩЕЙ фирмы, а не то, что записано на
+     * карточке. Считается оно уже по паре «организация — клиент», и если
+     * рисовать поле контрагента, экран разошёлся бы с цифрой долга: карточка
+     * показывала бы 15 000, а сальдо начиналось бы с нуля.
+     */
+    ...(() => {
+      const op = bdb.openingFor(cp.id, bdb.currentOrgId(userId));
+      return { opening_balance: round2(op.opening_balance), opening_date: op.opening_date };
+    })(),
     balance: b ? round2(b.closing) : 0,
     /*
      * С какими из моих фирм этот клиент связан. Список общий на аккаунт, и
