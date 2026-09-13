@@ -230,6 +230,38 @@ function migrate() {
   // отменяют проводку и не создают её дважды.
   addColumn('documents', 'paid_at', "TEXT NOT NULL DEFAULT ''");
   addColumn('operations', 'doc_id', 'INTEGER NOT NULL DEFAULT 0');
+  /*
+   * Чья это операция — расчёты ведутся между МОЕЙ фирмой и клиентом.
+   *
+   * Контрагенты у нас общие на аккаунт (решение владельца: один список, с
+   * пометкой, кто с кем работал), а вот деньги общими быть не могут. Зачесть
+   * долг клиента перед ООО «А» его оплатой в ООО «Б» нельзя: это разные
+   * юрлица, и в акте сверки каждое показывает только своё. Без этой колонки
+   * два бизнеса на одном аккаунте видели бы одно перемешанное сальдо.
+   */
+  addColumn('operations', 'org_id', 'INTEGER NOT NULL DEFAULT 0');
+
+  /*
+   * Начальное сальдо принадлежит ПАРЕ «организация — клиент», а не клиенту.
+   *
+   * Оно лежало на контрагенте, и при общих контрагентах это ломается тише
+   * всего остального: клиент, который на начало работы был должен 15 000,
+   * показал бы эти 15 000 обеим фирмам сразу — то есть долг задвоился бы, а
+   * человек увидел бы правдоподобную сумму и ничего не заподозрил.
+   *
+   * Поле на контрагенте остаётся: по нему рисуется карточка, и переучивать
+   * три десятка мест показа ради одной суммы ни к чему. Считаются же деньги
+   * отсюда, и это главное — сальдо и акт сверки берут пару.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cp_openings (
+      org_id          INTEGER NOT NULL,
+      cp_id           INTEGER NOT NULL,
+      opening_balance REAL    NOT NULL DEFAULT 0,
+      opening_date    TEXT    NOT NULL DEFAULT '',
+      PRIMARY KEY (org_id, cp_id)
+    );
+  `);
   // Человек отменил проводку долга по этому документу руками. Без такой
   // отметки пересчёт основания создавал её заново: он видит, что проводки
   // нет, и считает это упущением, — а это было решение человека.
@@ -454,6 +486,26 @@ function setDefaultOrg(userId, id) {
 }
 
 /**
+ * От лица какой организации человек сейчас работает.
+ *
+ * Единственное место, которое это решает, — и в том весь смысл. Журнал
+ * операций спрашивает организацию у него, а не принимает её аргументом:
+ * balanceOf зовётся из 122 мест, и протаскивать туда ещё один числовой
+ * параметр рядом с userId значило бы однажды перепутать их местами. Оба
+ * целые, оба маленькие, ошибка вышла бы молча и с неверным сальдо.
+ *
+ * Пока организация у всех одна, это просто «та, что по умолчанию». Когда
+ * появится переключатель, менять придётся ровно эту функцию — остальные
+ * 122 места поедут за ней сами.
+ *
+ * @returns {number} id организации; 0 — организаций нет вовсе
+ */
+function currentOrgId(userId) {
+  const org = getDefaultOrg(userId);
+  return org ? org.id : 0;
+}
+
+/**
  * «Ввести заново» должно ЗАМЕНЯТЬ мою организацию, а не плодить новые.
  * Раньше каждая правка создавала ещё одну организацию, а бот продолжал
  * брать самую первую — поэтому изменения будто не применялись. Теперь
@@ -569,7 +621,11 @@ function createCp(userId, fields) {
   const info = db.prepare(`
     INSERT INTO counterparties(user_id, ${cols.join(',')})
     VALUES(?, ${cols.map(() => '?').join(',')})`).run(userId, ...vals);
-  return Number(info.lastInsertRowid);
+  const id = Number(info.lastInsertRowid);
+  // Начальное сальдо принадлежит паре: заводим его той организации, от лица
+  // которой клиента и завели. Соседней фирме чужая история не достанется.
+  setOpeningFor(id, currentOrgId(userId), Number(fields.opening_balance) || 0, fields.opening_date || '');
+  return id;
 }
 function updateCp(userId, id, fields) {
   const allowed = ['name', 'full_name', 'inn', 'kpp', 'extra', 'kind', 'contract',
@@ -580,6 +636,20 @@ function updateCp(userId, id, fields) {
   if (!sets.length) return;
   vals.push(id, userId);
   db.prepare(`UPDATE counterparties SET ${sets.join(', ')} WHERE id = ? AND user_id = ?`).run(...vals);
+  /*
+   * Правку начального сальдо дублируем в пару — считается оно оттуда.
+   * Поле на карточке при этом остаётся: по нему рисуется экран, и держать
+   * их в согласии дешевле, чем переучивать три десятка мест показа.
+   */
+  if ('opening_balance' in fields || 'opening_date' in fields) {
+    const org = currentOrgId(userId);
+    const was = openingFor(id, org);
+    setOpeningFor(
+      id, org,
+      'opening_balance' in fields ? Number(fields.opening_balance) || 0 : was.opening_balance,
+      'opening_date' in fields ? (fields.opening_date || '') : was.opening_date,
+    );
+  }
 }
 function listCps(userId) {
   return db.prepare('SELECT * FROM counterparties WHERE user_id = ? ORDER BY id').all(userId);
@@ -591,25 +661,42 @@ function getCp(userId, id) {
 // ---------- операции контрагента (с проверкой владельца) ----------
 
 /** @returns {number} id созданной операции — нужен импорту выписки. */
-function addOp(userId, cpId, op) {
+/*
+ * Журнал ведётся парой «организация — контрагент», а не одним контрагентом.
+ *
+ * Организацию не принимаем аргументом, а спрашиваем у currentOrgId: так
+ * ни одно из полусотни мест вызова не сможет перепутать её с userId. Кому
+ * нужна не текущая, а названная — передаёт orgId последним параметром;
+ * так делают отчёты, где организация уже под рукой.
+ */
+function addOp(userId, cpId, op, orgId = null) {
   const cp = getCp(userId, cpId);
   if (!cp) throw new Error('Контрагент не найден');
-  const sort = db.prepare('SELECT COALESCE(MAX(sort),-1)+1 AS s FROM operations WHERE cp_id = ?').get(cpId).s;
-  const info = db.prepare(`INSERT INTO operations(cp_id, date, kind, doc, debit, credit, note, sort)
-              VALUES(?,?,?,?,?,?,?,?)`)
-    .run(cpId, op.date, op.kind || '', op.doc || '', Number(op.debit) || 0, Number(op.credit) || 0,
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const sort = db.prepare(
+    'SELECT COALESCE(MAX(sort),-1)+1 AS s FROM operations WHERE cp_id = ? AND org_id = ?',
+  ).get(cpId, org).s;
+  const info = db.prepare(`INSERT INTO operations(cp_id, org_id, date, kind, doc, debit, credit, note, sort)
+              VALUES(?,?,?,?,?,?,?,?,?)`)
+    .run(cpId, org, op.date, op.kind || '', op.doc || '', Number(op.debit) || 0, Number(op.credit) || 0,
       op.note || '', sort);
   return Number(info.lastInsertRowid);
 }
-function listOps(userId, cpId) {
+function listOps(userId, cpId, orgId = null) {
   const cp = getCp(userId, cpId);
   if (!cp) return [];
-  return db.prepare('SELECT * FROM operations WHERE cp_id = ? ORDER BY date, sort, id').all(cpId);
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  return db.prepare(
+    'SELECT * FROM operations WHERE cp_id = ? AND org_id = ? ORDER BY date, sort, id',
+  ).all(cpId, org);
 }
-function deleteLastOp(userId, cpId) {
+function deleteLastOp(userId, cpId, orgId = null) {
   const cp = getCp(userId, cpId);
   if (!cp) return false;
-  const row = db.prepare('SELECT id FROM operations WHERE cp_id = ? ORDER BY date DESC, sort DESC, id DESC LIMIT 1').get(cpId);
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const row = db.prepare(
+    'SELECT id FROM operations WHERE cp_id = ? AND org_id = ? ORDER BY date DESC, sort DESC, id DESC LIMIT 1',
+  ).get(cpId, org);
   return row ? deleteOp(userId, row.id) : false;
 }
 
@@ -676,10 +763,13 @@ function deleteOp(userId, opId) {
  * @param {string} from ISO-дата начала (включительно)
  * @param {string} to ISO-дата конца (включительно)
  */
-function periodBalance(userId, cpId, from, to) {
-  const cp = getCp(userId, cpId);
-  if (!cp) return null;
-  const all = listOps(userId, cpId);
+function periodBalance(userId, cpId, from, to, orgId = null) {
+  const cp0 = getCp(userId, cpId);
+  if (!cp0) return null;
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const all = listOps(userId, cpId, org);
+  // Начальное сальдо — пары, по тем же соображениям, что и в balanceOf.
+  const cp = { ...cp0, ...openingFor(cpId, org) };
 
   let opening = Number(cp.opening_balance) || 0;
   const inside = [];
@@ -898,10 +988,19 @@ function addOpForDoc(userId, cpId, op, docId) {
     'SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = ?',
   ).get(docId, op.kind).n;
   if (exists) return false;                    // повторный вызов ничего не портит
-  const sort = db.prepare('SELECT COALESCE(MAX(sort),-1)+1 AS s FROM operations WHERE cp_id = ?').get(cpId).s;
-  db.prepare(`INSERT INTO operations(cp_id, date, kind, doc, debit, credit, note, sort, doc_id)
-              VALUES(?,?,?,?,?,?,?,?,?)`)
-    .run(cpId, op.date, op.kind || '', op.doc || '', Number(op.debit) || 0,
+  /*
+   * Организацию берём с самого документа, а не текущую. Проводка рождена
+   * документом и принадлежит той же фирме, что выписала его, — даже если
+   * человек к этому моменту переключился на другую.
+   */
+  const src = db.prepare('SELECT org_id FROM documents WHERE id = ?').get(docId);
+  const org = (src && Number(src.org_id)) || currentOrgId(userId);
+  const sort = db.prepare(
+    'SELECT COALESCE(MAX(sort),-1)+1 AS s FROM operations WHERE cp_id = ? AND org_id = ?',
+  ).get(cpId, org).s;
+  db.prepare(`INSERT INTO operations(cp_id, org_id, date, kind, doc, debit, credit, note, sort, doc_id)
+              VALUES(?,?,?,?,?,?,?,?,?,?)`)
+    .run(cpId, org, op.date, op.kind || '', op.doc || '', Number(op.debit) || 0,
       Number(op.credit) || 0, op.note || '', sort, docId);
   return true;
 }
@@ -1415,11 +1514,18 @@ function closeDocsFromBank(userId, deals) {
 }
 
 /** Сальдо по контрагенту (переиспользует computeBalance из db.js) */
-function balanceOf(userId, cpId) {
+function balanceOf(userId, cpId, orgId = null) {
   const cp = getCp(userId, cpId);
   if (!cp) return null;
-  const ops = listOps(userId, cpId);
-  return { cp, ops, ...computeBalance(cp, ops) };
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const ops = listOps(userId, cpId, org);
+  /*
+   * Начальное сальдо берём у ПАРЫ, а не с карточки контрагента. Иначе долг,
+   * с которым клиент пришёл к первой фирме, посчитался бы и второй тоже.
+   */
+  const open = openingFor(cpId, org);
+  const view = { ...cp, ...open };
+  return { cp: view, ops, ...computeBalance(view, ops) };
 }
 
 // ---------- заблокировавшие бота ----------
@@ -1648,6 +1754,90 @@ function guardSeq() {
 guardSeq();
 
 /**
+ * Расставить организацию у операций, заведённых до появления колонки.
+ *
+ * Порядок важен. Проводка, рождённая документом, принадлежит той же фирме,
+ * что и документ, — это знание точное, берём его. Внесённой руками операции
+ * документа нет, и остаётся одно разумное предположение: фирма по умолчанию
+ * у владельца контрагента. Пока организация у всех одна, предположение
+ * верное; когда их станет несколько, все старые операции уже будут
+ * размечены, и гадать не придётся ни разу.
+ *
+ * Делаем один раз: на строках с org_id = 0. Повторный запуск ничего не
+ * трогает, поэтому вызов при каждой загрузке безопасен.
+ */
+function fillOpOrgs() {
+  try {
+    // 1. Из документа — там организация известна наверняка.
+    db.exec(`
+      UPDATE operations SET org_id = (
+        SELECT d.org_id FROM documents d WHERE d.id = operations.doc_id
+      )
+      WHERE org_id = 0 AND doc_id <> 0
+        AND EXISTS (SELECT 1 FROM documents d WHERE d.id = operations.doc_id AND d.org_id <> 0)
+    `);
+    // 2. Остальным — организация по умолчанию у хозяина контрагента.
+    db.exec(`
+      UPDATE operations SET org_id = COALESCE((
+        SELECT o.id FROM orgs o
+          JOIN counterparties c ON c.user_id = o.user_id
+         WHERE c.id = operations.cp_id
+         ORDER BY o.is_default DESC, o.id LIMIT 1
+      ), 0)
+      WHERE org_id = 0
+    `);
+  } catch (_) { /* колонки может не быть в очень старой базе — не повод падать */ }
+
+  /*
+   * Начальные сальдо переносим в пары — по одному разу на контрагента, для
+   * той организации, от лица которой он и заводился. Сегодня она у человека
+   * одна, так что перенос однозначен; заводить второй паре чужое начальное
+   * сальдо нельзя, иначе долг задвоится ровно тем способом, от которого мы
+   * и уходим.
+   */
+  try {
+    db.exec(`
+      INSERT OR IGNORE INTO cp_openings(org_id, cp_id, opening_balance, opening_date)
+      SELECT o.id, c.id, c.opening_balance, c.opening_date
+        FROM counterparties c
+        JOIN orgs o ON o.user_id = c.user_id
+       WHERE o.id = (SELECT id FROM orgs WHERE user_id = c.user_id
+                      ORDER BY is_default DESC, id LIMIT 1)
+    `);
+  } catch (_) { /* таблицы может не быть — не повод падать при загрузке */ }
+}
+fillOpOrgs();
+
+/**
+ * Начальное сальдо пары «организация — клиент».
+ *
+ * Пары нет — значит эта фирма с этим клиентом начала с нуля, и это верный
+ * ответ, а не пропуск. Подставлять сюда сальдо с карточки было бы той самой
+ * ошибкой: второй организации досталась бы история первой.
+ */
+function openingFor(cpId, orgId) {
+  const row = db.prepare(
+    'SELECT opening_balance, opening_date FROM cp_openings WHERE org_id = ? AND cp_id = ?',
+  ).get(Number(orgId) || 0, Number(cpId) || 0);
+  return {
+    opening_balance: row ? Number(row.opening_balance) || 0 : 0,
+    opening_date: row ? row.opening_date || '' : '',
+  };
+}
+
+/** Записать начальное сальдо пары. Карточку держим в согласии для показа. */
+function setOpeningFor(cpId, orgId, balance, date) {
+  const org = Number(orgId) || 0;
+  db.prepare(`
+    INSERT INTO cp_openings(org_id, cp_id, opening_balance, opening_date)
+    VALUES(?,?,?,?)
+    ON CONFLICT(org_id, cp_id) DO UPDATE SET
+      opening_balance = excluded.opening_balance,
+      opening_date    = excluded.opening_date
+  `).run(org, Number(cpId) || 0, Number(balance) || 0, String(date || ''));
+}
+
+/**
  * Занят ли уже такой номер в этом году у этого вида документа.
  *
  * Уникальный индекс стоит на порядковом номере (seq), а на самом номере —
@@ -1832,7 +2022,7 @@ module.exports = {
   markPaid, unmarkPaid, matchPaymentsToDocs, closeDocsFromBank,
   unpaidDocs, unpaidSummary, dealTotals, docsBetween,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
-  isSeqTaken, guardSeq, numberTakenInOrg,
+  isSeqTaken, guardSeq, numberTakenInOrg, currentOrgId, openingFor, setOpeningFor,
   nextSeqForOrg, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,
   quota, docsThisMonth, freePerMonth,

@@ -2034,6 +2034,84 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'и БИК без слова «БИК» перед ним', spaced && spaced.bik);
   }
 
+  console.log('\n── две организации не смешивают деньги ──');
+  {
+    /*
+     * Контрагенты общие на аккаунт, а деньги — нет.
+     *
+     * Решение владельца: один список клиентов, с пометкой, кто с кем работал.
+     * Но зачесть долг клиента перед ООО «А» его оплатой в ООО «Б» нельзя —
+     * это разные юрлица, и каждое в акте сверки показывает только своё. До
+     * появления org_id у операций два бизнеса на одном аккаунте видели бы
+     * одно перемешанное сальдо, и человек сверял бы с клиентом сумму, которой
+     * нет ни у одной из его фирм.
+     */
+    const bdbO = require('./lib/bot-db');
+    const uO = bdbO.getOrCreateUser(779080, 'Двефирмы');
+    bdbO.saveMyOrg(uO.id, { name: 'ООО «Первая»', inn: '7701234567' });
+    const orgA = bdbO.getDefaultOrg(uO.id).id;
+    const orgB = bdbO.createOrg(uO.id, { name: 'ООО «Вторая»', inn: '7707083893' });
+    const cpO = bdbO.createCp(uO.id, { name: 'ООО «Общий клиент»', kind: 'customer', opening_date: '2026-01-01' });
+
+    // Клиент должен первой фирме 30 000 и заплатил второй 12 000.
+    bdbO.addOp(uO.id, cpO, { date: '2026-09-01', kind: 'Приход', credit: 30000 }, orgA);
+    bdbO.addOp(uO.id, cpO, { date: '2026-09-02', kind: 'Оплата', debit: 12000 }, orgB);
+
+    const inA = bdbO.listOps(uO.id, cpO, orgA);
+    const inB = bdbO.listOps(uO.id, cpO, orgB);
+    ok(inA.length === 1 && Number(inA[0].credit) === 30000,
+      'первая фирма видит только свою отгрузку', `${inA.length} оп.`);
+    ok(inB.length === 1 && Number(inB[0].debit) === 12000,
+      'вторая — только свою оплату', `${inB.length} оп.`);
+
+    /*
+     * Главная проверка блока. Если сложить всё вместе, выйдет 18 000 —
+     * сумма, которой не должен ни один из двух клиентов: первой он должен
+     * тридцать, у второй переплатил двенадцать.
+     */
+    const { round2: r2o } = require('./lib/money');
+    const sumA = r2o(inA.reduce((s, o) => s + (o.credit || 0) - (o.debit || 0), 0));
+    const sumB = r2o(inB.reduce((s, o) => s + (o.credit || 0) - (o.debit || 0), 0));
+    ok(sumA === 30000 && sumB === -12000,
+      'долги считаются раздельно, а не в одну кучу', `${sumA} и ${sumB}`);
+    ok(sumA + sumB === 18000,
+      'а «в одну кучу» дало бы 18 000 — сумму, которой не должен никто');
+
+    // Проводка из документа принадлежит фирме документа, даже если человек
+    // к этому моменту работает от другой.
+    const dsO = require('./lib/doc-service');
+    const docO = await dsO.issueDocument(uO.id, {
+      type: 'usl', cpId: cpO, items: [{ name: 'Работа', qty: 1, price: 5000 }], skipQuota: true,
+    });
+    ok(docO.ok !== false, 'акт от первой фирмы выписан', docO.message);
+    const afterA = bdbO.listOps(uO.id, cpO, orgA);
+    const afterB = bdbO.listOps(uO.id, cpO, orgB);
+    ok(afterA.length === 2 && afterB.length === 1,
+      'проводка по документу легла в журнал его фирмы, а не соседней',
+      `${afterA.length} и ${afterB.length}`);
+
+    /*
+     * Начальное сальдо не задваивается — самая тихая ошибка из всех.
+     *
+     * Оно лежало на контрагенте, а не на паре. Клиент, который на начало
+     * работы был должен 15 000, показал бы эти 15 000 обеим фирмам сразу:
+     * сумма правдоподобная, и человек ничего бы не заподозрил, пока не
+     * сверился бы с клиентом.
+     */
+    const cpOpen = bdbO.createCp(uO.id, {
+      name: 'ООО «С долгом»', kind: 'customer',
+      opening_balance: 15000, opening_date: '2026-01-01',
+    });
+    const openA = bdbO.balanceOf(uO.id, cpOpen, orgA);
+    const openB = bdbO.balanceOf(uO.id, cpOpen, orgB);
+    ok(r2o(openA.closing) === 15000,
+      'начальный долг засчитан фирме, которая клиента завела', openA.closing);
+    ok(r2o(openB.closing) === 0,
+      'а соседней не достался: она с этим клиентом начинает с нуля', openB.closing);
+    ok(r2o(openA.closing + openB.closing) === 15000,
+      'вместе это по-прежнему пятнадцать тысяч, а не тридцать');
+  }
+
   console.log('\n── номера документов не задваиваются ──');
   {
     const dbx = require('./db').db;
