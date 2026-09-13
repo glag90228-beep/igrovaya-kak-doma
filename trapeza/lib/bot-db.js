@@ -651,8 +651,69 @@ function updateCp(userId, id, fields) {
     );
   }
 }
-function listCps(userId) {
-  return db.prepare('SELECT * FROM counterparties WHERE user_id = ? ORDER BY id').all(userId);
+/**
+ * С какими из моих организаций у этого клиента есть история.
+ *
+ * История — это выписанный документ, проводка в журнале или сам факт, что
+ * клиента завели от лица этой фирмы (пара в cp_openings появляется при
+ * заведении). Всё вместе одним запросом, а не тремя: список контрагентов
+ * рисуется на каждом экране, и три похода в базу на каждого клиента — это
+ * заметная задержка там, где человек ждёт списка.
+ */
+const CP_ORGS_SQL = `
+  SELECT cp_id, GROUP_CONCAT(DISTINCT org_id) AS orgs FROM (
+    SELECT cp_id, org_id FROM documents  WHERE user_id = ? AND org_id <> 0
+    UNION
+    SELECT o.cp_id, o.org_id FROM operations o
+      JOIN counterparties c ON c.id = o.cp_id
+     WHERE c.user_id = ? AND o.org_id <> 0
+    UNION
+    SELECT p.cp_id, p.org_id FROM cp_openings p
+      JOIN counterparties c ON c.id = p.cp_id
+     WHERE c.user_id = ? AND p.org_id <> 0
+  ) GROUP BY cp_id`;
+
+function cpOrgsMap(userId) {
+  const out = new Map();
+  for (const r of db.prepare(CP_ORGS_SQL).all(userId, userId, userId)) {
+    out.set(r.cp_id, String(r.orgs || '').split(',').map(Number).filter(Boolean));
+  }
+  return out;
+}
+
+/**
+ * Контрагенты — общие на аккаунт, но с пометкой, кто с кем работал.
+ *
+ * Так решил владелец, и решение разумное: один и тот же клиент часто
+ * обслуживается от обеих фирм, и заводить его дважды — значит развести
+ * реквизиты. Но список без пометки хуже раздельного: выписать документ не от
+ * той организации станет делом одного промаха, а замечают такое уже у
+ * контрагента.
+ *
+ * Поэтому у каждого клиента видно, с какими фирмами он связан, а свои идут
+ * первыми — в выборе по умолчанию человек попадает в них, не задумываясь.
+ *
+ * @param {number} userId
+ * @param {number|null} orgId чьими считать «своих»; по умолчанию — текущая
+ */
+function listCps(userId, orgId = null) {
+  const rows = db.prepare('SELECT * FROM counterparties WHERE user_id = ? ORDER BY id').all(userId);
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const map = cpOrgsMap(userId);
+  const marked = rows.map((cp) => {
+    const orgIds = map.get(cp.id) || [];
+    return { ...cp, orgIds, mine: org ? orgIds.includes(org) : true };
+  });
+  // Свои выше чужих, внутри — прежний порядок по id: он привычен людям.
+  return marked.sort((a, b) => (a.mine === b.mine ? a.id - b.id : (a.mine ? -1 : 1)));
+}
+
+/** С какими организациями связан один клиент — для карточки. */
+function cpOrgs(userId, cpId) {
+  const ids = cpOrgsMap(userId).get(Number(cpId)) || [];
+  if (!ids.length) return [];
+  const all = db.prepare('SELECT id, name FROM orgs WHERE user_id = ?').all(userId);
+  return all.filter((o) => ids.includes(o.id));
 }
 function getCp(userId, id) {
   return db.prepare('SELECT * FROM counterparties WHERE id = ? AND user_id = ?').get(id, userId);
@@ -2022,7 +2083,7 @@ module.exports = {
   markPaid, unmarkPaid, matchPaymentsToDocs, closeDocsFromBank,
   unpaidDocs, unpaidSummary, dealTotals, docsBetween,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
-  isSeqTaken, guardSeq, numberTakenInOrg, currentOrgId, openingFor, setOpeningFor,
+  isSeqTaken, guardSeq, numberTakenInOrg, currentOrgId, openingFor, setOpeningFor, cpOrgs,
   nextSeqForOrg, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, listTemplates, getTemplate, forgetTemplate,
   quota, docsThisMonth, freePerMonth,

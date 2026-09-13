@@ -4022,7 +4022,17 @@ async function showCps(tg, chatId, user) {
     await tg.sendMessage(chatId, 'Контрагентов пока нет.', keyboard([[{ text: '➕ Добавить контрагента', data: 'cp.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
     return;
   }
-  const rows = cps.map((c) => [{ text: `${c.kind === 'supplier' ? '📦' : '🧑‍💼'} ${c.name}`, data: `cp:${c.id}` }]);
+  /*
+   * Клиенты общие на аккаунт, и когда фирм несколько, надо видеть, чей это
+   * клиент: выписать документ не от той организации — дело одного промаха, а
+   * замечают это уже у контрагента. Пока фирма одна, «свои» — вообще все, и
+   * метка была бы шумом: её тогда просто нет.
+   */
+  const multiOrg = cps.some((c) => !c.mine);
+  const rows = cps.map((c) => [{
+    text: `${c.kind === 'supplier' ? '📦' : '🧑‍💼'} ${c.name}${multiOrg && !c.mine ? ' · другая фирма' : ''}`,
+    data: `cp:${c.id}`,
+  }]);
   rows.push([{ text: '➕ Добавить контрагента', data: 'cp.new' }]);
   rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
   await tg.sendMessage(chatId, 'Ваши контрагенты:', keyboard(rows));

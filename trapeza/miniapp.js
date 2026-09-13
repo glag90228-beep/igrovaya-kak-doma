@@ -440,6 +440,8 @@ function wantStamp(body) {
 
 function cpBrief(userId, cp) {
   const b = bdb.balanceOf(userId, cp.id);
+  // Из списка пометка приходит готовой; для одиночной карточки досчитываем.
+  const orgIds = cp.orgIds || bdb.cpOrgs(userId, cp.id).map((o) => o.id);
   return {
     id: cp.id, name: cp.name, full_name: cp.full_name, inn: cp.inn, kpp: cp.kpp,
     kind: cp.kind, address: cp.address, bank_name: cp.bank_name, bik: cp.bik,
@@ -447,6 +449,13 @@ function cpBrief(userId, cp) {
     opening_balance: round2(Number(cp.opening_balance) || 0),
     opening_date: cp.opening_date || '',
     balance: b ? round2(b.closing) : 0,
+    /*
+     * С какими из моих фирм этот клиент связан. Список общий на аккаунт, и
+     * без пометки выписать документ не от той организации — дело одного
+     * промаха, а замечают это уже у контрагента.
+     */
+    orgIds,
+    mine: cp.mine !== undefined ? cp.mine : orgIds.includes(bdb.currentOrgId(userId)),
   };
 }
 
