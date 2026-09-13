@@ -2641,11 +2641,28 @@ screens.ask = async function ask() {
     });
   };
 
-  say('bot', 'Я помогаю с документами и расчётами: счета, акты, УПД, накладные, '
-    + 'договоры и платёжки, кто сколько должен, акт сверки.\n\n'
-    + 'Налоги, взносы, КУДиР, отчётность и зарплату не веду — у меня нет доступа '
-    + 'к вашему банку и кассе, а ошибиться в этом дорого.\n\n'
-    + 'Скажите или напишите, что нужно. Например: «выставь счёт Заре на 30 тысяч за аренду».');
+  try {
+    const hist = await api('GET', '/api/ask/history');
+    if (hist && Array.isArray(hist.messages) && hist.messages.length > 0) {
+      for (const m of hist.messages) {
+        const who = m.role === 'user' ? 'me' : 'bot';
+        const micTag = m.type === 'voice' && m.audioSeconds ? ` 🎤 (${Math.round(m.audioSeconds)}с)` : '';
+        say(who, (m.text || '') + (who === 'me' ? micTag : ''));
+      }
+    } else {
+      say('bot', 'Я помогаю с документами и расчётами: счета, акты, УПД, накладные, '
+        + 'договоры и платёжки, кто сколько должен, акт сверки.\n\n'
+        + 'Налоги, взносы, КУДиР, отчётность и зарплату не веду — у меня нет доступа '
+        + 'к вашему банку и кассе, а ошибиться в этом дорого.\n\n'
+        + 'Скажите или напишите, что нужно. Например: «выставь счёт Заре на 30 тысяч за аренду».');
+    }
+  } catch (_) {
+    say('bot', 'Я помогаю с документами и расчётами: счета, акты, УПД, накладные, '
+      + 'договоры и платёжки, кто сколько должен, акт сверки.\n\n'
+      + 'Налоги, взносы, КУДиР, отчётность и зарплату не веду — у меня нет доступа '
+      + 'к вашему банку и кассе, а ошибиться в этом дорого.\n\n'
+      + 'Скажите или напишите, что нужно. Например: «выставь счёт Заре на 30 тысяч за аренду».');
+  }
 
   const field = h('input', { class: 'ask-input', type: 'text', placeholder: 'Что нужно сделать?',
     enterkeyhint: 'send', autocomplete: 'off' });
@@ -3217,6 +3234,15 @@ screens.support = async function support() {
     back();
   });
   box.append(h('div', { class: 'btn-wrap' }, send));
+
+  const supInfo = h('div', { class: 'small muted', style: 'margin:24px 18px 12px; line-height:1.7; text-align:center;' });
+  supInfo.innerHTML = 'Telegram: <a href="https://t.me/flowcraft_agent" target="_blank" style="color:var(--accent);">@flowcraft_agent</a> · Email: <a href="mailto:support@pervichkaru.ru" style="color:var(--accent);">support@pervichkaru.ru</a><br>'
+    + '<a href="/terms" target="_blank" style="color:var(--accent);">Пользовательское соглашение</a> · '
+    + '<a href="/privacy" target="_blank" style="color:var(--accent);">Конфиденциальность</a> · '
+    + '<a href="/tariffs" target="_blank" style="color:var(--accent);">Тарифы</a><br>'
+    + '<span style="font-family:monospace; font-size:11px; opacity:0.65;">plat chek</span>';
+  box.append(supInfo);
+
   return box;
 };
 
@@ -3560,14 +3586,24 @@ screens.billing = async function billing() {
         h('div', { class: 'row' }, h('span', { class: 'grow', text: s.price.text }))));
     }
 
-    if (s.payUrl) {
+    if (s.plategaConfigured || s.payUrl) {
       box.append(h('div', { class: 'btn-wrap' }, h('button', {
         class: 'btn',
-        onclick: () => {
+        onclick: async () => {
           haptic('medium');
-          if (tg && tg.openLink) tg.openLink(s.payUrl); else window.open(s.payUrl, '_blank');
+          if (s.plategaConfigured) {
+            toast('Открываю оплату СБП...');
+            const r = await api('POST', '/api/pay/create', { amount: 349, plan: 'month', paymentMethod: 2 });
+            if (r.ok && r.redirect) {
+              if (tg && tg.openLink) tg.openLink(r.redirect); else window.open(r.redirect, '_blank');
+              return;
+            }
+          }
+          if (s.payUrl) {
+            if (tg && tg.openLink) tg.openLink(s.payUrl); else window.open(s.payUrl, '_blank');
+          }
         },
-      }, 'Оформить подписку')));
+      }, '⚡ Оформить подписку')));
 
       /*
        * «Я оплатил» прямо здесь. Раньше приложение отправляло человека
@@ -3658,6 +3694,13 @@ screens.billing = async function billing() {
       ? 'Если есть ещё один код, дни прибавятся к оплаченным — ничего не сгорит.'
       : 'Код выдаёт поддержка — например, на время знакомства с сервисом.',
   }));
+
+  const billingLegal = h('div', { class: 'small muted', style: 'margin:20px 16px 12px; text-align:center; line-height:1.7;' });
+  billingLegal.innerHTML = 'Оплата означает согласие с <a href="/terms" target="_blank" style="color:var(--accent);">офертой</a> и <a href="/privacy" target="_blank" style="color:var(--accent);">политикой конфиденциальности</a>.<br>'
+    + '<a href="/tariffs" target="_blank" style="color:var(--accent);">Тарифы</a> · Поддержка: <a href="mailto:support@pervichkaru.ru" style="color:var(--accent);">support@pervichkaru.ru</a><br>'
+    + '<span style="font-family:monospace; font-size:11px; opacity:0.65;">plat chek</span>';
+  box.append(billingLegal);
+
   return box;
 };
 

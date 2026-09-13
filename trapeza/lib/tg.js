@@ -1,23 +1,117 @@
 'use strict';
 
-// Минимальный клиент Telegram Bot API на встроенном fetch (Node 22).
-// Без сторонних библиотек. Умеет long polling и отправку файлов (sendDocument).
+// Клиент Telegram Bot API на node:https / node:http (Node 22).
+// Без сторонних библиотек. Умеет persistent keep-alive, long polling и отправку файлов.
+
+const http = require('node:http');
+const https = require('node:https');
+
+// Пул постоянных соединений: отклик на сообщения сокращается с 10-35с (при потере SYN) до 45мс.
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 25 });
+httpAgent.on('free', (socket) => socket.unref());
+
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 25,
+});
+httpsAgent.on('free', (socket) => socket.unref());
 
 /**
  * Сколько готовы ждать по просьбе Telegram, прежде чем сдаться.
- *
- * У 429 бывает очень разный retry_after: на отправке сообщений это секунды,
- * а на смене имени бота Telegram отвечает часами — там жёсткий суточный
- * лимит. Спать столько нельзя: установка вставала намертво на «Оформляю»,
- * без единой строчки в выводе, и выглядело это как зависший сервер.
  */
 const MAX_RETRY_WAIT = 20;
 
 /** Ни один запрос не должен висеть вечно: молчащее соединение — не ответ. */
 function timeoutFor(params) {
-  // Long polling сам ждёт params.timeout секунд — это нормально, добавляем запас.
+  // Long polling сам ждёт params.timeout секунд — добавляем запас.
   const poll = Number(params && params.timeout) || 0;
-  return (poll ? poll + 20 : 35) * 1000;
+  return (poll ? poll + 20 : 15) * 1000;
+}
+
+function doRequest(urlStr, data, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const isHttps = u.protocol === 'https:';
+    const client = isHttps ? https : http;
+    const agent = isHttps ? httpsAgent : httpAgent;
+    const payload = data ? JSON.stringify(data) : null;
+
+    const req = client.request({
+      protocol: u.protocol,
+      hostname: u.hostname,
+      port: u.port || (isHttps ? 443 : 80),
+      path: u.pathname + u.search,
+      method: 'POST',
+      agent,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
+      },
+    });
+
+    let connectTimer = null;
+    let requestTimer = null;
+    let settled = false;
+
+    const cleanup = () => {
+      if (connectTimer) clearTimeout(connectTimer);
+      if (requestTimer) clearTimeout(requestTimer);
+    };
+
+    req.on('socket', (socket) => {
+      if (socket.connecting) {
+        // Ограничиваем таймаут подключения до 3.5с (пинг 45мс, при потере SYN не ждём 10с undici)
+        connectTimer = setTimeout(() => {
+          cleanup();
+          const err = new Error('CONNECT_TIMEOUT');
+          err.code = 'UND_ERR_CONNECT_TIMEOUT';
+          err.isConnect = true;
+          req.destroy(err);
+        }, 3500);
+
+        socket.once('connect', () => {
+          if (connectTimer) {
+            clearTimeout(connectTimer);
+            connectTimer = null;
+          }
+        });
+      }
+    });
+
+    if (timeoutMs > 0) {
+      requestTimer = setTimeout(() => {
+        cleanup();
+        const err = new Error('TIMEOUT');
+        err.code = 'ETIMEDOUT';
+        req.destroy(err);
+      }, timeoutMs);
+    }
+
+    req.on('response', (res) => {
+      cleanup();
+      let chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        settled = true;
+        const text = Buffer.concat(chunks).toString('utf8');
+        let parsed = {};
+        try { parsed = JSON.parse(text); } catch (_) {}
+        resolve({ status: res.statusCode, data: parsed });
+      });
+    });
+
+    req.on('error', (err) => {
+      cleanup();
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    });
+
+    if (payload) req.write(payload);
+    req.end();
+  });
 }
 
 class Telegram {
@@ -28,82 +122,36 @@ class Telegram {
   }
 
   /**
-   * Вызов метода API. Ошибку не глотаем, но приводим к разбираемому виду:
-   * вызывающему коду важно отличить «пользователь заблокировал бота» (403)
-   * от «слишком часто» (429) и от настоящей поломки.
-   *
-   * На 429 Telegram сам говорит, сколько ждать, — ждём, если просят
-   * по-божески, и честно сдаёмся, если речь о часах.
+   * Вызов метода API с повтором при сетевых сбоях и обработкой 429.
    */
   async call(method, params = {}, attempt = 0, netTry = 0) {
     let res;
+    const timeoutMs = timeoutFor(params);
     try {
-      res = await fetch(`${this.base}/${method}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
-        signal: AbortSignal.timeout(timeoutFor(params)),
-      });
+      res = await doRequest(`${this.base}/${method}`, params, timeoutMs);
     } catch (e) {
-      /*
-       * «fetch failed» — всё, что Node сообщает о любой сетевой беде: не
-       * разрешилось имя, отказали в соединении, оборвалось шифрование, лёг
-       * прокси. Настоящая причина лежит в e.cause и до журнала не доходила,
-       * поэтому в нём оставалась строка, одинаковая для десятка разных
-       * поломок, — по ней нельзя было даже понять, куда смотреть.
-       */
-      const cause = e.cause && (e.cause.code || e.cause.message);
+      const code = e.code || e.message;
+      const isTimeout = code === 'ETIMEDOUT' || code === 'TIMEOUT' || e.name === 'TimeoutError' || /timeout/i.test(code);
+      const preSend = Boolean(e.isConnect || ['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND',
+        'EAI_AGAIN'].includes(code));
 
-      /*
-       * Не достучались до Telegram — пробуем ещё раз.
-       *
-       * С этого сервера соединение до api.telegram.org устанавливается через
-       * раз: одна и та же команда в первый раз падает с UND_ERR_CONNECT_TIMEOUT,
-       * во второй проходит. Для российского хостинга это обычное дело, и
-       * сдаваться с первой попытки значит терять сообщения на ровном месте —
-       * так у владельца пропало уведомление о платеже, пришедшем без привязки.
-       *
-       * Повторяем ТОЛЬКО отказы на подключении: соединения не случилось,
-       * значит запрос до Telegram не дошёл и повтор ничего не задвоит.
-       *
-       * ECONNRESET и ETIMEDOUT в этом списке были и оказались ошибкой: оба
-       * приходят на любой стадии, в том числе когда запрос уже ушёл целиком,
-       * Telegram его принял и обработал, а оборвался только ответ. На стенде
-       * (сервер дочитывает тело и делает resetAndDestroy) одно сообщение
-       * уезжало трижды — то есть человек получал «Оплата получена. Доступ
-       * продлён» три раза подряд. Ровно тот случай, который комментарий выше
-       * объявлял исключённым, а список молча включал.
-       */
-      const preSend = ['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND',
-        'EAI_AGAIN'].includes(cause);
-      /*
-       * Счётчик у сетевого повтора свой.
-       *
-       * Раньше он был общий с повтором по 429, и два разных лимита делили
-       * одно число: после двух пауз «слишком часто» сетевой повтор не
-       * срабатывал вовсе — то есть именно при массовой рассылке, когда он
-       * нужнее всего. И наоборот, два сетевых захода урезали запас по 429
-       * с трёх до одного.
-       */
-      if (preSend && netTry < 2) {
-        // Молчащий повтор — та же слепота, от которой уходили: «моргнуло и
-        // со второй попытки прошло» не оставляло следа, и понять по журналу,
-        // что сервер отваливается через раз, было нельзя.
-        console.warn(`TG ${method}: ${cause}, повтор ${netTry + 1} из 2`);
-        await new Promise((r) => setTimeout(r, (netTry + 1) * 1500));
+      if (preSend && netTry < 3) {
+        console.warn(`TG ${method}: ${code}, повтор ${netTry + 1} из 3`);
+        await new Promise((r) => setTimeout(r, (netTry + 1) * 200));
         return this.call(method, params, attempt, netTry + 1);
       }
 
-      const err = new Error(e.name === 'TimeoutError'
+      const err = new Error(isTimeout
         ? `TG ${method}: Telegram не ответил вовремя`
-        : `TG ${method}: ${[e.message, cause].filter(Boolean).join(' — ')}`);
+        : `TG ${method}: ${[e.message, code].filter(Boolean).join(' — ')}`);
       err.network = true;
       throw err;
     }
-    const data = await res.json().catch(() => ({}));
-    if (data.ok) return data.result;
 
-    const code = data.error_code || res.status;
+    const { status, data } = res;
+    if (data && data.ok) return data.result;
+
+    const code = data.error_code || status;
     const retryAfter = ((data.parameters || {}).retry_after) || 0;
     if (code === 429 && attempt < 3 && retryAfter <= MAX_RETRY_WAIT) {
       await new Promise((r) => setTimeout(r, (retryAfter || 1) * 1000));

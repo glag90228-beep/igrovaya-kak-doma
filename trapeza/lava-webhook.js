@@ -21,6 +21,7 @@ const path = require('node:path');
 const bdb = require('./lib/bot-db');
 const billing = require('./lib/billing');
 const { parseWebhook, daysFor, secretOk, hmacOk } = require('./lib/lava');
+const platega = require('./lib/platega');
 const { Telegram } = require('./lib/tg');
 
 const PORT = Number(process.env.LAVA_PORT || 8788);
@@ -75,29 +76,20 @@ async function notifyOwner(text) {
  * Обрабатывает разобранный платёж: записывает, привязывает к пользователю
  * и продлевает доступ. Возвращает текст для лога.
  */
-async function handlePayment(p) {
-  /*
-   * Срок считаем только состоявшейся оплате.
-   *
-   * Раньше days считался до проверки p.paid, и строка отклонённого платежа
-   * или возврата ложилась в базу с полным сроком. Строка оставалась ничьей,
-   * а отбор ничьих платежей по почте на статус не смотрел — человеку хватало
-   * нажать «Я оплатил» и назвать почту с кассы, чтобы получить месяц за
-   * непрошедшую карту. Возврат выходил ещё щедрее: к строке оплаты
-   * добавлялась вторая с тем же сроком, и одно нажатие давало вдвое больше
-   * дней, чем было куплено.
-   *
-   * Ноль здесь — и есть замок: отбор в billing.unclaimedByEmail берёт только
-   * строки со сроком больше нуля.
-   */
-  const days = p.paid ? daysFor(p) : 0;
+async function handlePayment(p, provider = 'lava') {
+  const days = p.paid
+    ? (provider === 'platega' ? platega.daysFor(p) : daysFor(p))
+    : 0;
   let user = null;
-  if (p.tgId) {
+  if (p.userId) {
+    try { user = bdb.getUser(p.userId); } catch (_) { user = null; }
+  }
+  if (!user && p.tgId) {
     try { user = bdb.getOrCreateUser(p.tgId); } catch (_) { user = null; }
   }
 
   const { duplicate, near, payment, id } = billing.recordPayment({
-    externalId: p.externalId, provider: 'lava', userId: user ? user.id : 0,
+    externalId: p.externalId, provider, userId: user ? user.id : 0,
     email: p.email, amount: p.amount, currency: p.currency, days,
     status: p.status, raw: p.raw,
   });
@@ -161,8 +153,9 @@ async function handlePayment(p) {
    * Поэтому письмо счастья уходит следом за ответом, а не перед ним.
    */
   if (tg) {
+    const channelName = provider === 'platega' ? 'СБП / Platega' : 'Lava Top';
     tg.sendMessage(user.tg_id,
-      `✅ Оплата получена. Доступ продлён до <b>${until.split('-').reverse().join('.')}</b>.\n`
+      `✅ Оплата получена (${channelName}). Доступ продлён до <b>${until.split('-').reverse().join('.')}</b>.\n`
       + 'Спасибо! Если что-то не так — напишите в поддержку.')
       .catch((e) => {
         if (e && e.blocked) bdb.markBlocked(user.id);
@@ -178,7 +171,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/health') return done(200, 'ok');
   if (req.method !== 'POST') return done(405, 'only POST');
-  if (url.pathname !== '/lava' && url.pathname !== '/webhook') return done(404, 'not found');
+  if (url.pathname !== '/lava' && url.pathname !== '/webhook' && url.pathname !== '/platega') return done(404, 'not found');
 
   /*
    * Кто стучался — записываем обязательно.
@@ -245,6 +238,42 @@ const server = http.createServer((req, res) => {
     const urlSecret = () => (process.env.LAVA_ALLOW_URL_SECRET === '1'
       ? (url.searchParams.get('secret') || url.searchParams.get('token') || '')
       : '');
+
+    // Platega.io: СБП и банковские карты
+    const plategaMerchant = req.headers['x-merchantid'] || req.headers['x-merchant-id'] || '';
+    const plategaSecret = req.headers['x-secret'] || '';
+    const isPlatega = Boolean(plategaMerchant) || Boolean(plategaSecret) || url.pathname === '/platega';
+
+    if (isPlatega) {
+      if (!platega.secretOk(plategaMerchant, plategaSecret)) {
+        log(`отказ Platega: неверный секрет | от ${from} | путь ${url.pathname}`
+          + ` | merchant: ${plategaMerchant ? 'передан' : 'нет'}, secret: ${plategaSecret ? 'передан' : 'нет'}`);
+        return done(401, 'bad secret');
+      }
+      log(`принят запрос Platega от ${from} на ${url.pathname}`);
+      let json;
+      try { json = JSON.parse(body || '{}'); } catch (_) {
+        log('Platega не JSON:', body.slice(0, 500));
+        return done(400, 'bad json');
+      }
+      const parsed = platega.parseWebhook(json);
+      if (!parsed.ok) {
+        const body2 = JSON.stringify(json);
+        log('НЕ РАЗОБРАЛ вебхук Platega:', parsed.reason, '| тело:', body2);
+        notifyOwner('⚠️ Пришёл платёж Platega, который я не смог разобрать: '
+          + `<b>${parsed.reason}</b>.\n\n`
+          + `<code>${escHtml(body2.slice(0, 600))}</code>`)
+          .catch(() => {});
+        return done(200, 'stored');
+      }
+      try {
+        log(await handlePayment(parsed.payment, 'platega'));
+      } catch (e) {
+        log('ошибка обработки Platega:', e.message);
+        return done(500, 'error');
+      }
+      return done(200, 'ok');
+    }
 
     const carrier = (req.headers['x-api-key'] && 'X-Api-Key')
       || (req.headers['x-signature'] && 'X-Signature')
