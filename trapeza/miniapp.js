@@ -1979,8 +1979,25 @@ async function sendToChat(user, res) {
 function serveStatic(req, res, pathname) {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const full = path.join(ROOT, rel);
-  // За пределы папки приложения не выпускаем даже при «../» в адресе.
-  if (!full.startsWith(ROOT)) { res.writeHead(403); res.end('нельзя'); return; }
+  /*
+   * За пределы папки приложения не выпускаем — вторым рубежом.
+   *
+   * Первый рубеж выше и он же настоящий: pathname приходит из new URL(), а
+   * тот схлопывает «..» сам, ещё до нас. «/../../data/trapeza.db»
+   * превращается в «/data/trapeza.db», «%2e%2e» — тоже; «..%2f» остаётся как
+   * есть, но ничего не декодирует и подъёмом не становится. Поэтому сюда
+   * подъём по дереву не доходит ни в одном виде, и проверка ниже за всю
+   * жизнь ни разу не срабатывала.
+   *
+   * Сравниваем всё равно с разделителем на конце, а не с голым ROOT. Голый
+   * пропустил бы соседнюю папку с тем же началом имени: «…/public/app-old/x»
+   * добросовестно startsWith('…/public/app'). Сегодня это недостижимо, но
+   * рубеж на то и второй, чтобы держать, когда первый уберут: достаточно
+   * decodeURIComponent над rel или вызова serveStatic не отсюда.
+   */
+  if (full !== ROOT && !full.startsWith(ROOT + path.sep)) {
+    res.writeHead(403); res.end('нельзя'); return;
+  }
   fs.readFile(full, (err, data) => {
     if (err) {
       // Одностраничное приложение: неизвестный путь — это его внутренний

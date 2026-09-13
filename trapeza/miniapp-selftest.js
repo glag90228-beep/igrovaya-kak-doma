@@ -1504,6 +1504,51 @@ async function main() {
     'у статики стоит защита от подмены типа');
   r = await call('GET', '/../../../etc/passwd');
   ok(!/root:/.test(r.text), 'выход за пределы папки приложения не отдаёт системные файлы');
+
+  {
+    /*
+     * Подъём по дереву не отдаёт ни системные файлы, ни боевую базу.
+     *
+     * Держит это не проверка в serveStatic, а new URL() выше: он схлопывает
+     * «..» сам — «/../../data/trapeza.db» приходит уже как «/data/…». Стоит
+     * это записать проверкой, потому что защита неочевидна и её легко
+     * потерять, разбирая адрес иначе.
+     *
+     * Запрос шлём сокетом, а не fetch: fetch наводит порядок в адресе у себя,
+     * и до сервера подъём не доезжает вовсе — такая проверка была бы зелёной
+     * при любой дыре, потому что проверяла бы поведение своего же клиента.
+     * Атакующий возьмёт сокет, а Node отдаёт req.url как пришло.
+     */
+    const fsS = require('node:fs');
+    const pathS = require('node:path');
+    const sibling = pathS.join(__dirname, 'public', 'app-old');
+    fsS.mkdirSync(sibling, { recursive: true });
+    fsS.writeFileSync(pathS.join(sibling, 'secret.txt'), 'ЭТОГО-НАРУЖУ-БЫТЬ-НЕ-ДОЛЖНО');
+    const rawGet = (line) => new Promise((resolve) => {
+      const { port } = server.address();
+      const sock = require('node:net').connect(port, '127.0.0.1', () => {
+        sock.write(`GET ${line} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`);
+      });
+      let buf = '';
+      sock.on('data', (d) => { buf += d; });
+      sock.on('close', () => resolve(buf));
+      sock.on('error', () => resolve(buf));
+    });
+    try {
+      for (const attempt of ['/../app-old/secret.txt', '/%2e%2e/app-old/secret.txt',
+        '/..%2fapp-old/secret.txt', '/../../app-old/secret.txt']) {
+        // eslint-disable-next-line no-await-in-loop
+        const leak = await rawGet(attempt);
+        ok(!/НАРУЖУ-БЫТЬ-НЕ-ДОЛЖНО/.test(leak),
+          `подъём «${attempt}» соседнюю папку не отдаёт`, leak.split('\r\n')[0]);
+      }
+      const fine = await rawGet('/app.css');
+      ok(/--tg-theme/.test(fine), 'а свои файлы по-прежнему отдаются',
+        fine.split('\r\n')[0]);
+    } finally {
+      fsS.rmSync(sibling, { recursive: true, force: true });
+    }
+  }
   r = await call('GET', '/health');
   ok(r.status === 200 && r.text === 'ok', 'health отвечает');
   r = await call('GET', '/api/unknown', { user: masha });
