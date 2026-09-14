@@ -1385,6 +1385,9 @@ const api = {
     ai.spend(user.id);
     const res = await readInvoice(Buffer.from(m[2], 'base64'), m[1]);
     if (!res.ok) return { error: res.error };
+    // Снимок стоит на два порядка дороже фразы, и расход в ответе не
+    // приходит — считаем по заданной цене за снимок.
+    ai.spend(user.id, { photos: 1 });
     const f = res.fields || {};
     // Ищем, кому это относится: по ИНН из снимка, иначе по названию.
     const cps = bdb.listCps(user.id);
@@ -1759,6 +1762,9 @@ const api = {
       if (got.detail) office.record({ kind: 'speech', where: 'приложение', error: got.detail, userId: user.id });
       return { error: got.error };
     }
+    // Речь считается по секундам звука, а не по токенам: провайдер расход
+    // не возвращает, берём длительность и цену за минуту из настроек.
+    ai.spend(user.id, { voiceSeconds: seconds });
     bdb.saveAiMessage({
       userId: user.id, source: 'miniapp', role: 'user', type: 'voice',
       text: got.text, audioSeconds: seconds,

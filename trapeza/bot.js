@@ -3335,11 +3335,17 @@ async function handleVoice(tg, chatId, user, msg) {
   // Занимаем до обращения: считается попытка, а не удача. Иначе отказ
   // провайдера ничего не стоил бы, и упереться в потолок было бы нельзя.
   ai.spend(user.id);
-  const got = await speech.transcribe(buf, Number(src.duration) || 0);
+  const seconds = Number(src.duration) || 0;
+  const got = await speech.transcribe(buf, seconds);
   if (!got.ok) {
     await tg.sendMessage(chatId, `Не разобрал запись: ${esc(got.error)}`, mainMenu());
     return;
   }
+  // Речь тарифицируется по секундам звука, а не по токенам, и провайдер
+  // расход в ответе не возвращает — берём длительность из Telegram и цену
+  // за минуту из настроек. Дописываем ПОСЛЕ удачи: за сорвавшееся
+  // распознавание провайдер обычно не берёт денег.
+  ai.spend(user.id, { voiceSeconds: seconds });
 
   await tg.sendMessage(chatId, `Услышал: «${esc(got.text)}»`);
   bdb.saveAiMessage({
@@ -3401,6 +3407,11 @@ async function handlePhoto(tg, chatId, user, msg) {
       `Распознать не вышло: ${esc(res.error)}\nВнесите операцию текстом.`, mainMenu());
     return;
   }
+  // Снимок стоит на два порядка дороже фразы: картинка разворачивается в
+  // тысячи входных токенов, и расход в ответе не приходит. Считаем по
+  // заданной цене за снимок — иначе в бюджете он весит столько же, сколько
+  // «кто мне должен», и потолок в штуках перестаёт что-либо значить.
+  ai.spend(user.id, { photos: 1 });
   const f = res.fields || {};
   if (!f.amount) {
     await tg.sendMessage(chatId,

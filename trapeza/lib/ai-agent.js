@@ -21,8 +21,28 @@
  * Деньги
  * ------
  *  AI_ENABLED=1         — без этого модуль выключен, даже если ключ есть.
+ *
+ * Счёт ведём в копейках, а не в обращениях. Обращение обращению не равно:
+ * фраза стоит сотые доли копейки, снимок счёта — в полсотни раз больше,
+ * минута речи — почти в восемьдесят, а в старом счётчике все трое шли по
+ * единице. Пределы в штуках остались вторым рубежом: они срабатывают, когда
+ * провайдер расход не вернул и стоимость посчиталась нулём.
+ *
+ *  AI_MONTHLY_KOPECKS   — предел расхода в месяц на всех (300000 = 3000 ₽).
+ *  AI_USER_KOPECKS      — предел на одного пользователя (5000 = 50 ₽).
  *  AI_MONTHLY_LIMIT     — предел обращений к модели в месяц на всех (1000).
  *  AI_USER_LIMIT        — предел на одного пользователя в месяц (30).
+ *
+ * Цены провайдера — тоже из окружения, потому что меняются несколько раз в
+ * год, а выкладка ради новой цифры — это выкладка ради цифры:
+ *
+ *  AI_KOP_IN            — копеек за миллион входных токенов (1200 = 12 ₽).
+ *  AI_KOP_OUT           — за миллион исходящих (4800 = 48 ₽).
+ *  AI_KOP_CACHED        — за миллион прочитанных из кэша (120 = 1,2 ₽).
+ *  AI_KOP_PHOTO         — за один снимок счёта (90 = 90 копеек).
+ *  AI_KOP_VOICE         — за минуту речи (120 = 1,2 ₽).
+ *
+ * Прикинуть свой расход и остаток от подписки: `node tools/ai-cost.js`.
  *
  * Поддерживаемые провайдеры (AI_PROVIDER):
  *  - gemini      — по умолчанию. Ключ GEMINI_API_KEY; адрес можно увести на
@@ -126,33 +146,140 @@ function migrate() {
       PRIMARY KEY (month, user_id)
     );
   `);
+  /*
+   * Счёт в копейках, а не в обращениях.
+   *
+   * Обращения считать бессмысленно: фраза стоит сотые доли копейки, снимок
+   * счёта — в полсотни раз больше, минута речи — почти в восемьдесят. А в
+   * счётчике все трое шли по единице, и тридцать обращений значили то
+   * полрубля, то двадцать семь. Предел в штуках при этом якобы «держал
+   * расход» — на деле он держал его случайно, потому что дорогих обращений
+   * пока мало.
+   *
+   * Копейки целым числом, а не рубли дробью: деньги в double накапливают
+   * погрешность, а этот счётчик складывается тысячи раз за месяц.
+   */
+  try { db.exec('ALTER TABLE ai_usage ADD COLUMN kopecks INTEGER NOT NULL DEFAULT 0'); }
+  catch (_) { /* уже есть */ }
+  try { db.exec('ALTER TABLE ai_usage ADD COLUMN tokens_in INTEGER NOT NULL DEFAULT 0'); }
+  catch (_) { /* уже есть */ }
+  try { db.exec('ALTER TABLE ai_usage ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0'); }
+  catch (_) { /* уже есть */ }
+  try { db.exec('ALTER TABLE ai_usage ADD COLUMN tokens_cached INTEGER NOT NULL DEFAULT 0'); }
+  catch (_) { /* уже есть */ }
 }
 migrate();
 
-const callsOf = (userId) => {
-  const row = db.prepare('SELECT calls FROM ai_usage WHERE month = ? AND user_id = ?')
-    .get(monthKey(), userId);
-  return row ? row.calls : 0;
-};
+/*
+ * Цены провайдера — в копейках, из окружения.
+ *
+ * В коде их держать нельзя: они меняются несколько раз в год, а выкладка
+ * ради новой цифры — это выкладка ради цифры. Копейки за миллион токенов,
+ * чтобы не возиться с дробями там, где всё остальное целое.
+ *
+ *   AI_KOP_IN      — за миллион входных токенов
+ *   AI_KOP_OUT     — за миллион исходящих
+ *   AI_KOP_CACHED  — за миллион прочитанных из кэша (обычно кратно дешевле)
+ *   AI_KOP_PHOTO   — за один снимок
+ *   AI_KOP_VOICE   — за минуту речи
+ */
+const KOP_IN = () => Number(process.env.AI_KOP_IN || 1200);
+const KOP_OUT = () => Number(process.env.AI_KOP_OUT || 4800);
+const KOP_CACHED = () => Number(process.env.AI_KOP_CACHED || 120);
+const KOP_PHOTO = () => Number(process.env.AI_KOP_PHOTO || 90);
+const KOP_VOICE = () => Number(process.env.AI_KOP_VOICE || 120);
 
-/** Сколько обращений осталось: общий предел и личный. */
+/** Предел расхода в копейках: на всех и на одного. */
+const KOP_ALL = () => Number(process.env.AI_MONTHLY_KOPECKS || 300000);   // 3000 ₽
+const KOP_USER = () => Number(process.env.AI_USER_KOPECKS || 5000);       // 50 ₽
+
+/**
+ * Во что обошлось обращение. Считаем по ФАКТУ, а не по прикидке: сколько
+ * токенов ушло, знает только провайдер, и он это возвращает.
+ *
+ * @param {{in:number,out:number,cached:number}} usage что вернул провайдер
+ * @param {{photos?:number, voiceSeconds?:number}} extra снимки и речь
+ */
+function costKopecks(usage = {}, extra = {}) {
+  const tin = Math.max(0, Number(usage.in) || 0);
+  const tout = Math.max(0, Number(usage.out) || 0);
+  const tcached = Math.max(0, Number(usage.cached) || 0);
+  // Прочитанное из кэша провайдер обычно НЕ включает в input — но если
+  // включил, вычитать вслепую нельзя: уйдём в минус. Берём неотрицательное.
+  const billedIn = Math.max(0, tin - tcached);
+  const kop = (billedIn * KOP_IN() + tout * KOP_OUT() + tcached * KOP_CACHED()) / 1e6
+    + (Number(extra.photos) || 0) * KOP_PHOTO()
+    + ((Number(extra.voiceSeconds) || 0) / 60) * KOP_VOICE();
+  // Округляем вверх: недосчитать свой расход хуже, чем пересчитать на копейку.
+  return Math.ceil(kop);
+}
+
+const usageOf = (userId) => db.prepare(
+  'SELECT calls, kopecks, tokens_in, tokens_out, tokens_cached FROM ai_usage WHERE month = ? AND user_id = ?',
+).get(monthKey(), userId) || { calls: 0, kopecks: 0, tokens_in: 0, tokens_out: 0, tokens_cached: 0 };
+
+/**
+ * Сколько ещё можно потратить.
+ *
+ * Пределов два, и они разной природы. Копейки — настоящий: он про деньги и
+ * не даст одному снимку сожрать столько же, сколько сотне фраз. Штуки
+ * остались вторым рубежом на случай, когда провайдер не вернул расход (чужой
+ * шлюз, старая модель) и стоимость посчиталась нулём: бесконечно бесплатных
+ * обращений не бывает.
+ */
 function budget(userId) {
-  const all = callsOf(0);
-  const mine = callsOf(userId);
+  const all = usageOf(0);
+  const mine = usageOf(userId);
+  const leftCalls = Math.max(0, Math.min(LIMIT_ALL() - all.calls, LIMIT_USER() - mine.calls));
+  const leftKop = Math.max(0, Math.min(KOP_ALL() - all.kopecks, KOP_USER() - mine.kopecks));
   return {
-    all, mine,
+    all: all.calls,
+    mine: mine.calls,
     limitAll: LIMIT_ALL(),
     limitUser: LIMIT_USER(),
-    left: Math.max(0, Math.min(LIMIT_ALL() - all, LIMIT_USER() - mine)),
+    kopecks: mine.kopecks,
+    kopecksAll: all.kopecks,
+    limitKopecks: KOP_USER(),
+    limitKopecksAll: KOP_ALL(),
+    tokensIn: mine.tokens_in,
+    tokensOut: mine.tokens_out,
+    tokensCached: mine.tokens_cached,
+    // Кончилось то, что кончилось раньше.
+    left: Math.min(leftCalls, leftKop > 0 ? leftCalls : 0),
+    leftKopecks: leftKop,
   };
 }
 
-/** Занять одно обращение. */
-function spend(userId) {
-  const bump = db.prepare(`INSERT INTO ai_usage(month, user_id, calls) VALUES(?,?,1)
-      ON CONFLICT(month, user_id) DO UPDATE SET calls = calls + 1`);
-  bump.run(monthKey(), 0);
-  bump.run(monthKey(), userId);
+/**
+ * Записать расход.
+ *
+ * Зовётся ДО обращения (чтобы занять место) и ещё раз ПОСЛЕ — с фактическим
+ * расходом. Занимать заранее обязательно: между проверкой предела и ответом
+ * модели проходят секунды, и за это время человек успевает нажать ещё раз.
+ *
+ * @param {number} userId
+ * @param {object} [spent] что известно о расходе; пусто — просто занимаем штуку
+ */
+function spend(userId, spent = null) {
+  const kop = spent ? costKopecks(spent.usage, spent) : 0;
+  const tin = spent && spent.usage ? Math.max(0, Number(spent.usage.in) || 0) : 0;
+  const tout = spent && spent.usage ? Math.max(0, Number(spent.usage.out) || 0) : 0;
+  const tcached = spent && spent.usage ? Math.max(0, Number(spent.usage.cached) || 0) : 0;
+  // Штуку считаем только на входе: второй вызов дописывает деньги к той же
+  // строке, а не заводит ещё одно обращение.
+  const calls = spent ? 0 : 1;
+  const bump = db.prepare(`
+    INSERT INTO ai_usage(month, user_id, calls, kopecks, tokens_in, tokens_out, tokens_cached)
+    VALUES(?,?,?,?,?,?,?)
+    ON CONFLICT(month, user_id) DO UPDATE SET
+      calls         = calls + excluded.calls,
+      kopecks       = kopecks + excluded.kopecks,
+      tokens_in     = tokens_in + excluded.tokens_in,
+      tokens_out    = tokens_out + excluded.tokens_out,
+      tokens_cached = tokens_cached + excluded.tokens_cached`);
+  bump.run(monthKey(), 0, calls, kop, tin, tout, tcached);
+  bump.run(monthKey(), userId, calls, kop, tin, tout, tcached);
+  return kop;
 }
 
 // ---------- местный разбор, без модели ----------
@@ -481,9 +608,26 @@ const SYSTEM = `Ты помощник в боте «Первичка»: он в�
 
 // ---------- вызов модели ----------
 
+/**
+ * Спросить модель.
+ *
+ * Возвращает не строку, а `{text, usage}`. Расход в токенах знает только
+ * провайдер — прикидка «символы делить на 2.5» на кириллице врёт в полтора
+ * раза, а считать деньги по вранью нельзя. Поэтому каждая ветка достаёт
+ * usage из ответа и приводит к одному виду: `{in, out, cached}`.
+ */
 async function callModel(text) {
   const p = PROVIDER();
-  if (p === 'mock') return String(process.env.AI_MOCK || '{"action":"unknown"}');
+  if (p === 'mock') {
+    // Расход подделки задаётся как «вход,выход,из кэша» — так в тестах
+    // проверяется счётчик копеек, не поднимая настоящего провайдера.
+    const [tin, tout, tcached] = String(process.env.AI_MOCK_USAGE || '0,0,0')
+      .split(',').map((v) => Number(v) || 0);
+    return {
+      text: String(process.env.AI_MOCK || '{"action":"unknown"}'),
+      usage: { in: tin, out: tout, cached: tcached },
+    };
+  }
 
   const model = process.env.AI_MODEL || (p === 'yandexgpt' ? 'yandexgpt-lite/latest' : MODEL_DEFAULT);
   const maxTokens = Number(process.env.AI_MAX_TOKENS || 400);
@@ -513,7 +657,15 @@ async function callModel(text) {
     });
     if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 200)}`);
     const data = await res.json();
-    return ((((data.candidates || [])[0] || {}).content || {}).parts || [{}])[0].text || '';
+    const u = data.usageMetadata || {};
+    return {
+      text: ((((data.candidates || [])[0] || {}).content || {}).parts || [{}])[0].text || '',
+      usage: {
+        in: Number(u.promptTokenCount) || 0,
+        out: Number(u.candidatesTokenCount) || 0,
+        cached: Number(u.cachedContentTokenCount) || 0,
+      },
+    };
   }
 
   /*
@@ -546,7 +698,15 @@ async function callModel(text) {
     });
     if (!res.ok) throw new Error(`YandexGPT ${res.status}: ${(await res.text()).slice(0, 200)}`);
     const data = await res.json();
-    return (((data.result || {}).alternatives || [{}])[0].message || {}).text || '';
+    const uy = (data.result || {}).usage || {};
+    return {
+      text: (((data.result || {}).alternatives || [{}])[0].message || {}).text || '',
+      usage: {
+        in: Number(uy.inputTextTokens) || 0,
+        out: Number(uy.completionTokens) || 0,
+        cached: 0,
+      },
+    };
   }
 
   /*
@@ -575,7 +735,15 @@ async function callModel(text) {
     });
     if (!res.ok) throw new Error(`xAI ${res.status}: ${(await res.text()).slice(0, 200)}`);
     const data = await res.json();
-    return ((data.choices || [{}])[0].message || {}).content || '';
+    const uo = data.usage || {};
+    return {
+      text: ((data.choices || [{}])[0].message || {}).content || '',
+      usage: {
+        in: Number(uo.prompt_tokens) || 0,
+        out: Number(uo.completion_tokens) || 0,
+        cached: Number((uo.prompt_tokens_details || {}).cached_tokens) || 0,
+      },
+    };
   }
 
   // Вызов через OpenRouter API
@@ -601,7 +769,15 @@ async function callModel(text) {
     });
     if (!res.ok) throw new Error(`OpenRouter ${res.status}`);
     const data = await res.json();
-    return ((data.choices || [{}])[0].message || {}).content || '';
+    const uo = data.usage || {};
+    return {
+      text: ((data.choices || [{}])[0].message || {}).content || '',
+      usage: {
+        in: Number(uo.prompt_tokens) || 0,
+        out: Number(uo.completion_tokens) || 0,
+        cached: Number((uo.prompt_tokens_details || {}).cached_tokens) || 0,
+      },
+    };
   }
 
   // Прямой вызов Anthropic API
@@ -617,13 +793,30 @@ async function callModel(text) {
       body: JSON.stringify({
         model,
         max_tokens: maxTokens,
-        system: SYSTEM,
+        /*
+         * Подсказку помечаем к кэшированию: она одна и та же при каждом
+         * обращении, а платим за неё каждый раз — это 84% счёта.
+         *
+         * Провайдер кэширует не всё подряд: у подсказки есть нижний предел
+         * длины, и наши ~1150–1900 токенов лежат близко к нему. Не заведётся
+         * — пометка просто не сработает, лишнего не спишется. Сработало или
+         * нет, видно в usage: cache_read_input_tokens больше нуля.
+         */
+        system: [{ type: 'text', text: SYSTEM, cache_control: { type: 'ephemeral' } }],
         messages: [{ role: 'user', content: String(text).slice(0, 1000) }],
       }),
     });
     if (!res.ok) throw new Error(`Anthropic ${res.status}`);
     const data = await res.json();
-    return (data.content || []).map((c) => c.text || '').join('');
+    const ua = data.usage || {};
+    return {
+      text: (data.content || []).map((c) => c.text || '').join(''),
+      usage: {
+        in: (Number(ua.input_tokens) || 0) + (Number(ua.cache_creation_input_tokens) || 0),
+        out: Number(ua.output_tokens) || 0,
+        cached: Number(ua.cache_read_input_tokens) || 0,
+      },
+    };
   }
 
   // Прямой вызов OpenAI API
@@ -646,7 +839,15 @@ async function callModel(text) {
     });
     if (!res.ok) throw new Error(`OpenAI ${res.status}`);
     const data = await res.json();
-    return ((data.choices || [{}])[0].message || {}).content || '';
+    const uo = data.usage || {};
+    return {
+      text: ((data.choices || [{}])[0].message || {}).content || '',
+      usage: {
+        in: Number(uo.prompt_tokens) || 0,
+        out: Number(uo.completion_tokens) || 0,
+        cached: Number((uo.prompt_tokens_details || {}).cached_tokens) || 0,
+      },
+    };
   }
 
   throw new Error('Неизвестный провайдер в AI_PROVIDER');
@@ -693,10 +894,17 @@ async function understand(text, userId) {
   const left = budget(userId);
   if (left.left <= 0) return { action: 'unknown', source: 'limit' };
 
+  // Место занимаем ДО обращения, деньги дописываем ПОСЛЕ. Между проверкой
+  // предела и ответом модели проходят секунды, и за это время человек
+  // успевает нажать ещё раз — а платить придётся за оба.
   spend(userId);
   try {
-    return { ...sanitize(extractJson(await callModel(text))), source: 'model' };
+    const { text: raw, usage } = await callModel(text);
+    spend(userId, { usage });
+    return { ...sanitize(extractJson(raw)), source: 'model' };
   } catch (e) {
+    // Обращение не состоялось, но занятая штука остаётся: провайдер мог
+    // успеть посчитать запрос своим, а мы об этом уже не узнаем.
     return { action: 'unknown', source: 'error', error: e.message };
   }
 }

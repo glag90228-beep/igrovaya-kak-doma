@@ -1116,13 +1116,50 @@ async function main() {
 
     process.env.SPEECH_PROVIDER = 'mock';
     process.env.SPEECH_MOCK = 'что не оплачено';
+    process.env.AI_KOP_VOICE = '120';       // 1,2 ₽ за минуту речи
+    // Бюджет виден только в ответе переписки; спрашиваем бесплатной фразой
+    // — её разбирает местный код, и расход от неё не растёт.
+    const budgetNow = async () => (await call('POST', '/api/ask',
+      { user: masha, body: { text: 'кто мне должен' } })).json.budget;
+    const kopWas = (await budgetNow()).kopecks;
     r = await call('POST', '/api/ask/voice', { user: masha, body: { audio: Buffer.from('OggS зв').toString('base64'), seconds: 3 } });
     ok(r.status === 200 && r.json.action === 'unpaid' && r.json.heard === 'что не оплачено',
       'голос расшифрован и разобран', JSON.stringify(r.json).slice(0, 80));
+    /*
+     * Три секунды звука по 1,2 ₽ за минуту — шесть копеек. Проверяем не
+     * арифметику (она проверена в bot-selftest), а то, что приложение вообще
+     * доходит до кошелька: запись до двадцати мегабайт тарифицируется по
+     * секундам, а в бюджете весила столько же, сколько набранная фраза.
+     */
+    ok(r.json.budget && r.json.budget.kopecks === kopWas + 6,
+      'секунды звука записаны в расход', JSON.stringify((r.json.budget || {}).kopecks));
+    delete process.env.AI_KOP_VOICE;
     r = await call('POST', '/api/ask/voice', { user: masha, body: { audio: '' } });
     ok(r.status === 400, 'пустая запись отклонена');
     delete process.env.SPEECH_PROVIDER;
     delete process.env.SPEECH_MOCK;
+
+    /*
+     * Снимок счёта из приложения. Путь тот же, что у бота, и кошелёк тот же
+     * — а проверки до сих пор не было вовсе.
+     */
+    process.env.VISION_PROVIDER = 'mock';
+    process.env.VISION_MOCK = JSON.stringify({
+      date: '2026-08-03', amount: 6250, docNo: '148', inn: '1832012345', name: 'ООО «Заря»',
+    });
+    process.env.AI_KOP_PHOTO = '90';        // 90 копеек за снимок
+    const scanWas = (await budgetNow()).kopecks;
+    const dataUrl = `data:image/jpeg;base64,${Buffer.from('снимок счёта').toString('base64')}`;
+    r = await call('POST', '/api/scan', { user: masha, body: { dataUrl } });
+    ok(r.status === 200 && r.json.fields && r.json.fields.amount === 6250,
+      'сумма со снимка разобрана', JSON.stringify((r.json || {}).fields || r.json).slice(0, 80));
+    const scanNow = (await budgetNow()).kopecks;
+    ok(scanNow - scanWas === 90, 'снимок записан в расход', scanNow - scanWas);
+    r = await call('POST', '/api/scan', { user: masha, body: { dataUrl: 'не картинка' } });
+    ok(r.status === 400, 'мусор вместо снимка отклонён');
+    delete process.env.AI_KOP_PHOTO;
+    delete process.env.VISION_PROVIDER;
+    delete process.env.VISION_MOCK;
 
     r = await call('POST', '/api/ask', { user: petya, body: { text: 'кто мне должен' } });
     ok(r.status === 200 && r.json.action === 'debts', 'у второго пользователя свой разбор');

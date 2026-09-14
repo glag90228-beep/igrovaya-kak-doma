@@ -529,7 +529,18 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     date: '2026-08-03', amount: 6250, docNo: '148', inn: '1832012345', name: 'ООО «Заря»', text: SCAN,
   });
   tg.downloadFile = async () => Buffer.from('фото');
+  const aiPh = require('./lib/ai-agent');
+  process.env.AI_KOP_PHOTO = '90';          // 90 копеек за снимок
+  const phKopBefore = aiPh.budget(fxUserId()).kopecks;
   await handleUpdate(tg, { message: photoMsg });
+  /*
+   * Снимок стоит денег, и они должны лечь в тот же кошелёк, что и фразы.
+   * Раньше он весил в бюджете одну «штуку» — столько же, сколько «кто мне
+   * должен», которую бот разбирает своими силами и бесплатно.
+   */
+  ok(aiPh.budget(fxUserId()).kopecks - phKopBefore === 90,
+    'снимок записан в расход', aiPh.budget(fxUserId()).kopecks - phKopBefore);
+  delete process.env.AI_KOP_PHOTO;
   ok(norm(last()).includes('6 250,00'), 'сумма со снимка показана', norm(last()).slice(0, 60));
   ok(last().includes('узнал'), 'контрагент опознан по ИНН');
   const phBtn = button('✅ ООО «Заря»');
@@ -3176,6 +3187,98 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     delete process.env.AI_USER_LIMIT;
 
     /*
+     * ── счёт в копейках ──
+     *
+     * Предел в штуках держал расход случайно: фраза стоит сотые доли
+     * копейки, снимок счёта — в полсотни раз больше, минута речи — почти в
+     * восемьдесят, а в счётчике все трое шли по единице. Тридцать обращений
+     * значили то полрубля, то двадцать семь.
+     *
+     * Поэтому считаем не обращения, а деньги, и берём расход из ответа
+     * провайдера, а не из прикидки «символы делить на два с половиной»: на
+     * кириллице такая прикидка врёт в полтора раза.
+     */
+    const kuid = uid + 900001;               // отдельный кошелёк, чужого не заденем
+    const envWas = {};
+    for (const k of ['AI_KOP_IN', 'AI_KOP_OUT', 'AI_KOP_CACHED', 'AI_KOP_PHOTO',
+      'AI_KOP_VOICE', 'AI_USER_KOPECKS', 'AI_MONTHLY_KOPECKS', 'AI_MOCK_USAGE']) {
+      envWas[k] = process.env[k];
+    }
+    // Цены задаём руками: умолчания меняются, а числа в проверках — нет.
+    process.env.AI_KOP_IN = '1200';          // 12 ₽ за миллион входных
+    process.env.AI_KOP_OUT = '4800';         // 48 ₽ за миллион исходящих
+    process.env.AI_KOP_CACHED = '120';       // 1,2 ₽ за миллион из кэша — вдесятеро дешевле
+    process.env.AI_KOP_PHOTO = '90';         // 90 копеек за снимок
+    process.env.AI_KOP_VOICE = '120';        // 1,2 ₽ за минуту речи
+    process.env.AI_MONTHLY_KOPECKS = '100000000';
+    process.env.AI_USER_KOPECKS = '100000000';
+    process.env.AI_MOCK = '{"action":"debts"}';
+
+    // Миллион входных и сто тысяч исходящих: 1200 + 480 копеек.
+    process.env.AI_MOCK_USAGE = '1000000,100000,0';
+    await ai.understand('какая-то фраза для модели', kuid);
+    let bk = ai.budget(kuid);
+    ok(bk.kopecks === 1680, 'расход посчитан по ответу провайдера, а не по прикидке', bk.kopecks);
+    ok(bk.tokensIn === 1000000 && bk.tokensOut === 100000,
+      'токены записаны как есть', `${bk.tokensIn}/${bk.tokensOut}`);
+    ok(bk.mine === 1, 'два вызова spend — одно обращение, а не два', bk.mine);
+
+    /*
+     * Кэш подсказки: те же токены на входе, но девять десятых прочитаны из
+     * кэша — и счёт падает больше чем вдвое. Ради этого в запрос Anthropic и
+     * добавлена пометка cache_control.
+     */
+    const wasKop = bk.kopecks;
+    process.env.AI_MOCK_USAGE = '1000000,100000,900000';
+    await ai.understand('другая фраза для модели', kuid);
+    const cachedKop = ai.budget(kuid).kopecks - wasKop;
+    // 100000 не из кэша × 1200 + 100000 исх. × 4800 + 900000 из кэша × 120 = 708
+    ok(cachedKop === 708, 'прочитанное из кэша считается по своей цене', cachedKop);
+    ok(cachedKop < 1680, 'с кэшем подсказки обращение дешевле', `${cachedKop} против 1680`);
+
+    /*
+     * Провайдеры расходятся в том, входит ли кэш в input. Вычитать вслепую
+     * нельзя: у одних получится отрицательный расход, то есть возврат денег
+     * за обращение.
+     */
+    const wasKop2 = ai.budget(kuid).kopecks;
+    process.env.AI_MOCK_USAGE = '100,0,1000000';
+    await ai.understand('третья фраза для модели', kuid);
+    const oddKop = ai.budget(kuid).kopecks - wasKop2;
+    ok(oddKop === 120, 'кэша больше, чем входа, — расход не уходит в минус', oddKop);
+
+    // Снимок и голос: своя цена, потому что провайдер расход не возвращает.
+    process.env.AI_MOCK_USAGE = '1171,48,0';    // настоящая длина подсказки и ответа
+    const wasKop3 = ai.budget(kuid).kopecks;
+    await ai.understand('четвёртая фраза для модели', kuid);
+    const phraseKop = ai.budget(kuid).kopecks - wasKop3;
+    const photoKop = ai.spend(kuid, { photos: 1 });
+    const voiceKop = ai.spend(kuid, { voiceSeconds: 30 });
+    ok(photoKop === 90, 'снимок считается по своей цене', photoKop);
+    ok(voiceKop === 60, 'полминуты речи — половина цены минуты', voiceKop);
+    ok(photoKop > phraseKop * 20, 'снимок дороже фразы в десятки раз, а не равен ей',
+      `${photoKop} против ${phraseKop}`);
+
+    /*
+     * Главное: предел по деньгам останавливает, даже когда обращений
+     * осталось сколько угодно. Без этого снимки выедали бы счёт, не
+     * приближаясь к потолку в штуках.
+     */
+    bk = ai.budget(kuid);
+    process.env.AI_USER_KOPECKS = String(bk.kopecks);
+    process.env.AI_USER_LIMIT = '100000';
+    const stopped = await ai.understand('пятая фраза для модели', kuid);
+    ok(stopped.source === 'limit', 'предел по деньгам останавливает при свободных обращениях',
+      stopped.source);
+    ok(ai.budget(kuid).left === 0 && ai.budget(kuid).leftKopecks === 0,
+      'и это видно в бюджете', JSON.stringify({ left: ai.budget(kuid).left }));
+    delete process.env.AI_USER_LIMIT;
+
+    for (const [k, v] of Object.entries(envWas)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+
+    /*
      * Через бота — и здесь всё решает тумблер.
      *
      * Выключен: фраза разбирается, мастер открывается с подставленными
@@ -3273,6 +3376,10 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
 
     // Весь путь: пришло голосовое — бот показал услышанное и ответил долгами.
     sent.length = 0;
+    const aiMod = require('./lib/ai-agent');
+    const vuid = fxUserId();
+    process.env.AI_KOP_VOICE = '120';       // 1,2 ₽ за минуту
+    const kopBefore = aiMod.budget(vuid).kopecks;
     await handleUpdate(tg, {
       message: {
         message_id: 900, chat: CHAT, from: USER,
@@ -3282,6 +3389,16 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const texts = sent.map((m) => norm(m.text || ''));
     ok(texts.some((t) => t.includes('Услышал')), 'бот показал, что услышал', texts.join(' | ').slice(0, 120));
     ok(texts.some((t) => /должен|долг/i.test(t)), 'и выполнил услышанное');
+    /*
+     * И записал расход. Четыре секунды звука по 1,2 ₽ за минуту — восемь
+     * копеек. Тут проверяется не арифметика (она проверена выше), а то, что
+     * обработчик голоса вообще дошёл до кошелька: раньше секунды звука не
+     * стоили ничего, и запись на двадцать мегабайт весила в бюджете столько
+     * же, сколько фраза «кто мне должен», которую разбирает местный код.
+     */
+    ok(aiMod.budget(vuid).kopecks - kopBefore === 8,
+      'секунды звука записаны в расход', aiMod.budget(vuid).kopecks - kopBefore);
+    delete process.env.AI_KOP_VOICE;
 
     delete process.env.SPEECH_PROVIDER;
     delete process.env.SPEECH_MOCK;
