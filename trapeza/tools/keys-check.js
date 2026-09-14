@@ -38,6 +38,7 @@ const APP = path.join(__dirname, '..');
  * показываем: молча подменять окружение тоже нельзя.
  */
 const WATCH = ['ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'XAI_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
+  'GEMINI_API_KEY', 'GEMINI_BASE_URL',
   'VISION_PROVIDER', 'VISION_MODEL', 'SPEECH_PROVIDER', 'AI_ENABLED', 'AI_MODEL', 'AI_PROVIDER'];
 const shadowed = [];
 try {
@@ -249,6 +250,170 @@ async function checkOpenRouter(model, what) {
       + `пришло ${JSON.stringify(intent)}`);
   } catch (e) {
     no(`${what}: не достучались — ${e.message}`);
+  }
+}
+
+/**
+ * Куда сервер выходит в интернет.
+ *
+ * Нужно ровно в одном случае: провайдер ответил 403 до проверки ключа.
+ * Тогда вопрос не «тот ли ключ», а «откуда пришло обращение», и адрес —
+ * единственное, что на этот вопрос отвечает. Спрашиваем только при отказе,
+ * а не при каждом запуске: лишний поход наружу ради строчки в выводе.
+ */
+async function outboundIp() {
+  try {
+    const res = await fetch('https://api.ipify.org', { signal: AbortSignal.timeout(7000) });
+    return res.ok ? (await res.text()).trim() : '';
+  } catch (_) { return ''; }
+}
+
+/**
+ * Разбор фразы через Gemini — тот же вызов, что в lib/ai-agent.js.
+ *
+ * Проверяем не «принял ли ключ», а весь путь целиком: шлём живую фразу,
+ * которую местные регулярки специально не ловят, и смотрим на ответ тем же
+ * кодом, что стоит в бою (ai.sanitize). Ключ рабочий, ответ приходит, а
+ * внутри вместо JSON вежливое «конечно, вот что я понял» — бот на таком
+ * молча говорит «не понял», и догадаться неоткуда.
+ */
+async function checkGemini(model, what) {
+  if (!process.env.GEMINI_API_KEY) { skip(`${what}: GEMINI_API_KEY не заполнен`); return; }
+  const dirty = checkAscii(process.env.GEMINI_API_KEY, 'GEMINI_API_KEY');
+  if (dirty) { no(`${what}: ${dirty}`); return; }
+
+  const baseUrl = (process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
+  const PHRASE = 'надо бы выставить Заре за аренду тридцать тысяч';
+  try {
+    const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: ai.SYSTEM }] },
+        contents: [{ parts: [{ text: PHRASE }] }],
+        generationConfig: { temperature: 0.1, maxOutputTokens: 1500, responseMimeType: 'application/json' },
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+    const body = await res.text();
+
+    if (!res.ok) {
+      /*
+       * 403 у Google — это отказ на границе, до всякой проверки ключа: на
+       * неверный ключ приходит 400 с «API key not valid». Так отвечают
+       * обращению из страны, где сервис не работает, — с российского адреса
+       * этим уже встретили Anthropic и OpenRouter.
+       */
+      if (res.status === 403 || /location is not supported|user location/i.test(body)) {
+        const ip = await outboundIp();
+        no(`${what}: обращение отклонено до проверки ключа (${res.status}).\n`
+          + `      Ответ: ${String(body).replace(/\s+/g, ' ').slice(0, 300)}\n`
+          + '      На неверный ключ Google отвечает 400 «API key not valid», а не так, —\n'
+          + '      значит дело не в ключе, а в том, откуда пришло обращение.\n'
+          + `      Этот сервер выходит с адреса: ${ip || 'узнать не вышло'}\n`
+          + '      Рабочий путь с российского адреса — YandexGPT: AI_PROVIDER=yandexgpt');
+        return;
+      }
+      if (/API key not valid|API_KEY_INVALID/i.test(body)) {
+        no(`${what}: ключ GEMINI_API_KEY не принят — перевыпустите его в Google AI Studio`);
+        return;
+      }
+      if (res.status === 404 || /is not found|not supported/i.test(body)) {
+        no(`${what}: модели «${model}» у этого ключа нет.\n`
+          + `      Ответ: ${String(body).replace(/\s+/g, ' ').slice(0, 200)}\n`
+          + '      Проверьте написание в AI_MODEL.');
+        return;
+      }
+      if (res.status === 429 || /quota|RESOURCE_EXHAUSTED/i.test(body)) {
+        no(`${what}: квота исчерпана (429) — подождите или поднимите лимит в консоли Google`);
+        return;
+      }
+      no(`${what}: ${why(res.status, body)}`);
+      return;
+    }
+
+    let reply = '';
+    let usage = null;
+    try {
+      const data = JSON.parse(body);
+      reply = ((((data.candidates || [])[0] || {}).content || {}).parts || [{}])[0].text || '';
+      usage = data.usageMetadata || null;
+    } catch (_) { /* разберёмся ниже */ }
+    if (!reply) { no(`${what}: модель ответила пусто.\n      ${body.slice(0, 200)}`); return; }
+
+    let intent = null;
+    try {
+      const m = /\{[\s\S]*\}/.exec(reply);
+      intent = ai.sanitize(m ? JSON.parse(m[0]) : null);
+    } catch (_) { intent = { action: 'unknown' }; }
+
+    if (intent.action === 'draft') {
+      ok(`${what}: модель ${model} разобрала фразу — ${JSON.stringify(intent)}`);
+      /*
+       * Заодно показываем расход: именно по этим полям бот считает копейки,
+       * и если провайдер их не вернул, счётчик молча покажет ноль.
+       */
+      if (usage) {
+        const cached = Number(usage.cachedContentTokenCount) || 0;
+        console.log(`      расход: вход ${usage.promptTokenCount || 0}, выход `
+          + `${usage.candidatesTokenCount || 0}, из кэша ${cached}`
+          + (cached ? ' — кэш подсказки работает' : ' — кэш подсказки не включился'));
+      } else {
+        console.log('      ⚠ расход в ответе не пришёл — счётчик копеек покажет ноль');
+      }
+      return;
+    }
+    if (intent.action === 'unknown') {
+      no(`${what}: модель отвечает, но не по инструкции — вместо JSON пришло:\n`
+        + `      ${reply.replace(/\s+/g, ' ').slice(0, 200)}\n`
+        + '      Ключ и модель рабочие, но такой ответ бот понять не сможет.');
+      return;
+    }
+    no(`${what}: разбор получился, но не тот — ждали «выписать документ», `
+      + `пришло ${JSON.stringify(intent)}`);
+  } catch (e) {
+    no(`${what}: не достучались — ${e.message}`);
+  }
+}
+
+/** Распознавание снимка через Gemini — тем же запросом, что в lib/vision.js. */
+async function checkGeminiVision(model) {
+  if (!process.env.GEMINI_API_KEY) { skip(`Фото: GEMINI_API_KEY не заполнен`); return; }
+  const dirty = checkAscii(process.env.GEMINI_API_KEY, 'GEMINI_API_KEY');
+  if (dirty) { no(`Фото: ${dirty}`); return; }
+  const baseUrl = (process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
+  try {
+    const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { text: 'Ответь одним словом: ок' },
+            { inline_data: { mime_type: 'image/png', data: PNG_1PX } },
+          ],
+        }],
+        generationConfig: { temperature: 0, maxOutputTokens: 16 },
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+    const body = await res.text();
+    if (res.ok) { ok(`Фото: модель ${model} принимает картинки`); return; }
+    if (res.status === 403 || /location is not supported|user location/i.test(body)) {
+      const ip = await outboundIp();
+      no(`Фото: обращение отклонено до проверки ключа (${res.status}).\n`
+        + `      Ответ: ${String(body).replace(/\s+/g, ' ').slice(0, 300)}\n`
+        + `      Этот сервер выходит с адреса: ${ip || 'узнать не вышло'}\n`
+        + '      Рабочий путь с российского адреса — VISION_PROVIDER=yandex');
+      return;
+    }
+    if (/API key not valid|API_KEY_INVALID/i.test(body)) {
+      no('Фото: ключ GEMINI_API_KEY не принят — перевыпустите его в Google AI Studio');
+      return;
+    }
+    no(`Фото: ${why(res.status, body)}`);
+  } catch (e) {
+    no(`Фото: не достучались — ${e.message}`);
   }
 }
 
@@ -636,19 +801,30 @@ const ai = require(path.join(APP, 'lib/ai-agent'));
   // Спрашиваем ровно тот сервис, который выбран в .env. Раньше скрипт
   // всегда ломился в Anthropic и показывал его отказ даже там, где
   // распознавание давно переключено на Яндекс.
-  const vp = String(process.env.VISION_PROVIDER || '').toLowerCase();
+  /*
+   * Умолчания здесь — те же, что в самих модулях, а не «не задан».
+   *
+   * Раньше при пустом VISION_PROVIDER проверка говорила «распознавание
+   * выключено» и ничего не спрашивала. А lib/vision.js при пустой
+   * переменной берёт gemini и с ключом работает — то есть бот распознавал
+   * снимки, а проверка уверяла, что распознавания нет. Расхождение между
+   * инструментом и кодом хуже отсутствия инструмента: ему верят.
+   */
+  const vp = String(process.env.VISION_PROVIDER || 'gemini').toLowerCase();
   if (vp === 'anthropic') await checkAnthropic(process.env.VISION_MODEL || 'claude-sonnet-5', 'Фото');
   else if (vp === 'openrouter') {
     await checkOpenRouterVision(process.env.VISION_MODEL || 'anthropic/claude-sonnet-4.5');
   } else if (vp === 'yandex') await checkYandexVision();
-  else skip('Фото: VISION_PROVIDER не задан — распознавание выключено');
+  else if (vp === 'gemini') await checkGeminiVision(process.env.VISION_MODEL || 'gemini-3.6-flash');
+  else skip(`Фото: провайдер ${vp} — этой проверкой не покрыт`);
 
-  const ap = String(process.env.AI_PROVIDER || 'yandexgpt').toLowerCase();
+  const ap = String(process.env.AI_PROVIDER || 'gemini').toLowerCase();
   if (process.env.AI_ENABLED !== '1') skip('Фразы: AI_ENABLED не 1 — свободный ввод выключен');
   else if (ap === 'yandexgpt') await checkYandexGpt(process.env.AI_MODEL || ai.MODEL_DEFAULT);
   else if (ap === 'grok') await checkGrok(String(process.env.AI_MODEL || '').trim());
   else if (ap === 'anthropic') await checkAnthropic(process.env.AI_MODEL || ai.MODEL_DEFAULT, 'Фразы');
   else if (ap === 'openrouter') await checkOpenRouter(process.env.AI_MODEL || ai.MODEL_DEFAULT, 'Фразы');
+  else if (ap === 'gemini') await checkGemini(process.env.AI_MODEL || 'gemini-3.6-flash', 'Фразы');
   else skip(`Фразы: провайдер ${ap} — этой проверкой не покрыт`);
 
   const sp = String(process.env.SPEECH_PROVIDER || '').toLowerCase();
