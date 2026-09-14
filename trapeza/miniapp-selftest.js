@@ -17,6 +17,20 @@ const crypto = require('node:crypto');
 process.env.BOT_TOKEN = process.env.BOT_TOKEN || '111:TEST-TOKEN';
 process.env.FREE_DOCS = '2';          // лимит маленький — так его видно в тесте
 process.env.ENFORCE_LIMIT = '1';
+
+/*
+ * Ключи провайдеров убираем: прогон не должен зависеть от того, что лежит
+ * в окружении запускающего. Проверка «без распознавания речи отказ понятен»
+ * гасит SPEECH_PROVIDER, но одного YANDEX_API_KEY в окружении довольно,
+ * чтобы модуль счёл себя настроенным, — и прогон получал другой отказ, а то
+ * и ходил в сеть. Нужный ключ блок ставит себе сам.
+ */
+for (const k of ['GEMINI_API_KEY', 'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY', 'XAI_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
+  'VISION_PROVIDER', 'SPEECH_PROVIDER', 'AI_PROVIDER', 'AI_ENABLED', 'AI_MODEL',
+  'AI_MOCK', 'AI_MOCK_USAGE', 'DADATA_TOKEN']) {
+  delete process.env[k];
+}
 // DADATA_MOCK — это карта «значение → ответ справочника», а не флаг:
 // так прогон проверяет и разбор ответа, а не только факт вызова.
 // Данные выдуманные: настоящих организаций и людей в тестах не держим.
