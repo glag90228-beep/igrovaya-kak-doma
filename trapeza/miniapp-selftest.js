@@ -1109,6 +1109,43 @@ async function main() {
     const docsAfter = (await call('GET', '/api/docs', { user: masha })).json.docs.length;
     ok(docsBefore === docsAfter, 'переписка ничего не выписала сама', `${docsBefore} → ${docsAfter}`);
 
+    /*
+     * Отказ модели виден владельцу.
+     *
+     * Человеку показывают «попробуйте позже» — и правильно, чинить он это не
+     * может. А владельцу нужна причина: истёкший ключ и запрет провайдера по
+     * адресу выглядят одинаково, а чинятся по-разному. В боте такая запись
+     * была, в приложении её не было, и причина не оседала нигде.
+     */
+    {
+      const office = require('./lib/office');
+      const keep = {};
+      for (const k of ['AI_PROVIDER', 'AI_ENABLED', 'GEMINI_API_KEY', 'GEMINI_BASE_URL']) keep[k] = process.env[k];
+      process.env.AI_ENABLED = '1';
+      process.env.AI_PROVIDER = 'gemini';
+      process.env.GEMINI_API_KEY = 'test-key-not-real';   // латиницей: кириллица в заголовке падает раньше сети
+      // Адрес, который отказывает сразу: ждать 35 секунд тайм-аута незачем,
+      // а в сеть прогон не ходит вовсе.
+      process.env.GEMINI_BASE_URL = 'http://127.0.0.1:1';
+      const before = office.list('ai', 50).length;
+      r = await call('POST', '/api/ask', { user: masha, body: { text: 'посоветуй, что делать с должниками' } });
+      ok(r.status === 200 && /не отвечает/i.test(r.json.replyText || ''),
+        'при отказе модели человек видит «не отвечает», а не «не понял»',
+        `${r.status} ${(r.json || {}).replyText}`);
+      ok(r.json.source === 'error' && r.json.error === undefined,
+        'сырой ответ провайдера наружу не уходит', JSON.stringify(r.json.error));
+      const now = office.list('ai', 50);
+      ok(now.length === before + 1, 'отказ модели записан в журнал поддержки',
+        `${before} → ${now.length}`);
+      ok((now[0].error || '').length > 0, 'и в записи видна причина, а не пустая строка',
+        (now[0] || {}).error);
+      ok((now[0].where_at || '').includes('приложение'), 'видно, что это из приложения',
+        (now[0] || {}).where_at);
+      for (const [k, v] of Object.entries(keep)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+
     // Голос: без провайдера — честный отказ, с заглушкой — разбор.
     r = await call('POST', '/api/ask/voice', { user: masha, body: { audio: 'AAA=' } });
     ok(r.status === 400 && /не подключено|SPEECH/i.test(r.json.error || ''),

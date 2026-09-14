@@ -1722,6 +1722,25 @@ const api = {
     if (!text) return { error: 'Напишите или скажите, что нужно.' };
     bdb.saveAiMessage({ userId: user.id, source: 'miniapp', role: 'user', type: 'text', text });
     const intent = await ai.understand(text, user.id);
+    /*
+     * Отказ модели — владельцу в журнал поддержки, а из ответа убрать.
+     *
+     * Записи не было вовсе: человек видел «попробуйте позже», владелец не
+     * видел ничего. Истёкший ключ и запрет провайдера по адресу выглядят
+     * при этом одинаково, а чинятся по-разному.
+     *
+     * Убираем по двум причинам. Первая: в тексте лежит до двухсот символов
+     * ответа провайдера — не ключ, но и не то, что показывают клиенту.
+     * Вторая тише и хуже. Поле error в ответе router превращает в код 400,
+     * а api() в приложении на любой 400 бросает исключение с этим текстом.
+     * Значит ветка в app.js, написанная специально ради понятного
+     * объяснения при отказе модели, не выполнялась никогда — до неё просто
+     * не доходило. Ровно та беда, от которой её и заводили.
+     */
+    if (intent.source === 'error') {
+      office.record({ kind: 'ai', where: 'приложение', error: String(intent.error || ''), userId: user.id });
+      delete intent.error;
+    }
     const enriched = withCp(user, intent);
     const auto = bdb.isAiEnabled(user.id);
     const replyText = formatAiReply(intent, enriched, auto);
@@ -1770,6 +1789,10 @@ const api = {
       text: got.text, audioSeconds: seconds,
     });
     const intent = await ai.understand(got.text, user.id);
+    if (intent.source === 'error') {
+      office.record({ kind: 'ai', where: 'приложение, голос', error: String(intent.error || ''), userId: user.id });
+      delete intent.error;
+    }
     const enriched = withCp(user, intent);
     const auto = bdb.isAiEnabled(user.id);
     const replyText = formatAiReply(intent, enriched, auto);
