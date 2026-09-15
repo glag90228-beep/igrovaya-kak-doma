@@ -28,10 +28,16 @@
  * единице. Пределы в штуках остались вторым рубежом: они срабатывают, когда
  * провайдер расход не вернул и стоимость посчиталась нулём.
  *
+ * Личный предел зависит от подписки. Без неё — бесплатная доля: попробовать
+ * ассистента можно, жить на нём — нет. Документы подписка различала давно
+ * (quota в bot-db), а самое дорогое в продукте раздавалось всем поровну.
+ *
  *  AI_MONTHLY_KOPECKS   — предел расхода в месяц на всех (300000 = 3000 ₽).
- *  AI_USER_KOPECKS      — предел на одного пользователя (5000 = 50 ₽).
+ *  AI_USER_KOPECKS      — предел подписчика (5000 = 50 ₽).
+ *  AI_FREE_KOPECKS      — предел без подписки (500 = 5 ₽).
  *  AI_MONTHLY_LIMIT     — предел обращений к модели в месяц на всех (1000).
- *  AI_USER_LIMIT        — предел на одного пользователя в месяц (30).
+ *  AI_USER_LIMIT        — обращений у подписчика (30).
+ *  AI_FREE_LIMIT        — обращений без подписки (10).
  *
  * Цены провайдера — тоже из окружения, потому что меняются несколько раз в
  * год, а выкладка ради новой цифры — это выкладка ради цифры:
@@ -193,6 +199,39 @@ const KOP_VOICE = () => Number(process.env.AI_KOP_VOICE || 120);
 const KOP_ALL = () => Number(process.env.AI_MONTHLY_KOPECKS || 300000);   // 3000 ₽
 const KOP_USER = () => Number(process.env.AI_USER_KOPECKS || 5000);       // 50 ₽
 
+/*
+ * Предел зависит от подписки, а не только от человека.
+ *
+ * Раньше не зависел вовсе: бесплатный пользователь и подписчик получали
+ * одинаковые 30 обращений и 50 ₽ расхода. Документы подписка при этом
+ * различала честно (quota в bot-db), а самое дорогое в продукте — обращения
+ * к модели — раздавалось всем поровну. То есть за ассистента платил владелец
+ * бота, а не тот, кто им пользуется.
+ *
+ * Бесплатная доля нужна: без неё ассистента не попробовать, а не попробовав
+ * — не купить. Но доля, а не столько же.
+ *
+ *  AI_FREE_KOPECKS — расход без подписки (500 = 5 ₽)
+ *  AI_FREE_LIMIT   — обращений без подписки (10)
+ */
+const KOP_FREE = () => Number(process.env.AI_FREE_KOPECKS || 500);        // 5 ₽
+const LIMIT_FREE = () => Number(process.env.AI_FREE_LIMIT || 10);
+
+/**
+ * Оплачен ли доступ.
+ *
+ * Спрашиваем базу напрямую, а не через bot-db: тот тянет за собой половину
+ * проекта, а нам нужно одно поле. Календарь московский — тот же, по которому
+ * считается месячная квота документов, иначе подписка «до сегодня» кончалась
+ * бы у разных счётчиков в разные часы.
+ */
+const { todayISO } = require('./period');
+
+function paidAccess(userId) {
+  const u = db.prepare('SELECT access_until FROM bot_users WHERE id = ?').get(userId) || {};
+  return Boolean(u.access_until && String(u.access_until) >= todayISO());
+}
+
 /**
  * Во что обошлось обращение. Считаем по ФАКТУ, а не по прикидке: сколько
  * токенов ушло, знает только провайдер, и он это возвращает.
@@ -230,16 +269,22 @@ const usageOf = (userId) => db.prepare(
 function budget(userId) {
   const all = usageOf(0);
   const mine = usageOf(userId);
-  const leftCalls = Math.max(0, Math.min(LIMIT_ALL() - all.calls, LIMIT_USER() - mine.calls));
-  const leftKop = Math.max(0, Math.min(KOP_ALL() - all.kopecks, KOP_USER() - mine.kopecks));
+  // Подписка поднимает личный предел; общий предел владельца она не трогает —
+  // он про его собственный счёт у провайдера, а не про то, кто заплатил нам.
+  const paid = paidAccess(userId);
+  const myCalls = paid ? LIMIT_USER() : LIMIT_FREE();
+  const myKop = paid ? KOP_USER() : KOP_FREE();
+  const leftCalls = Math.max(0, Math.min(LIMIT_ALL() - all.calls, myCalls - mine.calls));
+  const leftKop = Math.max(0, Math.min(KOP_ALL() - all.kopecks, myKop - mine.kopecks));
   return {
     all: all.calls,
     mine: mine.calls,
+    paid,
     limitAll: LIMIT_ALL(),
-    limitUser: LIMIT_USER(),
+    limitUser: myCalls,
     kopecks: mine.kopecks,
     kopecksAll: all.kopecks,
-    limitKopecks: KOP_USER(),
+    limitKopecks: myKop,
     limitKopecksAll: KOP_ALL(),
     tokensIn: mine.tokens_in,
     tokensOut: mine.tokens_out,

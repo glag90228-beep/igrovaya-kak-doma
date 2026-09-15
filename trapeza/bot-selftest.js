@@ -3321,7 +3321,8 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const kuid = uid + 900001;               // отдельный кошелёк, чужого не заденем
     const envWas = {};
     for (const k of ['AI_KOP_IN', 'AI_KOP_OUT', 'AI_KOP_CACHED', 'AI_KOP_PHOTO',
-      'AI_KOP_VOICE', 'AI_USER_KOPECKS', 'AI_MONTHLY_KOPECKS', 'AI_MOCK_USAGE']) {
+      'AI_KOP_VOICE', 'AI_USER_KOPECKS', 'AI_MONTHLY_KOPECKS', 'AI_MOCK_USAGE',
+      'AI_FREE_KOPECKS', 'AI_FREE_LIMIT']) {
       envWas[k] = process.env[k];
     }
     // Цены задаём руками: умолчания меняются, а числа в проверках — нет.
@@ -3332,6 +3333,10 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     process.env.AI_KOP_VOICE = '120';        // 1,2 ₽ за минуту речи
     process.env.AI_MONTHLY_KOPECKS = '100000000';
     process.env.AI_USER_KOPECKS = '100000000';
+    // Кошелёк kuid без подписки, значит действует бесплатная доля — её тоже
+    // поднимаем: этот блок про арифметику расхода, а не про пределы.
+    process.env.AI_FREE_KOPECKS = '100000000';
+    process.env.AI_FREE_LIMIT = '100000';
     process.env.AI_MOCK = '{"action":"debts"}';
 
     // Миллион входных и сто тысяч исходящих: 1200 + 480 копеек.
@@ -3386,6 +3391,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
      */
     bk = ai.budget(kuid);
     process.env.AI_USER_KOPECKS = String(bk.kopecks);
+    process.env.AI_FREE_KOPECKS = String(bk.kopecks);   // kuid без подписки
     process.env.AI_USER_LIMIT = '100000';
     const stopped = await ai.understand('пятая фраза для модели', kuid);
     ok(stopped.source === 'limit', 'предел по деньгам останавливает при свободных обращениях',
@@ -3396,6 +3402,65 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
 
     for (const [k, v] of Object.entries(envWas)) {
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+
+    /*
+     * ── предел зависит от подписки ──
+     *
+     * Документы подписка различала давно, а обращения к модели — самое
+     * дорогое в продукте — раздавались всем поровну: бесплатному ровно
+     * столько же, сколько заплатившему. То есть за ассистента платил
+     * владелец бота, а не тот, кто им пользуется.
+     */
+    {
+      const bill = require('./lib/billing');
+      const freeUid = uid + 910001;
+      const paidUid = uid + 910002;
+      const keep2 = {};
+      for (const k of ['AI_USER_KOPECKS', 'AI_FREE_KOPECKS', 'AI_USER_LIMIT', 'AI_FREE_LIMIT']) {
+        keep2[k] = process.env[k];
+      }
+      process.env.AI_USER_KOPECKS = '5000';
+      process.env.AI_FREE_KOPECKS = '500';
+      process.env.AI_USER_LIMIT = '30';
+      process.env.AI_FREE_LIMIT = '10';
+
+      // Пользователи должны существовать: подписка живёт в их карточке.
+      const bdbB = require('./lib/bot-db');
+      const freeId = bdbB.getOrCreateUser(freeUid).id;
+      const paidId = bdbB.getOrCreateUser(paidUid).id;
+
+      const free = ai.budget(freeId);
+      ok(free.paid === false, 'без подписки так и помечено', String(free.paid));
+      ok(free.limitKopecks === 500 && free.limitUser === 10,
+        'без подписки доля меньше', `${free.limitKopecks} коп., ${free.limitUser} обращений`);
+
+      bill.grantDays(paidId, 30);
+      const paid = ai.budget(paidId);
+      ok(paid.paid === true, 'с подпиской так и помечено', String(paid.paid));
+      ok(paid.limitKopecks === 5000 && paid.limitUser === 30,
+        'подписка поднимает предел', `${paid.limitKopecks} коп., ${paid.limitUser} обращений`);
+      ok(paid.limitKopecks === free.limitKopecks * 10,
+        'разница между долей и подпиской не на словах',
+        `${free.limitKopecks} против ${paid.limitKopecks}`);
+
+      /*
+       * Бесплатная доля кончается раньше — и на этом обращения к модели
+       * прекращаются. Проверяем не число в объекте, а поведение understand.
+       */
+      process.env.AI_MOCK = '{"action":"debts"}';
+      ai.spend(freeId, { usage: { in: 0, out: 0, cached: 0 }, photos: 6 }); // 6 × 90 = 540 коп.
+      const stop = await ai.understand('какая-то фраза для модели', freeId);
+      ok(stop.source === 'limit', 'бесплатная доля исчерпана — к модели не идём', stop.source);
+
+      // А у подписчика тот же расход предела не достигает.
+      ai.spend(paidId, { usage: { in: 0, out: 0, cached: 0 }, photos: 6 });
+      const still = await ai.understand('какая-то фраза для модели', paidId);
+      ok(still.source === 'model', 'у подписчика тот же расход ещё в пределах', still.source);
+
+      for (const [k, v] of Object.entries(keep2)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
     }
 
     /*
