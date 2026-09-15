@@ -65,6 +65,7 @@
  */
 
 const { db } = require('../db');
+const knowledge = require('./knowledge');
 
 /*
  * Модель по умолчанию — маленькая, и это не экономия на спичках.
@@ -715,7 +716,7 @@ const SYSTEM = `Ты помощник в боте «Первичка»: он в�
  * раза, а считать деньги по вранью нельзя. Поэтому каждая ветка достаёт
  * usage из ответа и приводит к одному виду: `{in, out, cached}`.
  */
-async function callModel(text) {
+async function callModel(text, systemPrompt = SYSTEM) {
   const p = PROVIDER();
   if (p === 'mock') {
     // Расход подделки задаётся как «вход,выход,из кэша» — так в тестах
@@ -745,7 +746,7 @@ async function callModel(text) {
       signal,
       headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify({
-        system_instruction: { parts: [{ text: SYSTEM }] },
+        system_instruction: { parts: [{ text: systemPrompt }] },
         contents: [{ parts: [{ text: String(text).slice(0, 1000) }] }],
         generationConfig: {
           temperature: 0.1,
@@ -790,7 +791,7 @@ async function callModel(text) {
         modelUri: yandexModelUri(model),
         completionOptions: { stream: false, temperature: 0.1, maxTokens: String(maxTokens) },
         messages: [
-          { role: 'system', text: SYSTEM },
+          { role: 'system', text: systemPrompt },
           { role: 'user', text: String(text).slice(0, 1000) },
         ],
       }),
@@ -827,7 +828,7 @@ async function callModel(text) {
         max_tokens: maxTokens,
         temperature: 0.1,
         messages: [
-          { role: 'system', content: SYSTEM },
+          { role: 'system', content: systemPrompt },
           { role: 'user', content: String(text).slice(0, 1000) },
         ],
       }),
@@ -861,7 +862,7 @@ async function callModel(text) {
         max_tokens: maxTokens,
         temperature: 0.1,
         messages: [
-          { role: 'system', content: SYSTEM },
+          { role: 'system', content: systemPrompt },
           { role: 'user', content: String(text).slice(0, 1000) },
         ],
       }),
@@ -901,7 +902,7 @@ async function callModel(text) {
          * — пометка просто не сработает, лишнего не спишется. Сработало или
          * нет, видно в usage: cache_read_input_tokens больше нуля.
          */
-        system: [{ type: 'text', text: SYSTEM, cache_control: { type: 'ephemeral' } }],
+        system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
         messages: [{ role: 'user', content: String(text).slice(0, 1000) }],
       }),
     });
@@ -931,7 +932,7 @@ async function callModel(text) {
         model: process.env.AI_MODEL || 'gpt-4o-mini',
         max_tokens: maxTokens,
         messages: [
-          { role: 'system', content: SYSTEM },
+          { role: 'system', content: systemPrompt },
           { role: 'user', content: String(text).slice(0, 1000) },
         ],
       }),
@@ -1025,6 +1026,45 @@ function dropInventedVat(intent, text) {
   return rest;
 }
 
+/*
+ * ── Ответ на налоговый вопрос ──
+ *
+ * Порядок строгий и меняться не должен:
+ *   1) своя база — ответ с нормой, за него мы отвечаем;
+ *   2) модель — с пометкой «не сверяли», если владелец это разрешил;
+ *   3) отказ — как раньше.
+ *
+ * Тумблер AI_TAX_ANSWERS выключен по умолчанию, и это не перестраховка.
+ * Записи базы собраны по нормам, но сверить их с nalog.gov.ru при написании
+ * было нельзя — сайт недоступен из среды разработки. Неверная цифра здесь
+ * стоит не «неудобно», а штрафа человеку. Включать после сверки.
+ *
+ * Стоит это дороже разбора фразы: ответ идёт не в 48 токенов, а в несколько
+ * сотен. Поэтому расход считается тем же счётчиком и упирается в тот же
+ * предел — бесплатная доля кончится быстрее, и это честно.
+ */
+const taxAnswersOn = () => process.env.AI_TAX_ANSWERS === '1';
+
+async function answerTax(question, userId) {
+  const found = knowledge.lookup(question);
+  if (found) return { text: knowledge.render(found), from: 'base', id: found.entry.id };
+
+  if (!taxAnswersOn()) return { text: null, from: 'off' };
+  if (!aiAvailable()) return { text: null, from: 'off' };
+  if (budget(userId).left <= 0) return { text: null, from: 'limit' };
+
+  spend(userId);
+  try {
+    const { text: raw, usage } = await callModel(question, knowledge.TAX_SYSTEM);
+    spend(userId, { usage });
+    const where = `модель ${process.env.AI_MODEL || MODEL_DEFAULT}`;
+    const out = knowledge.renderExternal(raw, where);
+    return out ? { text: out, from: 'model' } : { text: null, from: 'offtopic' };
+  } catch (e) {
+    return { text: null, from: 'error', error: e.message };
+  }
+}
+
 async function understand(text, userId) {
   const quick = quickParse(text);
   if (quick) return { ...quick, source: 'local' };
@@ -1051,4 +1091,5 @@ async function understand(text, userId) {
 module.exports = {
   understand, quickParse, sanitize, matchCp, budget, spend,
   aiAvailable, aiHint, MODEL_DEFAULT, SHOW_ACTIONS, SYSTEM, OUTOFSCOPE_REPLY,
+  answerTax, taxAnswersOn,
 };

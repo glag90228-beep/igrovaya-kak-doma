@@ -2508,6 +2508,20 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
    * и говорим, что умеем вместо этого.
    */
   if (intent.action === 'outofscope') {
+    /*
+     * Сначала пробуем ответить, и только потом отказываем.
+     *
+     * Раньше здесь был глухой отказ на всё подряд. Владелец попросил, чтобы
+     * ассистент отвечал и на налоговые вопросы — по своей базе, а чего в ней
+     * нет, то с пометкой, что не сверяли. Отказ остался последним рубежом:
+     * когда и базе нечего сказать, и модель не разрешена или не ответила.
+     */
+    const got = await ai.answerTax(text, user.id);
+    if (got.text) {
+      logAiReply(got.from === 'base' ? `Справка из базы (${got.id})` : 'Справка моделью, не сверено');
+      await tg.sendMessage(chatId, esc(got.text), mainMenu());
+      return true;
+    }
     logAiReply('Вне компетенции (налоги, зарплата)');
     await tg.sendMessage(chatId, ai.OUTOFSCOPE_REPLY, mainMenu());
     return true;

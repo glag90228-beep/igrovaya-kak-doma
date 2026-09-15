@@ -303,7 +303,8 @@ function formatAiReply(intent, withCpRes, auto) {
   if (intent.action === 'cps') return 'Открываю список контрагентов.';
   if (intent.action === 'org') return 'Открываю реквизиты организации.';
   if (intent.action === 'vat') return 'Открываю настройки НДС.';
-  if (intent.action === 'outofscope') return ai.OUTOFSCOPE_REPLY;
+  // Справка есть — её и показываем; нет — прежний отказ.
+  if (intent.action === 'outofscope') return intent.taxAnswer || ai.OUTOFSCOPE_REPLY;
   if (intent.action === 'draft') {
     if (withCpRes && withCpRes.cpChoices && withCpRes.cpChoices.length) return `Уточните клиента: «${intent.who}»?`;
     if (withCpRes && withCpRes.cpMissing) return `Клиента «${intent.who}» пока нет в базе.`;
@@ -1722,6 +1723,14 @@ const api = {
     if (!text) return { error: 'Напишите или скажите, что нужно.' };
     bdb.saveAiMessage({ userId: user.id, source: 'miniapp', role: 'user', type: 'text', text });
     const intent = await ai.understand(text, user.id);
+    /*
+     * Налоговый вопрос: сначала своя база, потом — если владелец разрешил —
+     * модель с пометкой «не сверяли». Глухой отказ остался последним рубежом.
+     */
+    if (intent.action === 'outofscope') {
+      const got = await ai.answerTax(text, user.id);
+      if (got.text) intent.taxAnswer = got.text;
+    }
     /*
      * Отказ модели — владельцу в журнал поддержки, а из ответа убрать.
      *

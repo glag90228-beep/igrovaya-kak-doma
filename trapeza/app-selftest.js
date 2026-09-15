@@ -427,7 +427,15 @@ const ok = (c, m, extra) => {
     'и документ действительно не выписан', `${docsWas} → ${bdb.listDocs(user.id, 50).length}`);
   bdb.setAiEnabled(user.id, true);
 
-  await page.locator('.ask-input').fill('когда платить взносы за себя');
+  /*
+   * Фраза нарочно такая, которой в базе ответов НЕТ.
+   *
+   * Раньше здесь стояло «когда платить взносы за себя» — и проверка сломалась,
+   * как только появилась база: на этот вопрос бот теперь отвечает по норме, а
+   * не отказывает. Отказ остался последним рубежом, и проверять его надо тем,
+   * до чего база не достаёт.
+   */
+  await page.locator('.ask-input').fill('посчитай мне зарплату сотрудникам за июль');
   await page.locator('.ask-input').press('Enter');
   await page.waitForTimeout(900);
   const last = await page.evaluate(() => {
@@ -447,6 +455,24 @@ const ok = (c, m, extra) => {
     'текст тот же, что в боте, и порядок слов не вывихнут', last.slice(0, 120));
   ok(last.replace(/\s+/g, ' ').includes(OUTOFSCOPE_REPLY.split('\n')[0].replace(/\s+/g, ' ')),
     'приложение показывает текст сервера, а не свой', last.slice(0, 80));
+
+  /*
+   * А на то, что в базе есть, приходит справка — и обязательно с нормой.
+   * Ссылка на статью здесь не украшение: она и есть разница между «бот
+   * сказал» и «так написано в законе».
+   */
+  await page.locator('.ask-input').fill('когда платить взносы за себя');
+  await page.locator('.ask-input').press('Enter');
+  await page.waitForTimeout(900);
+  const spravka = await page.evaluate(() => {
+    const all = document.querySelectorAll('.bubble');
+    return all[all.length - 1].textContent;
+  });
+  ok(/28 декабря/.test(spravka), 'на вопрос из базы приходит справка, а не отказ',
+    spravka.slice(0, 70));
+  ok(/Основание:/.test(spravka) && /ст\. 430/.test(spravka),
+    'и под ней стоит норма', spravka.slice(-90));
+  ok(/не консультация/.test(spravka), 'и оговорка, что это не консультация');
 
   // Строка ввода приклеена к низу — последний ответ не должен под ней прятаться.
   const fits = await page.evaluate(() => {

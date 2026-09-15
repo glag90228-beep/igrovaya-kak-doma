@@ -97,6 +97,97 @@ const ok = (c, m, extra) => {
     'заглушённые повторы всё равно записаны',
     String(listed.filter((r) => r.error === 'boom').length));
 
+  console.log('\n── база ответов по налогам ──');
+  {
+    const kn = require('./lib/knowledge');
+    const ai2 = require('./lib/ai-agent');
+    const bdb2 = require('./lib/bot-db');
+    const uid2 = bdb2.getOrCreateUser(556001).id;
+
+    /*
+     * Главное правило базы: ответ без нормы наружу не выходит. Ссылка на
+     * статью — это и есть разница между «бот сказал» и «так написано в
+     * законе», и проверять её надо не на глаз, а по всем записям сразу.
+     */
+    const noSource = kn.ENTRIES.filter((e) => !e.source || !e.source.law || !e.source.article);
+    ok(noSource.length === 0, 'у каждой записи есть норма',
+      noSource.map((e) => e.id).join(' '));
+    const noYears = kn.ENTRIES.filter((e) => !Array.isArray(e.checkedFor) || !e.checkedFor.length);
+    ok(noYears.length === 0, 'у каждой записи сказано, на какие годы её проверяли',
+      noYears.map((e) => e.id).join(' '));
+    const dupe = kn.ENTRIES.map((e) => e.id).filter((v, i, a) => a.indexOf(v) !== i);
+    ok(dupe.length === 0, 'имена записей не повторяются', dupe.join(' '));
+
+    // Год из вопроса — и в полной форме, и в разговорной.
+    ok(kn.yearFrom('патент в 2027 году') === 2027, 'год четырьмя цифрами');
+    ok(kn.yearFrom('расскажи про патент в 26 году') === 2026, 'год двумя цифрами');
+    ok(kn.yearFrom('какой лимит на патенте') === null, 'года нет — и не выдумываем');
+
+    // Разные вопросы одной темы ведут к разным записям.
+    ok(kn.lookup('какой лимит на патенте').entry.id === 'psn-limit', 'лимит — своя запись');
+    ok(kn.lookup('когда подавать заявление на патент').entry.id === 'psn-apply', 'сроки — своя');
+    ok(kn.lookup('расскажи про патент').entry.id === 'psn-what', 'общий вопрос — общая запись');
+    ok(kn.lookup('как приготовить борщ') === null, 'чужая тема в базу не лезет');
+
+    // Устаревание: год вне проверенных — предупреждение, а не молчаливая ложь.
+    const old = kn.lookup('патент в 2031 году');
+    ok(old && old.covers === false, 'непроверенный год отмечен', String(old && old.covers));
+    ok(/не скажу/.test(kn.render(old)), 'и человек об этом читает, а не догадывается');
+    ok(!/не скажу/.test(kn.render(kn.lookup('патент в 2026 году'))),
+      'а проверенный год лишней тревогой не пугает');
+
+    // В каждом ответе — норма и оговорка, что это не консультация.
+    for (const e of kn.ENTRIES) {
+      const out = kn.render({ entry: e, year: null, covers: true });
+      if (!/Основание:/.test(out) || !/не консультация/.test(out)) {
+        ok(false, `ответ «${e.id}» без нормы или без оговорки`);
+      }
+    }
+    ok(true, 'в каждом ответе базы есть норма и оговорка');
+
+    /*
+     * Ответ не из базы размечается ИНАЧЕ — в этом вся его безопасность.
+     * Человек должен видеть с первой строки, проверяли мы это или нет.
+     */
+    const ext = kn.renderExternal('Ставка такая-то.', 'модель X');
+    ok(/нет в моей проверенной базе/.test(ext) || /проверенной базе нет/.test(ext),
+      'ответ не из базы прямо помечен', ext.slice(0, 60));
+    ok(/модель X/.test(ext), 'и названо, чем отвечали');
+    ok(kn.renderExternal(kn.OFFTOPIC, 'модель X') === null,
+      'модель сказала «не по теме» — наружу ничего не идёт');
+    ok(kn.renderExternal('   ', 'модель X') === null, 'пустой ответ наружу не идёт');
+
+    /*
+     * Тумблер. Пока записи не сверены с официальным источником, отвечать
+     * моделью на налоговые вопросы нельзя — поэтому по умолчанию выключено.
+     */
+    const wasTax = process.env.AI_TAX_ANSWERS;
+    const wasEn = process.env.AI_ENABLED;
+    const wasPr = process.env.AI_PROVIDER;
+    delete process.env.AI_TAX_ANSWERS;
+    process.env.AI_ENABLED = '1';
+    process.env.AI_PROVIDER = 'mock';
+    process.env.AI_MOCK = 'Какой-то ответ про НДФЛ.';
+    ok(ai2.taxAnswersOn() === false, 'по умолчанию ответы моделью выключены');
+    const off = await ai2.answerTax('когда сдавать 6-НДФЛ', uid2);
+    ok(off.text === null && off.from === 'off',
+      'выключено — модель не спрашивается вовсе', off.from);
+
+    // База отвечает и при выключенном тумблере: её записи мы писали сами.
+    const fromBase = await ai2.answerTax('какой лимит на патенте', uid2);
+    ok(fromBase.from === 'base' && /Основание/.test(fromBase.text),
+      'база отвечает независимо от тумблера', fromBase.from);
+
+    process.env.AI_TAX_ANSWERS = '1';
+    const viaModel = await ai2.answerTax('когда сдавать 6-НДФЛ', uid2);
+    ok(viaModel.from === 'model' && /проверенной базе нет/.test(viaModel.text),
+      'включено — отвечает моделью и честно помечает', viaModel.from);
+
+    if (wasTax === undefined) delete process.env.AI_TAX_ANSWERS; else process.env.AI_TAX_ANSWERS = wasTax;
+    if (wasEn === undefined) delete process.env.AI_ENABLED; else process.env.AI_ENABLED = wasEn;
+    if (wasPr === undefined) delete process.env.AI_PROVIDER; else process.env.AI_PROVIDER = wasPr;
+  }
+
   console.log('\n── три службы открывают базу разом ──');
   {
     /*
