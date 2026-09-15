@@ -83,6 +83,67 @@ function postJson(serverInstance, path, headers, body) {
   ok(platega.daysFor({ amount: 3490 }) === 365, '3490 ₽ дают 365 дней');
   ok(platega.daysFor({ amount: 99999 }) === 30, 'неизвестная сумма даёт дефолтный срок 30 дней');
 
+  console.log('\n── настоящий ответ Platega с боевого платежа ──');
+  {
+    /*
+     * Это не выдуманный пример. Так выглядит вебхук, пришедший на боевой
+     * сервер 15.09.2026 после первого настоящего платежа: поля, статус и
+     * номер способа оплаты — оттуда. До него форма ответа была написана по
+     * общей документации и не подтверждена ничем.
+     *
+     * Номера и идентификаторы обезличены, содержательная форма сохранена.
+     */
+    const живой = {
+      id: 'f5d5f024-0000-0000-0000-000000000000',
+      amount: 378.67,                     // ЗА ВЫЧЕТОМ комиссии: платили 390
+      currency: 'RUB',
+      status: 'CONFIRMED',
+      paymentMethod: 2,                   // СБП — подтверждено живым платежом
+      payload: JSON.stringify({ userId: 1, tgId: 700000000, plan: 'month', ts: 1789459961549 }),
+    };
+    const r = platega.parseWebhook(живой);
+    ok(r.ok, 'настоящий вебхук разобран', r.ok ? '' : r.reason);
+    ok(r.payment.paid === true, 'CONFIRMED считается оплатой');
+    ok(r.payment.amount === 378.67, 'сумма взята как есть', String(r.payment.amount));
+    ok(r.payment.tgId === 700000000, 'Telegram-id вернулся в payload — человек опознан',
+      String(r.payment.tgId));
+    ok(r.payment.paymentMethod === 2, 'способ оплаты 2 = СБП');
+
+    /*
+     * Тот платёж шёл ДО правки, и days в payload не было. Проверяем, что
+     * старые платежи не ломаются: срок подбирается по сумме с допуском.
+     */
+    ok(r.payment.days === 0, 'в старом платеже срока нет — так и должно быть');
+    const wasP = process.env.LAVA_PLAN_DAYS;
+    process.env.LAVA_PLAN_DAYS = '390:30,2990:365';
+    ok(platega.daysFor(r.payment) === 30, 'и он всё равно опознан как месяц',
+      String(platega.daysFor(r.payment)));
+    if (wasP === undefined) delete process.env.LAVA_PLAN_DAYS; else process.env.LAVA_PLAN_DAYS = wasP;
+
+    /*
+     * Ответ площадки должен лежать в базе разобранным с одного раза.
+     * Лежал с двух: lava отдаёт объект, platega — строку, а recordPayment
+     * кодировал всё подряд ещё раз. Разбор происшествия начинался с
+     * «payload не вернулся», хотя он вернулся.
+     */
+    const billing2 = require('./lib/billing');
+    const bdb2 = require('./lib/bot-db');
+    const uid2 = bdb2.getOrCreateUser(559001).id;
+    for (const [вид, raw] of [['строкой', JSON.stringify(живой)], ['объектом', живой]]) {
+      const ext = `raw-${вид}-${Date.now()}`;
+      billing2.recordPayment({
+        externalId: ext, provider: 'platega', userId: uid2, email: '',
+        amount: 378.67, currency: 'RUB', days: 30, status: 'CONFIRMED', raw,
+      });
+      const row = billing2.findPayment('platega', ext);
+      let parsed = null;
+      try { parsed = JSON.parse(row.raw); } catch (_) { parsed = null; }
+      ok(parsed && typeof parsed === 'object' && parsed.id === живой.id,
+        `ответ, переданный ${вид}, читается одним JSON.parse`,
+        parsed === null ? 'не разобрался' : typeof parsed);
+    }
+  }
+
   console.log('\n── Platega: срок берётся из выбора человека, а не из зачисленной суммы ──');
   {
     const was = process.env.LAVA_PLAN_DAYS;

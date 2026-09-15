@@ -307,6 +307,12 @@ function nearDuplicate(p) {
     .get(p.provider || 'lava', Number(p.amount) || 0, p.status || '', since, email || uid) || null;
 }
 
+/** Ответ площадки в текст: объект кодируем, готовую строку оставляем как есть. */
+function rawText(raw) {
+  if (!raw) return '';
+  return (typeof raw === 'string' ? raw : JSON.stringify(raw)).slice(0, 4000);
+}
+
 function recordPayment(p) {
   // Точное совпадение идентификатора — это ровно та же доставка того же
   // платежа. Записывать нечего, и дней тоже.
@@ -328,6 +334,20 @@ function recordPayment(p) {
    * Кто это был на самом деле — повтор доставки или вторая покупка — решает
    * человек, и для этого ему нужно сначала увидеть строку.
    */
+  /*
+   * Ответ площадки храним ОДИН раз закодированным.
+   *
+   * Поставщики приносят его по-разному: lib/lava.js отдаёт объект,
+   * lib/platega.js — уже готовую строку. Здесь стояло безусловное
+   * JSON.stringify, и строка кодировалась второй раз. В базе оказывалось
+   * "{\"id\":…}" вместо {"id":…}: разобрать такое можно только двумя
+   * JSON.parse подряд, о чём никто не догадается.
+   *
+   * Цена ошибки — не место в базе, а разбор происшествия. Первая же попытка
+   * посмотреть, что прислала площадка, дала «полей: 0, 1, 2, … 202» —
+   * номера символов строки, — и вывод «payload не вернулся», хотя он
+   * вернулся. По такому выводу чинят то, что не сломано.
+   */
   const near = nearDuplicate(p);
   const days = near ? 0 : (Number(p.days) || 0);
 
@@ -336,7 +356,7 @@ function recordPayment(p) {
     VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
     String(p.externalId), p.provider || 'lava', near ? 0 : (p.userId || 0), norm(p.email),
     Number(p.amount) || 0, p.currency || 'RUB', days,
-    p.status || '', p.raw ? JSON.stringify(p.raw).slice(0, 4000) : '', new Date().toISOString(),
+    p.status || '', rawText(p.raw), new Date().toISOString(),
   );
   const payment = findPayment(p.provider || 'lava', p.externalId);
   return {
