@@ -3223,6 +3223,90 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     delete process.env.AI_USER_LIMIT;
 
     /*
+     * ── модель не решает за человека, какой НДС ──
+     *
+     * На боевом замере фраза «надо бы выставить Заре за аренду тридцать
+     * тысяч» — где про налог ни слова — вернула "vatRate": null. А null в
+     * нашем коде значит не «не знаю», а «без НДС», и отменяет ставку
+     * организации: плательщик НДС получил бы счёт без НДС. Такую ошибку
+     * первым замечает покупатель, а не тот, кто выписал.
+     */
+    const vatMock = JSON.stringify({
+      action: 'draft', docType: 'sch', who: 'Заря',
+      items: [{ name: 'Аренда', qty: 1, price: 30000 }],
+      vatRate: null, priceIncludesVat: false,
+    });
+    process.env.AI_MOCK = vatMock;
+    const silent = await ai.understand('надо бы выставить Заре за аренду тридцать тысяч', uid);
+    ok(silent.action === 'draft', 'документ всё равно разобран', silent.action);
+    ok(silent.vatRate === undefined && silent.priceIncludesVat === undefined,
+      'про НДС не говорили — выдуманная ставка отброшена', JSON.stringify(silent.vatRate));
+
+    /*
+     * А когда сказали — уважаем сказанное. Фразы здесь нарочно такие, что
+     * местный разбор их не берёт: иначе проверялся бы он, а не защита.
+     * Первая версия этой проверки на том и обожглась.
+     */
+    process.env.AI_MOCK = JSON.stringify({
+      action: 'draft', docType: 'sch', who: 'Заря', items: [],
+      vatRate: 22, priceIncludesVat: true,
+    });
+    const rate = await ai.understand('счёт Заре, в т.ч. НДС 22', uid);
+    ok(rate.source === 'model', 'фраза дошла до модели, а не осела в regex', rate.source);
+    ok(rate.vatRate === 22 && rate.priceIncludesVat === true,
+      'названную ставку не трогаем', JSON.stringify(rate.vatRate));
+
+    process.env.AI_MOCK = vatMock;      // тот же ответ с vatRate: null
+    const said = await ai.understand('счёт Заре на 30000, НДС сверху не нужен', uid);
+    ok(said.vatRate === null, 'сказали про НДС — null сохранён как «без НДС»',
+      JSON.stringify(said.vatRate));
+
+    /*
+     * ── «счёт с НДС» — это документ, а не вопрос про налоги ──
+     *
+     * Правила выписки ловят фразу с глаголом. Без глагола — «счёт Заре, в
+     * т.ч. НДС 22» — черновик собрать не из чего, и фраза доезжала до отказа
+     * «налоги и отчётность не веду»: и документ не выписали, и обвинили в
+     * постороннем вопросе. Такие должны уходить в модель, у неё в подсказке
+     * это записано прямо.
+     */
+    const route = (phrase) => { const q = ai.quickParse(phrase); return q ? q.action : 'в модель'; };
+    for (const [phrase, want] of [
+      ['выставь счёт Заре с НДС 22%', 'draft'],
+      ['счёт Заре, в т.ч. НДС 22', 'в модель'],
+      ['счёт на 15000 НДС сверху', 'в модель'],
+      ['когда платить НДС', 'outofscope'],
+      ['сколько НДС по счетам за квартал', 'outofscope'],
+      ['как платить НДС со счёта', 'outofscope'],
+      ['надо ли сдавать КУДиР по счетам', 'outofscope'],
+      ['когда платить взносы за себя', 'outofscope'],
+      ['зарплата по акту', 'outofscope'],
+      ['смени НДС на 5 процентов', 'vat'],
+    ]) {
+      ok(route(phrase) === want, `«${phrase}» → ${want}`, route(phrase));
+    }
+
+    /*
+     * Подсказка и код должны знать об одних и тех же действиях. Раньше
+     * «pay» было в SHOW_ACTIONS, но в списке ответов для модели его не было
+     * вовсе: про «клиент заплатил» модель просто не знала и отвечала unknown.
+     */
+    const named = [...ai.SYSTEM.matchAll(/"action":"(\w+)"/g)].map((m) => m[1]);
+    const forgotten = ai.SHOW_ACTIONS.filter((a2) => !named.includes(a2));
+    ok(forgotten.length === 0, 'каждое действие из кода названо в подсказке',
+      forgotten.join(' '));
+
+    /*
+     * Длина подсказки — это деньги. Ниже 1024 токенов Gemini Flash не
+     * кэширует её вовсе, и мы платим полную цену при каждом обращении.
+     * Считаем по замеру с боевого сервера: 2922 символа дали 1008 токенов.
+     */
+    const perToken = 2922 / 1008;
+    const tokens = Math.round(ai.SYSTEM.length / perToken);
+    ok(tokens > 1024, 'подсказка длиннее порога кэширования Gemini Flash',
+      `${tokens} токенов при пороге 1024`);
+
+    /*
      * ── счёт в копейках ──
      *
      * Предел в штуках держал расход случайно: фраза стоит сотые доли
