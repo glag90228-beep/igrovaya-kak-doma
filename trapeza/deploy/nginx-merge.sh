@@ -140,6 +140,18 @@ cat <<NGINX
         proxy_set_header X-Real-IP \$remote_addr;
     }
 
+    # Platega шлёт колбэк на свой путь. Приёмник его принимает давно
+    # (lava-webhook.js знает и /lava, и /webhook, и /platega), а nginx
+    # проводил только /lava — снаружи колбэк упирался в статику и получал
+    # 404. Площадка при этом считает, что уведомила, и повторять не обязана:
+    # деньги у человека списаны, а подписка не открылась.
+    location ^~ /platega {
+        proxy_pass http://127.0.0.1:$LAVA_PORT;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+
     # Мини-приложение. Косая черта в конце proxy_pass обязательна: она
     # срезает префикс /app/, иначе приложение искало бы свои файлы по
     # /app/app/app.css и показывало бы пустой экран.
@@ -296,6 +308,9 @@ A=$(curl -sS -m 15 "https://$DOMAIN/app/" 2>/dev/null | grep -oE '<title>[^<]*' 
 echo "  /app/     → «${A:-пусто}»"
 echo "  /lava     → $(curl -sS -o /dev/null -w '%{http_code}' -m 10 -X POST \
   -H 'X-Api-Key: заведомо-неверный' -d '{}' "https://$DOMAIN/lava" 2>/dev/null) (нужен 401)"
+echo "  /platega  → $(curl -sS -o /dev/null -w '%{http_code}' -m 10 -X POST \
+  -H 'X-MerchantId: заведомо-неверный' -H 'X-Secret: тоже' -d '{}' \
+  "https://$DOMAIN/platega" 2>/dev/null) (нужен 401; 404 значит блок в nginx не приехал)"
 echo "  /d/…      → $(curl -sS -o /dev/null -w '%{http_code}' -m 15 "https://$DOMAIN/d/проверка" 2>/dev/null) (нужен 404)"
 echo
 echo "Копии старых конфигов: $BAKDIR"
