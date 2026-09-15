@@ -914,6 +914,24 @@ const extractJson = (raw) => {
   try { return JSON.parse(String(raw).slice(i, j + 1)); } catch (_) { return null; }
 };
 
+/**
+ * Отказ от налоговых вопросов — один текст на бота и на приложение.
+ *
+ * Их было три, и они разошлись. В боте: «Подскажу неверно — вам платить
+ * штраф» — понятно. В приложении то же самое пересказали своими словами и
+ * сломали: «а подскажу неверно — платить штраф вам». А в formatAiReply жил
+ * третий, короткий. Человек видел то одно, то другое, и одно из трёх — с
+ * вывихнутым порядком слов.
+ *
+ * Причина простая: текст без кнопок и без подстановок незачем держать в трёх
+ * местах. Приложение теперь показывает то, что прислал сервер.
+ */
+const OUTOFSCOPE_REPLY = 'Налоги, взносы, КУДиР, отчётность и зарплату я не веду — '
+  + 'для этого нужен доступ к вашему банку и кассе, а у меня его нет. '
+  + 'Подскажу неверно — штраф платить вам.\n\n'
+  + 'Что я умею: выписывать счета, акты, УПД, накладные, договоры и платёжки, '
+  + 'вести расчёты с контрагентами и собирать акт сверки.';
+
 const DOC_TYPES = new Set(['sch', 'schdog', 'usl', 'upd', 'torg12', 'pp', 'dog']);
 
 const SHOW_ACTIONS = ['debts', 'unpaid', 'docs', 'akt', 'cps', 'org', 'vat', 'pay',
@@ -987,5 +1005,5 @@ async function understand(text, userId) {
 
 module.exports = {
   understand, quickParse, sanitize, matchCp, budget, spend,
-  aiAvailable, aiHint, MODEL_DEFAULT, SHOW_ACTIONS, SYSTEM,
+  aiAvailable, aiHint, MODEL_DEFAULT, SHOW_ACTIONS, SYSTEM, OUTOFSCOPE_REPLY,
 };

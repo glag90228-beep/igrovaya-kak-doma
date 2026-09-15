@@ -303,7 +303,7 @@ function formatAiReply(intent, withCpRes, auto) {
   if (intent.action === 'cps') return 'Открываю список контрагентов.';
   if (intent.action === 'org') return 'Открываю реквизиты организации.';
   if (intent.action === 'vat') return 'Открываю настройки НДС.';
-  if (intent.action === 'outofscope') return 'Налоги, взносы, отчётность и зарплату я не веду. Могу выписать счёт, акт, УПД или показать долги.';
+  if (intent.action === 'outofscope') return ai.OUTOFSCOPE_REPLY;
   if (intent.action === 'draft') {
     if (withCpRes && withCpRes.cpChoices && withCpRes.cpChoices.length) return `Уточните клиента: «${intent.who}»?`;
     if (withCpRes && withCpRes.cpMissing) return `Клиента «${intent.who}» пока нет в базе.`;

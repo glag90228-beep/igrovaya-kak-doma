@@ -2509,12 +2509,7 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
    */
   if (intent.action === 'outofscope') {
     logAiReply('Вне компетенции (налоги, зарплата)');
-    await tg.sendMessage(chatId,
-      'Налоги, взносы, КУДиР, отчётность и зарплату я не веду — для этого нужен доступ '
-      + 'к вашему банку и кассе, а у меня его нет. Подскажу неверно — вам платить штраф.\n\n'
-      + 'Что я умею: выписывать счета, акты, УПД, накладные, договоры и платёжки, вести '
-      + 'расчёты с контрагентами и собирать акт сверки.',
-      mainMenu());
+    await tg.sendMessage(chatId, ai.OUTOFSCOPE_REPLY, mainMenu());
     return true;
   }
 
