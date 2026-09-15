@@ -2371,6 +2371,30 @@ if (require.main === module) {
     console.error('Не задан BOT_TOKEN — без него подпись Telegram не проверить.');
     process.exit(1);
   }
+  /*
+   * Почему не подняться — говорим словами.
+   *
+   * Без этого обработчика listen бросает необработанное событие 'error', и в
+   * журнале остаётся «throw er; // Unhandled 'error' event» со стеком Node.
+   * Служба при этом уходит в бесконечный перезапуск, а человек видит
+   * «activating (auto-restart)» и ни одного слова о причине. Между тем
+   * причин всего две, и обе чинятся за минуту.
+   */
+  server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      console.error(`Порт ${HOST}:${PORT} уже занят — приложение не поднялось.\n`
+        + '  Обычно это прежний процесс, который не успел отпустить порт.\n'
+        + `  Посмотреть, кто держит:  ss -ltnp | grep ${PORT}\n`
+        + '  Если это старое приложение:  systemctl restart trapeza-miniapp\n'
+        + '  Если порт занят чем-то чужим — смените MINIAPP_PORT в .env.');
+    } else if (e.code === 'EACCES') {
+      console.error(`Нет прав занять порт ${HOST}:${PORT}.\n`
+        + '  Порты ниже 1024 обычному пользователю недоступны — возьмите порт выше.');
+    } else {
+      console.error(`Приложение не смогло занять ${HOST}:${PORT}: ${e.message}`);
+    }
+    process.exit(1);
+  });
   server.listen(PORT, HOST, () => console.log(`Мини-приложение слушает ${HOST}:${PORT}`));
 }
 

@@ -355,6 +355,16 @@ if (require.main === module) {
   }
   // Только петля: наружу вебхуки принимает nginx по HTTPS.
   const host = process.env.LAVA_HOST || '127.0.0.1';
+  // Причину, по которой не поднялись, говорим словами: без этого в журнале
+  // остаётся стек Node, а служба молча уходит в перезапуск по кругу.
+  server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      log(`Порт ${host}:${PORT} занят — приёмник не поднялся. Кто держит: ss -ltnp | grep ${PORT}`);
+    } else {
+      log(`Приёмник не смог занять ${host}:${PORT}: ${e.message}`);
+    }
+    process.exit(1);
+  });
   server.listen(PORT, host, () => log(`Приёмник Lava слушает ${host}:${PORT}/lava`));
 }
 
