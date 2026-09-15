@@ -126,9 +126,51 @@ fi
 
 # shellcheck disable=SC2086
 systemctl restart $SERVICES
-sleep 2
-# shellcheck disable=SC2086
-systemctl --no-pager --lines=0 status $SERVICES | grep -E "^●|Active:" || true
+
+# Ждём, пока службы поднимутся, а не смотрим снимок через две секунды.
+#
+# Раньше здесь было `sleep 2` и показ состояния. Служба, упавшая на старте,
+# перезапускается через пять секунд (RestartSec=5) и обычно поднимается со
+# второго раза — порт не сразу отпускается прежним процессом. Снимок на
+# второй секунде попадал ровно в эту яму и показывал «activating
+# (auto-restart), Result: exit-code». Выглядит как авария, хотя через
+# несколько секунд всё работает; а настоящую аварию от этого не отличить.
+#
+# Теперь ждём до двадцати секунд и говорим о том, чем дело кончилось.
+echo
+for _ in $(seq 1 20); do
+  ALL_UP=1
+  for s in $SERVICES; do
+    systemctl is-active --quiet "$s" || ALL_UP=0
+  done
+  [ "$ALL_UP" = 1 ] && break
+  sleep 1
+done
+
+FAILED=""
+for s in $SERVICES; do
+  if systemctl is-active --quiet "$s"; then
+    echo "  ✅ $s — работает"
+  else
+    echo "  ❌ $s — НЕ поднялась"
+    FAILED="$FAILED $s"
+  fi
+done
+
+# Вывод служб уходит в файл, а не в journalctl (StandardOutput=append:…),
+# поэтому `journalctl -u` показывает только строки systemd, без причины.
+# Раз служба не встала — сразу показываем то место, где причина есть.
+if [ -n "$FAILED" ]; then
+  for s in $FAILED; do
+    LOG="/var/log/trapeza/${s#trapeza-}.log"
+    echo
+    echo "── последнее из $LOG ──"
+    [ -f "$LOG" ] && tail -20 "$LOG" || echo "   файла нет"
+  done
+  echo
+  echo "⚠️  Код разложен и проверки прошли, но службы не поднялись."
+  exit 1
+fi
 
 echo
 echo "Готово. Что стоит посмотреть глазами:"
