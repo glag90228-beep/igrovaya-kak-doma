@@ -1474,7 +1474,7 @@ async function showBilling(tg, chatId, user) {
   const rows = [];
   if (hasPlatega) {
     rows.push([
-      { text: '⚡ Оплатить СБП (349 ₽)', data: 'pay.plt:month' },
+      { text: `⚡ Оплатить СБП (${(platega.planByName('month') || {}).amount || '—'} ₽)`, data: 'pay.plt:month' },
       { text: '⭐ Год (3 490 ₽)', data: 'pay.plt:year' },
     ]);
   }
@@ -5412,10 +5412,20 @@ async function handleCallback(tg, cq) {
     if (data === 'billing') { await showBilling(tg, chatId, user); return; }
     if (data.startsWith('pay.plt:')) {
       const plan = data.slice(8);
-      const amount = plan === 'year' ? 3490 : 349;
+      /*
+       * Цена и срок — из тарифной сетки, а не числом здесь.
+       *
+       * Раньше стояло `plan === 'year' ? 3490 : 349`, а в сетке жили 390 и
+       * 2990. Ни один платёж в сетку не попадал, все проваливались в
+       * умолчание — 30 дней. Месяц случайно работал, год превращался в месяц.
+       */
+      const tariff = platega.planByName(plan);
+      if (!tariff) { await tg.sendMessage(chatId, 'Тарифы не настроены.'); return; }
+      const amount = tariff.amount;
       if (platega.isConfigured()) {
         const res = await platega.createTransaction({
           amount,
+          days: tariff.days,
           userId: user.id,
           tgId: user.tg_id,
           paymentMethod: 2,

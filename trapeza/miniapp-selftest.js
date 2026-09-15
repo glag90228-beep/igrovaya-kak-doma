@@ -1160,6 +1160,72 @@ async function main() {
       }
     }
 
+    /*
+     * ── цену назначает сервер ──
+     *
+     * Раньше /api/pay/create брал сумму из тела запроса. Приложение слало
+     * 349, и всё выглядело правильно — но тело запроса пишет не приложение,
+     * а тот, кто его открыл. Запрос с {"amount": 1} создавал настоящую
+     * транзакцию на рубль. Проверяем не «работает ли оплата», а что
+     * присланная клиентом цена игнорируется.
+     */
+    {
+      const platega = require('./lib/platega');
+      const keepP = {};
+      for (const k of ['PLATEGA_MERCHANT_ID', 'PLATEGA_SECRET', 'LAVA_PLAN_DAYS', 'PLATEGA_API_URL']) keepP[k] = process.env[k];
+      process.env.LAVA_PLAN_DAYS = '390:30,2990:365';
+      // Ключей нет нарочно: до сети дело не дойдёт, а цену сервер назначит
+      // до всякой сети — её и проверяем.
+      delete process.env.PLATEGA_MERCHANT_ID;
+      delete process.env.PLATEGA_SECRET;
+
+      ok(platega.planByName('month').amount === 390, 'месяц стоит столько, сколько в сетке');
+      ok(platega.planByName('year').amount === 2990, 'год — тоже');
+
+      /*
+       * Смотрим не на ответ, а на то, какая сумма УШЛА в Platega. Первая
+       * версия этой проверки обходилась ответом — и проходила по
+       * недоразумению: без ключей обработчик до цены вообще не доходит, и
+       * «цена не равна рублю» выполнялось само собой.
+       */
+      const http2 = require('node:http');
+      const seen = [];
+      const fake = http2.createServer((q, res2) => {
+        let b = '';
+        q.on('data', (c) => { b += c; });
+        q.on('end', () => {
+          try { seen.push(JSON.parse(b)); } catch (_) { seen.push({}); }
+          res2.writeHead(200, { 'content-type': 'application/json' });
+          res2.end(JSON.stringify({ id: 'test-1', redirect: 'https://example/pay', status: 'PENDING' }));
+        });
+      });
+      await new Promise((res3) => fake.listen(0, '127.0.0.1', res3));
+      process.env.PLATEGA_MERCHANT_ID = '7b7ed2b3-16a7-49da-8076-b2f63498858b';
+      process.env.PLATEGA_SECRET = 'test-secret';
+      process.env.PLATEGA_API_URL = `http://127.0.0.1:${fake.address().port}`;
+
+      r = await call('POST', '/api/pay/create', { user: masha, body: { plan: 'month', amount: 1 } });
+      ok(seen.length === 1, 'запрос до площадки дошёл', String(seen.length));
+      const sent = (seen[0] || {}).paymentDetails || {};
+      ok(sent.amount === 390, 'в Platega ушли 390 ₽, а не присланный клиентом рубль',
+        String(sent.amount));
+      ok(JSON.parse((seen[0] || {}).payload || '{}').days === 30,
+        'и срок уехал в payload', (seen[0] || {}).payload);
+
+      seen.length = 0;
+      r = await call('POST', '/api/pay/create', { user: masha, body: { plan: 'year', amount: 1 } });
+      const sentY = (seen[0] || {}).paymentDetails || {};
+      ok(sentY.amount === 2990, 'за год ушли 2990 ₽', String(sentY.amount));
+      ok(JSON.parse((seen[0] || {}).payload || '{}').days === 365,
+        'и в payload 365 дней — год не превратится в месяц', (seen[0] || {}).payload);
+      fake.close();
+      delete process.env.PLATEGA_API_URL;
+
+      for (const [k, v] of Object.entries(keepP)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+
     // Голос: без провайдера — честный отказ, с заглушкой — разбор.
     r = await call('POST', '/api/ask/voice', { user: masha, body: { audio: 'AAA=' } });
     ok(r.status === 400 && /не подключено|SPEECH/i.test(r.json.error || ''),

@@ -83,6 +83,54 @@ function postJson(serverInstance, path, headers, body) {
   ok(platega.daysFor({ amount: 3490 }) === 365, '3490 ₽ дают 365 дней');
   ok(platega.daysFor({ amount: 99999 }) === 30, 'неизвестная сумма даёт дефолтный срок 30 дней');
 
+  console.log('\n── Platega: срок берётся из выбора человека, а не из зачисленной суммы ──');
+  {
+    const was = process.env.LAVA_PLAN_DAYS;
+    process.env.LAVA_PLAN_DAYS = '390:30,2990:365';
+
+    /*
+     * Главная ошибка, которую здесь ловим: площадка сообщает сумму ЗА
+     * ВЫЧЕТОМ комиссии. За платёж в 390 ₽ пришло 378,67 — в сетке такой
+     * суммы нет. Раньше сравнение было точным, поэтому ЛЮБОЙ платёж
+     * проваливался в умолчание (30 дней). Месяц случайно работал, а год
+     * превращался в месяц: человек платит за год, получает тридцать дней.
+     */
+    ok(platega.daysFor({ amount: 378.67, days: 30 }) === 30,
+      'месяц по выбору человека', String(platega.daysFor({ amount: 378.67, days: 30 })));
+    ok(platega.daysFor({ amount: 2903.03, days: 365 }) === 365,
+      'ГОД по выбору человека, а не 30 дней', String(platega.daysFor({ amount: 2903.03, days: 365 })));
+
+    // Платёж без payload — по прямой ссылке. Ищем по сумме с допуском.
+    ok(platega.daysFor({ amount: 2903.03 }) === 365,
+      'без payload год опознаётся по сумме за вычетом комиссии',
+      String(platega.daysFor({ amount: 2903.03 })));
+    ok(platega.daysFor({ amount: 378.67 }) === 30,
+      'и месяц тоже', String(platega.daysFor({ amount: 378.67 })));
+    ok(platega.daysFor({ amount: 390 }) === 30, 'ровная сумма по-прежнему работает');
+
+    // Чужая сумма тариф не выдумывает.
+    ok(platega.daysFor({ amount: 500 }) === 30, 'посторонняя сумма — умолчание, а не год',
+      String(platega.daysFor({ amount: 500 })));
+    ok(platega.daysFor({ amount: 5 }) === 30, 'и пять рублей не становятся годом');
+
+    // Тариф по имени: цена и срок из одного места.
+    const m = platega.planByName('month');
+    const y = platega.planByName('year');
+    ok(m.amount === 390 && m.days === 30, 'месяц из сетки', JSON.stringify(m));
+    ok(y.amount === 2990 && y.days === 365, 'год из сетки', JSON.stringify(y));
+
+    // payload довозит срок до вебхука.
+    const hook = platega.parseWebhook({
+      id: 'abc', status: 'CONFIRMED',
+      paymentDetails: { amount: 2903.03, currency: 'RUB' },
+      payload: JSON.stringify({ userId: 7, tgId: 77, plan: 'year', days: 365 }),
+    });
+    ok(hook.ok && hook.payment.days === 365, 'срок доехал в payload', JSON.stringify(hook.payment.days));
+    ok(platega.daysFor(hook.payment) === 365, 'и по нему начислен год');
+
+    if (was === undefined) delete process.env.LAVA_PLAN_DAYS; else process.env.LAVA_PLAN_DAYS = was;
+  }
+
   console.log('\n── Platega: разбор callback-вебхука ──');
 
   // 1. Успешная оплата СБП

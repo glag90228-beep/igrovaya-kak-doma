@@ -3657,7 +3657,9 @@ screens.billing = async function billing() {
           haptic('medium');
           if (s.plategaConfigured) {
             toast('Открываю оплату СБП...');
-            const r = await api('POST', '/api/pay/create', { amount: 349, plan: 'month', paymentMethod: 2 });
+            // Сумму не шлём: её назначает сервер по тарифу. Присланная клиентом
+            // цена — это цена, которую назначил себе плательщик.
+            const r = await api('POST', '/api/pay/create', { plan: 'month', paymentMethod: 2 });
             if (r.ok && r.redirect) {
               if (tg && tg.openLink) tg.openLink(r.redirect); else window.open(r.redirect, '_blank');
               return;

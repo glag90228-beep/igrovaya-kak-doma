@@ -41,12 +41,49 @@ function plans() {
     .sort((a, b) => a.days - b.days);
 }
 
-/** Сколько дней даёт этот платёж. */
+/**
+ * Сколько дней даёт этот платёж.
+ *
+ * Порядок важен, и первый шаг — главный.
+ *
+ * Раньше дни определялись ТОЛЬКО по сумме из вебхука, и это оказалось
+ * неверно вдвойне. Во-первых, площадка сообщает сумму ЗА ВЫЧЕТОМ своей
+ * комиссии: за платёж в 390 ₽ приходит 378,67 — в сетке такой суммы нет, и
+ * поиск не находил ничего. Во-вторых, цены в кнопках бота (349 и 3490)
+ * разошлись с сеткой в .env (390 и 2990), так что не совпало бы и без
+ * комиссии.
+ *
+ * Обе ошибки складывались в одну тихую: ЛЮБОЙ платёж проваливался в
+ * умолчание, а умолчание — 30 дней. Месячная подписка случайно работала
+ * правильно, а годовая давала месяц. Человек платит за год и получает
+ * тридцать дней; узнаём мы об этом от него, а не от кода.
+ *
+ * Поэтому считаем по тому, что человек ВЫБРАЛ, а не по тому, сколько нам
+ * зачислили: срок кладётся в payload при создании платежа и возвращается
+ * оттуда же.
+ */
 function daysFor(payment) {
+  // 1. Срок, выбранный человеком. Мы сами его туда положили при создании.
+  const fromPayload = Number((payment && payment.days) || 0);
+  if (Number.isFinite(fromPayload) && fromPayload > 0) return Math.round(fromPayload);
+
+  /*
+   * 2. Платёж без payload — начатый по прямой ссылке, а не кнопкой в боте.
+   *
+   * Ищем по сумме, но с допуском на комиссию: зачисленное всегда МЕНЬШЕ
+   * заплаченного, поэтому подходит ближайший тариф, который не ниже
+   * пришедшей суммы и отстоит от неё не больше чем на MAX_FEE. Точное
+   * сравнение тут бессмысленно — оно и не работало.
+   */
   const amt = Number((payment && payment.amount) || 0);
-  for (const p of plans()) {
-    if (Math.abs(p.amount - amt) < 0.01) return p.days;
+  if (amt > 0) {
+    const maxFee = Number(process.env.PLATEGA_MAX_FEE || 0.15);
+    const fit = plans()
+      .filter((p) => p.amount >= amt - 0.01 && (p.amount - amt) <= p.amount * maxFee)
+      .sort((a, b) => a.amount - b.amount)[0];
+    if (fit) return fit.days;
   }
+
   return Number(process.env.PLATEGA_DEFAULT_DAYS || process.env.LAVA_DEFAULT_DAYS || 30);
 }
 
@@ -55,6 +92,22 @@ function planLabel(days) {
   if (days >= 175) return 'за полгода';
   if (days >= 80) return 'за квартал';
   return 'в месяц';
+}
+
+/**
+ * Тариф по имени: «month» или «year».
+ *
+ * Цену и срок берём из сетки, а не из числа в коде. Разошлись они уже
+ * однажды: кнопки предлагали 349 и 3490, сетка знала 390 и 2990, и ни один
+ * платёж в неё не попадал. Одно место — одна правда.
+ */
+function planByName(name) {
+  const list = plans();
+  if (!list.length) return null;
+  const wantYear = String(name || '').toLowerCase().startsWith('year');
+  const year = list.filter((p) => p.days >= 300).sort((a, b) => a.days - b.days)[0];
+  const month = list.filter((p) => p.days < 300).sort((a, b) => a.days - b.days)[0];
+  return (wantYear ? year : month) || list[0];
 }
 
 function planTitle(days) {
@@ -138,6 +191,7 @@ function parseWebhook(body) {
   const payload = parsePayload(body.payload);
   const userId = Number(payload.userId || payload.user_id || payload.uid) || 0;
   const tgId = Number(payload.tgId || payload.tg_id || payload.tg) || 0;
+  const days = Number(payload.days) || 0;
   const email = String(payload.email || body.email || '').trim().toLowerCase();
 
   return {
@@ -150,6 +204,7 @@ function parseWebhook(body) {
       paid,
       userId,
       tgId,
+      days,
       email,
       paymentMethod: body.paymentMethod != null ? Number(body.paymentMethod) : null,
       raw: JSON.stringify(body),
@@ -178,6 +233,9 @@ async function createTransaction(opts = {}) {
     userId: opts.userId || 0,
     tgId: opts.tgId || 0,
     plan: opts.plan || 'subscription',
+    // Срок кладём здесь, а не выводим потом из зачисленной суммы: площадка
+    // сообщает её за вычетом комиссии, и по ней тариф не опознать.
+    days: Number(opts.days) || 0,
     ts: Date.now(),
   };
 
@@ -263,6 +321,7 @@ async function getTransactionStatus(id) {
       paid: String(json.status || '').toUpperCase() === 'CONFIRMED',
       userId: Number(payload.userId || payload.user_id) || 0,
       tgId: Number(payload.tgId || payload.tg_id) || 0,
+      days: Number(payload.days) || 0,
       raw: json,
     };
   } catch (err) {
@@ -272,6 +331,7 @@ async function getTransactionStatus(id) {
 
 module.exports = {
   isConfigured,
+  planByName,
   plans,
   daysFor,
   planTitle,

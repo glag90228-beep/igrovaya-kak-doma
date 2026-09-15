@@ -1128,16 +1128,28 @@ const api = {
 
   /** Создание платёжной транзакции Platega (СБП / карты РФ). */
   async 'POST /api/pay/create'({ user, body }) {
-    const amount = Number(body && body.amount);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return { error: 'Некорректная сумма платежа.' };
-    }
+    /*
+     * Сумму назначает сервер, а не присылает приложение.
+     *
+     * Раньше она бралась из тела запроса: `Number(body.amount)`. Приложение
+     * посылало 349, и всё выглядело правильно — но тело запроса пишет не
+     * приложение, а тот, кто его открыл. Запрос с `{"amount": 1}` создавал
+     * настоящую транзакцию на рубль, а дни потом начислялись по умолчанию,
+     * то есть месяц. Подписка за рубль.
+     *
+     * Клиент теперь называет только тариф — «month» или «year». Цену и срок
+     * к нему подбирает сетка, одна и та же для бота и приложения.
+     */
     const plan = str((body && body.plan) || 'month', 20);
+    const tariff = platega.planByName(plan);
+    if (!tariff) return { error: 'Тарифы не настроены.' };
+    const amount = tariff.amount;
     const method = (body && body.paymentMethod != null) ? Number(body.paymentMethod) : 2; // 2 = СБП
 
     if (platega.isConfigured()) {
       const res = await platega.createTransaction({
         amount,
+        days: tariff.days,
         userId: user.id,
         tgId: user.tg_id,
         paymentMethod: method,
@@ -1145,7 +1157,7 @@ const api = {
         description: `Подписка Первичка (${amount} ₽)`,
       });
       if (res.ok) {
-        return { ok: true, redirect: res.redirect, qr: res.qr, id: res.id, provider: 'platega' };
+        return { ok: true, redirect: res.redirect, qr: res.qr, id: res.id, provider: 'platega', amount };
       }
     }
 
