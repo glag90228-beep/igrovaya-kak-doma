@@ -40,7 +40,7 @@ const APP = path.join(__dirname, '..');
 const WATCH = ['ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'XAI_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
   'GEMINI_API_KEY', 'GEMINI_BASE_URL',
   'VISION_PROVIDER', 'VISION_MODEL', 'SPEECH_PROVIDER', 'AI_ENABLED', 'AI_MODEL', 'AI_PROVIDER',
-  'SEARCH_PROVIDER', 'AI_TAX_ANSWERS'];
+  'SEARCH_PROVIDER', 'AI_TAX_ANSWERS', 'PLATEGA_MERCHANT_ID', 'PLATEGA_SECRET', 'PLATEGA_API_URL'];
 const shadowed = [];
 try {
   const raw = fs.readFileSync(path.join(APP, '.env'), 'utf8');
@@ -766,6 +766,7 @@ const vision = require(path.join(APP, 'lib/vision'));
 const speech = require(path.join(APP, 'lib/speech'));
 const ai = require(path.join(APP, 'lib/ai-agent'));
 const searchLib = require(path.join(APP, 'lib/search'));
+const platega = require(path.join(APP, 'lib/platega'));
 
 (async () => {
   if (shadowed.length) {
@@ -828,6 +829,56 @@ const searchLib = require(path.join(APP, 'lib/search'));
   else if (ap === 'openrouter') await checkOpenRouter(process.env.AI_MODEL || ai.MODEL_DEFAULT, 'Фразы');
   else if (ap === 'gemini') await checkGemini(process.env.AI_MODEL || 'gemini-3.6-flash', 'Фразы');
   else skip(`Фразы: провайдер ${ap} — этой проверкой не покрыт`);
+
+  /*
+   * Приём оплаты. Проверяем не «заполнены ли переменные», а принимает ли их
+   * площадка: ключ можно перевыпустить и забыть обновить, и узнать об этом
+   * на первом настоящем платеже — то есть на чужих деньгах.
+   *
+   * Спрашиваем несуществующую транзакцию. Это ничего не создаёт и ничего не
+   * стоит, а ответ говорит ровно то, что нужно:
+   *   401/403 — ключи не приняты, платежи работать не будут;
+   *   404     — ключи приняты, просто такой транзакции нет. Это успех.
+   */
+  if (!platega.isConfigured()) {
+    skip('Оплата: PLATEGA_MERCHANT_ID или PLATEGA_SECRET не заполнены — кнопка СБП не показывается');
+  } else {
+    const dirtyM = checkAscii(process.env.PLATEGA_MERCHANT_ID, 'PLATEGA_MERCHANT_ID');
+    const dirtyS = checkAscii(process.env.PLATEGA_SECRET, 'PLATEGA_SECRET');
+    if (dirtyM || dirtyS) no(`Оплата: ${dirtyM || dirtyS}`);
+    else if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+      .test(String(process.env.PLATEGA_MERCHANT_ID).trim())) {
+      no('Оплата: PLATEGA_MERCHANT_ID не похож на UUID из кабинета '
+        + '(вида 7b7ed2b3-16a7-49da-8076-b2f63498858b) — проверьте, что скопирован целиком');
+    } else {
+      const base = (process.env.PLATEGA_API_URL || 'https://app.platega.io').replace(/\/+$/, '');
+      const probe = '00000000-0000-4000-8000-000000000000';
+      try {
+        const res = await fetch(`${base}/transaction/${probe}`, {
+          method: 'GET',
+          headers: {
+            'X-MerchantId': String(process.env.PLATEGA_MERCHANT_ID).trim(),
+            'X-Secret': String(process.env.PLATEGA_SECRET).trim(),
+          },
+          signal: AbortSignal.timeout(30000),
+        });
+        const body = await res.text();
+        if (res.status === 401 || res.status === 403) {
+          no(`Оплата: площадка не приняла ключи (${res.status}).\n`
+            + `      Ответ: ${String(body).replace(/\s+/g, ' ').slice(0, 200)}\n`
+            + '      Перевыпустите API-ключ в кабинете my.platega.io и впишите в .env.\n'
+            + '      Он показывается целиком только один раз — сразу после перевыпуска.');
+        } else if (res.status === 404 || res.ok) {
+          ok('Оплата: Platega приняла ключи');
+          console.log(`      Колбэк должен быть настроен на https://<ваш домен>/platega`);
+        } else {
+          no(`Оплата: ${why(res.status, body)}`);
+        }
+      } catch (e) {
+        no(`Оплата: не достучались до Platega — ${e.message}`);
+      }
+    }
+  }
 
   /*
    * Поиск по официальным сайтам. Проверять его надо живым запросом: из среды
