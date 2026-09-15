@@ -97,6 +97,70 @@ const ok = (c, m, extra) => {
     'заглушённые повторы всё равно записаны',
     String(listed.filter((r) => r.error === 'boom').length));
 
+  console.log('\n── три службы открывают базу разом ──');
+  {
+    /*
+     * update.sh перезапускает бота, приложение и приёмник платежей одной
+     * командой, и все трое открывают базу в одну секунду. Если предыдущие
+     * были убиты и оставили неприбранный WAL, SQLite восстанавливает его под
+     * монопольной блокировкой — а опоздавшие получают «database is locked».
+     *
+     * Ловится это только так: оставить грязный WAL и открыть базу несколькими
+     * процессами сразу. Защищает одна строка в db.js — busy_timeout должен
+     * стоять ПЕРЕД journal_mode, потому что именно journal_mode и упирается
+     * в блокировку. Верните её на прежнее (третье) место — и здесь снова
+     * посыплется.
+     *
+     * Кругов два, и это не перестраховка. Проверка гоночная: с одним кругом
+     * сломанный порядок ловился два раза из трёх, а «случайно зелёный»
+     * прогон здесь хуже отсутствия проверки — он молча разрешает вернуть
+     * ошибку обратно. Два круга по десять процессов промахиваются заметно
+     * реже.
+     */
+    const { spawn, spawnSync } = require('node:child_process');
+    const os = require('node:os');
+    const fsx = require('node:fs');
+    const pathx = require('node:path');
+    const DB_MOD = JSON.stringify(pathx.join(__dirname, 'db'));
+    const ROUNDS = 2;
+    const WRITERS = 10;
+
+    let dirtyOk = 0;
+    let crashed = 0;
+    for (let round = 0; round < ROUNDS; round++) {
+      const dir = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'trapeza-wal-'));
+      const dbFile = pathx.join(dir, 'race.db');
+
+      // Грязный WAL: пишем большую пачку и убиваем себя, не завершив её.
+      spawnSync(process.execPath, ['-e', `
+        const { db } = require(${DB_MOD});
+        db.exec('CREATE TABLE IF NOT EXISTS wal_race(x)');
+        const ins = db.prepare('INSERT INTO wal_race(x) VALUES(?)');
+        db.exec('BEGIN');
+        for (let i = 0; i < 60000; i++) ins.run('строка ' + i);
+        db.exec('COMMIT');
+        db.exec('BEGIN');
+        for (let i = 0; i < 60000; i++) ins.run('вторая пачка ' + i);
+        process.kill(process.pid, 'SIGKILL');
+      `], { env: { ...process.env, TRAPEZA_DB: dbFile }, stdio: 'ignore' });
+
+      if (fsx.existsSync(`${dbFile}-wal`) && fsx.statSync(`${dbFile}-wal`).size > 100000) dirtyOk += 1;
+
+      const codes = await Promise.all(Array.from({ length: WRITERS }, () => new Promise((resolve) => {
+        const p = spawn(process.execPath, ['-e', `require(${DB_MOD})`],
+          { env: { ...process.env, TRAPEZA_DB: dbFile }, stdio: 'ignore' });
+        p.on('exit', (code) => resolve(code));
+      })));
+      crashed += codes.filter((c) => c !== 0).length;
+      fsx.rmSync(dir, { recursive: true, force: true });
+    }
+
+    ok(dirtyOk === ROUNDS, 'неприбранный WAL остался — есть что восстанавливать',
+      `${dirtyOk} из ${ROUNDS} кругов`);
+    ok(crashed === 0, 'базу открыли все, никто не упал на «database is locked»',
+      `упало ${crashed} из ${ROUNDS * WRITERS}`);
+  }
+
   console.log(bad ? `\nофис: ${bad} провала` : '\nофис готов ✅');
   process.exit(bad ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });
