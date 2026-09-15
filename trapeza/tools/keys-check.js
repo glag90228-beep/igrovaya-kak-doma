@@ -39,7 +39,8 @@ const APP = path.join(__dirname, '..');
  */
 const WATCH = ['ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'XAI_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
   'GEMINI_API_KEY', 'GEMINI_BASE_URL',
-  'VISION_PROVIDER', 'VISION_MODEL', 'SPEECH_PROVIDER', 'AI_ENABLED', 'AI_MODEL', 'AI_PROVIDER'];
+  'VISION_PROVIDER', 'VISION_MODEL', 'SPEECH_PROVIDER', 'AI_ENABLED', 'AI_MODEL', 'AI_PROVIDER',
+  'SEARCH_PROVIDER', 'AI_TAX_ANSWERS'];
 const shadowed = [];
 try {
   const raw = fs.readFileSync(path.join(APP, '.env'), 'utf8');
@@ -764,6 +765,7 @@ async function checkSpeechLong() {
 const vision = require(path.join(APP, 'lib/vision'));
 const speech = require(path.join(APP, 'lib/speech'));
 const ai = require(path.join(APP, 'lib/ai-agent'));
+const searchLib = require(path.join(APP, 'lib/search'));
 
 (async () => {
   if (shadowed.length) {
@@ -826,6 +828,28 @@ const ai = require(path.join(APP, 'lib/ai-agent'));
   else if (ap === 'openrouter') await checkOpenRouter(process.env.AI_MODEL || ai.MODEL_DEFAULT, 'Фразы');
   else if (ap === 'gemini') await checkGemini(process.env.AI_MODEL || 'gemini-3.6-flash', 'Фразы');
   else skip(`Фразы: провайдер ${ap} — этой проверкой не покрыт`);
+
+  /*
+   * Поиск по официальным сайтам. Проверять его надо живым запросом: из среды
+   * разработки сайты ФНС недоступны, и весь модуль написан по документации.
+   */
+  const sep = String(process.env.SEARCH_PROVIDER || '').toLowerCase();
+  if (!sep) skip('Поиск: SEARCH_PROVIDER не задан — ответы только из базы и по памяти модели');
+  else if (!searchLib.searchAvailable()) no(`Поиск: ${searchLib.searchHint()}`);
+  else {
+    const r = await searchLib.search('фиксированные страховые взносы ИП срок уплаты', 3)
+      .catch((e) => ({ ok: false, error: e.message }));
+    if (r.ok) {
+      ok(`Поиск: нашлось ${r.results.length} на доверенных сайтах`);
+      for (const one of r.results) console.log(`      ${one.source}: ${one.url}`);
+    } else if (r.filtered) {
+      no(`Поиск: выдача пришла (${r.filtered} шт.), но доверенных сайтов в ней нет.\n`
+        + '      Это не поломка: значит по такому запросу ФНС и Минфин наверх не попали.\n'
+        + '      Проверьте другим вопросом — модуль работает, отбор строгий намеренно.');
+    } else {
+      no(`Поиск: ${r.error}`);
+    }
+  }
 
   const sp = String(process.env.SPEECH_PROVIDER || '').toLowerCase();
   if (sp === 'yandex') { await checkSpeech(); await checkSpeechLong(); }

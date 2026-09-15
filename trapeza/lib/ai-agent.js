@@ -66,6 +66,7 @@
 
 const { db } = require('../db');
 const knowledge = require('./knowledge');
+const search = require('./search');
 
 /*
  * Модель по умолчанию — маленькая, и это не экономия на спичках.
@@ -1052,6 +1053,37 @@ async function answerTax(question, userId) {
   if (!taxAnswersOn()) return { text: null, from: 'off' };
   if (!aiAvailable()) return { text: null, from: 'off' };
   if (budget(userId).left <= 0) return { text: null, from: 'limit' };
+
+  /*
+   * Ступень вторая: поискать на официальных сайтах и пересказать найденное.
+   *
+   * Стоит она дороже памяти модели — платный запрос к поиску плюс длинные
+   * отрывки во входных токенах, — но и ответ другого качества: под ним стоит
+   * адрес страницы, которую можно открыть. Ради этого владелец всё и затевал.
+   *
+   * Не нашлось — не беда: идём к памяти модели, она ступенью ниже и помечена
+   * честнее некуда.
+   */
+  if (search.searchAvailable()) {
+    const found = await search.search(question, 3).catch((e) => ({ ok: false, error: e.message }));
+    if (found.ok) {
+      const отрывки = found.results
+        .map((r, i) => `[${i + 1}] ${r.source} — ${r.title}\n${r.snippet}`).join('\n\n');
+      spend(userId);
+      try {
+        const { text: raw, usage } = await callModel(
+          `Вопрос: ${question}\n\nНайдено:\n${отрывки}`, knowledge.SEARCH_SYSTEM,
+        );
+        spend(userId, { usage });
+        const out = knowledge.renderFound(raw, found.results);
+        if (out) return { text: out, from: 'search', hosts: found.results.map((r) => r.host) };
+      } catch (e) {
+        // Поиск нашёл, а пересказать не вышло — не повод молчать: ниже
+        // стоит ещё одна ступень.
+        void e;
+      }
+    }
+  }
 
   spend(userId);
   try {

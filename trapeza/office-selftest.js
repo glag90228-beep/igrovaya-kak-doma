@@ -188,6 +188,113 @@ const ok = (c, m, extra) => {
     if (wasPr === undefined) delete process.env.AI_PROVIDER; else process.env.AI_PROVIDER = wasPr;
   }
 
+  console.log('\n── поиск по доверенным источникам ──');
+  {
+    const se = require('./lib/search');
+    const kn2 = require('./lib/knowledge');
+    const ai3 = require('./lib/ai-agent');
+    const bdb3 = require('./lib/bot-db');
+    const uid3 = bdb3.getOrCreateUser(558001).id;
+
+    /*
+     * Белый список — главная защита этого модуля, и проверять его надо не
+     * на «работает ли», а на подделки. По налоговому вопросу выдачу
+     * занимают бухгалтерские блоги: пишут бойко, часто верно и почти всегда
+     * без даты. Сослаться на такой хуже, чем не ответить.
+     */
+    ok(Boolean(se.trustedSource('https://www.nalog.gov.ru/rn77/x')), 'ФНС — свой');
+    ok(Boolean(se.trustedSource('https://lk.nalog.gov.ru/a')), 'и его поддомен тоже');
+    ok(se.trustedSource('https://buhblog.example/nalog.gov.ru') === null,
+      'доверенный домен в ПУТИ чужой ссылки не считается');
+    ok(se.trustedSource('https://nalog.gov.ru.evil.example/x') === null,
+      'и приклеенный слева к чужому домену — тоже');
+    ok(se.trustedSource('https://evil.example/?src=nalog.gov.ru') === null,
+      'и спрятанный в параметрах');
+    ok(se.trustedSource('не ссылка') === null, 'мусор вместо ссылки не ломает разбор');
+
+    // Выдача Яндекса приходит XML — разбираем её сами, без зависимостей.
+    const xml = '<doc><url>https://nalog.gov.ru/a</url><title>Заголовок</title>'
+      + '<passage>Первый кусок.</passage><passage>Второй.</passage></doc>'
+      + '<doc><url>https://pravo.gov.ru/b</url><headline>Только заголовок</headline></doc>';
+    const parsed = se.parseYandexXml(xml);
+    ok(parsed.length === 2, 'обе находки разобраны', String(parsed.length));
+    ok(parsed[0].snippet.includes('Первый') && parsed[0].snippet.includes('Второй'),
+      'куски текста склеены', parsed[0].snippet);
+    ok(parsed[1].snippet.includes('Только заголовок'),
+      'нет кусков — берём заголовок', parsed[1].snippet);
+
+    // Фильтр выдачи целиком.
+    const wasSp = process.env.SEARCH_PROVIDER;
+    const wasSm = process.env.SEARCH_MOCK;
+    process.env.SEARCH_PROVIDER = 'mock';
+    process.env.SEARCH_MOCK = JSON.stringify([
+      { url: 'https://buhblog.example/a', title: 'Блог', snippet: 'Сдавайте когда хотите' },
+      { url: 'https://www.nalog.gov.ru/x', title: 'ФНС', snippet: 'Не позднее 25-го числа.' },
+    ]);
+    const res = await se.search('когда сдавать');
+    ok(res.ok && res.results.length === 1, 'чужой сайт из выдачи выброшен',
+      res.ok ? String(res.results.length) : res.error);
+    ok(res.results[0].source === 'ФНС России', 'источник назван по-человечески',
+      res.results[0].source);
+
+    process.env.SEARCH_MOCK = JSON.stringify([
+      { url: 'https://buhblog.example/a', title: 'Блог', snippet: 'что-то' },
+    ]);
+    const none = await se.search('когда сдавать');
+    ok(none.ok === false, 'одни чужие сайты — считаем, что не нашли', String(none.ok));
+
+    /*
+     * Пересказ найденного. Главное правило — не добавлять от себя: именно
+     * так рождается ответ, где ссылка настоящая, а утверждение нет. Такому
+     * верят охотнее всего.
+     */
+    ok(/ТОЛЬКО тем, что есть/.test(kn2.SEARCH_SYSTEM),
+      'подсказке для пересказа запрещено выдумывать сверх источника');
+    ok(kn2.renderFound(kn2.NOT_FOUND, []) === null,
+      'модель не нашла ответа в отрывках — наружу ничего не идёт');
+    const fnd = kn2.renderFound('Не позднее 25-го.', [
+      { source: 'ФНС России', url: 'https://www.nalog.gov.ru/x' },
+    ]);
+    ok(/https:\/\/www\.nalog\.gov\.ru\/x/.test(fnd), 'в ответе стоит адрес страницы',
+      String(fnd).slice(-140));
+    ok(/не сверяли/.test(fnd), 'и сказано, что это не наша проверенная запись');
+
+    // Лестница целиком: база → поиск → память модели.
+    const keep3 = {};
+    for (const k of ['AI_TAX_ANSWERS', 'AI_ENABLED', 'AI_PROVIDER', 'AI_MOCK']) keep3[k] = process.env[k];
+    process.env.AI_TAX_ANSWERS = '1';
+    process.env.AI_ENABLED = '1';
+    process.env.AI_PROVIDER = 'mock';
+
+    process.env.SEARCH_MOCK = JSON.stringify([
+      { url: 'https://www.nalog.gov.ru/x', title: 'ФНС', snippet: 'Не позднее 25-го числа.' },
+    ]);
+    process.env.AI_MOCK = 'Не позднее 25-го числа месяца после отчётного периода.';
+    const viaSearch = await ai3.answerTax('когда сдавать 6-НДФЛ', uid3);
+    ok(viaSearch.from === 'search', 'чего нет в базе — ищем на официальных сайтах', viaSearch.from);
+    ok(/nalog\.gov\.ru/.test(viaSearch.text), 'и в ответе виден сайт, а не «модель»');
+
+    // База всё равно первая: её записи мы писали и сверяли сами.
+    const viaBase = await ai3.answerTax('какой лимит на патенте', uid3);
+    ok(viaBase.from === 'base', 'что есть в базе — берём из базы, а не из интернета', viaBase.from);
+
+    // Поиск ничего не дал — остаётся память модели, и она помечена иначе.
+    process.env.SEARCH_MOCK = JSON.stringify([
+      { url: 'https://buhblog.example/a', title: 'Блог', snippet: 'выдумки' },
+    ]);
+    process.env.AI_MOCK = 'По памяти: ежеквартально.';
+    const viaModel2 = await ai3.answerTax('когда сдавать 6-НДФЛ', uid3);
+    ok(viaModel2.from === 'model', 'ничего не нашли — отвечаем памятью', viaModel2.from);
+    ok(/проверенной базе нет/.test(viaModel2.text) && !/nalog\.gov\.ru/.test(viaModel2.text),
+      'и пометка другая: сайта тут нет');
+
+    for (const [k, v] of Object.entries(keep3)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    if (wasSp === undefined) delete process.env.SEARCH_PROVIDER; else process.env.SEARCH_PROVIDER = wasSp;
+    if (wasSm === undefined) delete process.env.SEARCH_MOCK; else process.env.SEARCH_MOCK = wasSm;
+  }
+
   console.log('\n── три службы открывают базу разом ──');
   {
     /*
