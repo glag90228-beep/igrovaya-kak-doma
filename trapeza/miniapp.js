@@ -1802,9 +1802,9 @@ const api = {
       if (got.detail) office.record({ kind: 'speech', where: 'приложение', error: got.detail, userId: user.id });
       return { error: got.error };
     }
-    // Речь считается по секундам звука, а не по токенам: провайдер расход
-    // не возвращает, берём длительность и цену за минуту из настроек.
-    ai.spend(user.id, { voiceSeconds: seconds });
+    // По факту, если провайдер вернул расход: Gemini считает звук токенами и
+    // сообщает их, SpeechKit — нет, и для него остаётся цена за минуту.
+    ai.spend(user.id, got.usage ? { usage: got.usage } : { voiceSeconds: seconds });
     bdb.saveAiMessage({
       userId: user.id, source: 'miniapp', role: 'user', type: 'voice',
       text: got.text, audioSeconds: seconds,

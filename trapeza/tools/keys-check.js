@@ -40,7 +40,8 @@ const APP = path.join(__dirname, '..');
 const WATCH = ['ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'XAI_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
   'GEMINI_API_KEY', 'GEMINI_BASE_URL',
   'VISION_PROVIDER', 'VISION_MODEL', 'SPEECH_PROVIDER', 'AI_ENABLED', 'AI_MODEL', 'AI_PROVIDER',
-  'SEARCH_PROVIDER', 'AI_TAX_ANSWERS', 'PLATEGA_MERCHANT_ID', 'PLATEGA_SECRET', 'PLATEGA_API_URL'];
+  'SEARCH_PROVIDER', 'AI_TAX_ANSWERS', 'PLATEGA_MERCHANT_ID', 'PLATEGA_SECRET', 'PLATEGA_API_URL',
+  'SPEECH_MODEL'];
 const shadowed = [];
 try {
   const raw = fs.readFileSync(path.join(APP, '.env'), 'utf8');
@@ -97,6 +98,55 @@ function why(status, body) {
   if (status === 429) return `слишком много запросов или кончилась квота (429).\n      ${tail}`;
   if (status >= 500) return `сервис отвечает ошибкой (${status}).\n      ${tail}`;
   return `${status}. Ответ сервиса:\n      ${tail}`;
+}
+
+/**
+ * Речь через Gemini — тем же вызовом, что в бою.
+ *
+ * Шлём секунду тишины настоящим WAV: распознать в ней нечего, и это
+ * правильный ответ. Проверяем не текст, а то, что запрос приняли — ключ,
+ * модель и формат. Обёртка именно настоящая: Gemini разбирает контейнер
+ * сам, и на подделке ответил бы ошибкой формата, а мы решили бы, что дело
+ * в ключе.
+ */
+async function checkSpeechGemini() {
+  if (!process.env.GEMINI_API_KEY) { skip('Голос: GEMINI_API_KEY не заполнен'); return; }
+  const dirty = checkAscii(process.env.GEMINI_API_KEY, 'GEMINI_API_KEY');
+  if (dirty) { no(`Голос: ${dirty}`); return; }
+  const model = process.env.SPEECH_MODEL || process.env.AI_MODEL || 'gemini-3.6-flash';
+  try {
+    /*
+     * Настоящий WAV из тишины: у Gemini контейнер разбирается сам, и
+     * подсунуть ему что попало нельзя — он ответит ошибкой о формате, и мы
+     * решим, что дело в ключе.
+     */
+    const rate = 16000;
+    const pcm = Buffer.alloc(rate * 2);          // секунда тишины
+    const head = Buffer.alloc(44);
+    head.write('RIFF', 0); head.writeUInt32LE(36 + pcm.length, 4); head.write('WAVE', 8);
+    head.write('fmt ', 12); head.writeUInt32LE(16, 16); head.writeUInt16LE(1, 20);
+    head.writeUInt16LE(1, 22); head.writeUInt32LE(rate, 24);
+    head.writeUInt32LE(rate * 2, 28); head.writeUInt16LE(2, 32); head.writeUInt16LE(16, 34);
+    head.write('data', 36); head.writeUInt32LE(pcm.length, 40);
+    const got = await speech.viaGemini(Buffer.concat([head, pcm]), 'wav');
+    ok(`Голос: модель ${model} приняла запись`);
+    if (got.usage) {
+      console.log(`      расход: вход ${got.usage.in} токенов за секунду тишины`);
+      console.log('      Звук считается токенами (~25 на секунду) и приходит в ответе —');
+      console.log('      значит минуты считаются по факту, а не по цене из настроек.');
+    }
+  } catch (e) {
+    const m = String(e.message || '');
+    if (/API key not valid|API_KEY_INVALID/i.test(m)) {
+      no('Голос: ключ GEMINI_API_KEY не принят — перевыпустите в Google AI Studio');
+    } else if (/403|location is not supported/i.test(m)) {
+      no(`Голос: обращение отклонено до проверки ключа.\n      ${m.slice(0, 200)}`);
+    } else if (/404|not found/i.test(m)) {
+      no(`Голос: модели «${model}» у этого ключа нет.\n      ${m.slice(0, 200)}`);
+    } else {
+      no(`Голос: ${m.slice(0, 250)}`);
+    }
+  }
 }
 
 /** Секунда тихого тона: настоящий звук, но распознавать в нём нечего. */
@@ -904,6 +954,7 @@ const platega = require(path.join(APP, 'lib/platega'));
 
   const sp = String(process.env.SPEECH_PROVIDER || '').toLowerCase();
   if (sp === 'yandex') { await checkSpeech(); await checkSpeechLong(); }
+  else if (sp === 'gemini') await checkSpeechGemini();
   else skip('Голос: SPEECH_PROVIDER не задан — распознавание речи выключено');
 
   console.log(`\n${'='.repeat(52)}`);

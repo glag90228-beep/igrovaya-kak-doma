@@ -3,23 +3,38 @@
 /**
  * Распознавание речи: голосовое сообщение → текст.
  *
- * Зачем отдельный сервис. Голос — самый быстрый ввод, когда руки заняты
- * товаром или рулём. Но модель, которая понимает фразы (lib/ai-agent.js) и
- * читает счета (lib/vision.js), звук не принимает вовсе: Anthropic Messages
- * API берёт только текст, картинки и PDF. Поэтому расшифровка — отдельный
- * шаг и отдельный провайдер, а всё остальное дальше идёт как обычно, через
- * ai-agent.understand().
+ * Зачем это отдельный шаг. Голос — самый быстрый ввод, когда руки заняты
+ * товаром или рулём. Расшифровка идёт здесь, а дальше фраза живёт как
+ * напечатанная — через ai-agent.understand().
  *
  * Провайдер выбирается переменной SPEECH_PROVIDER, как в lib/vision.js:
  *
+ *   gemini — та же модель, что разбирает фразы и читает счета. Ключ
+ *            GEMINI_API_KEY, отдельной роли и второго сервиса не нужно;
  *   yandex — Yandex SpeechKit; ключ YANDEX_API_KEY, папка YANDEX_FOLDER_ID
  *            (те же, что для распознавания фото; сервисному аккаунту нужна
  *            роль ai.speechkit-stt.user — ключ сам по себе прав не даёт);
  *   mock   — для прогонов: возвращает SPEECH_MOCK, в сеть не ходит;
  *   не задан — распознавания нет, бот честно об этом говорит.
  *
- * Почему именно SpeechKit. Telegram присылает голосовые в OGG/Opus, и
- * SpeechKit принимает этот контейнер напрямую — перекодировать нечем и
+ * ── Почему появился gemini ──
+ *
+ * Здесь было написано, что модель звук не принимает вовсе и потому нужен
+ * отдельный сервис. Для Anthropic это верно до сих пор: Messages API берёт
+ * текст, картинки и PDF, а звук — нет. Для Gemini — уже нет: он принимает
+ * запись прямо в generateContent, тем же вызовом, что и снимок счёта.
+ *
+ * Разница не теоретическая. На боевом сервере SpeechKit молчит, потому что
+ * сервисному аккаунту не выдана роль, а Gemini на той же машине работает —
+ * это проверено фразами и снимками. Один ключ вместо двух сервисов, и
+ * ничего не нужно настраивать в чужой консоли.
+ *
+ * Платим по-разному, и это стоит знать заранее. SpeechKit считает минуты,
+ * Gemini — токены звука (около 25 на секунду), и возвращает их в ответе.
+ * Значит расход по нему считается ПО ФАКТУ, а не по нашей прикидке.
+ *
+ * Telegram присылает голосовые в OGG/Opus, приложение пишет WAV. Оба
+ * провайдера берут эти контейнеры напрямую — перекодировать нечем и
  * незачем, ffmpeg на сервере не нужен.
  *
  * Два метода вместо одного. Синхронный отвечает сразу, но берёт не больше
@@ -38,6 +53,7 @@ const PROVIDER = () => String(process.env.SPEECH_PROVIDER || '').toLowerCase();
 function speechAvailable() {
   const p = PROVIDER();
   if (p === 'mock') return true;
+  if (p === 'gemini') return Boolean(process.env.GEMINI_API_KEY);
   if (p === 'yandex') return Boolean(process.env.YANDEX_API_KEY && process.env.YANDEX_FOLDER_ID);
   return false;
 }
@@ -45,6 +61,11 @@ function speechAvailable() {
 function speechHint() {
   const p = PROVIDER();
   if (!p) return 'Распознавание речи не подключено (SPEECH_PROVIDER не задан).';
+  if (p === 'gemini') {
+    const bad = badKey(process.env.GEMINI_API_KEY);
+    if (bad) return bad;
+    return 'Нет ключа GEMINI_API_KEY.';
+  }
   if (p === 'yandex') {
     const bad = badKey(process.env.YANDEX_API_KEY);
     if (bad) return bad;
@@ -252,6 +273,66 @@ async function yandexAsync(buffer, kind) {
 }
 
 /**
+ * Расшифровка через Gemini.
+ *
+ * Звук уходит в тот же generateContent, что фраза и снимок счёта: файл в
+ * inline_data, до 20 МБ в запросе — ровно столько же, сколько Telegram
+ * отдаёт боту, так что второй границы не появляется.
+ *
+ * Подсказка короткая и запрещающая. Модель, которую попросили «расшифруй»,
+ * охотно добавляет от себя: приписывает «(неразборчиво)», расставляет
+ * говорящих, переводит на другой язык, а то и отвечает на услышанное вместо
+ * того, чтобы его записать. Для нас это не мелочь: расшифровка идёт дальше
+ * в разбор фразы, и лишнее слово превращается в неверный документ.
+ *
+ * Возвращаем и usage: Gemini считает звук токенами (около 25 на секунду) и
+ * сообщает их в ответе. Значит расход считается по факту — как у текста, а
+ * не по прикидке «минута стоит столько-то».
+ */
+async function viaGemini(buffer, kind) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY не задан');
+  const baseUrl = (process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com')
+    .replace(/\/+$/, '');
+  const model = process.env.SPEECH_MODEL || process.env.AI_MODEL || 'gemini-3.6-flash';
+
+  // Тип берём по сигнатуре файла, а не по словам отправителя: mime_type в
+  // Telegram задаёт он сам, а у видеокружка его нет вовсе.
+  const mime = { oggopus: 'audio/ogg', mp3: 'audio/mpeg', wav: 'audio/wav' }[kind] || 'audio/ogg';
+
+  const ASK = 'Запиши текстом то, что сказано в этой записи. Русский язык.\n'
+    + 'Только сами слова: без пояснений, без кавычек, без пометок вроде '
+    + '«неразборчиво», без имён говорящих. Ничего не добавляй от себя и не '
+    + 'отвечай на сказанное — только запиши. Если речи нет вовсе, ответь пустой строкой.';
+
+  const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
+    body: JSON.stringify({
+      contents: [{
+        parts: [
+          { text: ASK },
+          { inline_data: { mime_type: mime, data: buffer.toString('base64') } },
+        ],
+      }],
+      generationConfig: { temperature: 0, maxOutputTokens: 1200 },
+    }),
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const data = await res.json();
+  const u = data.usageMetadata || {};
+  return {
+    text: ((((data.candidates || [])[0] || {}).content || {}).parts || [{}])[0].text || '',
+    usage: {
+      in: Number(u.promptTokenCount) || 0,
+      out: Number(u.candidatesTokenCount) || 0,
+      cached: Number(u.cachedContentTokenCount) || 0,
+    },
+  };
+}
+
+/**
  * Расшифровать запись.
  *
  * @param {Buffer} buffer байты файла как их прислал Telegram
@@ -271,6 +352,32 @@ async function transcribe(buffer, seconds = 0) {
   if (kind === 'mp4') {
     // Видео не разбираем: чтобы достать звук, нужен ffmpeg на сервере.
     return { ok: false, error: 'Видео я пока не разбираю — пришлите голосовое сообщение.' };
+  }
+
+  /*
+   * Gemini разбирает контейнер сам, и делить записи на короткие и длинные
+   * не нужно: ни синхронного потолка в 30 секунд, ни отдельного
+   * асинхронного метода у него нет. Ограничение одно — 20 МБ на запрос,
+   * и оно совпадает с потолком Telegram на скачивание ботом.
+   */
+  if (PROVIDER() === 'gemini') {
+    if (buf.length > 20 * 1024 * 1024) {
+      return { ok: false, error: 'Запись слишком длинная — пришлите покороче или напишите текстом.' };
+    }
+    try {
+      const got = await viaGemini(buf, kind);
+      const clean = String(got.text || '').trim();
+      if (!clean) return { ok: false, error: 'Ничего не расслышал — попробуйте записать ещё раз.' };
+      // usage отдаём наверх: по нему бот считает деньги по факту, а не по
+      // прикидке «минута стоит столько-то».
+      return { ok: true, text: clean.slice(0, 4000), via: 'gemini', usage: got.usage };
+    } catch (e) {
+      const detail = String(e.message || '');
+      const human = /401|403|API key/i.test(detail)
+        ? 'Распознавание речи сейчас не работает — напишите, пожалуйста, текстом.'
+        : 'Не получилось разобрать запись — попробуйте ещё раз или напишите текстом.';
+      return { ok: false, error: human, detail };
+    }
   }
 
   /*
@@ -324,5 +431,6 @@ async function transcribe(buffer, seconds = 0) {
 
 module.exports = {
   speechAvailable, speechHint, transcribe, sniff, splitJsonStream, parseWav, badKey,
+  viaGemini,
   SYNC_LIMIT_SEC, SYNC_LIMIT_BYTES,
 };

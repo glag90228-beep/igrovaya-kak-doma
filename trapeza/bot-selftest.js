@@ -3585,6 +3585,83 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'секунды звука записаны в расход', aiMod.budget(vuid).kopecks - kopBefore);
     delete process.env.AI_KOP_VOICE;
 
+    /*
+     * ── Gemini как провайдер речи ──
+     *
+     * Появился не от хорошей жизни: на боевом сервере SpeechKit молчит из-за
+     * невыданной роли, а Gemini на той же машине работает. Заодно он считает
+     * звук токенами и возвращает их — значит расход по голосу перестаёт быть
+     * прикидкой «минута стоит столько-то».
+     *
+     * Ходим на поддельный адрес: сеть в прогонах не нужна.
+     */
+    {
+      const http3 = require('node:http');
+      const got3 = [];
+      const fakeG = http3.createServer((q, res3) => {
+        let b = '';
+        q.on('data', (c) => { b += c; });
+        q.on('end', () => {
+          try { got3.push(JSON.parse(b)); } catch (_) { got3.push({}); }
+          res3.writeHead(200, { 'content-type': 'application/json' });
+          res3.end(JSON.stringify({
+            candidates: [{ content: { parts: [{ text: 'кто мне должен' }] } }],
+            usageMetadata: { promptTokenCount: 770, candidatesTokenCount: 12 },
+          }));
+        });
+      });
+      await new Promise((r3) => fakeG.listen(0, '127.0.0.1', r3));
+      const keepG = {};
+      for (const k of ['SPEECH_PROVIDER', 'GEMINI_API_KEY', 'GEMINI_BASE_URL', 'AI_KOP_IN', 'AI_KOP_VOICE']) {
+        keepG[k] = process.env[k];
+      }
+      process.env.SPEECH_PROVIDER = 'gemini';
+      process.env.GEMINI_API_KEY = 'test-key';
+      process.env.GEMINI_BASE_URL = `http://127.0.0.1:${fakeG.address().port}`;
+      process.env.AI_KOP_IN = '1200';
+      process.env.AI_KOP_VOICE = '120';
+
+      const spG = require('./lib/speech');
+      ok(spG.speechAvailable() === true, 'с ключом Gemini речь доступна');
+
+      const ogg = Buffer.concat([Buffer.from('OggS'), Buffer.alloc(300)]);
+      const heardG = await spG.transcribe(ogg, 5);
+      ok(heardG.ok && heardG.text === 'кто мне должен', 'Gemini расшифровал',
+        JSON.stringify(heardG).slice(0, 80));
+      ok(heardG.via === 'gemini', 'и это видно в ответе', heardG.via);
+      ok(heardG.usage && heardG.usage.in === 770,
+        'расход вернулся токенами, а не прикидкой', JSON.stringify(heardG.usage));
+
+      // Запись уходит в том виде, в каком пришла: контейнер определяется по
+      // сигнатуре файла, а не по словам отправителя.
+      const part = ((got3[0] || {}).contents || [{}])[0].parts || [];
+      ok((part[1] || {}).inline_data && part[1].inline_data.mime_type === 'audio/ogg',
+        'OGG уехал как audio/ogg', JSON.stringify((part[1] || {}).inline_data || {}).slice(0, 60));
+      ok(/Только сами слова/.test((part[0] || {}).text || ''),
+        'подсказка запрещает добавлять от себя', ((part[0] || {}).text || '').slice(0, 40));
+
+      // WAV из приложения — тем же путём, но своим типом.
+      got3.length = 0;
+      const wav = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVE'), Buffer.alloc(200)]);
+      await spG.transcribe(wav, 3);
+      const partW = ((got3[0] || {}).contents || [{}])[0].parts || [];
+      ok((partW[1] || {}).inline_data.mime_type === 'audio/wav', 'WAV уехал как audio/wav',
+        (partW[1] || {}).inline_data.mime_type);
+
+      // Слишком длинная запись до сети не доходит вовсе.
+      got3.length = 0;
+      const huge = Buffer.concat([Buffer.from('OggS'), Buffer.alloc(21 * 1024 * 1024)]);
+      const big = await spG.transcribe(huge, 600);
+      ok(big.ok === false && /слишком длинная/.test(big.error), 'запись больше 20 МБ отклонена',
+        big.error);
+      ok(got3.length === 0, 'и в сеть за ней не ходили', String(got3.length));
+
+      fakeG.close();
+      for (const [k, v] of Object.entries(keepG)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+
     delete process.env.SPEECH_PROVIDER;
     delete process.env.SPEECH_MOCK;
     sent.length = 0;
