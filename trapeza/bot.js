@@ -11,6 +11,8 @@ const { formatRub, formatMoney, amountInWords, round2, vatTotals } = require('./
 const { buildAkt } = require('./lib/xlsx-akt');
 const { buildRegistry } = require('./lib/xlsx-registry');
 const { buildKnigaProdazh, bookRow } = require('./lib/xlsx-kniga');
+const kudir = require('./lib/kudir');
+const { buildKudir } = require('./lib/xlsx-kudir');
 const { advanceVat } = require('./lib/avans');
 const { correctionRow, correctionTotals } = require('./lib/ksf');
 const { buildAktUslugHtml } = require('./lib/akt-uslug');
@@ -1206,6 +1208,102 @@ async function sendKniga(tg, chatId, user, periodName) {
     caption: `Книга продаж за ${esc(title)} (${ru(from)}—${ru(to)}).\n`
       + `Счетов-фактур: <b>${rows.length}</b>, НДС к начислению: <b>${formatRub(vat)}</b>.\n\n`
       + '<i>Выгрузка для сверки: книга ведётся нарастающим итогом за квартал и подписывается.</i>',
+  });
+}
+
+/**
+ * Режим налогообложения: от него зависит форма книги учёта.
+ *
+ * Отдельным экраном, а не полем в карточке: выбор редкий, но последствия у
+ * него налоговые, и человек должен видеть рядом, что именно этот выбор
+ * меняет. Здесь же показывается отказ решателя, если он есть, — иначе
+ * человек выберет режим и не поймёт, почему книга всё равно не собирается.
+ */
+async function showTaxMode(tg, chatId, user) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+
+  const cur = String(org.tax_mode || '');
+  const mark = (v) => (cur === v ? '✅ ' : '');
+  const d = kudir.bookFor(org);
+
+  const lines = [
+    '<b>Режим налогообложения</b>', '',
+    'От него зависит форма книги учёта доходов: у упрощёнки и у патента они разные — '
+    + 'приложения 2 и 3 приказа ФНС от 07.11.2023 № ЕА-7-3/816@.', '',
+    cur ? `Сейчас: <b>${esc(kudir.TAX_MODES[cur] || cur)}</b>` : '<i>Пока не указан — книгу не собираю.</i>',
+  ];
+  if (d.blocked && cur) lines.push('', `⚠️ ${esc(d.blocked)}`);
+
+  await tg.sendMessage(chatId, lines.join('\n'), keyboard([
+    [{ text: `${mark('usn_income')}УСН «доходы»`, data: 'tax.set:usn_income' }],
+    [{ text: `${mark('usn_minus')}УСН «доходы минус расходы»`, data: 'tax.set:usn_minus' }],
+    [{ text: `${mark('psn')}Патент`, data: 'tax.set:psn' }],
+    [{ text: '⬅️ Меню', data: 'menu' }],
+  ]));
+}
+
+/**
+ * Книга учёта доходов из присланной выписки.
+ *
+ * Собирается из того файла, который человек только что прислал, а не из
+ * журнала: в журнал попадают только строки, сопоставленные с контрагентом,
+ * а книге нужны все поступления — в том числе свои деньги и займы, которые
+ * надо увидеть, чтобы исключить их осознанно, а не по умолчанию.
+ *
+ * Отсюда и ограничение, о котором сказано в подписи к файлу: книга выходит
+ * за период выписки. Годовая книга — годовая выписка.
+ */
+async function sendKudir(tg, chatId, user) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+
+  const d = kudir.bookFor(org);
+  if (d.blocked) {
+    await tg.sendMessage(chatId, esc(d.blocked), keyboard([
+      ...(d.needs === 'tax_mode' ? [[{ text: '⚙️ Указать режим', data: 'taxmode' }]] : []),
+      [{ text: '⬅️ Меню', data: 'menu' }],
+    ]));
+    return;
+  }
+
+  const st = bdb.getState(user.id);
+  const all = st.state === 'bank' && Array.isArray(st.data.all) ? st.data.all : [];
+  if (!all.length) {
+    await tg.sendMessage(chatId,
+      'Книга собирается из банковской выписки. Пришлите её файлом — 1С-Клиент-Банк, '
+      + 'OFX или CSV из личного кабинета, — и сразу под разбором появится кнопка.',
+      keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+
+  const dates = all.map((r) => r.date).filter(Boolean).sort();
+  const from = dates[0];
+  const to = dates[dates.length - 1];
+  const book = kudir.buildIncomeBook(all, { from, to });
+  if (book.blocked) {
+    await tg.sendMessage(chatId, esc(book.blocked), keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+
+  await tg.sendChatAction(chatId, 'upload_document');
+  const buf = await buildKudir({ org, book, year: Number(from.slice(0, 4)), mode: d.mode });
+
+  const caption = [
+    `Книга учёта доходов за ${ru(from)}—${ru(to)}.`,
+    `Строк: <b>${book.rows.length}</b>, доход: <b>${formatRub(book.total)}</b>.`,
+  ];
+  if (book.ask.length) {
+    caption.push('', `⚠️ <b>Не разнесено: ${book.ask.length}</b> — первым листом в файле. `
+      + 'Пока они не разобраны, книга не полна.');
+  }
+  caption.push('', '<i>Книга собрана за период присланной выписки. Для годовой книги '
+    + 'пришлите выписку за год. Проверьте и подпишите — это черновик, а не сданная отчётность.</i>');
+
+  await tg.sendDocument(chatId, {
+    filename: `Книга_учета_доходов_${from}_${to}.xlsx`,
+    buffer: buf,
+    caption: caption.join('\n'),
   });
 }
 
@@ -3238,13 +3336,28 @@ async function handleStatement(tg, chatId, user, msg) {
 
   // Строки кладём в состояние: кнопка нажимается позже, а файла к тому
   // времени уже нет.
+  /*
+   * Рядом с сопоставленными строками кладём ВСЕ разобранные — они нужны
+   * книге учёта. В журнал попадают только те, у кого нашёлся контрагент, а
+   * книге надо увидеть и свои деньги, и займы, и возвраты налога: исключить
+   * их следует осознанно, а не потому, что они потерялись по дороге.
+   * Поля только те, что нужны книге, иначе состояние разрастается зря.
+   */
   bdb.setState(user.id, 'bank', {
     rows: sure.map((t) => ({ key: t.key, cpId: t.cp.id, amount: t.amount, date: t.date, doc: t.doc })),
+    all: rows.map((r) => ({
+      date: r.date, amount: r.amount, incoming: r.incoming,
+      name: r.name || '', purpose: r.purpose || '', doc: r.doc || '',
+    })),
   });
 
   const app = webAppUrl();
+  const book = kudir.bookFor(bdb.currentOrg(user.id));
   await tg.sendMessage(chatId, lines.join('\n'), keyboard([
     ...(sure.length ? [[{ text: `✅ Занести ${sure.length} ${plural(sure.length, 'оплату', 'оплаты', 'оплат')}`, data: 'bank:take' }]] : []),
+    // Кнопку показываем и когда книга не положена: отказ с объяснением
+    // полезнее молчания, а из него ведёт кнопка к выбору режима.
+    [{ text: book.blocked ? '📒 Книга учёта доходов' : '📒 Собрать книгу учёта доходов', data: 'kudir' }],
     ...(app ? [[{ text: '📱 Разобрать в приложении', webApp: app }]] : []),
     [{ text: '⬅️ Меню', data: 'menu' }],
   ]));
@@ -4966,6 +5079,19 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('reg.p:')) { await sendRegistry(tg, chatId, user, data.slice(6)); return; }
     if (data.startsWith('kniga.p:')) { await sendKniga(tg, chatId, user, data.slice(8)); return; }
+    if (data === 'taxmode') { await showTaxMode(tg, chatId, user); return; }
+    if (data.startsWith('tax.set:')) {
+      const v = data.slice(8);
+      // Пишем только известные значения: решатель на незнакомый режим
+      // отвечает отказом, и молча записанный мусор превратился бы в
+      // «книга почему-то не собирается» без единой подсказки.
+      if (!Object.prototype.hasOwnProperty.call(kudir.TAX_MODES, v)) return;
+      const org = bdb.currentOrg(user.id);
+      if (org) bdb.updateOrg(user.id, org.id, { tax_mode: v });
+      await showTaxMode(tg, chatId, user);
+      return;
+    }
+    if (data === 'kudir') { await sendKudir(tg, chatId, user); return; }
     if (data === 'vat') { await showVat(tg, chatId, user); return; }
     if (data === 'npd') { await showNpd(tg, chatId, user); return; }
     if (data.startsWith('npd.set:')) {
