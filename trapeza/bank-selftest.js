@@ -431,6 +431,49 @@ console.log('\n── книга учёта доходов ──');
   ok(mixed.rows.map((r) => r.n).join(',') === '1,2,3', 'и нумерация следует хронологии');
 }
 
+console.log('\n── книга учёта: какую и кому ──');
+{
+  const kudir = require('./lib/kudir');
+  const f = (org) => kudir.bookFor(org);
+
+  ok(f({ tax_mode: 'usn_income' }).mode === 'usn', 'УСН «доходы» — книга упрощенца');
+  ok(f({ tax_mode: 'psn' }).mode === 'psn', 'патент — своя книга доходов');
+
+  /*
+   * Пустой режим — это не «наверное УСН». Пустая ставка НДС одинаково
+   * выглядит у упрощенца до порога и у патента, а формы книги разные:
+   * приложения 2 и 3 одного приказа. Отдать не ту форму хуже, чем не
+   * отдать никакой.
+   */
+  const none = f({});
+  ok(!none.mode && none.needs === 'tax_mode', 'режим не указан — не угадываем, а спрашиваем');
+  ok(/разные/.test(none.blocked), 'и сказано почему', none.blocked.slice(0, 44));
+
+  ok(!f({ tax_mode: 'usn_minus' }).mode, '«доходы минус расходы» не собираем');
+  ok(/346\.16/.test(f({ tax_mode: 'usn_minus' }).blocked),
+    'и названа причина — закрытый перечень расходов');
+
+  // Плательщик НДС: отказ один и тот же, каким путём ни приди.
+  const vat = f({ tax_mode: 'usn_income', vat_rate: '22' });
+  ok(!vat.mode && vat.vatPayer, 'плательщику НДС книга не положена');
+  ok(vat.blocked === kudir.VAT_BLOCK, 'текст отказа один на решатель и на сборщик');
+  ok(kudir.buildIncomeBook([], { vatPayer: true }).blocked === kudir.VAT_BLOCK,
+    'и сборщик отказывает теми же словами');
+
+  // Ставка 0% — это тоже плательщик НДС, а не «без НДС».
+  ok(!f({ tax_mode: 'usn_income', vat_rate: '0' }).mode,
+    'ставка 0% — плательщик, книга не собирается');
+
+  ok(!f({ tax_mode: 'psn', vat_rate: '22' }).mode, 'патент со ставкой НДС — похоже на совмещение');
+  ok(/совмещ/i.test(f({ tax_mode: 'psn', vat_rate: '22' }).blocked), 'и так и сказано');
+
+  const npd = f({ npd: 1, tax_mode: 'usn_income' });
+  ok(!npd.mode && /Мой налог/.test(npd.blocked),
+    'самозанятому книга не нужна вовсе, и сказано куда идти');
+
+  ok(!f({ tax_mode: 'esxn' }).mode, 'незнакомый режим не притворяется знакомым');
+}
+
 console.log('\n── книга учёта: форма ФНС ──');
 {
   const kudir = require('./lib/kudir');

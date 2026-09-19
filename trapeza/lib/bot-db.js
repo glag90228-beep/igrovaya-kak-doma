@@ -247,6 +247,22 @@ function migrate() {
    */
   addColumn('orgs', 'debt_basis', "TEXT NOT NULL DEFAULT 'closing'");
 
+  /*
+   * Режим налогообложения — нужен книге учёта доходов.
+   *
+   * '' | 'usn_income' | 'usn_minus' | 'psn'
+   *
+   * Отдельным полем, а не догадкой по ставке НДС: пустая ставка одинаково
+   * выглядит и у упрощенца до порога, и у патента, а формы книги у них
+   * разные (приложения 2 и 3 приказа ФНС от 07.11.2023 № ЕА-7-3/816@).
+   * Отдать не ту форму хуже, чем не отдать никакой, поэтому пустое
+   * значение означает «не знаем» и книга не собирается.
+   *
+   * Плательщика НДС сюда не пишем: он уже выводится из vat_rate. Второе
+   * поле о том же разъехалось бы с первым при первой же правке.
+   */
+  addColumn('orgs', 'tax_mode', "TEXT NOT NULL DEFAULT ''");
+
   // Отметка оплаты документа и связь операции с документом: по ней
   // отменяют проводку и не создают её дважды.
   addColumn('documents', 'paid_at', "TEXT NOT NULL DEFAULT ''");
@@ -485,7 +501,7 @@ function vatOf(org) {
 function updateOrg(userId, id, fields) {
   const allowed = ['name', 'full_name', 'inn', 'kpp', 'signer', 'address',
     'bank_name', 'bik', 'acc', 'corr_acc', 'ogrnip', 'vat_rate', 'vat_gross', 'debt_basis',
-    'biz_type', 'npd'];
+    'biz_type', 'npd', 'tax_mode'];
   const sets = [], vals = [];
   for (const k of allowed) if (k in fields) { sets.push(`${k} = ?`); vals.push(fields[k]); }
   if (!sets.length) return;
