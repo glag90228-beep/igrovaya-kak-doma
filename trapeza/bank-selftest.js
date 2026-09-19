@@ -414,7 +414,113 @@ console.log('\n── книга учёта доходов ──');
   const v = kudir.buildIncomeBook(rows, { from: '2026-03-01', to: '2026-03-31', vatPayer: true });
   ok(v.blocked && v.rows.length === 0, 'плательщику НДС книга не собирается');
   ok(/ст\. 248/.test(v.blocked), 'и сказано, на каком основании', v.blocked.slice(0, 40));
+
+  /*
+   * Хронология. Банки выгружают строки как им удобно, а два файла за разные
+   * месяцы человек грузит в любом порядке. Книга ведётся хронологически, и
+   * номер строки ссылается на место в этом порядке — пронумеруй как пришло,
+   * и получится книга с датами вразнобой.
+   */
+  const mixed = kudir.buildIncomeBook([
+    row('Оплата по счету 3', { date: '2026-03-20' }),
+    row('Оплата по счету 1', { date: '2026-03-05' }),
+    row('Оплата по счету 2', { date: '2026-03-12' }),
+  ], { from: '2026-03-01', to: '2026-03-31' });
+  ok(mixed.rows.map((r) => r.date).join(' ') === '2026-03-05 2026-03-12 2026-03-20',
+    'строки идут по датам, а не в порядке выписки', mixed.rows.map((r) => r.date).join(' '));
+  ok(mixed.rows.map((r) => r.n).join(',') === '1,2,3', 'и нумерация следует хронологии');
 }
 
-console.log(bad === 0 ? '\n✅ Разбор выписок: все проверки прошли\n' : `\n❌ Ошибок: ${bad}\n`);
-process.exit(bad === 0 ? 0 : 1);
+console.log('\n── книга учёта: форма ФНС ──');
+{
+  const kudir = require('./lib/kudir');
+  const { buildKudir, quarterOf } = require('./lib/xlsx-kudir');
+  const ExcelJS = require('exceljs');
+  const org = { full_name: 'ИП Иванов Иван Иванович', inn: '183112345678', acc: '40802810500000012345', bank_name: 'Т-Банк', signer: 'Иванов И.И.', address: 'Ижевск' };
+
+  ok(quarterOf('2026-01-15') === 1 && quarterOf('2026-04-01') === 2
+    && quarterOf('2026-09-30') === 3 && quarterOf('2026-12-31') === 4, 'кварталы считаются по месяцу');
+
+  // По одной оплате в каждом квартале — так видно и нумерацию, и итоги.
+  const rows = [
+    { date: '2026-02-10', amount: 10000, incoming: true, name: 'А', doc: '1', purpose: 'Оплата по счету 1' },
+    { date: '2026-05-10', amount: 20000, incoming: true, name: 'Б', doc: '2', purpose: 'Оплата по счету 2' },
+    { date: '2026-08-10', amount: 30000, incoming: true, name: 'В', doc: '3', purpose: 'Оплата по счету 3' },
+    { date: '2026-11-10', amount: 40000, incoming: true, name: 'Г', doc: '4', purpose: 'Оплата по счету 4' },
+    { date: '2026-06-01', amount: 7000, incoming: true, name: 'Д', doc: '5', purpose: 'Эквайринг' },
+  ];
+  const book = kudir.buildIncomeBook(rows, { from: '2026-01-01', to: '2026-12-31' });
+
+  const read = async (mode) => {
+    const buf = await buildKudir({ org, book, year: 2026, mode });
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf);
+    return wb;
+  };
+
+  (async () => {
+    const wb = await read('usn');
+    const names = wb.worksheets.map((w) => w.name);
+
+    /*
+     * Лист с вопросами первым — намеренно. Эквайринг из выписки не разнесён,
+     * и человек должен увидеть это при открытии файла, а не через месяц при
+     * сверке с декларацией.
+     */
+    ok(names[0] === 'Не разнесено', 'неразнесённое встречает первым', names.join(' | '));
+    ok(names.includes('Титульный лист') && names.includes('Раздел I'), 'титульный лист и раздел на месте');
+
+    const s = wb.getWorksheet('Раздел I');
+    const text = [];
+    s.eachRow((r) => text.push(r.values.map((v) => (v == null ? '' : String(v))).join('\t')));
+    const all = text.join('\n');
+
+    ok(/I квартал/.test(all) && /IV квартал/.test(all), 'таблица на каждый квартал');
+    ok(/Итого за полугодие/.test(all) && /Итого за 9 месяцев/.test(all) && /Итого за год/.test(all),
+      'нарастающие итоги подписаны как в бланке');
+
+    /*
+     * Сквозная нумерация через кварталы — ключевое свойство формы. Если в
+     * каждой таблице начать с единицы, книга разойдётся с декларацией,
+     * потому что доход считается нарастающим итогом.
+     */
+    const nums = [];
+    s.eachRow((r) => { const v = r.getCell(1).value; if (typeof v === 'number') nums.push(v); });
+    ok(nums.join(',') === '1,2,3,4', 'нумерация сквозная через все кварталы, а не своя в каждом', nums.join(','));
+
+    // Нарастающий итог за год = сумма всех кварталов, а не последнего.
+    const year = [];
+    s.eachRow((r) => { if (String(r.getCell(3).value || '') === 'Итого за год') year.push(r.getCell(4).value); });
+    ok(year[0] === 100000, 'итог за год нарастающий: 10+20+30+40 тысяч', year[0]);
+
+    const half = [];
+    s.eachRow((r) => { if (String(r.getCell(3).value || '') === 'Итого за полугодие') half.push(r.getCell(4).value); });
+    ok(half[0] === 30000, 'за полугодие — первые два квартала, а не второй', half[0]);
+
+    // Патент: другая форма, а не та же с другой подписью.
+    const wp = await read('psn');
+    const sp = wp.getWorksheet('Доходы');
+    const ptext = [];
+    sp.eachRow((r) => ptext.push(r.values.map((v) => (v == null ? '' : String(v))).join('\t')));
+    const pall = ptext.join('\n');
+    ok(!!sp, 'у патента свой лист доходов');
+    ok(!/квартал/i.test(pall), 'и без деления по кварталам — в приложении 3 его нет');
+    ok(!/Расходы, учитываемые/.test(pall), 'и без графы расходов');
+    ok(/В книге пронумеровано и прошнуровано/.test(pall), 'заготовка для прошивки напечатана');
+
+    // Плательщику НДС файл не собирается вовсе.
+    let threw = '';
+    try {
+      await buildKudir({ org, book: { blocked: 'нельзя', rows: [], ask: [] }, year: 2026, mode: 'usn' });
+    } catch (e) { threw = e.message; }
+    ok(threw === 'нельзя', 'заблокированная книга в файл не выгружается', threw);
+
+    console.log(bad === 0 ? '\n✅ Разбор выписок: все проверки прошли\n' : `\n❌ Ошибок: ${bad}\n`);
+    process.exit(bad === 0 ? 0 : 1);
+  })().catch((e) => {
+    // Иначе упавшая проверка формы тихо уронит промис, процесс выйдет с
+    // нулём, и прогон отчитается об успехе, которого не было.
+    console.log('  ❌ проверка формы оборвалась → ' + e.message);
+    process.exit(1);
+  });
+}
