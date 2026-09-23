@@ -272,6 +272,10 @@ async function createTransaction(opts = {}) {
   const url = `${API_BASE()}/transaction/process`;
   try {
     const res = await fetch(url, {
+      // Без таймаута замолчавшая площадка вешала «Оплатить СБП» навсегда, а
+      // бот обрабатывает обновления по одному — замирал весь бот, не только
+      // этот человек, и сам не отвисал до перезапуска.
+      signal: AbortSignal.timeout(20000),
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -315,6 +319,7 @@ async function getTransactionStatus(id) {
   const url = `${API_BASE()}/transaction/${encodeURIComponent(String(id).trim())}`;
   try {
     const res = await fetch(url, {
+      signal: AbortSignal.timeout(20000),
       method: 'GET',
       headers: {
         'X-MerchantId': merchantId,

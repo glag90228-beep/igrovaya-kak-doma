@@ -88,12 +88,44 @@ async function handlePayment(p, provider = 'lava') {
     try { user = bdb.getOrCreateUser(p.tgId); } catch (_) { user = null; }
   }
 
-  const { duplicate, near, payment, id } = billing.recordPayment({
-    externalId: p.externalId, provider, userId: user ? user.id : 0,
-    email: p.email, amount: p.amount, currency: p.currency, days,
-    status: p.status, raw: p.raw,
+  /*
+   * Вся работа с базой — одной транзакцией, уведомления — после неё.
+   *
+   * Раньше платёж записывался, а срок продлевался следующей командой. Если
+   * она падала, приёмник отвечал 500, площадка присылала уведомление снова —
+   * и видела «уже записан»: срок не продлевался уже никогда. Теперь сбой
+   * откатывает и запись, и повтор проходит заново с нуля.
+   *
+   * Уведомления вынесены наружу намеренно: сообщение в Telegram нельзя
+   * откатить, и отправлять его до фиксации значило бы обещать то, что ещё
+   * может не записаться.
+   */
+  const out = billing.inTx(() => {
+    const rec = billing.recordPayment({
+      externalId: p.externalId, provider, userId: user ? user.id : 0,
+      email: p.email, amount: p.amount, currency: p.currency, days,
+      status: p.status, raw: p.raw,
+    });
+    if (rec.duplicate) return { kind: 'dup', rec };
+    if (!p.paid) return { kind: 'unpaid', rec };
+    if (!user) return { kind: 'nouser', rec };
+    const pay = rec.payment || {};
+    // Привязываем только то, что пришло ничьим (см. attachPayment).
+    if (!Number(pay.user_id) && !billing.attachPayment(rec.id || pay.id, user.id)) {
+      return { kind: 'taken', rec };
+    }
+    return { kind: 'granted', rec, until: billing.grantDays(user.id, days) };
   });
-  if (duplicate) {
+  const { near, reversed } = out.rec;
+
+  if (out.kind === 'dup' && reversed) {
+    notifyOwner(`⚠️ По оплаченному платежу ${escHtml(p.externalId)} пришёл статус `
+      + `«${escHtml(reversed.to)}» (был «${escHtml(reversed.from)}») — похоже на возврат или отмену.\n\n`
+      + 'Доступ сам не отозван: проверьте в кабинете площадки и снимите вручную, если деньги вернулись.')
+      .catch(() => {});
+    return `платёж ${p.externalId}: статус сменился на «${reversed.to}» — владелец предупреждён`;
+  }
+  if (out.kind === 'dup') {
     /*
      * Похожий платёж записан, но дней не даёт. Сказать об этом обязаны: под
      * тот же признак попадает и настоящая вторая покупка — месяц себе и
@@ -109,9 +141,9 @@ async function handlePayment(p, provider = 'lava') {
     return `повтор ${p.externalId} — записан, доступ не выдан`;
   }
 
-  if (!p.paid) return `платёж ${p.externalId} со статусом «${p.status}» — записан, доступ не выдан`;
+  if (out.kind === 'unpaid') return `платёж ${p.externalId} со статусом «${p.status}» — записан, доступ не выдан`;
 
-  if (!user) {
+  if (out.kind === 'nouser') {
     /*
      * Про такие оплаты обязаны узнать вы, а не только журнал.
      *
@@ -129,17 +161,11 @@ async function handlePayment(p, provider = 'lava') {
   }
 
   /*
-   * Привязываем только то, что пришло ничьим.
-   *
-   * Когда Telegram-id известен, строка записана уже на этого человека — и
-   * привязывать нечего. Если же она легла ничьей, привязка отвечает, не
-   * забрал ли её кто-то секундой раньше по почте в боте: начислять срок
-   * второй раз за один платёж было бы подарком за наш счёт.
+   * «Уже зачтён» — строку секундой раньше забрали по почте в боте.
+   * Начислять срок второй раз за один платёж было бы подарком за наш счёт.
    */
-  if (!Number((payment || {}).user_id) && !billing.attachPayment(id || payment.id, user.id)) {
-    return `платёж ${p.externalId} уже зачтён — срок не трогаем`;
-  }
-  const until = billing.grantDays(user.id, days);
+  if (out.kind === 'taken') return `платёж ${p.externalId} уже зачтён — срок не трогаем`;
+  const { until } = out;
   /*
    * Уведомление не задерживает ответ площадке.
    *
@@ -203,14 +229,26 @@ const server = http.createServer((req, res) => {
    * Подпись считается по сырому телу, поэтому его нужно иметь на руках до
    * решения. Ограничение размера при этом никуда не делось.
    */
-  let body = '';
+  /*
+   * Тело копим байтами и раскодируем один раз в конце.
+   *
+   * Было `body += chunk`: каждый кусок превращался в строку отдельно, и буква,
+   * которую nginx разрезал между двумя TCP-кусками, становилась «�». Подпись
+   * HMAC считается по байтам тела — по испорченной строке она не сходилась,
+   * и оплата с кириллицей в названии товара отвергалась как «неверный секрет»
+   * на каждом повторе. Заодно лимит теперь в байтах, как и написано.
+   */
+  const parts = [];
+  let size = 0;
   let tooBig = false;
   req.on('data', (chunk) => {
-    body += chunk;
-    if (body.length > MAX_BODY) { tooBig = true; req.destroy(); }
+    size += chunk.length;
+    if (size > MAX_BODY) { tooBig = true; req.destroy(); return; }
+    parts.push(chunk);
   });
   req.on('end', async () => {
     if (tooBig) return done(413, 'too large');
+    const body = Buffer.concat(parts).toString('utf8');
 
     /*
      * Кто стучался — записываем обязательно.

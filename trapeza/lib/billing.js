@@ -106,6 +106,32 @@ function accessInfo(userId) {
 }
 
 /**
+ * Выполнить fn в одной транзакции: либо всё, либо ничего.
+ *
+ * Зачем. Оплата зачисляется в два шага — отметить платёж и продлить срок.
+ * Раньше это были два отдельных запроса: если второй падал (например,
+ * SQLITE_BUSY — на одной базе работают бот, приложение и приёмник), платёж
+ * оставался отмеченным, а срок не продлевался. Повторная доставка вебхука
+ * видела «уже записан» и дней не давала никогда: человек заплатил и остался
+ * без подписки. С промокодом так же — код сгорал, дней не было.
+ *
+ * Теперь при любой ошибке откатываются оба шага, и повтор проходит заново.
+ * Обычный возврат из fn (включая «неверный код») фиксирует всё, что fn
+ * записала, — счётчик попыток, например, должен сохраниться.
+ */
+function inTx(fn) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const out = fn();
+    db.exec('COMMIT');
+    return out;
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch (_) { /* откатывать уже нечего */ }
+    throw e;
+  }
+}
+
+/**
  * Продлевает доступ. Считаем от большей из двух дат — сегодня и текущего
  * окончания: если человек продлил заранее, оплаченные дни не должны сгореть.
  */
@@ -210,7 +236,7 @@ function codeProblem(c) {
  *
  * @returns {{ok:true, until:string, days:number}|{ok:false, error:string}}
  */
-function redeemCode(userId, raw) {
+function redeemCodeInner(userId, raw) {
   const c = getCode(raw);
   if (!c) return { ok: false, error: codeProblem(c) };
 
@@ -314,10 +340,50 @@ function rawText(raw) {
 }
 
 function recordPayment(p) {
-  // Точное совпадение идентификатора — это ровно та же доставка того же
-  // платежа. Записывать нечего, и дней тоже.
   const same = findPayment(p.provider || 'lava', p.externalId);
-  if (same) return { duplicate: true, payment: same };
+  if (same) {
+    /*
+     * Тот же идентификатор — ещё не значит тот же платёж.
+     *
+     * У Platega id транзакции одинаков во всех уведомлениях: сначала может
+     * прийти «в обработке», потом «оплачено». Первое пишет строку без дней,
+     * и раньше второе отбрасывалось как повтор — деньги списаны, доступа
+     * нет, и никто об этом не узнаёт.
+     *
+     * Поэтому неоплаченную строку, по которой пришла оплата, дописываем
+     * сроком. Условие `days = 0` в самом UPDATE — не формальность: два
+     * одновременных «оплачено» по одному id оба увидят нулевой срок, но
+     * строку сменит только один, и срок получит только он.
+     *
+     * Отличаем от записанного «похожего платежа» (у него тоже days = 0) по
+     * статусу: там статус уже оплаченный и совпадает с новым, а здесь он
+     * другой.
+     */
+    const payingNow = Number(p.days) > 0;
+    const wasUnpaid = !(Number(same.days) > 0);
+    const statusMoved = String(same.status || '') !== String(p.status || '');
+    if (payingNow && wasUnpaid && statusMoved) {
+      const up = db.prepare(`
+        UPDATE payments
+           SET status = ?, days = ?, amount = ?, raw = ?,
+               user_id = CASE WHEN user_id = 0 THEN ? ELSE user_id END,
+               email = CASE WHEN email = '' THEN ? ELSE email END
+         WHERE id = ? AND days = 0`)
+        .run(p.status || '', Number(p.days), Number(p.amount) || 0, rawText(p.raw),
+          Number(p.userId) || 0, norm(p.email), same.id);
+      if (up.changes === 1) {
+        return { duplicate: false, near: false, upgraded: true, payment: findPayment(same.provider, same.external_id), id: same.id };
+      }
+    }
+    /*
+     * Оплаченный платёж получил другой статус — возврат, отмена, спор.
+     * Доступ здесь сам не отзываем: сколько дней снимать и снимать ли вообще,
+     * решает человек. Но и молчать нельзя — приёмник об этом скажет.
+     */
+    const reversed = !wasUnpaid && statusMoved && !payingNow
+      ? { from: same.status || '', to: p.status || '' } : null;
+    return { duplicate: true, payment: same, reversed };
+  }
 
   /*
    * Похожий платёж — не то же самое, что тот же самый.
@@ -462,7 +528,7 @@ function refundClaimSend(userId) {
  *
  * @returns {{ok:boolean, until?:string, taken?:number, error?:string, left?:number}}
  */
-function confirmEmailClaim(userId, code) {
+function confirmEmailClaimInner(userId, code) {
   const row = db.prepare('SELECT * FROM pay_claims WHERE user_id = ?').get(userId);
   if (!row) return { ok: false, error: 'нет-заявки' };
   if (Date.parse(row.expires_at) < Date.now()) {
@@ -510,8 +576,21 @@ function paymentsOf(userId, limit = 10) {
     .all(userId, limit);
 }
 
+/*
+ * Код списывается и срок продлевается в одной транзакции — см. inTx.
+ * Раньше при сбое выдачи код считался использованным, а дней не было.
+ */
+const redeemCode = (userId, raw) => inTx(() => redeemCodeInner(userId, raw));
+
+/*
+ * Оплаты привязываются и срок продлевается в одной транзакции. Раньше
+ * привязанная строка при сбое продления оставалась «чужой», и забрать её
+ * повторно было нельзя: user_id уже не 0.
+ */
+const confirmEmailClaim = (userId, code) => inTx(() => confirmEmailClaimInner(userId, code));
+
 module.exports = {
-  accessInfo, grantDays, revokeAccess, paidUsers,
+  accessInfo, grantDays, revokeAccess, paidUsers, inTx,
   recordPayment, findPayment, attachPayment, unclaimedByEmail, paymentsOf,
   startEmailClaim, confirmEmailClaim, pendingClaim, refundClaimSend,
   createCodes, getCode, redeemCode, revokeCode, listCodes, codeUsers, usedCodes,

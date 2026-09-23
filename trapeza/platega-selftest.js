@@ -358,6 +358,54 @@ function postJson(serverInstance, path, headers, body) {
     const accessYear = billing.accessInfo(testUser.id);
     ok(accessYear.left >= 390, 'годовой платёж 3490 ₽ добавил 365 дней к текущему сроку');
 
+    const H = { 'X-MerchantId': 'test-merchant-uuid-1234', 'X-Secret': 'test-secret-key-5678' };
+    const hook = (u, id, status) => postJson(testServer, '/platega', H, {
+      id, amount: 390, currency: 'RUB', status, paymentMethod: 2,
+      payload: JSON.stringify({ userId: u.id, tgId: u.tg_id }),
+    });
+
+    /*
+     * 5. Сначала «в обработке», потом «оплачено» — с одним и тем же id.
+     *
+     * У Platega id транзакции одинаков во всех уведомлениях. Раньше первое
+     * записывало строку без дней, второе отбрасывалось как повтор: деньги
+     * списаны, доступа нет.
+     */
+    const u5 = bdb.getOrCreateUser(777111301);
+    await hook(u5, 'plt-pend-001', 'PENDING');
+    ok(!billing.accessInfo(u5.id).active, '«в обработке» доступа не даёт');
+    await hook(u5, 'plt-pend-001', 'CONFIRMED');
+    const a5 = billing.accessInfo(u5.id);
+    ok(a5.active && a5.left >= 29, 'а следом «оплачено» по тому же id — даёт', JSON.stringify(a5));
+
+    /*
+     * 6. Два «оплачено» одновременно по одной ожидающей строке.
+     *
+     * Обе доставки видят нулевой срок; дописать строку должна только одна.
+     */
+    const u6 = bdb.getOrCreateUser(777111302);
+    await hook(u6, 'plt-pend-002', 'PENDING');
+    await Promise.all([hook(u6, 'plt-pend-002', 'CONFIRMED'), hook(u6, 'plt-pend-002', 'CONFIRMED')]);
+    const a6 = billing.accessInfo(u6.id);
+    ok(a6.left >= 29 && a6.left <= 31, 'двойная доставка «оплачено» дала срок один раз', a6.left);
+
+    /*
+     * 7. Выдача дней упала — повторная доставка обязана их выдать.
+     *
+     * Раньше платёж записывался, а срок продлевался отдельной командой. Сбой
+     * второй оставлял строку записанной, и повтор видел «уже записан».
+     */
+    const u7 = bdb.getOrCreateUser(777111303);
+    const realGrant = billing.grantDays;
+    billing.grantDays = () => { throw new Error('SQLITE_BUSY (имитация)'); };
+    const first = await hook(u7, 'plt-fail-001', 'CONFIRMED');
+    billing.grantDays = realGrant;
+    ok(first.status >= 500, 'сбой выдачи — приёмник просит повторить', first.status);
+    ok(billing.paymentsOf(u7.id, 5).length === 0, 'и платёж не остался записанным наполовину');
+    await hook(u7, 'plt-fail-001', 'CONFIRMED');
+    const a7 = billing.accessInfo(u7.id);
+    ok(a7.active && a7.left >= 29, 'повторная доставка срок выдала', JSON.stringify(a7));
+
   } finally {
     testServer.close();
   }

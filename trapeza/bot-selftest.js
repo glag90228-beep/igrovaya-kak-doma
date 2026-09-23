@@ -914,6 +914,34 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(await post('/lava?secret=sekret', {}) !== 401,
       'старый способ доступен, только если его включили явно');
     delete process.env.LAVA_ALLOW_URL_SECRET;
+
+    /*
+     * Тело с кириллицей, разрезанное посреди буквы.
+     *
+     * nginx передаёт тело кусками, и граница может прийти на середину
+     * двухбайтовой буквы. Приёмник склеивал куски как строки, буква
+     * превращалась в «�», и подпись, посчитанная по байтам, не сходилась:
+     * оплата с русским названием товара отвергалась как «неверный секрет»
+     * на каждом повторе. Шлём настоящими байтами через сокет, двумя кусками.
+     */
+    const net = require('node:net');
+    const ruBody = Buffer.from('{"eventType":"payment.success","amount":390,"product":{"title":"Подписка на Первичку"}}');
+    const cut = ruBody.indexOf(Buffer.from('П')) + 1;   // ровно между байтами буквы «П»
+    const sig = podpis('sekret', ruBody);
+    const splitStatus = await new Promise((resolve, reject) => {
+      const sock = net.connect(hookPort, '127.0.0.1', () => {
+        sock.write(`POST /lava HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n`
+          + `x-api-key: ${sig}\r\nContent-Length: ${ruBody.length}\r\nConnection: close\r\n\r\n`);
+        sock.write(ruBody.subarray(0, cut));
+        setTimeout(() => sock.end(ruBody.subarray(cut)), 30);
+      });
+      let resp = '';
+      sock.on('data', (d) => { resp += d; });
+      sock.on('end', () => resolve(Number((/^HTTP\/1\.1 (\d+)/.exec(resp) || [])[1])));
+      sock.on('error', reject);
+    });
+    ok(splitStatus !== 401, 'подпись тела с разрезанной буквой сходится', splitStatus);
+
     await new Promise((r) => hookServer.close(r));
   }
   process.env.LAVA_OFFER_URL = 'https://lava.top/x?a=1';

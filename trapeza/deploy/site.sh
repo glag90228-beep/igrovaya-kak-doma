@@ -230,6 +230,15 @@ server {
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Real-IP \$remote_addr;
     }
+    # Уведомление об оплате СБП (Platega) — тот же приёмник. Без этой ветки
+    # колбэк уходил в общее правило и получал 404: деньги списаны, площадка
+    # считает уведомление доставленным, подписка не открывается.
+    location /platega {
+        proxy_pass http://127.0.0.1:$LAVA_PORT;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
 
     # Картинки и снимки экрана не меняются — пусть браузер их запоминает.
     location ~* \.(webp|png|jpg|svg|ico|woff2)\$ {

@@ -69,6 +69,16 @@ server {
         client_max_body_size 256k;
     }
 
+    # Приёмник оплат СБП (Platega) — тот же процесс, что у Lava. Без этой
+    # ветки колбэк уходил в мини-приложение и получал 404: деньги списаны,
+    # подписка не открывается.
+    location /platega {
+        proxy_pass http://127.0.0.1:8788/platega;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        client_max_body_size 256k;
+    }
+
     # Мини-приложение Telegram: страница и его API.
     # Заголовок Authorization несёт подпись Telegram — его нужно пропустить.
     location / {

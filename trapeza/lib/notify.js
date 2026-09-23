@@ -55,6 +55,7 @@ async function notifyOrder({ order, totals, settings, link, kind }) {
 
   try {
     const res = await fetch(api(token, 'sendMessage'), {
+      signal: AbortSignal.timeout(15000),
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -77,10 +78,10 @@ async function notifyOrder({ order, totals, settings, link, kind }) {
 async function checkBot(token) {
   const t = (token || '').trim();
   if (!t) throw new Error('Токен не задан');
-  const me = await fetch(api(t, 'getMe')).then((r) => r.json());
+  const me = await fetch(api(t, 'getMe'), { signal: AbortSignal.timeout(15000) }).then((r) => r.json());
   if (!me.ok) throw new Error(me.description || 'Токен не подошёл');
 
-  const upd = await fetch(api(t, 'getUpdates?limit=20')).then((r) => r.json());
+  const upd = await fetch(api(t, 'getUpdates?limit=20'), { signal: AbortSignal.timeout(15000) }).then((r) => r.json());
   const chats = [];
   if (upd.ok) {
     for (const u of upd.result || []) {
