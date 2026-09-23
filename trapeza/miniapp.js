@@ -1831,8 +1831,20 @@ const api = {
     return { ok: true, messages };
   },
 
-  /** Выгрузка датасета для анализа и обучения модели. */
+  /**
+   * Выгрузка датасета для анализа и обучения модели — только владельцу.
+   *
+   * Выгрузка идёт по ВСЕМ клиентам: имена контрагентов, суммы, налоговые
+   * вопросы. Раньше её получал любой, кто открыл приложение, — достаточно
+   * было знать адрес. Владелец здесь тот же, что у команд бота: личный
+   * Telegram из SUPPORT_CHAT_ID. Групповой чат туда не подходит — у группы
+   * отрицательный id, и с id человека он не совпадёт никогда.
+   */
   async 'GET /api/ask/dataset'({ user, url }) {
+    const owner = String(process.env.SUPPORT_CHAT_ID || '').trim();
+    if (!owner || String(user.tg_id) !== owner) {
+      return { error: 'Выгрузка доступна только владельцу бота.' };
+    }
     const limit = Number(url.searchParams.get('limit')) || 1000;
     const type = url.searchParams.get('type') || null;
     const dataset = bdb.getAiDataset({ limit, type });

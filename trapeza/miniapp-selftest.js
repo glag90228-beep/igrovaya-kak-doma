@@ -2087,6 +2087,38 @@ async function main() {
     delete process.env.SMTP_FROM;
   }
 
+  section('выгрузка переписок — только владельцу');
+  {
+    /*
+     * Выгрузка идёт по всем клиентам сразу. Раньше её получал любой, кто
+     * открыл приложение, — это была утечка чужих имён, сумм и вопросов.
+     * Проверяем по-настоящему: Маша пишет ассистенту, Петя просит выгрузку
+     * и не должен увидеть ни одной Машиной фразы.
+     */
+    const bdbD = require('./lib/bot-db');
+    const mashaD = bdbD.getOrCreateUser(MASHA.id).id;
+    const secret = 'ООО Тайная Ромашка должна 777 777';
+    bdbD.saveAiMessage({ userId: mashaD, source: 'miniapp', role: 'user', type: 'text', text: secret });
+
+    const was = process.env.SUPPORT_CHAT_ID;
+    process.env.SUPPORT_CHAT_ID = String(MASHA.id);
+
+    const byPetya = await call('GET', '/api/ask/dataset?limit=5000', { user: petya });
+    ok(!byPetya.text.includes('Тайная Ромашка'), 'посторонний не видит чужих фраз', byPetya.text.slice(0, 80));
+    ok(!(byPetya.json && Array.isArray(byPetya.json.dataset)), 'и выгрузку не получает вовсе');
+
+    const byOwner = await call('GET', '/api/ask/dataset?limit=5000', { user: masha });
+    ok(byOwner.json && Array.isArray(byOwner.json.dataset)
+      && byOwner.json.dataset.some((m) => m.text === secret), 'владелец выгрузку получает');
+
+    // Без SUPPORT_CHAT_ID владельца нет — значит выгрузки нет ни у кого.
+    delete process.env.SUPPORT_CHAT_ID;
+    const noOwner = await call('GET', '/api/ask/dataset', { user: masha });
+    ok(!(noOwner.json && Array.isArray(noOwner.json.dataset)), 'без владельца выгрузка закрыта для всех');
+
+    if (was === undefined) delete process.env.SUPPORT_CHAT_ID; else process.env.SUPPORT_CHAT_ID = was;
+  }
+
   // Сервер держим до конца: проверки выше ходят к нему по HTTP, и закрытый
   // раньше времени он давал ECONNREFUSED вместо внятного провала.
   await new Promise((r2) => server.close(r2));
