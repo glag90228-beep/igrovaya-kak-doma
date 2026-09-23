@@ -2285,7 +2285,43 @@ function serveStatic(req, res, pathname) {
 
 // ---------- маршрутизация ----------
 
-const server = http.createServer(async (req, res) => {
+/**
+ * Кто пришёл — для ограничения частоты.
+ *
+ * Заголовкам X-Real-IP и X-Forwarded-For верим только тогда, когда запрос
+ * пришёл от нашего же nginx, то есть с петли. Напрямую их присылает кто
+ * угодно, и счётчик, построенный на них, обнулялся подменой заголовка —
+ * лимит на перебор ссылок не работал. Первый адрес в X-Forwarded-For не
+ * берём никогда: его как раз и пишет клиент, nginx лишь дописывает свой в
+ * конец. Берём X-Real-IP, который nginx перезаписывает сам.
+ */
+function clientIp(req) {
+  const peer = String((req.socket && req.socket.remoteAddress) || '');
+  const fromProxy = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
+  if (fromProxy) {
+    const real = String(req.headers['x-real-ip'] || '').trim();
+    if (real) return real;
+  }
+  return peer || 'нет-адреса';
+}
+
+/*
+ * Любое исключение внутри запроса заканчивается ответом 500, а не
+ * падением процесса. Обработчик асинхронный, и непойманный отказ его
+ * промиса в Node 22 завершает процесс целиком — значит одна ошибка в одном
+ * маршруте клала мини-приложение для всех пользователей сразу.
+ */
+const server = http.createServer((req, res) => {
+  handle(req, res).catch((e) => {
+    console.error('miniapp: запрос упал', req.url, e && e.message);
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    }
+    res.end('На сервере что-то пошло не так.');
+  });
+});
+
+async function handle(req, res) {
   const url = new URL(req.url, 'http://localhost');
   const { pathname } = url;
 
@@ -2323,10 +2359,14 @@ const server = http.createServer(async (req, res) => {
    */
   if (pathname.startsWith('/d/')) {
     if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); return res.end('only GET'); }
-    const token = decodeURIComponent(pathname.slice(3));
-    const who = String(req.headers['x-real-ip'] || '').trim()
-      || String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()
-      || (req.socket && req.socket.remoteAddress) || 'нет-адреса';
+    // Адрес публичный: кривое «%E0%A4%A» здесь присылает кто угодно, и
+    // decodeURIComponent на нём бросает. Непойманное исключение раньше
+    // роняло весь процесс — одним запросом без всякой авторизации.
+    let token;
+    try { token = decodeURIComponent(pathname.slice(3)); } catch (_) {
+      return sendLinkPage(res, 404, 'Ссылка больше не работает.');
+    }
+    const who = clientIp(req);
     if (tooOften(`d:${who}`, 60)) return sendLinkPage(res, 429, 'Слишком часто. Подождите минуту и обновите страницу.');
     const link = docLink.resolve(token);
     if (!link) return sendLinkPage(res, 404, 'Ссылка больше не работает.');
@@ -2397,7 +2437,7 @@ const server = http.createServer(async (req, res) => {
     console.error('miniapp:', pathname, e.message);
     return sendJson(res, 500, { error: 'На сервере что-то пошло не так. Попробуйте ещё раз.' });
   }
-});
+}
 
 if (require.main === module) {
   if (!process.env.BOT_TOKEN) {

@@ -180,6 +180,9 @@ cat <<NGINX
         proxy_pass http://127.0.0.1:$MINIAPP_PORT/d/;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        # Без этой строки nginx передаёт присланный клиентом X-Real-IP как
+        # есть, и ограничение частоты на перебор ссылок обходится подделкой.
+        proxy_set_header X-Real-IP \$remote_addr;
         proxy_read_timeout 60s;
     }
 

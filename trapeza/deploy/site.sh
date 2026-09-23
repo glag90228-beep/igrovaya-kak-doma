@@ -177,15 +177,20 @@ server {
     #
     # Запросы к API идут отдельной веткой: страница обращается к ним по
     # адресу /api/..., без префикса.
+    # X-Real-IP во всех трёх ветках — не лишний. Клиент может прислать
+    # свой X-Real-IP, и без этой строки nginx передаст его как есть, а
+    # ограничение частоты в приложении посчитает подделку за адрес.
     location /app/ {
         proxy_pass http://127.0.0.1:$MINIAPP_PORT/;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Real-IP \$remote_addr;
     }
     location /api/ {
         proxy_pass http://127.0.0.1:$MINIAPP_PORT/api/;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Real-IP \$remote_addr;
         client_max_body_size 4m;      # выписка и снимки счетов
     }
     # Документ по временной ссылке: /d/<токен>. Открывает его клиент нашего
@@ -196,6 +201,7 @@ server {
         proxy_pass http://127.0.0.1:$MINIAPP_PORT/d/;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Real-IP \$remote_addr;
         proxy_read_timeout 60s;
     }
 

@@ -2119,6 +2119,33 @@ async function main() {
     if (was === undefined) delete process.env.SUPPORT_CHAT_ID; else process.env.SUPPORT_CHAT_ID = was;
   }
 
+  section('публичная ссылка /d/ не роняет сервер');
+  {
+    /*
+     * Кривое процентное кодирование на публичном адресе раньше бросало
+     * URIError из асинхронного обработчика — и Node завершал процесс.
+     * Сервер здесь живёт в том же процессе, что и проверки, поэтому на
+     * прежнем коде весь прогон обрывался прямо на этом запросе.
+     */
+    const bad = await call('GET', '/d/%E0%A4%A');
+    ok(bad.status === 404, 'кривая ссылка — обычный ответ «не работает»', bad.status);
+    const alive = await call('GET', '/health');
+    ok(alive.status === 200 && alive.text === 'ok', 'и сервер после неё жив');
+
+    /*
+     * Первый адрес в X-Forwarded-For пишет сам клиент. Раньше лимит считался
+     * по нему, и каждая подмена открывала новый счётчик — перебор ссылок
+     * шёл без ограничения. Здесь 61 запрос с разными X-Forwarded-For: лимит
+     * 60 в минуту обязан сработать, потому что пришли все с одного адреса.
+     */
+    let limited = false;
+    for (let i = 0; i < 61 && !limited; i += 1) {
+      const r = await call('GET', `/d/nope${i}`, { headers: { 'X-Forwarded-For': `203.0.113.${i}` } });
+      if (r.status === 429) limited = true;
+    }
+    ok(limited, 'подмена X-Forwarded-For не обходит ограничение частоты');
+  }
+
   // Сервер держим до конца: проверки выше ходят к нему по HTTP, и закрытый
   // раньше времени он давал ECONNREFUSED вместо внятного провала.
   await new Promise((r2) => server.close(r2));
