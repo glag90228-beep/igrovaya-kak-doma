@@ -40,6 +40,20 @@ cp "$SRC/public/landing/shots/"*.webp "$ROOT/shots/" 2>/dev/null || true
 # страницы конкурируют в выдаче, и в поиск попадает не та, что нужна.
 rm -f "$ROOT/index-v2.html"
 
+# Тарифы и соглашение — на них ведут кнопки бота (lib/bot-support.js:
+# /tariffs и /terms). Раньше скрипт их не публиковал вовсе, и человек,
+# нажавший «Оферта» перед оплатой, получал «страница не найдена».
+#
+# Кладём папкой с index.html, а не только файлом: адрес без «.html»
+# открывается тогда и со старым конфигом nginx (try_files $uri/), который
+# на работающем сервере уже есть и который этот скрипт не переписывает.
+for page in tariffs terms; do
+  mkdir -p "$ROOT/$page"
+  cp "$SRC/public/landing/$page.html" "$ROOT/$page/index.html"
+  cp "$SRC/public/landing/$page.html" "$ROOT/$page.html"
+done
+PAGES="$ROOT/index.html $ROOT/tariffs/index.html $ROOT/tariffs.html $ROOT/terms/index.html $ROOT/terms.html"
+
 echo "Страница разложена: $(ls -1 "$ROOT" | wc -l) файлов в корне, $(ls -1 "$ROOT/shots" 2>/dev/null | wc -l) снимков."
 
 # ---------- 1а. Сколько документов бесплатно ----------
@@ -68,7 +82,11 @@ if ! printf '%s' "$FREE" | grep -qE '^[0-9]+$'; then
   echo "⚠️  FREE_DOCS у бота — «$FREE», это не число. Оставляю страницу как есть."
 else
   WAS="$(sed -n 's/.*class="[^"]*free-docs[^"]*">\([0-9]\+\)<.*/\1/p' "$ROOT/index.html" | head -1)"
-  sed -i -E "s|(class=\"[^\"]*free-docs[^\"]*\">)[0-9]+(<)|\1$FREE\2|g" "$ROOT/index.html"
+  # Во все страницы, а не только в главную: в оферте и тарифах стояло «5»
+  # независимо от того, сколько даёт бот.
+  for f in $PAGES; do
+    sed -i -E "s|(class=\"[^\"]*free-docs[^\"]*\">)[0-9]+(<)|\1$FREE\2|g" "$f"
+  done
   N="$(grep -c 'free-docs' "$ROOT/index.html" || true)"
   if [ "$WAS" = "$FREE" ]; then
     echo "Бесплатных документов: $FREE — страница и бот сходятся (мест на странице: $N)."
@@ -76,6 +94,37 @@ else
     echo "Бесплатных документов у бота: $FREE, на странице стояло $WAS — поправил в $N местах."
   fi
 fi
+
+# ---------- 1б. Цены ----------
+#
+# Та же беда, что с бесплатными документами, только дороже: в оферте
+# стояли 349 и 3 490, а касса списывала 390 и 2 990. Цены берём из сетки
+# работающего бота и разбираем тем же кодом, что и он (lib/platega.js), —
+# иначе сайт и касса разойдутся на первом же изменении .env. Бот не
+# запущен — берётся его же запасная сетка, как и с документами выше.
+
+PLANS=""
+if [ "${BOT_PID:-0}" != "0" ] && [ -r "/proc/$BOT_PID/environ" ]; then
+  PLANS="$(tr '\0' '\n' < "/proc/$BOT_PID/environ" | sed -n 's/^PLATEGA_PLAN_DAYS=//p' | head -1)"
+  [ -z "$PLANS" ] && PLANS="$(tr '\0' '\n' < "/proc/$BOT_PID/environ" | sed -n 's/^LAVA_PLAN_DAYS=//p' | head -1)"
+fi
+# shellcheck disable=SC2086  # $PAGES — список файлов, разбиваем намеренно
+PLATEGA_PLAN_DAYS="$PLANS" LAVA_PLAN_DAYS="" node -e '
+  const fs = require("fs");
+  const facts = require(process.argv[1] + "/lib/platega").priceFacts();
+  if (!facts) {
+    console.log("⚠️  В сетке тарифов нет месяца или года — цены на страницах не трогаю.");
+    process.exit(0);
+  }
+  for (const file of process.argv.slice(2)) {
+    let s = fs.readFileSync(file, "utf8");
+    for (const [k, v] of Object.entries(facts)) {
+      s = s.replace(new RegExp(`(class="[^"]*price-${k}[^"]*">)[0-9 ]+(<)`, "g"), `$1${v}$2`);
+    }
+    fs.writeFileSync(file, s);
+  }
+  console.log(`Цены из сетки бота: ${facts.month} ₽ месяц, ${facts.year} ₽ год, выгода ${facts.save} ₽.`);
+' "$SRC" $PAGES
 
 # ---------- 2. Оферта и политика ----------
 #

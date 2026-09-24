@@ -5,7 +5,7 @@
  *
  * Проверяет:
  *   1. Проверку секретов (timingSafeEqual, защита от подделки).
- *   2. Тарифную сетку и расчёт дней (349 ₽ / 30 дн., 3490 ₽ / 365 дн.).
+ *   2. Тарифную сетку и расчёт дней (390 ₽ / 30 дн., 2990 ₽ / 365 дн.).
  *   3. Разбор входящего callback-вебхука (успешный, отклонённый, битый).
  *   4. Создание транзакции через API (заголовки, тело, ответ).
  *   5. Получение статуса транзакции.
@@ -77,10 +77,12 @@ function postJson(serverInstance, path, headers, body) {
   console.log('\n── Platega: тарифы и дни ──');
   const plans = platega.plans();
   ok(plans.length >= 2, 'тарифная сетка содержит варианты');
-  ok(plans.some((p) => p.amount === 349 && p.days === 30), 'тариф 1 месяц: 349 ₽ за 30 дней');
-  ok(plans.some((p) => p.amount === 3490 && p.days === 365), 'тариф 1 год: 3 490 ₽ за 365 дней');
-  ok(platega.daysFor({ amount: 349 }) === 30, '349 ₽ дают 30 дней');
-  ok(platega.daysFor({ amount: 3490 }) === 365, '3490 ₽ дают 365 дней');
+  // Запасная сетка — цены, утверждённые владельцем. Прежние 349/3490 здесь
+  // и были закреплены проверкой — оттого старые цены и дожили до оферты.
+  ok(plans.some((p) => p.amount === 390 && p.days === 30), 'тариф 1 месяц: 390 ₽ за 30 дней');
+  ok(plans.some((p) => p.amount === 2990 && p.days === 365), 'тариф 1 год: 2 990 ₽ за 365 дней');
+  ok(platega.daysFor({ amount: 390 }) === 30, '390 ₽ дают 30 дней');
+  ok(platega.daysFor({ amount: 2990 }) === 365, '2990 ₽ дают 365 дней');
   ok(platega.daysFor({ amount: 99999 }) === 30, 'неизвестная сумма даёт дефолтный срок 30 дней');
 
   console.log('\n── настоящий ответ Platega с боевого платежа ──');
@@ -348,7 +350,7 @@ function postJson(serverInstance, path, headers, body) {
       'X-Secret': 'test-secret-key-5678',
     }, {
       id: 'plt-live-002',
-      amount: 3490,
+      amount: 2990,
       currency: 'RUB',
       status: 'CONFIRMED',
       paymentMethod: 2,
@@ -356,7 +358,7 @@ function postJson(serverInstance, path, headers, body) {
     });
     ok(plategaPathRes.status === 200, 'вебхук на пути /platega успешно принят');
     const accessYear = billing.accessInfo(testUser.id);
-    ok(accessYear.left >= 390, 'годовой платёж 3490 ₽ добавил 365 дней к текущему сроку');
+    ok(accessYear.left >= 390, 'годовой платёж 2990 ₽ добавил 365 дней к текущему сроку');
 
     const H = { 'X-MerchantId': 'test-merchant-uuid-1234', 'X-Secret': 'test-secret-key-5678' };
     const hook = (u, id, status) => postJson(testServer, '/platega', H, {

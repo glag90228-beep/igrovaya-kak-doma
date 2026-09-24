@@ -983,6 +983,60 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     process.env.LAVA_PLAN_DAYS = was === undefined ? '' : was;
   }
 
+  console.log('\n── одна цена: кнопки, касса, сайт ──');
+  {
+    /*
+     * Кнопка года в боте стояла числом «3 490 ₽», а касса брала из сетки
+     * 2 990. В оферте и тарифах на сайте — 349 и 3 490. Человек видел одну
+     * цену и платил другую. Проверяем по нажатию, а не по исходнику.
+     */
+    const pl = require('./lib/platega');
+    const keep = ['PLATEGA_MERCHANT_ID', 'PLATEGA_SECRET', 'PLATEGA_PLAN_DAYS', 'LAVA_PLAN_DAYS']
+      .map((k) => [k, process.env[k]]);
+    process.env.PLATEGA_MERCHANT_ID = 'm-test';
+    process.env.PLATEGA_SECRET = 's-test';
+    process.env.LAVA_PLAN_DAYS = '';
+    const kbText = () => ((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.text).join(' | ');
+
+    process.env.PLATEGA_PLAN_DAYS = '450:30,3990:365';
+    await tap('billing');
+    ok(/Год \(3990 ₽\)/.test(kbText()) && /СБП \(450 ₽\)/.test(kbText()),
+      'обе кнопки оплаты показывают цену из сетки', kbText());
+
+    /*
+     * Без годового тарифа «Год» раньше создавал платёж на МЕСЯЧНУЮ сумму:
+     * человек платил за «год» и получал тридцать дней.
+     */
+    process.env.PLATEGA_PLAN_DAYS = '450:30';
+    await tap('billing');
+    ok(!/Год/.test(kbText()), 'нет годового тарифа — нет и кнопки года', kbText());
+    ok(pl.planByName('year') === null, 'за «год» месяц не подсовывается');
+
+    // Запасная сетка — те цены, что утвердил владелец, а не прежние 349/3490.
+    delete process.env.PLATEGA_PLAN_DAYS;
+    const f = pl.priceFacts();
+    ok(f && f.month === 390 && f.year === 2990, 'запасная сетка — 390 и 2 990', JSON.stringify(f));
+    ok(f && f.save === 1690 && f.permonth === 249, 'выгода и цена месяца в году считаются', JSON.stringify(f));
+
+    /*
+     * Страницы сайта. Числа в вёрстке помечены классами, при публикации
+     * site.sh подставляет их из сетки бота. Но и сами файлы в репозитории
+     * должны быть верными — их видно до первой публикации и в предпросмотре.
+     */
+    const fsP = require('node:fs');
+    for (const page of ['index', 'tariffs', 'terms']) {
+      const html = fsP.readFileSync(`${__dirname}/public/landing/${page}.html`, 'utf8');
+      const marked = (k) => [...html.matchAll(new RegExp(`class="[^"]*price-${k}[^"]*">([0-9 ]+)<`, 'g'))]
+        .map((m) => Number(m[1].replace(/\s/g, '')));
+      ok(marked('month').length > 0 && marked('month').every((v) => v === f.month)
+        && marked('year').length > 0 && marked('year').every((v) => v === f.year),
+      `${page}: цены помечены и совпадают с сеткой`, `месяц ${marked('month')}, год ${marked('year')}`);
+      ok(!/\b349 ₽|3 490 ₽|700 ₽|2 месяца в подарок/.test(html), `${page}: старых цен и «выгод» не осталось`);
+    }
+
+    for (const [k, v] of keep) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+
   console.log('\n── доступ и оплата ──');
   const bill = require('./lib/billing');
   const meUser = require('./lib/bot-db').getOrCreateUser(USER.id);

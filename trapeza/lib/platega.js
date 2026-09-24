@@ -45,10 +45,17 @@ function isConfigured() {
 /**
  * Тарифы: сумма платежа → сколько дней доступа.
  * Считывается из PLATEGA_PLAN_DAYS или LAVA_PLAN_DAYS (если настроена общая),
- * иначе дефолт: 349 ₽ (30 дней), 3 490 ₽ (365 дней).
+ * иначе — цены, которые утвердил владелец: 390 ₽ за 30 дней, 2 990 ₽ за год.
+ *
+ * Запасная сетка раньше была 349/3490 — цены, от которых отказались. Пока в
+ * .env стояла своя, это было незаметно; но оферта и тарифы на сайте
+ * переписали именно эти старые числа, и человек видел в оферте одну цену, а
+ * платил другую.
  */
+const DEFAULT_PLANS = '390:30,2990:365';
+
 function plans() {
-  const raw = process.env.PLATEGA_PLAN_DAYS || process.env.LAVA_PLAN_DAYS || '349:30,3490:365';
+  const raw = process.env.PLATEGA_PLAN_DAYS || process.env.LAVA_PLAN_DAYS || DEFAULT_PLANS;
   return String(raw).trim().split(',')
     .map((pair) => {
       const [sum, days] = pair.split(':').map((x) => Number(String(x).trim()));
@@ -124,7 +131,34 @@ function planByName(name) {
   const wantYear = String(name || '').toLowerCase().startsWith('year');
   const year = list.filter((p) => p.days >= 300).sort((a, b) => a.days - b.days)[0];
   const month = list.filter((p) => p.days < 300).sort((a, b) => a.days - b.days)[0];
-  return (wantYear ? year : month) || list[0];
+  /*
+   * Нет такого тарифа — значит нет, а не «какой-нибудь».
+   *
+   * Раньше здесь стоял запасной list[0]: без годового тарифа в сетке кнопка
+   * «Год» создавала платёж на месячную сумму, человек платил и получал
+   * тридцать дней. Теперь кнопку года показывают, только если год есть.
+   */
+  return (wantYear ? year : month) || null;
+}
+
+/**
+ * Цифры для страниц сайта: месяц, год, выгода, год в пересчёте на месяц.
+ *
+ * Отдельной функцией, потому что эти же числа печатаются в трёх местах —
+ * на главной, в тарифах и в оферте — и считаются из одной сетки. Ручной
+ * пересчёт уже подвёл: при смене цен «выгода 700 ₽» и «2 месяца в подарок»
+ * остались от старых.
+ */
+function priceFacts() {
+  const m = planByName('month');
+  const y = planByName('year');
+  if (!m || !y) return null;
+  return {
+    month: m.amount,
+    year: y.amount,
+    save: Math.max(0, Math.round(m.amount * 12 - y.amount)),
+    permonth: Math.round(y.amount / 12),
+  };
 }
 
 function planTitle(days) {
@@ -355,6 +389,8 @@ module.exports = {
   isConfigured,
   planByName,
   plans,
+  priceFacts,
+  DEFAULT_PLANS,
   daysFor,
   planTitle,
   planLabel,

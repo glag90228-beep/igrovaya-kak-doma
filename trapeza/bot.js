@@ -1571,10 +1571,18 @@ async function showBilling(tg, chatId, user) {
 
   const rows = [];
   if (hasPlatega) {
-    rows.push([
-      { text: `⚡ Оплатить СБП (${(platega.planByName('month') || {}).amount || '—'} ₽)`, data: 'pay.plt:month' },
-      { text: '⭐ Год (3 490 ₽)', data: 'pay.plt:year' },
-    ]);
+    /*
+     * Обе цены — из сетки. Годовая стояла числом «3 490 ₽», а списание шло
+     * по сетке (2 990): кнопка обещала одну цену, касса брала другую. Нет
+     * тарифа в сетке — нет и кнопки: платить за «Год» и получать месяц
+     * хуже, чем не видеть кнопку вовсе.
+     */
+    const month = platega.planByName('month');
+    const year = platega.planByName('year');
+    const pay = [];
+    if (month) pay.push({ text: `⚡ Оплатить СБП (${month.amount} ₽)`, data: 'pay.plt:month' });
+    if (year) pay.push({ text: `⭐ Год (${year.amount} ₽)`, data: 'pay.plt:year' });
+    if (pay.length) rows.push(pay);
   }
   if (link) rows.push([{ text: a.active ? '⭐ Продлить' : '⭐ Оформить подписку', url: link }]);
   if (link || hasPlatega) rows.push([{ text: '✅ Я оплатил', data: 'pay.claim' }]);

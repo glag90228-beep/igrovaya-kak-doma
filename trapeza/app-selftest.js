@@ -573,7 +573,10 @@ const ok = (c, m, extra) => {
      * подписки отношения не имеет.
      */
     const priceOf = (file) => {
-      const html = fsL.readFileSync(path.join(APP, 'public/landing', file), 'utf8');
+      // Цифры обёрнуты в <span class="price-…">: их при публикации подставляет
+      // site.sh из сетки бота. Для чтения цены обёртки снимаем.
+      const html = fsL.readFileSync(path.join(APP, 'public/landing', file), 'utf8')
+        .replace(/<span class="price-[a-z]+">([^<]*)<\/span>/g, '$1');
       const month = html.match(/class="big">([\d  ]+)\s*₽/);
       const year = html.match(/Или\s+([\d  ]+)\s*₽\s*за год\s*—\s*выгода\s+([\d  ]+)\s*₽/);
       return {
