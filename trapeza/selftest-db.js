@@ -41,31 +41,53 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+/*
+ * Журнал вебхуков оплаты — тоже во временную папку. lava-webhook.js пишет
+ * его рядом с кодом, в data/, и прогоны, которые его подключают, дописывали
+ * тестовые платежи в боевой журнал: на сервере это тот самый файл, по
+ * которому разбирают спорные оплаты.
+ */
+process.env.LAVA_LOG = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'trapeza-lava-')), 'lava-webhook.log');
+
 if (!process.env.TRAPEZA_DB) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'trapeza-selftest-'));
   process.env.TRAPEZA_DB = path.join(dir, 'test.db');
 } else {
   const target = process.env.TRAPEZA_DB;
-  let people = 0;
-  if (fs.existsSync(target)) {
+  /*
+   * Пустая — значит без единой записи в ЛЮБОЙ таблице.
+   *
+   * Раньше считались только люди бота (bot_users). Но db.js общий с сервером
+   * смет, и его боевая база — заказы, меню, сверки — пользователей бота не
+   * содержит вовсе: заслонка признавала её пустой, и прогон писал в неё свои
+   * документы. А базу, которая не открылась, пропускали дальше — хотя
+   * доказать, что она пустая, тогда нечем.
+   */
+  let rows = 0;
+  let unreadable = '';
+  if (fs.existsSync(target) && fs.statSync(target).size > 0) {
     try {
       const { DatabaseSync } = require('node:sqlite');
       const db = new DatabaseSync(target, { readOnly: true });
-      const has = db.prepare(
-        "SELECT 1 AS y FROM sqlite_master WHERE type = 'table' AND name = 'bot_users'",
-      ).get();
-      if (has) people = Number(db.prepare('SELECT COUNT(*) AS n FROM bot_users').get().n) || 0;
+      const tables = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+      ).all();
+      for (const t of tables) {
+        rows += Number(db.prepare(`SELECT COUNT(*) AS n FROM "${t.name.replace(/"/g, '""')}"`).get().n) || 0;
+      }
       db.close();
-    } catch (_) {
-      // Не открылась — пусть дальше падает своим чередом: заслонка нужна от
-      // живой базы, а не от испорченного файла.
+    } catch (e) {
+      unreadable = e.message;
     }
   }
-  if (people > 0) {
+  if (rows > 0 || unreadable) {
     console.error(
-      '\n⛔ Прогон остановлен: в базе уже есть люди.\n'
-      + `   TRAPEZA_DB=${target}\n`
-      + `   пользователей в ней: ${people}\n\n`
+      (unreadable
+        ? `\n⛔ Прогон остановлен: базу не удалось открыть и убедиться, что она пустая.\n`
+          + `   TRAPEZA_DB=${target}\n   ${unreadable}\n\n`
+        : '\n⛔ Прогон остановлен: база не пустая.\n'
+          + `   TRAPEZA_DB=${target}\n`
+          + `   записей в ней: ${rows}\n\n`)
       + '   Самотесты выписывают документы и заводят контрагентов. Начинать\n'
       + '   они должны с пустой базы — иначе чужие записи смешаются с их\n'
       + '   собственными, а на боевом сервере это записи клиентов.\n\n'

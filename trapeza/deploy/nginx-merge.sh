@@ -42,11 +42,11 @@ DOMAIN="${DOMAIN:-pervichkaru.ru}"
 ROOT="${ROOT:-/var/www/pervichka}"
 MINIAPP_PORT="${MINIAPP_PORT:-8790}"
 LAVA_PORT="${LAVA_PORT:-8788}"
-AVAIL=/etc/nginx/sites-available
-ENABLED=/etc/nginx/sites-enabled
+AVAIL="${AVAIL:-/etc/nginx/sites-available}"
+ENABLED="${ENABLED:-/etc/nginx/sites-enabled}"
 CONF="$AVAIL/$DOMAIN"
 STAMP="$(date +%F-%H%M%S)"
-BAKDIR="/root/nginx-merge-$STAMP"
+BAKDIR="${BAKROOT:-/root}/nginx-merge-$STAMP"
 
 if [ "$(id -u)" != "0" ]; then echo "Нужен root: sudo bash $0"; exit 1; fi
 
@@ -57,8 +57,14 @@ echo
 
 # ---------- 1. Что сейчас включено ----------
 
-mkdir -p "$BAKDIR"
-cp -a "$ENABLED"/. "$BAKDIR/" 2>/dev/null || true
+# Копируем и ссылки, и то, на что ведёт наша. sites-enabled — это
+# символические ссылки, cp -a их так и сохраняет; а файл, на который ведёт
+# ссылка нашего домена, ниже перезаписывается новым конфигом. Без его копии
+# «откат» возвращал ссылки на тот же сломанный файл, nginx -t падал снова,
+# и первая же перезагрузка nginx клала сайт.
+mkdir -p "$BAKDIR/enabled"
+cp -a "$ENABLED"/. "$BAKDIR/enabled/" 2>/dev/null || true
+[ -f "$CONF" ] && cp -a "$CONF" "$BAKDIR/available-$DOMAIN"
 # grep -R, а не -r: sites-enabled состоит из символических ссылок, и -r
 # по ним не идёт — список соперников выходил пустым, а лишний конфиг
 # оставался включённым. Ровно это и случилось на боевом сервере.
@@ -236,9 +242,14 @@ ln -sf "$CONF" "$ENABLED/$DOMAIN"
 if ! nginx -t 2>/dev/null; then
   echo
   echo "⚠️  nginx не принял новый конфиг — возвращаю всё как было."
-  if [ -n "$(ls -A "$BAKDIR" 2>/dev/null)" ]; then
+  if [ -f "$BAKDIR/available-$DOMAIN" ]; then
+    cp -a "$BAKDIR/available-$DOMAIN" "$CONF"
+  else
+    rm -f "$CONF"                     # до нас такого файла не было
+  fi
+  if [ -n "$(ls -A "$BAKDIR/enabled" 2>/dev/null)" ]; then
     rm -f "$ENABLED"/*
-    cp -a "$BAKDIR"/. "$ENABLED/"
+    cp -a "$BAKDIR/enabled"/. "$ENABLED/"
   fi
   nginx -t 2>&1 | sed 's/^/    /'
   exit 1

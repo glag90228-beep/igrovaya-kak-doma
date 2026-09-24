@@ -125,8 +125,11 @@ async function main() {
     msg.attachments[0].filename);
   ok(msg.attachments[0].content.equals(PDF), 'содержимое вложения совпало байт в байт');
   ok(mime.looksLikeDocument(msg.attachments[0]), 'PDF признан документом');
-  ok(!mime.looksLikeDocument({ filename: 'логотип.svg', contentType: 'image/svg+xml' })
-    || true, 'картинки допускаются как возможные сканы');
+  // Здесь стояло «… || true» — проверка проходила при любом ответе функции.
+  ok(mime.looksLikeDocument({ filename: 'скан.jpg', contentType: 'image/jpeg', size: 350000 }),
+    'крупная картинка допускается как возможный скан');
+  ok(!mime.looksLikeDocument({ filename: 'логотип.svg', contentType: 'image/svg+xml', size: 3000 }),
+    'а мелкий логотип — нет');
   // Word и Excel берём, хотя содержимое прочитать нечем: акты присылают в
   // них едва ли не чаще, чем в PDF, а потерять документ хуже, чем показать
   // тот, который мы не разберём, — переслать и разнести можно и вслепую.

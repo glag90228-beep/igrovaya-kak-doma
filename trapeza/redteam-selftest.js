@@ -284,6 +284,49 @@ async function startSmeta(env = {}) {
     s.stop();
   }
 
+  console.log('\n=== Прогоны не трогают боевое ===');
+  {
+    const { spawnSync } = require('node:child_process');
+    /*
+     * База смет: заказы есть, людей бота нет. Заслонка считала только людей
+     * бота и признавала такую базу пустой — прогон писал в неё свои записи.
+     */
+    const live = pathR.join(osR.tmpdir(), `live-${process.pid}.db`);
+    {
+      const { DatabaseSync } = require('node:sqlite');
+      const d = new DatabaseSync(live);
+      d.exec("CREATE TABLE orders(id INTEGER PRIMARY KEY, code TEXT); INSERT INTO orders(code) VALUES ('живой заказ')");
+      d.close();
+    }
+    const run = spawnSync(process.execPath, ['bank-selftest.js'], {
+      cwd: __dirname, env: { ...process.env, TRAPEZA_DB: live }, encoding: 'utf8',
+    });
+    ok(run.status === 1 && /не пустая/.test(run.stderr), 'на живую базу смет прогон не пошёл',
+      `${run.status} ${String(run.stderr).trim().slice(0, 60)}`);
+    {
+      const { DatabaseSync } = require('node:sqlite');
+      const d = new DatabaseSync(live, { readOnly: true });
+      const tables = d.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE type='table'").get().n;
+      d.close();
+      ok(tables === 1, 'и ни одной своей таблицы в неё не завёл', tables);
+    }
+    for (const f of [live, `${live}-wal`, `${live}-shm`]) fsR.rmSync(f, { force: true });
+
+    /*
+     * Журнал вебхуков оплаты. Прогоны, подключающие lava-webhook.js,
+     * дописывали тестовые платежи в data/lava-webhook.log рядом с кодом — на
+     * сервере это боевой журнал оплат.
+     */
+    const logFile = pathR.join(__dirname, 'data', 'lava-webhook.log');
+    const stat = () => (fsR.existsSync(logFile) ? `${fsR.statSync(logFile).size}:${fsR.statSync(logFile).mtimeMs}` : 'нет');
+    const before = stat();
+    const env = { ...process.env };
+    delete env.TRAPEZA_DB;
+    delete env.LAVA_LOG;
+    spawnSync(process.execPath, ['platega-selftest.js'], { cwd: __dirname, env, encoding: 'utf8' });
+    ok(stat() === before, 'прогон оплат не пишет в боевой журнал вебхуков', `${before} → ${stat()}`);
+  }
+
   console.log(bad ? `\nне прошло: ${bad}` : '\nвсе атаки отражены ✅');
   process.exit(bad ? 1 : 0);
 })().catch((e) => {

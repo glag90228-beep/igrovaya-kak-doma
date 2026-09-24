@@ -149,10 +149,15 @@ cat <<'TXT'
   • адрес приложения впишите в WEBAPP_URL и повторите оформление:
     cd /opt/trapeza && set -a && . ./.env && set +a && node bot.js --setup
   • резервные копии:  node backup.js --list   (лежат в /var/backups/trapeza)
-    восстановление:   systemctl stop trapeza-bot trapeza-miniapp
-                      gunzip -c /var/backups/trapeza/ИМЯ.db.gz > /opt/trapeza/data/trapeza.db
-                      chown trapeza:trapeza /opt/trapeza/data/trapeza.db
-                      systemctl start trapeza-bot trapeza-miniapp
+    восстановление:   systemctl stop trapeza-bot trapeza-miniapp trapeza-lava
+                      cd /opt/trapeza/data && mkdir -p before-restore
+                      mv trapeza.db* before-restore/
+                      gunzip -c /var/backups/trapeza/ИМЯ.db.gz > trapeza.db
+                      chown trapeza:trapeza trapeza.db && chmod 600 trapeza.db
+                      systemctl start trapeza-bot trapeza-miniapp trapeza-lava
+    (файлы trapeza.db-wal и -shm убираются вместе с базой: оставленный
+     журнал накатится поверх копии, и «восстановленная» база молча покажет
+     прежние данные. Остановить надо все три службы — lava тоже пишет в базу.)
   • логи:  journalctl -u trapeza-bot -f
            tail -f /var/log/trapeza/lava.log
            tail -f /var/log/trapeza/miniapp.log

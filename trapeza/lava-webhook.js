@@ -25,7 +25,8 @@ const platega = require('./lib/platega');
 const { Telegram } = require('./lib/tg');
 
 const PORT = Number(process.env.LAVA_PORT || 8788);
-const LOG = path.join(__dirname, 'data', 'lava-webhook.log');
+// LAVA_LOG задают самотесты (selftest-db.js): их платежи в боевой журнал не идут.
+const LOG = process.env.LAVA_LOG || path.join(__dirname, 'data', 'lava-webhook.log');
 const MAX_BODY = 256 * 1024;
 
 const tg = process.env.BOT_TOKEN ? new Telegram(process.env.BOT_TOKEN) : null;

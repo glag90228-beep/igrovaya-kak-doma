@@ -1468,8 +1468,12 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   ok(last().includes('Отправил'), 'пользователю подтвердили отправку');
   delete process.env.SUPPORT_CHAT_ID;
   await tap('support');
-  ok(!last().includes('Написать в поддержку') || last().includes('не настроен')
-    || last().includes('Напишите нам'), 'без настройки бот не обещает того, чего не может');
+  // Смотрим на кнопки, а не на текст: «Написать в поддержку» — надпись на
+  // кнопке, в тексте сообщения её не бывает, и прежняя проверка «текст её не
+  // содержит» проходила всегда.
+  const supKb = ((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.callback_data);
+  ok(!supKb.includes('sup.write'), 'без настройки бот не обещает того, чего не может',
+    supKb.join(' '));
   delete process.env.LEGAL_OFERTA_URL;
 
   console.log('\n── блокировка бота ──');
@@ -5142,6 +5146,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       books.map((f) => f.filename).join(', ') || norm(last()).slice(0, 80));
     const b26 = books.find((f) => f.filename.includes('_2026-'));
     const b25 = books.find((f) => f.filename.includes('_2025-'));
+    ok(Boolean(b26 && b25), 'обе книги нашлись по году в имени', books.map((f) => f.filename).join(', '));
     if (b26 && b25) {
       const wb26 = await readBook(b26);
       ok(yearTotal(wb26) === 20000,
@@ -5175,7 +5180,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     // Ассистент больше не отказывается: «собери КУДиР» — это работа.
     before = files.length;
     await sayK('собери КУДиР');
-    ok(files.length - before === 2 || /выписк/i.test(last()),
+    ok(files.length - before === 2,
       'на «собери КУДиР» ассистент собирает книгу, а не отказывает', norm(last()).slice(0, 80));
     ok(!/не веду/.test(last()), 'и слов «КУДиР я не веду» больше нет');
 
@@ -5367,9 +5372,16 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'долг погашен ровно на пять частей', bdbR.balanceOf(uid, cpF).closing);
 
     // Второе такое же правило по тому же клиенту не заводится.
+    /*
+     * Вторая половина прежней проверки («правил не больше одного») была
+     * истинна всегда: нажатие ro.new только открывает диалог, правило
+     * заводится в конце. Проверяем то, что бот действительно решает: есть
+     * правило по клиенту — отказ, нет — начало диалога.
+     */
+    const hasRule = rec.list(uid).some((r) => r.cp_id === cpF && rec.isOp(r));
     await tap(`ro.new:${cpF}`);
-    ok(norm(last()).includes('уже настроено') || rec.list(uid).filter((r) => r.cp_id === cpF).length <= 1,
-      'два одинаковых правила по одному клиенту не заводятся', norm(last()).slice(0, 50));
+    ok(hasRule ? norm(last()).includes('уже настроено') : norm(last()).includes('Повторять операцию'),
+      'второе правило по тому же клиенту не заводится, пока есть первое', norm(last()).slice(0, 50));
   }
 
   console.log('\n── тот же путь кнопками в чате ──');
@@ -5471,10 +5483,14 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
      * там, где его нет. Вылезало это только без Chromium, когда документ
      * уходит HTML: в PDF текста стилей нет, и проверка молчала.
      */
-    if (fakedHtml) {
-      ok(!fakedHtml.includes('<div class="stamps">'), 'и штампа в файле нет');
-      ok(!fakedHtml.includes('class="doc has-stamps"'), 'и места под него не отведено');
-    }
+    /*
+     * Проверка шла только без Chromium (когда файл — HTML), а с ним молча
+     * пропускалась. Берём разметку всегда: пересборка с forView отдаёт тот
+     * же шаблон, а штамп вклеивается до выбора формата.
+     */
+    const fakedMarkup = fakedHtml || require('./lib/doc-html').withStamps('<div class="doc">x</div>', faked.stamp);
+    ok(!fakedMarkup.includes('<div class="stamps">'), 'и штампа в файле нет');
+    ok(!fakedMarkup.includes('class="doc has-stamps"'), 'и места под него не отведено');
 
     bdbS.markPaid(uid, docId, '2026-08-20');
     const stamped = await docSvc.rebuildDocument(uid, docId, { stamp: { paid: true, copy: true } });

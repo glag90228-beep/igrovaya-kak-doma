@@ -189,11 +189,13 @@ const ok = (c, m, extra) => {
 
     // И она обязана уйти сама: заставка, оставшаяся на экране, — это
     // приложение, которое не открылось.
-    await page.waitForFunction(() => {
+    // Итог ожидания — в проверку, а не ok(true) после него: истёкшее
+    // ожидание роняло весь прогон вместо одной понятной строки.
+    const splashGone = await page.waitForFunction(() => {
       const s = document.getElementById('splash');
       return !s || s.classList.contains('gone');
-    }, null, { timeout: 5000 });
-    ok(true, 'и уходит сама, когда экран готов');
+    }, null, { timeout: 5000 }).then(() => true, () => false);
+    ok(splashGone, 'и уходит сама, когда экран готов');
   }
 
   console.log('\n── смахивание ──');
