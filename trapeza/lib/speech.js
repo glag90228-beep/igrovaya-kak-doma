@@ -63,11 +63,9 @@ function speechAvailable() {
 function speechHint() {
   const p = PROVIDER();
   if (!p) return 'Распознавание речи не подключено (SPEECH_PROVIDER не задан).';
-  if (p === 'gemini') {
-    const bad = badKey(process.env.GEMINI_API_KEY);
-    if (bad) return bad;
-    return 'Нет ключа GEMINI_API_KEY.';
-  }
+  // badKey знает только ключи Яндекса: на ключе Gemini («AIza…») он
+  // ругался бы на YANDEX_API_KEY, которого человек и не задавал.
+  if (p === 'gemini') return 'Нет ключа GEMINI_API_KEY.';
   if (p === 'yandex') {
     const bad = badKey(process.env.YANDEX_API_KEY);
     if (bad) return bad;

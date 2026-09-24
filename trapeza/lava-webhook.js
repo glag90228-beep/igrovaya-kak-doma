@@ -193,8 +193,16 @@ async function handlePayment(p, provider = 'lava') {
 }
 
 const server = http.createServer((req, res) => {
-  const url = new URL(req.url, 'http://localhost');
   const done = (code, text) => { res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end(text); };
+  /*
+   * Адрес вида «//[» URL читает как чужой хост и бросает исключение. Здесь
+   * обработчик синхронный, так что исключение роняло весь приёмник одним
+   * запросом. Сейчас такой адрес отсекает nginx, но полагаться только на
+   * его настройку нельзя: пока служба перезапускается, уведомления об
+   * оплатах уходят в пустоту.
+   */
+  let url;
+  try { url = new URL(req.url, 'http://localhost'); } catch (_) { return done(400, 'bad url'); }
 
   if (req.method === 'GET' && url.pathname === '/health') return done(200, 'ok');
   if (req.method !== 'POST') return done(405, 'only POST');

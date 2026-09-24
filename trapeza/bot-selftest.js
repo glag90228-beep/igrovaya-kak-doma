@@ -1008,6 +1008,24 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     });
     ok(splitStatus !== 401, 'подпись тела с разрезанной буквой сходится', splitStatus);
 
+    /*
+     * Адрес «//[» URL читает как хост и бросает исключение, а обработчик
+     * приёмника синхронный — один такой запрос ронял весь процесс. fetch
+     * такой адрес не отправит, поэтому пишем в сокет сами.
+     */
+    const rawStatus = (line) => new Promise((resolve, reject) => {
+      const sock = net.connect(hookPort, '127.0.0.1', () => {
+        sock.end(`${line}\r\nHost: x\r\nConnection: close\r\n\r\n`);
+      });
+      let resp = '';
+      sock.on('data', (d) => { resp += d; });
+      sock.on('end', () => resolve(Number((/^HTTP\/1\.1 (\d+)/.exec(resp) || [])[1])));
+      sock.on('error', reject);
+    });
+    const crooked = await rawStatus('GET //[ HTTP/1.1');
+    ok(crooked === 400, 'кривой адрес получает отказ, а не роняет приёмник', crooked);
+    ok(await rawStatus('GET /health HTTP/1.1') === 200, 'и после него приёмник жив');
+
     await new Promise((r) => hookServer.close(r));
   }
   process.env.LAVA_OFFER_URL = 'https://lava.top/x?a=1';
@@ -4029,6 +4047,16 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(/начинается не с AQVN/.test(sp.badKey('YCAJEabcdef')), 'не тот тип ключа распознан');
     ok(sp.badKey('AQVN-kluch-iz-testa') === '', 'нормальный ключ пропущен');
     ok(sp.badKey('') === '', 'пустой ключ здесь не ругаем — про него скажет speechHint');
+    {
+      const was = { p: process.env.SPEECH_PROVIDER, k: process.env.GEMINI_API_KEY };
+      process.env.SPEECH_PROVIDER = 'gemini';
+      process.env.GEMINI_API_KEY = 'AIzaSy-kluch-iz-testa';
+      ok(!/YANDEX|AQVN/.test(sp.speechHint()),
+        'ключ Gemini не проверяется по правилам Яндекса', sp.speechHint());
+      for (const [name, v] of [['SPEECH_PROVIDER', was.p], ['GEMINI_API_KEY', was.k]]) {
+        if (v === undefined) delete process.env[name]; else process.env[name] = v;
+      }
+    }
 
     /*
      * Ответ асинхронного распознавания — склеенные подряд объекты, а не
