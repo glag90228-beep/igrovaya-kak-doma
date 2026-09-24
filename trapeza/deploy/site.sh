@@ -111,9 +111,18 @@ fi
 # shellcheck disable=SC2086  # $PAGES — список файлов, разбиваем намеренно
 PLATEGA_PLAN_DAYS="$PLANS" LAVA_PLAN_DAYS="" node -e '
   const fs = require("fs");
-  const facts = require(process.argv[1] + "/lib/platega").priceFacts();
+  const pl = require(process.argv[1] + "/lib/platega");
+  const facts = pl.priceFacts();
   if (!facts) {
-    console.log("⚠️  В сетке тарифов нет месяца или года — цены на страницах не трогаю.");
+    // Говорим, что прочитали и чего не хватает: без этого предупреждение
+    // приходилось разгадывать, а от сетки зависит, какие кнопки видит бот.
+    const raw = process.env.PLATEGA_PLAN_DAYS || "(не задана — взята запасная " + pl.DEFAULT_PLANS + ")";
+    const got = pl.plans().map((p) => p.amount + " ₽ на " + p.days + " дней").join(", ") || "ни одного тарифа не разобрано";
+    const miss = [!pl.planByName("month") && "месячного (до 300 дней)", !pl.planByName("year") && "годового (от 300 дней)"]
+      .filter(Boolean).join(" и ");
+    console.log("⚠️  Сетка тарифов бота: PLATEGA_PLAN_DAYS=" + raw);
+    console.log("    Разобрано: " + got + ". Нет " + miss + " тарифа.");
+    console.log("    Цены на страницах не трогаю. Формат сетки: сумма:дни через запятую, например 390:30,2990:365.");
     process.exit(0);
   }
   for (const file of process.argv.slice(2)) {
