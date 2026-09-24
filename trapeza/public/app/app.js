@@ -2850,6 +2850,8 @@ screens.ask = async function ask() {
         || 'Налоги, взносы, отчётность и зарплату я не веду. Спросите про документы, долги или сверку.');
       return;
     }
+    // Книга учёта: текст с сервера — куда прислать выписку.
+    if (r.action === 'kudir') { say('bot', r.replyText); return; }
     const known = ASK_GO[r.action];
     if (known) {
       const btn = h('button', { class: 'btn' }, known[0]);

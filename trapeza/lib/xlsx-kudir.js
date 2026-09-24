@@ -24,7 +24,7 @@
  */
 
 const ExcelJS = require('exceljs');
-const { round2 } = require('./money');
+const { round2, plural } = require('./money');
 
 const HEAD = 'FF2E3A8C';
 const CREAM = 'FFF4F6FC';
@@ -84,6 +84,9 @@ function addTitleSheet(wb, { org, year, mode, objectName }) {
   field(ws, 'на', `${year} год`);
   field(ws, 'Налогоплательщик', org.full_name || org.name || '');
   field(ws, 'ИНН', org.inn || '');
+  // У организации в бланке ИНН и КПП — одна строка «ИНН/КПП»; у предпринимателя
+  // КПП нет. Раньше КПП не печатался вовсе, и титул организации был неполон.
+  if (!isIp(org.inn)) field(ws, 'КПП', org.kpp || '');
   if (mode !== 'psn') field(ws, 'Объект налогообложения', objectName || 'доходы');
   field(ws, isIp(org.inn) ? 'Адрес места жительства' : 'Адрес места нахождения', org.address || '');
 
@@ -165,7 +168,13 @@ function totalRow(ws, label, sum, mode, strong) {
 
 function addIncomeSheet(wb, { rows, mode, year }) {
   const ws = wb.addWorksheet(mode === 'psn' ? 'Доходы' : 'Раздел I', {
-    views: [{ state: 'frozen', ySplit: 3 }],
+    /*
+     * Закрепляем то, что есть над ВСЕЙ таблицей. У патента это заголовок,
+     * шапка и номера граф — три строки. У УСН шапка своя на каждый квартал,
+     * и закрепить можно только заголовок: ySplit 3 держал на экране пустую
+     * строку и «I квартал», когда человек листал уже четвёртый.
+     */
+    views: [{ state: 'frozen', ySplit: mode === 'psn' ? 3 : 1 }],
     pageSetup: { orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0 },
   });
   ws.columns = mode === 'psn'
@@ -216,7 +225,7 @@ function addAskSheet(wb, ask) {
   });
   ws.columns = [{ width: 12 }, { width: 15 }, { width: 28 }, { width: 44 }, { width: 46 }];
 
-  const t = title(ws, `Не разнесено: ${ask.length} ${ask.length === 1 ? 'поступление' : 'поступлений'}`);
+  const t = title(ws, `Не разнесено: ${ask.length} ${plural(ask.length, 'поступление', 'поступления', 'поступлений')}`);
   t.font = { bold: true, size: 12, color: { argb: 'FFA33322' } };
 
   const warn = ws.addRow(['Книга без этих строк не полна. Разберите каждую и добавьте в раздел вручную либо исключите — сумма налога зависит от этого решения.']);

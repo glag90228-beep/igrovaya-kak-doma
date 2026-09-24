@@ -3678,6 +3678,10 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       ['сколько НДС по счетам за квартал', 'outofscope'],
       ['как платить НДС со счёта', 'outofscope'],
       ['надо ли сдавать КУДиР по счетам', 'outofscope'],
+      // Книгу бот собирает сам — просьба собрать её больше не отказ.
+      ['собери КУДиР', 'kudir'],
+      ['сформируй книгу учёта доходов за год', 'kudir'],
+      ['сделай мне книгу учета', 'kudir'],
       ['когда платить взносы за себя', 'outofscope'],
       ['зарплата по акту', 'outofscope'],
       ['смени НДС на 5 процентов', 'vat'],
@@ -5016,6 +5020,119 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     tg.downloadFile = async () => Buffer.from('это не выписка, а записка', 'utf8');
     await statement('zametki.txt');
     ok(last().includes('ни одной операции'), 'на посторонний файл понятный ответ', last().slice(0, 60));
+  }
+
+  console.log('\n── книга учёта: от файла до таблицы ──');
+  {
+    /*
+     * Путь целиком, как у человека: файл выписки в чат → кнопка под разбором
+     * → таблица, которую открываем и читаем. Раньше проверка книги искала в
+     * bot.js строчку «data === 'kudir'» и была зелёной, пока сама кнопка
+     * сбрасывала выписку, и книга отвечала «пришлите выписку файлом».
+     */
+    const bdbK = require('./lib/bot-db');
+    const ExcelJS = require('exceljs');
+    const who = { id: 779140, first_name: 'Книга', username: 'kniga' };
+    const chat = { id: who.id };
+    const sayK = (t) => handleUpdate(tg, { message: { chat, from: who, text: t } });
+    const tapK = (d) => handleUpdate(tg,
+      { callback_query: { id: 'cb', from: who, data: d, message: { chat } } });
+    const uK = bdbK.getOrCreateUser(who.id, 'Книга');
+    bdbK.saveMyOrg(uK.id, { name: 'ИП Книгин', inn: '183112345670', acc: '40802810900000000077',
+      bank_name: 'ПАО Сбербанк', bik: '044525225', corr_acc: '30101810400000000225' });
+    const orgK = bdbK.getDefaultOrg(uK.id);
+    bdbK.updateOrg(uK.id, orgK.id, { vat_rate: '', npd: 0, tax_mode: '' });
+    bdbK.createCp(uK.id, { name: 'ООО «Ветер»', inn: '7701234560', kind: 'customer', opening_date: '2025-01-01' });
+    const csvK = [
+      'Дата;ИНН плательщика;Плательщик;Приход;Назначение платежа',
+      '29.12.2025;7701234560;ООО "Ветер";10 000,00;Оплата по счету 1',
+      '15.01.2026;7701234560;ООО "Ветер";20 000,00;Оплата по счету 2',
+      '16.01.2026;;ИП Книгин;50 000,00;Внесение собственных средств',
+      '17.01.2026;7707083893;ООО "Бриз";3 000,00;Возврат аванса по договору 5',
+    ].join('\n');
+    const keepDl = tg.downloadFile;
+    tg.downloadFile = async () => Buffer.from(csvK, 'utf8');
+    const sendFile = () => handleUpdate(tg, { message: { chat, from: who,
+      document: { file_id: 'k-1', file_name: 'vypiska.csv', file_size: csvK.length } } });
+    const lastKb = () => ((sent[sent.length - 1] || {}).kb || []).flat();
+    const bookBtn = () => lastKb().find((b) => /книг/i.test(b.text));
+    const readBook = async (f) => {
+      const wb = new ExcelJS.Workbook();
+      await wb.xlsx.readFile(path.join(OUT, f.filename));
+      return wb;
+    };
+    const yearTotal = (wb) => {
+      const out = [];
+      wb.getWorksheet('Раздел I').eachRow((r) => {
+        if (String(r.getCell(3).value || '') === 'Итого за год') out.push(r.getCell(4).value);
+      });
+      return out[0];
+    };
+
+    await sendFile();
+    ok(bookBtn() && bookBtn().callback_data === 'bank:kudir', 'под разбором выписки есть кнопка книги',
+      JSON.stringify(bookBtn()));
+
+    // Режим не указан: книга спрашивает его — и выбор режима НЕ теряет выписку.
+    await tapK('bank:kudir');
+    ok(/режим/i.test(last()), 'без режима книга спрашивает режим', last().slice(0, 60));
+    await tapK('taxmode');
+    ok(lastKb().some((b) => b.callback_data === 'tax.set:psn'), 'предпринимателю патент предложен');
+    await tapK('tax.set:usn_income');
+    ok(lastKb().some((b) => b.callback_data === 'bank:kudir'),
+      'после выбора режима книгу можно собрать сразу, не присылая файл заново',
+      lastKb().map((b) => b.callback_data).join(' '));
+
+    let before = files.length;
+    await tapK('bank:kudir');
+    let books = files.slice(before);
+    ok(books.length === 2 && books.every((f) => /^Книга_учета_доходов_/.test(f.filename)),
+      'выписка через Новый год — две книги, по одной на год',
+      books.map((f) => f.filename).join(', ') || norm(last()).slice(0, 80));
+    const b26 = books.find((f) => f.filename.includes('_2026-'));
+    const b25 = books.find((f) => f.filename.includes('_2025-'));
+    if (b26 && b25) {
+      const wb26 = await readBook(b26);
+      ok(yearTotal(wb26) === 20000,
+        'в книге 2026 года только январская выручка: свои деньги и возврат аванса — не доход',
+        yearTotal(wb26));
+      ok(wb26.worksheets[0].name === 'Не разнесено', 'возврат аванса ушёл в вопросы, а не в доход',
+        wb26.worksheets.map((w) => w.name).join(' | '));
+      const wb25 = await readBook(b25);
+      ok(yearTotal(wb25) === 10000, 'декабрьская оплата — в книге 2025 года', yearTotal(wb25));
+    }
+
+    // Занесли оплаты — книгу всё равно можно собрать из той же выписки.
+    await sendFile();
+    ok(lastKb().some((b) => b.callback_data === 'bank:take'), 'есть что занести');
+    await tapK('bank:take');
+    before = files.length;
+    await tapK('bank:kudir');
+    ok(files.length - before === 2, 'после «Занести» книга собирается', norm(last()).slice(0, 80));
+
+    // Всё уже занесено: выписку присылают второй раз ровно ради книги.
+    const csvKnown = csvK.split('\n').slice(0, 3).join('\n');
+    tg.downloadFile = async () => Buffer.from(csvKnown, 'utf8');
+    await sendFile();
+    ok(norm(last()).includes('Новых поступлений нет') && bookBtn() && bookBtn().callback_data === 'bank:kudir',
+      'уже занесённая выписка тоже даёт кнопку книги', lastKb().map((b) => b.text).join(' | '));
+    before = files.length;
+    await tapK('bank:kudir');
+    ok(files.length - before === 2, 'и книга собирается', norm(last()).slice(0, 80));
+    tg.downloadFile = async () => Buffer.from(csvK, 'utf8');
+
+    // Ассистент больше не отказывается: «собери КУДиР» — это работа.
+    before = files.length;
+    await sayK('собери КУДиР');
+    ok(files.length - before === 2 || /выписк/i.test(last()),
+      'на «собери КУДиР» ассистент собирает книгу, а не отказывает', norm(last()).slice(0, 80));
+    ok(!/не веду/.test(last()), 'и слов «КУДиР я не веду» больше нет');
+
+    // Режим можно сменить из настроек, а не только из отказа.
+    await tapK('org');
+    ok(lastKb().some((b) => b.callback_data === 'taxmode'), 'в настройках организации есть режим налогов',
+      lastKb().map((b) => b.text).join(' | '));
+    tg.downloadFile = keepDl;
   }
 
   console.log('\n── выписка закрывает счета ──');

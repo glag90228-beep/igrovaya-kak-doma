@@ -303,6 +303,11 @@ function formatAiReply(intent, withCpRes, auto) {
   if (intent.action === 'cps') return 'Открываю список контрагентов.';
   if (intent.action === 'org') return 'Открываю реквизиты организации.';
   if (intent.action === 'vat') return 'Открываю настройки НДС.';
+  // Книга собирается в боте: ей нужен файл выписки, а файлы приходят в чат.
+  if (intent.action === 'kudir') {
+    return 'Книгу учёта доходов собираю из банковской выписки. Пришлите выписку файлом '
+      + 'в чат с ботом — под разбором будет кнопка «Собрать книгу учёта доходов».';
+  }
   // Справка есть — её и показываем; нет — прежний отказ.
   if (intent.action === 'outofscope') return intent.taxAnswer || ai.OUTOFSCOPE_REPLY;
   if (intent.action === 'draft') {

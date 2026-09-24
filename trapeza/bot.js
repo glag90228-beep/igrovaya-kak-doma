@@ -12,6 +12,7 @@ const { buildAkt } = require('./lib/xlsx-akt');
 const { buildRegistry } = require('./lib/xlsx-registry');
 const { buildKnigaProdazh, bookRow } = require('./lib/xlsx-kniga');
 const kudir = require('./lib/kudir');
+const { isIp } = require('./lib/doc-html');
 const { buildKudir } = require('./lib/xlsx-kudir');
 const { advanceVat } = require('./lib/avans');
 const { correctionRow, correctionTotals, correctionNet } = require('./lib/ksf');
@@ -98,7 +99,10 @@ const FLOW_BUTTONS = {
   'items:': ['items.', 'tpl:', 'doc.make', 'doc.num', 'doc.date', 'doc.vat'],
   'form:': ['fb:', 'form.skip'],
   photo: ['ph.'],
-  bank: ['bank:'],
+  // Книга учёта и выбор режима — часть работы с выпиской: раньше их нажатие
+  // сбрасывало состояние, и книга не находила строк, которые только что
+  // разобрали. «Пришлите выписку» в ответ на кнопку под выпиской.
+  bank: ['bank:', 'taxmode', 'tax.set:'],
   'pp:': ['pp.'],
   'dog:': ['dog.'],
   'fx:': ['fx.'],
@@ -1256,12 +1260,36 @@ async function showTaxMode(tg, chatId, user) {
   ];
   if (d.blocked && cur) lines.push('', `⚠️ ${esc(d.blocked)}`);
 
+  // Патент — только для предпринимателя (ст. 346.43 НК): организации его
+  // не применяют, и выбор, который ни к чему не ведёт, не показываем.
+  const ip = isIp(org);
+  const withBook = bankRows(user).length > 0 && !d.blocked;
   await tg.sendMessage(chatId, lines.join('\n'), keyboard([
     [{ text: `${mark('usn_income')}УСН «доходы»`, data: 'tax.set:usn_income' }],
     [{ text: `${mark('usn_minus')}УСН «доходы минус расходы»`, data: 'tax.set:usn_minus' }],
-    [{ text: `${mark('psn')}Патент`, data: 'tax.set:psn' }],
+    ...(ip ? [[{ text: `${mark('psn')}Патент`, data: 'tax.set:psn' }]] : []),
+    // Выписка ещё в работе — книгу можно собрать сразу, не присылая файл заново.
+    ...(withBook ? [[{ text: '📒 Собрать книгу учёта доходов', data: 'bank:kudir' }]] : []),
     [{ text: '⬅️ Меню', data: 'menu' }],
   ]));
+}
+
+/**
+ * Строки выписки, которые ещё в работе.
+ *
+ * Лежат в состоянии «bank», а после «Занести» и «Отметить» — в «bank-paid»:
+ * книгу можно собрать и до, и после этих шагов.
+ */
+function bankRows(user) {
+  const st = bdb.getState(user.id);
+  return (st.state === 'bank' || st.state === 'bank-paid') && Array.isArray((st.data || {}).all)
+    ? st.data.all : [];
+}
+
+/** Сбросить шаг выписки, но оставить строки для книги. */
+function keepBankRows(user, all) {
+  if (Array.isArray(all) && all.length) bdb.setState(user.id, 'bank', { rows: [], all });
+  else bdb.clearState(user.id);
 }
 
 /**
@@ -1281,15 +1309,16 @@ async function sendKudir(tg, chatId, user) {
 
   const d = kudir.bookFor(org);
   if (d.blocked) {
+    // Режим можно поменять из отказа всегда, а не только когда он не указан:
+    // иначе выбравший по ошибке «доходы минус расходы» оставался в тупике.
     await tg.sendMessage(chatId, esc(d.blocked), keyboard([
-      ...(d.needs === 'tax_mode' ? [[{ text: '⚙️ Указать режим', data: 'taxmode' }]] : []),
+      ...(d.needs === 'npd' ? [] : [[{ text: d.needs === 'tax_mode' ? '⚙️ Указать режим' : '⚙️ Сменить режим', data: 'taxmode' }]]),
       [{ text: '⬅️ Меню', data: 'menu' }],
     ]));
     return;
   }
 
-  const st = bdb.getState(user.id);
-  const all = st.state === 'bank' && Array.isArray(st.data.all) ? st.data.all : [];
+  const all = bankRows(user);
   if (!all.length) {
     await tg.sendMessage(chatId,
       'Книга собирается из банковской выписки. Пришлите её файлом — 1С-Клиент-Банк, '
@@ -1298,34 +1327,45 @@ async function sendKudir(tg, chatId, user) {
     return;
   }
 
+  /*
+   * Книга годовая: выписка с декабря по январь — это две книги, а не одна.
+   * Раньше год брался по первой дате, и январские поступления ложились в
+   * прошлогоднюю книгу — с неверным итогом за оба года.
+   */
   const dates = all.map((r) => r.date).filter(Boolean).sort();
-  const from = dates[0];
-  const to = dates[dates.length - 1];
-  const book = kudir.buildIncomeBook(all, { from, to });
-  if (book.blocked) {
-    await tg.sendMessage(chatId, esc(book.blocked), keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
-    return;
-  }
-
+  const years = [...new Set(dates.map((x) => x.slice(0, 4)))];
   await tg.sendChatAction(chatId, 'upload_document');
-  const buf = await buildKudir({ org, book, year: Number(from.slice(0, 4)), mode: d.mode });
+  for (const y of years) {
+    const inYear = dates.filter((x) => x.startsWith(y));
+    const from = inYear[0];
+    const to = inYear[inYear.length - 1];
+    // vatPayer — второй рубеж: решатель выше уже отказал бы, но книга
+    // плательщика НДС не должна собраться ни одним путём.
+    const book = kudir.buildIncomeBook(all, { from, to, vatPayer: d.vatPayer });
+    if (book.blocked) {
+      await tg.sendMessage(chatId, esc(book.blocked), keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
+    const buf = await buildKudir({ org, book, year: Number(y), mode: d.mode });
 
-  const caption = [
-    `Книга учёта доходов за ${ru(from)}—${ru(to)}.`,
-    `Строк: <b>${book.rows.length}</b>, доход: <b>${formatRub(book.total)}</b>.`,
-  ];
-  if (book.ask.length) {
-    caption.push('', `⚠️ <b>Не разнесено: ${book.ask.length}</b> — первым листом в файле. `
-      + 'Пока они не разобраны, книга не полна.');
+    const caption = [
+      `Книга учёта доходов за ${ru(from)}—${ru(to)}.`,
+      `Строк: <b>${book.rows.length}</b>, доход: <b>${formatRub(book.total)}</b>.`,
+    ];
+    if (book.ask.length) {
+      caption.push('', `⚠️ <b>Не разнесено: ${book.ask.length}</b> — первым листом в файле. `
+        + 'Пока они не разобраны, книга не полна.');
+    }
+    caption.push('', '<i>Книга собрана за период присланной выписки. Для годовой книги '
+      + 'пришлите выписку за год. Проверьте и подпишите — это черновик, а не сданная отчётность.</i>');
+
+    // eslint-disable-next-line no-await-in-loop
+    await tg.sendDocument(chatId, {
+      filename: `Книга_учета_доходов_${from}_${to}.xlsx`,
+      buffer: buf,
+      caption: caption.join('\n'),
+    });
   }
-  caption.push('', '<i>Книга собрана за период присланной выписки. Для годовой книги '
-    + 'пришлите выписку за год. Проверьте и подпишите — это черновик, а не сданная отчётность.</i>');
-
-  await tg.sendDocument(chatId, {
-    filename: `Книга_учета_доходов_${from}_${to}.xlsx`,
-    buffer: buf,
-    caption: caption.join('\n'),
-  });
 }
 
 async function sendRegistry(tg, chatId, user, periodName) {
@@ -2558,6 +2598,7 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
   if (intent.action === 'cps') { logAiReply('Показываю контрагентов'); await showCps(tg, chatId, user); return true; }
   if (intent.action === 'org') { logAiReply('Показываю организацию'); await showOrg(tg, chatId, user); return true; }
   if (intent.action === 'vat') { logAiReply('Показываю НДС'); await showVat(tg, chatId, user); return true; }
+  if (intent.action === 'kudir') { logAiReply('Книга учёта доходов'); await sendKudir(tg, chatId, user); return true; }
 
   /*
    * Оплата по фразе — ассистент вносит её сам.
@@ -3345,13 +3386,35 @@ async function handleStatement(tg, chatId, user, msg) {
   const fresh = matched.filter((t) => !known.has(t.key));
   const sure = fresh.filter((t) => t.cp && t.confidence >= 60);
 
+  /*
+   * Все разобранные строки — сразу в состояние, до любых выходов.
+   *
+   * Книге учёта они нужны целиком: в журнал попадают только те, у кого
+   * нашёлся контрагент, а книге надо увидеть и свои деньги, и займы, и
+   * возвраты налога — исключить их следует осознанно, а не потому, что они
+   * потерялись по дороге. Раньше состояние писалось ниже раннего выхода, и
+   * выписка, уже занесённая в журнал, книгу не давала вовсе: её присылают
+   * повторно ровно ради книги. Поля только те, что нужны книге.
+   */
+  const all = rows.map((r) => ({
+    date: r.date, amount: r.amount, incoming: r.incoming,
+    name: r.name || '', purpose: r.purpose || '', doc: r.doc || '',
+  }));
+  const bookBtn = (book) => [{
+    text: book.blocked ? '📒 Книга учёта доходов' : '📒 Собрать книгу учёта доходов', data: 'bank:kudir',
+  }];
+
   const lines = [`Выписка ${format}: строк ${rows.length}, поступлений ${matched.length}.`];
   if (matched.length !== fresh.length) {
     lines.push(`Уже занесено раньше: ${matched.length - fresh.length}.`);
   }
   if (!fresh.length) {
+    bdb.setState(user.id, 'bank', { rows: [], all });
     lines.push('', 'Новых поступлений нет — повторно они не пройдут.');
-    await tg.sendMessage(chatId, lines.join('\n'), mainMenu());
+    await tg.sendMessage(chatId, lines.join('\n'), keyboard([
+      bookBtn(kudir.bookFor(org)),
+      [{ text: '⬅️ Меню', data: 'menu' }],
+    ]));
     return;
   }
 
@@ -3380,19 +3443,9 @@ async function handleStatement(tg, chatId, user, msg) {
 
   // Строки кладём в состояние: кнопка нажимается позже, а файла к тому
   // времени уже нет.
-  /*
-   * Рядом с сопоставленными строками кладём ВСЕ разобранные — они нужны
-   * книге учёта. В журнал попадают только те, у кого нашёлся контрагент, а
-   * книге надо увидеть и свои деньги, и займы, и возвраты налога: исключить
-   * их следует осознанно, а не потому, что они потерялись по дороге.
-   * Поля только те, что нужны книге, иначе состояние разрастается зря.
-   */
   bdb.setState(user.id, 'bank', {
     rows: sure.map((t) => ({ key: t.key, cpId: t.cp.id, amount: t.amount, date: t.date, doc: t.doc })),
-    all: rows.map((r) => ({
-      date: r.date, amount: r.amount, incoming: r.incoming,
-      name: r.name || '', purpose: r.purpose || '', doc: r.doc || '',
-    })),
+    all,
   });
 
   const app = webAppUrl();
@@ -3401,7 +3454,7 @@ async function handleStatement(tg, chatId, user, msg) {
     ...(sure.length ? [[{ text: `✅ Занести ${sure.length} ${plural(sure.length, 'оплату', 'оплаты', 'оплат')}`, data: 'bank:take' }]] : []),
     // Кнопку показываем и когда книга не положена: отказ с объяснением
     // полезнее молчания, а из него ведёт кнопка к выбору режима.
-    [{ text: book.blocked ? '📒 Книга учёта доходов' : '📒 Собрать книгу учёта доходов', data: 'kudir' }],
+    bookBtn(book),
     ...(app ? [[{ text: '📱 Разобрать в приложении', webApp: app }]] : []),
     [{ text: '⬅️ Меню', data: 'menu' }],
   ]));
@@ -3444,7 +3497,7 @@ async function offerClosedDocs(tg, chatId, user, rows, head) {
   }
 
   const count = deals.reduce((n, d) => n + (d.twinId ? 2 : 1), 0);
-  bdb.setState(user.id, 'bank-paid', { deals });
+  bdb.setState(user.id, 'bank-paid', { deals, all: bankRows(user) });
   await tg.sendMessage(chatId, lines.join('\n'), keyboard([
     [{ text: `✅ Отметить оплаченными (${count})`, data: 'bank:paid' }],
     [{ text: 'Не надо', data: 'menu' }],
@@ -4347,6 +4400,9 @@ async function showOrg(tg, chatId, user) {
     [{ text: fxLabel, data: 'fx' }],
     [{ text: `🧾 НДС: ${vatLabel(org)}`.slice(0, 60), data: 'vat' }],
     [{ text: `💼 Самозанятость: ${npd.isNpd(org) ? 'да' : 'нет'}`, data: 'npd' }],
+    // Режим налогов — для книги учёта. Раньше экран открывался только из
+    // отказа «не знаю ваш режим», и выбранный однажды режим было не сменить.
+    [{ text: `📒 Режим: ${kudir.TAX_MODES[org.tax_mode] || 'не указан'}`.slice(0, 60), data: 'taxmode' }],
     [{ text: `📊 Долг: ${BASIS_LABEL[bdb.basisOf(org)]}`.slice(0, 60), data: 'basis' }],
     [{ text: bdb.isAiEnabled(user.id) ? '🤖 ИИ-ассистент: включён' : '🤖 ИИ-ассистент: выключен', data: 'toggle.ai' }],
     [{ text: mailbox.has(user.id) ? '✉️ Почта: подключена' : '✉️ Подключить почту', data: 'mb' }],
@@ -4781,7 +4837,8 @@ async function handleCallback(tg, cq) {
     if (data === 'bank:take') {
       const st = bdb.getState(user.id);
       const rows = st.state === 'bank' && Array.isArray(st.data.rows) ? st.data.rows : [];
-      bdb.clearState(user.id);
+      // Занесли оплаты — а книгу ещё собирать: строки выписки оставляем.
+      keepBankRows(user, bankRows(user));
       if (!rows.length) {
         await tg.sendMessage(chatId, 'Выписка уже не в работе — пришлите файл заново.', mainMenu());
         return;
@@ -4808,7 +4865,7 @@ async function handleCallback(tg, cq) {
     if (data === 'bank:paid') {
       const st = bdb.getState(user.id);
       const deals = st.state === 'bank-paid' && Array.isArray(st.data.deals) ? st.data.deals : [];
-      bdb.clearState(user.id);
+      keepBankRows(user, bankRows(user));
       if (!deals.length) {
         await tg.sendMessage(chatId, 'Список уже не в работе — пришлите выписку заново.', mainMenu());
         return;
@@ -5157,11 +5214,17 @@ async function handleCallback(tg, cq) {
       // «книга почему-то не собирается» без единой подсказки.
       if (!Object.prototype.hasOwnProperty.call(kudir.TAX_MODES, v)) return;
       const org = bdb.currentOrg(user.id);
+      if (v === 'psn' && org && !isIp(org)) {
+        await tg.sendMessage(chatId, 'Патент применяют только предприниматели — у организации его не бывает.');
+        await showTaxMode(tg, chatId, user);
+        return;
+      }
       if (org) bdb.updateOrg(user.id, org.id, { tax_mode: v });
       await showTaxMode(tg, chatId, user);
       return;
     }
-    if (data === 'kudir') { await sendKudir(tg, chatId, user); return; }
+    // 'kudir' — у кнопок в уже отправленных сообщениях.
+    if (data === 'bank:kudir' || data === 'kudir') { await sendKudir(tg, chatId, user); return; }
     if (data === 'vat') { await showVat(tg, chatId, user); return; }
     if (data === 'npd') { await showNpd(tg, chatId, user); return; }
     if (data.startsWith('npd.set:')) {

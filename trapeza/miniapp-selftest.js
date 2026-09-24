@@ -365,6 +365,11 @@ async function main() {
     ok(r.json.action === 'pay' && Number(r.json.cpId) === cpPay && r.json.amount === 10000,
       'фраза разобрана как оплата и клиент найден', JSON.stringify(r.json).slice(0, 130));
 
+    // «Собери КУДиР» — не отказ «налоги не веду», а подсказка, куда прислать выписку.
+    r = await call('POST', '/api/ask', { user: masha, body: { text: 'собери КУДиР' } });
+    ok(r.json.action === 'kudir' && /выписк/.test(r.json.replyText || '') && !/не веду/.test(r.json.replyText || ''),
+      'на «собери КУДиР» приложение объясняет, как собрать книгу', JSON.stringify(r.json).slice(0, 140));
+
     r = await call('POST', '/api/pay', { user: masha, body: { cpId: cpPay, amount: 10000 } });
     ok(r.status === 200 && r.json.balance === 30000,
       'проводка внесена, сальдо 40 000 − 10 000', JSON.stringify(r.json));
