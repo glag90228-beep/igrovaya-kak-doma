@@ -327,15 +327,20 @@ async function startSmeta(env = {}) {
     ok(stat() === before, 'прогон оплат не пишет в боевой журнал вебхуков', `${before} → ${stat()}`);
 
     /*
-     * Раскладка update.sh удаляет всё, чего нет в репозитории, — кроме базы,
-     * ключей и зависимостей. Одна пропавшая защита, и обновление стирает
-     * боевую базу. Команду берём из самого скрипта, а не переписываем сюда:
-     * иначе проверялась бы копия, а скрипт жил бы своей жизнью.
+     * Раскладка update.sh и install.sh удаляет всё, чего нет в репозитории, —
+     * кроме базы, ключей и зависимостей. Одна пропавшая защита, и обновление
+     * стирает боевую базу. Команду берём из самого скрипта, а не переписываем
+     * сюда: иначе проверялась бы копия, а скрипт жил бы своей жизнью.
+     *
+     * SRC у скриптов разный: update.sh получает корень клона и сам дописывает
+     * trapeza/, install.sh — уже папку trapeza, в которой лежит.
      */
-    const script = fsR.readFileSync(pathR.join(__dirname, 'deploy', 'update.sh'), 'utf8');
-    const cmd = (/^rsync -a --delete[\s\S]*?"\$APP\/"$/m.exec(script) || [])[0];
-    ok(Boolean(cmd), 'в update.sh раскладка идёт через rsync --delete');
-    if (cmd && spawnSync('rsync', ['--version']).status === 0) {
+    const haveRsync = spawnSync('rsync', ['--version']).status === 0;
+    for (const [name, srcDir] of [['update.sh', 'src'], ['install.sh', 'src/trapeza']]) {
+      const script = fsR.readFileSync(pathR.join(__dirname, 'deploy', name), 'utf8');
+      const cmd = (/^rsync -a --delete[\s\S]*?"\$APP\/"$/m.exec(script) || [])[0];
+      ok(Boolean(cmd), `в ${name} раскладка идёт через rsync --delete`);
+      if (!cmd || !haveRsync) continue;
       const box = fsR.mkdtempSync(pathR.join(osR.tmpdir(), 'trapeza-deploy-'));
       const put = (rel, text) => {
         fsR.mkdirSync(pathR.dirname(pathR.join(box, rel)), { recursive: true });
@@ -349,18 +354,17 @@ async function startSmeta(env = {}) {
         '.env', '.env.bak.20260901', '.package-lock.deployed'];
       for (const f of keep) put(`app/${f}`, `боевое: ${f}`);
       const r = spawnSync('bash', ['-c', cmd], {
-        env: { ...process.env, SRC: pathR.join(box, 'src'), APP: pathR.join(box, 'app') }, encoding: 'utf8',
+        env: { ...process.env, SRC: pathR.join(box, srcDir), APP: pathR.join(box, 'app') }, encoding: 'utf8',
       });
       const read = (rel) => (fsR.existsSync(pathR.join(box, 'app', rel)) ? fsR.readFileSync(pathR.join(box, 'app', rel), 'utf8') : null);
       const lost = keep.filter((f) => read(f) !== `боевое: ${f}`);
-      ok(r.status === 0 && !lost.length, 'база, ключи и зависимости переживают раскладку',
+      ok(r.status === 0 && !lost.length, `${name}: база, ключи и зависимости переживают раскладку`,
         `${r.status} ${lost.join(', ')} ${String(r.stderr).trim()}`);
-      ok(read('lib/udalyonnyj.js') === null, 'убранный из репозитория файл с сервера удалён');
-      ok(read('bot.js') === 'новый код', 'правка руками на сервере заменена кодом из репозитория');
+      ok(read('lib/udalyonnyj.js') === null, `${name}: убранный из репозитория файл с сервера удалён`);
+      ok(read('bot.js') === 'новый код', `${name}: правка руками на сервере заменена кодом из репозитория`);
       fsR.rmSync(box, { recursive: true, force: true });
-    } else if (cmd) {
-      console.log('  — rsync на этой машине нет: раскладку проверит прогон на сервере');
     }
+    if (!haveRsync) console.log('  — rsync на этой машине нет: раскладку проверит прогон на сервере');
   }
 
   console.log(bad ? `\nне прошло: ${bad}` : '\nвсе атаки отражены ✅');

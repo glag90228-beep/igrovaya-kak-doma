@@ -40,9 +40,18 @@ command -v rsync >/dev/null 2>&1 || apt-get install -y rsync
 # data, node_modules и .env защищены дважды. Исключение из передачи по правилам
 # rsync и так спасает файл от удаления, но цена ошибки здесь — боевая база
 # с данными клиентов, поэтому то же самое сказано ещё и явным protect.
+#
+# Ещё два файла только защищены от удаления: копии .env.bak.*, которые делает
+# nginx-merge.sh перед правкой ключей, и .package-lock.deployed — метка
+# update.sh, без которой следующее обновление ставило бы зависимости заново.
+#
+# Список тот же, что в update.sh, и redteam-selftest.js гоняет оба: поправили
+# защиту в одном — поправьте и в другом.
 rsync -a --delete \
-  --filter='protect data' --filter='protect node_modules' --filter='protect .env' \
-  --exclude node_modules --exclude data --exclude .env "$SRC"/ "$APP"/
+  --filter='protect /data' --filter='protect node_modules' \
+  --filter='protect /.env*' --filter='protect /.package-lock.deployed' \
+  --exclude /data --exclude node_modules --exclude /.env \
+  "$SRC/" "$APP/"
 cd "$APP"
 
 if [ ! -f .env ]; then
