@@ -166,6 +166,23 @@ function migrate() {
   addColumn('recurring', 'pay_day', 'INTEGER NOT NULL DEFAULT 0');
   addColumn('recurring', 'lead_days', 'INTEGER NOT NULL DEFAULT 0');
   addColumn('recurring', 'last_due', "TEXT NOT NULL DEFAULT ''");
+  // YYYY-MM, за какой месяц документ по правилу уже выписан. Защита кнопки
+  // «Выписать» от второго нажатия — см. recurring.claimIssue.
+  addColumn('recurring', 'last_issued', "TEXT NOT NULL DEFAULT ''");
+
+  /*
+   * Одноразовые кнопки — см. claimButton. Первичный ключ и есть защита:
+   * второй INSERT того же токена не пройдёт, сколько бы нажатий ни пришло
+   * одновременно.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS button_uses (
+      user_id INTEGER NOT NULL,
+      token   TEXT    NOT NULL,
+      used_at TEXT    NOT NULL,
+      PRIMARY KEY (user_id, token)
+    );
+  `);
 
   /*
    * Чем занимается бизнес. Нужен ровно для одного: подсказать, откуда у
@@ -513,6 +530,22 @@ function listOrgs(userId) {
 }
 function getOrg(userId, id) {
   return db.prepare('SELECT * FROM orgs WHERE id = ? AND user_id = ?').get(id, userId);
+}
+
+/**
+ * Забрать одноразовую кнопку. true — нажатие первое, действие делать.
+ *
+ * Сообщения с кнопками в Telegram не гаснут: «✅ Да, внести 50 000» жмут
+ * дважды, возвращаются к нему назавтра, пальцем задевают при прокрутке. Раньше
+ * каждое нажатие проводило оплату заново, и сальдо показывало переплату,
+ * которой не было. Токен кладётся в данные кнопки при отрисовке; все кнопки
+ * одного сообщения несут один токен, так что и выбор из списка срабатывает
+ * один раз.
+ */
+function claimButton(userId, token) {
+  if (!token) return true;          // старые кнопки без токена — как раньше
+  return db.prepare('INSERT OR IGNORE INTO button_uses(user_id, token, used_at) VALUES(?,?,?)')
+    .run(userId, String(token), new Date().toISOString()).changes === 1;
 }
 
 /**
@@ -2242,7 +2275,7 @@ module.exports = {
   migrate,
   getOrCreateUser, setState, getState, clearState, isAiEnabled, setAiEnabled, setSource,
   saveAiMessage, listAiMessages, getAiDataset,
-  createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, orgOfDoc, getDefaultOrg, setDefaultOrg,
+  createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, orgOfDoc, claimButton, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp, openAdvances, updateDocPayload,
   addOp, listOps, deleteLastOp, deleteOp, balanceOf, debtors, debtBreakdown, periodBalance, cpForPeriod,
   knownBankKeys, importBankRows,

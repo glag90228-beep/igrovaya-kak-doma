@@ -805,6 +805,21 @@ function itemsKb(user, data) {
 }
 
 async function startItems(tg, chatId, user, type, cpId, extra = {}) {
+  /*
+   * Платёжка и договор собираются из своих полей, а не из позиций, и у них
+   * свои сценарии. Ассистент законно называет оба вида (они есть в его
+   * списке документов), и раньше просьба «выпиши платёжку Заре на 5000»
+   * попадала сюда: ITEM_DOCS[type].title падал с TypeError, человек не
+   * получал ответа, а брошенное состояние ловило следующее сообщение.
+   * Развилка стоит в самом начале, чтобы упасть здесь не мог ни один
+   * вызывающий, а не только ассистент.
+   */
+  if (!ITEM_DOCS[type]) {
+    if (type === 'pp') return startPp(tg, chatId, user, cpId);
+    if (type === 'dog') return startDogovor(tg, chatId, user, cpId);
+    await tg.sendMessage(chatId, 'Такой документ из позиций не собирается — выберите его в меню.', mainMenu());
+    return undefined;
+  }
   if (!(await requireQuota(tg, chatId, user))) return;
   const year = currentYear();
   /*
@@ -2470,6 +2485,9 @@ async function showBasis(tg, chatId, user) {
  * проводку сделал бот, у человека должен быть способ убрать её тем же
  * количеством нажатий, каким она появилась.
  */
+/** Токен одноразовой кнопки — см. bdb.claimButton. Короткий: у данных кнопки лимит 64 байта. */
+const oneShot = () => require('node:crypto').randomBytes(4).toString('hex');
+
 async function recordPay(tg, chatId, user, cpId, amount, kind) {
   const cp = bdb.getCp(user.id, cpId);
   if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
@@ -2489,7 +2507,7 @@ async function recordPay(tg, chatId, user, cpId, amount, kind) {
     await tg.sendMessage(chatId,
       `За «${esc(cp.name)}» числится <b>${formatRub(owed)}</b>. Внести эту сумму как оплату?`,
       keyboard([
-        [{ text: `✅ Да, ${formatMoney(owed)}`, data: `pay.cp:${cpId}:${owed}:o` }],
+        [{ text: `✅ Да, ${formatMoney(owed)}`, data: `pay.cp:${cpId}:${owed}:o:${oneShot()}` }],
         [{ text: '⬅️ Меню', data: 'menu' }],
       ]));
     return;
@@ -2563,10 +2581,17 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
       return true;
     }
     const found = intent.who ? ai.matchCp(cps, intent.who) : {};
-    const cp = found.cp || (cps.length === 1 ? cps[0] : null);
+    /*
+     * Единственному клиенту оплату приписываем, только если плательщика не
+     * назвали вовсе. Раньше «Ромашка заплатила 50 000» при одном клиенте
+     * «Заря» вносило оплату Заре — имя не совпало, а запасной вариант
+     * сработал молча.
+     */
+    const cp = found.cp || (!intent.who && cps.length === 1 ? cps[0] : null);
     if (!cp) {
+      const tok = oneShot();
       const rows = (found.choices || cps).slice(0, 8)
-        .map((c) => ([{ text: c.name.slice(0, 60), data: `pay.cp:${c.id}:${intent.amount || 0}:${intent.kind === 'Приход' ? 'p' : 'o'}` }]));
+        .map((c) => ([{ text: c.name.slice(0, 60), data: `pay.cp:${c.id}:${intent.amount || 0}:${intent.kind === 'Приход' ? 'p' : 'o'}:${tok}` }]));
       await tg.sendMessage(chatId,
         intent.who ? `Кого именно вы имели в виду — «${esc(intent.who)}»?` : 'По кому вносим?',
         keyboard([...rows, [{ text: '⬅️ Меню', data: 'menu' }]]));
@@ -2574,7 +2599,9 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
     }
     if (!auto) {
       const sum = round2(Number(intent.amount) || 0);
-      const bal = round2(Math.abs(bdb.balanceOf(user.id, cp.id).closing));
+      // Только долг, не переплата: с Math.abs переплата 30 000 предлагалась
+      // к внесению как оплата — и удваивалась.
+      const bal = round2(Math.max(0, bdb.balanceOf(user.id, cp.id).closing));
       const use = sum || bal;
       if (!use) {
         await tg.sendMessage(chatId, `За «${esc(cp.name)}» долга нет. Напишите сумму.`, mainMenu());
@@ -2584,7 +2611,7 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
         `Подготовил: <b>${intent.kind} ${formatRub(use)}</b> по «${esc(cp.name)}».\n\n`
         + '<i>Сам я ничего не провожу — нажмите, и внесу.</i>',
         keyboard([
-          [{ text: `✅ Внести ${formatMoney(use)}`, data: `pay.cp:${cp.id}:${use}:${intent.kind === 'Приход' ? 'p' : 'o'}` }],
+          [{ text: `✅ Внести ${formatMoney(use)}`, data: `pay.cp:${cp.id}:${use}:${intent.kind === 'Приход' ? 'p' : 'o'}:${oneShot()}` }],
           [{ text: '⬅️ Меню', data: 'menu' }],
         ]));
       return true;
@@ -2871,7 +2898,7 @@ async function offerRoutine(tg, chatId, user, key) {
   return true;
 }
 
-async function offerRecurring(tg, rec) {
+async function offerRecurring(tg, rec, month = recurring.monthKey()) {
   const user = bdb.userById(rec.user_id);
   if (!user || user.blocked_at) return false;
   const kind = docService.ITEM_DOCS[rec.type];
@@ -2897,8 +2924,8 @@ async function offerRecurring(tg, rec) {
     keyboard([
       [empty
         ? { text: '✍️ Заполнить и выписать', data: `d.${rec.type}:${rec.cp_id}` }
-        : { text: '✅ Выписать', data: `rec.go:${rec.id}` }],
-      [{ text: '⏭ Пропустить месяц', data: `rec.skip:${rec.id}` }],
+        : { text: '✅ Выписать', data: `rec.go:${rec.id}:${month}` }],
+      [{ text: '⏭ Пропустить месяц', data: `rec.skip:${rec.id}:${month}` }],
       [{ text: '✖️ Больше не напоминать', data: `rec.off:${rec.id}` }],
     ]));
   return true;
@@ -2926,13 +2953,13 @@ async function askRoDay(tg, chatId, user, cpId, data) {
  * ними, лучше пропустить месяц, чем внести строку дважды — задвоенная
  * оплата в учёте хуже ненайденной.
  */
-async function postRecurringOp(tg, rec) {
+async function postRecurringOp(tg, rec, month) {
   const user = bdb.userById(rec.user_id);
   if (!user || user.blocked_at) return false;
   const cp = bdb.getCp(user.id, rec.cp_id);
   if (!cp) return false;
 
-  const step = recurring.bumpOp(user.id, rec.id, 1);
+  const step = recurring.bumpOp(user.id, rec.id, 1, undefined, month);
   if (!step) return false;
 
   const { kind, amount, note } = rec.op;
@@ -2988,14 +3015,17 @@ async function runDaily(tg, at = new Date()) {
   let sent = 0;
   for (const rec of recurring.due(on)) {
     try {
+      // За какой месяц это предложение — не всегда текущий (догонялка
+      // «последнего дня», см. recurring.offerMonth). Им же и отмечаем.
+      const month = recurring.offerMonth(rec, on);
       if (recurring.isOp(rec)) {
         // eslint-disable-next-line no-await-in-loop
-        if (await postRecurringOp(tg, rec)) sent += 1;
+        if (await postRecurringOp(tg, rec, month)) sent += 1;
         continue;                       // счётчик двигает сам postRecurringOp
       }
       // eslint-disable-next-line no-await-in-loop
-      if (await offerRecurring(tg, rec)) sent += 1;
-      recurring.markOffered(rec.user_id, rec.id, on);
+      if (await offerRecurring(tg, rec, month)) sent += 1;
+      recurring.markOffered(rec.user_id, rec.id, on, month);
     } catch (e) {
       console.error('регулярные документы:', e.message);
     }
@@ -3004,7 +3034,7 @@ async function runDaily(tg, at = new Date()) {
     try {
       // eslint-disable-next-line no-await-in-loop
       if (await warnOverdue(tg, rec, on)) sent += 1;
-      recurring.markDueNoticed(rec.id, on);
+      recurring.markDueNoticed(rec.id, on, recurring.dueMonth(rec, on));
     } catch (e) {
       console.error('просрочка:', e.message);
     }
@@ -5041,19 +5071,38 @@ async function handleCallback(tg, cq) {
       return;
     }
     if (data.startsWith('rec.go:')) {
-      const rec = recurring.get(user.id, Number(data.slice(7)));
+      // rec.go:<id>:<YYYY-MM>. Старые кнопки без месяца — за текущий.
+      const [idStr, monthStr] = data.slice(7).split(':');
+      const month = /^\d{4}-\d{2}$/.test(monthStr || '') ? monthStr : recurring.monthKey();
+      const rec = recurring.get(user.id, Number(idStr));
       if (!rec) { await tg.sendMessage(chatId, 'Это повторение уже удалено.', mainMenu()); return; }
+      /*
+       * Одно нажатие — один документ за месяц напоминания. Кнопка не гаснет,
+       * и раньше двойной тап или возврат к вчерашнему сообщению выпускали
+       * второй счёт с новым номером: долг клиента удваивался.
+       */
+      const claim = recurring.claimIssue(user.id, rec.id, month);
+      if (!claim.ok) {
+        await tg.sendMessage(chatId, 'По этому напоминанию документ уже выписан — второй не делаю. '
+          + 'Нужен ещё один — выпишите его обычным путём.', mainMenu());
+        return;
+      }
       const done = await issueDoc(tg, chatId, user, {
         type: rec.type,
         cpId: rec.cp_id,
         doc: { items: rec.items, date: todayISO(), number: '' },
         extra: rec.extra,
       });
+      // Не вышло (лимит, ошибка сборки) — возвращаем отметку, чтобы кнопка
+      // сработала, когда причину уберут.
+      if (!done) recurring.releaseIssue(user.id, rec.id, month, claim.prev);
       if (done) await afterDoc(tg, chatId, user, rec.cp_id);
       return;
     }
     if (data.startsWith('rec.skip:')) {
-      recurring.markOffered(user.id, Number(data.slice(9)));
+      const [idStr, monthStr] = data.slice(9).split(':');
+      const month = /^\d{4}-\d{2}$/.test(monthStr || '') ? monthStr : recurring.monthKey();
+      recurring.markOffered(user.id, Number(idStr), undefined, month);
       await tg.sendMessage(chatId, 'Пропустил. Напомню в следующем месяце.', mainMenu());
       return;
     }
@@ -5338,7 +5387,13 @@ async function handleCallback(tg, cq) {
     if (data.startsWith('ro.undo:')) {
       const [, recIdStr, opIdStr] = data.split(':');
       const removed = bdb.deleteOp(user.id, Number(opIdStr));
-      recurring.bumpOp(user.id, Number(recIdStr), -1);
+      /*
+       * Счётчик откатываем, только если строка действительно убрана. Раньше
+       * откат шёл всегда: второе нажатие «Отменить» уже ничего не удаляло,
+       * но счётчик уменьшало ещё раз — и правило «5 раз по 10 000» вносило
+       * шестой платёж, лишние 10 000 уходили в сальдо и в акт сверки.
+       */
+      if (removed) recurring.bumpOp(user.id, Number(recIdStr), -1);
       await tg.sendMessage(chatId,
         removed
           ? '↩️ Убрал операцию из журнала. Счётчик вернул назад — в следующий раз внесу снова.'
@@ -5364,7 +5419,11 @@ async function handleCallback(tg, cq) {
     if (data === 'cp.new') { await startForm(tg, chatId, user, 'cp'); return; }
     // Выбор клиента и суммы для проводки, начатой фразой.
     if (data.startsWith('pay.cp:')) {
-      const [cpIdStr, sumStr, kindFlag] = data.slice(7).split(':');
+      const [cpIdStr, sumStr, kindFlag, tok] = data.slice(7).split(':');
+      if (!bdb.claimButton(user.id, tok)) {
+        await tg.sendMessage(chatId, 'Эта оплата уже внесена — повторно не провожу.', mainMenu());
+        return;
+      }
       await recordPay(tg, chatId, user, Number(cpIdStr), Number(sumStr), kindFlag === 'p' ? 'Приход' : 'Оплата');
       return;
     }

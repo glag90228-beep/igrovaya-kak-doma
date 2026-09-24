@@ -151,6 +151,29 @@ function isDue(rec, date = todayDate()) {
 }
 
 /**
+ * За какой месяц предложение, которое isDue разрешило в этот день.
+ *
+ * Обычно — за текущий. Но «последний день», пойманный не в последний день,
+ * — это догонялка пропущенного прошлого месяца (см. isDue). Раньше отметка
+ * всегда ставилась текущим месяцем: пятого сентября догоняли август, а в
+ * отметку писали сентябрь — и тридцатого сентября собственный сентябрь уже
+ * не предлагался. Акт закрытия сентября терялся ровно так, как в шапке
+ * модуля обещано не терять.
+ */
+function offerMonth(rec, date = todayDate()) {
+  if (offerDay(rec) === LAST_DAY && !isLastDayOfMonth(date)) return prevMonthKey(date);
+  return monthKey(date);
+}
+
+/**
+ * За какой месяц просрочка, которую isOverdue нашёл в этот день.
+ * После срока в этом месяце — этот; первого числа, догоняя, — прошлый.
+ */
+function dueMonth(rec, date = todayDate()) {
+  return date.getDate() > Number(rec.pay_day) ? monthKey(date) : prevMonthKey(date);
+}
+
+/**
  * Наступила ли просрочка: срок оплаты прошёл, а этот месяц ещё не отмечен.
  *
  * Сообщаем со следующего дня после срока — «в первый же день неоплаты»,
@@ -278,7 +301,7 @@ function get(userId, id) {
  * @param {number} step +1 при проведении, −1 при отмене
  * @returns {{done:number, left:number, finished:boolean}|null}
  */
-function bumpOp(userId, id, step = 1, date = todayDate()) {
+function bumpOp(userId, id, step = 1, date = todayDate(), month = monthKey(date)) {
   const rec = get(userId, id);
   if (!isOp(rec)) return null;
   const done = Math.max(0, rec.op.done + step);
@@ -303,7 +326,7 @@ function bumpOp(userId, id, step = 1, date = todayDate()) {
   const wasSpent = rec.op.times > 0 && rec.op.done >= rec.op.times;
   if (step > 0) {
     db.prepare('UPDATE recurring SET extra = ?, last_offer = ?, active = ? WHERE id = ? AND user_id = ?')
-      .run(JSON.stringify(extra), monthKey(date), finished ? 0 : 1, Number(id), userId);
+      .run(JSON.stringify(extra), month, finished ? 0 : 1, Number(id), userId);
   } else {
     const active = wasSpent && !finished ? 1 : (rec.active ? 1 : 0);
     db.prepare('UPDATE recurring SET extra = ?, active = ? WHERE id = ? AND user_id = ?')
@@ -342,9 +365,37 @@ function due(date = todayDate()) {
  * виден любому. Без проверки посторонний мог отключить чужое напоминание
  * на месяц — и человек не выставил бы счёт за аренду, не поняв почему.
  */
-function markOffered(userId, id, date = todayDate()) {
+/**
+ * Занять выпуск документа по правилу за месяц. true — выпускать можно.
+ *
+ * Кнопка «✅ Выписать» в напоминании не гаснет, и раньше каждое нажатие
+ * выпускало новый документ: двойной тап или возврат к вчерашнему
+ * сообщению давали два счёта с разными номерами — и долг клиента
+ * удваивался. Условие `last_issued <> ?` стоит в самом UPDATE: из двух
+ * одновременных нажатий строку сменит только одно.
+ *
+ * @param {string} month YYYY-MM — за какой месяц напоминание
+ * @returns {{ok: boolean, prev: string}} prev — чтобы вернуть, если выпуск не удался
+ */
+function claimIssue(userId, id, month) {
+  const row = db.prepare('SELECT last_issued FROM recurring WHERE id = ? AND user_id = ?')
+    .get(Number(id), userId);
+  if (!row) return { ok: false, prev: '' };
+  const r = db.prepare('UPDATE recurring SET last_issued = ? WHERE id = ? AND user_id = ? AND last_issued <> ?')
+    .run(month, Number(id), userId, month);
+  return { ok: r.changes === 1, prev: row.last_issued };
+}
+
+/** Вернуть отметку, если выпуск не состоялся (лимит, ошибка сборки). */
+function releaseIssue(userId, id, month, prev) {
+  db.prepare('UPDATE recurring SET last_issued = ? WHERE id = ? AND user_id = ? AND last_issued = ?')
+    .run(prev || '', Number(id), userId, month);
+}
+
+/** month — за какой месяц предложение (offerMonth); по умолчанию текущий. */
+function markOffered(userId, id, date = todayDate(), month = monthKey(date)) {
   db.prepare('UPDATE recurring SET last_offer = ? WHERE id = ? AND user_id = ?')
-    .run(monthKey(date), Number(id), userId);
+    .run(month, Number(id), userId);
 }
 
 /**
@@ -363,8 +414,9 @@ function overdue(date = todayDate()) {
 }
 
 /** Отметить, что о просрочке за этот месяц уже сообщили. */
-function markDueNoticed(id, date = todayDate()) {
-  db.prepare('UPDATE recurring SET last_due = ? WHERE id = ?').run(monthKey(date), Number(id));
+/** month — за какой месяц просрочка (dueMonth); по умолчанию текущий. */
+function markDueNoticed(id, date = todayDate(), month = monthKey(date)) {
+  db.prepare('UPDATE recurring SET last_due = ? WHERE id = ?').run(month, Number(id));
 }
 
 /** Срок оплаты и предупреждение — вместе, одним вызовом для UI. */
@@ -377,7 +429,7 @@ function setSchedule(userId, id, { payDay, leadDays }) {
 
 module.exports = {
   add, list, get, setDay, setSchedule, off,
-  due, markOffered, overdue, markDueNoticed,
+  due, markOffered, claimIssue, releaseIssue, overdue, markDueNoticed, offerMonth, dueMonth,
   isDue, isOverdue, offerDay, dueDate, dayPassed,
   OP_TYPE, isOp, bumpOp,
   monthKey, prevMonthKey, normalizeDay, dayLabel, LAST_DAY,

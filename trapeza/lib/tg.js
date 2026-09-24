@@ -89,10 +89,33 @@ function doRequest(urlStr, data, timeoutMs) {
     }
 
     req.on('response', (res) => {
-      cleanup();
-      let chunks = [];
+      /*
+       * Снимаем только таймер подключения, а общий оставляем до конца тела.
+       *
+       * Раньше здесь снимались оба, а у ответа не было обработчиков обрыва.
+       * Telegram отдавал заголовки getUpdates, соединение рвалось посреди
+       * тела — и промис не завершался никогда: ни 'end', ни 'error' (его Node
+       * испускает, только если на него подписаны). Цикл опроса вставал, бот
+       * молчал до перезапуска службы.
+       */
+      if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+      const chunks = [];
+      const fail = (err) => {
+        cleanup();
+        if (settled) return;
+        settled = true;
+        reject(err);
+      };
       res.on('data', (c) => chunks.push(c));
+      res.on('error', fail);
+      res.on('aborted', () => fail(Object.assign(new Error('RESPONSE_ABORTED'), { code: 'ECONNRESET' })));
+      res.on('close', () => {
+        // 'close' без 'end' — тело оборвалось. После 'end' settled уже true.
+        if (!settled) fail(Object.assign(new Error('RESPONSE_CLOSED'), { code: 'ECONNRESET' }));
+      });
       res.on('end', () => {
+        cleanup();
+        if (settled) return;
         settled = true;
         const text = Buffer.concat(chunks).toString('utf8');
         let parsed = {};

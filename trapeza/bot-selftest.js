@@ -2510,6 +2510,111 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'акт по фирме Б строится из её операций, а не текущей', `${actB.ops.length} и ${actA.ops.length}`);
   }
 
+  console.log('\n── бот не падает и не проводит дважды ──');
+  {
+    const bdbX = require('./lib/bot-db');
+    const recX = require('./lib/recurring');
+    const whoX = { id: 779130, first_name: 'Двойнойтап', username: 'dbl' };
+    const sayX = (t) => handleUpdate(tg, { message: { chat: { id: whoX.id }, from: whoX, text: t } });
+    const tapX = (d) => handleUpdate(tg,
+      { callback_query: { id: 'cb', from: whoX, data: d, message: { chat: { id: whoX.id } } } });
+    const uX = bdbX.getOrCreateUser(whoX.id, 'Двойнойтап');
+    bdbX.saveMyOrg(uX.id, { name: 'ИП Тапов', inn: '183112345678', acc: '40802810900000000009',
+      bank_name: 'ПАО Сбербанк', bik: '044525225', corr_acc: '30101810400000000225' });
+    bdbX.updateOrg(uX.id, bdbX.getDefaultOrg(uX.id).id, { debt_basis: 'invoice' });
+    const cpX = bdbX.createCp(uX.id, { name: 'ООО «Заря»', kind: 'customer', opening_date: '2026-01-01' });
+    const opsOf = () => bdbX.listOps(uX.id, cpX).filter((o) => o.kind === 'Оплата').length;
+    const keepEnv = ['AI_ENABLED', 'AI_MOCK', 'AI_PROVIDER'].map((k) => [k, process.env[k]]);
+
+    // 1. «Выпиши платёжку» от ассистента: раньше TypeError и тишина.
+    process.env.AI_ENABLED = '1';
+    process.env.AI_PROVIDER = process.env.AI_PROVIDER || 'gemini';
+    process.env.AI_MOCK = JSON.stringify({ action: 'draft', docType: 'pp', who: 'Заря', items: [{ name: 'Оплата', qty: 1, price: 5000 }] });
+    let crashed = '';
+    const mark = sent.length;
+    try { await sayX('выпиши платёжку Заре на 5000'); } catch (e) { crashed = e.message; }
+    ok(!crashed, 'просьба о платёжке не роняет бота', crashed);
+    ok(sent.length > mark, 'и человек получает ответ, а не тишину');
+    ok(!String(bdbX.getState(uX.id).state || '').startsWith('items:pp'),
+      'и сценарий позиций для платёжки не заводится', bdbX.getState(uX.id).state);
+    await tapX('menu');
+
+    // 2. Оплата по фразе с незнакомым плательщиком не уходит единственному клиенту.
+    process.env.AI_MOCK = JSON.stringify({ action: 'pay', who: 'Ромашка', amount: 50000, kind: 'Оплата' });
+    const opsBefore = opsOf();
+    await sayX('Ромашка заплатила 50000');
+    ok(opsOf() === opsBefore, 'оплата «Ромашки» не записана на «Зарю» только потому, что клиент один');
+
+    // 3. «✅ Внести» дважды — одна оплата. Ассистент выключен: бот готовит кнопку.
+    await require('./lib/doc-service').issueDocument(uX.id, {
+      type: 'sch', cpId: cpX, items: [{ name: 'Аренда', qty: 1, price: 50000 }], skipQuota: true,
+    });
+    bdbX.setAiEnabled(uX.id, false);
+    process.env.AI_MOCK = JSON.stringify({ action: 'pay', who: 'Заря', amount: 0, kind: 'Оплата' });
+    await sayX('Заря оплатила');
+    const payBtn = ((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.callback_data)
+      .find((d) => /^pay\.cp:/.test(d || ''));
+    const before3 = opsOf();
+    if (payBtn) { await tapX(payBtn); await tapX(payBtn); }
+    ok(Boolean(payBtn), 'кнопка внесения оплаты нарисована', ((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.text).join('|'));
+    ok(opsOf() === before3 + 1, 'двойное нажатие «внести» провело оплату один раз', opsOf() - before3);
+
+    // 4. Переплата не предлагается к внесению как долг.
+    bdbX.addOp(uX.id, cpX, { date: '2026-02-01', kind: 'Оплата', debit: 30000 });   // переплатили
+    ok(bdbX.balanceOf(uX.id, cpX).closing < 0, 'у клиента переплата');
+    await sayX('Заря оплатила снова');
+    ok(!/Внести|Да, /.test(((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.text).join('|')),
+      'переплату внести «как оплату» бот не предлагает', last().slice(0, 60));
+    for (const [k, v] of keepEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+
+    // 5. «✅ Выписать» по напоминанию дважды — один документ.
+    const rid = recX.add(uX.id, { cpId: cpX, type: 'sch', day: 1, items: [{ name: 'Аренда', qty: 1, price: 1000 }] });
+    const docs0 = bdbX.listDocs(uX.id, 100).length;
+    await tapX(`rec.go:${rid}:2026-09`);
+    await tapX(`rec.go:${rid}:2026-09`);
+    ok(bdbX.listDocs(uX.id, 100).length === docs0 + 1, 'два нажатия «Выписать» — один документ',
+      bdbX.listDocs(uX.id, 100).length - docs0);
+    await tapX(`rec.go:${rid}:2026-10`);
+    ok(bdbX.listDocs(uX.id, 100).length === docs0 + 2, 'а напоминание за следующий месяц выписывает');
+
+    // 6. Догонялка «последнего дня» не съедает текущий месяц.
+    const lastRid = recX.add(uX.id, { cpId: cpX, type: 'usl', day: recX.LAST_DAY, items: [{ name: 'Акт', qty: 1, price: 1 }] });
+    const sep5 = new Date(2026, 8, 5, 12);
+    const sep30 = new Date(2026, 8, 30, 12);
+    recX.markOffered(uX.id, lastRid, undefined, '2026-07');   // конец августа пропущен
+    const r6 = () => recX.list(uX.id).find((r) => r.id === lastRid);
+    ok(recX.isDue(r6(), sep5) && recX.offerMonth(r6(), sep5) === '2026-08',
+      'пятого сентября догоняется август', recX.offerMonth(r6(), sep5));
+    recX.markOffered(uX.id, lastRid, sep5, recX.offerMonth(r6(), sep5));
+    ok(recX.isDue(r6(), sep30), 'и тридцатого сентября сентябрь всё равно предлагается', r6().last_offer);
+    recX.off(uX.id, lastRid);
+    recX.off(uX.id, rid);
+  }
+
+  console.log('\n── обрыв ответа Telegram не вешает бота ──');
+  {
+    /*
+     * Заголовки пришли, тело оборвалось. Раньше промис не завершался никогда:
+     * ни 'end', ни 'error' — цикл опроса вставал, бот молчал до перезапуска.
+     */
+    const httpT = require('node:http');
+    const { Telegram } = require('./lib/tg');
+    const srv = httpT.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '1000' });
+      res.write('{"ok":true,"result":[');
+      setTimeout(() => req.socket.destroy(), 50);
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const tgT = new Telegram('x');
+    tgT.base = `http://127.0.0.1:${srv.address().port}/botx`;
+    const outcome = await Promise.race([
+      tgT.call('getMe').then(() => 'ответ', (e) => `ошибка: ${e.message}`),
+      new Promise((r) => setTimeout(() => r('ЗАВИС'), 5000)),
+    ]);
+    ok(outcome !== 'ЗАВИС', 'оборванный ответ заканчивается ошибкой, а не вечным ожиданием', outcome);
+    await new Promise((r) => srv.close(r));
+  }
+
   console.log('\n── номера документов не задваиваются ──');
   {
     const dbx = require('./db').db;
