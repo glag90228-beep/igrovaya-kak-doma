@@ -519,6 +519,17 @@ async function main() {
     ok(r.status === 400 && /уже выписан/.test((r.json || {}).error || ''),
       'занятый номер платёжки не пропускается', `${r.status} ${JSON.stringify(r.json).slice(0, 100)}`);
 
+    /*
+     * Имя клиента в подписи к акту сверки шло в HTML как есть. «&» или «<»
+     * в названии — и Telegram отклонял сообщение целиком: акт не приходил.
+     */
+    const cpAmp = bdbS.createCp(mid, { name: 'ООО «Рога & Копыта» <юг>', kind: 'customer', opening_date: '2026-01-01' });
+    sentToChat.length = 0;
+    r = await call('GET', `/api/akt?cp=${cpAmp}&from=2026-01-01&to=2026-12-31`, { user: sfUser });
+    const aktCap = (sentToChat[0] || {}).caption || '';
+    ok(r.status === 200 && aktCap.includes('Рога &amp; Копыта» &lt;юг&gt;'),
+      'имя клиента в подписи к акту экранировано', aktCap.slice(0, 90));
+
     // --- исправление ---
     r = await call('POST', '/api/doc/fix', { user: sfUser, body: { id: shipId } });
     ok(r.status === 200 && r.json.no === 1, 'исправление № 1 выписано', JSON.stringify(r.json && r.json.no));

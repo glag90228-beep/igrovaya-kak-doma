@@ -640,6 +640,15 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   ok(pr.name.startsWith('ИП ') && pr.full_name.startsWith('ИНДИВИДУАЛЬНЫЙ'),
     'наименование отделено от реквизитов и сокращено в «ИП»', pr.name);
 
+  // «ИНН/КПП» одной меткой — так пишут в шапке счёта и в УПД. Раньше ИНН не
+  // находился, а КПП брался из первых девяти цифр ИНН.
+  const slash = parseRequisites('ООО «Ромашка» ИНН/КПП 7707083893/770701001 р/с 40702810900000012345');
+  ok(slash.inn === '7707083893' && slash.kpp === '770701001', '«ИНН/КПП» через косую разобран',
+    `${slash.inn} | ${slash.kpp}`);
+  const slashIp = parseRequisites('ИП Петров ИНН/КПП 183114389446 р/с 40802810900000012345');
+  ok(slashIp.inn === '183114389446' && slashIp.kpp === '', 'у ИП после «ИНН/КПП» один ИНН, КПП пустой',
+    `${slashIp.inn} | ${slashIp.kpp}`);
+
   // вставка блока прямо в бота на шаге ИНН — поля должны разложиться, QR появиться
   await tap('cp.new');
   await say(blob);
@@ -1822,6 +1831,12 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'у организации подпись стоит у руководителя');
     ok(!line(updOoo, 'Индивидуальный предприниматель или иное').includes('Сарычев'),
       'и не дублируется в строке ИП');
+    // Имя директора в строке бухгалтера утверждало, что учёт ведёт он сам, —
+    // а этого мы не знаем. Строка остаётся под подпись от руки.
+    ok(!line(updOoo, 'Главный бухгалтер').includes('Сарычев'),
+      'в строке главного бухгалтера УПД не печатается директор', line(updOoo, 'Главный бухгалтер'));
+    ok(!line(oooHtml, 'Бухгалтер').includes('Сарычев'),
+      'и в счёте строка бухгалтера пустая', line(oooHtml, 'Бухгалтер'));
 
     /*
      * Строка 5а «Документ об отгрузке».
@@ -2563,6 +2578,40 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(qMore.limit === 3 && qMore.canAdd,
       'после доплаты место открылось', JSON.stringify(qMore));
     ok(qMore.used === 2, 'а уже заведённое никуда не делось', qMore.used);
+  }
+
+  console.log('\n── платёжный QR читается сканером ──');
+  {
+    /*
+     * Наш QR-кодировщик написан без сторонних библиотек, и проверялся он
+     * только собственным декодером того же автора. Оба путали строку и
+     * столбец в битах формата — и хвалили друг друга, а код в счёте не
+     * читал ни один банк. Поэтому сверяем не с собой: ниже матрицы, собранные
+     * независимым кодировщиком (npm-пакет qrcode, режим «байты», та же маска)
+     * и прочитанные настоящим сканером (jsQR). Совпасть должно до модуля.
+     *
+     * Версии выбраны так, чтобы задеть всё: 3 — выравнивающий узор, 13 —
+     * информация о версии, несколько блоков и 16-битная длина, 14 — уровень L.
+     */
+    const { encodeQr } = require('./lib/qr');
+    const pack = (qr) => {
+      const out = Buffer.alloc(Math.ceil((qr.size * qr.size) / 8));
+      for (let i = 0; i < qr.size * qr.size; i++) if (qr.modules[i]) out[i >> 3] |= 0x80 >> (i & 7);
+      return out.toString('base64');
+    };
+    const REF = [
+      { v: 3, ecc: 'M', mask: 3, text: 'ST00012|Name=ООО «Ромашка»',
+        bits: '/tmL/BU6kG6SMLt1C+XbolWuwQjBB/qqr+ASAwC3BDJeA6xUe61XiKhzrp6qrid2yZ4firfNIDpvos6y89FpEbrmpYzwahwWdGj9+oBgrEP6b6pQU9kQugGf5dTnPm6249MERuiv7kgLAA==' },
+      { v: 13, ecc: 'M', mask: 5, text: `ST00012|${'Назначение платежа '.repeat(8)}`,
+        bits: '/nzqIgaegfv8FHIoXRtmsBBuoIoQ6i9C6Lt1vPxjVEREFdulZp3P8GsCrsEoajBGI3IxB/qqqqqqqqqv4B93RLEmPuEAgvzkZPj9Vd5x47JNt8Xu7qeqsT54xf5150K4x+5nL3IG4YA22GpVFzd0+4aGv/YLAVgxGvmBlMkVE9E0/pf05Ul/97Vjv9pIxQz7Dh3RxAzX8Mq7KIHyt3JtuIqu5vypRD5PYHE7EkIhbyEDCsWMCBxeg6FoBMZVDE4Xv46bCkm46rlB/B16uqE9997CSb8iAmc65rTn8PL3rxEnlL681Vwzw8IJas4WF1amX7Ms4ICai8OtLhyQvlZRBXAXlbsrN2BmB+br6rsfjB+S+m0yP4MsdP05a5/ARIxflF5upkeGrQkWqppRgrpxf271E303EY//FkhP90d2+8gQRXZvAxAUGHg9S8dVFdCM8zaORaR/e/ewal7Kxej9TdlS6OK2+1G/K0/ls3XzulCujdSaJNMkH7IGB4B9IPKD+ICtBjbVUPI2ZEBBnAnSuE10k7Dc+TGMkHousqGCnsOhKOYgYi8NjSZp8hq7IEH74b2W9bx14MsYBckdSmVlTV4uTqMKusW/6H4w7UVnAdBmW7wXA7u+Z+BngRau9AJqumOF8yr4pPF5b84n4RZBvq6m2klrnwlkzVwzwfMCZXrEwkI3MumrTO5f53d2+4BnpRbFCVAUW/l8xFq9C9Aq8E1oXfHDt3kRulzORf0hS4/F0F3A/0q8488ujzZhzy6K6c8E7K4fM3I3AI/uQAQtGsGt9wA=' },
+      { v: 14, ecc: 'L', mask: 6, text: `ST00012|${'Оплата по счёту № 17 '.repeat(12)}`,
+        bits: '/tdD8cnM+66/wQ0le8UdV8EQbo+xnr9JkhoLt0GPCMZuh9Zl26MUT88X/TGa7BB/zHI0RCGxB/qqqqqqqqqq/gHbcxW+ceP8ANpAYPrAP7adoOrsYHSUjIdXl6D6f+xbhb8kU1SQXUHlPEiGxX97e59mQ5LmjpsvlIQVrAwfSckt0FlEVN/fPzli+Ud0dFU4IMFbpj5S4wmh7AmmKVtibbsk/8FKi/Y7jrF1HWGDKwbUX94ZPI7Q+3gyjF08IV8tBLUHoWl2s7pt/hM2y/0eKdRrCqxEm3EmeSB4P4q5+XMf/mf77E5QRsCsUujE3qdNq8J+vvcryR7F8XrvE0NxU/sif+M4+30/v8lrsYrUJqIkJv7XH87u+o3rEfoiTcQjcZM7noLX/Z/nosoF6mYii15G5H9eXR/V5Tav1B6mimaQw3HFHHeHagt9Is62N/buJm6H8MKHaiAWVc/sNNKMt9d+kt+b2Qt3R0l1NjHXpiL3BuMzT5MwvDgSXepqLn2roAM+B+c83W3xnhodU2ZaUxAe+lcvr2b8wi+PxKgsSFhHR1Rb6ps2puLqSf61UVXXHlLR1TETT7gL+mffguf5orCVjAoPAsS0i5KMcrDoHEnvND/FgnR0ICgVsSaVj5GO5HocnmWLA3Ayk5LsYvtvG/eurRVbtbP8sZWMjgJIM/8xMbOPBqr93KIoOeZa1XOndaWyG9C/0KYdo0m8XPgCLHTRWHr82yKR82Zn9h4n10Qncgj3VL9c9jicr4kBmsQzhufOaO9DQdqLniD4VW+mS/gAdOnELyxlx8U/naFq7q6s76vwQHgRQssYFdFbq5dPutH8vy+N1ATVZs5Of1aW6dme0nT0yny3BebX3nPpWBMr/v/R0nJ26n4agA==' },
+    ];
+    for (const ref of REF) {
+      const qr = encodeQr(ref.text, { ecc: ref.ecc, mask: ref.mask });
+      ok(qr.version === ref.v && pack(qr) === ref.bits,
+        `QR версии ${ref.v}-${ref.ecc} совпадает с эталонным до модуля`, `версия ${qr.version}`);
+    }
   }
 
   console.log('\n── документ живёт в своей фирме, а не в текущей ──');
@@ -6197,6 +6246,44 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     }
 
     /*
+     * Статус 1, попрошенный явно — кнопкой «Статус 1» в боте или полем status
+     * в приложении, — проходил мимо правила: самозанятый получал счёт-фактуру,
+     * а по п. 5 ст. 173 НК за выставленный счёт-фактуру платят налог.
+     */
+    const npdS1 = await dsK.issueDocument(npdU.id, {
+      type: 'upd', cpId: npdCp, date: '2026-09-20', skipQuota: true,
+      extra: { status: 1, vatRate: 22, priceIncludesVat: false },
+      items: [{ name: 'Работы', qty: 1, price: 1000, unit: 'шт' }],
+    });
+    ok(npdS1.ok && bdbK.getDoc(npdU.id, npdS1.doc.id).payload.status === 2,
+      'явно попрошенный статус 1 самозанятому всё равно не достаётся',
+      npdS1.ok ? bdbK.getDoc(npdU.id, npdS1.doc.id).payload.status : npdS1.message);
+    const npdOrgNow = bdbK.getDefaultOrg(npdU.id);
+    const npdDog = require('./lib/dogovor').buildDogovorHtml({
+      org: npdOrgNow, cp: { name: 'ООО «Заказчик»' },
+      doc: { number: '1', date: '2026-09-20', subject: 'работы', price: 100000 },
+    });
+    ok(!/НДС 22%/.test(npdDog) && /профессиональный доход/.test(npdDog),
+      'в договоре самозанятого нет «НДС 22%», есть оговорка про НПД',
+      (/[^.]*НДС[^.]*\./.exec(npdDog) || [''])[0].replace(/\s+/g, ' ').slice(0, 120));
+    ok(/профессиональный доход/.test(require('./lib/doc-html').usnNote(npdOrgNow)),
+      'и в накладной с УПД оговорка про НПД печатается, хоть ставка и выбрана');
+
+    /*
+     * Город — из адреса. Раньше всем печаталось «г. Ижевск»: московское ООО
+     * подписывало договор, заключённый в Ижевске.
+     */
+    const dogIn = (address) => require('./lib/dogovor').buildDogovorHtml({
+      org: { name: 'ООО «Альфа»', inn: '7707083893', address }, cp: { name: 'ООО «Бета»' },
+      doc: { number: '1', date: '2026-09-20', subject: 'работы' },
+    });
+    ok(dogIn('123456, г. Москва, ул. Тверская, д. 1').includes('г. Москва ·'),
+      'договор московской фирмы заключён в Москве');
+    ok(dogIn('Удмуртская Респ, г Ижевск, ул Пушкинская, д 1').includes('г. Ижевск ·'),
+      'адрес в записи ФНС («г Ижевск») тоже понятен');
+    ok(!dogIn('').includes('г. '), 'без адреса город не выдумывается');
+
+    /*
      * Без платёжки авансового счёта-фактуры не бывает.
      *
      * Строка 5 обязательна (п. 5.1 ст. 169 НК): документ выставляется на
@@ -6782,6 +6869,19 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await pdf.closePdf();
     const buf = await pdf.htmlToPdf('<h1>после закрытия</h1>');
     ok(buf && buf.length > 500, 'после закрытия браузер поднимается заново');
+
+    // Ориентацию берём из бланка: УПД и ТОРГ-12 альбомные, счёт — книжный.
+    const box = (b) => {
+      const m = /\/MediaBox\s*\[\s*[\d.]+\s+[\d.]+\s+([\d.]+)\s+([\d.]+)/.exec(b.toString('latin1'));
+      return m ? { w: Number(m[1]), h: Number(m[2]) } : null;
+    };
+    const updPdf = box(await pdf.htmlToPdf(require('./lib/upd').buildUpdHtml({
+      org: { name: 'ООО «Альфа»', inn: '7707083893' }, cp: { name: 'ООО «Бета»' },
+      doc: { number: '1', date: '2026-09-20', status: 2, items: [{ name: 'Работа', qty: 1, price: 100 }] },
+    })));
+    ok(updPdf && updPdf.w > updPdf.h, 'УПД печатается альбомным, как задано в бланке', JSON.stringify(updPdf));
+    const plain = box(await pdf.htmlToPdf('<h1>счёт</h1>'));
+    ok(plain && plain.h > plain.w, 'а документ без размера в бланке — книжным A4', JSON.stringify(plain));
     await pdf.closePdf();
   } else {
     console.log('  ·  Chromium недоступен, проверка пропущена');

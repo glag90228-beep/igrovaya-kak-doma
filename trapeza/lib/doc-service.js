@@ -230,7 +230,9 @@ async function issueDocument(userId, {
     const payer = bdb.vatOf(org).rate != null && !isNpd(org);
     fields = { ...fields, status: payer ? 1 : 2 };
   }
-  if (isNpd(org)) fields = { ...fields, vatRate: null };
+  // И явно попрошенная единица самозанятому не достаётся: кнопка «Статус 1»
+  // в боте и поле status в приложении раньше проходили мимо правила выше.
+  if (isNpd(org)) fields = { ...fields, vatRate: null, ...(type === 'upd' ? { status: 2 } : {}) };
 
   /*
    * Строка 5б: чем закрываем ранее полученный аванс.

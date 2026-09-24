@@ -200,9 +200,18 @@ function signRows(org, fx = () => '') {
     // Одна подпись — и она же с печатью, если печать загружена.
     return [{ title: 'Индивидуальный предприниматель', html: `${fx({ stamp: true })}${who}` }];
   }
+  /*
+   * Строка бухгалтера — пустая, под подпись от руки.
+   *
+   * Сюда печатались имя и факсимиле руководителя: документ утверждал, что
+   * бухгалтером расписался директор. Так бывает (ст. 7 402-ФЗ разрешает
+   * руководителю вести учёт самому), но знать этого мы не можем — графы
+   * «главный бухгалтер» у организации нет. Пустая строка честнее: кто
+   * подписывает, тот и распишется.
+   */
   return [
     { title: 'Руководитель', html: `${fx({ stamp: true })}${who}` },
-    { title: 'Бухгалтер', html: `${fx()}${who}` },
+    { title: 'Бухгалтер', html: '' },
   ];
 }
 
@@ -232,7 +241,8 @@ function signRows(org, fx = () => '') {
  */
 function usnNote(org, tail = '') {
   const raw = org && org.vat_rate;
-  const payer = !(raw === '' || raw == null) && Number.isFinite(Number(raw));
+  // Самозанятый не плательщик НДС при любой ставке в настройках.
+  const payer = !(raw === '' || raw == null) && Number.isFinite(Number(raw)) && !Number(org.npd);
   if (payer) return '';
   const add = tail ? ` ${esc(tail)}` : '';
   if (org && Number(org.npd)) {
@@ -244,6 +254,31 @@ function usnNote(org, tail = '') {
      не предъявляется.${add}</p>`;
 }
 
+/**
+ * Город для шапки договора и акта — из адреса организации.
+ *
+ * Отдельной графы «город» у организации нет, и шаблоны подставляли
+ * «Ижевск» всем: московское ООО подписывало договор, «заключённый в
+ * Ижевске». Место заключения — условие договора (ст. 444 ГК), выдумывать
+ * его нельзя. Берём из адреса: «г. Москва», «г Ижевск» (так пишет ФНС),
+ * город федерального значения без «г.». Не нашли — пусто, и шаблон
+ * печатает одну дату.
+ */
+function cityOf(org) {
+  if (org && String(org.city || '').trim()) return String(org.city).trim();
+  const addr = String((org && org.address) || '');
+  const m = /(?:^|[\s,])(?:г\.|г|город)\s+([^,\d]+)/u.exec(addr);
+  if (m && m[1].trim()) return m[1].trim();
+  const fed = /(Москва|Санкт-Петербург|Севастополь)/u.exec(addr);
+  return fed ? fed[1] : '';
+}
+
+/** «г. Москва · 01.09.2026» или просто дата, если город неизвестен. */
+function placeDate(org, iso) {
+  const city = cityOf(org);
+  return `${city ? `г. ${esc(city)} · ` : ''}${ru(iso)}`;
+}
+
 function page(title, body) {
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8">`
     + `<title>${esc(title)}</title><style>${CSS}</style></head>`
@@ -251,6 +286,6 @@ function page(title, body) {
 }
 
 module.exports = {
-  esc, ru, page, fxHtml, stampsHtml, withStamps, isIp, signRows, usnNote,
+  esc, ru, page, fxHtml, stampsHtml, withStamps, isIp, signRows, usnNote, cityOf, placeDate,
   formatMoney, formatRub, amountInWords,
 };

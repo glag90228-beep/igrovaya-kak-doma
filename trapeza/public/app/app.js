@@ -1997,7 +1997,7 @@ screens.more = async function more() {
 
 /** Человеческое название режима НДС — то же, что в боте. */
 function vatLabel(org) {
-  if (!org || !org.vat_rate) return 'без НДС';
+  if (!org || !org.vat_rate || Number(org.npd)) return 'без НДС';
   return `${org.vat_rate}%${org.vat_rate === '0' ? '' : (org.vat_gross ? ', цены с НДС' : ', сверху')}`;
 }
 
@@ -4165,6 +4165,9 @@ screens.new = async function newDoc(params) {
    * lib/doc-service.js: отсутствие ключа и null означают разное.
    */
   const docRate = () => {
+    // Самозанятому сервер ставку обнуляет при любых настройках — и кнопка
+    // обязана считать так же, иначе обещает на налог больше, чем выйдет.
+    if (Number(myOrg.npd)) return null;
     if (draft.vatRate !== undefined) return draft.vatRate == null ? null : Number(draft.vatRate);
     return myOrg.vat_rate ? Number(myOrg.vat_rate) : null;
   };

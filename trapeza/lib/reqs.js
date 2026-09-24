@@ -19,7 +19,9 @@ const clean = (s) => String(s == null ? '' : s).replace(/ /g, ' ').replace(/\s+
 
 /** Значение метки, у которой нет слова «банк» рядом (реквизит самой организации). */
 function labelOwn(text, label, digits) {
-  const re = new RegExp(`${label}\\s*(банка|банк)?\\s*[:№N]?\\s*(\\d{${digits}})`, 'gi');
+  // (?!\d) — число целиком, а не его начало: иначе «КПП» за девять цифр
+  // выхватывал кусок стоящего рядом ИНН.
+  const re = new RegExp(`${label}\\s*(банка|банк)?\\s*[:№N]?\\s*(\\d{${digits}})(?!\\d)`, 'gi');
   let m; let own = ''; let any = '';
   while ((m = re.exec(text)) !== null) {
     if (!m[1]) { own = m[2]; break; }
@@ -59,8 +61,16 @@ function parseRequisites(raw) {
     bank_name: '', bik: '', acc: '', corr_acc: '', ogrnip: '',
   };
 
-  out.inn = labelOwn(text, 'ИНН', '10,12') || labelOwn(text, 'ИНН', '12') || labelOwn(text, 'ИНН', '10');
-  out.kpp = labelOwn(text, 'КПП', '9');
+  /*
+   * «ИНН/КПП 7707083893/770701001» — одна метка на два числа, так их пишут
+   * в шапке счёта и в УПД. Раздельные метки этого не видели: ИНН не
+   * находился вовсе, а в КПП уходили первые девять цифр ИНН.
+   */
+  const pairRe = /ИНН\s*\/\s*КПП\s*(банка|банк)?\s*[:№N]?\s*(\d{12}|\d{10})(?!\d)(?:\s*[/\\]?\s*(\d{9})(?!\d))?/gi;
+  let pair = null;
+  for (const m of text.matchAll(pairRe)) { if (!m[1]) { pair = m; break; } }
+  out.inn = pair ? pair[2] : (labelOwn(text, 'ИНН', '10,12') || labelOwn(text, 'ИНН', '12') || labelOwn(text, 'ИНН', '10'));
+  out.kpp = pair ? (pair[3] || '') : labelOwn(text, 'КПП', '9');
   out.bik = (/(?:БИК)\s*(?:банка|банк)?\s*[:№N]?\s*(\d{9})/i.exec(text) || [])[1] || '';
   out.ogrnip = (/ОГРНИ?П?\s*[:№N]?\s*(\d{13,15})/i.exec(text) || [])[1] || '';
 

@@ -263,6 +263,10 @@ function buildUpdHtml({ org, cp, doc }) {
    * бухгалтера, предприниматель — у себя. Раньше имя и факсимиле ставились
    * на первые две строки всегда, и у ИП получалось «Руководитель
    * организации И.Н. Сарычев» — должность, которой у него нет.
+   *
+   * Строку главного бухгалтера оставляем пустой и у организации: имя
+   * руководителя в ней означало бы, что учёт он ведёт сам, а этого мы не
+   * знаем (см. signRows в doc-html.js).
    */
   const ip = isIp(org);
   const ipLine = esc(org.ogrnip ? `${org.signer || ''} · ОГРНИП ${org.ogrnip}` : (org.signer || ''));
@@ -271,7 +275,7 @@ function buildUpdHtml({ org, cp, doc }) {
       <div>Руководитель организации или иное уполномоченное лицо
         <div class="line">${ip ? '' : `${fxHtml(org.fx, { stamp: true })}${esc(org.signer || '')}`}</div></div>
       <div>Главный бухгалтер или иное уполномоченное лицо
-        <div class="line">${ip ? '' : fxHtml(org.fx) + esc(org.signer || '')}</div></div>
+        <div class="line"></div></div>
       <div>Индивидуальный предприниматель или иное уполномоченное лицо
         <div class="line">${ip ? `${fxHtml(org.fx, { stamp: true })}${ipLine}` : ''}</div></div>
     </div>` : '';

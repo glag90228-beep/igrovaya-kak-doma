@@ -89,12 +89,15 @@ function decodeQr(qr) {
   const version = (size - 17) / 4;
   const get = (r, c) => m[r * size + c];
 
-  // формат: 15 бит вдоль верхнего-левого угла
+  // Формат: 15 бит у левого верхнего угла, по местам стандарта — младшие
+  // вниз по столбцу 8, старшие влево по строке 8. Раньше здесь строка и
+  // столбец были перепутаны ровно так же, как в кодировщике, и проверка
+  // хвалила код, который не читал ни один сканер.
   let raw = 0;
   const seq = [];
-  for (let i = 0; i <= 5; i++) seq.push(get(8, i));
-  seq.push(get(8, 7), get(8, 8), get(7, 8));
-  for (let i = 5; i >= 0; i--) seq.push(get(i, 8));
+  for (let i = 0; i <= 5; i++) seq.push(get(i, 8));
+  seq.push(get(7, 8), get(8, 8), get(8, 7));
+  for (let i = 9; i <= 14; i++) seq.push(get(8, 14 - i));
   seq.forEach((b, i) => { raw |= b << i; });
   const fmt = raw ^ 0x5412;
 

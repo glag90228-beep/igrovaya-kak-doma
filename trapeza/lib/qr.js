@@ -360,17 +360,32 @@ function placeData(mod, used, size, codewords) {
   }
 }
 
+/*
+ * Места битов формата — по стандарту (ISO/IEC 18004, рис. 25): младшие биты
+ * первой копии идут вниз по столбцу 8, старшие — влево по строке 8; во
+ * второй копии младшие — по строке 8 справа, старшие — по столбцу 8 внизу.
+ *
+ * Здесь строка и столбец были перепутаны, то есть 15 бит стояли задом
+ * наперёд. Сканер читал не ту маску и не тот уровень коррекции — и не
+ * читал код вообще: платёжный QR в счёте не распознавал ни один банк.
+ * Собственная проверка (check-qr.js) этого не видела, потому что её
+ * декодер читал формат с той же перестановкой. Теперь раскладку сверяет
+ * bot-selftest с матрицей, собранной независимым кодировщиком.
+ */
 function applyFormat(mod, used, size, ecc, mask) {
   const bits = formatBits(ecc, mask);
   const bit = (i) => (bits >> i) & 1;
-  for (let i = 0; i <= 5; i++) mod[8 * size + i] = bit(i);
-  mod[8 * size + 7] = bit(6);
-  mod[8 * size + 8] = bit(7);
-  mod[7 * size + 8] = bit(8);
-  for (let i = 9; i <= 14; i++) mod[(14 - i) * size + 8] = bit(i);
-  for (let i = 0; i <= 7; i++) mod[(size - 1 - i) * size + 8] = bit(i);
-  for (let i = 8; i <= 14; i++) mod[8 * size + (size - 15 + i)] = bit(i);
-  mod[(size - 8) * size + 8] = 1; // тёмный модуль
+  const put = (r, c, v) => { mod[r * size + c] = v; };
+  // первая копия — вокруг левого верхнего поискового узора
+  for (let i = 0; i <= 5; i++) put(i, 8, bit(i));
+  put(7, 8, bit(6));
+  put(8, 8, bit(7));
+  put(8, 7, bit(8));
+  for (let i = 9; i <= 14; i++) put(8, 14 - i, bit(i));
+  // вторая — у правого верхнего и левого нижнего
+  for (let i = 0; i <= 7; i++) put(8, size - 1 - i, bit(i));
+  for (let i = 8; i <= 14; i++) put(size - 15 + i, 8, bit(i));
+  put(size - 8, 8, 1); // тёмный модуль
   void used;
 }
 
@@ -405,8 +420,11 @@ function encodeQr(text, opts = {}) {
   placeData(base, used, size, codewords);
   applyVersion(base, size, version);
 
+  // opts.mask — только для сверки с эталонной матрицей в тестах: там маска
+  // должна совпасть, а выбор по штрафу у разных кодировщиков разный.
   let best = null;
   for (let mask = 0; mask < 8; mask++) {
+    if (opts.mask != null && mask !== Number(opts.mask)) continue;
     const mod = Int8Array.from(base);
     for (let r = 0; r < size; r++) {
       for (let c = 0; c < size; c++) {

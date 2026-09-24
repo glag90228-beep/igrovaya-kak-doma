@@ -625,7 +625,26 @@ const ok = (c, m, extra) => {
     });
     ok(issued.ok !== false && issued.total === 122000,
       'и документ выходит ровно на неё', issued.total);
-    bdb.updateOrg(user.id, bdb.getDefaultOrg(user.id).id, { vat_rate: '', vat_gross: 0 });
+
+    // Самозанятому сервер налог не начисляет при любой ставке в настройках —
+    // а форма начисляла и обещала на 22 000 больше, чем выйдет.
+    bdb.updateOrg(user.id, bdb.getDefaultOrg(user.id).id, { npd: 1 });
+    await page.evaluate(() => window.__go('home'));
+    await page.evaluate((cpId) => window.__go('new', { type: 'sch', cpId }), cp);
+    await page.waitForSelector('.item input.name');
+    await page.locator('.item input.name').first().fill('Услуга');
+    await page.locator('.item [aria-label="Цена"]').first().fill('100000');
+    await page.waitForTimeout(300);
+    const npdShown = await page.evaluate(() => {
+      const el = document.querySelector('.total-row .money');
+      return el ? el.textContent.replace(/[^\d,]/g, '') : '';
+    });
+    const npdIssued = await docService.issueDocument(user.id, {
+      type: 'sch', cpId: cp, items: [{ name: 'Услуга', qty: 1, price: 100000 }], skipQuota: true,
+    });
+    ok(npdShown === '100000,00' && npdIssued.total === 100000,
+      'у самозанятого форма и документ сходятся — без налога', `${npdShown} / ${npdIssued.total}`);
+    bdb.updateOrg(user.id, bdb.getDefaultOrg(user.id).id, { vat_rate: '', vat_gross: 0, npd: 0 });
   }
 
   await browser.close();

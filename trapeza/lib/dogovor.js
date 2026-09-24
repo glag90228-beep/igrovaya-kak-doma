@@ -10,7 +10,7 @@
  * собственность), в шаблон не тащим — там нужен юрист, а не генератор.
  */
 
-const { esc, ru, page, formatMoney, amountInWords } = require('./doc-html');
+const { esc, page, formatMoney, amountInWords, placeDate } = require('./doc-html');
 const { vatSplit } = require('./money');
 
 const CSS = `
@@ -44,7 +44,6 @@ function requisites(p) {
  *   price — фиксированная сумма; если её нет, платим по счетам (priceText).
  */
 function buildDogovorHtml({ org, cp, doc }) {
-  const city = doc.city || org.city || 'Ижевск';
   /*
    * Оговорка про упрощёнку — только тому, кто на упрощёнке.
    *
@@ -55,8 +54,11 @@ function buildDogovorHtml({ org, cp, doc }) {
    * ровно для этого заведена usnNote — накладная и УПД ею пользуются,
    * договор был единственным, кто решал за всех.
    */
+  // Ставка в настройках у самозанятого ничего не значит: экраны «НДС» и
+  // «Самозанятость» независимы, и без этой проверки договор НПД выходил
+  // с «в том числе НДС 22%» — налогом, который он брать не вправе.
   const vatPayer = org && org.vat_rate != null && org.vat_rate !== ''
-    && Number.isFinite(Number(org.vat_rate));
+    && Number.isFinite(Number(org.vat_rate)) && !Number(org.npd);
 
   /*
    * Про налог в цене договор обязан сказать прямо.
@@ -118,7 +120,7 @@ function buildDogovorHtml({ org, cp, doc }) {
     <div class="dg">
       <h1 class="center">ДОГОВОР № ${esc(doc.number || '1')}</h1>
       <p class="center">возмездного оказания услуг</p>
-      <p class="center muted small">г. ${esc(city)} · ${ru(doc.date)}</p>
+      <p class="center muted small">${placeDate({ ...org, city: doc.city || org.city }, doc.date)}</p>
       <hr class="rule">
 
       <p>${nameOf(org)}, именуемое в дальнейшем «Исполнитель», с одной стороны,

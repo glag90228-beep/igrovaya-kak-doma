@@ -1010,7 +1010,7 @@ const api = {
       return { error: `Бесплатные документы на этот месяц закончились (${q.limit}).`, reason: 'quota', quota: q };
     }
     const file = await makeAkt(user, org, p,
-      `Акт сверки с <b>${cp.name}</b> за период ${ruDate(p.from)}—${ruDate(p.to)}.`);
+      `Акт сверки с <b>${escTg(cp.name)}</b> за период ${ruDate(p.from)}—${ruDate(p.to)}.`);
     return {
       file: { url: `/api/file/${keepFile(user.id, file)}`, name: file.filename },
       from: p.from, to: p.to, opening: p.opening, closing: p.closing, ops: p.ops.length,
@@ -1043,7 +1043,7 @@ const api = {
       const p = bdb.cpForPeriod(user.id, row.cp.id);
       if (!p) continue;
       // eslint-disable-next-line no-await-in-loop
-      await makeAkt(user, org, p, `Акт сверки с <b>${p.cp.name}</b> — долг ${formatRub(row.amount)}.`);
+      await makeAkt(user, org, p, `Акт сверки с <b>${escTg(p.cp.name)}</b> — долг ${formatRub(row.amount)}.`);
       made.push({ cp: p.cp.name, amount: row.amount });
     }
     if (!made.length) {
@@ -2081,7 +2081,7 @@ const api = {
     if (tg) {
       await tg.sendDocument(user.tg_id, {
         filename: res.file.filename, buffer: res.file.buffer,
-        caption: `Исправление № ${no} к счёту-фактуре № ${src.number}.`,
+        caption: `Исправление № ${no} к счёту-фактуре № ${escTg(src.number)}.`,
       }).catch(() => {});
     }
     return { no, file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf } };
@@ -2096,7 +2096,7 @@ const api = {
       await tg.sendDocument(user.tg_id, {
         filename: res.file.filename,
         buffer: res.file.buffer,
-        caption: `${res.title} № ${res.doc.number} — копия.`,
+        caption: `${res.title} № ${escTg(res.doc.number)} — копия.`,
       }).catch(() => {});
     }
     return {
@@ -2180,7 +2180,8 @@ async function sendToChat(user, res) {
     await tg.sendDocument(user.tg_id, {
       filename: res.file.filename,
       buffer: res.file.buffer,
-      caption: `${title} № ${docNumber}${cpName ? ` для <b>${escTg(cpName)}</b>` : ''}`
+      // Номер тоже экранируем: его можно ввести руками, и «<» в нём ломал бы подпись.
+      caption: `${title} № ${escTg(docNumber)}${cpName ? ` для <b>${escTg(cpName)}</b>` : ''}`
         + ` на ${money} ₽.`
         + (docType === 'sch' ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.' : ''),
       buttons,
