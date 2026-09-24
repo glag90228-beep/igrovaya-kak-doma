@@ -15,6 +15,8 @@
  * поэтому провайдер подключаемый: DADATA_TOKEN — боевой, mock — для прогонов.
  */
 
+const { fetchRetry } = require('./net-retry');
+
 const PARTY_URL = 'https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party';
 const BANK_URL = 'https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/bank';
 
@@ -52,7 +54,7 @@ async function query(url, value) {
    */
   // e.message отсюда уходит человеку в подсказку под полем (bot.js:429), а
   // TimeoutError говорит по-английски. Переводим на месте.
-  const res = await fetch(url, {
+  const res = await fetchRetry(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -61,7 +63,7 @@ async function query(url, value) {
     },
     body: JSON.stringify({ query: digits(value), count: 1 }),
     signal: AbortSignal.timeout(8000),
-  }).catch((e) => {
+  }, { idempotent: true }).catch((e) => {
     if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
       throw new Error('справочник не ответил за восемь секунд — заполните поля вручную');
     }

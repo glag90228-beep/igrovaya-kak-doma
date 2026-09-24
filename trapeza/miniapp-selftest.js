@@ -1299,6 +1299,121 @@ async function main() {
       }
     }
 
+    /*
+     * ── связь сорвалась — повторяем, но ничего не задваиваем ──
+     *
+     * На боевом сервере соединение наружу иногда не устанавливается, и
+     * встроенный fetch сдавался с «fetch failed» с первого раза: помощник «не
+     * отвечал», оплата «временно недоступна», хотя площадки были живы.
+     * Площадки здесь поддельные и рвут первое соединение по-настоящему.
+     */
+    {
+      const http2 = require('node:http');
+      const { fetchRetry, beforeSend } = require('./lib/net-retry');
+      const keepN = {};
+      for (const k of ['PLATEGA_MERCHANT_ID', 'PLATEGA_SECRET', 'LAVA_PLAN_DAYS', 'PLATEGA_API_URL',
+        'AI_PROVIDER', 'AI_ENABLED', 'GEMINI_API_KEY', 'GEMINI_BASE_URL']) keepN[k] = process.env[k];
+      const restoreN = () => {
+        for (const [k, v] of Object.entries(keepN)) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      };
+      const warnOrig = console.warn;
+      const warned = [];
+      let onWarn = () => {};
+      console.warn = (...a) => { warned.push(a.join(' ')); onWarn(); };
+      try {
+        // Node перебирает адреса и отдаёт AggregateError с кодом ETIMEDOUT —
+        // по коду это не отличить от обрыва посреди ответа, по syscall можно.
+        const agg = Object.assign(new Error('x'), {
+          code: 'ETIMEDOUT',
+          errors: [{ code: 'ETIMEDOUT', syscall: 'connect' }, { code: 'ENETUNREACH', syscall: 'connect' }],
+        });
+        ok(beforeSend(new TypeError('fetch failed', { cause: agg })),
+          'не подключились ни к одному адресу — запрос не ушёл');
+        ok(!beforeSend(new TypeError('fetch failed', { cause: { code: 'ECONNRESET', syscall: 'read' } })),
+          'обрыв при чтении ответа — запрос мог уйти');
+        ok(!beforeSend(new TypeError('fetch failed', { cause: { code: 'UND_ERR_SOCKET' } })),
+          '«площадка закрыла соединение» — тоже мог уйти');
+
+        // Истёкший срок — не сбой связи: повторять его — ждать сверх срока.
+        warned.length = 0;
+        const gone = await fetchRetry('http://127.0.0.1:1/', { signal: AbortSignal.abort() }, { idempotent: true })
+          .then(() => 'ответ', (e) => e.name);
+        ok(gone === 'AbortError' && warned.length === 0, 'отменённый запрос не повторяется',
+          `${gone}, повторов ${warned.length}`);
+
+        process.env.LAVA_PLAN_DAYS = '390:30,2990:365';
+        process.env.PLATEGA_MERCHANT_ID = '7b7ed2b3-16a7-49da-8076-b2f63498858b';
+        process.env.PLATEGA_SECRET = 'test-secret';
+        const payOk = { id: 'net-1', redirect: 'https://example/pay', status: 'PENDING' };
+
+        // 1. Площадка приняла запрос и оборвала связь, не ответив. Платёж мог
+        // создаться — второй запрос выставил бы человеку второй счёт.
+        let hits = 0;
+        const cut = http2.createServer((q, res2) => {
+          hits += 1;
+          q.resume();
+          q.on('end', () => {
+            if (hits === 1) { q.socket.destroy(); return; }
+            res2.writeHead(200, { 'content-type': 'application/json' });
+            res2.end(JSON.stringify(payOk));
+          });
+        });
+        await new Promise((res3) => cut.listen(0, '127.0.0.1', res3));
+        process.env.PLATEGA_API_URL = `http://127.0.0.1:${cut.address().port}`;
+        r = await call('POST', '/api/pay/create', { user: masha, body: { plan: 'month' } });
+        ok(hits === 1, 'оборванное после отправки создание платежа не повторяется',
+          `запросов: ${hits}`);
+        ok(r.json.provider !== 'platega', 'и человеку не отдают несуществующий счёт',
+          JSON.stringify(r.json));
+
+        // 2. До площадки не достучались вовсе — запрос не ушёл, повтор безопасен.
+        // Площадка «оживает», как только клиент заметил отказ и собрался повторить:
+        // так проверка не зависит от того, насколько быстрая машина.
+        await new Promise((res3) => cut.close(res3));
+        hits = 1;          // первый ответ этой площадки — сразу нормальный
+        const port = Number(process.env.PLATEGA_API_URL.split(':').pop());
+        onWarn = () => { if (!cut.listening) cut.listen(port, '127.0.0.1'); };
+        warned.length = 0;
+        r = await call('POST', '/api/pay/create', { user: masha, body: { plan: 'month' } });
+        onWarn = () => {};
+        ok(r.json.ok && r.json.provider === 'platega' && r.json.id === 'net-1',
+          'не подключились к Platega с первого раза — счёт всё равно выставлен', JSON.stringify(r.json));
+        ok(hits === 2 && warned.some((w) => /ECONNREFUSED/.test(w)),
+          'со второй попытки и ровно один', `запросов: ${hits - 1}, ${warned.join(' | ')}`);
+        ok(warned.every((w) => !w.includes('test-secret') && !w.includes('/transaction')),
+          'в журнал попал только адрес площадки', warned.join(' | '));
+        await new Promise((res3) => cut.close(res3));
+
+        // 3. Помощник: модель только читает, поэтому и обрыв после отправки
+        // повторяем — иначе человек видит «не отвечает» на ровном месте.
+        let gHits = 0;
+        const gem = http2.createServer((q, res2) => {
+          gHits += 1;
+          q.resume();
+          q.on('end', () => {
+            if (gHits === 1) { q.socket.destroy(); return; }
+            res2.writeHead(200, { 'content-type': 'application/json' });
+            res2.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: '{"action":"debts"}' }] } }] }));
+          });
+        });
+        await new Promise((res3) => gem.listen(0, '127.0.0.1', res3));
+        process.env.AI_ENABLED = '1';
+        process.env.AI_PROVIDER = 'gemini';
+        process.env.GEMINI_API_KEY = 'test-key-not-real';
+        process.env.GEMINI_BASE_URL = `http://127.0.0.1:${gem.address().port}`;
+        r = await call('POST', '/api/ask', { user: masha, body: { text: 'посоветуй, что делать с должниками' } });
+        ok(r.status === 200 && r.json.source === 'model' && gHits === 2,
+          'модель оборвала связь — помощник переспросил и ответил',
+          `${r.status} ${r.json.source} ${r.json.replyText || ''} запросов: ${gHits}`);
+        await new Promise((res3) => gem.close(res3));
+      } finally {
+        console.warn = warnOrig;
+        restoreN();
+      }
+    }
+
     // Голос: без провайдера — честный отказ, с заглушкой — разбор.
     r = await call('POST', '/api/ask/voice', { user: masha, body: { audio: 'AAA=' } });
     ok(r.status === 400 && /не подключено|SPEECH/i.test(r.json.error || ''),

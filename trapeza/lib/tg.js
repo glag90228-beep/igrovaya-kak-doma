@@ -5,6 +5,7 @@
 
 const http = require('node:http');
 const https = require('node:https');
+const { fetchRetry, beforeSend } = require('./net-retry');
 
 // Пул постоянных соединений: отклик на сообщения сокращается с 10-35с (при потере SYN) до 45мс.
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 25 });
@@ -194,12 +195,6 @@ function getBytes(urlStr, timeoutMs, maxBytes) {
   });
 }
 
-/** Ошибка случилась до того, как запрос ушёл: повторять безопасно. */
-const CONNECT_CODES = ['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN',
-  'ENETUNREACH', 'EHOSTUNREACH'];
-const beforeSend = (e) => Boolean(e && (e.isConnect || CONNECT_CODES.includes(e.code)
-  || (e.cause && CONNECT_CODES.includes(e.cause.code))));
-
 class Telegram {
   constructor(token) {
     if (!token) throw new Error('BOT_TOKEN не задан');
@@ -218,10 +213,8 @@ class Telegram {
     } catch (e) {
       const code = e.code || e.message;
       const isTimeout = code === 'ETIMEDOUT' || code === 'TIMEOUT' || e.name === 'TimeoutError' || /timeout/i.test(code);
-      const preSend = Boolean(e.isConnect || ['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND',
-        'EAI_AGAIN'].includes(code));
 
-      if (preSend && netTry < 3) {
+      if (beforeSend(e) && netTry < 3) {
         console.warn(`TG ${method}: ${code}, повтор ${netTry + 1} из 3`);
         await new Promise((r) => setTimeout(r, (netTry + 1) * 200));
         return this.call(method, params, attempt, netTry + 1);
@@ -301,19 +294,8 @@ class Telegram {
     // обычному вызову, но не бесконечность. Не подключились — повторяем:
     // запрос до Telegram не дошёл, и второй раз документ не придёт. Упавший
     // после отправки не повторяем — он мог дойти.
-    let res;
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        res = await fetch(`${this.base}/sendDocument`,
-          { method: 'POST', body: form, signal: AbortSignal.timeout(120000) });
-        break;
-      } catch (e) {
-        if (!beforeSend(e) || attempt >= 2) throw e;
-        // eslint-disable-next-line no-await-in-loop
-        await new Promise((r) => setTimeout(r, (attempt + 1) * 300));
-      }
-    }
+    const res = await fetchRetry(`${this.base}/sendDocument`,
+      { method: 'POST', body: form, signal: AbortSignal.timeout(120000) });
     const data = await res.json().catch(() => ({}));
     if (data.ok) return data.result;
     const code = data.error_code || res.status;

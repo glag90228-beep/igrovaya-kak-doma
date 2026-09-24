@@ -32,6 +32,7 @@
  */
 
 const crypto = require('node:crypto');
+const { fetchRetry } = require('./net-retry');
 
 const API_BASE = () => (process.env.PLATEGA_API_URL || 'https://app.platega.io').replace(/\/+$/, '');
 const MERCHANT_ID = () => String(process.env.PLATEGA_MERCHANT_ID || '').trim();
@@ -305,7 +306,7 @@ async function createTransaction(opts = {}) {
 
   const url = `${API_BASE()}/transaction/process`;
   try {
-    const res = await fetch(url, {
+    const res = await fetchRetry(url, {
       // Без таймаута замолчавшая площадка вешала «Оплатить СБП» навсегда, а
       // бот обрабатывает обновления по одному — замирал весь бот, не только
       // этот человек, и сам не отвисал до перезапуска.
@@ -352,14 +353,14 @@ async function getTransactionStatus(id) {
 
   const url = `${API_BASE()}/transaction/${encodeURIComponent(String(id).trim())}`;
   try {
-    const res = await fetch(url, {
+    const res = await fetchRetry(url, {
       signal: AbortSignal.timeout(20000),
       method: 'GET',
       headers: {
         'X-MerchantId': merchantId,
         'X-Secret': secret,
       },
-    });
+    }, { idempotent: true });
 
     const json = await res.json().catch(() => null);
     if (!res.ok || !json) {

@@ -28,6 +28,8 @@
  * вместо JSON.
  */
 
+const { fetchRetry } = require('./net-retry');
+
 const PROVIDER = () => String(process.env.VISION_PROVIDER || 'gemini').toLowerCase();
 
 function visionAvailable() {
@@ -153,7 +155,7 @@ async function viaGemini(buffer, mime) {
 
   // Ключ заголовком, а не в адресе: строка запроса оседает в логах прокси
   // и посредников, а это ключ от нашей квоты.
-  const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent`, {
+  const res = await fetchRetry(`${baseUrl}/v1beta/models/${model}:generateContent`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
     body: JSON.stringify({
@@ -170,7 +172,7 @@ async function viaGemini(buffer, mime) {
       },
     }),
     signal: AbortSignal.timeout(60000),
-  });
+  }, { idempotent: true });
   if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
   return ((((data.candidates || [])[0] || {}).content || {}).parts || [{}])[0].text || '';
@@ -182,7 +184,7 @@ async function viaGemini(buffer, mime) {
  */
 async function viaOpenRouter(buffer, mime) {
   const model = process.env.VISION_MODEL || 'anthropic/claude-sonnet-4.5';
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+  const res = await fetchRetry('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -206,14 +208,14 @@ async function viaOpenRouter(buffer, mime) {
       }],
     }),
     signal: AbortSignal.timeout(60000),
-  });
+  }, { idempotent: true });
   if (!res.ok) throw new Error(`OpenRouter ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
   return ((data.choices || [{}])[0].message || {}).content || '';
 }
 
 async function viaAnthropic(buffer, mime) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+  const res = await fetchRetry('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -236,7 +238,7 @@ async function viaAnthropic(buffer, mime) {
     // не завершался ни успехом, ни отказом. У OpenRouter такой предел стоял,
     // у этих двух — нет, хотя ходят они туда же и так же.
     signal: AbortSignal.timeout(60000),
-  });
+  }, { idempotent: true });
   if (!res.ok) throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
   const raw = (data.content || []).map((c) => c.text || '').join('');
@@ -244,7 +246,7 @@ async function viaAnthropic(buffer, mime) {
 }
 
 async function viaYandex(buffer, mime) {
-  const res = await fetch('https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText', {
+  const res = await fetchRetry('https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -257,7 +259,7 @@ async function viaYandex(buffer, mime) {
       content: buffer.toString('base64'),
     }),
     signal: AbortSignal.timeout(60000),   // тот же предел, что у соседей
-  });
+  }, { idempotent: true });
   if (!res.ok) throw new Error(`Yandex ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
   return ((data.result || {}).textAnnotation || {}).fullText || '';

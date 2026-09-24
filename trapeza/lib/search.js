@@ -32,6 +32,8 @@
  * сервере проверьте `node tools/keys-check.js` — он делает настоящий запрос.
  */
 
+const { fetchRetry } = require('./net-retry');
+
 /**
  * Кому верим.
  *
@@ -146,7 +148,7 @@ function mockResults() {
  * тянуть ради этого зависимость в проект, где их две, — плохой обмен.
  */
 async function viaYandex(query) {
-  const res = await fetch('https://searchapi.api.cloud.yandex.net/v2/web/search', {
+  const res = await fetchRetry('https://searchapi.api.cloud.yandex.net/v2/web/search', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -159,7 +161,7 @@ async function viaYandex(query) {
       groupSpec: { groupMode: 'GROUP_MODE_DEEP', groupsOnPage: 10, docsInGroup: 1 },
     }),
     signal: AbortSignal.timeout(20000),
-  });
+  }, { idempotent: true });
   if (!res.ok) throw new Error(`Поиск Яндекса ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
   // Ответ приходит в base64 — так устроен их API, поле называется rawData.

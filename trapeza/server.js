@@ -9,6 +9,7 @@ const { db, getSetting, setSetting, allSettings, listMenu, computeBalance } = re
 const seed = require('./seed');
 const { buildAkt } = require('./lib/xlsx-akt');
 const { notifyOrder, checkBot, api: tgApi } = require('./lib/notify');
+const { fetchRetry } = require('./lib/net-retry');
 
 const PORT = Number(process.env.PORT) || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -454,7 +455,9 @@ async function handleApi(req, res, url) {
         const chatId = String(b.chat_id || getSetting('tg_chat_id', '') || '').trim();
         let sent = null;
         if (chatId) {
-          const r = await fetch(tgApi(token, 'sendMessage'), {
+          // Без срока замолчавший Telegram держал бы запрос админки вечно.
+          const r = await fetchRetry(tgApi(token, 'sendMessage'), {
+            signal: AbortSignal.timeout(15000),
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({

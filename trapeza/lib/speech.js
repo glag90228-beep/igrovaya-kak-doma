@@ -43,6 +43,8 @@
  * часов, но ответа приходится ждать — примерно 10 секунд на минуту записи.
  */
 
+const { fetchRetry } = require('./net-retry');
+
 const SYNC_LIMIT_SEC = 30;              // потолок синхронного метода
 const SYNC_LIMIT_BYTES = 1024 * 1024;   // и его же потолок по размеру
 const POLL_MS = 2000;                   // как часто спрашивать готовность
@@ -149,7 +151,7 @@ function parseWav(buf) {
 /** Синхронное распознавание: до 30 секунд, ответ сразу. */
 async function yandexSync(buffer, params = 'format=oggopus') {
   const url = `https://stt.api.cloud.yandex.net/speech/v1/stt:recognize?lang=ru-RU&topic=general&${params}`;
-  const res = await fetch(url, {
+  const res = await fetchRetry(url, {
     method: 'POST',
     // Папку не передаём намеренно: у ключа сервисного аккаунта она своя, а
     // явный folderId документация велит слать только пользовательскому.
@@ -165,7 +167,7 @@ async function yandexSync(buffer, params = 'format=oggopus') {
     },
     body: buffer,
     signal: AbortSignal.timeout(60000),
-  });
+  }, { idempotent: true });
   const text = await res.text();
   if (!res.ok) throw new Error(`SpeechKit ${res.status}: ${text.slice(0, 200)}`);
   try { return String(JSON.parse(text).result || ''); } catch (_) { return ''; }
@@ -217,7 +219,7 @@ async function yandexAsync(buffer, kind) {
     'x-data-logging-enabled': 'false',
   };
 
-  const started = await fetch('https://stt.api.cloud.yandex.net/stt/v3/recognizeFileAsync', {
+  const started = await fetchRetry('https://stt.api.cloud.yandex.net/stt/v3/recognizeFileAsync', {
     method: 'POST',
     headers: head,
     body: JSON.stringify({
@@ -241,10 +243,10 @@ async function yandexAsync(buffer, kind) {
     // eslint-disable-next-line no-await-in-loop
     await sleep(POLL_MS);
     // eslint-disable-next-line no-await-in-loop
-    const st = await fetch(`https://operation.api.cloud.yandex.net/operations/${op.id}`, {
+    const st = await fetchRetry(`https://operation.api.cloud.yandex.net/operations/${op.id}`, {
       headers: { Authorization: `Api-Key ${process.env.YANDEX_API_KEY}` },
       signal: AbortSignal.timeout(30000),
-    });
+    }, { idempotent: true });
     if (!st.ok) throw new Error(`SpeechKit ${st.status}`);
     // eslint-disable-next-line no-await-in-loop
     const state = await st.json();
@@ -252,10 +254,10 @@ async function yandexAsync(buffer, kind) {
     if (state.done) break;
   }
 
-  const got = await fetch(`https://stt.api.cloud.yandex.net/stt/v3/getRecognition?operation_id=${op.id}`, {
+  const got = await fetchRetry(`https://stt.api.cloud.yandex.net/stt/v3/getRecognition?operation_id=${op.id}`, {
     headers: { Authorization: `Api-Key ${process.env.YANDEX_API_KEY}` },
     signal: AbortSignal.timeout(60000),
-  });
+  }, { idempotent: true });
   if (!got.ok) throw new Error(`SpeechKit ${got.status}: ${(await got.text()).slice(0, 200)}`);
 
   // Берём финальные куски. Уточнённый вариант (finalRefinement) точнее —
@@ -305,7 +307,7 @@ async function viaGemini(buffer, kind) {
     + '«неразборчиво», без имён говорящих. Ничего не добавляй от себя и не '
     + 'отвечай на сказанное — только запиши. Если речи нет вовсе, ответь пустой строкой.';
 
-  const res = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent`, {
+  const res = await fetchRetry(`${baseUrl}/v1beta/models/${model}:generateContent`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
     body: JSON.stringify({
@@ -318,7 +320,7 @@ async function viaGemini(buffer, kind) {
       generationConfig: { temperature: 0, maxOutputTokens: 1200 },
     }),
     signal: AbortSignal.timeout(120000),
-  });
+  }, { idempotent: true });
   if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
   const u = data.usageMetadata || {};

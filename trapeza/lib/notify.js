@@ -5,6 +5,7 @@
 // а менеджеру приходит готовое сообщение со сметой и ссылкой.
 
 const { formatMoney, formatRub } = require('./money');
+const { fetchRetry } = require('./net-retry');
 
 // Адрес Telegram API. Меняется только для тестов и работы через прокси.
 const API = (process.env.TG_API || 'https://api.telegram.org').replace(/\/+$/, '');
@@ -54,7 +55,7 @@ async function notifyOrder({ order, totals, settings, link, kind }) {
   if (!token || !chatId) return { ok: false, skipped: 'не заданы токен бота или чат' };
 
   try {
-    const res = await fetch(api(token, 'sendMessage'), {
+    const res = await fetchRetry(api(token, 'sendMessage'), {
       signal: AbortSignal.timeout(15000),
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -78,10 +79,10 @@ async function notifyOrder({ order, totals, settings, link, kind }) {
 async function checkBot(token) {
   const t = (token || '').trim();
   if (!t) throw new Error('Токен не задан');
-  const me = await fetch(api(t, 'getMe'), { signal: AbortSignal.timeout(15000) }).then((r) => r.json());
+  const me = await fetchRetry(api(t, 'getMe'), { signal: AbortSignal.timeout(15000) }, { idempotent: true }).then((r) => r.json());
   if (!me.ok) throw new Error(me.description || 'Токен не подошёл');
 
-  const upd = await fetch(api(t, 'getUpdates?limit=20'), { signal: AbortSignal.timeout(15000) }).then((r) => r.json());
+  const upd = await fetchRetry(api(t, 'getUpdates?limit=20'), { signal: AbortSignal.timeout(15000) }, { idempotent: true }).then((r) => r.json());
   const chats = [];
   if (upd.ok) {
     for (const u of upd.result || []) {

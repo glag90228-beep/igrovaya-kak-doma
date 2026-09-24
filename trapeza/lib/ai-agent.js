@@ -67,6 +67,7 @@
 const { db } = require('../db');
 const knowledge = require('./knowledge');
 const search = require('./search');
+const { fetchRetry } = require('./net-retry');
 
 /*
  * Модель по умолчанию — маленькая, и это не экономия на спичках.
@@ -757,7 +758,7 @@ async function callModel(text, systemPrompt = SYSTEM) {
 
     // Ключ заголовком, а не в адресе: строка запроса оседает в логах
     // прокси и посредников, а это ключ от нашей квоты.
-    const res = await fetch(`${baseUrl}/v1beta/models/${geminiModel}:generateContent`, {
+    const res = await fetchRetry(`${baseUrl}/v1beta/models/${geminiModel}:generateContent`, {
       method: 'POST',
       signal,
       headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
@@ -770,7 +771,7 @@ async function callModel(text, systemPrompt = SYSTEM) {
           responseMimeType: 'application/json',
         },
       }),
-    });
+    }, { idempotent: true });
     if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 200)}`);
     const data = await res.json();
     const u = data.usageMetadata || {};
@@ -792,7 +793,7 @@ async function callModel(text, systemPrompt = SYSTEM) {
    * maxTokens строкой — так требует их API; число он не принимает.
    */
   if (p === 'yandexgpt') {
-    const res = await fetch('https://llm.api.cloud.yandex.net/foundationModels/v1/completion', {
+    const res = await fetchRetry('https://llm.api.cloud.yandex.net/foundationModels/v1/completion', {
       method: 'POST',
       signal,
       headers: {
@@ -811,7 +812,7 @@ async function callModel(text, systemPrompt = SYSTEM) {
           { role: 'user', text: String(text).slice(0, 1000) },
         ],
       }),
-    });
+    }, { idempotent: true });
     if (!res.ok) throw new Error(`YandexGPT ${res.status}: ${(await res.text()).slice(0, 200)}`);
     const data = await res.json();
     const uy = (data.result || {}).usage || {};
@@ -832,7 +833,7 @@ async function callModel(text, systemPrompt = SYSTEM) {
    * ошибок), и общая функция с тремя «если» читается хуже двух явных.
    */
   if (p === 'grok') {
-    const res = await fetch('https://api.x.ai/v1/chat/completions', {
+    const res = await fetchRetry('https://api.x.ai/v1/chat/completions', {
       method: 'POST',
       signal,
       headers: {
@@ -848,7 +849,7 @@ async function callModel(text, systemPrompt = SYSTEM) {
           { role: 'user', content: String(text).slice(0, 1000) },
         ],
       }),
-    });
+    }, { idempotent: true });
     if (!res.ok) throw new Error(`xAI ${res.status}: ${(await res.text()).slice(0, 200)}`);
     const data = await res.json();
     const uo = data.usage || {};
@@ -864,7 +865,7 @@ async function callModel(text, systemPrompt = SYSTEM) {
 
   // Вызов через OpenRouter API
   if (p === 'openrouter') {
-    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    const res = await fetchRetry('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       signal,
       headers: {
@@ -882,7 +883,7 @@ async function callModel(text, systemPrompt = SYSTEM) {
           { role: 'user', content: String(text).slice(0, 1000) },
         ],
       }),
-    });
+    }, { idempotent: true });
     if (!res.ok) throw new Error(`OpenRouter ${res.status}`);
     const data = await res.json();
     const uo = data.usage || {};
@@ -898,7 +899,7 @@ async function callModel(text, systemPrompt = SYSTEM) {
 
   // Прямой вызов Anthropic API
   if (p === 'anthropic') {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    const res = await fetchRetry('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       signal,
       headers: {
@@ -921,7 +922,7 @@ async function callModel(text, systemPrompt = SYSTEM) {
         system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
         messages: [{ role: 'user', content: String(text).slice(0, 1000) }],
       }),
-    });
+    }, { idempotent: true });
     if (!res.ok) throw new Error(`Anthropic ${res.status}`);
     const data = await res.json();
     const ua = data.usage || {};
@@ -937,7 +938,7 @@ async function callModel(text, systemPrompt = SYSTEM) {
 
   // Прямой вызов OpenAI API
   if (p === 'openai') {
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    const res = await fetchRetry('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       signal,
       headers: {
@@ -952,7 +953,7 @@ async function callModel(text, systemPrompt = SYSTEM) {
           { role: 'user', content: String(text).slice(0, 1000) },
         ],
       }),
-    });
+    }, { idempotent: true });
     if (!res.ok) throw new Error(`OpenAI ${res.status}`);
     const data = await res.json();
     const uo = data.usage || {};
