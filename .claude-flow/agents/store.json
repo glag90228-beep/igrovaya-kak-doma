@@ -14,6 +14,19 @@
       "createdAt": "2026-08-18T07:14:43.990Z",
       "model": "sonnet",
       "modelRoutedBy": "default"
+    },
+    "net-scout": {
+      "agentId": "net-scout",
+      "agentType": "researcher",
+      "status": "idle",
+      "health": 1,
+      "taskCount": 0,
+      "config": {
+        "model": "haiku"
+      },
+      "createdAt": "2026-09-24T09:49:00.513Z",
+      "model": "haiku",
+      "modelRoutedBy": "explicit"
     }
   },
   "version": "3.0.0"
