@@ -1141,15 +1141,22 @@ async function repeatDoc(tg, chatId, user, docId) {
   const { items, extra } = docService.reusablePayload(src.payload);
   const year = currentYear();
   /*
-   * Ряд номеров продолжаем ТОТ ЖЕ, в котором выписан исходный документ:
-   * повтор счёта фирмы «А» не должен получить номер из ряда фирмы «Б».
+   * Номер — из ряда той фирмы, ОТ КОТОРОЙ документ выйдет, а выходит он
+   * всегда от текущей (issueDocument). Раньше номер брался из ряда исходной
+   * фирмы: повтор счёта фирмы А при выбранной Б выходил от Б с номером из
+   * ряда А — в ряду Б дыра, а если номер там уже занят, выпуск падал.
+   * Раз фирма у повтора другая — говорим об этом вслух, а не молча.
    */
-  const seq = bdb.nextSeqForOrg(src.org_id, src.type, year);
+  const cur = bdb.currentOrg(user.id) || {};
+  const seq = bdb.nextSeqForOrg(cur.id, src.type, year);
   const data = { seq, number: String(seq), date: todayISO(), items, ask: '', doc: extra };
   bdb.setState(user.id, `items:${src.type}:${src.cp_id}`, data);
+  const otherOrg = Number(src.org_id) && Number(src.org_id) !== Number(cur.id);
   await tg.sendMessage(chatId,
     `Повторяю <b>${esc(src.title.toLowerCase())} № ${esc(src.number)}</b>: ${items.length} поз., `
-    + `${formatRub(src.total)}\nНовый номер — ${esc(data.number)}, дата — ${ru(data.date)}.`);
+    + `${formatRub(src.total)}\nНовый номер — ${esc(data.number)}, дата — ${ru(data.date)}.`
+    + (otherOrg ? `\n\n⚠️ Исходный документ выписан от другой организации. Повтор выйдет от `
+      + `текущей — <b>${esc(cur.name || 'без названия')}</b>. Нужна прежняя — переключитесь на неё и повторите.` : ''));
   await showPreview(tg, chatId, user, bdb.getState(user.id));
 }
 
@@ -3783,15 +3790,22 @@ async function sendReminderMail(tg, chatId, user, cpId, email) {
    */
   const attachments = [];
   try {
-    if (!cp.period_end) {
-      bdb.updateCp(user.id, cp.id, { period_end: todayISO() });
-      cp.period_end = todayISO();
-    }
+    /*
+     * Акт — тем же путём, что обычный акт сверки (cpForPeriod), а не
+     * сборкой вручную. Ручная сборка навсегда записывала period_end в
+     * карточку при первом напоминании: через полгода контрагент получал акт
+     * с шапкой «по 01.03» и операциями по сентябрь. И начальное сальдо она
+     * брала с карточки, а не у пары фирма—клиент — при нескольких фирмах
+     * это сальдо чужой фирмы. Период здесь — всё время по сегодня: долг,
+     * о котором напоминаем, считается так же.
+     */
+    const p = bdb.cpForPeriod(user.id, cp.id, '', todayISO(), org.id || null);
+    if (!p) throw new Error('не собрался период');
     const buf = await buildAkt({
       org: { brand: org.name, org_short: org.name, org_full: org.full_name || org.name,
         org_inn: org.inn, signer: org.signer },
-      cp,
-      ops: bdb.listOps(user.id, cp.id),
+      cp: p.view,
+      ops: p.ops,
     });
     attachments.push({
       filename: `Акт_сверки_${docService.safeName(cp.name)}.xlsx`,

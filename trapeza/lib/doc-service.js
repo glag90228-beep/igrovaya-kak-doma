@@ -488,7 +488,8 @@ async function rebuildDocument(userId, docId, opts = {}) {
    * оплату, контрагент должен увидеть её, а не устаревшую бумагу.
    */
   if (saved.type === 'akt') {
-    const p = bdb.cpForPeriod(userId, saved.cp_id, saved.payload.from || '', saved.payload.to || '');
+    // Журнал — той фирмы, что в шапке акта (org0), а не текущей.
+    const p = bdb.cpForPeriod(userId, saved.cp_id, saved.payload.from || '', saved.payload.to || '', org0.id);
     if (!p) return fail('data', 'Не удалось собрать акт: проверьте контрагента.');
     const forAkt = {
       org: {

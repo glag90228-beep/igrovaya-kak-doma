@@ -880,7 +880,9 @@ const api = {
     return {
       paidAt: when,
       doc: docBrief(bdb.getDoc(user.id, id)),
-      npd: npd.chequeReminder(bdb.currentOrg(user.id), {
+      // Чек нужен, если самозанятая ФИРМА ДОКУМЕНТА, а не та, что выбрана
+      // сейчас: иначе при переключённой фирме напоминание о чеке терялось.
+      npd: npd.chequeReminder(bdb.orgOfDoc(user.id, doc), {
         paidAt: when, cpName: cp && cp.name,
       }),
     };
@@ -2002,7 +2004,8 @@ const api = {
   async 'GET /api/doc/qr'({ user, url }) {
     const d = bdb.getDoc(user.id, Number(url.searchParams.get('id')));
     if (!d) return { error: 'Документ не найден.' };
-    const org = bdb.currentOrg(user.id);
+    // Фирма счёта, а не текущая: иначе QR вёл на чужой расчётный счёт.
+    const org = bdb.orgOfDoc(user.id, d);
     if (!org) return { problems: ['реквизиты организации не заполнены'] };
     const cp = bdb.getCp(user.id, d.cp_id);
     const problems = payProblems({ org });

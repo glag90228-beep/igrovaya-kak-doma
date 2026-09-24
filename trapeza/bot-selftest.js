@@ -2456,6 +2456,60 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(qMore.used === 2, 'а уже заведённое никуда не делось', qMore.used);
   }
 
+  console.log('\n── документ живёт в своей фирме, а не в текущей ──');
+  {
+    /*
+     * Во всех проверках ниже документ выписан фирмой Б, а человек потом
+     * переключился на фирму А. Раньше в нескольких местах брали текущую
+     * фирму — и выходили: QR на чужой расчётный счёт, «оплачен» без
+     * погашения долга, акт с шапкой одной фирмы и строками другой.
+     */
+    const bdbF = require('./lib/bot-db');
+    const dsF = require('./lib/doc-service');
+    const { payQrSvg } = require('./lib/qr-pay');
+    const uF = bdbF.getOrCreateUser(779120, 'Двефирмы');
+    const bank = { bank_name: 'ПАО Сбербанк', bik: '044525225', corr_acc: '30101810400000000225' };
+    bdbF.saveMyOrg(uF.id, { name: 'ООО «Альфа»', inn: '7701234567', acc: '40702810900000000001', ...bank });
+    const fA = bdbF.getDefaultOrg(uF.id).id;
+    bdbF.updateOrg(uF.id, fA, { debt_basis: 'manual' });     // А: журнал ведёт человек
+    const fB = bdbF.createOrg(uF.id, { name: 'ООО «Бета»', inn: '7707083893', acc: '40702810900000000002', ...bank });
+    bdbF.updateOrg(uF.id, fB, { debt_basis: 'invoice' });    // Б: долг по счёту
+    const cpF = bdbF.createCp(uF.id, { name: 'ООО «Клиент»', kind: 'customer', opening_date: '2026-01-01' });
+
+    bdbF.setActiveOrg(uF.id, fB);
+    const sch = await dsF.issueDocument(uF.id, {
+      type: 'sch', cpId: cpF, items: [{ name: 'Аренда', qty: 1, price: 30000 }], skipQuota: true,
+    });
+    const docB = bdbF.getDoc(uF.id, sch.doc.id);
+    bdbF.setActiveOrg(uF.id, fA);                            // переключились на А
+
+    // 1. Платёжный QR счёта — на расчётный счёт ФИРМЫ СЧЁТА.
+    ok(bdbF.orgOfDoc(uF.id, docB).id === fB, 'фирма документа находится по документу, а не по выбору');
+    const { api: miniApi } = require('./miniapp');
+    const qr = await miniApi['GET /api/doc/qr']({
+      user: uF, url: new URL(`http://x/api/doc/qr?id=${docB.id}`),
+    });
+    const expect = (orgId) => payQrSvg({
+      org: bdbF.getOrg(uF.id, orgId), sum: docB.total, payer: 'ООО «Клиент»',
+      purpose: `Оплата по счёту № ${docB.number} от ${docB.date.split('-').reverse().join('.')}`,
+    }, { size: 200 });
+    ok(qr.svg && qr.svg === expect(fB), 'QR счёта ведёт на счёт фирмы Б, выписавшей его');
+    ok(qr.svg !== expect(fA), 'а не на счёт текущей фирмы А');
+
+    // 2. «Оплачен» гасит долг в фирме документа, по её правилам.
+    const debtBefore = bdbF.balanceOf(uF.id, cpF, fB).closing;
+    bdbF.markPaid(uF.id, docB.id);
+    const debtAfter = bdbF.balanceOf(uF.id, cpF, fB).closing;
+    ok(debtBefore === 30000 && debtAfter === 0,
+      'отметка «оплачен» погасила долг в фирме Б, хотя выбрана А', `${debtBefore} → ${debtAfter}`);
+
+    // 3. Акт сверки фирмы Б берёт журнал фирмы Б.
+    const actB = bdbF.cpForPeriod(uF.id, cpF, '', '', fB);
+    const actA = bdbF.cpForPeriod(uF.id, cpF, '', '');
+    ok(actB.ops.length > 0 && actA.ops.length === 0,
+      'акт по фирме Б строится из её операций, а не текущей', `${actB.ops.length} и ${actA.ops.length}`);
+  }
+
   console.log('\n── номера документов не задваиваются ──');
   {
     const dbx = require('./db').db;

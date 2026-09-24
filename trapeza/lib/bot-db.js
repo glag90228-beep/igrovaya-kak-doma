@@ -514,6 +514,20 @@ function listOrgs(userId) {
 function getOrg(userId, id) {
   return db.prepare('SELECT * FROM orgs WHERE id = ? AND user_id = ?').get(id, userId);
 }
+
+/**
+ * Организация, от которой выписан документ.
+ *
+ * Не «текущая»: человек с несколькими фирмами переключается между ними, а
+ * документ остаётся за той, что его выписала. Раньше в нескольких местах
+ * брали текущую — и платёжный QR счёта фирмы А вёл на расчётный счёт фирмы Б:
+ * клиент сканировал и платил не тому получателю. Текущая — только запасной
+ * путь для старых документов, выписанных до того, как фирм стало несколько
+ * (у них org_id = 0).
+ */
+function orgOfDoc(userId, doc) {
+  return (doc && getOrg(userId, doc.org_id)) || currentOrg(userId);
+}
 function getDefaultOrg(userId) {
   return db.prepare('SELECT * FROM orgs WHERE user_id = ? ORDER BY is_default DESC, id LIMIT 1').get(userId);
 }
@@ -943,8 +957,13 @@ function periodBalance(userId, cpId, from, to, orgId = null) {
  * шаблона — и не трогаем саму карточку, где эти поля значат другое:
  * начало отношений, а не начало выбранного периода.
  */
-function cpForPeriod(userId, cpId, from, to) {
-  const b = periodBalance(userId, cpId, from, to);
+/*
+ * orgId — чей журнал брать. По умолчанию текущей фирмы, как раньше; но акт,
+ * который пересобирают или шлют почтой, обязан брать журнал СВОЕЙ фирмы.
+ * Иначе контрагент получал акт «между ООО А и …» с операциями фирмы Б.
+ */
+function cpForPeriod(userId, cpId, from, to, orgId = null) {
+  const b = periodBalance(userId, cpId, from, to, orgId);
   if (!b) return null;
   return {
     ...b,
@@ -1300,7 +1319,14 @@ function markPaid(userId, docId, date) {
   // оплаты без встречной реализации увела бы сальдо в минус — вышло бы,
   // что это мы должны контрагенту. Отметку об оплате при этом сохраняем:
   // она нужна списку «Не оплачено» и живёт отдельно от журнала.
-  const org = currentOrg(userId);
+  /*
+   * Основание долга и сальдо — фирмы ДОКУМЕНТА, той же, куда addOpForDoc
+   * положит проводку. Раньше брались по текущей: документ фирмы Б при
+   * выбранной фирме А получал основание и сальдо А, выходило left = 0 —
+   * документ помечался оплаченным, а долг в фирме Б оставался висеть.
+   */
+  const org = orgOfDoc(userId, d);
+  const docOrgId = Number(d.org_id) || currentOrgId(userId);
   if (basisOf(org || {}) === 'manual') return when;
   /*
    * Проводку оплаты делаем только по тому документу, который создаёт долг.
@@ -1324,7 +1350,7 @@ function markPaid(userId, docId, date) {
    * что осталось закрыть.
    */
   if (d.cp_id && d.total && !d.no_debt && makesDebt(org || {}, d.type)) {
-    const bal = balanceOf(userId, d.cp_id);
+    const bal = balanceOf(userId, d.cp_id, docOrgId);
     const left = round2(Math.min(Number(d.total), Math.max(0, bal ? bal.closing : 0)));
     if (left > 0) {
       addOpForDoc(userId, d.cp_id, {
@@ -2216,7 +2242,7 @@ module.exports = {
   migrate,
   getOrCreateUser, setState, getState, clearState, isAiEnabled, setAiEnabled, setSource,
   saveAiMessage, listAiMessages, getAiDataset,
-  createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, getDefaultOrg, setDefaultOrg,
+  createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, orgOfDoc, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp, openAdvances, updateDocPayload,
   addOp, listOps, deleteLastOp, deleteOp, balanceOf, debtors, debtBreakdown, periodBalance, cpForPeriod,
   knownBankKeys, importBankRows,
