@@ -2978,6 +2978,36 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     fake.close();
     ok(hung && hung.network, 'молчание сервера — ошибка, а не бесконечное ожидание', hung && hung.message);
     ok(Date.now() - t0 < 60000, 'ожидание ограничено', `${Math.round((Date.now() - t0) / 1000)} с`);
+
+    /*
+     * Скачивание файла. Шло встроенным fetch без повторов, и на боевом
+     * сервере первая же оборванная попытка давала «fetch failed»: выписка,
+     * присланная в чат, роняла обработку. Первое соединение за файлом здесь
+     * рвём — клиент обязан повторить и получить файл целиком.
+     */
+    let fileHits = 0;
+    const files2 = http.createServer((req, res) => {
+      if (req.url.includes('/getFile')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, result: { file_path: 'documents/v.xlsx', file_size: 11 } }));
+        return;
+      }
+      if (req.url.startsWith('/file/bottest-token/documents/v.xlsx')) {
+        fileHits += 1;
+        if (fileHits === 1) { req.socket.destroy(); return; }
+        res.writeHead(200);
+        res.end('байты файла');
+        return;
+      }
+      res.writeHead(404); res.end();
+    });
+    await new Promise((r) => files2.listen(0, '127.0.0.1', r));
+    const tgf = new Telegram('test-token');
+    tgf.base = `http://127.0.0.1:${files2.address().port}/bottest-token`;
+    const got = await tgf.downloadFile('f1').then((b) => b, (e) => e);
+    ok(Buffer.isBuffer(got) && got.toString() === 'байты файла' && fileHits === 2,
+      'оборванное скачивание повторяется, и файл приходит целиком', Buffer.isBuffer(got) ? `попыток ${fileHits}` : got.message);
+    files2.close();
   }
 
   console.log('\n── защита от второго экземпляра ──');
@@ -5210,6 +5240,17 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     before = files.length;
     await tapK('bank:kudir');
     ok(files.length - before === 1, 'и книга из неё собирается', norm(last()).slice(0, 80));
+
+    // Связь оборвалась при скачивании — ответ человеку, а не падение.
+    tg.downloadFile = async () => { throw new TypeError('fetch failed'); };
+    let crashed = null;
+    const beforeDl = sent.length;
+    try {
+      await handleUpdate(tg, { message: { chat, from: who,
+        document: { file_id: 'k-e', file_name: 'vypiska.xlsx', file_size: 100 } } });
+    } catch (e) { crashed = e; }
+    ok(!crashed && sent.length > beforeDl && /Не смог забрать файл/.test(last()),
+      'выписка не скачалась — бот говорит об этом, а не падает', crashed ? crashed.message : norm(last()).slice(0, 60));
 
     // PDF и прочие файлы — ответ, а не тишина.
     tg.downloadFile = async () => Buffer.from('%PDF-1.7');

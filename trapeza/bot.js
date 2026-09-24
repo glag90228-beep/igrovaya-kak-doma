@@ -3386,7 +3386,17 @@ async function handleStatement(tg, chatId, user, msg) {
   }
   await tg.sendChatAction(chatId, 'typing');
 
-  const buf = await tg.downloadFile(doc.file_id, 10 * 1024 * 1024);
+  // Скачивание может не выйти — связь с Telegram рвётся. Раньше ошибка
+  // роняла обработку, и человек, приславший выписку, не получал ответа.
+  let buf;
+  try {
+    buf = await tg.downloadFile(doc.file_id, 10 * 1024 * 1024);
+  } catch (e) {
+    console.error('выписка: не скачалась:', e.message);
+    await tg.sendMessage(chatId, 'Не смог забрать файл у Telegram — связь оборвалась. '
+      + 'Пришлите выписку ещё раз.', mainMenu());
+    return;
+  }
   const org = bdb.currentOrg(user.id);
   const { format, rows, unsupported } = await bank.parseStatementFile(buf,
     { ownAccounts: [org && org.acc].filter(Boolean) });
@@ -6040,8 +6050,11 @@ async function main() {
     for (const u of updates) {
       offset = u.update_id + 1;
       try { await handleUpdate(tg, u); } catch (e) {
-        console.error('handleUpdate:', e.message);
-        office.record({ kind: 'crash', where: 'handleUpdate', error: e.message }).catch(() => {});
+        // У «fetch failed» причина лежит в e.cause — без неё сообщение
+        // ничего не говорит: ни что оборвалось, ни где.
+        const why = e.cause ? ` (${e.cause.code || e.cause.message})` : '';
+        console.error('handleUpdate:', e.message + why);
+        office.record({ kind: 'crash', where: 'handleUpdate', error: e.message + why }).catch(() => {});
       }
     }
   }

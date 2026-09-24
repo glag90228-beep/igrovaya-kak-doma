@@ -137,6 +137,69 @@ function doRequest(urlStr, data, timeoutMs) {
   });
 }
 
+/**
+ * GET за байтами — тем же путём, что и вызовы API: общий пул соединений,
+ * 3,5 с на подключение, общий таймаут и обрыв тела как ошибка.
+ *
+ * Файлы раньше качались встроенным fetch. У него нет ни нашего короткого
+ * ожидания подключения, ни повторов, и на этом сервере, где SYN иногда
+ * теряется, он падал с голым «fetch failed»: выписка, присланная в чат,
+ * роняла обработку, и человек не получал ничего.
+ */
+function getBytes(urlStr, timeoutMs, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const isHttps = u.protocol === 'https:';
+    const req = (isHttps ? https : http).request({
+      protocol: u.protocol, hostname: u.hostname, port: u.port || (isHttps ? 443 : 80),
+      path: u.pathname + u.search, method: 'GET', agent: isHttps ? httpsAgent : httpAgent,
+    });
+    let settled = false;
+    let connectTimer = null;
+    const finish = (err, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(connectTimer);
+      clearTimeout(allTimer);
+      if (err) { req.destroy(); reject(err); } else resolve(val);
+    };
+    const allTimer = setTimeout(() => finish(Object.assign(new Error('TIMEOUT'), { code: 'ETIMEDOUT' })), timeoutMs);
+    req.on('socket', (socket) => {
+      if (!socket.connecting) return;
+      connectTimer = setTimeout(() => finish(Object.assign(new Error('CONNECT_TIMEOUT'),
+        { code: 'UND_ERR_CONNECT_TIMEOUT', isConnect: true })), 3500);
+      socket.once('connect', () => clearTimeout(connectTimer));
+    });
+    req.on('error', (e) => finish(e));
+    req.on('response', (res) => {
+      clearTimeout(connectTimer);
+      if (res.statusCode !== 200) {
+        res.resume();
+        finish(Object.assign(new Error(`Не удалось скачать файл: ${res.statusCode}`), { status: res.statusCode }));
+        return;
+      }
+      const chunks = [];
+      let size = 0;
+      res.on('data', (c) => {
+        size += c.length;
+        if (size > maxBytes) { finish(new Error('Файл слишком большой')); return; }
+        chunks.push(c);
+      });
+      res.on('error', (e) => finish(e));
+      res.on('aborted', () => finish(Object.assign(new Error('RESPONSE_ABORTED'), { code: 'ECONNRESET' })));
+      res.on('close', () => finish(Object.assign(new Error('RESPONSE_CLOSED'), { code: 'ECONNRESET' })));
+      res.on('end', () => finish(null, Buffer.concat(chunks)));
+    });
+    req.end();
+  });
+}
+
+/** Ошибка случилась до того, как запрос ушёл: повторять безопасно. */
+const CONNECT_CODES = ['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN',
+  'ENETUNREACH', 'EHOSTUNREACH'];
+const beforeSend = (e) => Boolean(e && (e.isConnect || CONNECT_CODES.includes(e.code)
+  || (e.cause && CONNECT_CODES.includes(e.cause.code))));
+
 class Telegram {
   constructor(token) {
     if (!token) throw new Error('BOT_TOKEN не задан');
@@ -235,9 +298,22 @@ class Telegram {
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     form.append('document', new Blob([bytes]), filename);
     // Документ бывает на несколько мегабайт — даём больше времени, чем
-    // обычному вызову, но не бесконечность.
-    const res = await fetch(`${this.base}/sendDocument`,
-      { method: 'POST', body: form, signal: AbortSignal.timeout(120000) });
+    // обычному вызову, но не бесконечность. Не подключились — повторяем:
+    // запрос до Telegram не дошёл, и второй раз документ не придёт. Упавший
+    // после отправки не повторяем — он мог дойти.
+    let res;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        res = await fetch(`${this.base}/sendDocument`,
+          { method: 'POST', body: form, signal: AbortSignal.timeout(120000) });
+        break;
+      } catch (e) {
+        if (!beforeSend(e) || attempt >= 2) throw e;
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((r) => setTimeout(r, (attempt + 1) * 300));
+      }
+    }
     const data = await res.json().catch(() => ({}));
     if (data.ok) return data.result;
     const code = data.error_code || res.status;
@@ -258,10 +334,22 @@ class Telegram {
     if (info.file_size && info.file_size > maxBytes) {
       throw new Error('Файл слишком большой');
     }
-    const res = await fetch(`https://api.telegram.org/file/bot${this.token}/${info.file_path}`,
-      { signal: AbortSignal.timeout(120000) });
-    if (!res.ok) throw new Error(`Не удалось скачать файл: ${res.status}`);
-    return Buffer.from(await res.arrayBuffer());
+    // Адрес файлов — от того же сервера, что и API (в тестах он свой).
+    const url = `${this.base.replace(/\/bot[^/]*$/, '')}/file/bot${this.token}/${info.file_path}`;
+    // GET повторять безопасно всегда: скачивание ничего не меняет.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        return await getBytes(url, 120000, maxBytes);
+      } catch (e) {
+        const net = !e.status && e.message !== 'Файл слишком большой';
+        if (!net || attempt >= 2) {
+          throw net ? Object.assign(new Error(`Telegram не отдал файл: ${e.code || e.message}`), { network: true }) : e;
+        }
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((r) => setTimeout(r, (attempt + 1) * 300));
+      }
+    }
   }
 }
 
