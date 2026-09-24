@@ -176,5 +176,117 @@ console.log('\n=== Документы ===');
   ok(html.includes('&lt;script&gt;'), 'она экранируется');
 }
 
-console.log(bad ? `\nне прошло: ${bad}` : '\nвсе атаки отражены ✅');
-process.exit(bad ? 1 : 0);
+// ---------- сервер смет: живой процесс ----------
+
+/*
+ * Эти проверки поднимают настоящий server.js на свободном порту со своей
+ * базой: вход в админку и приём заказа проверяются тем же путём, каким по
+ * ним ходит браузер, а не вызовом функции.
+ */
+const { spawn } = require('node:child_process');
+const fsR = require('node:fs');
+const osR = require('node:os');
+const pathR = require('node:path');
+const netR = require('node:net');
+
+const freePort = () => new Promise((resolve) => {
+  const srv = netR.createServer();
+  srv.listen(0, '127.0.0.1', () => { const { port } = srv.address(); srv.close(() => resolve(port)); });
+});
+
+async function startSmeta(env = {}) {
+  const port = await freePort();
+  const dbPath = pathR.join(osR.tmpdir(), `smeta-${process.pid}-${port}.db`);
+  const child = spawn(process.execPath, ['server.js'], {
+    cwd: __dirname,
+    env: { ...process.env, ADMIN_PASSWORD: '', ...env, PORT: String(port), TRAPEZA_DB: dbPath },
+    stdio: 'ignore',
+  });
+  const base = `http://127.0.0.1:${port}`;
+  for (let i = 0; i < 100; i += 1) {
+    try { await fetch(`${base}/api/settings`); break; } catch (_) { await new Promise((r) => setTimeout(r, 100)); }
+  }
+  const post = async (url, body) => {
+    const r = await fetch(`${base}${url}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    return { status: r.status, json: await r.json().catch(() => ({})) };
+  };
+  const stop = () => {
+    child.kill();
+    for (const f of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) fsR.rmSync(f, { force: true });
+  };
+  return { base, post, stop };
+}
+
+(async () => {
+  console.log('\n=== Сервер смет: вход в админку ===');
+  {
+    /*
+     * Пароль «trapeza» стоял в seed.js, а репозиторий публичный — то есть
+     * войти в админку с чужими сметами и токеном бота мог любой, кто
+     * прочитал код. Пустая настройка пускала с пустым паролем.
+     */
+    const s = await startSmeta();
+    const def = await s.post('/api/login', { password: 'trapeza' });
+    ok(def.status === 403, 'опубликованный пароль «trapeza» не пускает', def.status);
+    const empty = await s.post('/api/login', { password: '' });
+    ok(empty.status === 403, 'пустой пароль не пускает', empty.status);
+    ok(/ADMIN_PASSWORD/.test(empty.json.error || ''), 'и сказано, как задать свой', empty.json.error);
+    s.stop();
+
+    const s2 = await startSmeta({ ADMIN_PASSWORD: 'длинный-свой-пароль-7' });
+    const good = await s2.post('/api/login', { password: 'длинный-свой-пароль-7' });
+    ok(good.status === 200, 'свой пароль из окружения пускает', good.status);
+    const wrong = await s2.post('/api/login', { password: 'trapeza' });
+    ok(wrong.status === 403, 'а старый опубликованный — нет', wrong.status);
+    s2.stop();
+  }
+
+  console.log('\n=== Сервер смет: цены и файлы ===');
+  {
+    const s = await startSmeta();
+    const boot = await (await fetch(`${s.base}/api/bootstrap`)).json();
+    const dish = (boot.menu || []).find((m) => !m.price_tbd && Number(m.price) > 1);
+    /*
+     * Цена — из меню, а не из запроса. Раньше сохранялось то, что прислал
+     * браузер, и смета на фирменном бланке выходила с ценой в рубль.
+     */
+    const r = await s.post('/api/orders', {
+      client_name: 'Тест', phone: '1', transport: 0,
+      items: [{ id: dish.id, name: dish.name, qty: 2, price: 1, price_tbd: 0 }],
+    });
+    const saved = r.json.code ? await (await fetch(`${s.base}/api/orders/${r.json.code}`)).json() : {};
+    const it = ((saved.order || {}).items || [])[0] || {};
+    ok(r.status === 201 && it.price === dish.price, 'цена позиции — из меню, а не из запроса',
+      `${it.price} против ${dish.price}`);
+    ok(saved.order && Number(saved.order.transport) === Number(saved.settings.transport_default),
+      'доставку назначает меню, а не посетитель', saved.order && saved.order.transport);
+    const fake = await s.post('/api/orders', {
+      client_name: 'Тест', phone: '1', items: [{ id: 999999, name: 'Икра по рублю', qty: 1, price: 1 }],
+    });
+    ok(fake.status === 400, 'позицию, которой нет в меню, не сохранить', fake.status);
+
+    /*
+     * Выход в соседний каталог. Проверка «путь начинается с public» пропускала
+     * «public-что-угодно»: «/..%2Fpublic-x/файл» отдавал файл рядом с сайтом.
+     */
+    const sib = pathR.join(__dirname, `public-selftest-${process.pid}`);
+    fsR.mkdirSync(sib, { recursive: true });
+    fsR.writeFileSync(pathR.join(sib, 'secret.txt'), 'секрет');
+    try {
+      const leak = await fetch(`${s.base}/..%2Fpublic-selftest-${process.pid}/secret.txt`);
+      const body = await leak.text();
+      ok(!body.includes('секрет'), 'файл из соседнего каталога не отдаётся', `${leak.status} ${body.slice(0, 20)}`);
+    } finally {
+      fsR.rmSync(sib, { recursive: true, force: true });
+    }
+    s.stop();
+  }
+
+  console.log(bad ? `\nне прошло: ${bad}` : '\nвсе атаки отражены ✅');
+  process.exit(bad ? 1 : 0);
+})().catch((e) => {
+  console.log(`  ❌ проверка оборвалась → ${e.message}`);
+  process.exit(1);
+});

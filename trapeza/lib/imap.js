@@ -18,6 +18,7 @@
 
 const tls = require('node:tls');
 const net = require('node:net');
+const { guardedTarget } = require('./mail');
 
 const CRLF = '\r\n';
 
@@ -144,16 +145,20 @@ class Reader {
 }
 
 class Imap {
-  constructor({ host, port = 993, secure = true, user, pass, timeout = 30000 }) {
-    Object.assign(this, { host, port, secure, user, pass, timeout });
+  constructor({ host, port = 993, secure = true, user, pass, timeout = 30000, guard = false }) {
+    Object.assign(this, { host, port, secure, user, pass, timeout, guard });
     this.n = 0;
   }
 
   async connect() {
     this.socket = await new Promise((resolve, reject) => {
+      // guard — ящик пользователя: адрес проверяется в момент подключения
+      // (см. guardedTarget в mail.js — там же про DNS rebinding).
+      let extra = {};
+      try { extra = this.guard ? guardedTarget(this.host) : {}; } catch (e) { reject(e); return; }
       const s = this.secure
-        ? tls.connect({ host: this.host, port: this.port, servername: this.host })
-        : net.connect({ host: this.host, port: this.port });
+        ? tls.connect({ host: this.host, port: this.port, servername: this.host, ...extra })
+        : net.connect({ host: this.host, port: this.port, ...extra });
       const fail = (e) => { s.destroy(); reject(e); };
       s.setTimeout(this.timeout, () => fail(new Error('не удалось соединиться с почтовым сервером')));
       s.once('error', fail);
@@ -181,6 +186,15 @@ class Imap {
   async login() {
     // Пароль в кавычках: в нём бывают пробелы, а спецсимволы экранируем.
     const esc = (v) => String(v).replace(/([\\"])/g, '\\$1');
+    /*
+     * Перевод строки в строке в кавычках IMAP не допускает, а мы его не
+     * отсекали: пароль «x"\r\na2 DELETE INBOX» давал серверу вторую команду
+     * от имени владельца ящика. Кавычки экранируются, переводы строк —
+     * нет, поэтому такие логин и пароль просто не отправляем.
+     */
+    if (/[\r\n\0]/.test(`${this.user}${this.pass}`)) {
+      throw new Error('в логине или пароле недопустимые символы перевода строки');
+    }
     try {
       await this.send(`LOGIN "${esc(this.user)}" "${esc(this.pass)}"`);
     } catch (e) {

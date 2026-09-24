@@ -197,6 +197,53 @@ async function main() {
     `${Date.now() - started} мс`);
   mute.close();
 
+  console.log('\n── чужие команды и чужие адреса ──');
+  {
+    /*
+     * Пароль с переводом строки. Кавычки в команде LOGIN экранировались,
+     * переводы строк — нет, и «x"\r\na9 DELETE INBOX» доходил до сервера
+     * второй командой от имени владельца ящика.
+     */
+    const inj = fakeImap([]);
+    const pi = await listen(inj.server);
+    const ri = await fetchNew({ ...cfg, port: pi, pass: 'x"\r\na9 DELETE INBOX' });
+    ok(!ri.ok, 'пароль с переводом строки не отправляется', ri.error);
+    ok(!inj.log.commands.some((c) => /DELETE/i.test(c)), 'и чужая команда до сервера не дошла',
+      inj.log.commands.join(' / '));
+    inj.server.close();
+
+    /*
+     * Подмена отправителя. Имя «<boss@bank.ru>», закодированное по RFC 2047,
+     * после раскодирования давало первые угловые скобки — и письмо
+     * злоумышленника считалось письмом известного контрагента.
+     */
+    const spoof = mime.parseMessage(letter({ subject: 'Счёт', from: 'x@evil.com', fromName: '<boss@bank.ru>' }));
+    ok(spoof.from === 'x@evil.com', 'адрес отправителя — настоящий, а не из имени', spoof.from);
+
+    /*
+     * Адрес во внутреннюю сеть. Проверка при сохранении ящика есть, но
+     * соединение потом открывается по имени заново, и DNS с коротким TTL
+     * отвечает уже 127.0.0.1. Теперь адрес проверяется в момент подключения:
+     * «localhost» ведёт на ту же петлю, что и подменённая запись.
+     */
+    const keepLocal = process.env.MAIL_ALLOW_LOCAL;
+    delete process.env.MAIL_ALLOW_LOCAL;
+    const inner = fakeImap([]);
+    const pn = await listen(inner.server);
+    let reached = 0;
+    inner.server.on('connection', () => { reached += 1; });
+    const rn = await fetchNew({ ...cfg, host: 'localhost', port: pn, guard: true });
+    ok(!rn.ok && reached === 0, 'имя, ведущее во внутреннюю сеть, не соединяется',
+      rn.ok ? 'соединились' : `${rn.error}; соединений: ${reached}`);
+    const rl = await fetchNew({ ...cfg, host: '127.0.0.1', port: pn, guard: true });
+    ok(!rl.ok && reached === 0, 'и адрес петли напрямую — тоже', rl.error);
+    const sent = await require('./lib/mail').sendMail({ to: 'a@b.ru', subject: 's', text: 't' },
+      { host: 'localhost', port: pn, secure: false, from: 'me@x.ru', guard: true, timeout: 2000 });
+    ok(!sent.ok && reached === 0, 'отправка письма через такой адрес тоже не соединяется', sent.error);
+    inner.server.close();
+    if (keepLocal !== undefined) process.env.MAIL_ALLOW_LOCAL = keepLocal;
+  }
+
   console.log('\n── бот забирает письма ──');
   {
     process.env.MAIL_KEY = 'test-key';

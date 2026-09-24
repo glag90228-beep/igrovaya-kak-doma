@@ -28,7 +28,66 @@
 
 const net = require('node:net');
 const tls = require('node:tls');
+const dns = require('node:dns');
 const crypto = require('node:crypto');
+
+/** Внутренний ли адрес: петля, частные сети, link-local, свои IPv6. */
+function isPrivateIp(ip) {
+  const v = String(ip || '');
+  if (net.isIPv4(v)) {
+    const [a, b] = v.split('.').map(Number);
+    return a === 10 || a === 127 || a === 0
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || (a === 169 && b === 254)
+      || (a === 100 && b >= 64 && b <= 127)   // CGNAT
+      || a >= 224;                            // multicast и выше
+  }
+  const low = v.toLowerCase().replace(/^\[|\]$/g, '');
+  if (low === '::1' || low === '::' || low.startsWith('fe80:')) return true;
+  if (/^f[cd][0-9a-f]{2}:/.test(low)) return true;          // уникальные локальные
+  const m = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(low);      // IPv4 в обёртке IPv6
+  return m ? isPrivateIp(m[1]) : false;
+}
+
+/**
+ * Параметры соединения, которые не пустят во внутреннюю сеть.
+ *
+ * Адрес почтового сервера вводит пользователь, и проверки при сохранении
+ * мало: соединение потом годами открывается по имени, и каждый раз имя
+ * резолвится заново. Свой DNS с коротким TTL отдаёт на проверке внешний
+ * адрес, а на подключении — 127.0.0.1 (DNS rebinding), и мы стучимся
+ * к собственным службам. Поэтому проверяем в момент подключения и
+ * подключаемся ровно к тому адресу, который проверили: своя функция lookup
+ * у сокета — единственный резолв, другого не будет.
+ *
+ * IP-литерал в lookup не попадает вовсе — его проверяем сразу.
+ *
+ * @returns {object} что добавить к опциям net/tls.connect
+ */
+function guardedTarget(host) {
+  // Калитка для прогонов: игрушечные серверы поднимаются на 127.0.0.1.
+  if (process.env.MAIL_ALLOW_LOCAL === '1') return {};
+  const h = String(host || '').replace(/^\[|\]$/g, '');
+  if (net.isIP(h)) {
+    if (isPrivateIp(h)) throw new Error('адрес внутренней сети — почтовый сервер должен быть внешним');
+    return {};
+  }
+  return {
+    lookup(name, opts, cb) {
+      dns.lookup(name, { ...opts, all: true }, (err, addrs) => {
+        if (err) { cb(err); return; }
+        const list = Array.isArray(addrs) ? addrs : [];
+        if (!list.length || list.some((a) => isPrivateIp(a.address))) {
+          cb(Object.assign(new Error('адрес ведёт во внутреннюю сеть'), { code: 'EPRIVATE' }));
+          return;
+        }
+        if (opts && opts.all) cb(null, list);
+        else cb(null, list[0].address, list[0].family);
+      });
+    },
+  };
+}
 
 const CRLF = '\r\n';
 
@@ -266,11 +325,14 @@ function conversation(socket, timeout) {
   return { say, read, detach };
 }
 
-function connect({ host, port, secure, timeout }) {
+function connect({ host, port, secure, timeout, guard }) {
   return new Promise((resolve, reject) => {
+    // guard — ящик пользователя: адрес проверяем здесь же, при подключении.
+    let extra = {};
+    try { extra = guard ? guardedTarget(host) : {}; } catch (e) { reject(e); return; }
     const socket = secure
-      ? tls.connect({ host, port, servername: host })
-      : net.connect({ host, port });
+      ? tls.connect({ host, port, servername: host, ...extra })
+      : net.connect({ host, port, ...extra });
     const fail = (e) => { socket.destroy(); reject(e); };
     socket.setTimeout(timeout, () => fail(new Error('превышено время ожидания сервера')));
     socket.once('error', fail);
@@ -375,5 +437,5 @@ async function sendMail(letter, options = {}) {
 
 module.exports = {
   sendMail, buildMessage, mailAvailable, mailHint, validEmail,
-  encodeHeader, encodeFilename, dotStuff, cfg,
+  encodeHeader, encodeFilename, dotStuff, cfg, isPrivateIp, guardedTarget,
 };

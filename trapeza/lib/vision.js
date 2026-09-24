@@ -321,7 +321,20 @@ async function readInvoice(buffer, mime = 'image/jpeg') {
       : parsed;
     return { ok: true, fields, text: String(text).slice(0, 4000) };
   } catch (e) {
-    return { ok: false, error: e.message };
+    /*
+     * Человеку — понятная фраза, подробности — в журнал сервера.
+     *
+     * Здесь отдавался e.message как есть, а в нём ответ провайдера: «Gemini
+     * 400: {…}» до двухсот символов, с текстом их внутренних ошибок, а при
+     * пустом ключе — имя переменной окружения. Бот и приложение показывали
+     * это пользователю дословно.
+     */
+    console.error('распознавание снимка:', e && e.message);
+    return {
+      ok: false,
+      error: 'сервис распознавания сейчас не ответил — попробуйте чуть позже',
+      detail: String((e && e.message) || e),
+    };
   }
 }
 

@@ -207,13 +207,30 @@ function parseMessage(raw) {
 
   const at = s.indexOf('\r\n\r\n') >= 0 ? s.indexOf('\r\n\r\n') : s.indexOf('\n\n');
   const h = parseHeaders(at === -1 ? s : s.slice(0, at));
-  const fromRaw = decodeHeader(h.from || '');
-  const addr = (/<([^>]+)>/.exec(fromRaw) || [])[1] || fromRaw.trim();
+  /*
+   * Адрес — из СЫРОГО заголовка и последний в угловых скобках.
+   *
+   * Раньше заголовок сначала раскодировали, а потом брали первые скобки.
+   * Имя «=?UTF-8?B?PGJvc3NAYmFuay5ydT4=?=» раскодируется в «<boss@bank.ru>»,
+   * и письмо злоумышленника принималось за письмо известного контрагента:
+   * его вложение уходило в документы этого клиента. Настоящий адрес в
+   * заголовке всегда последний и всегда в скобках — закодированным он быть
+   * не может, так что берём его до раскодирования. Скобки в кавычках имени
+   * («"<boss@bank.ru>" <x@evil.com>») обходит то же правило: последний.
+   */
+  const rawFrom = String(h.from || '');
+  const bracketed = [...rawFrom.matchAll(/<([^<>]*)>/g)];
+  const bare = rawFrom.trim();
+  const addr = bracketed.length
+    ? bracketed[bracketed.length - 1][1]
+    : (/^[^\s@<>"]+@[^\s@<>"]+$/.test(bare) ? bare : '');
+  const fromRaw = decodeHeader(bracketed.length
+    ? rawFrom.slice(0, bracketed[bracketed.length - 1].index) : '');
 
   return {
     ...out,
     from: String(addr).trim().toLowerCase(),
-    fromName: fromRaw.replace(/<[^>]*>/, '').replace(/^"|"$/g, '').trim(),
+    fromName: fromRaw.replace(/^\s*"|"\s*$/g, '').trim(),
     subject: decodeHeader(h.subject || ''),
     date: h.date || '',
     messageId: h['message-id'] || '',

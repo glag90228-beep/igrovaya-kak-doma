@@ -281,7 +281,8 @@ function selectedItems() {
   for (const m of MENU) {
     const qty = picked.get(m.id);
     if (qty > 0) {
-      out.push({ name: m.name, unit: m.unit, qty, price: m.price, price_tbd: m.price_tbd, photo: m.photo });
+      // id — по нему сервер берёт цену из меню; остальное — для подсчёта здесь.
+      out.push({ id: m.id, name: m.name, unit: m.unit, qty, price: m.price, price_tbd: m.price_tbd, photo: m.photo });
     }
   }
   return out;

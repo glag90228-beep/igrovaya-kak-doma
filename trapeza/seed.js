@@ -18,7 +18,9 @@ const SETTINGS = {
   transport_default: '1000',
   smeta_note: 'Срок действия сметы — 7 дней. Цены указаны в рублях с учётом сервировки. '
     + 'Количество и состав меню согласовываются с заказчиком.',
-  admin_password: 'trapeza',
+  // Пароля по умолчанию нет: репозиторий публичный, и любой вписанный сюда
+  // пароль опубликован. Пароль задаётся ADMIN_PASSWORD в окружении (server.js).
+  admin_password: '',
 
   // Куда клиент может написать напрямую (кнопка на сайте и в смете).
   max_link: 'https://max.ru/u/f9LHodD0cOIz8xuJ-IfBNwM6edcBt6rQkkcUaDH9taCFdfnYG6hHcI6o6Uo',

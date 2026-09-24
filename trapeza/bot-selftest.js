@@ -620,6 +620,30 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   ok(last().includes('Текущее сальдо'), 'операция занесена со снимка');
   ok(last().includes('занёс со снимка') || sent[sent.length - 2].text.includes('занёс со снимка'),
     'в подтверждении сказано, что это с фотографии');
+
+  /*
+   * Провайдер ответил ошибкой. Раньше человеку уходило её тело целиком —
+   * «Gemini 400: {…}» с внутренними сообщениями сервиса.
+   */
+  {
+    const keepFetch = global.fetch;
+    const keepKey = process.env.GEMINI_API_KEY;
+    process.env.VISION_PROVIDER = 'gemini';
+    process.env.GEMINI_API_KEY = 'тестовый-ключ';
+    global.fetch = async () => new Response('{"error":{"message":"internal quota bucket 7f3a exceeded"}}',
+      { status: 400 });
+    const keepErr = console.error;
+    console.error = () => {};
+    try {
+      await handleUpdate(tg, { message: photoMsg });
+    } finally {
+      console.error = keepErr;
+      global.fetch = keepFetch;
+      if (keepKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = keepKey;
+    }
+    ok(/Распознать не вышло/.test(last()) && !/Gemini|quota|7f3a|400/.test(last()),
+      'ошибка провайдера не показывается человеку дословно', last().slice(0, 90));
+  }
   delete process.env.VISION_PROVIDER;
 
   console.log('\n── разбор вставленных реквизитов ──');
@@ -2844,6 +2868,33 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const r1 = await backup.makeBackup();
     ok(fs.existsSync(r1.file) && r1.size > 0, 'копия создана', `${Math.round(r1.size / 1024)} КБ`);
     ok(r1.file.endsWith('.db.gz'), 'копия сжата', path.basename(r1.file));
+    // В копии вся база — читать её может только владелец.
+    ok((fs.statSync(r1.file).mode & 0o077) === 0 && (fs.statSync(dir).mode & 0o077) === 0,
+      'копия и каталог закрыты от остальных пользователей сервера',
+      `${(fs.statSync(r1.file).mode & 0o777).toString(8)} / ${(fs.statSync(dir).mode & 0o777).toString(8)}`);
+    ok(!fs.readdirSync(dir).some((f) => f.startsWith('.tmp-')), 'временных файлов не осталось');
+
+    /*
+     * Оборванная запись не выдаёт себя за копию. Ломаем сжатие посередине —
+     * раньше под итоговым именем оставался обрезок, и список считал его
+     * копией.
+     */
+    {
+      const keepWs = fs.createWriteStream;
+      const { Writable } = require('node:stream');
+      // Первый же кусок архива — «кончилось место»; файл при этом уже создан.
+      fs.createWriteStream = (f, o) => {
+        fs.writeFileSync(f, 'обрезок', o);
+        return new Writable({ write(c, e, cb) { cb(new Error('кончилось место')); } });
+      };
+      const listBefore = backup.list().length;
+      let failed = '';
+      try { await backup.makeBackup(); } catch (e) { failed = e.message; } finally { fs.createWriteStream = keepWs; }
+      ok(failed && backup.list().length === listBefore, 'оборванная копия в список не попала',
+        `${failed || 'не упала'}; копий ${backup.list().length}`);
+      ok(!fs.readdirSync(dir).some((f) => f.startsWith('.tmp-')), 'и обрезков не осталось',
+        fs.readdirSync(dir).join(', '));
+    }
 
     // Главное: из копии должна открываться рабочая база с теми же данными.
     const zlib = require('node:zlib');

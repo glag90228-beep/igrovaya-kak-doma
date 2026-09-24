@@ -24,7 +24,7 @@ const net = require('node:net');
 const { db } = require('../db');
 require('./bot-db');                   // таблицы создаёт он, порядок важен
 const { seal, openBox, canEncrypt } = require('./crypto-box');
-const { validEmail } = require('./mail');
+const { validEmail, isPrivateIp } = require('./mail');
 
 /*
  * Куда разрешено ходить за почтой.
@@ -39,24 +39,7 @@ const { validEmail } = require('./mail');
  */
 const MAIL_PORTS = new Set([25, 143, 465, 587, 993, 2525]);
 
-/** Внутренний ли адрес: петля, частные сети, link-local, свои IPv6. */
-function isPrivateIp(ip) {
-  const v = String(ip || '');
-  if (net.isIPv4(v)) {
-    const [a, b] = v.split('.').map(Number);
-    return a === 10 || a === 127 || a === 0
-      || (a === 172 && b >= 16 && b <= 31)
-      || (a === 192 && b === 168)
-      || (a === 169 && b === 254)
-      || (a === 100 && b >= 64 && b <= 127)   // CGNAT
-      || a >= 224;                            // multicast и выше
-  }
-  const low = v.toLowerCase().replace(/^\[|\]$/g, '');
-  if (low === '::1' || low === '::' || low.startsWith('fe80:')) return true;
-  if (/^f[cd][0-9a-f]{2}:/.test(low)) return true;          // уникальные локальные
-  const m = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(low);      // IPv4 в обёртке IPv6
-  return m ? isPrivateIp(m[1]) : false;
-}
+// isPrivateIp живёт в mail.js: им же проверяется адрес при каждом подключении.
 
 /**
  * Пускать ли к этому серверу. Резолвим имя: проверять одну лишь строку
@@ -300,6 +283,8 @@ function resolve(userId) {
         pass,
         from: m.from_addr,
         fromName: m.from_name,
+        // Адрес ввёл пользователь — проверяем его при каждом подключении.
+        guard: true,
       },
     };
   }
@@ -323,7 +308,7 @@ function resolveImap(userId) {
   if (pass == null) return { ok: false, reason: 'Пароль от ящика не читается — подключите почту заново.' };
   return {
     ok: true,
-    config: { host: m.imap_host, port: m.imap_port || 993, secure: true, user: m.login, pass },
+    config: { host: m.imap_host, port: m.imap_port || 993, secure: true, user: m.login, pass, guard: true },
     lastUid: m.last_uid || 0,
   };
 }

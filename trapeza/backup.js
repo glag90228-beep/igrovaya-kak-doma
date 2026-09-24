@@ -58,22 +58,46 @@ function list() {
     .sort((a, b) => b.mtimeMs - a.mtimeMs);
 }
 
-/** Снимает копию. @returns {Promise<{file:string, size:number}>} */
+/**
+ * Снимает копию. @returns {Promise<{file:string, size:number}>}
+ *
+ * Два правила, которых раньше не было.
+ *
+ * Права — только владельцу. В копии вся база: клиенты, документы, почтовые
+ * ящики. Файлы создавались по umask, то есть обычно 0644, и читать их мог
+ * любой пользователь сервера. Теперь каталог 0700, файлы 0600.
+ *
+ * Готовое имя — только готовой копии. Архив писался сразу под итоговым
+ * именем, и оборванная запись (кончилось место, процесс убили) выглядела
+ * полноценной копией: попадала в «последние три», которые prune не трогает,
+ * и вытесняла хорошую. Теперь пишем во временный файл и переименовываем,
+ * когда он дописан и сброшен на диск.
+ */
 async function makeBackup() {
-  fs.mkdirSync(DIR, { recursive: true });
+  fs.mkdirSync(DIR, { recursive: true, mode: 0o700 });
+  fs.chmodSync(DIR, 0o700);        // каталог мог существовать с прежними правами
   const raw = path.join(DIR, `.tmp-${process.pid}.db`);
-  if (fs.existsSync(raw)) fs.unlinkSync(raw);
-
-  // Согласованный снимок живой базы. Кавычки удваиваем: путь идёт в SQL.
-  db.exec(`VACUUM INTO '${raw.replace(/'/g, "''")}'`);
-
+  const part = path.join(DIR, `.tmp-${process.pid}.db.gz`);
   const file = path.join(DIR, `trapeza-${stamp()}.db.gz`);
-  await pipeline(
-    fs.createReadStream(raw),
-    zlib.createGzip({ level: 9 }),
-    fs.createWriteStream(file),
-  );
-  fs.unlinkSync(raw);
+  for (const f of [raw, part]) if (fs.existsSync(f)) fs.unlinkSync(f);
+
+  // VACUUM INTO создаёт файл сам, по umask процесса, — сужаем её на время.
+  const umask = process.umask(0o077);
+  try {
+    // Согласованный снимок живой базы. Кавычки удваиваем: путь идёт в SQL.
+    db.exec(`VACUUM INTO '${raw.replace(/'/g, "''")}'`);
+    await pipeline(
+      fs.createReadStream(raw),
+      zlib.createGzip({ level: 9 }),
+      fs.createWriteStream(part, { mode: 0o600 }),
+    );
+    const fd = fs.openSync(part, 'r');
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(part, file);
+  } finally {
+    process.umask(umask);
+    for (const f of [raw, part]) if (fs.existsSync(f)) fs.unlinkSync(f);
+  }
   return { file, size: fs.statSync(file).size };
 }
 

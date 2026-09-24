@@ -112,6 +112,31 @@ function requireAdmin(req, res) {
   return false;
 }
 
+/*
+ * Пароль админки.
+ *
+ * В seed.js по умолчанию стоял «trapeza», а репозиторий публичный — пароль
+ * был опубликован вместе с кодом. Пустая же настройка пускала с пустым
+ * паролем. Теперь пароль берётся из ADMIN_PASSWORD в окружении сервера
+ * (или из настройки, если его сменили в самой админке), а пустой и
+ * опубликованный вход не открывают вовсе — лучше закрытая админка, чем
+ * открытая всем, кто прочитал код.
+ */
+const PUBLISHED_PASSWORDS = new Set(['trapeza']);
+
+function adminPassword() {
+  const p = String(process.env.ADMIN_PASSWORD || getSetting('admin_password', '') || '');
+  return p && !PUBLISHED_PASSWORDS.has(p) ? p : '';
+}
+
+/** Сравнение без утечки по времени: хэши одной длины, сравнение постоянное. */
+function passwordOk(given) {
+  const want = adminPassword();
+  if (!want) return false;
+  const h = (v) => crypto.createHash('sha256').update(String(v || ''), 'utf8').digest();
+  return crypto.timingSafeEqual(h(given), h(want));
+}
+
 // ---------------------------------------------------------------- нормализация данных
 
 /** Настройки, которые никогда не уходят в браузер. */
@@ -170,6 +195,34 @@ function saveOrderItems(orderId, items) {
   });
 }
 
+/**
+ * Позиции заказа с сайта — по меню, а не по тому, что прислал браузер.
+ *
+ * Публичный конструктор присылал название, цену и «цену по запросу» сам, и
+ * сервер сохранял их как есть. Любой мог собрать смету на фирменном бланке
+ * с ценой в рубль за позицию и показать её как нашу — а менеджеру ещё и
+ * приходило уведомление со ссылкой. Теперь от браузера берём только, что
+ * выбрано и сколько; остальное — из действующего меню.
+ *
+ * @returns {{items:Array}|{error:string}}
+ */
+function priceFromMenu(items) {
+  const menu = listMenu(true);
+  const byId = new Map(menu.map((m) => [Number(m.id), m]));
+  const out = [];
+  for (const it of items || []) {
+    // Старые страницы в кэше браузера шлют без id — узнаём по точному имени.
+    const m = byId.get(Number(it && it.id)) || menu.find((x) => x.name === String((it && it.name) || ''));
+    if (!m) return { error: `Позиции «${String((it && it.name) || '').slice(0, 60)}» нет в меню` };
+    const qty = Number(it.qty);
+    if (!(qty > 0) || qty > 100000) return { error: `Неверное количество у «${m.name}»` };
+    out.push({
+      name: m.name, unit: m.unit, qty, price: m.price, price_tbd: m.price_tbd, photo: m.photo,
+    });
+  }
+  return { items: out };
+}
+
 function nextOrderNumber() {
   const row = db.prepare('SELECT MAX(number) AS n FROM orders').get();
   return (row && row.n ? Number(row.n) : 0) + 1;
@@ -189,10 +242,17 @@ function serveFile(res, filePath) {
   });
 }
 
-/** Защита от выхода за пределы каталога. */
+/**
+ * Защита от выхода за пределы каталога.
+ *
+ * Сравниваем с базой ВМЕСТЕ с разделителем: голый startsWith пропускал
+ * соседа с тем же началом имени — «../public-old/…» при базе «public»
+ * нормализуется в «…/public-old/…», и строка честно начинается с «…/public».
+ */
 function safeJoin(base, target) {
-  const p = path.normalize(path.join(base, target));
-  return p.startsWith(base) ? p : null;
+  const root = path.resolve(base);
+  const p = path.resolve(root, `.${path.sep}${target}`);
+  return p === root || p.startsWith(root + path.sep) ? p : null;
 }
 
 // ---------------------------------------------------------------- маршруты API
@@ -212,11 +272,13 @@ async function handleApi(req, res, url) {
     if (!Array.isArray(body.items) || body.items.length === 0) {
       return fail(res, 400, 'Не выбрано ни одной позиции');
     }
+    const priced = priceFromMenu(body.items);
+    if (priced.error) return fail(res, 400, priced.error);
     const code = makeCode();
     const number = nextOrderNumber();
     const ts = nowIso();
-    const transport = body.transport === undefined || body.transport === null
-      ? Number(getSetting('transport_default', 0)) : Number(body.transport) || 0;
+    // Доставку назначает менеджер, а не посетитель сайта: из тела не берём.
+    const transport = Number(getSetting('transport_default', 0)) || 0;
     const info = db.prepare(`
       INSERT INTO orders(code, number, title, client_name, phone, event_date, place, guests,
                          comment, transport, status, created_at, updated_at)
@@ -224,7 +286,7 @@ async function handleApi(req, res, url) {
       code, number, String(body.title || 'Заказ'), String(body.client_name || ''),
       String(body.phone || ''), String(body.event_date || ''), String(body.place || ''),
       Number(body.guests) || 0, String(body.comment || ''), transport, 'новая', ts, ts);
-    saveOrderItems(Number(info.lastInsertRowid), body.items);
+    saveOrderItems(Number(info.lastInsertRowid), priced.items);
     pushNotification(req, code, 'new');
     return json(res, { code, number }, 201);
   }
@@ -243,13 +305,16 @@ async function handleApi(req, res, url) {
         return fail(res, 409, 'Смета уже согласована — изменения вносит менеджер');
       }
       const body = await readJson(req);
+      // Та же проверка, что при создании: правка по ссылке — тоже публичный путь.
+      const priced = Array.isArray(body.items) ? priceFromMenu(body.items) : null;
+      if (priced && priced.error) return fail(res, 400, priced.error);
       db.prepare(`UPDATE orders SET client_name=?, phone=?, event_date=?, place=?, guests=?,
                   comment=?, updated_at=? WHERE id=?`).run(
         String(body.client_name ?? order.client_name), String(body.phone ?? order.phone),
         String(body.event_date ?? order.event_date), String(body.place ?? order.place),
         Number(body.guests) || order.guests, String(body.comment ?? order.comment),
         nowIso(), order.id);
-      if (Array.isArray(body.items)) saveOrderItems(order.id, body.items);
+      if (priced) saveOrderItems(order.id, priced.items);
       pushNotification(req, m[1], 'edit');
       const updated = loadOrderByCode(m[1]);
       return json(res, { order: updated, totals: orderTotals(updated) });
@@ -519,7 +584,11 @@ const server = http.createServer(async (req, res) => {
       if (pathname === '/api/login' && req.method === 'POST') {
         const buf = await readBody(req);
         const body = buf.length ? JSON.parse(buf.toString('utf8')) : {};
-        if (String(body.password || '') !== getSetting('admin_password', '')) {
+        if (!adminPassword()) {
+          return fail(res, 403, 'Вход в админку закрыт: пароль не задан. '
+            + 'Задайте ADMIN_PASSWORD в окружении сервера и перезапустите его.');
+        }
+        if (!passwordOk(body.password)) {
           return fail(res, 403, 'Неверный пароль');
         }
         const token = crypto.randomBytes(24).toString('hex');
