@@ -321,8 +321,21 @@ fi
 
 echo
 echo "Проверка изнутри:"
-curl -sS -o /dev/null -w '  сайт          → %{http_code}\n' \
-  -H "Host: $DOMAIN" http://127.0.0.1/ || true
+
+# С сертификатом проверяем по HTTPS: certbot ставит перенаправление с http,
+# и проверка по http видела одни 301 — «ожидался 401» и совет получить
+# сертификат, который давно получен. Запрос всё равно не выходит наружу:
+# --resolve направляет имя на 127.0.0.1.
+if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+  HAS_CERT=1
+  CHECK=(--resolve "$DOMAIN:443:127.0.0.1" -k)
+  BASE="https://$DOMAIN"
+else
+  HAS_CERT=0
+  CHECK=(-H "Host: $DOMAIN")
+  BASE="http://127.0.0.1"
+fi
+curl -sS -o /dev/null -w '  сайт            → %{http_code}\n' "${CHECK[@]}" "$BASE/" || true
 
 # Доходит ли уведомление об оплате до приёмника.
 #
@@ -333,20 +346,28 @@ curl -sS -o /dev/null -w '  сайт          → %{http_code}\n' \
 # Проверять это обязательно и именно так: раньше маршрута не было вовсе,
 # площадка исправно слала уведомления, они упирались в 404 — деньги
 # списывались, доступ не включался, и узнали мы об этом от покупателя.
-LAVA_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -m 10 -X POST \
-  -H "Host: $DOMAIN" -H 'X-Api-Key: заведомо-неверный' \
-  -H 'Content-Type: application/json' -d '{}' \
-  http://127.0.0.1/lava 2>/dev/null || echo 000)
-case "$LAVA_CODE" in
-  401) echo "  оплата /lava  → 401 (так и надо: приёмник ответил, путь проложен)" ;;
-  404) echo "  оплата /lava  → 404 ⚠️  запрос не доходит до приёмника — оплата работать не будет" ;;
-  502|503) echo "  оплата /lava  → $LAVA_CODE ⚠️  приёмник не отвечает: systemctl status trapeza-lava" ;;
-  *)   echo "  оплата /lava  → $LAVA_CODE (ожидался 401 — посмотрите логи trapeza-lava)" ;;
-esac
+# Оба пути: /platega — нынешний приём оплат, /lava — прежний.
+for HOOK in platega lava; do
+  CODE=$(curl -sS -o /dev/null -w '%{http_code}' -m 10 -X POST "${CHECK[@]}" \
+    -H 'X-Api-Key: заведомо-неверный' -H 'X-Secret: заведомо-неверный' \
+    -H 'Content-Type: application/json' -d '{}' \
+    "$BASE/$HOOK" 2>/dev/null || echo 000)
+  LABEL=$(printf '  оплата /%-8s' "$HOOK")
+  case "$CODE" in
+    401) echo "$LABEL → 401 (так и надо: приёмник ответил, путь проложен)" ;;
+    404) echo "$LABEL → 404 ⚠️  запрос не доходит до приёмника — оплата работать не будет" ;;
+    502|503) echo "$LABEL → $CODE ⚠️  приёмник не отвечает: systemctl status trapeza-lava" ;;
+    *)   echo "$LABEL → $CODE (ожидался 401 — посмотрите /var/log/trapeza/lava.log)" ;;
+  esac
+done
 echo
-echo "Если код 200 — сайт отдаётся. Осталось получить сертификат, один раз:"
-echo
-echo "  certbot --nginx -d $DOMAIN -d www.$DOMAIN"
-echo
-echo "После этого https://$DOMAIN/ откроется без предупреждений,"
-echo "а certbot сам добавит перенаправление с http и продление по расписанию."
+if [ "$HAS_CERT" = 1 ]; then
+  echo "Сертификат на месте — сайт открыт по https://$DOMAIN/"
+else
+  echo "Если код 200 — сайт отдаётся. Осталось получить сертификат, один раз:"
+  echo
+  echo "  certbot --nginx -d $DOMAIN -d www.$DOMAIN"
+  echo
+  echo "После этого https://$DOMAIN/ откроется без предупреждений,"
+  echo "а certbot сам добавит перенаправление с http и продление по расписанию."
+fi

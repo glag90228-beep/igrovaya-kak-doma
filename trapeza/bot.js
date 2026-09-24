@@ -3346,7 +3346,28 @@ async function acceptFacsimile(tg, chatId, user, msg, kind) {
  * Смотрим на имя, а не на mime: Telegram отдаёт для выгрузок из банка то
  * text/plain, то application/octet-stream, то вовсе ничего.
  */
-const STATEMENT_FILE = /\.(csv|txt|ofx|qfx)$/i;
+const STATEMENT_FILE = /\.(csv|txt|ofx|qfx|xlsx|xls)$/i;
+
+/**
+ * Файл, который бот не разбирает, — ответ, а не тишина.
+ *
+ * Раньше документ, не похожий на выписку по расширению, проваливался мимо
+ * всех обработчиков: человек присылал выписку из Сбера в PDF и ждал.
+ * Теперь бот говорит, что это за файл и в каком виде его прислать.
+ */
+async function handleOtherDocument(tg, chatId, user, msg) {
+  const name = String((msg.document && msg.document.file_name) || '');
+  const pdf = /\.pdf$/i.test(name) || /pdf/i.test((msg.document && msg.document.mime_type) || '');
+  const looksStatement = /выписк|statement|vypisk/i.test(name);
+  await tg.sendMessage(chatId, looksStatement || pdf
+    ? `Файл «${esc(name.slice(0, 80))}» я прочитать не могу: ${pdf ? 'в PDF нет таблицы, только изображение страниц' : 'такой формат я не знаю'}.\n\n`
+      + 'Выписку пришлите файлом в одном из форматов:\n'
+      + '• «1С» (текстовый файл .txt) — есть в любом интернет-банке в экспорте выписки;\n'
+      + '• Excel (.xlsx);\n• OFX или CSV.\n\n'
+      + 'Под разбором появится кнопка «📒 Собрать книгу учёта доходов».'
+    : `Файл «${esc(name.slice(0, 80))}» я не разбираю. Умею: выписку из банка (1С, Excel, OFX, CSV) `
+      + 'и фото счёта — его пришлите картинкой.', mainMenu());
+}
 
 /**
  * Разбор выписки прямо в чате.
@@ -3358,20 +3379,28 @@ const STATEMENT_FILE = /\.(csv|txt|ofx|qfx)$/i;
  */
 async function handleStatement(tg, chatId, user, msg) {
   const doc = msg.document;
-  if (doc.file_size > 2 * 1024 * 1024) {
-    await tg.sendMessage(chatId, 'Файл больше 2 МБ — выгрузите выписку за месяц, а не за год.');
+  // Годовая выписка для книги учёта в Excel весит мегабайты — два было мало.
+  if (doc.file_size > 10 * 1024 * 1024) {
+    await tg.sendMessage(chatId, 'Файл больше 10 МБ — выгрузите выписку по кварталам.');
     return;
   }
   await tg.sendChatAction(chatId, 'typing');
 
-  const buf = await tg.downloadFile(doc.file_id, 2 * 1024 * 1024);
+  const buf = await tg.downloadFile(doc.file_id, 10 * 1024 * 1024);
   const org = bdb.currentOrg(user.id);
-  const { format, rows } = bank.parseStatement(buf, { ownAccounts: [org && org.acc].filter(Boolean) });
+  const { format, rows, unsupported } = await bank.parseStatementFile(buf,
+    { ownAccounts: [org && org.acc].filter(Boolean) });
+  if (unsupported === 'xls') {
+    await tg.sendMessage(chatId,
+      'Это старый формат Excel (.xls) — его я не читаю. Откройте файл и сохраните как .xlsx, '
+      + 'или выгрузите выписку в формате «1С» (.txt).', mainMenu());
+    return;
+  }
   if (!rows.length) {
     await tg.sendMessage(chatId,
       'Не нашёл в файле ни одной операции.\n\n'
-      + 'Подойдёт выгрузка «1С Клиент-Банк», OFX или CSV, где есть колонки с датой и суммой. '
-      + 'В интернет-банке это обычно «Экспорт» → «1С».', mainMenu());
+      + 'Подойдёт выгрузка «1С Клиент-Банк», Excel (.xlsx), OFX или CSV, где есть колонки '
+      + 'с датой и суммой.', mainMenu());
     return;
   }
 
@@ -4446,6 +4475,12 @@ async function route(tg, update) {
     const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
     bdb.markActive(user.id);
     return handleStatement(tg, msg.chat.id, user, msg);
+  }
+  if (msg.document) {
+    const from = msg.from || {};
+    const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
+    bdb.markActive(user.id);
+    return handleOtherDocument(tg, msg.chat.id, user, msg);
   }
   if (msg.voice || msg.audio || msg.video_note) {
     const from = msg.from || {};

@@ -3333,14 +3333,19 @@ screens.support = async function support() {
 screens.bank = async function bankScreen() {
   const box = h('div', {}, h('h1', { text: 'Выписка из банка' }));
   box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
-    text: 'Выгрузите выписку в интернет-банке и пришлите файл: 1С «Клиент-Банк», OFX '
-      + 'или CSV. Найду поступления, покажу, от кого они, — отметите нужные, и они '
+    text: 'Выгрузите выписку в интернет-банке и пришлите файл: 1С «Клиент-Банк», Excel, '
+      + 'OFX или CSV. Найду поступления, покажу, от кого они, — отметите нужные, и они '
       + 'попадут в журнал как оплаты.' }));
+  // Книга учёта собирается в чате: сюда за ней приходили и не находили.
+  box.append(h('p', { class: 'small muted', style: 'margin:8px 18px 0',
+    text: 'Книгу учёта доходов собирает бот: пришлите этот же файл в чат с ботом — '
+      + 'под разбором будет кнопка «Собрать книгу».' }));
 
   const cps = (await api('GET', '/api/cps')).cps || [];
   const input = h('input', {
     type: 'file',
-    accept: '.csv,.txt,.ofx,.qfx,text/csv,text/plain',
+    accept: '.csv,.txt,.ofx,.qfx,.xlsx,.xls,.pdf,text/csv,text/plain,'
+      + 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     style: 'display:none',
   });
   const pick = h('button', { class: 'btn' }, 'Выбрать файл выписки');

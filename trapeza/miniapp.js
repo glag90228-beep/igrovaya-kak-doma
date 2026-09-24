@@ -1407,16 +1407,24 @@ const api = {
   async 'POST /api/bank/parse'({ user, body }) {
     const m = /^data:([^;,]*);base64,(.+)$/s.exec(String(body.dataUrl || ''));
     const raw = m ? m[2] : String(body.base64 || '');
-    if (!raw) return { error: 'Пришлите файл выписки: CSV, TXT из Клиент-Банка или OFX.' };
+    if (!raw) return { error: 'Пришлите файл выписки: 1С (.txt), Excel (.xlsx), OFX или CSV.' };
 
     const org = bdb.currentOrg(user.id);
-    const { format, rows } = bank.parseStatement(Buffer.from(raw, 'base64'), {
+    const { format, rows, unsupported } = await bank.parseStatementFile(Buffer.from(raw, 'base64'), {
       ownAccounts: [org && org.acc].filter(Boolean),
     });
+    if (unsupported) {
+      return {
+        error: unsupported === 'pdf'
+          ? 'PDF-выписку прочитать нельзя: в ней нет таблицы, только изображение страниц. '
+            + 'Выгрузите ту же выписку в формате «1С» (.txt) или Excel (.xlsx).'
+          : 'Это старый формат Excel (.xls). Сохраните файл как .xlsx или выгрузите выписку в «1С».',
+      };
+    }
     if (!rows.length) {
       return {
         error: 'В файле не нашлось операций. Подойдёт выгрузка «1С Клиент-Банк», '
-          + 'OFX или CSV, где есть колонки с датой и суммой.',
+          + 'Excel (.xlsx), OFX или CSV, где есть колонки с датой и суммой.',
       };
     }
 

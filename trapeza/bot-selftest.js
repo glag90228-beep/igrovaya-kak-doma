@@ -5188,6 +5188,40 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await tapK('org');
     ok(lastKb().some((b) => b.callback_data === 'taxmode'), 'в настройках организации есть режим налогов',
       lastKb().map((b) => b.text).join(' | '));
+
+    /*
+     * Выписка из Сбера приходит Excel-файлом «Выписка_по_счёту_№_….xlsx».
+     * Бот знал только .txt, .csv и .ofx и такой файл молча пропускал —
+     * человек присылал выписку с подписью «собрать книгу» и ждал ответа.
+     */
+    const xw = new ExcelJS.Workbook();
+    const xs = xw.addWorksheet('Выписка');
+    xs.addRow(['Дата проводки', 'Счет', '', 'Сумма по дебету', 'Сумма по кредиту', '№ документа', 'Назначение платежа']);
+    xs.addRow(['', 'Дебет', 'Кредит', '', '', '', '']);
+    xs.addRow([new Date(Date.UTC(2026, 1, 3)), '40702810900000012345\n7701234560\nООО "Ветер"',
+      '40802810900000000077\n183112345670\nИП Книгин', null, 15000, '31', 'Оплата по счету 7']);
+    const xlsxBuf = Buffer.from(await xw.xlsx.writeBuffer());
+    tg.downloadFile = async () => xlsxBuf;
+    const sentBefore = sent.length;
+    await handleUpdate(tg, { message: { chat, from: who,
+      document: { file_id: 'k-x', file_name: 'Выписка_по_счёту_№_40802_810_9_0000_0000077.xlsx', file_size: xlsxBuf.length } } });
+    ok(sent.length > sentBefore && /Выписка Excel/.test(last()) && bookBtn() && bookBtn().callback_data === 'bank:kudir',
+      'Excel-выписка разобрана, под ней кнопка книги', norm(last()).slice(0, 80));
+    before = files.length;
+    await tapK('bank:kudir');
+    ok(files.length - before === 1, 'и книга из неё собирается', norm(last()).slice(0, 80));
+
+    // PDF и прочие файлы — ответ, а не тишина.
+    tg.downloadFile = async () => Buffer.from('%PDF-1.7');
+    const beforePdf = sent.length;
+    await handleUpdate(tg, { message: { chat, from: who,
+      document: { file_id: 'k-p', file_name: 'Выписка_по_счёту.pdf', mime_type: 'application/pdf', file_size: 8 } } });
+    ok(sent.length > beforePdf && /PDF/.test(last()) && /1С/.test(last()),
+      'на PDF-выписку бот отвечает, в каком виде её прислать', norm(last()).slice(0, 80));
+    const beforeDoc = sent.length;
+    await handleUpdate(tg, { message: { chat, from: who,
+      document: { file_id: 'k-d', file_name: 'договор.docx', file_size: 100 } } });
+    ok(sent.length > beforeDoc, 'на любой другой файл тоже есть ответ', norm(last()).slice(0, 60));
     tg.downloadFile = keepDl;
   }
 

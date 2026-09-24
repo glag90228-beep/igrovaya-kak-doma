@@ -216,6 +216,8 @@ const COL = {
   accPayer: ['счет плательщика', 'счёт плательщика'],
   accPayee: ['счет получателя', 'счёт получателя'],
   direction: ['тип операции', 'направление', 'приход/расход', 'тип', 'direction'],
+  // Номер платёжки: книга учёта пишет его в графу «основание».
+  doc: ['№ документа', 'номер документа', 'n документа', '№ док'],
 };
 
 /**
@@ -259,6 +261,7 @@ function mapHeader(headers) {
   c.payee = findCol(headers, COL.payee, used);
   c.name = findCol(headers, COL.name, used);
   c.direction = findCol(headers, COL.direction, used);
+  c.doc = findCol(headers, COL.doc, used);
   return c;
 }
 
@@ -287,11 +290,16 @@ function parseCsv(text, own = new Set()) {
   const lines = String(text).split(/\r?\n/).filter((l) => l.trim());
   const head = findHeaderLine(lines);
   if (!head) return [];
-  const { sep, cols: c } = head;
+  return tableRows(lines.slice(head.index + 1).map((l) => splitLine(l, head.sep)), head.cols, own);
+}
 
+/**
+ * Строки таблицы под найденным заголовком → операции. Общее у CSV и Excel:
+ * разные только способ добыть ячейки и место заголовка.
+ */
+function tableRows(rows, c, own = new Set()) {
   const out = [];
-  for (const line of lines.slice(head.index + 1)) {
-    const cols = splitLine(line, sep);
+  for (const cols of rows) {
     if (cols.length < 2) continue;
     const date = parseDate(at(cols, c.date));
     if (!date) continue;
@@ -352,10 +360,125 @@ function parseCsv(text, own = new Set()) {
       name: side,
       inn: sideInn,
       purpose,
-      doc: '',
+      doc: clean(at(cols, c.doc)).slice(0, 40),
     });
   }
   return assignKeys(out);
+}
+
+// ---------- Excel ----------
+
+/** Текст ячейки exceljs: даты — по-русски, формулы — результатом. */
+function cellText(v) {
+  if (v == null) return '';
+  if (v instanceof Date) {
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(v.getUTCDate())}.${p(v.getUTCMonth() + 1)}.${v.getUTCFullYear()}`;
+  }
+  if (typeof v === 'object') {
+    if (Array.isArray(v.richText)) return v.richText.map((r) => r.text).join('');
+    if ('result' in v) return cellText(v.result);
+    if ('text' in v) return String(v.text);
+    return '';
+  }
+  return String(v);
+}
+
+/**
+ * Ячейка «счёт / ИНН / название» → три поля.
+ *
+ * Так пишет Сбер: в колонках «Дебет» и «Кредит» под общей шапкой «Счёт»
+ * одна ячейка на сторону, внутри — счёт, ИНН и название строками.
+ */
+function splitParty(text) {
+  const s = String(text || '');
+  const acc = (/(?<!\d)\d{20}(?!\d)/.exec(s) || [''])[0];
+  const rest = acc ? s.replace(acc, ' ') : s;
+  const inn = (/(?<!\d)(\d{12}|\d{10})(?!\d)/.exec(rest) || [''])[0];
+  const name = clean((inn ? rest.replace(inn, ' ') : rest).replace(/[\r\n]+/g, ' '))
+    .replace(/^[,;\s]+|[,;\s]+$/g, '');
+  return [acc, inn, name];
+}
+
+/**
+ * Выписка в Excel (.xlsx).
+ *
+ * Банки охотно отдают выписку в Excel — Сбер выгружает её так по
+ * умолчанию, — а бот понимал только 1С, OFX и CSV и такой файл молча
+ * пропускал. Здесь таблица листа разбирается тем же путём, что CSV: по
+ * названиям колонок. Одна особенность Сбера — шапка в две строки: «Счёт»
+ * над «Дебет» и «Кредит». Эти две колонки раскладываем на счёт, ИНН и
+ * название плательщика и получателя.
+ */
+async function parseXlsx(buf, own = new Set()) {
+  const ExcelJS = require('exceljs');
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  for (const ws of wb.worksheets) {
+    const width = Math.max(ws.columnCount || 0, 1);
+    const grid = [];
+    ws.eachRow({ includeEmpty: true }, (row, n) => {
+      const cells = [];
+      for (let i = 1; i <= width; i += 1) cells.push(cellText(row.getCell(i).value).trim());
+      grid[n - 1] = cells;
+    });
+    for (let i = 0; i < grid.length; i += 1) if (!grid[i]) grid[i] = [];
+
+    let h = -1;
+    for (let i = 0; i < Math.min(grid.length, 40); i += 1) {
+      const c = mapHeader(grid[i].map(normHeader));
+      if (c.date >= 0 && (c.amount >= 0 || c.income >= 0 || c.expense >= 0)) { h = i; break; }
+    }
+    if (h < 0) continue;
+
+    // Шапка в две строки: под ней «Дебет» и «Кредит» — стороны платежа.
+    const sub = (grid[h + 1] || []).map(normHeader);
+    const twoRows = sub.includes('дебет') && sub.includes('кредит');
+    const PARTY = {
+      дебет: ['счет плательщика', 'инн плательщика', 'плательщик'],
+      кредит: ['счет получателя', 'инн получателя', 'получатель'],
+    };
+    const headers = [];
+    grid[h].forEach((cell, j) => {
+      if (twoRows && PARTY[sub[j]]) headers.push(...PARTY[sub[j]]);
+      else headers.push(normHeader(cell));
+    });
+    const rows = grid.slice(h + (twoRows ? 2 : 1)).map((cells) => {
+      const out = [];
+      cells.forEach((cell, j) => {
+        if (twoRows && PARTY[sub[j]]) out.push(...splitParty(cell));
+        else out.push(cell);
+      });
+      return out;
+    });
+    return tableRows(rows, mapHeader(headers), own);
+  }
+  return [];
+}
+
+/**
+ * Выписка любым файлом — главный вход для бота и приложения.
+ *
+ * Асинхронный, потому что Excel читается асинхронно. PDF и старый .xls
+ * честно не разбираем и говорим почему: rows пустой, unsupported — что это.
+ *
+ * @returns {Promise<{format:string, rows:Array, unsupported?:string}>}
+ */
+async function parseStatementFile(buf, opts = {}) {
+  const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || '');
+  const own = new Set((opts.ownAccounts || []).map(digits).filter(Boolean));
+  if (b.length > 4 && b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x03 && b[3] === 0x04) {
+    try {
+      return { format: 'Excel', rows: await parseXlsx(b, own) };
+    } catch (_) {
+      return { format: 'Excel', rows: [] };
+    }
+  }
+  if (b.slice(0, 5).toString('latin1') === '%PDF-') return { format: 'PDF', rows: [], unsupported: 'pdf' };
+  if (b.length > 4 && b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0) {
+    return { format: 'XLS', rows: [], unsupported: 'xls' };
+  }
+  return parseStatement(b, opts);
 }
 
 // ---------- OFX ----------
@@ -556,6 +679,6 @@ function matchToCounterparties(rows, cps, balanceOf = () => 0) {
 }
 
 module.exports = {
-  parseStatement, parseCsv, parseOfx, parse1C, matchToCounterparties,
+  parseStatement, parseStatementFile, parseXlsx, parseCsv, parseOfx, parse1C, matchToCounterparties,
   decodeBytes, parseDate, parseMoney, similarity, keyOf,
 };

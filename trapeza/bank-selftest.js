@@ -636,6 +636,56 @@ console.log('\n── книга учёта: форма ФНС ──');
     } catch (e) { threw = e.message; }
     ok(threw === 'нельзя', 'заблокированная книга в файл не выгружается', threw);
 
+    /*
+     * Выписка в Excel — так её по умолчанию отдаёт Сбер. Бот понимал только
+     * 1С, OFX и CSV, а такой файл молча пропускал: человек присылал выписку
+     * и не получал ничего. Собираем файл по образцу сберовского: шапка в две
+     * строки, «Счёт» над «Дебет» и «Кредит», в каждой стороне счёт, ИНН и
+     * название строками, дата — датой, суммы — числами, внизу итог.
+     */
+    {
+      const bank = require('./lib/bank-statement');
+      const x = new ExcelJS.Workbook();
+      const ws = x.addWorksheet('Выписка');
+      ws.addRow(['ПАО СБЕРБАНК']);
+      ws.addRow(['ВЫПИСКА ОПЕРАЦИЙ ПО ЛИЦЕВОМУ СЧЕТУ 40802810468710003890']);
+      ws.addRow(['за период с 01.01.2026 по 31.03.2026']);
+      ws.addRow([]);
+      ws.addRow(['Дата проводки', 'Счет', '', 'Сумма по дебету', 'Сумма по кредиту', '№ документа', 'ВО',
+        'Банк (БИК и наименование)', 'Назначение платежа']);
+      ws.addRow(['', 'Дебет', 'Кредит', '', '', '', '', '', '']);
+      ws.mergeCells('B5:C5');
+      ws.mergeCells('A5:A6');
+      ws.addRow([new Date(Date.UTC(2026, 0, 15)), '40702810900000012345\n7707083893\nООО "Ромашка"',
+        '40802810468710003890\n183112345678\nИП Иванов И.И.', null, 30000, '17', '01',
+        'БИК 044525225 ПАО СБЕРБАНК', 'Оплата по счету 5 от 10.01.2026']);
+      ws.addRow([new Date(Date.UTC(2026, 0, 20)), '40802810468710003890\n183112345678\nИП Иванов И.И.',
+        '40702810500000054321\n7801234567\nООО "Аренда"', 12500.5, null, '18', '01',
+        'БИК 044030653 ПАО СБЕРБАНК', 'Аренда за январь']);
+      ws.addRow(['Итого обороты', '', '', 12500.5, 30000]);
+      const xbuf = Buffer.from(await x.xlsx.writeBuffer());
+
+      const got = await bank.parseStatementFile(xbuf, { ownAccounts: ['40802810468710003890'] });
+      const [inc, out] = got.rows;
+      ok(got.format === 'Excel' && got.rows.length === 2, 'Excel-выписка разобрана: две операции, итог не в счёт',
+        `${got.format} ${got.rows.length}`);
+      ok(inc && inc.date === '2026-01-15' && inc.incoming && inc.amount === 30000,
+        'поступление: дата из ячейки-даты, сумма из числа', JSON.stringify(inc));
+      ok(inc && inc.name === 'ООО "Ромашка"' && inc.inn === '7707083893',
+        'плательщик и ИНН достаются из ячейки «Дебет»', inc && `${inc.name} | ${inc.inn}`);
+      ok(inc && inc.doc === '17', 'номер платёжки — из «№ документа»', inc && inc.doc);
+      ok(out && !out.incoming && out.amount === 12500.5 && out.name === 'ООО "Аренда"',
+        'списание: получатель из «Кредит», копейки на месте', JSON.stringify(out));
+      const xb = kudir.buildIncomeBook(got.rows, { from: '2026-01-01', to: '2026-12-31' });
+      ok(xb.total === 30000 && /п\/п № 17/.test((xb.rows[0] || {}).basis || ''),
+        'и книга из Excel собирается с номером платёжки в основании', `${xb.total} ${(xb.rows[0] || {}).basis}`);
+
+      const pdf = await bank.parseStatementFile(Buffer.from('%PDF-1.7 выписка'));
+      ok(pdf.unsupported === 'pdf' && !pdf.rows.length, 'PDF честно не разбирается, и видно почему');
+      const xls = await bank.parseStatementFile(Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]));
+      ok(xls.unsupported === 'xls', 'старый .xls тоже назван, а не выдан за пустую выписку');
+    }
+
     console.log(bad === 0 ? '\n✅ Разбор выписок: все проверки прошли\n' : `\n❌ Ошибок: ${bad}\n`);
     process.exit(bad === 0 ? 0 : 1);
   })().catch((e) => {
