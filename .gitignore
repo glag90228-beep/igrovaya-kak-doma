@@ -26,6 +26,8 @@ ruvector.db
 .claude-flow/policy/
 .claude-flow/security/
 .claude-flow/swarm/
+# Сюда пишет замеры проверка здоровья роя (system_health) — тот же род, что metrics/.
+.claude-flow/system/
 
 # Отдельные рабочие копии агентов. Каждому пишущему агенту рой выдаёт свой
 # worktree — полный checkout проекта рядом с основным. Это черновик на время
