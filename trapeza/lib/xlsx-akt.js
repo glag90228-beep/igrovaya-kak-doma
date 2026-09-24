@@ -168,7 +168,20 @@ async function buildAkt({ org, cp, ops }) {
     }
   });
 
-  const last = FIRST + ops.length - 1;
+  /*
+   * Период без операций — тоже акт, и в нём должна остаться строка. Иначе
+   * итог встаёт в первую строку таблицы, SUM(E10:E9) Excel разворачивает в
+   * E9:E10 — и формула ссылается сама на себя: при открытии файла
+   * предупреждение о циклической ссылке, вместо итогов нули.
+   */
+  if (!ops.length) {
+    const row = j.getRow(FIRST);
+    row.getCell(4).value = 'Операций за период не было';
+    row.getCell(4).font = { italic: true, size: 10 };
+    row.getCell(9).value = { formula: `I${FIRST - 1}`, result: round2(cp.opening_balance) };
+    for (let c = 1; c <= 8; c++) box(row.getCell(c));
+  }
+  const last = FIRST + Math.max(ops.length, 1) - 1;
   const totalRow = last + 1;
   j.getCell(`D${totalRow}`).value = 'ИТОГО обороты за период:';
   j.getCell(`D${totalRow}`).font = { bold: true, color: { argb: 'FFFFFFFF' } };
@@ -309,7 +322,13 @@ async function buildAkt({ org, cp, ops }) {
     }
   });
 
-  const aLast = AFIRST + ops.length - 1;
+  // Та же пустая строка, что и на журнале, — по той же причине.
+  if (!ops.length) {
+    a.getCell(`B${AFIRST}`).value = 'Операций за период не было';
+    a.getCell(`B${AFIRST}`).font = { italic: true, size: 9 };
+    for (let c = 1; c <= 8; c++) box(a.getRow(AFIRST).getCell(c));
+  }
+  const aLast = AFIRST + Math.max(ops.length, 1) - 1;
   const aTot = aLast + 1;
   a.getCell(`B${aTot}`).value = 'Обороты за период';
   a.getCell(`F${aTot}`).value = 'Обороты за период';
@@ -329,7 +348,15 @@ async function buildAkt({ org, cp, ops }) {
   a.getCell(`B${aClose}`).value = `Сальдо конечное на ${ru(cp.period_end)}`;
   a.getCell(`F${aClose}`).value = `Сальдо конечное на ${ru(cp.period_end)}`;
   a.getCell(`D${aClose}`).value = { formula: `D11+D${aTot}-C${aTot}`, result: closingVal };
-  a.getCell(`G${aClose}`).value = { formula: `H11+H${aTot}-G${aTot}`, result: 0 };
+  /*
+   * Сторона контрагента — зеркало нашей: наше начальное сальдо стоит у него в
+   * дебете (G11), значит и конечное считается от G11. Раньше формула брала
+   * пустую H11, и у незаполненной стороны сальдо на входе было 10 000, а на
+   * выходе — ноль.
+   */
+  a.getCell(`G${aClose}`).value = {
+    formula: `G11+G${aTot}-H${aTot}`, result: round2(cp.opening_balance),
+  };
   for (let c = 1; c <= 8; c++) {
     const cell = a.getRow(aClose).getCell(c);
     fill(cell, DARK);

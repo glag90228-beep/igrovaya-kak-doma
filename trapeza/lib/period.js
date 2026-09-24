@@ -148,6 +148,18 @@ function parseDay(s, today = todayDate()) {
   return `${y}-${pad(mon)}-${pad(day)}`;
 }
 
+/**
+ * 'YYYY-MM-DD' как есть, если такой день бывает, иначе ''.
+ *
+ * Для дат, которые приходят из приложения уже в ISO. Одного шаблона мало:
+ * «2026-02-31» ему подходит, а в журнале такая строка ломает и сортировку,
+ * и отбор по периоду.
+ */
+function isoDay(v) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v == null ? '' : v));
+  return m && parseDay(`${m[3]}.${m[2]}.${m[1]}`) ? m[0] : '';
+}
+
 /** Номер месяца (0-based) по слову: «март», «марта», «мае» → 2, 4; иначе −1. */
 function monthByWord(word) {
   const w = String(word).toLowerCase().replace(/ё/g, 'е');
@@ -166,8 +178,25 @@ function monthByWord(word) {
  * Возвращает { from, to } или null, если не разобрали.
  */
 function parsePeriodText(text, today = todayDate()) {
+  const r = parsePeriodIn(text, today, today.getFullYear());
+  /*
+   * Год не назван, а период целиком впереди — значит, имели в виду прошлый.
+   * «Акт за декабрь», попрошенный в январе, — это декабрь, который только
+   * что закончился, а не тот, что наступит через год: раньше приходил акт за
+   * будущий месяц, пустой, с одним начальным сальдо.
+   */
+  const withYear = /20\d{2}|\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}/.test(String(text || ''));
+  if (r && r.from && r.from > iso(today) && !withYear) {
+    return parsePeriodIn(text, today, today.getFullYear() - 1);
+  }
+  return r;
+}
+
+/** Разбор периода, где год, если его не назвали, — defaultYear. */
+function parsePeriodIn(text, today, defaultYear) {
   const raw = String(text || '').trim().toLowerCase().replace(/ё/g, 'е');
   if (!raw) return null;
+  const base = new Date(defaultYear, 0, 1);    // parseDay берёт из неё только год
   if (/^(вс[её]|все время|за вс[её]|весь период|с начала)/.test(raw)) {
     return { from: '', to: iso(today) };
   }
@@ -175,17 +204,17 @@ function parsePeriodText(text, today = todayDate()) {
   // Две даты — самый частый и самый однозначный случай.
   const days = raw.match(/\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?/g) || [];
   if (days.length >= 2) {
-    const a = parseDay(days[0], today);
-    const b = parseDay(days[1], today);
+    const a = parseDay(days[0], base);
+    const b = parseDay(days[1], base);
     if (a && b) return a <= b ? { from: a, to: b } : { from: b, to: a };
   }
   if (days.length === 1) {
-    const a = parseDay(days[0], today);
+    const a = parseDay(days[0], base);
     if (a) return { from: a, to: iso(today) };
   }
 
   const yearIn = /(20\d{2})/.exec(raw);
-  const year = yearIn ? Number(yearIn[1]) : today.getFullYear();
+  const year = yearIn ? Number(yearIn[1]) : defaultYear;
 
   // Квартал: «1 квартал», «i кв 2025», «квартал 2».
   if (/кв(артал)?/.test(raw)) {
@@ -226,5 +255,5 @@ function parsePeriodText(text, today = todayDate()) {
 // такая дата существует. bot.js держал свою копию без проверки — и «31.02»
 // попадало в журнал.
 module.exports = {
-  PRESETS, presetRange, parsePeriodText, parseDay, iso, todayISO, todayDate, currentYear,
+  PRESETS, presetRange, parsePeriodText, parseDay, isoDay, iso, todayISO, todayDate, currentYear,
 };

@@ -379,6 +379,17 @@ async function main() {
     r = await call('POST', '/api/pay', { user: masha, body: { cpId: cpPay, amount: 0 } });
     ok(r.status === 400, 'нулевая сумма отклоняется', (r.json || {}).error);
 
+    // Дата ложилась в журнал любой строкой — и операция выпадала из всех
+    // периодов: ни в акт, ни в отчёт она уже не попадала.
+    for (const bad of ['вчера', '2026-02-31', '2026-13-01']) {
+      r = await call('POST', '/api/pay', { user: masha, body: { cpId: cpPay, amount: 100, date: bad } });
+      ok(r.status === 400, `дата «${bad}» в оплате отклоняется`, JSON.stringify(r.json));
+      r = await call('POST', '/api/op', { user: masha, body: { cpId: cpPay, amount: 100, date: bad } });
+      ok(r.status === 400, `и в журнале тоже — «${bad}»`, JSON.stringify(r.json).slice(0, 80));
+    }
+    ok(bdbA.balanceOf(mashaId2, cpPay).closing === 40000, 'ни одна кривая дата в журнал не попала',
+      bdbA.balanceOf(mashaId2, cpPay).closing);
+
     delete process.env.AI_PROVIDER;
     delete process.env.AI_ENABLED;
   }
@@ -461,6 +472,52 @@ async function main() {
       baseId: shipId, lines: [{ name: 'Монтаж', qty: 1, price: 130000 }] } });
     ok(r.status === 400 && /основания/.test((r.json || {}).error || ''),
       'без основания корректировочный не выписать', (r.json || {}).error);
+
+    /*
+     * Смешанная корректировка: одна позиция дорожает, другая дешевеет.
+     * В итог документа раньше шло «up.total || down.total» — одно
+     * увеличение, а уменьшение на 12 200 пропадало. А корректировка на
+     * уменьшение ложилась в реестр с плюсом и прибавлялась к продажам.
+     */
+    const downDoc = bdbS.getDoc(mid, bdbS.docsBetween(mid, '2000-01-01', '2100-01-01')
+      .find((d) => d.type === 'ksf').id);
+    ok(downDoc.total === -24400, 'корректировка на уменьшение записана с минусом', downDoc.total);
+    r = await call('POST', '/api/doc', { user: sfUser, body: {
+      type: 'upd', cpId: cpS, vatRate: 22, status: 1,
+      items: [{ name: 'Монтаж', qty: 1, price: 100000 }, { name: 'Материал', qty: 1, price: 50000 }] } });
+    const twoId = r.json.doc.id;
+    r = await call('POST', '/api/doc/ksf', { user: sfUser, body: {
+      baseId: twoId, reason: 'Соглашение № 4',
+      lines: [{ name: 'Монтаж', qty: 1, price: 120000 }, { name: 'Материал', qty: 1, price: 40000 }] } });
+    ok(r.status === 200 && r.json.up.total === 24400 && r.json.down.total === 12200,
+      'увеличение и уменьшение посчитаны раздельно', JSON.stringify([r.json.up, r.json.down]));
+    const mixed = bdbS.getDoc(mid, r.json.doc.id);
+    ok(mixed.total === 12200, 'в итог документа пошло изменение целиком: +24 400 − 12 200', mixed.total);
+    const ExcelJS = require('exceljs');
+    const wbR = new ExcelJS.Workbook();
+    await wbR.xlsx.load(await require('./lib/xlsx-registry').buildRegistry({
+      org: bdbS.getDefaultOrg(mid), from: '2000-01-01', to: '2100-01-01',
+      docs: bdbS.docsBetween(mid, '2000-01-01', '2100-01-01').filter((d) => d.id === mixed.id),
+    }));
+    const regRow = wbR.getWorksheet('Реестр').getRow(6);
+    ok(regRow.getCell(5).value === 10000 && regRow.getCell(6).value === 2200 && regRow.getCell(7).value === 12200,
+      'и в реестре то же: без НДС +10 000, НДС +2 200',
+      [5, 6, 7].map((c) => regRow.getCell(c).value).join(' / '));
+
+    /*
+     * Платёжка из приложения шла мимо общей нумерации: номер, введённый
+     * руками, не проверялся — выходило две платёжки № 1 за год, — а сумма
+     * записывалась с долями копейки.
+     */
+    r = await call('POST', '/api/doc/other', { user: sfUser, body: {
+      type: 'pp', cpId: cpS, amount: 1234.567, purpose: 'Оплата по счёту № 1' } });
+    ok(r.status === 200 && r.json.total === 1234.57, 'сумма платёжки округлена до копеек',
+      `${r.status} ${JSON.stringify(r.json && r.json.total)}`);
+    const ppNo = r.json.doc && r.json.doc.number;
+    r = await call('POST', '/api/doc/other', { user: sfUser, body: {
+      type: 'pp', cpId: cpS, amount: 100, purpose: 'Ещё', number: ppNo } });
+    ok(r.status === 400 && /уже выписан/.test((r.json || {}).error || ''),
+      'занятый номер платёжки не пропускается', `${r.status} ${JSON.stringify(r.json).slice(0, 100)}`);
 
     // --- исправление ---
     r = await call('POST', '/api/doc/fix', { user: sfUser, body: { id: shipId } });
@@ -1474,6 +1531,62 @@ async function main() {
     // Чужие сделки не закрываются: leadId проверяется по владельцу.
     r = await call('POST', '/api/bank/close', { user: petya, body: { deals } });
     ok(r.json.docs === 0, 'чужую сделку закрыть нельзя', JSON.stringify(r.json));
+
+    /*
+     * Деньги из выписки пришли на самом деле: сняв отметку или удалив
+     * документ, человек отменяет привязку, а не поступление. Раньше строка
+     * удалялась, а отметка о загрузке оставалась — и выписку было уже не
+     * загрузить заново: 17 000 пропадали из учёта насовсем.
+     */
+    const leadId = deals[0].leadId;
+    r = await call('POST', '/api/doc/paid', { user: masha, body: { id: leadId, paid: false } });
+    ok(bdbA.unpaidDocs(mid).some((d) => d.id === leadId), 'сняли отметку — документ снова ждёт оплаты');
+    ok(bdbA.balanceOf(mid, cpA).closing === 0, 'а деньги из выписки остались в журнале',
+      bdbA.balanceOf(mid, cpA).closing);
+    ok(r.json.kept === 17000, 'и приложение говорит об этом, а не «долг вернулся»', JSON.stringify(r.json.kept));
+    r = await call('POST', '/api/doc/delete', { user: masha, body: { id: leadId } });
+    ok(bdbA.balanceOf(mid, cpA).closing === -17000, 'удалили документ — оплата стала авансом, а не исчезла',
+      bdbA.balanceOf(mid, cpA).closing);
+
+    // Выписка на бо́льшую сумму: остаток остаётся свободной строкой, а
+    // привязанная часть на отметку о загрузке уже не ссылается.
+    const cpB = bdbA.createCp(mid, { name: 'ООО «Сверка Б»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(mid, {
+      type: 'usl', cpId: cpB, date: '2026-08-04',
+      items: [{ name: 'Работа', qty: 1, price: 17000 }], skipQuota: true });
+    r = await call('POST', '/api/bank/import', {
+      user: masha,
+      body: { rows: [{ key: 'сверка-б|in|20000|оплата', cpId: cpB, amount: 20000, date: '2026-08-25', doc: 'п/п 6' }] },
+    });
+    await call('POST', '/api/bank/close', { user: masha, body: { deals: r.json.deals } });
+    ok(bdbA.balanceOf(mid, cpB).closing === -3000, 'переплата 3 000 видна авансом',
+      bdbA.balanceOf(mid, cpB).closing);
+    await call('POST', '/api/doc/paid', { user: masha, body: { id: r.json.deals[0].leadId, paid: false } });
+    ok(bdbA.balanceOf(mid, cpB).closing === -3000, 'и после снятия отметки все 20 000 на месте',
+      bdbA.balanceOf(mid, cpB).closing);
+
+    /*
+     * Долг «по акту», а оплачен одинокий счёт — долга он не создаёт. Раньше
+     * деньги всё равно привязывались к нему, и первый же пересчёт журнала
+     * их убирал как лишние: 12 000 пропадали из сальдо.
+     */
+    const cpC = bdbA.createCp(mid, { name: 'ООО «Сверка В»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(mid, {
+      type: 'sch', cpId: cpC, date: '2026-08-04',
+      items: [{ name: 'Работа', qty: 1, price: 12000 }], skipQuota: true });
+    r = await call('POST', '/api/bank/import', {
+      user: masha,
+      body: { rows: [{ key: 'сверка-в|in|12000|оплата', cpId: cpC, amount: 12000, date: '2026-08-25', doc: 'п/п 7' }] },
+    });
+    ok((r.json.deals || []).length === 1, 'счёт предложен к закрытию', JSON.stringify(r.json.deals || []));
+    await call('POST', '/api/bank/close', { user: masha, body: { deals: r.json.deals } });
+    await call('POST', '/api/basis', { user: masha, body: { basis: 'closing' } });
+    ok(bdbA.balanceOf(mid, cpC).closing === -12000, 'после пересчёта оплата по счёту осталась авансом',
+      bdbA.balanceOf(mid, cpC).closing);
+    await call('POST', '/api/basis', { user: masha, body: { basis: 'invoice' } });
+    ok(bdbA.balanceOf(mid, cpC).closing === 0, 'перешли на долг «по счёту» — оплата не задвоилась',
+      bdbA.balanceOf(mid, cpC).closing);
+    await call('POST', '/api/basis', { user: masha, body: { basis: 'closing' } });
   }
 
   section('свой ящик и отправка на почту');

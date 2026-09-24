@@ -126,8 +126,11 @@ function parseDate(raw) {
 function parseMoney(raw) {
   let s = String(raw == null ? '' : raw).replace(/[^\d,.\-]/g, '');
   if (!s || !/\d/.test(s)) return null;
-  const neg = s.startsWith('-');
-  s = s.replace(/-/g, '');
+  const neg = /^[,.]*-/.test(s);
+  // Разделитель по краям остаётся от подписи вроде «руб.» или «р.» — это
+  // не копейки. Без обрезки «1 500,00 руб.» превращалось в «1500,00.» и
+  // читалось как 150 000.
+  s = s.replace(/-/g, '').replace(/^[,.]+|[,.]+$/g, '');
   const last = Math.max(s.lastIndexOf(','), s.lastIndexOf('.'));
   if (last >= 0 && s.length - last - 1 <= 2 && s.length - last - 1 > 0) {
     s = `${s.slice(0, last).replace(/[,.]/g, '')}.${s.slice(last + 1)}`;

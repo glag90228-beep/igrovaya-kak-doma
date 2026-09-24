@@ -63,6 +63,22 @@ function correctionTotals(rows) {
 }
 
 /**
+ * Изменение стоимости одним числом, со знаком: увеличение минус уменьшение.
+ *
+ * Так его пишем в итог документа и в реестр. Раньше туда шло
+ * «up.total || down.total»: в смешанной корректировке — одно увеличение, а
+ * уменьшение пропадало; в корректировке на уменьшение — сумма с плюсом, и
+ * реестр прибавлял её к продажам вместо того, чтобы вычесть.
+ */
+function correctionNet({ up, down }) {
+  return {
+    net: round2(up.net - down.net),
+    vat: round2(up.vat - down.vat),
+    total: round2(up.total - down.total),
+  };
+}
+
+/**
  * doc: { number, date, base:{number, date}, reason (договор/соглашение),
  *        vatRate, priceIncludesVat,
  *        lines: [{ name, unit, before:{qty,price}, after:{qty,price} }] }
@@ -177,4 +193,4 @@ function fixNote(fix) {
   return `ИСПРАВЛЕНИЕ № ${esc(String(fix.no))} от ${ru(fix.date)}`;
 }
 
-module.exports = { buildKsfHtml, correctionRow, correctionTotals, fixNote };
+module.exports = { buildKsfHtml, correctionRow, correctionTotals, correctionNet, fixNote };

@@ -52,11 +52,11 @@ const bizTypes = require('./lib/biz-types');
 const reqCheck = require('./lib/requisites-check');
 const { round2 } = require('./lib/money');
 const { advanceVat } = require('./lib/avans');
-const { correctionRow, correctionTotals } = require('./lib/ksf');
+const { correctionRow, correctionTotals, correctionNet } = require('./lib/ksf');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
 const { payLink, priceText, yearSaving, planTitle, plans: lavaPlans } = require('./lib/lava');
 const platega = require('./lib/platega');
-const { currentYear } = require('./lib/period');
+const { currentYear, isoDay } = require('./lib/period');
 const { Telegram } = require('./lib/tg');
 
 const PORT = Number(process.env.MINIAPP_PORT || 8790);
@@ -528,8 +528,12 @@ const api = {
     if (!cp) return { error: 'Контрагент не найден.' };
     const sum = round2(Number(body.amount) || 0);
     if (sum <= 0) return { error: 'Сумма должна быть больше нуля.' };
+    // Дату проверяем, а не принимаем любой строкой: «вчера» или «31.02»
+    // ложились в журнал как есть, и операция выпадала из всех периодов.
+    const date = body.date ? isoDay(body.date) : docService.todayISO();
+    if (!date) return { error: 'Не понял дату оплаты.' };
     const isIncome = body.kind === 'Приход';
-    const op = { date: str(body.date, 10) || docService.todayISO(), kind: isIncome ? 'Приход' : 'Оплата' };
+    const op = { date, kind: isIncome ? 'Приход' : 'Оплата' };
     if (isIncome) op.credit = sum; else op.debit = sum;
     const id = bdb.addOp(user.id, cpId, op);
     return { id, kind: op.kind, sum, cpName: cp.name, balance: round2(bdb.balanceOf(user.id, cpId).closing) };
@@ -870,8 +874,8 @@ const api = {
     const doc = bdb.getDoc(user.id, id);
     if (!doc) return { error: 'Документ не найден.' };
     if (body.paid === false) {
-      bdb.unmarkPaid(user.id, id);
-      return { doc: docBrief(bdb.getDoc(user.id, id)) };
+      const un = bdb.unmarkPaid(user.id, id);
+      return { doc: docBrief(bdb.getDoc(user.id, id)), kept: (un && un.kept) || 0 };
     }
     const when = bdb.markPaid(user.id, id, str(body.date, 10));
     // Самозанятому в этот момент надо выдать чек: счёт и акт доход не
@@ -979,7 +983,8 @@ const api = {
     const amount = round2(Math.abs(Number(body.amount) || 0));
     if (!amount) return { error: 'Укажите сумму.' };
     const paid = body.kind === 'payment';
-    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(body.date)) ? String(body.date) : docService.todayISO();
+    const date = body.date ? isoDay(body.date) : docService.todayISO();
+    if (!date) return { error: 'Такой даты не бывает.' };
     bdb.addOp(user.id, cp.id, {
       date,
       kind: paid ? 'Оплата' : 'Приход',
@@ -994,9 +999,8 @@ const api = {
   async 'GET /api/akt'({ user, url }) {
     const org = bdb.currentOrg(user.id);
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
-    const iso0 = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(v || '') ? v : '');
     const p = bdb.cpForPeriod(user.id, Number(url.searchParams.get('cp')),
-      iso0(url.searchParams.get('from')), iso0(url.searchParams.get('to')));
+      isoDay(url.searchParams.get('from')), isoDay(url.searchParams.get('to')));
     if (!p) return { error: 'Контрагент не найден.' };
     const cp = p.cp;
     // Лимит бесплатных: в боте акт его тратил, здесь — нет, и лимит
@@ -1212,50 +1216,27 @@ const api = {
    */
   async 'POST /api/doc/other'({ user, body }) {
     const type = str(body.type, 10);
-    const kind = docService.OTHER_DOCS[type];
-    if (!kind) return { error: 'Такой документ выписать нельзя.' };
-
-    const org = bdb.currentOrg(user.id);
-    if (!org) return { error: 'Сначала заполните реквизиты организации.' };
-    const cp = bdb.getCp(user.id, Number(body.cpId));
-    if (!cp) return { error: 'Контрагент не найден.' };
-
-    const quota = bdb.quota(user.id);
-    if (!quota.allowed) {
-      return { error: `Бесплатные документы на этот месяц закончились (${quota.limit}).`, reason: 'quota', quota };
-    }
-
-    const when = /^\d{4}-\d{2}-\d{2}$/.test(String(body.date)) ? String(body.date) : docService.todayISO();
-    const year = Number(when.slice(0, 4));
-    const amount = Math.abs(Number(body.amount) || 0);
-    const seq = bdb.nextSeqForOrg(org.id, type, year);
-    const number = str(body.number, 40) || String(seq);
-
-    const doc = type === 'pp'
-      ? { number, date: when, amount, purpose: str(body.purpose, 400) }
-      : { number, date: when, subject: str(body.subject, 500), price: amount, term: str(body.term, 60) };
-    if (type === 'pp' && !amount) return { error: 'Укажите сумму платежа.' };
-    if (type === 'pp' && !doc.purpose) return { error: 'Укажите назначение платежа.' };
-    if (type === 'dog' && !doc.subject) return { error: 'Укажите предмет договора.' };
-
-    const file = await docService.renderFile(
-      kind.build({ org, cp, doc }),
-      `${kind.file}_${docService.safeName(number)}_${docService.safeName(cp.name)}`,
-    );
-    const id = bdb.saveDoc(user.id, {
-      orgId: org.id, cpId: cp.id, type, number, seq, date: when, total: amount, payload: doc,
+    if (!['pp', 'dog'].includes(type)) return { error: 'Такой документ выписать нельзя.' };
+    // Номер, квота, округление суммы — в issuePlain, тем же путём, что в боте.
+    const date = body.date ? isoDay(body.date) : '';
+    if (body.date && !date) return { error: 'Такой даты не бывает.' };
+    const res = await docService.issuePlain(user.id, {
+      type,
+      cpId: Number(body.cpId),
+      date,
+      number: str(body.number, 40),
+      fields: type === 'pp'
+        ? { amount: body.amount, purpose: str(body.purpose, 400) }
+        : { subject: str(body.subject, 500), price: body.amount, term: str(body.term, 60) },
     });
+    if (!res.ok) return { error: res.message, reason: res.reason, quota: res.quota };
 
-    const res = {
-      ok: true, total: amount, title: kind.title, file,
-      doc: { ...docBrief(bdb.getDoc(user.id, id)), cp: { name: cp.name } },
-    };
-    const token = keepFile(user.id, file);
+    const token = keepFile(user.id, res.file);
     await sendToChat(user, res).catch(() => {});
     return {
-      total: amount,
-      doc: docBrief(bdb.getDoc(user.id, id)),
-      file: { url: `/api/file/${token}`, name: file.filename, pdf: file.pdf },
+      total: res.total,
+      doc: docBrief(bdb.getDoc(user.id, res.doc.id)),
+      file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf },
       quota: bdb.quota(user.id),
     };
   },
@@ -2063,7 +2044,7 @@ const api = {
     const { up, down } = correctionTotals(rows);
 
     const res = await docService.issueFlat(user.id, {
-      type: 'ksf', cpId: src.cp_id, total: up.total || down.total,
+      type: 'ksf', cpId: src.cp_id, total: correctionNet({ up, down }).total,
       payload: {
         vatRate: rate, priceIncludesVat: Boolean(p.priceIncludesVat),
         base: { number: src.number, date: src.date }, reason, lines,

@@ -17,7 +17,7 @@
 const ExcelJS = require('exceljs');
 const { round2, vatTotals } = require('./money');
 const { advanceVat } = require('./avans');
-const { correctionRow, correctionTotals } = require('./ksf');
+const { correctionRow, correctionTotals, correctionNet } = require('./ksf');
 
 const BROWN = 'FF2E3A8C';
 const CREAM = 'FFF4F6FC';
@@ -63,14 +63,14 @@ function splitOf(d) {
   }
 
   // Корректировочный: суммы живут в парах «было/стало». В реестр идёт
-  // модуль изменения — тот же, что записан в d.total при выписке.
+  // изменение со знаком — то же, что записано в d.total при выписке:
+  // уменьшение продажи вычитается из итога, а не прибавляется к нему.
   if (d.type === 'ksf') {
     const rows = (p.lines || []).map((l) => correctionRow(
       l.before || { qty: 0, price: 0 }, l.after || { qty: 0, price: 0 },
       rate, Boolean(p.priceIncludesVat),
     ));
-    const { up, down } = correctionTotals(rows);
-    const box = up.total ? up : down;
+    const box = correctionNet(correctionTotals(rows));
     return { net: box.net, vat: rate == null ? null : box.vat };
   }
 

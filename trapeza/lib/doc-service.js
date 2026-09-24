@@ -424,33 +424,102 @@ async function issueFlat(userId, {
     return fail('number', `${kind.title} № ${wanted} за ${year} год уже выписан. Укажите другой номер.`);
   }
 
-  let num; let file; let id;
+  const { file, id } = await saveNumbered(userId, {
+    org, cp, kind, type, when, wanted, payload, total: round2(total),
+  });
+  return {
+    ok: true, total: round2(total), title: kind.title, file,
+    doc: bdb.getDoc(userId, id),
+  };
+}
+
+/**
+ * Номер, файл и запись в журнал для документа без позиций.
+ *
+ * Тот же цикл, что в issueDocument, и по тем же причинам: номер печатается
+ * в файле, файл собирается около секунды, и за это время номер может занять
+ * другой документ. База повтор не пропустит — берём следующий и
+ * пересобираем. Номер, заданный руками, к этому моменту уже проверен.
+ */
+async function saveNumbered(userId, { org, cp, kind, type, when, wanted, payload, total }) {
+  const year = Number(when.slice(0, 4));
   for (let attempt = 0; ; attempt += 1) {
     let seq = bdb.nextSeqForOrg(org.id, type, year);
     if (!wanted) {
       while (bdb.numberTakenInOrg(org.id, type, year, String(seq))) seq += 1;
     }
-    num = String(wanted || seq).slice(0, 40);
+    const num = String(wanted || seq).slice(0, 40);
     const doc = { number: num, date: when, ...payload };
     // eslint-disable-next-line no-await-in-loop
-    file = await renderFile(
+    const file = await renderFile(
       kind.build({ org: withFx(userId, org, type, doc), cp, doc }),
       `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
     );
     try {
-      id = bdb.saveDoc(userId, {
-        orgId: org.id, cpId: cp.id, type, number: num, seq, date: when,
-        total: round2(total), payload,
+      const id = bdb.saveDoc(userId, {
+        orgId: org.id, cpId: cp.id, type, number: num, seq, date: when, total, payload,
       });
-      break;
+      return { num, file, id };
     } catch (e) {
       if (!bdb.isSeqTaken(e) || attempt >= 2) throw e;
     }
   }
+}
 
+/**
+ * Платёжка и договор — из бота и из приложения одним путём.
+ *
+ * Раньше у каждого был свой, и оба мимо общей нумерации. Бот брал номер в
+ * начале диалога, до трёх вопросов: выпиши за это время документ того же
+ * вида из приложения — запись падала на уникальном номере, когда PDF уже
+ * ушёл человеку, и в журнале его не оказывалось. Приложение не проверяло
+ * номер, введённый руками, и не округляло сумму до копеек.
+ *
+ * @param {object} p
+ * @param {'pp'|'dog'} p.type
+ * @param {object} p.fields pp: {amount, purpose}; dog: {subject, price, term}
+ * @returns {Promise<{ok:true, doc, file, total, title}|{ok:false, reason, message}>}
+ */
+async function issuePlain(userId, {
+  type, cpId, date, number, fields = {}, skipQuota = false,
+}) {
+  const kind = OTHER_DOCS[type];
+  if (!kind || !['pp', 'dog'].includes(type)) return fail('type', 'Такой документ выписать нельзя.');
+  const org = bdb.currentOrg(userId);
+  if (!org) return fail('org', 'Сначала заполните реквизиты своей организации.');
+  const cp = bdb.getCp(userId, Number(cpId));
+  if (!cp) return fail('cp', 'Контрагент не найден.');
+
+  const payload = type === 'pp'
+    ? { amount: round2(Math.abs(Number(fields.amount) || 0)), purpose: String(fields.purpose || '').trim().slice(0, 400) }
+    : {
+      subject: String(fields.subject || '').trim().slice(0, 500),
+      price: round2(Math.abs(Number(fields.price) || 0)),
+      term: String(fields.term || '').trim().slice(0, 60),
+    };
+  if (type === 'pp' && !payload.amount) return fail('amount', 'Укажите сумму платежа.');
+  if (type === 'pp' && !payload.purpose) return fail('purpose', 'Укажите назначение платежа.');
+  if (type === 'dog' && !payload.subject) return fail('subject', 'Укажите предмет договора.');
+
+  const quota = bdb.quota(userId);
+  if (!skipQuota && !quota.allowed) {
+    return { ...fail('quota', `Бесплатные документы на этот месяц закончились (${quota.limit}).`), quota };
+  }
+
+  const when = /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? String(date) : todayISO();
+  const year = Number(when.slice(0, 4));
+  const wanted = number == null || number === '' ? '' : String(number).slice(0, 40);
+  if (wanted && bdb.numberTakenInOrg(org.id, type, year, wanted)) {
+    return fail('number', `${kind.title} № ${wanted} за ${year} год уже выписан. Укажите другой номер.`);
+  }
+
+  const total = type === 'pp' ? payload.amount : payload.price;
+  const { file, id } = await saveNumbered(userId, {
+    org, cp, kind, type, when, wanted, payload, total,
+  });
   return {
-    ok: true, total: round2(total), title: kind.title, file,
-    doc: bdb.getDoc(userId, id),
+    ok: true, total, title: kind.title, file,
+    doc: { ...bdb.getDoc(userId, id), cp: { id: cp.id, name: cp.name } },
   };
 }
 
@@ -587,6 +656,6 @@ function reusablePayload(payload) {
 
 module.exports = {
   ITEM_DOCS, OTHER_DOCS, ALL_DOCS,
-  issueDocument, issueFlat, rebuildDocument, renderFile, stampFor,
+  issueDocument, issueFlat, issuePlain, rebuildDocument, renderFile, stampFor,
   totalOf, cleanItems, safeName, todayISO, reusablePayload,
 };

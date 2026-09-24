@@ -14,13 +14,11 @@ const { buildKnigaProdazh, bookRow } = require('./lib/xlsx-kniga');
 const kudir = require('./lib/kudir');
 const { buildKudir } = require('./lib/xlsx-kudir');
 const { advanceVat } = require('./lib/avans');
-const { correctionRow, correctionTotals } = require('./lib/ksf');
+const { correctionRow, correctionTotals, correctionNet } = require('./lib/ksf');
 const { buildAktUslugHtml } = require('./lib/akt-uslug');
 const { buildSchetHtml } = require('./lib/schet');
-const { buildPlatyozhkaHtml } = require('./lib/platyozhka');
 const { buildUpdHtml } = require('./lib/upd');
 const { buildTorg12Html } = require('./lib/torg12');
-const { buildDogovorHtml } = require('./lib/dogovor');
 const { pdfAvailable, htmlToPdf } = require('./lib/pdf');
 const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
 const speech = require('./lib/speech');
@@ -653,13 +651,14 @@ const orgForAkt = (o) => ({
 // а слеш обязателен к замене, иначе получится подпапка.
 const safeName = (s) => String(s).replace(/[«»"]/g, '').replace(/[^\wА-Яа-яЁё-]+/g, '_').replace(/^[_-]+|[_-]+$/g, '');
 
-async function sendGenerated(tg, chatId, { html, xlsxBuffer, base, caption }) {
+/** file — уже собранный файл (его отдаёт docService), иначе собираем из html. */
+async function sendGenerated(tg, chatId, { html, xlsxBuffer, base, caption, file: ready }) {
   await tg.sendChatAction(chatId, 'upload_document');
   if (xlsxBuffer) {
     await tg.sendDocument(chatId, { filename: `${base}.xlsx`, buffer: xlsxBuffer, caption });
     return;
   }
-  const file = await docService.renderFile(html, base);
+  const file = ready || await docService.renderFile(html, base);
   await tg.sendDocument(chatId, {
     filename: file.filename,
     buffer: file.buffer,
@@ -3874,10 +3873,15 @@ async function startDogovor(tg, chatId, user, cpId) {
   if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
   const cp = bdb.getCp(user.id, cpId); if (!cp) return;
-  const seq = bdb.nextSeqForOrg(org.id, 'dog', currentYear());
-  bdb.setState(user.id, `dog:${cpId}`, { i: 0, seq, number: String(seq), date: todayISO(), values: {} });
+  /*
+   * Номер не берём заранее. Раньше он резервировался здесь, до трёх
+   * вопросов, и если за это время договор выписывали из приложения, запись
+   * падала на занятом номере — уже после того, как файл ушёл человеку.
+   * Номер присваивает issuePlain в момент выпуска.
+   */
+  bdb.setState(user.id, `dog:${cpId}`, { i: 0, values: {} });
   await tg.sendMessage(chatId,
-    `Договор № ${seq} с <b>${esc(cp.name)}</b>. Реквизиты обеих сторон подставлю сам — `
+    `Договор с <b>${esc(cp.name)}</b>. Реквизиты обеих сторон подставлю сам — `
     + 'нужно три ответа.');
   await tg.sendMessage(chatId, esc(DOG_STEPS[0].q));
 }
@@ -3902,24 +3906,15 @@ async function handleDogText(tg, chatId, user, state, text) {
     return;
   }
 
-  const org = bdb.currentOrg(user.id);
-  const cp = bdb.getCp(user.id, cpId);
   bdb.clearState(user.id);
-  if (!org || !cp) { await tg.sendMessage(chatId, 'Не хватает данных.', mainMenu()); return; }
-
-  const doc = {
-    number: d.number, date: d.date, subject: d.values.subject,
-    price: d.values.price, term: d.values.term,
-  };
+  await tg.sendChatAction(chatId, 'upload_document');
+  const res = await docService.issuePlain(user.id, { type: 'dog', cpId, fields: d.values });
+  if (!res.ok) { await tg.sendMessage(chatId, esc(res.message), mainMenu()); return; }
+  const cp = bdb.getCp(user.id, cpId);
   await sendGenerated(tg, chatId, {
-    html: buildDogovorHtml({ org, cp, doc }),
-    base: `Договор_${safeName(doc.number)}_${safeName(cp.name)}`,
-    caption: `Договор № ${esc(doc.number)} от ${ru(doc.date)} с <b>${esc(cp.name)}</b>.`
+    file: res.file,
+    caption: `Договор № ${esc(res.doc.number)} от ${ru(res.doc.date)} с <b>${esc(cp.name)}</b>.`
       + '\nШаблон общего назначения — под конкретную сделку покажите юристу.',
-  });
-  bdb.saveDoc(user.id, {
-    orgId: org.id, cpId, type: 'dog', number: doc.number, seq: d.seq, date: doc.date,
-    total: Number(doc.price) || 0, payload: { subject: doc.subject, price: doc.price, term: doc.term },
   });
   const { info, kb } = cpMenu(user.id, cp);
   await tg.sendMessage(chatId, info, kb);
@@ -3928,9 +3923,9 @@ async function handleDogText(tg, chatId, user, state, text) {
 async function startPp(tg, chatId, user, cpId) {
   if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
-  const seq = bdb.nextSeqForOrg(org.id, 'pp', currentYear());
-  bdb.setState(user.id, `pp:${cpId}`, { step: 'amount', seq, number: String(seq), date: todayISO() });
-  await tg.sendMessage(chatId, `Платёжное поручение № ${seq}. Введите <b>сумму</b>, руб.:`);
+  // Номер — в момент выпуска, как у договора выше.
+  bdb.setState(user.id, `pp:${cpId}`, { step: 'amount' });
+  await tg.sendMessage(chatId, 'Платёжное поручение. Введите <b>сумму</b>, руб.:');
 }
 async function handlePpText(tg, chatId, user, state, text) {
   const cpId = Number(state.state.split(':')[1]);
@@ -3942,18 +3937,17 @@ async function handlePpText(tg, chatId, user, state, text) {
     return;
   }
   // purpose
-  const org = await requireOrg(tg, chatId, user); if (!org) { bdb.clearState(user.id); return; }
-  const cp = bdb.getCp(user.id, cpId); if (!cp) { bdb.clearState(user.id); return; }
-  const doc = { number: state.data.number, date: state.data.date, amount: state.data.amount, purpose: String(text).trim() };
   bdb.clearState(user.id);
-  const html = buildPlatyozhkaHtml({ org, cp, doc });
-  await sendGenerated(tg, chatId, {
-    html, base: `Платежка_${safeName(doc.number)}_${safeName(cp.name)}`,
-    caption: `Платёжное поручение № ${esc(doc.number)} получателю <b>${esc(cp.name)}</b> на ${formatRub(doc.amount)}`,
+  await tg.sendChatAction(chatId, 'upload_document');
+  const res = await docService.issuePlain(user.id, {
+    type: 'pp', cpId, fields: { amount: state.data.amount, purpose: text },
   });
-  bdb.saveDoc(user.id, {
-    orgId: org.id, cpId, type: 'pp', number: doc.number, seq: state.data.seq,
-    date: doc.date, total: doc.amount, payload: { amount: doc.amount, purpose: doc.purpose },
+  if (!res.ok) { await tg.sendMessage(chatId, esc(res.message), mainMenu()); return; }
+  const cp = bdb.getCp(user.id, cpId);
+  await sendGenerated(tg, chatId, {
+    file: res.file,
+    caption: `Платёжное поручение № ${esc(res.doc.number)} получателю <b>${esc(cp.name)}</b> `
+      + `на ${formatRub(res.total)}`,
   });
   const { info, kb } = cpMenu(user.id, cp);
   await tg.sendMessage(chatId, info, kb);
@@ -4143,7 +4137,7 @@ async function handleKsfText(tg, chatId, user, state, text) {
   bdb.clearState(user.id);
 
   const res = await docService.issueFlat(user.id, {
-    type: 'ksf', cpId: src.cp_id, total: up.total || down.total,
+    type: 'ksf', cpId: src.cp_id, total: correctionNet({ up, down }).total,
     payload: { vatRate: rate, priceIncludesVat: Boolean(p.priceIncludesVat),
       base: { number: src.number, date: src.date }, reason: String(text).trim().slice(0, 300), lines },
   });
@@ -5122,8 +5116,13 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('doc.unpaid:')) {
       const id = Number(data.slice(11));
-      bdb.unmarkPaid(user.id, id);
-      await tg.sendMessage(chatId, 'Отметку об оплате снял, долг вернул в журнал.');
+      const un = bdb.unmarkPaid(user.id, id);
+      // Деньги из выписки пришли на самом деле — их не убираем, и долг по
+      // документу поэтому не вернётся. Сказать «вернул долг» было бы неправдой.
+      await tg.sendMessage(chatId, un && un.kept
+        ? `Отметку об оплате снял. ${formatRub(un.kept)} из выписки оставил в журнале`
+          + ' как оплату клиента без документа — деньги ведь пришли.'
+        : 'Отметку об оплате снял, долг вернул в журнал.');
       await showDoc(tg, chatId, user, id);
       return;
     }

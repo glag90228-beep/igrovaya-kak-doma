@@ -507,6 +507,39 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await tap(`doc.get:${updBtn.split(':')[1]}`);
   ok(files.length === 13 && files[12].filename.startsWith('УПД'), 'УПД пересобирается из журнала', files[12].filename);
 
+  /*
+   * Бот начал договор, а приложение за время трёх вопросов выписало свой.
+   * Раньше номер резервировался в начале диалога, и на последнем ответе
+   * запись падала на занятом номере — файл человек уже получил, а в журнале
+   * его не было.
+   */
+  {
+    const bdbR = require('./lib/bot-db');
+    const uidR = fxUserId();
+    const dogsBefore = bdbR.listDocs(uidR, 500).filter((d) => d.type === 'dog').length;
+    const filesBefore = files.length;
+    await tap(`d.dog:${cpId}`);
+    await say('аренда зала');
+    // Договор «из приложения» — прямо записью в журнал со следующим номером:
+    // так тест одинаково работает и на старом коде, и на новом.
+    const orgR = bdbR.currentOrg(uidR);
+    const today = require('./lib/period').todayISO();
+    const seqR = bdbR.nextSeqForOrg(orgR.id, 'dog', Number(today.slice(0, 4)));
+    bdbR.saveDoc(uidR, {
+      orgId: orgR.id, cpId, type: 'dog', number: String(seqR), seq: seqR, date: today, total: 1,
+      payload: { subject: 'из приложения', price: 1, term: '' },
+    });
+    let threw = null;
+    try { await say('0'); await say('-'); } catch (e) { threw = e; }
+    const dogs = bdbR.listDocs(uidR, 500).filter((d) => d.type === 'dog');
+    ok(!threw && dogs.length === dogsBefore + 2, 'оба договора в журнале, бот не упал',
+      threw ? threw.message : dogs.length - dogsBefore);
+    ok(new Set(dogs.map((d) => d.number)).size === dogs.length, 'и номера у них разные',
+      dogs.map((d) => d.number).join(', '));
+    ok(files.length === filesBefore + 1 && files[files.length - 1].caption.includes(`№ ${seqR + 1} `),
+      'в подписи файла — номер, под которым договор записан', (files[files.length - 1] || {}).caption);
+  }
+
   console.log('\n── разбор текста счёта ──');
   const { parseInvoiceText } = require('./lib/vision');
   const SCAN = `ООО «Ромашка»
@@ -1870,6 +1903,41 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'в шапке акта дата начала выбранного периода', String(j.getCell('D9').value).trim());
     ok(j.getCell('G9').value === 15000, 'и входящее сальдо этого периода', j.getCell('G9').value);
 
+    /*
+     * Акт за месяц без операций. Раньше итог вставал в первую строку таблицы,
+     * и SUM(E10:E9) — это E9:E10, то есть формула включала саму себя: Excel
+     * ругался на циклическую ссылку и показывал нули.
+     */
+    const empty = bdbP.cpForPeriod(uid, cpP, '2026-04-01', '2026-04-30');
+    const wbE = new ExcelJS.Workbook();
+    await wbE.xlsx.load(await buildAkt({
+      org: { brand: 'ИП Тест', org_short: 'ИП Тест', org_full: 'ИП Тест', org_inn: '183114389446', signer: 'И. Т.' },
+      cp: empty.view, ops: empty.ops,
+    }));
+    const col = (s) => [...s].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0);
+    const loops = [];
+    wbE.eachSheet((ws) => ws.eachRow((row) => row.eachCell((cell) => {
+      const f = cell.formula || (cell.value && cell.value.formula);
+      if (!f) return;
+      // Ссылки на другой лист циклом на этом не бывают — выкидываем их.
+      const local = String(f).replace(/'[^']*'!\$?[A-Z]+\$?\d+/g, '');
+      for (const m of local.matchAll(/([A-Z]{1,2})(\d+)(?::([A-Z]{1,2})(\d+))?/g)) {
+        const [c1, r1] = [col(m[1]), Number(m[2])];
+        const [c2, r2] = m[3] ? [col(m[3]), Number(m[4])] : [c1, r1];
+        const inside = cell.col >= Math.min(c1, c2) && cell.col <= Math.max(c1, c2)
+          && cell.row >= Math.min(r1, r2) && cell.row <= Math.max(r1, r2);
+        if (inside) loops.push(`${ws.name}!${cell.address}=${f}`);
+      }
+    })));
+    ok(empty.ops.length === 0 && loops.length === 0, 'в акте за пустой период нет циклических ссылок',
+      loops.join('; '));
+    const aE = wbE.getWorksheet('Акт сверки');
+    const closeE = [...Array(30).keys()].map((i) => aE.getCell(`G${i + 12}`).value)
+      .find((v) => v && v.formula && /G11/.test(v.formula));
+    ok(closeE && closeE.result === empty.opening && empty.opening === 14000,
+      'у стороны контрагента конечное сальдо считается от её же начального',
+      JSON.stringify(closeE));
+
     // Карточку акт не портит: там своё значение — начало отношений.
     ok(bdbP.getCp(uid, cpP).opening_date === '2026-01-01',
       'начало расчётов в карточке не подменяется периодом акта',
@@ -1931,8 +1999,26 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(t('март-май').to === '2026-05-31', 'месяцы через дефис — тоже диапазон');
     ok(t('апрель-июнь 2025').from === '2025-04-01' && t('апрель-июнь 2025').to === '2025-06-30',
       'диапазон месяцев с годом', JSON.stringify(t('апрель-июнь 2025')));
-    ok(t('ноябрь-февраль').to === '2027-02-28',
+    // В мае «ноябрь-февраль» — прошедшая зима, а не будущая.
+    ok(t('ноябрь-февраль').from === '2025-11-01' && t('ноябрь-февраль').to === '2026-02-28',
       'диапазон через новый год не сворачивается в пустой', JSON.stringify(t('ноябрь-февраль')));
+
+    /*
+     * Год не назван, а период впереди — значит, прошлогодний. Раньше «акт за
+     * декабрь», попрошенный в январе, приходил за декабрь, который наступит
+     * через год: пустой, с одним начальным сальдо.
+     */
+    const inJan = (s) => period.parsePeriodText(s, new Date(2027, 0, 10));
+    ok(inJan('за декабрь').from === '2026-12-01' && inJan('за декабрь').to === '2026-12-31',
+      'в январе «за декабрь» — только что закончившийся декабрь', JSON.stringify(inJan('за декабрь')));
+    ok(inJan('4 квартал').from === '2026-10-01', 'и «4 квартал» — прошлогодний',
+      JSON.stringify(inJan('4 квартал')));
+    ok(inJan('01.12 - 31.12').from === '2026-12-01', 'и даты без года тоже',
+      JSON.stringify(inJan('01.12 - 31.12')));
+    ok(inJan('январь').from === '2027-01-01', 'а текущий месяц остаётся текущим',
+      JSON.stringify(inJan('январь')));
+    ok(inJan('декабрь 2027').from === '2027-12-01', 'названный год не трогаем',
+      JSON.stringify(inJan('декабрь 2027')));
 
     // Несуществующие даты. «31.02.2026» проходило и печаталось в шапке акта.
     ok(t('31.02.2026') === null, 'тридцать первого февраля не бывает');
@@ -1945,9 +2031,10 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(t('максимум') === null, '«максимум» — не май');
     ok(t('декада') === null, '«декада» — не декабрь');
     ok(t('маркетинг') === null, '«маркетинг» — не март');
-    ok(t('августе').from === '2026-08-01', 'а склонённый месяц по-прежнему понятен',
+    // Год здесь прошлый (в мае август ещё впереди), проверяем само слово.
+    ok(t('августе').from.slice(5) === '08-01', 'а склонённый месяц по-прежнему понятен',
       JSON.stringify(t('августе')));
-    ok(t('сен').from === '2026-09-01', 'и сокращение тоже', JSON.stringify(t('сен')));
+    ok(t('сен').from.slice(5) === '09-01', 'и сокращение тоже', JSON.stringify(t('сен')));
 
     // Дата документа — по Москве, а не по часовому поясу сервера.
     // Сервер стоит в UTC: в 01:00 первого сентября по Москве документ
@@ -2358,6 +2445,28 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(shown(orgA) === 15000 && shown(orgB) === 0,
       'карточка покажет разное начальное сальдо разным фирмам',
       `${shown(orgA)} и ${shown(orgB)}`);
+
+    /*
+     * Клиента завели от лица второй фирмы — начальное сальдо только у неё.
+     * Перенос старых сальдо при загрузке (fillOpOrgs) раньше досоздавал пару
+     * ещё и основной фирме, и после каждого перезапуска долг клиента
+     * удваивался. Перезапуск здесь настоящий: модуль грузится заново в
+     * отдельном процессе на той же базе.
+     */
+    const uR = bdbO.getOrCreateUser(779083, 'Перезапуск');
+    bdbO.saveMyOrg(uR.id, { name: 'ООО «Главная»', inn: '7701234567' });
+    const reA = bdbO.getDefaultOrg(uR.id).id;
+    const reB = bdbO.createOrg(uR.id, { name: 'ООО «Вторая»', inn: '7707083893' });
+    bdbO.setActiveOrg(uR.id, reB);
+    const cpR = bdbO.createCp(uR.id, {
+      name: 'ООО «Старый долг»', kind: 'customer', opening_balance: 8000, opening_date: '2026-01-01',
+    });
+    require('node:child_process').execFileSync(process.execPath,
+      ['-e', "require('./lib/bot-db')"], { cwd: __dirname, env: process.env, stdio: 'ignore' });
+    ok(bdbO.openingFor(cpR, reA).opening_balance === 0,
+      'после перезапуска чужое начальное сальдо основной фирме не досталось',
+      bdbO.openingFor(cpR, reA).opening_balance);
+    ok(bdbO.openingFor(cpR, reB).opening_balance === 8000, 'а у своей фирмы осталось как было');
 
     /*
      * Сводная проверка блока: две фирмы не смешиваются нигде.
