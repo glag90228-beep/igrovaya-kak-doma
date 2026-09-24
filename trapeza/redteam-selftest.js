@@ -325,6 +325,42 @@ async function startSmeta(env = {}) {
     delete env.LAVA_LOG;
     spawnSync(process.execPath, ['platega-selftest.js'], { cwd: __dirname, env, encoding: 'utf8' });
     ok(stat() === before, 'прогон оплат не пишет в боевой журнал вебхуков', `${before} → ${stat()}`);
+
+    /*
+     * Раскладка update.sh удаляет всё, чего нет в репозитории, — кроме базы,
+     * ключей и зависимостей. Одна пропавшая защита, и обновление стирает
+     * боевую базу. Команду берём из самого скрипта, а не переписываем сюда:
+     * иначе проверялась бы копия, а скрипт жил бы своей жизнью.
+     */
+    const script = fsR.readFileSync(pathR.join(__dirname, 'deploy', 'update.sh'), 'utf8');
+    const cmd = (/^rsync -a --delete[\s\S]*?"\$APP\/"$/m.exec(script) || [])[0];
+    ok(Boolean(cmd), 'в update.sh раскладка идёт через rsync --delete');
+    if (cmd && spawnSync('rsync', ['--version']).status === 0) {
+      const box = fsR.mkdtempSync(pathR.join(osR.tmpdir(), 'trapeza-deploy-'));
+      const put = (rel, text) => {
+        fsR.mkdirSync(pathR.dirname(pathR.join(box, rel)), { recursive: true });
+        fsR.writeFileSync(pathR.join(box, rel), text);
+      };
+      put('src/trapeza/bot.js', 'новый код');
+      put('src/trapeza/.env.example', 'BOT_TOKEN=');
+      put('app/bot.js', 'поправлено руками на сервере');
+      put('app/lib/udalyonnyj.js', 'модуль, убранный из репозитория');
+      const keep = ['data/trapeza.db', 'data/lava-webhook.log', 'node_modules/exceljs/index.js',
+        '.env', '.env.bak.20260901', '.package-lock.deployed'];
+      for (const f of keep) put(`app/${f}`, `боевое: ${f}`);
+      const r = spawnSync('bash', ['-c', cmd], {
+        env: { ...process.env, SRC: pathR.join(box, 'src'), APP: pathR.join(box, 'app') }, encoding: 'utf8',
+      });
+      const read = (rel) => (fsR.existsSync(pathR.join(box, 'app', rel)) ? fsR.readFileSync(pathR.join(box, 'app', rel), 'utf8') : null);
+      const lost = keep.filter((f) => read(f) !== `боевое: ${f}`);
+      ok(r.status === 0 && !lost.length, 'база, ключи и зависимости переживают раскладку',
+        `${r.status} ${lost.join(', ')} ${String(r.stderr).trim()}`);
+      ok(read('lib/udalyonnyj.js') === null, 'убранный из репозитория файл с сервера удалён');
+      ok(read('bot.js') === 'новый код', 'правка руками на сервере заменена кодом из репозитория');
+      fsR.rmSync(box, { recursive: true, force: true });
+    } else if (cmd) {
+      console.log('  — rsync на этой машине нет: раскладку проверит прогон на сервере');
+    }
   }
 
   console.log(bad ? `\nне прошло: ${bad}` : '\nвсе атаки отражены ✅');

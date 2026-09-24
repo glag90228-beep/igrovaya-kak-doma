@@ -40,6 +40,10 @@ echo "Ветка:  $BRANCH"
 echo "Сервер: $APP"
 echo
 
+# Раскладке нужен rsync. install.sh его ставит, но проверяем здесь, в самом
+# начале: узнать о его отсутствии после двухминутного прогона обидно.
+command -v rsync >/dev/null 2>&1 || apt-get install -y rsync
+
 # ---------- 1. Свежий код ----------
 #
 # Клон живёт отдельно от рабочей папки: в /opt/trapeza лежат .env, база и
@@ -128,10 +132,24 @@ fi
 
 # ---------- 4. Раскладка ----------
 #
-# Копируем содержимое, а не папку целиком: .env, data/ и node_modules
-# в репозитории отсутствуют, значит и перезаписать их нечем.
-
-cp -r "$SRC/trapeza/." "$APP/"
+# Папка на сервере приводится в точное соответствие с репозиторием: файл,
+# которого в git больше нет, удаляется. Раньше здесь был `cp -r` поверх, и
+# удалённый из репозитория модуль продолжал лежать в /opt/trapeza — по папке
+# уже нельзя было сказать, какой код на самом деле работает.
+#
+# Защищено от удаления то, чего в git нет и быть не должно:
+#   data/                 — база клиентов, журналы вебхуков, замки;
+#   node_modules/         — зависимости, ставятся отдельно;
+#   .env и .env.bak.*     — ключи; копии делает nginx-merge.sh перед правкой;
+#   .package-lock.deployed — по нему шаг 2 решает, ставить ли зависимости:
+#                            сотри его, и каждое обновление ставило бы их заново.
+# protect не даёт удалить, exclude — перезаписать. data и .env защищены
+# обоими способами, как в install.sh: ошибка здесь стоит боевой базы.
+rsync -a --delete \
+  --filter='protect /data' --filter='protect node_modules' \
+  --filter='protect /.env*' --filter='protect /.package-lock.deployed' \
+  --exclude /data --exclude node_modules --exclude /.env \
+  "$SRC/trapeza/" "$APP/"
 if [ "$DEPS_CHANGED" = 1 ]; then
   (cd "$APP" && npm install --omit=dev --no-audit --no-fund >/dev/null)
   cp "$SRC/trapeza/package-lock.json" "$APP/.package-lock.deployed"
