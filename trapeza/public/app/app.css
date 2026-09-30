@@ -415,7 +415,8 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   box-shadow: var(--shadow-1);
 }
 .prompt:active { transform: scale(.985); transition: transform 90ms var(--ease); }
-.prompt .grow { min-width: 0; }
+/* flex: 1 — иначе на широком экране стрелка встаёт сразу за текстом, а не у края. */
+.prompt .grow { flex: 1; min-width: 0; }
 .prompt-go {
   display: flex; align-items: center; justify-content: center;
   width: 34px; height: 34px; flex: none; border-radius: 50%;
