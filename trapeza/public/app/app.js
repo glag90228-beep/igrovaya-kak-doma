@@ -198,10 +198,122 @@ async function afterIssue() {
   reset(st.bizType ? 'home' : 'basis');
 }
 
+// Заголовок шапки для экранов, которых нет во вкладках.
+const TITLES = {
+  cp: 'Клиент', op: 'Операция', doc: 'Документ', new: 'Новый документ',
+  inbox: 'Почта', letter: 'Письмо', mail: 'Почта', bank: 'Банк', org: 'Организация',
+  billing: 'Тариф', support: 'Поддержка', help: 'Помощь', ask: 'Помощник',
+  recurring: 'По расписанию', reminders: 'Напоминания', unpaid: 'Не оплачено',
+};
+
+const topbar = document.getElementById('topbar');
+const drawer = document.getElementById('drawer');
+const scrim = document.getElementById('scrim');
+const DESKTOP = window.matchMedia('(min-width: 1024px)');
+
+function sectionTitle(name) {
+  const t = TABS.find((x) => x.name === name);
+  return t ? t.label : (TITLES[name] || 'Первичка');
+}
+
+/** Открыть/закрыть панель. На широком экране она стоит всегда — там нечего переключать. */
+function setDrawer(open) {
+  if (DESKTOP.matches) open = true;
+  drawer.hidden = false;
+  drawer.classList.toggle('open', open);
+  scrim.hidden = !open || DESKTOP.matches;
+  document.body.classList.toggle('drawer-open', open && !DESKTOP.matches);
+  // Пока панель закрыта, её ссылки не должны ловить Tab.
+  drawer.inert = !open;
+  const burger = document.getElementById('burger');
+  if (burger) burger.setAttribute('aria-expanded', String(open));
+  if (open && !DESKTOP.matches) drawer.querySelector('button')?.focus();
+}
+
+function userInfo() {
+  const u = (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) || {};
+  const name = [u.first_name, u.last_name].filter(Boolean).join(' ') || 'Профиль';
+  return { name, initial: name.trim().charAt(0).toUpperCase() || '·', photo: u.photo_url };
+}
+
+function avatar(u) {
+  return u.photo
+    ? h('img', { class: 'avatar', src: u.photo, alt: '', referrerpolicy: 'no-referrer' })
+    : h('span', { class: 'avatar', 'aria-hidden': 'true', text: u.initial });
+}
+
+function closeActions() {
+  const m = document.getElementById('actions');
+  if (m) m.hidden = true;
+  document.getElementById('actions-btn')?.setAttribute('aria-expanded', 'false');
+}
+
+function buildChrome() {
+  const u = userInfo();
+
+  const go1 = (name) => { haptic(); closeActions(); setDrawer(false); reset(name); };
+
+  const menuItem = (label, iconName, name) => h('button', {
+    type: 'button', role: 'menuitem', class: 'menu-item', onclick: () => go1(name),
+  }, icon(iconName), h('span', { text: label }));
+
+  topbar.replaceChildren(
+    h('button', {
+      id: 'burger', class: 'tb-btn', type: 'button', 'aria-label': 'Меню',
+      'aria-controls': 'drawer', 'aria-expanded': 'false',
+      onclick: () => setDrawer(!drawer.classList.contains('open')),
+    }, icon('menu')),
+    h('button', { class: 'tb-btn tb-home', type: 'button', 'aria-label': 'Главная', onclick: () => go1('home') }, icon('home')),
+    h('div', { id: 'tb-title', class: 'tb-title' }),
+    h('span', { class: 'tb-user' }, avatar(u), h('span', { class: 'tb-name', text: u.name })),
+    h('div', { class: 'tb-actions' },
+      h('button', {
+        id: 'actions-btn', class: 'tb-btn', type: 'button', 'aria-label': 'Действия',
+        'aria-haspopup': 'menu', 'aria-expanded': 'false',
+        onclick: (e) => {
+          e.stopPropagation();
+          const m = document.getElementById('actions');
+          m.hidden = !m.hidden;
+          e.currentTarget.setAttribute('aria-expanded', String(!m.hidden));
+          if (!m.hidden) m.querySelector('button').focus();
+        },
+      }, icon('more')),
+      h('div', { id: 'actions', class: 'menu', role: 'menu', hidden: true },
+        menuItem('Почта', 'mail', 'inbox'),
+        menuItem('Помощь', 'help', 'help'),
+        menuItem('Поддержка', 'bot', 'support'))));
+
+  drawer.replaceChildren(
+    h('div', { class: 'drawer-head' },
+      avatar(u), h('div', {}, h('b', { text: u.name }), h('div', { class: 'small', text: 'Первичка' })),
+      h('button', { class: 'tb-btn drawer-close', type: 'button', 'aria-label': 'Закрыть меню', onclick: () => setDrawer(false) }, icon('close'))),
+    h('nav', { 'aria-label': 'Разделы' }, TABS.map((t) => h('button', {
+      class: 'drawer-item', type: 'button', dataset: { name: t.name },
+      onclick: () => go1(t.name),
+    }, icon(t.icon), h('span', { text: t.label })))));
+
+  scrim.addEventListener('click', () => setDrawer(false));
+  document.addEventListener('click', (e) => { if (!e.target.closest('.tb-actions')) closeActions(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    closeActions();
+    if (drawer.classList.contains('open') && !DESKTOP.matches) { setDrawer(false); document.getElementById('burger').focus(); }
+  });
+  DESKTOP.addEventListener('change', () => setDrawer(DESKTOP.matches));
+  topbar.hidden = false;
+  setDrawer(DESKTOP.matches);
+}
+
 function syncChrome() {
   const { name } = current();
   const isTab = TABS.some((t) => t.name === name);
   tabsBox.hidden = false;
+  const title = document.getElementById('tb-title');
+  if (title) title.textContent = sectionTitle(name);
+  for (const btn of drawer.querySelectorAll('.drawer-item')) {
+    if (btn.dataset.name === name) btn.setAttribute('aria-current', 'page');
+    else btn.removeAttribute('aria-current');
+  }
   for (const btn of tabsBox.children) {
     const active = btn.dataset.name === name;
     if (active) btn.setAttribute('aria-current', 'page');
@@ -250,9 +362,12 @@ function dropSplash() {
 }
 
 function skeleton() {
-  return h('div', {},
-    h('div', { class: 'skeleton' }, h('div', { class: 'line', style: 'width:55%' }), h('div', { class: 'line', style: 'width:80%' })),
-    h('div', { class: 'skeleton' }, h('div', { class: 'line' }), h('div', { class: 'line', style: 'width:70%' })));
+  const row = (w) => h('div', { class: 'sk-row' },
+    h('span', { class: 'sk-dot' }),
+    h('div', { class: 'sk-col' }, h('div', { class: 'line', style: `width:${w}%` }), h('div', { class: 'line short' })));
+  return h('div', { role: 'status', 'aria-label': 'Загружаю' },
+    h('div', { class: 'skeleton' }, h('div', { class: 'line big', style: 'width:45%' }), h('div', { class: 'line', style: 'width:70%' })),
+    h('div', { class: 'skeleton' }, row(65), row(80), row(55)));
 }
 
 function errorScreen(e) {
@@ -4373,11 +4488,14 @@ window.__go = (name, params) => go(name, params || {});
 
 function start() {
   buildTabs();
+  buildChrome();
 
   if (!tg) {
     app.replaceChildren(empty('warn', 'Откройте из Telegram',
       'Это приложение работает внутри Telegram: оттуда оно получает, кто вы.'));
     tabsBox.hidden = true;
+    topbar.hidden = true;
+    drawer.hidden = true;
     dropSplash();            // иначе заставка останется висеть поверх ответа
     return;
   }
@@ -4393,6 +4511,8 @@ function start() {
     app.replaceChildren(empty('warn', 'Не удалось вас опознать',
       'Закройте приложение и откройте его заново из чата с ботом.'));
     tabsBox.hidden = true;
+    topbar.hidden = true;
+    drawer.hidden = true;
     dropSplash();            // иначе заставка останется висеть поверх ответа
     return;
   }

@@ -351,9 +351,12 @@ const ok = (c, m, extra) => {
   ok(await page.evaluate(() => document.querySelector('h1') === null
     || document.querySelector('.balance') !== null), 'после оплаты вернулись в карточку клиента');
 
-  await page.touchscreen.tap(200, 400);              // сбросить возможный фокус
+  // Фокус сбрасываем явно: тап «в пустое место» зависит от вёрстки и после
+  // появления шапки попадал в строку списка.
+  await page.evaluate(() => document.activeElement && document.activeElement.blur());
   const swipeBack = async () => {
-    await page.touchscreen.tap(5, 400);
+    // Настоящий тап тут не нужен: Chromium подтягивает его к ближайшей строке списка
+    // и открывает её. Жест проверяем событиями — их и слушает приложение.
     await page.evaluate(() => {
       const t = (type, x) => {
         const touch = new Touch({ identifier: 1, target: document.body, clientX: x, clientY: 400 });
