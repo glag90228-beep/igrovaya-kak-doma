@@ -1931,6 +1931,17 @@ const api = {
       }
       extra.priceIncludesVat = Boolean(body.priceIncludesVat);
     }
+    /*
+     * Основание накладной и УПД — то, что человек написал сам.
+     *
+     * Раньше это поле до сервера не доходило: приложение его не спрашивало,
+     * сервер не принимал, и в графе «Основание» всегда стоял договор из
+     * карточки или «Без договора» — даже когда товар шёл по конкретному
+     * договору или заказу. Пустое не передаём: тогда шаблон сам возьмёт
+     * договор контрагента, а без него — «Без договора».
+     */
+    const basis = str(body.basis, 200);
+    if (basis && ['torg12', 'upd'].includes(String(body.type))) extra.basis = basis;
     const res = await docService.issueDocument(user.id, {
       type: str(body.type, 10),
       cpId: Number(body.cpId),

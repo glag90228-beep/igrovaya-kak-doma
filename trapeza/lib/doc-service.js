@@ -234,13 +234,6 @@ async function issueDocument(userId, {
   // в боте и поле status в приложении раньше проходили мимо правила выше.
   if (isNpd(org)) fields = { ...fields, vatRate: null, ...(type === 'upd' ? { status: 2 } : {}) };
 
-  // Основание накладной: если не задано, берём договор контрагента; если и его нет,
-  // генерируем автоматическое основание по дате.
-  if (type === 'torg12' && !Object.prototype.hasOwnProperty.call(fields, 'basis')) {
-    const contract = cp.contract || '';
-    fields = { ...fields, basis: contract || `По накладной от ${ruDate(when)}` };
-  }
-
   /*
    * Строка 5б: чем закрываем ранее полученный аванс.
    *

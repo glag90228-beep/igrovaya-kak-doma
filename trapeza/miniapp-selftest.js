@@ -455,6 +455,40 @@ async function main() {
     ok(/^№ \d+ от /.test(String((bdbS.getDoc(mid, shipId).payload || {}).advDoc || '')),
       'строка 5б заполнилась сама', (bdbS.getDoc(mid, shipId).payload || {}).advDoc);
 
+    // --- основание накладной: своё, из карточки или «Без договора» ---
+    {
+      const payloadOf = (res) => (bdbS.getDoc(mid, ((res.json || {}).doc || {}).id) || {}).payload || {};
+      r = await call('POST', '/api/doc', { user: sfUser, body: {
+        type: 'torg12', cpId: cpS, items: [{ name: 'Кабель', qty: 10, price: 500 }],
+        basis: '  Договор поставки № 7 от 01.09.2026  ' } });
+      ok(r.status === 200, 'накладная с основанием выписана', (r.json || {}).error);
+      ok(payloadOf(r).basis === 'Договор поставки № 7 от 01.09.2026',
+        'основание, написанное руками, дошло до документа', payloadOf(r).basis);
+
+      // Без основания и без договора в карточке: прежняя вставка здесь падала,
+      // обращаясь к дате раньше, чем та была посчитана.
+      r = await call('POST', '/api/doc', { user: sfUser, body: {
+        type: 'torg12', cpId: cpS, items: [{ name: 'Кабель', qty: 1, price: 500 }] } });
+      ok(r.status === 200, 'без основания накладная тоже выписывается', (r.json || {}).error);
+      ok(!('basis' in payloadOf(r)),
+        'пустое основание не записывается — шаблон решит по карточке', payloadOf(r).basis);
+
+      r = await call('POST', '/api/doc', { user: sfUser, body: {
+        type: 'sch', cpId: cpS, items: [{ name: 'Кабель', qty: 1, price: 500 }], basis: 'Договор № 1' } });
+      ok(!('basis' in payloadOf(r)), 'у счёта графы «Основание» нет — и в документ она не попадает');
+
+      const { buildTorg12Html } = require('./lib/torg12');
+      const blank = { number: '1', date: '2026-10-05', items: [{ name: 'Кабель', qty: 1, price: 1 }] };
+      const cpNoContract = { name: 'Покупатель' };
+      const orgT = { name: 'Поставщик' };
+      ok(buildTorg12Html({ org: orgT, cp: cpNoContract, doc: { ...blank, basis: 'Заказ № 45' } }).includes('Заказ № 45'),
+        'своё основание напечатано в накладной');
+      ok(buildTorg12Html({ org: orgT, cp: { ...cpNoContract, contract: 'Договор № 3 от 01.02.2026' }, doc: blank })
+        .includes('Договор № 3 от 01.02.2026'), 'без своего — договор из карточки');
+      ok(buildTorg12Html({ org: orgT, cp: cpNoContract, doc: blank }).includes('Без договора'),
+        'а без договора — «Без договора»');
+    }
+
     // --- что можно корректировать ---
     r = await call('GET', `/api/doc/correctable?cpId=${cpS}`, { user: sfUser });
     ok(r.json.docs.some((d) => d.id === shipId), 'счёт-фактура предлагается к корректировке',

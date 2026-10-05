@@ -4166,8 +4166,29 @@ screens.new = async function newDoc(params) {
    */
   const dateInput = h('input', { id: 'f-date', type: 'date', value: draft.date });
   const cpField = h('div', { class: 'field' });
+
+  /*
+   * Основание — только у накладной и УПД: в их бланке есть такая графа.
+   * Пустое поле не ошибка: сервер ничего не передаёт, и шаблон печатает
+   * договор из карточки клиента, а без него — «Без договора». Что именно
+   * выйдет, пишем под полем, чтобы пустое поле не выглядело забытым.
+   */
+  const basisInput = ['torg12', 'upd'].includes(type)
+    ? h('input', { id: 'f-basis', autocomplete: 'off', maxlength: 200, placeholder: 'Договор № … от …' })
+    : null;
+  const basisHint = h('div', { class: 'small muted', style: 'margin-top:4px' });
+  function drawBasisHint() {
+    if (!basisInput) return;
+    const contract = (known.find((c) => c.id === draft.cpId) || {}).contract || '';
+    basisHint.textContent = contract
+      ? `Не заполните — напечатаем договор из карточки: «${contract}»`
+      : 'Не заполните — напечатаем «Без договора»';
+  }
+
   box.append(h('div', { class: 'card' }, cpField,
-    h('div', { class: 'field' }, h('label', { for: 'f-date', text: 'Дата' }), dateInput)));
+    h('div', { class: 'field' }, h('label', { for: 'f-date', text: 'Дата' }), dateInput),
+    basisInput ? h('div', { class: 'field' },
+      h('label', { for: 'f-basis', text: 'Основание' }), basisInput, basisHint) : null));
 
   // Список пополняется прямо здесь, поэтому держим свою копию: перерисовывать
   // весь экран ради одной новой строки незачем.
@@ -4181,6 +4202,7 @@ screens.new = async function newDoc(params) {
 
   function drawCp() {
     cpField.textContent = '';
+    drawBasisHint();
     if (draft.cpId) {
       // Выбранного показываем строкой, а не полем: главное здесь — увидеть,
       // ЧТО выбрано. Ошибка в получателе документа дороже лишнего нажатия.
@@ -4403,6 +4425,7 @@ screens.new = async function newDoc(params) {
     try {
       if (tg) tg.MainButton.showProgress();
       const payload = { type, cpId: draft.cpId, date: dateInput.value, items };
+      if (basisInput && basisInput.value.trim()) payload.basis = basisInput.value.trim();
       if (draft.vatRate !== undefined) {
         payload.vatRate = draft.vatRate;
         payload.priceIncludesVat = Boolean(draft.priceIncludesVat);
