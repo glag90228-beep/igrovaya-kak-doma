@@ -338,6 +338,8 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   ok(last().includes('№ 2'), 'следующий счёт получил номер 2', last().slice(0, 40));
   await say('Доставка; 1; 1000');
   await tap('items.done');
+  ok(!button('Основание') && !last().includes('Основание:'),
+    'у счёта основания нет — в его бланке такой графы нет');
   await tap('doc.num');
   await say('СЧ-2026/007');
   ok(last().includes('СЧ-2026/007'), 'номер можно задать свой', last().slice(0, 40));
@@ -487,8 +489,27 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await say('Пирожки с мясом; 100; 45');
   await say('Морсы, 1 л; 10; 250');
   await tap('items.done');
+  ok(/Основание: <b>[^<]+<\/b>/.test(last()), 'в сводке накладной видно, какое основание напечатается',
+    last().slice(0, 160));
+  ok(button('Основание') === 'doc.basis', 'и его можно поменять кнопкой');
+  await tap('doc.basis');
+  await say('Договор поставки № 7 от 01.09.2026');
+  ok(last().includes('Основание: <b>Договор поставки № 7 от 01.09.2026</b>'),
+    'своё основание принято и показано в сводке', last().slice(0, 160));
+  await tap('doc.basis');
+  await say('-');
+  ok(!last().includes('Договор поставки № 7') && last().includes('Основание:'),
+    '«-» возвращает основание из карточки', last().slice(0, 160));
+  await tap('doc.basis');
+  await say('Заказ № 45 от 01.10.2026');
   await tap('doc.make');
   ok(files.length === 11 && files[10].filename.startsWith('ТОРГ-12'), 'накладная сформирована', files[10].filename);
+  {
+    const b = require('./lib/bot-db');
+    const t12 = b.listDocs(fxUserId(), 20).find((x) => x.type === 'torg12');
+    const basis = ((t12 && b.getDoc(fxUserId(), t12.id)) || {}).payload || {};
+    ok(basis.basis === 'Заказ № 45 от 01.10.2026', 'основание из бота дошло до документа', basis.basis);
+  }
   // formatRub ставит неразрывный пробел — сравниваем по обычному
   const cap9 = norm(files[10].caption);
   ok(cap9.includes('7 000,00'), 'сумма накладной посчитана', cap9.slice(0, 80));

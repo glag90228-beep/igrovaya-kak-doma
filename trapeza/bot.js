@@ -96,7 +96,7 @@ const clean = (s) => (String(s).trim() === '-' ? '' : String(s).trim());
  * ждут только текста, и любая кнопка для них — выход.
  */
 const FLOW_BUTTONS = {
-  'items:': ['items.', 'tpl:', 'doc.make', 'doc.num', 'doc.date', 'doc.vat'],
+  'items:': ['items.', 'tpl:', 'doc.make', 'doc.num', 'doc.date', 'doc.basis', 'doc.vat'],
   'form:': ['fb:', 'form.skip'],
   photo: ['ph.'],
   // Книга учёта и выбор режима — часть работы с выпиской: раньше их нажатие
@@ -874,9 +874,18 @@ async function startItems(tg, chatId, user, type, cpId, extra = {}) {
 
 /** Сводка перед выпуском: номер и дату можно поправить. */
 async function showPreview(tg, chatId, user, state) {
-  const [, type] = state.state.split(':');
+  const [, type, cpIdStr] = state.state.split(':');
   const d = state.data;
   const extra = d.doc || {};
+  /*
+   * Основание есть только в бланке накладной и УПД. Показываем то, что
+   * действительно напечатается: своё, если вписали, иначе договор из
+   * карточки, а без него — «Без договора». Тот же порядок, что в шаблонах.
+   */
+  const hasBasis = ['torg12', 'upd'].includes(type);
+  const basisLine = hasBasis
+    ? `Основание: <b>${esc(extra.basis || (bdb.getCp(user.id, Number(cpIdStr)) || {}).contract || 'Без договора')}</b>\n`
+    : '';
   // Итог считаем тем же кодом, что и сам документ: иначе сводка покажет
   // одно, а в PDF попадёт другое — на НДС «сверху» разница заметная.
   const sums = vatTotals(d.items, extra.vatRate == null ? null : Number(extra.vatRate),
@@ -900,7 +909,7 @@ async function showPreview(tg, chatId, user, state) {
     ? `От: <b>${esc((bdb.currentOrg(user.id) || {}).name || '—')}</b>\n` : '';
   await tg.sendMessage(chatId,
     `Проверьте документ: <b>${esc(ITEM_DOCS[type].title)} № ${esc(d.number)}</b> от ${ru(d.date)}${head}\n`
-    + from + '\n'
+    + from + basisLine + '\n'
     + (lines.join('\n') || '— пусто —')
     + (sums.vat == null
       ? `\n\nИтого: <b>${formatRub(total)}</b> (без НДС)`
@@ -910,6 +919,7 @@ async function showPreview(tg, chatId, user, state) {
     keyboard([
       [{ text: '📄 Сформировать документ', data: 'doc.make' }],
       [{ text: '✏️ Номер', data: 'doc.num' }, { text: '📅 Дата', data: 'doc.date' }],
+      ...(hasBasis ? [[{ text: '📎 Основание', data: 'doc.basis' }]] : []),
       ...(['sch', 'schdog'].includes(type)
         ? [[{ text: `🧾 НДС: ${sums.vat == null ? 'нет' : `${extra.vatRate}%`}`, data: 'doc.vat' }]] : []),
       [{ text: '➕ Ещё позиция', data: 'items.more' }],
@@ -4629,6 +4639,16 @@ async function handleMessage(tg, msg) {
       await showPreview(tg, chatId, user, bdb.getState(user.id));
       return;
     }
+    if (d.ask === 'basis') {
+      // Предел тот же, что у договора в карточке и у поля в приложении.
+      const basis = text.trim().slice(0, 200);
+      const doc = { ...(d.doc || {}) };
+      if (!basis || /^[-—–]$/.test(basis)) delete doc.basis; else doc.basis = basis;
+      d.doc = doc; d.ask = '';
+      bdb.setState(user.id, state.state, d);
+      await showPreview(tg, chatId, user, bdb.getState(user.id));
+      return;
+    }
     if (d.ask === 'qty') {
       const qty = parseAmount(text);
       if (qty == null || qty <= 0) { await tg.sendMessage(chatId, 'Нужно количество числом, напр. 20:'); return; }
@@ -5717,6 +5737,16 @@ async function handleCallback(tg, cq) {
       await tg.sendMessage(chatId, data === 'doc.num'
         ? `Введите номер документа (сейчас ${esc(state.data.number)}):`
         : `Введите дату ДД.ММ.ГГГГ (сейчас ${ru(state.data.date)}):`);
+      return;
+    }
+    if (data === 'doc.basis') {
+      const state = bdb.getState(user.id);
+      if (!state.state.startsWith('items:')) return;
+      state.data.ask = 'basis';
+      bdb.setState(user.id, state.state, state.data);
+      await tg.sendMessage(chatId, 'Напишите основание — например, '
+        + '<code>Договор поставки № 7 от 01.09.2026</code> или <code>Заказ № 45</code>.\n'
+        + '<i>Отправьте «-», чтобы печатать договор из карточки клиента, а без него — «Без договора».</i>');
       return;
     }
     if (data.startsWith('tpl:')) {
