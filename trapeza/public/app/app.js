@@ -81,7 +81,7 @@ function haptic(kind = 'light') {
 }
 
 let toastTimer = 0;
-function toast(text, isError = false) {
+function toast(text, isError = false, ms = 0) {
   const box = document.getElementById('toast');
   box.textContent = text;
   box.className = `toast${isError ? ' err' : ''}`;
@@ -91,7 +91,7 @@ function toast(text, isError = false) {
   toastTimer = setTimeout(() => {
     box.classList.remove('show');
     setTimeout(() => { box.hidden = true; }, 200);
-  }, isError ? 5000 : 3000);
+  }, ms || (isError ? 5000 : 3000));
 }
 
 // ---------- обращения к серверу ----------
@@ -446,12 +446,45 @@ function greetName(raw) {
  * читался как ошибка продукта. Подробный разбор с пересчётом никуда не
  * делся — он открывается по нажатию, когда человек сам захочет разобраться.
  */
+/*
+ * Режимов три, а подписей было две: «журнал веду сам» показывался как
+ * «Считаем по актам». Человек читал, что накладная попадёт в долг, выписывал
+ * её — и долг не появлялся, потому что в этом режиме документы журнал не
+ * трогают вовсе. Подпись обязана говорить ровно то, что делает учёт.
+ */
+const BASIS_CHIP = {
+  closing: 'Считаем по актам и накладным',
+  invoice: 'Считаем по счетам',
+  manual: 'Долг сам не считается',
+};
+
 function basisChip(s) {
-  const byBill = s.debtBasis === 'invoice';
   const chip = h('button', { class: 'chip-basis' },
-    `Считаем ${byBill ? 'по счетам' : 'по актам'} ▾`);
+    `${BASIS_CHIP[s.debtBasis] || BASIS_CHIP.closing} ▾`);
   chip.onclick = () => { haptic(); go('why'); };
   return chip;
+}
+
+/**
+ * Почему выписанный акт или накладная не попали в долг — или '' если попали.
+ *
+ * Закрывающий документ не создаёт долга при основании «по счёту» и в режиме
+ * «журнал веду сам». Так и задумано, но молчать об этом в момент выписки
+ * нельзя: человек идёт в карточку клиента, видит ноль и считает это
+ * поломкой. Про счёт не говорим — при основании «по отгрузке» он долга не
+ * создаёт у всех, это обычный порядок, а не сюрприз.
+ */
+function noDebtNote(type, r) {
+  if (!r || r.debt || !(Number(r.total) > 0) || !['usl', 'upd', 'torg12'].includes(type)) return '';
+  if (r.debtBasis === 'manual') {
+    return 'В долг клиента не попал: выбрано «журнал веду сам». '
+      + 'Чтобы акты и накладные считались — плашка под суммой на главной.';
+  }
+  if (r.debtBasis === 'invoice') {
+    return 'Долг у вас считается по счетам, поэтому сам документ в долг клиента не попал. '
+      + 'Чтобы считались акты и накладные — плашка под суммой на главной.';
+  }
+  return '';
 }
 
 // ---------- экраны ----------
@@ -670,34 +703,58 @@ screens.why = async function why() {
    * Сам переключатель важен и остаётся: он пересчитывает уже выписанное.
    */
   {
-    const byBill = s.debtBasis === 'invoice';
+    const basis = BASIS_CHIP[s.debtBasis] ? s.debtBasis : 'closing';
     const m = s.basisMismatch;
-    const fix = h('button', { class: 'btn secondary' },
-      byBill ? 'Считать долг по актам' : 'Считать долг по счетам');
-    fix.onclick = () => withBusy(fix, async () => {
-      const r = await api('POST', '/api/basis', { basis: byBill ? 'closing' : 'invoice' });
-      haptic('medium');
-      const f = r.fixed || {};
-      toast(f.added
-        ? `Пересчитал: долг появился по ${f.added} ${plural(f.added, 'документу', 'документам', 'документам')}`
-        : (f.paid ? `Пересчитал журнал: поправлено строк оплаты — ${f.paid}` : 'Готово'));
-      cache = {};
-      reset('home');
-    });
+    const switchTo = (value, label, cls) => {
+      const btn = h('button', { class: cls }, label);
+      btn.onclick = () => withBusy(btn, async () => {
+        const r = await api('POST', '/api/basis', { basis: value });
+        haptic('medium');
+        const f = r.fixed || {};
+        toast(f.added
+          ? `Пересчитал: долг появился по ${f.added} ${plural(f.added, 'документу', 'документам', 'документам')}`
+          : (f.paid ? `Пересчитал журнал: поправлено строк оплаты — ${f.paid}` : 'Готово'));
+        cache = {};
+        reset('home');
+      });
+      return btn;
+    };
+    /*
+     * Ручной режим — отдельный случай, а не «по актам».
+     *
+     * Раньше экран знал два состояния и в ручном режиме рассказывал, что долг
+     * возникает с актом или накладной, а кнопка предлагала перейти «на
+     * счета». Накладные при этом не считались ни до, ни после нажатия.
+     * Человеку в ручном режиме нужнее всего вернуть подсчёт по отгрузке,
+     * поэтому эта кнопка первая.
+     */
+    const head = {
+      closing: ['Долг считается по актам и накладным',
+        'Обязательство возникает, когда подписан акт, УПД или накладная. Счёт долга не создаёт.'],
+      invoice: ['Долг считается по счетам',
+        'Обязательство возникает, когда выписан счёт. Акт, УПД и накладная долга не создают.'],
+      manual: ['Долг сам не считается',
+        'Журнал ведёте вы: ни акты, ни накладные, ни счета в долг не попадают — '
+        + 'приход и оплату вносите руками.'],
+    }[basis];
+    const buttons = {
+      closing: [switchTo('invoice', 'Считать долг по счетам', 'btn secondary')],
+      invoice: [switchTo('closing', 'Считать долг по актам и накладным', 'btn secondary')],
+      manual: [switchTo('closing', 'Считать долг по актам и накладным', 'btn'),
+        switchTo('invoice', 'Считать по счетам', 'btn secondary')],
+    }[basis];
     box.append(h('div', { class: 'card' },
       h('div', { class: 'row' },
         h('span', { class: 'icon-box' }, icon('wallet')),
         h('span', { class: 'grow' },
-          h('div', { text: byBill ? 'Долг считается по счетам' : 'Долг считается по актам' }),
-          h('div', { class: 'small muted', text: byBill
-            ? 'Обязательство возникает, когда выписан счёт.'
-            : 'Обязательство возникает, когда подписан акт или накладная. Счёт долга не создаёт.' }))),
+          h('div', { text: head[0] }),
+          h('div', { class: 'small muted', text: head[1] }))),
       // Про расхождение говорим, только когда оно есть на самом деле.
       m ? h('div', { class: 'row muted small' },
         `Поэтому ${m.count} ${plural(m.count, 'документ', 'документа', 'документов')} `
         + `на ${money0(m.sum)} ${m.advance ? 'показаны авансом, будто должны вы' : 'в долг не попали'}. `
         + 'Переключите — пересчитаю прошлые.') : null,
-      h('div', { class: 'btn-wrap' }, fix)));
+      buttons.map((b) => h('div', { class: 'btn-wrap' }, b))));
   }
 
   const parts = [
@@ -2897,9 +2954,11 @@ screens.ask = async function ask() {
           haptic('heavy');
           const openDoc = h('button', { class: 'btn secondary' }, 'Открыть документ');
           openDoc.onclick = () => { haptic(); download(made.file); };
+          const note = noDebtNote(r.docType, made);
           say('bot', `Выписал: ${made.doc.title} № ${made.doc.number} для «${r.cpName}» `
             + `на ${money(made.total)}. Файл в чате с ботом; отсюда — кнопкой ниже. `
-            + 'Ненужное удаляется из журнала смахиванием.', openDoc);
+            + 'Ненужное удаляется из журнала смахиванием.'
+            + (note ? ` ${note}` : ''), openDoc);
           download(made.file);
         } catch (e) { say('bot', e.message); }
         return;
@@ -4432,7 +4491,9 @@ screens.new = async function newDoc(params) {
       }
       const r = await api('POST', '/api/doc', payload);
       haptic('heavy');
-      toast(r.sentToChat ? 'Готово — файл отправлен в чат' : 'Документ выписан');
+      const note = noDebtNote(type, r);
+      if (note) toast(`Документ выписан. ${note}`, false, 8000);
+      else toast(r.sentToChat ? 'Готово — файл отправлен в чат' : 'Документ выписан');
       download(r.file);
       await afterIssue();
     } catch (e) {

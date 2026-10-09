@@ -1168,9 +1168,14 @@ async function main() {
     const cpK = (await call('POST', '/api/cp', {
       user: katya, body: { name: 'ООО «Акт»', kind: 'customer' },
     })).json.cp.id;
-    await call('POST', '/api/doc', {
+    r = await call('POST', '/api/doc', {
       user: katya, body: { type: 'usl', cpId: cpK, items: [{ name: 'Работа', qty: 1, price: 20000 }] },
     });
+    // Приложение должно узнать об этом в момент выписки, а не через ноль в
+    // карточке клиента: по этим полям оно и объясняет, почему долга нет.
+    ok(r.status === 200 && r.json.debt === false && r.json.debtBasis === 'invoice',
+      'ответ на выписку говорит, что акт в долг не попал и почему',
+      JSON.stringify({ debt: r.json.debt, debtBasis: r.json.debtBasis }));
     r = await call('GET', '/api/state', { user: katya });
     ok(r.json.basisMismatch && r.json.basisMismatch.to === 'closing',
       'подсказка зовёт туда, где долг появится, а не туда, где уже стоим',
@@ -1183,6 +1188,19 @@ async function main() {
     await call('POST', '/api/basis', { user: katya, body: { basis: 'closing' } });
     r = await call('GET', '/api/cps', { user: katya });
     ok(r.json.cps.find((c) => c.id === cpK).balance === 20000, 'после переключения долг появился');
+    // А при «по отгрузке» накладная попадает в долг — и ответ это подтверждает.
+    const cpT = (await call('POST', '/api/cp', {
+      user: katya, body: { name: 'ООО «Накладная»', kind: 'customer' },
+    })).json.cp.id;
+    r = await call('POST', '/api/doc', {
+      user: katya, body: { type: 'torg12', cpId: cpT, items: [{ name: 'Кабель', qty: 2, price: 1500 }] },
+    });
+    ok(r.status === 200 && r.json.debt === true && r.json.debtBasis === 'closing',
+      'при «по отгрузке» ответ на ТОРГ-12 говорит, что долг внесён',
+      JSON.stringify({ status: r.status, debt: r.json.debt, error: r.json.error }));
+    r = await call('GET', '/api/cps', { user: katya });
+    ok(r.json.cps.find((c) => c.id === cpT).balance === 3000,
+      'и долг накладной виден на контрагенте', r.json.cps.find((c) => c.id === cpT).balance);
 
     // Отменить проводку можно из бота; приложение обязано это показать.
     bdb.deleteLastOp(bdb.getOrCreateUser(500404).id, cpK);

@@ -84,9 +84,9 @@ const tg = {
     sent.push({ text, kb: (opts.reply_markup || {}).inline_keyboard || [] });
     return { message_id: sent.length };
   },
-  async sendDocument(chatId, { filename, buffer, caption }) {
+  async sendDocument(chatId, { filename, buffer, caption, buttons }) {
     fs.writeFileSync(path.join(OUT, filename), Buffer.from(buffer));
-    files.push({ filename, caption, size: buffer.length });
+    files.push({ filename, caption, size: buffer.length, buttons: buttons || [] });
     return { message_id: sent.length };
   },
   async sendChatAction() {},
@@ -3097,6 +3097,12 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await tap('doc.make');
     ok(bdb3.balanceOf(uid, rentId).closing === 0,
       'в режиме «по акту» счёт долг не создаёт', bdb3.balanceOf(uid, rentId).closing);
+    // Счёт при «по отгрузке» долга не создаёт у всех — это порядок, а не
+    // сюрприз, и пугать человека подписью под каждым счётом незачем.
+    const fileBtn = (f, data) => ((f || {}).buttons || []).flat().some((b) => b.data === data);
+    ok(!fileBtn(files[files.length - 1], 'basis.set:closing')
+      && !/в долг клиента не попал/.test((files[files.length - 1] || {}).caption || ''),
+    'под счётом при «по отгрузке» нет предупреждения про долг');
 
     // Режим «по счёту» — субаренда.
     //
@@ -3144,6 +3150,23 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(last().includes('Не оплачено') || last().includes('Неоплаченных'),
       'экран неоплаченных открывается', last().slice(0, 40));
 
+    /*
+     * Накладная при «долге по счёту» в долг не попадает — и бот обязан
+     * сказать это сразу, а не оставить человека гадать над нулём в карточке
+     * клиента. Это и была жалоба: «ТОРГ-12 выписал, а долга нет».
+     */
+    const shipId = bdb3.createCp(uid, { name: 'ООО «Отгрузка»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.torg12:${shipId}`);
+    await say('Кабель; 2; 1500');
+    await tap('items.done');
+    await tap('doc.make');
+    const shipFile = files[files.length - 1] || {};
+    ok(bdb3.balanceOf(uid, shipId).closing === 0, 'при «долге по счёту» накладная долга не создаёт',
+      bdb3.balanceOf(uid, shipId).closing);
+    ok(/считается по счетам/.test(shipFile.caption || '') && /в долг клиента не попал/.test(shipFile.caption || ''),
+      'и бот говорит об этом в подписи к накладной', (shipFile.caption || '').slice(-200));
+    ok(fileBtn(shipFile, 'basis.set:closing'), 'а под файлом — кнопка «считать по актам и накладным»');
+
     // Режим «вручную» — бот в журнал не лезет.
     await tap('basis.set:manual');
     const manId = bdb3.createCp(uid, { name: 'ООО «Ручной учёт»', kind: 'customer', opening_date: '2026-01-01' });
@@ -3153,8 +3176,23 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await tap('doc.make');
     ok(bdb3.balanceOf(uid, manId).closing === 0, 'в режиме «вручную» проводок не появляется',
       bdb3.balanceOf(uid, manId).closing);
+    const manFile = files[files.length - 1] || {};
+    ok(/журнал веду сам/.test(manFile.caption || '') && fileBtn(manFile, 'basis.set:closing'),
+      'в ручном режиме акт тоже говорит, почему не попал в долг, и даёт кнопку',
+      (manFile.caption || '').slice(-200));
 
+    // «Все рассчитались» при невнесённых документах — неправда.
+    await tap('debts');
+    ok(/журнал веду сам/.test(sent.slice(-3).map((m) => m.text).join('\n')),
+      'список долгов в ручном режиме называет режим, а не молчит',
+      sent.slice(-3).map((m) => m.text).join(' | ').slice(-200));
+
+    // Та самая кнопка из-под файла: переключает и подтягивает выписанное раньше.
     await tap('basis.set:closing');   // возвращаем как было
+    ok(bdb3.balanceOf(uid, shipId).closing === 3000,
+      'после переключения накладная попала в долг клиента', bdb3.balanceOf(uid, shipId).closing);
+    ok(bdb3.balanceOf(uid, manId).closing === 5000,
+      'и акт, выписанный в ручном режиме, тоже', bdb3.balanceOf(uid, manId).closing);
   }
 
   console.log('\n── НДС в счёте ──');

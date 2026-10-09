@@ -1085,10 +1085,26 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
   const tail = q.paid ? '' : `\n<i>Выписано в этом месяце: ${q.used} из ${q.limit} бесплатных.</i>`;
   // Проводка в журнал — вещь неочевидная, о ней надо сказать прямо,
   // иначе человек не поймёт, откуда взялся долг в разделе «Кто должен».
+  /*
+   * Акт или накладная, не попавшие в долг, — говорим об этом сразу.
+   *
+   * При основании «по счёту» и в режиме «журнал веду сам» закрывающий
+   * документ проводки не делает. Так задумано, но бот об этом молчал:
+   * человек выписывал ТОРГ-12, открывал карточку клиента, видел ноль и
+   * считал это поломкой. Кнопка здесь же — переключить одним нажатием, а
+   * пересчёт подтянет и выписанные раньше.
+   */
+  const unseen = !res.debt && res.total > 0 && bdb.DEBT_DOCS.closing.includes(type)
+    && ['manual', 'invoice'].includes(res.basis);
   const ledger = res.debt
     ? `\n<i>Долг ${formatRub(res.total)} внесён в журнал. Отметить оплату — в карточке документа.</i>`
-    : '';
+    : (unseen ? `\n\n<i>${res.basis === 'manual'
+      ? 'В долг клиента не попал: выбрано «журнал веду сам».'
+      : 'Долг у вас считается по счетам, поэтому сам документ в долг клиента не попал.'}`
+      + ' Чтобы акты и накладные считались — кнопка ниже, выписанные раньше тоже пересчитаю.</i>'
+      : '');
   await tg.sendDocument(chatId, {
+    buttons: unseen ? [[{ text: '📊 Считать долг по актам и накладным', data: 'basis.set:closing' }]] : [],
     filename: res.file.filename,
     buffer: res.file.buffer,
     caption: `${esc(res.title)} № ${esc(res.doc.number)}`
@@ -3782,9 +3798,19 @@ async function showDebts(tg, chatId, user) {
    * и решал, что цифра сломана, — а объяснение было только в мини-приложении.
    * Кто смотрел долги в боте, не получал ни слова.
    */
-  const basis = bdb.basisMismatch(user.id, bdb.currentOrg(user.id),
+  const org = bdb.currentOrg(user.id);
+  const basis = bdb.basisMismatch(user.id, org,
     rows.filter((r) => r.theyOwe).reduce((s, r) => s + r.amount, 0));
-  const basisNote = basis
+  /*
+   * В ручном режиме разбор выше молчит — человек сам сказал, что журнал ведёт
+   * он. Но «все рассчитались» при невнесённых накладных и актах звучит как
+   * правда, а это не она: документы просто не считаются. Называем режим.
+   */
+  const manualNote = !basis && bdb.basisOf(org || {}) === 'manual' && bdb.unpaidDocs(user.id, 1).length
+    ? '\n\n<i>Долг у вас сам не считается: выбрано «журнал веду сам», и выписанные '
+      + 'акты, накладные и счета сюда не попадают. Поменять — «📊 Долг» в настройках.</i>'
+    : '';
+  const basisNote = manualNote || (basis
     ? `\n\n<i>${basis.to === 'invoice'
       ? 'Долг у вас считается по актам, а не по счетам'
       : 'Долг у вас считается по счетам, а не по актам'}, поэтому `
@@ -3797,7 +3823,7 @@ async function showDebts(tg, chatId, user) {
         ? 'показаны авансом, будто должны вы.'
         : 'сюда не попали.')
       + ' Поменять — «📊 Долг» в настройках.</i>'
-    : '';
+    : '');
 
   if (!rows.length) {
     await tg.sendMessage(chatId,
