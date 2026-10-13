@@ -1097,14 +1097,22 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
   const unseen = !res.debt && res.total > 0 && bdb.DEBT_DOCS.closing.includes(type)
     && ['manual', 'invoice'].includes(res.basis);
   const ledger = res.debt
-    ? `\n<i>Долг ${formatRub(res.total)} внесён в журнал. Отметить оплату — в карточке документа.</i>`
+    ? `\n<i>Долг ${formatRub(res.total)} внесён в журнал. Пришли деньги — нажмите «Оплачено».</i>`
     : (unseen ? `\n\n<i>${res.basis === 'manual'
       ? 'В долг клиента не попал: выбрано «журнал веду сам».'
       : 'Долг у вас считается по счетам, поэтому сам документ в долг клиента не попал.'}`
       + ' Чтобы акты и накладные считались — кнопка ниже, выписанные раньше тоже пересчитаю.</i>'
       : '');
+  /*
+   * «Оплачено» — прямо под файлом. Раньше за ней надо было идти в карточку
+   * документа: выписал накладную, клиент тут же перевёл деньги, а закрыть
+   * долг можно было только через три экрана. Приложение кнопку здесь
+   * показывало давно, бот — нет.
+   */
+  const buttons = unseen ? [[{ text: '📊 Считать долг по актам и накладным', data: 'basis.set:closing' }]]
+    : res.debt ? [[{ text: '✅ Оплачено', data: `doc.paid:${res.doc.id}` }]] : [];
   await tg.sendDocument(chatId, {
-    buttons: unseen ? [[{ text: '📊 Считать долг по актам и накладным', data: 'basis.set:closing' }]] : [],
+    buttons,
     filename: res.file.filename,
     buffer: res.file.buffer,
     caption: `${esc(res.title)} № ${esc(res.doc.number)}`
@@ -3854,8 +3862,16 @@ async function showDebts(tg, chatId, user) {
     kb.push([{ text: `📄 Акты сверки всем должникам (${theyOwe.length})`, data: 'debt.akts' }]);
     kb.push([{ text: '✉️ Текст напоминания', data: 'debt.remind' }]);
   }
+  /*
+   * Рядом с должником — «Оплатил»: одно нажатие вносит оплату на весь долг,
+   * а под ответом есть «Отменить проводку». Токен одноразовый, чтобы
+   * двойное нажатие не провело деньги дважды.
+   */
   for (const r of rows.slice(0, 6)) {
-    kb.push([{ text: `${r.theyOwe ? '🧑‍💼' : '📦'} ${r.cp.name} · ${formatRub(r.amount)}`.slice(0, 60), data: `cp:${r.cp.id}` }]);
+    const card = { text: `${r.theyOwe ? '🧑‍💼' : '📦'} ${r.cp.name} · ${formatRub(r.amount)}`.slice(0, 60), data: `cp:${r.cp.id}` };
+    kb.push(r.theyOwe
+      ? [card, { text: '✅ Оплатил', data: `pay.cp:${r.cp.id}:${round2(r.amount)}:o:${oneShot()}` }]
+      : [card]);
   }
   kb.push([{ text: '⬅️ Меню', data: 'menu' }]);
   await tg.sendMessage(chatId, text, keyboard(kb));

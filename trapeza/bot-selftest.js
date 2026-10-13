@@ -3193,6 +3193,44 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'после переключения накладная попала в долг клиента', bdb3.balanceOf(uid, shipId).closing);
     ok(bdb3.balanceOf(uid, manId).closing === 5000,
       'и акт, выписанный в ручном режиме, тоже', bdb3.balanceOf(uid, manId).closing);
+
+    // «Оплачено» — прямо под свежей накладной, без похода в карточку документа.
+    const paidCp = bdb3.createCp(uid, { name: 'ООО «Сразу заплатил»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.torg12:${paidCp}`);
+    await say('Плитка; 4; 1000');
+    await tap('items.done');
+    await tap('doc.make');
+    const paidFile = files[files.length - 1] || {};
+    const paidBtn = (paidFile.buttons || []).flat().find((b) => /Оплачено/.test(b.text));
+    ok(paidBtn && /^doc\.paid:\d+$/.test(paidBtn.data), 'под накладной, попавшей в долг, есть «Оплачено»',
+      JSON.stringify(paidFile.buttons));
+    ok(bdb3.balanceOf(uid, paidCp).closing === 4000, 'до нажатия долг висит',
+      bdb3.balanceOf(uid, paidCp).closing);
+    if (paidBtn) await tap(paidBtn.data);
+    ok(bdb3.balanceOf(uid, paidCp).closing === 0, 'одно нажатие закрывает долг',
+      bdb3.balanceOf(uid, paidCp).closing);
+
+    // «Оплатил» рядом с должником в «Кто должен».
+    const owesCp = bdb3.createCp(uid, { name: 'ООО «Должник»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.usl:${owesCp}`);
+    await say('Монтаж; 1; 7000');
+    await tap('items.done');
+    await tap('doc.make');
+    await tap('debts');
+    const debtsMsg = sent.slice(-3).find((m) => (m.kb || []).flat().some((b) => /Оплатил/.test(b.text))) || {};
+    const owesRow = (debtsMsg.kb || []).find((row) => row.some((b) => b.callback_data === `cp:${owesCp}`)) || [];
+    const owesBtn = owesRow.find((b) => /Оплатил/.test(b.text));
+    ok(owesBtn && owesBtn.callback_data.startsWith(`pay.cp:${owesCp}:7000:o:`),
+      'в списке долгов рядом с должником — «Оплатил» на весь долг', JSON.stringify(owesRow));
+    if (owesBtn) {
+      await tap(owesBtn.callback_data);
+      ok(bdb3.balanceOf(uid, owesCp).closing === 0, 'нажатие вносит оплату и закрывает долг',
+        bdb3.balanceOf(uid, owesCp).closing);
+      ok(Boolean(button('Отменить проводку')), 'и оплату можно тут же отменить');
+      await tap(owesBtn.callback_data);
+      ok(/уже внесена/.test(last()) && bdb3.balanceOf(uid, owesCp).closing === 0,
+        'второе нажатие той же кнопки деньги не проводит', last());
+    }
   }
 
   console.log('\n── НДС в счёте ──');
