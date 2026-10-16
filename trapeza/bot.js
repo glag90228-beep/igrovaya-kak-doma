@@ -4339,6 +4339,42 @@ function reminderText(org, r, tone = 'biz') {
     + `${sign}`;
 }
 
+/**
+ * Ссылка «переслать клиенту»: встроенный в Telegram выбор чата с готовым
+ * текстом. Бот сам клиенту не пишет — человек выбирает, кому и куда.
+ *
+ * Предел длины: Telegram отвергает кнопку со ссылкой за ~2 тысячи знаков, а
+ * кириллица после кодирования раздувается в шесть раз. Поэтому полный текст
+ * (строгий тон с реквизитами почти всегда не влезает) заменяем коротким в
+ * том же тоне; не влез и он — кнопки нет, текст для копирования остаётся.
+ */
+function shareReminderUrl(org, row, tone) {
+  const make = (text) => `https://t.me/share/url?url=&text=${encodeURIComponent(text)}`;
+  // Сначала полный текст, как в сообщении; не влез — короткий в том же тоне.
+  for (const text of [reminderText(org, row, tone), reminderShort(org, row, tone)]) {
+    const u = make(text);
+    if (u.length <= 2000) return u;
+  }
+  return null;
+}
+
+/** Короткое напоминание для ссылки: тот же тон и тот же смысл, без реквизитов. */
+function reminderShort(org, r, tone = 'biz') {
+  const sum = formatRub(r.amount).replace(/\sруб\.$/, ' руб');
+  const sign = (org && (org.full_name || org.name)) ? `\n\n${org.full_name || org.name}` : '';
+  if (tone === 'soft') {
+    return `Здравствуйте! Небольшое напоминание: не отмечена оплата на ${sum}. `
+      + `Если уже заплатили — пришлите, пожалуйста, платёжку.${sign}`;
+  }
+  if (tone === 'firm') {
+    return `Здравствуйте! Задолженность ${sum} на ${ru(todayISO())} не погашена, хотя мы уже напоминали. `
+      + 'Просим оплатить в течение 5 рабочих дней или назвать точный срок, иначе придётся '
+      + `взыскивать долг с процентами по ст. 395 ГК РФ.${sign}`;
+  }
+  return `Здравствуйте! По нашим данным за вами числится задолженность ${sum}. `
+    + `Просим подтвердить сумму и сообщить срок оплаты. Если уже заплатили — пришлите платёжку.${sign}`;
+}
+
 /*
  * Напоминание одному должнику — из утренней сводки и списка долгов.
  * Тон переключается кнопками; «напоминали N дней назад» подсказывает,
@@ -4359,6 +4395,8 @@ async function remindOne(tg, chatId, user, cpId, tone = '') {
       ? { text: `✉️ Отправить на ${row.cp.email}`.slice(0, 60), data: `rm.mail:${cpId}:${t}` }
       : { text: '✉️ Указать почту и отправить', data: `rm.ask:${cpId}:${t}` }]);
   }
+  const share = shareReminderUrl(org, row, t);
+  if (share) kb.push([{ text: '📤 Переслать клиенту', url: share }]);
   kb.push([{ text: '✅ Отправил сам', data: `rm.done:${cpId}:${t}` }, { text: '⬅️ Долги', data: 'debts' }]);
   await tg.sendMessage(chatId, `${head}\n\nНажмите на текст, чтобы скопировать, и перешлите клиенту:`);
   await tg.sendMessage(chatId, `<code>${esc(reminderText(org, row, t))}</code>`, keyboard(kb));
@@ -4391,6 +4429,8 @@ async function debtReminder(tg, chatId, user) {
         ? { text: `✉️ Отправить на ${r.cp.email}`.slice(0, 60), data: `rm.mail:${r.cp.id}` }
         : { text: '✉️ Указать почту и отправить', data: `rm.ask:${r.cp.id}` }]);
     }
+    const share = shareReminderUrl(org, r, 'biz');
+    if (share) kb.push([{ text: '📤 Переслать клиенту', url: share }]);
     kb.push([{ text: '🎚 Мягче или строже', data: `rm.one:${r.cp.id}` }]);
     await tg.sendMessage(chatId, `<code>${esc(reminderText(org, r))}</code>`, keyboard(kb));
   }

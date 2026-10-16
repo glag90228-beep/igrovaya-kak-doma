@@ -4852,6 +4852,13 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await tap(`rm.one:${dcp}:firm`);
     ok(/ст\. 395 ГК РФ/.test(last()) && /претензию/.test(last()) && Boolean(button('• Строго')),
       'строгий тон: претензия и проценты по закону, без выдуманных штрафов');
+    // «Переслать клиенту»: ссылка-шеринг Telegram с готовым текстом в выбранном тоне;
+    // бот сам клиенту не пишет, чат выбирает человек.
+    const shareBtn = ((sent[sent.length - 1] || {}).kb || []).flat().find((b) => b.text.includes('Переслать клиенту'));
+    ok(shareBtn && shareBtn.url.startsWith('https://t.me/share/url?'), 'у напоминания есть «Переслать клиенту»', shareBtn && shareBtn.url.slice(0, 40));
+    ok(shareBtn && decodeURIComponent(shareBtn.url.split('text=')[1]).includes('ст. 395 ГК РФ'),
+      'в ссылке текст именно выбранного (строгого) тона');
+    ok(shareBtn && shareBtn.url.length <= 2000, 'ссылка укладывается в предел Telegram', shareBtn && shareBtn.url.length);
     await tap(`rm.done:${dcp}:firm`);
     ok(dg.lastReminded(uidD, dcp) === 0, 'отмечено, что напомнили');
     await tap(`rm.one:${dcp}`);
