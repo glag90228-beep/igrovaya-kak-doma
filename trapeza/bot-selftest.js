@@ -1919,15 +1919,18 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(nBtn('Выписать счёт') === 'go.sch', 'на первом экране есть кнопка «Выписать счёт»');
 
     await nTap('go.sch');
-    ok(nLast().includes('Как называется') && nLast().includes('Шаг 1 из 4'),
-      'проводник спрашивает название и показывает, сколько шагов', nLast().slice(0, 40));
+    ok(nLast().includes('Ваш ИНН') && nLast().includes('Шаг 1 из 4'),
+      'проводник спрашивает ИНН первым и показывает, сколько шагов', nLast().slice(0, 40));
     ok(nBtn('Отмена'), 'из формы есть выход');
 
+    // Реестр не подключён (в прогоне ключа нет) — тогда, и только тогда, название спрашиваем сами.
+    await nTap(nBtn('Пропустить'));
+    ok(nLast().includes('Как называется ваша'), 'реестр не ответил — спросили название', nLast().slice(0, 40));
     await nSay('ИП Петров П. П.');
     ok(Boolean(nBtn('Пропустить')), 'необязательное поле можно пропустить кнопкой');
     // Каждый раз читаем кнопку заново — как человек, который жмёт последнюю.
     const nSkip = async () => { const b = nBtn('Пропустить'); if (b) await nTap(b); return b; };
-    await nSkip(); await nSkip(); await nSkip();
+    await nSkip(); await nSkip();
     ok(nLast().includes('ИНН клиента'), 'дошли до анкеты клиента', nLast().slice(0, 30));
 
     // Сообщения в чате остаются, и кнопка из прошлого вопроса живёт вечно.
@@ -1955,6 +1958,32 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(nLast().includes('Чем занимаетесь'),
       'после первого документа спросили про дело, а не про основание долга',
       nLast().slice(0, 40));
+  }
+
+  console.log('\n── проводник: реестр ответил по ИНН ──');
+  {
+    // Если реестр знает ИНН, название не спрашиваем — человек его не печатает.
+    const R = { id: 979002, first_name: 'Реестр' };
+    const rSay = (t) => handleUpdate(tg, { message: { chat: { id: R.id }, from: R, text: t } });
+    const rTap = (d) => handleUpdate(tg,
+      { callback_query: { id: 'c', from: R, data: d, message: { chat: { id: R.id } } } });
+    const rLast = () => (sent[sent.length - 1] || {}).text || '';
+    process.env.DADATA_MOCK = JSON.stringify({
+      183114389446: {
+        type: 'INDIVIDUAL',
+        name: { full_with_opf: 'Индивидуальный предприниматель Тестов Тест Тестович' },
+        inn: '183114389446', ogrn: '318183200012345',
+        address: { value: 'г Ижевск, ул Тестовая, д 1' },
+        fio: { surname: 'Тестов', name: 'Тест', patronymic: 'Тестович' },
+        state: { status: 'ACTIVE' },
+      },
+    });
+    await rSay('/start');
+    await rTap('go.sch');
+    await rSay('183114389446');
+    delete process.env.DADATA_MOCK;
+    ok(rLast().includes('БИК'), 'название из реестра подставлено — про него не спросили', rLast().slice(0, 40));
+    ok(!rLast().includes('Как называется ваша'), 'вопроса про название нет');
   }
 
   console.log('\n── платёжный QR: длина строки ──');
