@@ -26,6 +26,7 @@ const path = require('node:path');
 const bdb = require('./lib/bot-db');
 const billing = require('./lib/billing');
 const docService = require('./lib/doc-service');
+const crm = require('./lib/crm');
 // Платёжный QR по ГОСТ Р 56042: тот же модуль, что рисует его в самом счёте,
 // — иначе код на превью и код в PDF однажды разойдутся.
 const { payQrSvg, payProblems } = require('./lib/qr-pay');
@@ -589,6 +590,12 @@ async function makeAkt(user, org, p, caption) {
   return file;
 }
 
+// Просрочку считает сервер по московскому дню: у телефона может быть другой пояс.
+const fuBrief = (f) => {
+  const today = docService.todayISO();
+  return { id: f.id, cpId: f.cp_id, cpName: f.cp_name || '', due: f.due, text: f.text, overdue: f.due < today, today: f.due === today };
+};
+
 // ---------- обработчики API ----------
 
 const api = {
@@ -622,6 +629,49 @@ const api = {
   async 'POST /api/user/ai'({ user, body }) {
     const on = bdb.setAiEnabled(user.id, Boolean(body && body.enabled));
     return { aiEnabled: on };
+  },
+
+  /*
+   * Мини-CRM клиента: лента, заметки, «напомнить мне».
+   *
+   * Всё это раньше жило только в боте, и владелец, открыв приложение, её не
+   * находил. Логика та же (lib/crm.js), здесь только дверь. Клиента
+   * проверяем у каждого обращения: cpId приходит от клиента приложения, и
+   * без проверки чужой id отдал бы чужую ленту или принял бы чужую заметку.
+   */
+  async 'GET /api/crm/timeline'({ user, url }) {
+    const cpId = Number(url.searchParams.get('cpId'));
+    if (!bdb.getCp(user.id, cpId)) return { error: 'Контрагент не найден.' };
+    return { items: crm.timeline(user.id, cpId, 40), followups: crm.openFollowups(user.id, cpId).map(fuBrief) };
+  },
+
+  async 'POST /api/crm/note'({ user, body }) {
+    const cpId = Number(body.cpId);
+    if (!bdb.getCp(user.id, cpId)) return { error: 'Контрагент не найден.' };
+    const id = crm.addNote(user.id, cpId, str(body.text, 1000));
+    if (!id) return { error: 'Заметка пустая.' };
+    return { id };
+  },
+
+  async 'POST /api/crm/followup'({ user, body }) {
+    const cpId = Number(body.cpId);
+    if (!bdb.getCp(user.id, cpId)) return { error: 'Контрагент не найден.' };
+    const f = crm.addFollowup(user.id, cpId, { today: docService.todayISO(), days: Number(body.days), text: str(body.text, 300) });
+    return { followup: f };
+  },
+
+  async 'POST /api/crm/followup/done'({ user, body }) {
+    return crm.done(user.id, Number(body.id)) ? { ok: true } : { error: 'Напоминание не найдено.' };
+  },
+
+  async 'POST /api/crm/followup/snooze'({ user, body }) {
+    const days = Math.max(1, Math.min(30, Number(body.days) || 3));
+    return crm.snooze(user.id, Number(body.id), docService.todayISO(), days) ? { ok: true } : { error: 'Напоминание не найдено.' };
+  },
+
+  async 'GET /api/crm/followups'({ user }) {
+    const today = docService.todayISO();
+    return { today, followups: crm.allOpenFollowups(user.id).map(fuBrief) };
   },
 
   async 'GET /api/cps'({ user }) {

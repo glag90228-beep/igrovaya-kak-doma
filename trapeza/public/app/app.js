@@ -323,18 +323,24 @@ function syncChrome() {
   if (stack.length > 1 || !isTab) tg.BackButton.show(); else tg.BackButton.hide();
 }
 
+let renderSeq = 0;
 async function render() {
   const { name, params } = current();
+  // Экраны грузят данные по сети. Если за это время человек ушёл дальше,
+  // запоздавший ответ не должен затирать новый экран старым.
+  const seq = ++renderSeq;
   syncChrome();
   if (tg) tg.MainButton.hide();
   const build = screens[name] || screens.home;
   app.replaceChildren(skeleton());
   try {
     const node = await build(params);
+    if (seq !== renderSeq) return;
     app.replaceChildren(node);
     app.firstChild && app.firstChild.classList && app.firstChild.classList.add('screen');
     window.scrollTo(0, 0);
   } catch (e) {
+    if (seq !== renderSeq) return;
     app.replaceChildren(errorScreen(e));
   }
   dropSplash();
@@ -624,6 +630,24 @@ screens.home = async function home() {
     box.append(h('div', { class: 'card' }, again));
   }
 
+
+  /*
+   * Напоминания и вход в клиентов — на виду, а не в глубине карточки.
+   * Владелец открыл приложение и мини-CRM не нашёл: она была только в боте.
+   */
+  const fuAll = await api('GET', '/api/crm/followups').catch(() => ({ followups: [] }));
+  const fuNow = fuAll.followups.filter((f) => f.overdue || f.today);
+  if (fuNow.length) {
+    box.append(h('div', { class: 'section-title', text: 'Напоминания' }),
+      h('div', { class: 'card' }, followupRows(fuNow.slice(0, 5), () => render(), true)));
+  }
+  box.append(h('div', { class: 'card' }, navRow({
+    icon: 'pen', title: 'Клиенты и заметки',
+    sub: fuAll.followups.length
+      ? `${fuAll.followups.length} ${plural(fuAll.followups.length, 'напоминание', 'напоминания', 'напоминаний')} · история, заметки`
+      : 'история, заметки, «напомнить мне»',
+    onclick: () => reset('cps'),
+  })));
 
   if (!s.orgReady) {
     box.append(h('div', { class: 'banner' }, icon('warn'),
@@ -1371,9 +1395,86 @@ screens.doc = async function docScreen({ id }) {
   return box;
 };
 
+
+/*
+ * Мини-CRM: напоминания, заметки, лента клиента.
+ *
+ * Раньше всё это было только в боте, и из приложения клиента «с историей»
+ * было не найти. Серверная логика общая (lib/crm.js); бот по-прежнему сам
+ * присылает напоминание в срок, здесь его можно увидеть и закрыть.
+ */
+const FU_DAYS = [[1, 'Завтра'], [3, 'Через 3 дня'], [7, 'Через неделю'], [14, 'Через 2 недели']];
+
+/** Строки напоминаний с «Готово» и «Отложить на 3 дня»; after — перерисовать. */
+function followupRows(list, after, withCp) {
+  return list.map((f) => {
+    const late = f.overdue;
+    const act = async (path, body, msg) => {
+      try { await api('POST', path, body); toast(msg); haptic('medium'); await after(); }
+      catch (e) { toast(e.message, true); }
+    };
+    return h('div', { class: 'row fu-row' },
+      h('span', { class: `icon-box ${late ? 'warn' : ''}` }, icon('clock')),
+      h('span', { class: 'grow' },
+        h('div', { text: f.text }),
+        h('div', { class: `small ${late ? 'fu-late' : 'muted'}`,
+          text: `${late ? 'просрочено · ' : (f.today ? 'сегодня · ' : '')}${ru(f.due)}${withCp && f.cpName ? ` · ${f.cpName}` : ''}` }),
+        h('div', { class: 'fu-btns' },
+          h('button', { class: 'btn small-btn', onclick: () => act('/api/crm/followup/done', { id: f.id }, 'Готово') }, 'Готово'),
+          h('button', { class: 'btn secondary small-btn', onclick: () => act('/api/crm/followup/snooze', { id: f.id, days: 3 }, 'Отложил на 3 дня') }, 'Отложить на 3 дня'),
+          withCp && f.cpId && h('button', { class: 'btn ghost small-btn', onclick: () => go('cp', { id: f.cpId }) }, 'К клиенту'))));
+  });
+}
+
+/** Блок «История клиента» в карточке: заметка, напоминание, напоминания, лента. */
+function crmBlock(cpId) {
+  const wrap = h('div', {});
+  const draw = async () => {
+    const { items, followups } = await api('GET', `/api/crm/timeline?cpId=${cpId}`);
+    const note = h('textarea', { id: 'crm-note', placeholder: 'Например: договорились на пятницу', maxlength: '1000', rows: '2' });
+    const saveNote = async (e) => withBusy(e.currentTarget, async () => {
+      if (!note.value.trim()) { toast('Напишите, что записать', true); return; }
+      await api('POST', '/api/crm/note', { cpId, text: note.value.trim() });
+      toast('Заметка сохранена'); haptic('medium'); await draw();
+    });
+    const fuText = h('input', { id: 'crm-fu-text', type: 'text', maxlength: '300', placeholder: 'О чём напомнить (можно пусто)', autocomplete: 'off' });
+    const fuBtns = h('div', { class: 'fu-btns' }, FU_DAYS.map(([days, label]) => h('button', {
+      class: 'btn secondary small-btn',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        await api('POST', '/api/crm/followup', { cpId, days, text: fuText.value.trim() });
+        toast(`Напомню: ${label.toLowerCase()}`); haptic('medium'); await draw();
+      }),
+    }, label)));
+    const feed = items.length
+      ? items.map((it) => h('div', { class: 'row tl-row' },
+        h('span', { class: 'tl-ico', text: it.icon }),
+        h('span', { class: 'grow' },
+          h('div', { text: it.text }),
+          h('div', { class: 'small muted', text: ru(String(it.at).slice(0, 10)) }))))
+      : [h('div', { class: 'row muted', text: 'Пока пусто: документы, оплаты и заметки появятся здесь' })];
+    wrap.replaceChildren(
+      h('div', { class: 'section-title', text: 'История клиента' }),
+      h('div', { class: 'card crm-form' },
+        h('div', { class: 'field' }, h('label', { for: 'crm-note', text: '📝 Заметка' }), note,
+          h('button', { class: 'btn secondary', onclick: saveNote }, 'Сохранить заметку')),
+        h('div', { class: 'field' }, h('label', { for: 'crm-fu-text', text: '⏰ Напомнить мне' }), fuText, fuBtns)),
+      followups.length ? h('div', { class: 'card' }, followupRows(followups, draw, false)) : null,
+      h('div', { class: 'card' }, feed));
+  };
+  draw().catch((e) => wrap.replaceChildren(h('div', { class: 'row muted', text: e.message })));
+  return wrap;
+}
+
 screens.cps = async function cps() {
   const { cps: list } = await api('GET', '/api/cps');
   const box = h('div', {}, h('h1', { text: 'Контрагенты' }));
+  // Напоминания — первым делом: в список заходят, в том числе, чтобы вспомнить, кому позвонить.
+  const fu = await api('GET', '/api/crm/followups').catch(() => ({ followups: [] }));
+  if (fu.followups.length) {
+    box.append(h('div', { class: 'section-title', text: 'Напоминания' }),
+      h('div', { class: 'card' }, followupRows(fu.followups, () => render(), true)));
+  }
+  if (list.length) box.append(h('div', { class: 'small muted crm-hint', text: 'Откройте клиента — там история, заметки и «напомнить мне».' }));
   if (!list.length) {
     box.append(empty('users', 'Пока никого нет',
       'Добавьте заказчика или поставщика — реквизиты подставятся в документы автоматически.',
@@ -1578,6 +1679,7 @@ screens.cp = async function cpScreen({ id, name }) {
           } catch (e) { toast(e.message, true); }
         } }),
       navRow({ icon: 'docs2', title: 'Документы клиента', onclick: () => go('docs', { cp: id }) })));
+    box.append(crmBlock(id));
     box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
   }
 

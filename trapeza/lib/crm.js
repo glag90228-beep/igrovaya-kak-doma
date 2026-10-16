@@ -89,6 +89,18 @@ function openFollowups(userId, cpId) {
 }
 
 /**
+ * Все открытые напоминания человека — для главной экрана приложения.
+ * Имя клиента берём с проверкой user_id: напоминание не должно тащить за
+ * собой название чужой записи, даже если cp_id когда-то разошёлся.
+ */
+function allOpenFollowups(userId) {
+  return db.prepare(`
+    SELECT f.*, c.name AS cp_name FROM cp_followups f
+      LEFT JOIN counterparties c ON c.id = f.cp_id AND c.user_id = f.user_id
+     WHERE f.user_id = ? AND f.done = 0 ORDER BY f.due, f.id LIMIT 200`).all(userId);
+}
+
+/**
  * Лента клиента: документы, деньги, напоминания должнику, заметки — по
  * датам, свежие сверху.
  */
@@ -117,4 +129,4 @@ function timeline(userId, cpId, limit = 25) {
   return items.slice(0, limit);
 }
 
-module.exports = { addNote, addFollowup, dueFollowups, markSent, done, snooze, openFollowups, timeline, plusDays };
+module.exports = { addNote, addFollowup, dueFollowups, markSent, done, snooze, openFollowups, allOpenFollowups, timeline, plusDays };

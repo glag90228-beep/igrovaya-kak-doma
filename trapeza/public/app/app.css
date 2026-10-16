@@ -1221,3 +1221,14 @@ body.drawer-open { overflow: hidden; }
      без движения это просто лишняя секунда тёмного экрана. */
   #splash { display: none; }
 }
+
+/* Мини-CRM: напоминания и лента клиента */
+.fu-row { align-items: flex-start; }
+.fu-late { color: var(--danger); }
+.fu-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.small-btn { width: auto; min-height: 36px; padding: 6px 12px; font-size: 14px; }
+.crm-form .field + .field { margin-top: 14px; }
+.crm-form textarea { width: 100%; margin-bottom: 8px; }
+.crm-hint { margin: -4px 0 8px; }
+.tl-row { align-items: flex-start; }
+.tl-ico { width: 28px; text-align: center; flex: none; }
