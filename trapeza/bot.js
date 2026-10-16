@@ -82,12 +82,32 @@ const { todayISO, todayDate, currentYear } = period;
 const parseDate = (s) => period.parseDay(s);
 
 /**
+ * «30 тысяч», «30 тыс.», «30к», «1,5 млн», «полтора миллиона» → цифрами.
+ *
+ * Предприниматель говорит и пишет суммы словами, а не нулями, и «Монтаж 30
+ * тысяч» раньше превращалось в название без цены. Подстановка делается до
+ * любого разбора, поэтому и «2 по 15 тысяч» читается обычной парой.
+ * «к» берём только вплотную к числу («30к»): «30 к 2» — не тридцать тысяч.
+ */
+function spellOutMagnitudes(s) {
+  const mult = (w) => (/^м/i.test(w) ? 1e6 : 1e3);
+  const word = '(?:миллион[а-я]*|млн\\.?|тысяч[а-я]*|тыс\\.?)(?![а-яёa-z])';
+  return String(s)
+    .replace(new RegExp('(^|[^а-яёa-z])пол(?:тора|торы)\\s+(' + word + ')', 'gi'),
+      (_, pre, w) => pre + String(1.5 * mult(w)))
+    .replace(new RegExp('(\\d+(?:[.,]\\d+)?)\\s*(' + word + ')', 'gi'),
+      (_, n, w) => String(Math.round(Number(n.replace(',', '.')) * mult(w) * 100) / 100))
+    .replace(/(\d+(?:[.,]\d+)?)к(?![а-яёa-z\d])/gi,
+      (_, n) => String(Math.round(Number(n.replace(',', '.')) * 1e3 * 100) / 100));
+}
+
+/**
  * Сумма из текста. Пробелы внутри числа убираем: их ставят как разделитель
  * разрядов. Копейки округляем — доли копейки в деньгах не существует.
  * Заведомо невозможные величины отвергаем: это опечатка, а не платёж.
  */
 function parseAmount(s) {
-  const v = Number(String(s).replace(/\s/g, '').replace(',', '.'));
+  const v = Number(spellOutMagnitudes(s).replace(/\s/g, '').replace(',', '.'));
   if (!Number.isFinite(v) || Math.abs(v) >= 1e12) return null;
   return Math.round(v * 100) / 100;
 }
@@ -208,7 +228,7 @@ const GREETING =
   + '👇 <b>Как быстрее всего сделать счёт:</b>\n'
   + '1. Нажмите кнопку <b>«Выписать счёт за 1 мин»</b> ниже.\n'
   + '2. Или просто <b>отправьте голосовое или текст</b>:\n'
-  + '   <code>Выстави счёт ООО Заря на 50 000 руб за оказание услуг</code>\n\n'
+  + '   <code>Выставь счёт ООО Заря на 50 000 руб за оказание услуг</code>\n\n'
   + '<i>Счёт сразу с факсимиле, печатью и QR-кодом для быстрой оплаты клиентом через банковское приложение. '
   + 'Первые 5 документов в месяц — бесплатно. Без 1С и бухгалтера.</i>';
 
@@ -1032,7 +1052,7 @@ function unitAfter(text, pos) {
  *   partial — поняли только название; количество и цену спросим отдельно.
  */
 function readItemLine(text) {
-  const line = String(text || '').replace(/\u00a0/g, ' ').trim();
+  const line = spellOutMagnitudes(String(text || '').replace(/\u00a0/g, ' ')).trim();
   if (!line) return null;
 
   const parts = line.split(/[;|]/).map((s) => s.trim()).filter(Boolean);
@@ -6656,5 +6676,5 @@ async function main() {
 if (require.main === module) main();
 
 module.exports = {
-  handleUpdate, runDaily, sendFollowups, parseOp, parseDate, parseItemLine, readItemLine, parseAmount,
+  handleUpdate, runDaily, sendFollowups, parseOp, parseDate, parseItemLine, readItemLine, parseAmount, spellOutMagnitudes,
 };

@@ -298,30 +298,6 @@ section { padding: clamp(64px, 11vw, 130px) 0; }
    секции уезжает ровно под неё — нажимаешь «Цена» и цены не видишь. */
 [id] { scroll-margin-top: 84px; }
 
-/* ---------- отзывы ---------- */
-
-.quotes { margin-top: 52px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
-.quote {
-  border: 1px dashed var(--line); border-radius: var(--r);
-  padding: 28px; display: flex; flex-direction: column; gap: 18px;
-  background: var(--mist);
-}
-.quote .q { font-size: 17px; line-height: 1.55; color: var(--muted); font-style: italic; }
-.quote .who { display: flex; align-items: center; gap: 12px; margin-top: auto; }
-.quote .av {
-  width: 38px; height: 38px; border-radius: 50%; flex: none;
-  background: var(--line); display: grid; place-items: center;
-  font: 700 14px/1 var(--font); color: var(--muted);
-}
-.quote .nm { font-size: 15px; font-weight: 600; }
-.quote .rl { font-size: 13px; color: var(--muted); }
-.slot {
-  display: inline-block; padding: 3px 9px; border-radius: 6px;
-  background: color-mix(in srgb, var(--green) 16%, transparent);
-  color: var(--green); font: 600 12px/1.4 var(--font); letter-spacing: .02em;
-}
-@media (max-width: 900px) { .quotes { grid-template-columns: 1fr; } }
-
 /* ---------- цена и призыв ---------- */
 
 .price { display: flex; flex-wrap: wrap; gap: 40px; align-items: flex-start; margin-top: 44px; }
@@ -538,48 +514,6 @@ footer { background: var(--deep); color: var(--on-deep-muted); padding: 56px 0 4
 </section>
 
 <hr class="rule">
-
-<section>
-  <div class="wrap">
-    <div class="head">
-      <span class="eyebrow">Отзывы</span>
-      <h2>Что говорят пользователи</h2>
-      <p class="lead">Здесь будут настоящие отзывы ваших клиентов. Замените текст и имена —
-        и уберите пунктирную рамку в стилях <code>.quote</code>.</p>
-    </div>
-    <div class="quotes">
-      <figure class="quote" style="margin:0">
-        <span class="slot">Место для отзыва</span>
-        <blockquote class="q" style="margin:0">Попросите отзыв у клиента, который пользуется
-          ботом дольше месяца. Лучше всего работает конкретика: что делал раньше, сколько
-          времени уходило, что изменилось.</blockquote>
-        <figcaption class="who">
-          <span class="av">?</span>
-          <span><span class="nm">Имя и фамилия</span><br><span class="rl">чем занимается, город</span></span>
-        </figcaption>
-      </figure>
-      <figure class="quote" style="margin:0">
-        <span class="slot">Место для отзыва</span>
-        <blockquote class="q" style="margin:0">Второй отзыв стоит взять у другого типа бизнеса —
-          если первый от арендодателя, то этот от подрядчика или магазина.</blockquote>
-        <figcaption class="who">
-          <span class="av">?</span>
-          <span><span class="nm">Имя и фамилия</span><br><span class="rl">чем занимается, город</span></span>
-        </figcaption>
-      </figure>
-      <figure class="quote" style="margin:0">
-        <span class="slot">Место для отзыва</span>
-        <blockquote class="q" style="margin:0">Третий — про конкретную возможность: выписку из
-          банка, акт сверки или напоминания о просрочке.</blockquote>
-        <figcaption class="who">
-          <span class="av">?</span>
-          <span><span class="nm">Имя и фамилия</span><br><span class="rl">чем занимается, город</span></span>
-        </figcaption>
-      </figure>
-    </div>
-  </div>
-</section>
-
 <div class="band" id="cena">
   <section>
     <div class="wrap">
