@@ -50,7 +50,18 @@ const SYNC_LIMIT_BYTES = 1024 * 1024;   // и его же потолок по р
 const POLL_MS = 2000;                   // как часто спрашивать готовность
 const POLL_TIMEOUT_MS = 180000;         // и сколько всего ждать
 
-const PROVIDER = () => String(process.env.SPEECH_PROVIDER || '').toLowerCase();
+/*
+ * Провайдер не задан, а ключ Gemini есть — берём Gemini. Тот же ключ уже
+ * читает договоры и отвечает голосом, и требовать от человека ещё одну
+ * переменную значило оставить голосовой ввод выключенным молча: в приложении
+ * он отвечал «не подключено», хотя всё остальное на этом ключе работало.
+ * Явный SPEECH_PROVIDER по-прежнему главнее (yandex, mock, off).
+ */
+const PROVIDER = () => {
+  const p = String(process.env.SPEECH_PROVIDER || '').toLowerCase();
+  if (p) return p === 'off' ? '' : p;
+  return process.env.GEMINI_API_KEY ? 'gemini' : '';
+};
 
 function speechAvailable() {
   const p = PROVIDER();

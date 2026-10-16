@@ -4372,6 +4372,19 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(sp.badKey('AQVN-kluch-iz-testa') === '', 'нормальный ключ пропущен');
     ok(sp.badKey('') === '', 'пустой ключ здесь не ругаем — про него скажет speechHint');
     {
+      {
+        // Без SPEECH_PROVIDER, но с ключом Gemini голос включается сам.
+        const sp = require('./lib/speech');
+        const wasP = process.env.SPEECH_PROVIDER; const wasK = process.env.GEMINI_API_KEY;
+        delete process.env.SPEECH_PROVIDER; process.env.GEMINI_API_KEY = 'AIza-test';
+        ok(sp.speechAvailable(), 'ключ Gemini есть — распознавание голоса включено без лишних настроек');
+        process.env.SPEECH_PROVIDER = 'off';
+        ok(!sp.speechAvailable(), 'SPEECH_PROVIDER=off выключает его явно');
+        delete process.env.GEMINI_API_KEY; delete process.env.SPEECH_PROVIDER;
+        ok(!sp.speechAvailable(), 'нет ключа и провайдера — выключено');
+        if (wasP !== undefined) process.env.SPEECH_PROVIDER = wasP;
+        if (wasK !== undefined) process.env.GEMINI_API_KEY = wasK;
+      }
       const was = { p: process.env.SPEECH_PROVIDER, k: process.env.GEMINI_API_KEY };
       process.env.SPEECH_PROVIDER = 'gemini';
       process.env.GEMINI_API_KEY = 'AIzaSy-kluch-iz-testa';
