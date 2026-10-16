@@ -222,13 +222,18 @@ function greeting() {
 
 function cpMenu(userId, cp) {
   const b = bdb.balanceOf(userId, cp.id);
+  const pre = bdb.prepayState(userId, cp.id);
   const closing = b ? round2(b.closing) : 0;
   const favour = cp.kind === 'supplier' ? 'наш долг ему' : 'в нашу пользу';
   const info = `<b>${esc(cp.name)}</b>${cp.inn ? ` · ИНН ${esc(cp.inn)}` : ''}\n`
     + `Тип: ${cp.kind === 'supplier' ? 'поставщик' : 'заказчик'} · операций: ${b ? b.ops.length : 0}\n`
-    + `Текущее сальдо: <b>${formatRub(Math.abs(closing))}</b> (${favour})`;
+    + `Текущее сальдо: <b>${formatRub(Math.abs(closing))}</b> (${favour})`
+    + (pre ? `\n💰 <b>${bdb.prepayLine(pre)}</b>` : '');
   const rows = [
     [{ text: '➕ Внести операцию', data: `op:${cp.id}` }],
+    // Предоплата — отдельная кнопка: это не «оплата по счёту», а режим работы с клиентом.
+    pre ? [{ text: '💰 Предоплата', data: `pp.in:${cp.id}` }, { text: '📄 Акт за месяц', data: `pp.act:${cp.id}` }]
+      : [{ text: '💰 Предоплата', data: `pp.in:${cp.id}` }],
     [{ text: '📄 Акт сверки', data: `d.akt:${cp.id}` }, { text: '🧾 Акт услуг', data: `d.usl:${cp.id}` }],
     [{ text: '💰 Счёт на оплату', data: `d.sch:${cp.id}` }, { text: '🏦 Платёжка', data: `d.pp:${cp.id}` }],
     [{ text: '🤝 Счёт-договор', data: `d.schdog:${cp.id}` }],
@@ -1127,11 +1132,16 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
    * переключать там нечего — нужно проставить цены.
    */
   const zeroSum = !res.debt && !(res.total > 0) && bdb.DEBT_DOCS.closing.includes(type);
-  const ledger = zeroSum
+  const pre = res.prepay;
+  const preNote = res.prepaid
+    ? `\n\n<i>Списано с предоплаты. Осталось ${formatRub(pre.left)}.</i>`
+      + (pre.low ? '\n⚠️ <b>Предоплата скоро кончится.</b>' : '')
+    : (res.debt && pre ? `\n\n<i>Предоплата кончилась: долг ${formatRub(pre.debt)}.</i>` : '');
+  const ledger = res.prepaid ? preNote : zeroSum
     ? '\n\n<i>Сумма документа 0 ₽ — долг клиента не записан: у позиций не указана цена. '
       + 'Выпишите документ заново с ценами.</i>'
     : res.debt
-    ? `\n<i>Долг ${formatRub(res.total)} внесён в журнал. Пришли деньги — нажмите «Оплачено».</i>`
+    ? `\n<i>Долг ${formatRub(res.total)} внесён в журнал. Пришли деньги — нажмите «Оплачено».</i>${preNote}`
     : (unseen ? `\n\n<i>${res.basis === 'manual'
       ? 'В долг клиента не попал: выбрано «журнал веду сам».'
       : 'Долг у вас считается по счетам, поэтому сам документ в долг клиента не попал.'}`
@@ -1144,7 +1154,7 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
    * показывало давно, бот — нет.
    */
   const buttons = unseen ? [[{ text: '📊 Считать долг по актам и накладным', data: 'basis.set:closing' }]]
-    : res.debt ? [[{ text: '✅ Оплачено', data: `doc.paid:${res.doc.id}` }]] : [];
+    : (res.debt && !res.prepaid) ? [[{ text: '✅ Оплачено', data: `doc.paid:${res.doc.id}` }]] : [];
   await tg.sendDocument(chatId, {
     buttons,
     filename: res.file.filename,
@@ -2595,6 +2605,111 @@ async function showBasis(tg, chatId, user) {
 /** Токен одноразовой кнопки — см. bdb.claimButton. Короткий: у данных кнопки лимит 64 байта. */
 const oneShot = () => require('node:crypto').randomBytes(4).toString('hex');
 
+/*
+ * Предоплата клиента.
+ *
+ * Деньги ложатся обычной строкой «Оплата» (bdb.addPrepay) — не документом и не
+ * второй проводкой, иначе каждая накладная оплачивалась бы дважды. Дальше всё
+ * делает выписка: пока остаток покрывает накладную, она сразу «оплачена».
+ */
+async function doPrepay(tg, chatId, user, cpId, amount) {
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+  const sum = round2(Math.abs(Number(amount) || 0));
+  if (!sum || sum >= 1e10) { await tg.sendMessage(chatId, 'Не разобрал сумму. Напишите число, например <code>140000</code>.'); return; }
+  const r = bdb.addPrepay(user.id, cpId, sum, todayISO());
+  const st = bdb.prepayState(user.id, cpId);
+  await tg.sendMessage(chatId,
+    `✅ Предоплата <b>${formatRub(sum)}</b> от «${esc(cp.name)}» внесена.\n\n`
+    + `${esc(bdb.prepayLine(st))}.\n`
+    + '<i>Накладные, акты и УПД этого клиента будут сами отмечаться оплаченными, пока хватает остатка.</i>',
+    keyboard([
+      [{ text: '↩️ Отменить проводку', data: `pay.undo:${cpId}:${r.opId}` }],
+      [{ text: `📂 Карточка «${cp.name}»`.slice(0, 60), data: `cp:${cpId}` }],
+    ]));
+}
+
+const MONTHS_RU = ['январь', 'февраль', 'март', 'апрель', 'май', 'июнь', 'июль', 'август',
+  'сентябрь', 'октябрь', 'ноябрь', 'декабрь'];
+
+/** Выбор месяца для акта: три последних, с суммой отгрузок на кнопке. */
+async function askMonthAct(tg, chatId, user, cpId) {
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+  const now = todayISO();
+  let y = Number(now.slice(0, 4)); let m = Number(now.slice(5, 7));
+  const rows = [];
+  for (let i = 0; i < 3; i += 1) {
+    const ym = `${y}-${String(m).padStart(2, '0')}`;
+    const sh = bdb.shipmentsOfMonth(user.id, cpId, ym);
+    if (sh.sum > 0) {
+      const done = bdb.monthActOf(user.id, cpId, ym) ? ' ✓' : '';
+      rows.push([{ text: `${MONTHS_RU[m - 1]} ${y} · ${formatMoney(sh.sum)} ₽${done}`, data: `pp.act:${cpId}:${ym}` }]);
+    }
+    m -= 1; if (m === 0) { m = 12; y -= 1; }
+  }
+  if (!rows.length) {
+    await tg.sendMessage(chatId, `У «${esc(cp.name)}» за последние три месяца нет накладных и УПД — акту не на чем строиться.`,
+      keyboard([[{ text: '⬅️ Карточка', data: `cp:${cpId}` }]]));
+    return;
+  }
+  await tg.sendMessage(chatId,
+    'Акт за какой месяц? Сумма — по накладным и УПД этого клиента. Акт закрывающий: '
+    + '<b>новый долг он не создаёт</b>, сумма уже учтена накладными.',
+    keyboard([...rows, [{ text: '⬅️ Карточка', data: `cp:${cpId}` }]]));
+}
+
+/** Акт услуг за месяц на сумму отгрузок — без проводки, чтобы не задвоить долг. */
+async function issueMonthAct(tg, chatId, user, cpId, ym) {
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(ym)) return;
+  const cp = bdb.getCp(user.id, cpId);
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+  const have = bdb.monthActOf(user.id, cpId, ym);
+  if (have) {
+    await tg.sendMessage(chatId, `Акт за этот месяц уже выписан: № ${esc(have.number)} от ${ru(have.date)}. Второй не делаю — найдёте его в документах клиента.`,
+      keyboard([[{ text: '📁 Документы клиента', data: `docs.cp:${cpId}` }]]));
+    return;
+  }
+  const sh = bdb.shipmentsOfMonth(user.id, cpId, ym);
+  if (!(sh.sum > 0)) { await tg.sendMessage(chatId, 'За этот месяц отгрузок нет.', mainMenu()); return; }
+  const y = Number(ym.slice(0, 4)); const m = Number(ym.slice(5, 7));
+  const last = `${ym}-${String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, '0')}`;
+  const date = last > todayISO() ? todayISO() : last;
+  const nums = sh.docs.map((d) => `№ ${d.number}`).join(', ');
+  const v = bdb.vatOf(org);
+  // Цена в акте — уже итог накладных (с налогом, если он там был), поэтому
+  // «с налогом внутри»: иначе НДС лёг бы на него второй раз и сумма разошлась.
+  const extra = { monthAct: ym, ...(v.rate != null ? { vatRate: v.rate, priceIncludesVat: true } : {}) };
+  await tg.sendChatAction(chatId, 'upload_document');
+  const res = await docService.issueDocument(user.id, {
+    type: 'usl', cpId, date, extra, noDebt: true,
+    items: [{ name: `Услуги за ${MONTHS_RU[m - 1]} ${y} по накладным ${nums}`, qty: 1, unit: 'усл.', price: sh.sum }],
+  });
+  if (!res.ok) { await tg.sendMessage(chatId, esc(res.message), mainMenu()); return; }
+  // Акт ничего не должен: отгрузки покрыты предоплатой или висят своими
+  // накладными. Отметка нужна, чтобы он не торчал в «Не оплачено» вторым долгом.
+  bdb.markPaid(user.id, res.doc.id, date);
+  const st = bdb.prepayState(user.id, cpId);
+  await tg.sendDocument(chatId, {
+    filename: res.file.filename, buffer: res.file.buffer,
+    caption: `Акт № ${esc(res.doc.number)} от ${ru(date)} для <b>${esc(cp.name)}</b> на ${formatRub(res.total)} `
+      + `за ${MONTHS_RU[m - 1]} ${y}.\n<i>Долг не изменился: сумма уже в накладных.</i>`,
+  });
+  const ended = !st || st.ended || st.low;
+  await tg.sendMessage(chatId,
+    (st ? `${esc(bdb.prepayLine(st))}.\n\n` : '')
+    + (ended
+      ? 'Предоплата закончилась (или вот-вот): выпишите клиенту счёт на новую предоплату и допсоглашение.'
+      : 'Когда будете продлевать предоплату — счёт и договор здесь же.')
+    + '\n<i>Текст допсоглашения я не придумываю: «Договор» соберёт по вашему шаблону.</i>',
+    keyboard([
+      [{ text: '🧾 Счёт на новую предоплату', data: `d.sch:${cpId}` }],
+      [{ text: '📝 Договор', data: `d.dog:${cpId}` }, { text: '📎 Свой договор', data: `mc.menu:${cpId}` }],
+      [{ text: '💰 Внёс предоплату', data: `pp.in:${cpId}` }],
+    ]));
+}
+
 async function recordPay(tg, chatId, user, cpId, amount, kind) {
   const cp = bdb.getCp(user.id, cpId);
   if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
@@ -2778,10 +2893,29 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
     if (!cp) {
       const tok = oneShot();
       const rows = (found.choices || cps).slice(0, 8)
-        .map((c) => ([{ text: c.name.slice(0, 60), data: `pay.cp:${c.id}:${intent.amount || 0}:${intent.kind === 'Приход' ? 'p' : 'o'}:${tok}` }]));
+        .map((c) => ([{ text: c.name.slice(0, 60), data: intent.prepay
+          ? (intent.amount ? `pp.do:${c.id}:${round2(intent.amount)}:${tok}` : `pp.in:${c.id}`)
+          : `pay.cp:${c.id}:${intent.amount || 0}:${intent.kind === 'Приход' ? 'p' : 'o'}:${tok}` }]));
       await tg.sendMessage(chatId,
         intent.who ? `Кого именно вы имели в виду — «${esc(intent.who)}»?` : 'По кому вносим?',
         keyboard([...rows, [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return true;
+    }
+    if (intent.prepay) {
+      const pSum = round2(Number(intent.amount) || 0);
+      if (!pSum) {
+        bdb.setState(user.id, `ppay:${cp.id}`, {});
+        await tg.sendMessage(chatId, `Сколько внёс «${esc(cp.name)}»? Напишите сумму предоплаты.`);
+        return true;
+      }
+      if (!auto) {
+        await tg.sendMessage(chatId,
+          `Подготовил: <b>предоплата ${formatRub(pSum)}</b> от «${esc(cp.name)}».\n\n<i>Сам я ничего не провожу — нажмите, и внесу.</i>`,
+          keyboard([[{ text: `✅ Внести ${formatMoney(pSum)}`, data: `pp.do:${cp.id}:${pSum}:${oneShot()}` }],
+            [{ text: '⬅️ Меню', data: 'menu' }]]));
+        return true;
+      }
+      await doPrepay(tg, chatId, user, cp.id, pSum);
       return true;
     }
     if (!auto) {
@@ -3998,7 +4132,11 @@ async function showDebts(tg, chatId, user) {
     return;
   }
   const theyOwe = rows.filter((r) => r.theyOwe);
-  const weOwe = rows.filter((r) => !r.theyOwe);
+  // Остаток предоплаты клиента — не «мы должны»: это его аванс, который мы
+  // отработаем отгрузками, и в одной куче с долгом поставщикам он путает.
+  const isPre = (r) => !r.theyOwe && r.cp.kind !== 'supplier' && bdb.prepayState(user.id, r.cp.id);
+  const prepaid = rows.filter(isPre);
+  const weOwe = rows.filter((r) => !r.theyOwe && !isPre(r));
   const sum = (list) => round2(list.reduce((s, r) => s + r.amount, 0));
 
   const line = (r) => {
@@ -4007,7 +4145,9 @@ async function showDebts(tg, chatId, user) {
     // Когда напоминали — чтобы не написать второй раз за день и не забыть на месяц.
     const ago = r.theyOwe ? digest.lastReminded(user.id, r.cp.id) : null;
     const rem = ago == null ? '' : ago === 0 ? ' · напомнили сегодня' : ` · напоминали ${ago} ${plural(ago, 'день', 'дня', 'дней')} назад`;
-    return `• <b>${esc(r.cp.name)}</b> — ${formatRub(r.amount)}${quiet}${rem}${flag}`;
+    const pl = bdb.prepayLine(bdb.prepayState(user.id, r.cp.id));
+    return `• <b>${esc(r.cp.name)}</b> — ${formatRub(r.amount)}${quiet}${rem}${flag}`
+      + (pl ? `\n   💰 ${pl}` : '');
   };
 
   let text = '';
@@ -4016,6 +4156,9 @@ async function showDebts(tg, chatId, user) {
   }
   if (weOwe.length) {
     text += `<b>Мы должны — ${formatRub(sum(weOwe))}</b>\n${weOwe.map(line).join('\n')}\n\n`;
+  }
+  if (prepaid.length) {
+    text += `<b>На предоплате</b>\n${prepaid.map(line).join('\n')}\n\n`;
   }
   text += `⚠️ — больше двух месяцев без единой операции.${basisNote}`;
 
@@ -5122,6 +5265,15 @@ async function handleMessage(tg, msg) {
     return;
   }
 
+  if (state.state.startsWith('ppay:')) {
+    const cpId = Number(state.state.split(':')[1]);
+    const num = Number(String(text).replace(/[\s\u00A0]/g, '').replace(',', '.').replace(/(?:₽|руб\.?|р\.?)$/i, ''));
+    if (!(num > 0)) { await tg.sendMessage(chatId, 'Не разобрал сумму. Напишите число, например <code>140000</code>.'); return; }
+    bdb.clearState(user.id);
+    await doPrepay(tg, chatId, user, cpId, num);
+    return;
+  }
+
   if (state.state.startsWith('op:')) {
     const cpId = Number(state.state.split(':')[1]);
     const op = parseOp(text);
@@ -5842,6 +5994,29 @@ async function handleCallback(tg, cq) {
         return;
       }
       await recordPay(tg, chatId, user, Number(cpIdStr), Number(sumStr), kindFlag === 'p' ? 'Приход' : 'Оплата');
+      return;
+    }
+    if (data.startsWith('pp.in:')) {
+      const cpId = Number(data.slice(6));
+      const cp = bdb.getCp(user.id, cpId);
+      if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+      bdb.setState(user.id, `ppay:${cpId}`, {});
+      await tg.sendMessage(chatId, `Сколько внёс «${esc(cp.name)}» предоплатой? Напишите сумму, например <code>140000</code>.`);
+      return;
+    }
+    if (data.startsWith('pp.do:')) {
+      const [cpIdStr, sumStr, tok] = data.slice(6).split(':');
+      if (!bdb.claimButton(user.id, tok)) {
+        await tg.sendMessage(chatId, 'Эта предоплата уже внесена — повторно не провожу.', mainMenu());
+        return;
+      }
+      await doPrepay(tg, chatId, user, Number(cpIdStr), Number(sumStr));
+      return;
+    }
+    if (data.startsWith('pp.act:')) {
+      const [cpIdStr, ym] = data.slice(7).split(':');
+      if (ym) await issueMonthAct(tg, chatId, user, Number(cpIdStr), ym);
+      else await askMonthAct(tg, chatId, user, Number(cpIdStr));
       return;
     }
     if (data.startsWith('pay.undo:')) {

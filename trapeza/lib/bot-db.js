@@ -319,6 +319,24 @@ function migrate() {
       PRIMARY KEY (org_id, cp_id)
     );
   `);
+  /*
+   * «Работает по предоплате» — отметка ПАРЫ «организация — клиент», как и
+   * начальное сальдо: с одной фирмой клиент платит вперёд, с другой — по
+   * факту, и общая галочка на карточке перепутала бы их.
+   * last_sum — последняя внесённая предоплата: от неё считаем «скоро кончится».
+   * Деньги здесь не хранятся: предоплата — обычная строка «Оплата» в журнале,
+   * а остаток — это минус сальдо. Вторая копия суммы разъехалась бы с журналом.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cp_prepay (
+      org_id   INTEGER NOT NULL,
+      cp_id    INTEGER NOT NULL,
+      prepay   INTEGER NOT NULL DEFAULT 0,
+      last_sum REAL    NOT NULL DEFAULT 0,
+      base_doc TEXT    NOT NULL DEFAULT '',
+      PRIMARY KEY (org_id, cp_id)
+    );
+  `);
   // Человек отменил проводку долга по этому документу руками. Без такой
   // отметки пересчёт основания создавал её заново: он видит, что проводки
   // нет, и считает это упущением, — а это было решение человека.
@@ -1392,6 +1410,18 @@ function markPaid(userId, docId, date) {
   const d = getDoc(userId, docId);
   if (!d) return null;
   const when = /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? date : todayISO();
+  /*
+   * Повторная отметка уже оплаченного документа, у которого проводки оплаты
+   * нет, — холостая. Такое бывает, когда его закрыла предоплата или оплата
+   * строкой в журнале: paid_sum = 0 значит «долг закрыт свободной оплатой».
+   * Без этой защиты второе нажатие «Оплачено» видело чужой долг по клиенту
+   * и гасило его оплатой ЭТОГО документа — накладная № 3 исчезала из долга
+   * оттого, что дважды нажали на № 1.
+   */
+  if (d.paid_at && !(Number(d.paid_sum) > 0) && !d.no_debt && d.cp_id
+      && !hasOpOfDoc(docId, 'Оплата') && makesDebt(orgOfDoc(userId, d) || {}, d.type)) {
+    return d.paid_at;
+  }
   db.prepare('UPDATE documents SET paid_at = ? WHERE id = ? AND user_id = ?').run(when, docId, userId);
   // В ручном режиме журнал ведёт человек, и лезть туда нельзя: проводка
   // оплаты без встречной реализации увела бы сальдо в минус — вышло бы,
@@ -2131,6 +2161,133 @@ function setOpeningFor(cpId, orgId, balance, date) {
   `).run(org, Number(cpId) || 0, Number(balance) || 0, String(date || ''));
 }
 
+/** Режим предоплаты пары «организация — клиент». Пары нет — значит, обычный клиент. */
+function prepayFor(cpId, orgId) {
+  const row = db.prepare(
+    'SELECT prepay, last_sum, base_doc FROM cp_prepay WHERE org_id = ? AND cp_id = ?',
+  ).get(Number(orgId) || 0, Number(cpId) || 0);
+  return {
+    prepay: Boolean(row && row.prepay),
+    last_sum: row ? Number(row.last_sum) || 0 : 0,
+    base_doc: row ? row.base_doc || '' : '',
+  };
+}
+
+/** Включить или выключить режим. Сумму последней предоплаты при этом не теряем. */
+function setPrepayMode(userId, cpId, orgId, on, baseDoc) {
+  if (!getCp(userId, cpId)) return false;
+  db.prepare(`
+    INSERT INTO cp_prepay(org_id, cp_id, prepay, base_doc) VALUES(?,?,?,?)
+    ON CONFLICT(org_id, cp_id) DO UPDATE SET
+      prepay = excluded.prepay,
+      base_doc = CASE WHEN excluded.base_doc <> '' THEN excluded.base_doc ELSE base_doc END
+  `).run(Number(orgId) || 0, Number(cpId), on ? 1 : 0, String(baseDoc || '').slice(0, 120));
+  return true;
+}
+
+/**
+ * Внести предоплату: свободная строка «Оплата» (debit) с пометкой и режим.
+ *
+ * Именно свободная строка, без привязки к документу: она сама уводит сальдо
+ * в минус, и каждая накладная съедает её своим «Реализация». Вторая проводка
+ * поверх задвоила бы оплату.
+ */
+function addPrepay(userId, cpId, sum, date, orgId = null) {
+  const amount = round2(Math.abs(Number(sum) || 0));
+  if (!amount || !getCp(userId, cpId)) return null;
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const opId = addOp(userId, cpId, {
+    date: /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? date : todayISO(),
+    kind: 'Оплата', doc: 'Предоплата', note: 'Предоплата', debit: amount,
+  }, org);
+  setPrepayMode(userId, cpId, org, true);
+  db.prepare('UPDATE cp_prepay SET last_sum = ? WHERE org_id = ? AND cp_id = ?').run(amount, org, cpId);
+  return { opId, amount };
+}
+
+/**
+ * Состояние предоплаты для показа: остаток, долг, «скоро кончится».
+ * null — клиент не на предоплате. «Скоро» — остаток не больше 20% последней
+ * внесённой суммы, но ещё положительный: на нуле уже не «скоро», а «кончилась».
+ */
+function prepayState(userId, cpId, orgId = null) {
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const pp = prepayFor(cpId, org);
+  if (!pp.prepay) return null;
+  const b = balanceOf(userId, cpId, org);
+  if (!b) return null;
+  const closing = round2(b.closing);
+  const left = closing < 0 ? round2(-closing) : 0;
+  return {
+    left,
+    debt: closing > 0 ? closing : 0,
+    lastSum: pp.last_sum,
+    low: left > 0 && pp.last_sum > 0 && left <= round2(pp.last_sum * 0.2),
+    ended: closing >= 0,
+  };
+}
+
+const fmtRub = (n) => `${new Intl.NumberFormat('ru-RU').format(round2(n)).replace(/\u00A0|\u202F/g, ' ')} ₽`;
+
+/** Строка для карточки клиента и «Кто должен». Пустая — не на предоплате. */
+function prepayLine(st) {
+  if (!st) return '';
+  if (st.debt > 0) return `Предоплата закончилась, долг ${fmtRub(st.debt)}`;
+  if (st.left <= 0) return 'Предоплата закончилась';
+  return `Предоплата: осталось ${fmtRub(st.left)}` + (st.low ? ' — скоро кончится' : '');
+}
+
+const hasOpOfDoc = (docId, kind) => db.prepare(
+  'SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = ?').get(docId, kind).n > 0;
+
+/**
+ * После выписки документа: если клиент на предоплате и сальдо с этим
+ * документом не выше нуля — предоплата его покрыла, ставим «оплачено».
+ * Накладную, которая не помещается в остаток, не дробим: она остаётся
+ * неоплаченной и сальдо показывает долг. Проводку оплаты markPaid не пишет
+ * (долг уже закрыт предоплатой, left = 0) — ровно то, что нужно.
+ * @returns {boolean} закрыт ли документ предоплатой
+ */
+function settleFromPrepay(userId, docId) {
+  const d = getDoc(userId, docId);
+  if (!d || !d.cp_id || d.paid_at || d.no_debt || !(Number(d.total) > 0)) return false;
+  const org = Number(d.org_id) || currentOrgId(userId);
+  if (!prepayFor(d.cp_id, org).prepay) return false;
+  if (!makesDebt(orgOfDoc(userId, d) || {}, d.type)) return false;
+  if (!hasOpOfDoc(docId, 'Реализация')) return false;
+  const b = balanceOf(userId, d.cp_id, org);
+  if (!b || round2(b.closing) > 0) return false;
+  markPaid(userId, docId, d.date);
+  return true;
+}
+
+/** Закрывающий документ без долга: сумма уже учтена накладными. */
+function setNoDebt(userId, docId) {
+  db.prepare('UPDATE documents SET no_debt = 1 WHERE id = ? AND user_id = ?').run(docId, userId);
+}
+
+/** Отгрузки клиента за месяц YYYY-MM: накладные и УПД, создавшие долг. */
+function shipmentsOfMonth(userId, cpId, ym, orgId = null) {
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const rows = db.prepare(`
+    SELECT id, type, number, date, total FROM documents
+     WHERE user_id = ? AND org_id = ? AND cp_id = ? AND type IN ('torg12','upd')
+       AND no_debt = 0 AND date LIKE ? ORDER BY date, id`).all(userId, org, cpId, `${ym}-%`);
+  return {
+    docs: rows,
+    sum: round2(rows.reduce((a, r) => a + (Number(r.total) || 0), 0)),
+  };
+}
+
+/** Уже выписанный акт за этот месяц (payload.monthAct), чтобы не выписать второй. */
+function monthActOf(userId, cpId, ym, orgId = null) {
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const rows = db.prepare(
+    "SELECT * FROM documents WHERE user_id = ? AND org_id = ? AND cp_id = ? AND type = 'usl' AND payload LIKE ?",
+  ).all(userId, org, cpId, '%"monthAct"%');
+  return rows.map(withPayload).find((r) => r.payload.monthAct === ym) || null;
+}
+
 /**
  * Занят ли уже такой номер в этом году у этого вида документа.
  *
@@ -2374,6 +2531,8 @@ module.exports = {
   isSeqTaken, guardSeq, numberTakenInOrg, currentOrgId, currentOrg, setActiveOrg,
   orgQuota, grantOrgSlots,
   openingFor, setOpeningFor, cpOrgs,
+  prepayFor, setPrepayMode, addPrepay, prepayState, prepayLine, settleFromPrepay,
+  setNoDebt, shipmentsOfMonth, monthActOf,
   nextSeqForOrg, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, seedItems, listTemplates, getTemplate, forgetTemplate,
   quota, docsThisMonth, freePerMonth,

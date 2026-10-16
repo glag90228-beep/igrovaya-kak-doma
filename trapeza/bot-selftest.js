@@ -7741,6 +7741,116 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'а только что заведённое правило не пугает долгом за месяц, которого не видело');
   }
 
+  console.log('\n── предоплата ──');
+  {
+    const bdbP = require('./lib/bot-db');
+    const dsP = require('./lib/doc-service');
+    const whoP = { id: 779210, first_name: 'Предоплатов', username: 'prepay' };
+    const sayP = (t) => handleUpdate(tg, { message: { chat: { id: whoP.id }, from: whoP, text: t } });
+    const tapP = (d) => handleUpdate(tg,
+      { callback_query: { id: 'cb', from: whoP, data: d, message: { chat: { id: whoP.id } } } });
+    const uP = bdbP.getOrCreateUser(whoP.id, 'Предоплатов');
+    const bank = { bank_name: 'ПАО Сбербанк', bik: '044525225', corr_acc: '30101810400000000225' };
+    bdbP.saveMyOrg(uP.id, { name: 'ИП Обедов', inn: '183112345678', acc: '40802810900000000009', ...bank });
+    const orgA = bdbP.getDefaultOrg(uP.id).id;
+    const cpP = bdbP.createCp(uP.id, { name: 'ООО «Заводская»', kind: 'customer', opening_date: '2026-01-01' });
+    const cpPlain = bdbP.createCp(uP.id, { name: 'ООО «Обычный»', kind: 'customer', opening_date: '2026-01-01' });
+    const torg = (cp, day, price = 50000) => dsP.issueDocument(uP.id, {
+      type: 'torg12', cpId: cp, date: `2026-10-${day}`, skipQuota: true,
+      items: [{ name: 'Обеды', qty: 1, price }],
+    });
+    const bal = (cp, org) => bdbP.balanceOf(uP.id, cp, org).closing;
+    const paidAt = (r) => bdbP.getDoc(uP.id, r.doc.id).paid_at;
+
+    // Ввод предоплаты кнопкой: бот спрашивает сумму и записывает одну строку «Оплата».
+    await tapP(`pp.in:${cpP}`);
+    ok(norm(last()).includes('предоплатой'), 'кнопка «Предоплата» спрашивает сумму');
+    await sayP('140 000');
+    ok(bal(cpP) === -140000 && bdbP.prepayFor(cpP, orgA).prepay,
+      'предоплата 140 000: сальдо −140 000 и режим включён', String(bal(cpP)));
+    const prepOps = bdbP.listOps(uP.id, cpP).filter((o) => o.kind === 'Оплата' && o.doc === 'Предоплата');
+    ok(prepOps.length === 1 && prepOps[0].doc_id === 0 && prepOps[0].debit === 140000,
+      'предоплата — одна свободная строка «Оплата», не привязанная к документу');
+
+    const r1 = await torg(cpP, '01'); const r2 = await torg(cpP, '02'); const r3 = await torg(cpP, '03');
+    ok(paidAt(r1) && paidAt(r2) && !paidAt(r3), 'две накладные по 50 000 оплачены предоплатой, третья — нет');
+    ok(r1.prepaid && r2.prepaid && !r3.prepaid, 'выпуск сообщает, что списал с предоплаты');
+    ok(bal(cpP) === 10000, 'долг 10 000: сальдо положительное', String(bal(cpP)));
+    ok(r2.prepay.left === 40000 && r3.prepay.debt === 10000, 'остаток считается верно: 40 000, затем долг 10 000');
+    ok(bdbP.unpaidDocs(uP.id).filter((d) => d.cp_id === cpP).map((d) => d.id).join() === String(r3.doc.id),
+      'в «Не оплачено» только третья накладная');
+    ok(!bdbP.listOps(uP.id, cpP).some((o) => o.doc_id === r1.doc.id && o.kind === 'Оплата'),
+      'второй проводки оплаты поверх предоплаты нет (ноль = закрыто свободной оплатой)');
+
+    // Пересчёт и повторное «Оплачено» не задваивают.
+    const before = bal(cpP);
+    bdbP.rebuildDebt(uP.id); bdbP.rebuildDebt(uP.id);
+    ok(bal(cpP) === before && bdbP.listOps(uP.id, cpP).filter((o) => o.kind === 'Оплата').length === 1,
+      'rebuildDebt не задваивает оплату и не двигает сальдо');
+    bdbP.markPaid(uP.id, r1.doc.id);
+    ok(bal(cpP) === before, 'повторная отметка «оплачено» у закрытой предоплатой накладной сальдо не меняет');
+
+    // Показ.
+    await tapP(`cp:${cpP}`);
+    ok(norm(last()).includes('Предоплата закончилась, долг 10 000'), 'карточка клиента: «Предоплата закончилась, долг 10 000 ₽»');
+    await tapP('debts');
+    ok(sent.slice(-3).some((m) => norm(m.text).includes('Предоплата закончилась, долг 10 000')),
+      '«Кто должен» показывает строку про предоплату');
+
+    // «Скоро кончится»: остаток ≤ 20% последней предоплаты.
+    bdbP.addPrepay(uP.id, cpP, 100000, '2026-10-04');       // сальдо 10 000 − 100 000 = −90 000
+    const r4 = await torg(cpP, '05', 70000);                  // остаток 20 000 = 20% от 100 000
+    ok(r4.prepaid && r4.prepay.left === 20000 && r4.prepay.low,
+      'остаток 20 000 при предоплате 100 000 — «скоро кончится»', JSON.stringify(r4.prepay));
+    ok(!(await torg(cpP, '06', 30000)).prepaid, 'накладная больше остатка не дробится и остаётся неоплаченной');
+
+    // Клиент без предоплаты — по-старому.
+    const rp = await torg(cpPlain, '01');
+    ok(!rp.prepaid && !paidAt(rp) && bal(cpPlain) === 50000 && rp.prepay === null,
+      'клиент без предоплаты: накладная неоплачена, долг как раньше');
+    ok(bdbP.prepayState(uP.id, cpPlain) === null, 'у обычного клиента нет состояния предоплаты');
+
+    // Две организации не путаются.
+    const orgB = bdbP.createOrg(uP.id, { name: 'ООО «Вторая»', inn: '7707083893', acc: '40702810900000000002', ...bank });
+    bdbP.setActiveOrg(uP.id, orgB);
+    ok(!bdbP.prepayFor(cpP, orgB).prepay && bdbP.prepayState(uP.id, cpP) === null,
+      'предоплата первой фирмы не видна во второй');
+    const rB = await torg(cpP, '07');
+    ok(!rB.prepaid && !paidAt(rB), 'во второй фирме накладная того же клиента не гасится чужой предоплатой');
+    bdbP.setActiveOrg(uP.id, orgA);
+
+    // Акт за месяц: сумма отгрузок первой фирмы, долга не добавляет.
+    const sh = bdbP.shipmentsOfMonth(uP.id, cpP, '2026-10', orgA);
+    const debtBeforeAct = bal(cpP, orgA);
+    const docsBefore = bdbP.listDocs(uP.id, 200, cpP, orgA).length;
+    await tapP(`pp.act:${cpP}`);
+    ok(button('октябрь 2026') === `pp.act:${cpP}:2026-10`, 'выбор месяца предлагает октябрь с суммой');
+    await tapP(`pp.act:${cpP}:2026-10`);
+    const act = bdbP.monthActOf(uP.id, cpP, '2026-10', orgA);
+    ok(act && act.type === 'usl' && act.total === sh.sum && sh.sum === 250000,
+      'акт услуг выписан на сумму всех отгрузок за месяц (250 000)', act ? `${act.total} / ${sh.sum}` : 'нет');
+    ok(act && act.no_debt === 1, 'акт помечен «без долга» (no_debt)');
+    ok(bal(cpP, orgA) === debtBeforeAct && !bdbP.listOps(uP.id, cpP, orgA).some((o) => o.doc_id === act.id),
+      'акт не добавил долг и не создал проводку');
+    bdbP.rebuildDebt(uP.id);
+    ok(bal(cpP, orgA) === debtBeforeAct, 'пересчёт тоже не добавляет долг по акту');
+    ok(!bdbP.unpaidDocs(uP.id).some((d) => d.id === act.id), 'акт не лежит в «Не оплачено»');
+    ok(bdbP.listDocs(uP.id, 200, cpP, orgA).length === docsBefore + 1, 'выписан ровно один акт');
+    ok(sent.slice(-3).some((m) => m.kb.some((row) => row.some((b) => b.callback_data === `d.sch:${cpP}`))
+      && m.kb.some((row) => row.some((b) => b.callback_data === `d.dog:${cpP}`))),
+    'после акта предложены счёт на новую предоплату и договор');
+    await tapP(`pp.act:${cpP}:2026-10`);
+    ok(bdbP.listDocs(uP.id, 200, cpP, orgA).length === docsBefore + 1, 'повторное нажатие второй акт не выписывает');
+
+    // Текстом: «предоплата 140000 от <клиент>».
+    const ai = require('./lib/ai-agent');
+    const q = ai.quickParse('предоплата 140000 от Обычный');
+    ok(q && q.action === 'pay' && q.prepay && q.amount === 140000 && /Обычный/.test(q.who),
+      'фраза «предоплата 140000 от Обычный» разбирается', JSON.stringify(q));
+    const q2 = ai.quickParse('договор с предоплатой 30%');
+    ok(!q2 || !q2.prepay, 'слово «предоплатой» внутри фразы режим не включает');
+  }
+
   console.log('\n── общий браузер для PDF ──');
   const pdf = require('./lib/pdf');
   if (pdf.pdfAvailable()) {

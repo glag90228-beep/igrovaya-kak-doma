@@ -481,6 +481,12 @@ function basisChip(s) {
  * создаёт у всех, это обычный порядок, а не сюрприз.
  */
 function noDebtNote(type, r) {
+  // Клиент на предоплате: говорим, списалось ли с неё, — вместо «Оплачено».
+  if (r && r.debt && r.prepay && ['usl', 'upd', 'torg12'].includes(type)) {
+    return r.prepaid
+      ? `Списано с предоплаты. ${r.prepay.text}.`
+      : `Предоплата кончилась: ${r.prepay.text}.`;
+  }
   if (!r || r.debt || !['usl', 'upd', 'torg12'].includes(type)) return '';
   // Ноль рублей — не вопрос основания: быстрые позиции приходят без цены,
   // и на нулевую сумму проводку не пишем. Говорим про цены, а не про настройку.
@@ -1497,6 +1503,7 @@ screens.cps = async function cps() {
     icon: 'users',
     title: cp.name,
     sub: (multiOrg && !cp.mine ? 'другая ваша фирма · ' : '')
+      + (cp.prepay ? `${cp.prepay.text} · ` : '')
       + (cp.inn ? `ИНН ${cp.inn}` : (cp.kind === 'supplier' ? 'поставщик' : 'заказчик')),
     right: cp.balance ? money(Math.abs(cp.balance)) : '',
     // Сумма без знака непонятна: в списке рядом стоят и должники, и те,
@@ -1660,6 +1667,7 @@ screens.cp = async function cpScreen({ id, name }) {
         h('div', { class: 'ellipsis muted small',
           text: cp.balance ? (owesUs(cp) ? 'Должен нам' : 'Должны мы') : 'Сальдо' }),
         h('div', { class: `v money ${balanceTone(cp)}`, text: money(Math.abs(cp.balance || 0)) }),
+        cp.prepay ? h('div', { class: 'small', text: `💰 ${cp.prepay.text}` }) : '',
         h('div', { class: 'hint', text: openingHint() })),
       icon('chev', 'chev'));
     balanceRow.onclick = () => { haptic(); gotoOpening(); };
@@ -2754,7 +2762,7 @@ screens.op = async function op({ cpId, doc }) {
     return b;
   };
   const picker = h('div', { class: 'btn-wrap', style: 'display:flex;gap:10px' });
-  picker.append(btn('payment', 'Оплата'), btn('income', 'Приход'));
+  picker.append(btn('payment', 'Оплата'), btn('prepay', 'Предоплата'), btn('income', 'Приход'));
 
   box.append(h('div', { class: 'card' },
     h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Клиент' }),
@@ -2762,7 +2770,7 @@ screens.op = async function op({ cpId, doc }) {
   box.append(picker);
   box.append(h('div', { class: 'card' }, amount, date, docF));
   box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
-    text: 'Оплата уменьшает долг клиента, приход — увеличивает.' }));
+    text: 'Оплата уменьшает долг клиента, приход — увеличивает. Предоплата — деньги вперёд: накладные клиента дальше отмечаются оплаченными сами, пока хватает остатка.' }));
 
   const save = h('button', { class: 'btn' }, 'Внести в журнал');
   save.onclick = () => withBusy(save, async () => {

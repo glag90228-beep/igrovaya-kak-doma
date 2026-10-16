@@ -545,6 +545,8 @@ function cpBrief(userId, cp) {
       return { opening_balance: round2(op.opening_balance), opening_date: op.opening_date };
     })(),
     balance: b ? round2(b.closing) : 0,
+    // Предоплата ТЕКУЩЕЙ фирмы: null — клиент на обычных условиях.
+    prepay: (() => { const st = bdb.prepayState(userId, cp.id); return st ? { ...st, text: bdb.prepayLine(st) } : null; })(),
     /*
      * С какими из моих фирм этот клиент связан. Список общий на аккаунт, и
      * без пометки выписать документ не от той организации — дело одного
@@ -1111,9 +1113,15 @@ const api = {
     // колонку сальдо и её разбор — считают-то они по-разному.
     const amount = round2(Math.abs(Number(body.amount) || 0));
     if (!amount) return { error: 'Укажите сумму.' };
-    const paid = body.kind === 'payment';
+    const paid = body.kind === 'payment' || body.kind === 'prepay';
     const date = body.date ? isoDay(body.date) : docService.todayISO();
     if (!date) return { error: 'Такой даты не бывает.' };
+    // Предоплата — свободная строка «Оплата» плюс режим у клиента; накладные
+    // дальше закрываются сами (см. bdb.settleFromPrepay).
+    if (body.kind === 'prepay') {
+      bdb.addPrepay(user.id, cp.id, amount, date);
+      return { cp: cpBrief(user.id, bdb.getCp(user.id, cp.id)) };
+    }
     bdb.addOp(user.id, cp.id, {
       date,
       kind: paid ? 'Оплата' : 'Приход',
@@ -2108,6 +2116,8 @@ const api = {
        * поломкой. Теперь экран говорит об этом в момент выписки.
        */
       debt: Boolean(res.debt),
+      prepaid: Boolean(res.prepaid),
+      prepay: res.prepay ? { ...res.prepay, text: bdb.prepayLine(res.prepay) } : null,
       debtBasis: res.basis,
     };
   },

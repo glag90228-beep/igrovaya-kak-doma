@@ -163,7 +163,7 @@ function withFx(userId, org, docType, doc) {
  *          |{ok:false, reason:string, message:string, quota?:object}}
  */
 async function issueDocument(userId, {
-  type, cpId, items, date, number, extra = {}, skipQuota = false,
+  type, cpId, items, date, number, extra = {}, skipQuota = false, noDebt = false,
 }) {
   const kind = ITEM_DOCS[type];
   if (!kind) return fail('type', 'Такой документ выписать нельзя.');
@@ -333,16 +333,25 @@ async function issueDocument(userId, {
   // Долг в журнал — если этот тип документа его создаёт при выбранном
   // основании. Проводка привязана к документу: её видно, можно отменить,
   // и повторный выпуск того же документа её не задвоит.
-  const debt = bdb.makesDebt(org, type) && total > 0
+  // noDebt — закрывающий акт за месяц: сумма уже в долге через накладные,
+  // и второй «Реализацией» она бы удвоилась. Флаг ставим ДО проводки и ДО
+  // пересчёта, иначе rebuildDebt заведёт её сам.
+  if (noDebt) bdb.setNoDebt(userId, id);
+  const debt = !noDebt && bdb.makesDebt(org, type) && total > 0
     ? bdb.addOpForDoc(userId, cp.id, {
       date: when, kind: 'Реализация', doc: `${kind.title} № ${num}`, credit: total,
     }, id)
     : false;
+  // Клиент на предоплате: пока остаток её покрывает, документ сразу оплачен.
+  const prepaid = debt ? bdb.settleFromPrepay(userId, id) : false;
+  const prepay = bdb.prepayState(userId, cp.id, org.id);
 
   return {
     ok: true,
     total,
     debt,
+    prepaid,
+    prepay,
     basis: bdb.basisOf(org),
     title: kind.title,
     file,
