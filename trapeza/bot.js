@@ -60,6 +60,7 @@ const recurring = require('./lib/recurring');
 const period = require('./lib/period');
 const bizTypes = require('./lib/biz-types');
 const digest = require('./lib/digest');
+const crm = require('./lib/crm');
 const ai = require('./lib/ai-agent');
 
 // ---------- утилиты дат/чисел ----------
@@ -129,6 +130,8 @@ const FLOW_BUTTONS = {
   'mycon.ok:': ['mc.save:', 'mc.cancel'],
   ctfile: ['ct.rev', 'ct.tpl', 'mc.cancel'],
   'dogx:': [],
+  'note:': [],
+  'fu:': [],
 };
 
 // ---------- меню ----------
@@ -231,6 +234,8 @@ function cpMenu(userId, cp) {
     [{ text: '🤝 Счёт-договор', data: `d.schdog:${cp.id}` }],
     [{ text: '📦 УПД', data: `d.upd:${cp.id}` }, { text: '🚚 ТОРГ-12', data: `d.torg12:${cp.id}` }],
     [{ text: '📝 Договор', data: `d.dog:${cp.id}` }, { text: '📎 Свой договор', data: `mc.menu:${cp.id}` }],
+    [{ text: '🕑 История', data: `crm.h:${cp.id}` }, { text: '📝 Заметка', data: `crm.n:${cp.id}` },
+      { text: '⏰ Напомнить мне', data: `crm.f:${cp.id}` }],
   ];
   /*
    * Счета-фактуры показываем только плательщику НДС. Неплательщику они не
@@ -3209,6 +3214,25 @@ async function runDaily(tg, at = new Date()) {
   return sent;
 }
 
+/** «Напомнить мне» по клиентам — утром, вместе со сводкой. */
+async function sendFollowups(tg, today = todayISO()) {
+  let n = 0;
+  for (const f of crm.dueFollowups(today)) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await tg.sendMessage(f.tg_id, `⏰ <b>${esc(f.cp_name || 'Клиент')}</b>: ${esc(f.text)}`, keyboard([
+        [{ text: '✅ Сделано', data: `crm.done:${f.id}` }, { text: '⏰ Через 3 дня', data: `crm.snz:${f.id}` }],
+        [{ text: '🕑 История клиента', data: `crm.h:${f.cp_id}` }],
+      ]));
+      crm.markSent(f.id);
+      n += 1;
+    } catch (e) {
+      if (e && e.blocked) bdb.markBlocked(f.user_id);
+    }
+  }
+  return n;
+}
+
 /** Завести повторение по уже выписанному документу и рассказать, что будет. */
 async function addRecurring(tg, chatId, user, src, when) {
   const { items, extra } = docService.reusablePayload(src.payload);
@@ -4925,6 +4949,22 @@ async function handleMessage(tg, msg) {
   if (state.state.startsWith('av:')) { await handleAvansText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('ksf:')) { await handleKsfText(tg, chatId, user, state, text); return; }
   if (await contractFlow().onText(tg, chatId, user, state, text)) return;
+  if (state.state.startsWith('note:')) {
+    const cpId = Number(state.state.slice(5));
+    bdb.clearState(user.id);
+    crm.addNote(user.id, cpId, text);
+    await tg.sendMessage(chatId, '📝 Записал в историю клиента.',
+      keyboard([[{ text: '🕑 История', data: `crm.h:${cpId}` }, { text: '⏰ Напомнить мне', data: `crm.f:${cpId}` }]]));
+    return;
+  }
+  if (state.state.startsWith('fu:')) {
+    const [, cpIdStr, daysStr] = state.state.split(':');
+    bdb.clearState(user.id);
+    const t = text.trim();
+    const fu = crm.addFollowup(user.id, Number(cpIdStr), { today: todayISO(), days: Number(daysStr), text: t === '-' ? '' : t });
+    await tg.sendMessage(chatId, `⏰ Напомню ${ru(fu.due)} утром: «${esc(fu.text)}».`, mainMenu());
+    return;
+  }
   if (state.state.startsWith('dog:')) { await handleDogText(tg, chatId, user, state, text); return; }
   if (state.state === 'support') { await handleSupportText(tg, chatId, user, text); return; }
   if (state.state.startsWith('rm:')) {
@@ -6044,6 +6084,52 @@ async function handleCallback(tg, cq) {
         keyboard([[{ text: '✖️ Отмена', data: 'billing' }]]));
       return;
     }
+    if (data.startsWith('crm.h:')) {
+      const cpId = Number(data.slice(6));
+      const cp = bdb.getCp(user.id, cpId);
+      if (!cp) return;
+      const items = crm.timeline(user.id, cpId);
+      const open = crm.openFollowups(user.id, cpId);
+      const lines = [`🕑 <b>История: ${esc(cp.name)}</b>`, ''];
+      if (open.length) lines.push(...open.map((f) => `⏰ ${ru(f.due)} — ${esc(f.text)}`), '');
+      lines.push(...(items.length ? items.map((x) => `${x.icon} ${ru(x.at)} — ${esc(x.text)}`) : ['Пока пусто.']));
+      await tg.sendMessage(chatId, lines.join('\n').slice(0, 4000), keyboard([
+        [{ text: '📝 Заметка', data: `crm.n:${cpId}` }, { text: '⏰ Напомнить мне', data: `crm.f:${cpId}` }],
+        [{ text: `📂 ${cp.name}`.slice(0, 60), data: `cp:${cpId}` }],
+      ]));
+      return;
+    }
+    if (data.startsWith('crm.n:')) {
+      const cpId = Number(data.slice(6));
+      bdb.setState(user.id, `note:${cpId}`, {});
+      await tg.sendMessage(chatId, 'Что записать? Например: «договорились на банкет 20 июня, 40 гостей, предоплата 30%».',
+        keyboard([[{ text: '✖️ Отмена', data: `cp:${cpId}` }]]));
+      return;
+    }
+    if (data.startsWith('crm.f:')) {
+      const cpId = Number(data.slice(6));
+      await tg.sendMessage(chatId, 'Когда напомнить?', keyboard([
+        [{ text: 'Завтра', data: `crm.fd:${cpId}:1` }, { text: 'Через 3 дня', data: `crm.fd:${cpId}:3` }],
+        [{ text: 'Через неделю', data: `crm.fd:${cpId}:7` }, { text: 'Через 2 недели', data: `crm.fd:${cpId}:14` }],
+        [{ text: '✖️ Отмена', data: `cp:${cpId}` }],
+      ]));
+      return;
+    }
+    if (data.startsWith('crm.fd:')) {
+      const [cpIdStr, daysStr] = data.slice(7).split(':');
+      bdb.setState(user.id, `fu:${Number(cpIdStr)}:${Number(daysStr)}`, {});
+      await tg.sendMessage(chatId, 'О чём напомнить? Например: «позвонить насчёт предоплаты». Или «-» — просто связаться.');
+      return;
+    }
+    if (data.startsWith('crm.done:')) {
+      await tg.sendMessage(chatId, crm.done(user.id, Number(data.slice(9))) ? '✅ Отметил: сделано.' : 'Уже отмечено.', mainMenu());
+      return;
+    }
+    if (data.startsWith('crm.snz:')) {
+      await tg.sendMessage(chatId, crm.snooze(user.id, Number(data.slice(8)), todayISO(), 3)
+        ? '⏰ Напомню через три дня.' : 'Это напоминание уже закрыто.', mainMenu());
+      return;
+    }
     if (data === 'dg.off' || data === 'dg.on') {
       const on = digest.setOn(user.id, data === 'dg.on');
       await tg.sendMessage(chatId, on
@@ -6297,6 +6383,7 @@ async function main() {
         const n = await digest.run(tg, keyboard);
         if (n) console.log(`Утренняя сводка: отправлено — ${n}`);
       } catch (e) { console.error('утренняя сводка:', e.message); }
+      try { await sendFollowups(tg); } catch (e) { console.error('напоминания по клиентам:', e.message); }
     }
     let updates = [];
     try {
@@ -6351,5 +6438,5 @@ async function main() {
 if (require.main === module) main();
 
 module.exports = {
-  handleUpdate, runDaily, parseOp, parseDate, parseItemLine, readItemLine, parseAmount,
+  handleUpdate, runDaily, sendFollowups, parseOp, parseDate, parseItemLine, readItemLine, parseAmount,
 };

@@ -4703,6 +4703,31 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await say('40 2500');
     ok(/Банкетное обслуживание — 40/.test(norm(last())) && /100 000/.test(norm(last())) === false && /2 500/.test(norm(last())),
       'позиция добавлена с ценой', norm(last()).slice(0, 100));
+
+    // Мини-CRM: история по датам, заметка, «напомнить мне» утром.
+    const crmM = require('./lib/crm');
+    await tap(`crm.n:${dcp}`);
+    await say('договорились: оплатят до пятницы');
+    ok(/Записал/.test(last()), 'заметка записана');
+    await tap(`crm.fd:${dcp}:3`);
+    await say('позвонить насчёт оплаты');
+    ok(/Напомню/.test(last()), 'напоминание себе поставлено', last());
+    await tap(`crm.h:${dcp}`);
+    const histT = norm(last());
+    ok(/История: ООО «Тянет с оплатой»/.test(histT) && /📝 .*оплатят до пятницы/.test(histT)
+      && /⏰ .*позвонить насчёт оплаты/.test(histT) && /✉️ .*Напоминание об оплате/.test(histT) && /💰/.test(histT),
+    'в истории — заметка, напоминание себе, напоминание должнику и деньги', histT.slice(0, 200));
+    const outF = [];
+    const tgF = { async sendMessage(chatId, text, opts) { outF.push({ chatId, text, opts }); return {}; } };
+    const inThree = crmM.plusDays(require('./lib/period').todayISO(), 3);
+    ok(await require('./bot').sendFollowups(tgF, inThree) >= 1 && outF.some((m) => /позвонить насчёт оплаты/.test(m.text)),
+      'в срок напоминание пришло');
+    ok(await require('./bot').sendFollowups(tgF, inThree) === 0, 'и второй раз не приходит');
+    const fuId = crmM.openFollowups(uidD, dcp)[0].id;
+    await tap(`crm.snz:${fuId}`);
+    ok(crmM.openFollowups(uidD, dcp)[0].due > inThree, '«Через 3 дня» откладывает');
+    await tap(`crm.done:${fuId}`);
+    ok(crmM.openFollowups(uidD, dcp).length === 0, '«Сделано» закрывает');
     await tap('menu');
   }
 
