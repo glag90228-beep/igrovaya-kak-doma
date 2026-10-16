@@ -715,7 +715,7 @@ async function main() {
   r = await call('POST', '/api/doc', {
     user: masha, body: { type: 'sch', cpId: 999999, items: [{ name: 'X', qty: 1, price: 1 }] },
   });
-  ok(r.status === 400 && /онтрагент/.test(r.json.error), 'на чужого контрагента выписать нельзя', r.json.error);
+  ok(r.status === 400 && /нет в вашем списке/.test(r.json.error), 'на чужого контрагента выписать нельзя', r.json.error);
 
   section('лимит бесплатных');
   r = await call('POST', '/api/doc', {
