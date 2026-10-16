@@ -59,6 +59,7 @@ const bank = require('./lib/bank-statement');
 const recurring = require('./lib/recurring');
 const period = require('./lib/period');
 const bizTypes = require('./lib/biz-types');
+const digest = require('./lib/digest');
 const ai = require('./lib/ai-agent');
 
 // ---------- утилиты дат/чисел ----------
@@ -3938,7 +3939,10 @@ async function showDebts(tg, chatId, user) {
   const line = (r) => {
     const quiet = r.days == null ? '' : ` · без движения ${r.days} ${plural(r.days, 'день', 'дня', 'дней')}`;
     const flag = r.days != null && r.days > 60 ? ' ⚠️' : '';
-    return `• <b>${esc(r.cp.name)}</b> — ${formatRub(r.amount)}${quiet}${flag}`;
+    // Когда напоминали — чтобы не написать второй раз за день и не забыть на месяц.
+    const ago = r.theyOwe ? digest.lastReminded(user.id, r.cp.id) : null;
+    const rem = ago == null ? '' : ago === 0 ? ' · напомнили сегодня' : ` · напоминали ${ago} ${plural(ago, 'день', 'дня', 'дней')} назад`;
+    return `• <b>${esc(r.cp.name)}</b> — ${formatRub(r.amount)}${quiet}${rem}${flag}`;
   };
 
   let text = '';
@@ -3987,18 +3991,68 @@ async function sendDebtAkts(tg, chatId, user) {
       [{ text: '⬅️ Меню', data: 'menu' }]]));
 }
 
-/** Текст напоминания: и для копирования, и для письма — один и тот же. */
-function reminderText(org, r) {
+/*
+ * Текст напоминания: и для копирования, и для письма — один и тот же.
+ *
+ * Три тона, потому что первое напоминание и третье — разные письма.
+ * Начинать со «строго» — испортить отношения с клиентом, который просто
+ * забыл; писать «мягко» в третий раз — дать понять, что можно не платить.
+ * Строгий тон называет только то, что действительно следует из закона:
+ * претензию и проценты по ст. 395 ГК РФ — без выдуманных штрафов.
+ */
+const REMIND_TONES = { soft: 'Мягко', biz: 'По делу', firm: 'Строго' };
+
+function reminderText(org, r, tone = 'biz') {
   const bank = org && org.acc
     ? `\n\nРеквизиты для оплаты:\n${org.bank_name || ''}\nБИК ${org.bik || '—'}\nР/с ${org.acc}`
     : '';
+  const sum = `${formatRub(r.amount).replace(/ /g, ' ').replace(/\sруб\.$/, ' руб')}`;
+  const by = r.cp.contract ? ` по ${r.cp.contract}` : '';
+  const sign = `${bank}\n\nС уважением,\n${(org && (org.full_name || org.name)) || ''}`;
+  if (tone === 'soft') {
+    return 'Здравствуйте!\n\n'
+      + `Небольшое напоминание: у нас не отмечена оплата на ${sum}${by}. `
+      + 'Возможно, платёж уже в пути — тогда просто пришлите, пожалуйста, платёжку, и я закрою вопрос.'
+      + `${sign}`;
+  }
+  if (tone === 'firm') {
+    return 'Здравствуйте!\n\n'
+      + `На ${ru(todayISO())} задолженность ${sum}${by} не погашена, хотя мы уже напоминали о ней. `
+      + 'Просим оплатить её в течение 5 рабочих дней или сообщить точный срок оплаты.\n\n'
+      + 'Если оплаты не будет, мы будем вынуждены направить претензию и взыскивать долг '
+      + 'вместе с процентами за пользование чужими денежными средствами (ст. 395 ГК РФ).'
+      + `${sign}`;
+  }
   return 'Здравствуйте!\n\n'
-    + `По нашим данным на ${ru(todayISO())} за вами числится задолженность `
-    + `${formatRub(r.amount).replace(/ /g, ' ').replace(/\sруб\.$/, ' руб')}`
-    + `${r.cp.contract ? ` по ${r.cp.contract}` : ''}.\n\n`
+    + `По нашим данным на ${ru(todayISO())} за вами числится задолженность ${sum}${by}.\n\n`
     + 'Направляем акт сверки. Просим подтвердить сумму и сообщить срок оплаты. '
     + 'Если платёж уже прошёл — пришлите, пожалуйста, платёжное поручение.'
-    + `${bank}\n\nС уважением,\n${(org && (org.full_name || org.name)) || ''}`;
+    + `${sign}`;
+}
+
+/*
+ * Напоминание одному должнику — из утренней сводки и списка долгов.
+ * Тон переключается кнопками; «напоминали N дней назад» подсказывает,
+ * какой выбрать. Отправка письмом — только по нажатию.
+ */
+async function remindOne(tg, chatId, user, cpId, tone = '') {
+  const org = bdb.currentOrg(user.id);
+  const row = bdb.debtors(user.id).find((d) => d.theyOwe && d.cp.id === cpId);
+  if (!row) { await tg.sendMessage(chatId, 'За этим клиентом долга нет — напоминать не о чем.', mainMenu()); return; }
+  const ago = digest.lastReminded(user.id, cpId);
+  // Тон по умолчанию — по истории: первый раз мягко, потом по делу, после двух недель — строго.
+  const t = REMIND_TONES[tone] ? tone : ago == null ? 'soft' : ago >= 14 ? 'firm' : 'biz';
+  const head = `<b>Напоминание: ${esc(row.cp.name)}</b> — ${formatRub(row.amount)}`
+    + (ago == null ? '' : ago === 0 ? ' · сегодня уже напоминали' : ` · напоминали ${ago} ${plural(ago, 'день', 'дня', 'дней')} назад`);
+  const kb = [Object.entries(REMIND_TONES).map(([k, name]) => ({ text: k === t ? `• ${name}` : name, data: `rm.one:${cpId}:${k}` }))];
+  if (mailbox.has(user.id)) {
+    kb.push([row.cp.email
+      ? { text: `✉️ Отправить на ${row.cp.email}`.slice(0, 60), data: `rm.mail:${cpId}:${t}` }
+      : { text: '✉️ Указать почту и отправить', data: `rm.ask:${cpId}:${t}` }]);
+  }
+  kb.push([{ text: '✅ Отправил сам', data: `rm.done:${cpId}:${t}` }, { text: '⬅️ Долги', data: 'debts' }]);
+  await tg.sendMessage(chatId, `${head}\n\nНажмите на текст, чтобы скопировать, и перешлите клиенту:`);
+  await tg.sendMessage(chatId, `<code>${esc(reminderText(org, row, t))}</code>`, keyboard(kb));
 }
 
 /**
@@ -4028,13 +4082,13 @@ async function debtReminder(tg, chatId, user) {
         ? { text: `✉️ Отправить на ${r.cp.email}`.slice(0, 60), data: `rm.mail:${r.cp.id}` }
         : { text: '✉️ Указать почту и отправить', data: `rm.ask:${r.cp.id}` }]);
     }
-    await tg.sendMessage(chatId, `<code>${esc(reminderText(org, r))}</code>`,
-      kb.length ? keyboard(kb) : undefined);
+    kb.push([{ text: '🎚 Мягче или строже', data: `rm.one:${r.cp.id}` }]);
+    await tg.sendMessage(chatId, `<code>${esc(reminderText(org, r))}</code>`, keyboard(kb));
   }
 }
 
 /** Отправить напоминание должнику письмом — с актом сверки во вложении. */
-async function sendReminderMail(tg, chatId, user, cpId, email) {
+async function sendReminderMail(tg, chatId, user, cpId, email, tone = 'biz') {
   const box = mailbox.resolve(user.id);
   if (!box.ok) { await tg.sendMessage(chatId, esc(box.reason), mainMenu()); return; }
   const cp = bdb.getCp(user.id, cpId);
@@ -4085,13 +4139,14 @@ async function sendReminderMail(tg, chatId, user, cpId, email) {
   const res = await mailer.sendMail({
     to,
     subject: `Задолженность по расчётам${org.name ? ` — ${org.name}` : ''}`,
-    text: reminderText(org, row),
+    text: reminderText(org, row, REMIND_TONES[tone] ? tone : 'biz'),
     attachments,
   }, box.options);
   if (!res.ok) {
     await tg.sendMessage(chatId, `Не отправилось: ${esc(res.error)}`, mainMenu());
     return;
   }
+  digest.logReminder(user.id, cp.id, { tone, via: 'mail' });
   if (to !== cp.email) bdb.updateCp(user.id, cp.id, { email: to });
   await tg.sendMessage(chatId,
     `✅ Отправлено на <b>${esc(to)}</b>${attachments.length ? ' вместе с актом сверки' : ''}.`,
@@ -4595,6 +4650,9 @@ async function showOrg(tg, chatId, user) {
     [{ text: `📒 Режим: ${kudir.TAX_MODES[org.tax_mode] || 'не указан'}`.slice(0, 60), data: 'taxmode' }],
     [{ text: `📊 Долг: ${BASIS_LABEL[bdb.basisOf(org)]}`.slice(0, 60), data: 'basis' }],
     [{ text: bdb.isAiEnabled(user.id) ? '🤖 ИИ-ассистент: включён' : '🤖 ИИ-ассистент: выключен', data: 'toggle.ai' }],
+    [digest.isOn(user.id)
+      ? { text: '☀️ Утренняя сводка: включена', data: 'dg.off' }
+      : { text: '🔕 Утренняя сводка: выключена', data: 'dg.on' }],
     [{ text: mailbox.has(user.id) ? '✉️ Почта: подключена' : '✉️ Подключить почту', data: 'mb' }],
     [{ text: '⬅️ Меню', data: 'menu' }],
   ]));
@@ -4871,8 +4929,9 @@ async function handleMessage(tg, msg) {
   if (state.state === 'support') { await handleSupportText(tg, chatId, user, text); return; }
   if (state.state.startsWith('rm:')) {
     const cpId = Number(state.state.slice(3));
+    const tone = (state.data && state.data.tone) || 'biz';
     bdb.clearState(user.id);
-    await sendReminderMail(tg, chatId, user, cpId, text.trim());
+    await sendReminderMail(tg, chatId, user, cpId, text.trim(), tone);
     return;
   }
   if (state.state.startsWith('aktp:')) {
@@ -5179,8 +5238,14 @@ async function handleCallback(tg, cq) {
         // пересчёт. Иначе выбравший «Аренда» читает «долг по счёту», а долг
         // по уже выписанным счетам не появляется.
         const said = rebuildText(bdb.rebuildDebt(user.id));
+        // Готовые строки под это дело — кнопками при выписке, цену спрошу.
+        const presets = bizTypes.itemsOf(key);
+        const seeded = bdb.seedItems(user.id, presets);
+        const presetNote = seeded
+          ? `\n\nДобавил готовые позиции — будут кнопками при выписке: ${presets.map((x) => esc(x.name)).join(', ')}.`
+          : '';
         await tg.sendMessage(chatId,
-          `<b>${esc(t.name)}</b>\n\n${esc(t.why)}${said ? `\n\n${said}` : ''}`);
+          `<b>${esc(t.name)}</b>\n\n${esc(t.why)}${said ? `\n\n${said}` : ''}${presetNote}`);
         if (await offerRoutine(tg, chatId, user, key)) return;
       }
       await showBasis(tg, chatId, user);
@@ -5900,6 +5965,15 @@ async function handleCallback(tg, cq) {
       if (!state.state.startsWith('items:')) return;
       const t = bdb.getTemplate(user.id, Number(data.slice(4)));
       if (!t) { await tg.sendMessage(chatId, 'Шаблон не найден.'); return; }
+      // Готовая позиция без цены (из набора под профессию) — спрашиваем и
+      // количество, и цену тем же путём, что у новой позиции.
+      if (!(Number(t.price) > 0)) {
+        state.data.ask = 'np'; state.data.pending = { name: t.name, unit: t.unit || 'шт.' };
+        bdb.setState(user.id, state.state, state.data);
+        await tg.sendMessage(chatId, `<b>${esc(t.name)}</b>\nСколько и по какой цене?\n\n`
+          + '<i>Можно одним сообщением: <code>40 2500</code> — сорок по 2 500.</i>');
+        return;
+      }
       state.data.ask = 'qty'; state.data.tplId = t.id;
       bdb.setState(user.id, state.state, state.data);
       await tg.sendMessage(chatId, `<b>${esc(t.name)}</b> по ${formatRub(t.price)} за ${esc(t.unit)}\nСколько?`);
@@ -5970,6 +6044,13 @@ async function handleCallback(tg, cq) {
         keyboard([[{ text: '✖️ Отмена', data: 'billing' }]]));
       return;
     }
+    if (data === 'dg.off' || data === 'dg.on') {
+      const on = digest.setOn(user.id, data === 'dg.on');
+      await tg.sendMessage(chatId, on
+        ? '☀️ Утренняя сводка включена: в 9 утра пришлю, кто сколько должен, — если есть что сказать.'
+        : '🔕 Сводку больше не присылаю. Включить — «Моя организация» → «Утренняя сводка».', mainMenu());
+      return;
+    }
     if (data === 'voice.off' || data === 'voice.on') {
       const on = bdb.setVoiceReply(user.id, data === 'voice.on');
       await tg.sendMessage(chatId, on
@@ -5989,13 +6070,26 @@ async function handleCallback(tg, cq) {
     if (data === 'debts') { await showDebts(tg, chatId, user); return; }
     if (data === 'debt.akts') { await sendDebtAkts(tg, chatId, user); return; }
     if (data === 'debt.remind') { await debtReminder(tg, chatId, user); return; }
+    if (data.startsWith('rm.one:')) {
+      const [cpIdStr, tone] = data.slice(7).split(':');
+      await remindOne(tg, chatId, user, Number(cpIdStr), tone || '');
+      return;
+    }
+    if (data.startsWith('rm.done:')) {
+      const [cpIdStr, tone] = data.slice(8).split(':');
+      digest.logReminder(user.id, Number(cpIdStr), { tone: tone || '', via: 'text' });
+      await tg.sendMessage(chatId, 'Записал, что напомнили. В сводке будет видно, сколько дней прошло.', mainMenu());
+      return;
+    }
     if (data.startsWith('rm.mail:')) {
-      await sendReminderMail(tg, chatId, user, Number(data.slice(8)));
+      const [cpIdStr, tone] = data.slice(8).split(':');
+      await sendReminderMail(tg, chatId, user, Number(cpIdStr), undefined, tone || 'biz');
       return;
     }
     if (data.startsWith('rm.ask:')) {
-      const cpId = Number(data.slice(7));
-      bdb.setState(user.id, `rm:${cpId}`, {});
+      const [cpIdStr, tone] = data.slice(7).split(':');
+      const cpId = Number(cpIdStr);
+      bdb.setState(user.id, `rm:${cpId}`, { tone: tone || 'biz' });
       const cp = bdb.getCp(user.id, cpId);
       await tg.sendMessage(chatId,
         `Куда отправить напоминание для <b>${esc((cp && cp.name) || 'клиента')}</b>?\n\n`
@@ -6188,11 +6282,21 @@ async function main() {
    * не должен превращаться в рассылку предложений.
    */
   let dailyDone = todayISO();
+  // Сводка — с 9 утра по Москве. Отметка «отправлено сегодня» у каждого
+  // человека лежит в базе, поэтому перезапуск днём сводку не повторит.
+  let digestDone = '';
   // eslint-disable-next-line no-constant-condition
   while (true) {
     if (dailyDone !== todayISO()) {
       dailyDone = todayISO();
       try { await runDaily(tg); } catch (e) { console.error('ежедневные дела:', e.message); }
+    }
+    if (digestDone !== todayISO() && digest.isMorning()) {
+      digestDone = todayISO();
+      try {
+        const n = await digest.run(tg, keyboard);
+        if (n) console.log(`Утренняя сводка: отправлено — ${n}`);
+      } catch (e) { console.error('утренняя сводка:', e.message); }
     }
     let updates = [];
     try {

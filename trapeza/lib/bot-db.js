@@ -2254,6 +2254,22 @@ function rememberItems(userId, items) {
   }
 }
 
+/**
+ * Готовые позиции под вид деятельности — без цены и с нулём употреблений,
+ * чтобы свои, настоящие, всегда стояли выше. Уже существующие не трогаем.
+ */
+function seedItems(userId, items) {
+  const now = new Date().toISOString();
+  let added = 0;
+  for (const it of items || []) {
+    const name = String(it.name || '').trim();
+    if (!name) continue;
+    added += db.prepare('INSERT OR IGNORE INTO item_templates(user_id, name, unit, price, uses, used_at) VALUES(?,?,?,?,0,?)')
+      .run(userId, name, it.unit || 'шт.', 0, now).changes;
+  }
+  return added;
+}
+
 function listTemplates(userId, limit = 8) {
   return db.prepare(
     'SELECT * FROM item_templates WHERE user_id = ? ORDER BY uses DESC, used_at DESC LIMIT ?',
@@ -2359,6 +2375,6 @@ module.exports = {
   orgQuota, grantOrgSlots,
   openingFor, setOpeningFor, cpOrgs,
   nextSeqForOrg, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
-  rememberItems, listTemplates, getTemplate, forgetTemplate,
+  rememberItems, seedItems, listTemplates, getTemplate, forgetTemplate,
   quota, docsThisMonth, freePerMonth,
 };

@@ -4645,6 +4645,67 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     }
   }
 
+  console.log('\n── утренняя сводка, напоминания в трёх тонах, позиции под профессию ──');
+  {
+    const dg = require('./lib/digest');
+    const bdbD = require('./lib/bot-db');
+    const uidD = fxUserId();
+    const dcp = bdbD.createCp(uidD, { name: 'ООО «Тянет с оплатой»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbD.addOp(uidD, dcp, { date: '2026-03-01', kind: 'Реализация', credit: 88000 });
+    const { db: rawD } = require('./db');
+    rawD.prepare("UPDATE bot_users SET digest_at = '', digest_total = -1, digest_on = 1 WHERE id = ?").run(uidD);
+
+    const d1 = dg.build(uidD, { today: '2026-10-16' });
+    ok(d1 && /Доброе утро/.test(d1.text) && /Тянет с оплатой/.test(norm(d1.text)),
+      'сводка: сколько должны и кто', d1 && norm(d1.text).slice(0, 120));
+    const btns = d1 ? d1.rows.flat() : [];
+    ok(btns.some((b) => b.data.startsWith('rm.one:')) && btns.some((b) => b.data.startsWith('pay.cp:'))
+      && btns.some((b) => b.data === 'dg.off'), 'под сводкой — «Напомнить», «Оплатил» и «Не присылать»');
+
+    const outD = [];
+    const tgD = { async sendMessage(chatId, text, opts) { outD.push({ chatId, text, opts }); return {}; } };
+    const kbD = (rows) => ({ reply_markup: { inline_keyboard: rows } });
+    const n1 = await dg.run(tgD, kbD, { today: '2026-10-16' });
+    ok(n1 >= 1 && outD.some((m) => m.chatId === USER.id), 'сводка разослана тем, у кого есть должники', n1);
+    const was = outD.length;
+    const n2 = await dg.run(tgD, kbD, { today: '2026-10-16' });
+    ok(n2 === 0 && outD.length === was, 'второй раз за день — тишина (перезапуск бота не дублирует)');
+    ok(dg.build(uidD, { today: '2026-10-17' }) === null, 'сумма не изменилась — назавтра не беспокоим');
+    ok(Boolean(dg.build(uidD, { today: '2026-10-19' })), 'через три дня напомним снова');
+    ok(dg.isMorning(new Date('2026-10-16T06:30:00Z')) && !dg.isMorning(new Date('2026-10-16T04:00:00Z')),
+      'время — по Москве: 9:30 пора, 7:00 рано');
+    await tap('dg.off');
+    ok(!dg.isOn(uidD) && !dg.candidates('2026-10-20').some((u) => u.id === uidD), '«Не присылать» выключает сводку');
+    await tap('dg.on');
+    ok(dg.isOn(uidD), 'и включается обратно');
+
+    // Напоминание одному должнику: первый раз — мягко, после «Отправил сам» — по делу, строго — со ст. 395.
+    await tap(`rm.one:${dcp}`);
+    ok(/Небольшое напоминание/.test(last()) && Boolean(button('• Мягко')), 'первое напоминание — мягким тоном', norm(last()).slice(0, 80));
+    await tap(`rm.one:${dcp}:firm`);
+    ok(/ст\. 395 ГК РФ/.test(last()) && /претензию/.test(last()) && Boolean(button('• Строго')),
+      'строгий тон: претензия и проценты по закону, без выдуманных штрафов');
+    await tap(`rm.done:${dcp}:firm`);
+    ok(dg.lastReminded(uidD, dcp) === 0, 'отмечено, что напомнили');
+    await tap(`rm.one:${dcp}`);
+    ok(/числится задолженность/.test(last()) && Boolean(button('• По делу')), 'после напоминания — тон «по делу»');
+    await tap('debts');
+    ok(/напомнили сегодня/.test(norm(sent.slice(-2).map((m) => m.text).join(' '))), 'в списке долгов видно, что напоминали');
+
+    // Вид деятельности — готовые позиции; позиция без цены спрашивает цену.
+    await tap('biz.set:catering');
+    ok(/Банкетное обслуживание/.test(norm(sent.slice(-3).map((m) => m.text).join(' '))), 'кейтеринг: добавлены готовые позиции');
+    const preset = bdbD.listTemplates(uidD, 50).find((t) => t.name === 'Банкетное обслуживание');
+    ok(preset && preset.price === 0 && preset.uses === 0, 'позиция без цены и ниже своих', JSON.stringify(preset));
+    await tap(`d.sch:${dcp}`);
+    await tap(`tpl:${preset.id}`);
+    ok(/Сколько и по какой цене/.test(last()), 'позиция из набора спрашивает количество и цену', last());
+    await say('40 2500');
+    ok(/Банкетное обслуживание — 40/.test(norm(last())) && /100 000/.test(norm(last())) === false && /2 500/.test(norm(last())),
+      'позиция добавлена с ценой', norm(last()).slice(0, 100));
+    await tap('menu');
+  }
+
   console.log('\n── проводка не переживает свой документ ──');
   {
     const bdbO = require('./lib/bot-db');
