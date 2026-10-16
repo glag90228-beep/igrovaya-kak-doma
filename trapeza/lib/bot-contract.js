@@ -68,6 +68,12 @@ module.exports = function contractFlow(h) {
   }
 
   async function askUpload(tg, chatId, user, scope) {
+    // Номер клиента приходит из кнопки, а кнопку можно подделать: шаблон не
+    // должен ссылаться на чужую карточку, даже если читать её никто не даст.
+    if (Number(scope) && !bdb.getCp(user.id, Number(scope))) {
+      await tg.sendMessage(chatId, 'Такого клиента нет в вашем справочнике.');
+      return;
+    }
     bdb.setState(user.id, `mycon:${Number(scope) || 0}`, {});
     await tg.sendMessage(chatId,
       `Пришлите свой договор файлом — Word (DOCX), PDF или фото страниц. Сохраню его ${scopeName(user.id, scope)}.\n\n`

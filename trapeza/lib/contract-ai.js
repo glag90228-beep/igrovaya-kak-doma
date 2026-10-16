@@ -148,6 +148,8 @@ async function ask(userId, { buffer, mime, name }, promptFor, { mockEnv, maxToke
   if (ai.budget(userId).left <= 0) {
     return { ok: false, reason: 'limit', error: 'На этот месяц разбор ИИ закончился — продлите подписку или дождитесь нового месяца.' };
   }
+  const release = ai.aiLock(userId);
+  if (!release) return { ok: false, reason: 'busy', error: 'Я ещё читаю прошлый файл — пришлите этот через минуту.' };
   ai.spend(userId);
   try {
     let got;
@@ -172,6 +174,8 @@ async function ask(userId, { buffer, mime, name }, promptFor, { mockEnv, maxToke
     return { ok: true, json, text, kind };
   } catch (e) {
     return { ok: false, reason: 'error', error: 'Сервис разбора сейчас не отвечает — попробуйте чуть позже.', detail: e.message };
+  } finally {
+    release();
   }
 }
 

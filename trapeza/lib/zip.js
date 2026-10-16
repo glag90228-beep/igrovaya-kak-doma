@@ -11,12 +11,19 @@
  * в Node встроен.
  *
  * Защита от «ZIP-бомбы»: распаковка каждой записи ограничена по размеру —
- * договор на десять страниц весит десятки килобайт, а не гигабайты.
+ * договор на десять страниц весит десятки килобайт, а не гигабайты. Ещё
+ * ограничен общий объём: иначе тысячи записей каталога, указывающих на одну
+ * и ту же бомбу, распаковали бы её тысячи раз подряд.
  */
 
 const zlib = require('node:zlib');
 
 const MAX_ENTRY = 30 * 1024 * 1024;
+const MAX_TOTAL = 40 * 1024 * 1024;
+// Текст Word разбираем в основном потоке бота — больше этого не бывает у
+// настоящих договоров, а разбор чужого «документа» на сотни мегабайт встал бы
+// для всех пользователей разом.
+const MAX_XML = 5 * 1024 * 1024;
 
 /** Прочитать нужные записи. names — какие файлы вернуть (без него — все). */
 function readZip(buf, names = null) {
@@ -30,6 +37,8 @@ function readZip(buf, names = null) {
   const count = b.readUInt16LE(eocd + 10);
   let p = b.readUInt32LE(eocd + 16);
   const out = new Map();
+  const seen = new Set();
+  let total = 0;
   for (let n = 0; n < count; n += 1) {
     if (p + 46 > b.length || b.readUInt32LE(p) !== 0x02014b50) throw new Error('каталог архива повреждён');
     const method = b.readUInt16LE(p + 10);
@@ -42,13 +51,20 @@ function readZip(buf, names = null) {
     const name = b.toString('utf8', p + 46, p + 46 + nameLen);
     p += 46 + nameLen + extraLen + commentLen;
     if (names && !names.includes(name)) continue;
+    // Word не кладёт один файл дважды; повтор — признак подделки.
+    if (seen.has(name)) throw new Error('каталог архива повреждён');
+    seen.add(name);
     if (local + 30 > b.length || b.readUInt32LE(local) !== 0x04034b50) throw new Error('запись архива повреждена');
     const start = local + 30 + b.readUInt16LE(local + 26) + b.readUInt16LE(local + 28);
     const raw = b.subarray(start, start + compSize);
     if (size > MAX_ENTRY) throw new Error('в архиве слишком большой файл');
-    if (method === 0) out.set(name, Buffer.from(raw));
-    else if (method === 8) out.set(name, zlib.inflateRawSync(raw, { maxOutputLength: MAX_ENTRY }));
+    let data;
+    if (method === 0) data = Buffer.from(raw);
+    else if (method === 8) data = zlib.inflateRawSync(raw, { maxOutputLength: Math.max(1, Math.min(MAX_ENTRY, MAX_TOTAL - total)) });
     else throw new Error(`неизвестный метод сжатия ${method}`);
+    total += data.length;
+    if (total > MAX_TOTAL) throw new Error('архив слишком большой');
+    out.set(name, data);
   }
   return out;
 }
@@ -112,6 +128,29 @@ const attr = (xml, name) => {
   return m ? m[1] : '';
 };
 
+/*
+ * Регулярки ниже нарочно без «[\s\S]*?» и без «[^>]*»: на файле, где теги не
+ * закрыты, такие шаблоны перебирают хвост заново от каждого открытия, и один
+ * подделанный DOCX вешал бота на минуты для всех. «[^<>]*» обрывается на
+ * ближайшей угловой скобке — каждый символ просматривается считанные разы.
+ * В атрибутах XML сырой «<» запрещён, так что настоящие теги это не задевает.
+ */
+const emptyTag = (body, tag) => (new RegExp(`<${tag}\\b[^<>]*\\/>`).exec(body) || [''])[0];
+
+/** Блоки <tag …>…</tag> одним проходом; самозакрытые пропускаем. */
+function* blocks(xml, tag) {
+  const open = new RegExp(`<${tag}\\b[^<>]*>`, 'g');
+  const close = `</${tag}>`;
+  let m;
+  while ((m = open.exec(xml))) {
+    if (m[0].endsWith('/>')) continue;
+    const end = xml.indexOf(close, open.lastIndex);
+    if (end < 0) return;
+    yield { head: m[0], body: xml.slice(open.lastIndex, end) };
+    open.lastIndex = end + close.length;
+  }
+}
+
 /**
  * Автонумерация Word.
  *
@@ -122,23 +161,28 @@ const attr = (xml, name) => {
  * десятичные номера по numbering.xml; маркеры списков — тире.
  */
 function numberingOf(xml) {
-  if (!xml) return null;
+  if (!xml || xml.length > MAX_XML) return null;
   const abstract = {};
-  for (const m of xml.matchAll(/<w:abstractNum\b[^>]*w:abstractNumId="(\d+)"[^>]*>([\s\S]*?)<\/w:abstractNum>/g)) {
+  for (const m of blocks(xml, 'w:abstractNum')) {
+    const id = attr(m.head, 'w:abstractNumId');
+    if (!/^\d+$/.test(id)) continue;
     const lvls = {};
-    for (const l of m[2].matchAll(/<w:lvl\b[^>]*w:ilvl="(\d+)"[^>]*>([\s\S]*?)<\/w:lvl>/g)) {
-      lvls[l[1]] = {
-        fmt: attr((/<w:numFmt\b[^>]*\/>/.exec(l[2]) || [''])[0], 'w:val') || 'decimal',
-        text: attr((/<w:lvlText\b[^>]*\/>/.exec(l[2]) || [''])[0], 'w:val'),
-        start: Number(attr((/<w:start\b[^>]*\/>/.exec(l[2]) || [''])[0], 'w:val')) || 1,
+    for (const l of blocks(m.body, 'w:lvl')) {
+      const lv = attr(l.head, 'w:ilvl');
+      if (!/^\d+$/.test(lv)) continue;
+      lvls[lv] = {
+        fmt: attr(emptyTag(l.body, 'w:numFmt'), 'w:val') || 'decimal',
+        text: attr(emptyTag(l.body, 'w:lvlText'), 'w:val'),
+        start: Number(attr(emptyTag(l.body, 'w:start'), 'w:val')) || 1,
       };
     }
-    abstract[m[1]] = lvls;
+    abstract[id] = lvls;
   }
   const nums = {};
-  for (const m of xml.matchAll(/<w:num\b[^>]*w:numId="(\d+)"[^>]*>([\s\S]*?)<\/w:num>/g)) {
-    const a = attr((/<w:abstractNumId\b[^>]*\/>/.exec(m[2]) || [''])[0], 'w:val');
-    if (abstract[a]) nums[m[1]] = abstract[a];
+  for (const m of blocks(xml, 'w:num')) {
+    const a = attr(emptyTag(m.body, 'w:abstractNumId'), 'w:val');
+    const id = attr(m.head, 'w:numId');
+    if (/^\d+$/.test(id) && abstract[a]) nums[id] = abstract[a];
   }
   return nums;
 }
@@ -151,25 +195,26 @@ function docxText(buf) {
   const files = readZip(buf, ['word/document.xml', 'word/numbering.xml']);
   const doc = files.get('word/document.xml');
   if (!doc) throw new Error('в файле нет текста Word (word/document.xml)');
+  if (doc.length > MAX_XML) throw new Error('документ Word слишком большой');
   const xml = doc.toString('utf8');
   const numbering = numberingOf((files.get('word/numbering.xml') || '').toString('utf8'));
   const counters = {};
   const lines = [];
   let row = null;
-  // Пустой абзац <w:p/> ищем первым: иначе шаблон «абзац с телом» принял бы
-  // его за начало и проглотил следующий абзац целиком.
-  for (const tok of xml.matchAll(/<w:tr\b[^>]*>|<\/w:tr>|<w:p\b[^>]*\/>|<w:p\b(?:[^>]*[^/>])?>[\s\S]*?<\/w:p>/g)) {
-    const t = tok[0];
-    if (t.startsWith('<w:tr')) { row = []; continue; }
-    if (t === '</w:tr>') { if (row) lines.push(row.filter(Boolean).join('\t')); row = null; continue; }
+  // Абзац собираем по тегам открытия и закрытия, а не одной регуляркой «от
+  // <w:p> до </w:p>»: так разбор линейный при любом файле. Абзацы внутри
+  // надписей вложены в абзац — их текст достаётся внешнему.
+  let depth = 0;
+  let pStart = 0;
+  const paragraph = (t) => {
     let text = '';
-    for (const r of t.matchAll(/<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>|<w:tab\/>|<w:br\b[^>]*\/>|<w:cr\/>/g)) {
+    for (const r of t.matchAll(/<w:t(?:\s[^<>]*)?>([^<]*)<\/w:t>|<w:tab\/>|<w:br\b[^<>]*\/>|<w:cr\/>/g)) {
       if (r[1] !== undefined) text += unxml(r[1]);
       else if (r[0].startsWith('<w:tab')) text += '\t';
       else text += '\n';
     }
-    const numId = attr((/<w:numId\b[^>]*\/>/.exec(t) || [''])[0], 'w:val');
-    const ilvl = Number(attr((/<w:ilvl\b[^>]*\/>/.exec(t) || [''])[0], 'w:val')) || 0;
+    const numId = attr(emptyTag(t, 'w:numId'), 'w:val');
+    const ilvl = Number(attr(emptyTag(t, 'w:ilvl'), 'w:val')) || 0;
     if (numbering && numId && numbering[numId] && text.trim()) {
       const lv = numbering[numId];
       const c = counters[numId] || (counters[numId] = []);
@@ -189,6 +234,17 @@ function docxText(buf) {
     }
     if (row) row.push(text.trim());
     else lines.push(text);
+  };
+  for (const tok of xml.matchAll(/<w:tr\b[^<>]*>|<\/w:tr>|<w:p\b[^<>]*>|<\/w:p>/g)) {
+    const t = tok[0];
+    if (t.startsWith('<w:tr')) { if (!t.endsWith('/>')) row = []; continue; }
+    if (t === '</w:tr>') { if (row) lines.push(row.filter(Boolean).join('\t')); row = null; continue; }
+    if (t === '</w:p>') {
+      if (depth > 0 && --depth === 0) paragraph(xml.slice(pStart, tok.index));
+      continue;
+    }
+    if (t.endsWith('/>')) { if (!depth) paragraph(''); continue; }   // пустой абзац <w:p/>
+    if (depth++ === 0) pStart = tok.index;
   }
   return lines.join('\n').replace(/[  ]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }

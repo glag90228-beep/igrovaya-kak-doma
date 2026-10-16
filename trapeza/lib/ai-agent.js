@@ -315,6 +315,21 @@ function budget(userId) {
  * @param {number} userId
  * @param {object} [spent] что известно о расходе; пусто — просто занимаем штуку
  */
+/*
+ * Один дорогой запрос на человека за раз.
+ *
+ * Штуку spend() занимает заранее, а деньги дописывает после ответа. Для
+ * коротких фраз этого хватает, но разбор договора стоит как сотня фраз: сто
+ * одновременных разборов прошли бы проверку остатка разом и вместе выбрали бы
+ * кошелёк далеко за предел. Пока идёт один — второй получает «подождите».
+ */
+const inFlight = new Set();
+function aiLock(userId) {
+  if (inFlight.has(userId)) return null;
+  inFlight.add(userId);
+  return () => inFlight.delete(userId);
+}
+
 function spend(userId, spent = null) {
   const kop = spent ? costKopecks(spent.usage, spent) : 0;
   const tin = spent && spent.usage ? Math.max(0, Number(spent.usage.in) || 0) : 0;
@@ -1145,7 +1160,7 @@ async function understand(text, userId) {
 }
 
 module.exports = {
-  understand, quickParse, sanitize, matchCp, budget, spend,
+  understand, quickParse, sanitize, matchCp, budget, spend, aiLock,
   aiAvailable, aiHint, MODEL_DEFAULT, SHOW_ACTIONS, SYSTEM, OUTOFSCOPE_REPLY,
   answerTax, taxAnswersOn,
 };

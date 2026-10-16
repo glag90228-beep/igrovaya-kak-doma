@@ -325,6 +325,7 @@ async function askFlow(user, text, { heard, speak }) {
   if (intent.action === 'unknown' && !['limit', 'off', 'error'].includes(intent.source) && consult.consultAvailable()) {
     const got = await consult.reply(user.id, text);
     if (got.ok) consulted = got.text;
+    else if (got.from === 'busy') consulted = 'Секунду — ещё отвечаю на прошлый вопрос.';
     else if (got.from === 'error') {
       office.record({ kind: 'ai', where: 'приложение, помощник', error: String(got.error || ''), userId: user.id });
     }

@@ -2976,6 +2976,10 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
       if (opts.isVoice) await replyVoice(tg, chatId, user, got.text);
       return true;
     }
+    if (got.from === 'busy') {
+      await tg.sendMessage(chatId, 'Секунду — ещё отвечаю на прошлый вопрос.', mainMenu());
+      return true;
+    }
     if (got.from === 'error') {
       Promise.resolve(office.record({ kind: 'ai', where: 'помощник', error: String(got.error || ''), userId: user.id }))
         .catch(() => {});

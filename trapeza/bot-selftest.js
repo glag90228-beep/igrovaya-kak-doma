@@ -588,6 +588,27 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     try { zipM.docxText(Buffer.from('не архив')); } catch (e) { broken = e.message; }
     ok(/не ZIP/.test(broken), 'битый файл — понятная ошибка, а не падение', broken);
 
+    // Находки безопасника ECC: подделанный Word не должен вешать бота.
+    const tEvil = Date.now();
+    const evilText = zipM.docxText(zipM.makeZip({
+      'word/document.xml': `<w:body>${'<w:p>'.repeat(150000)}${'<w:p '.repeat(150000)}</w:body>`,
+      'word/numbering.xml': '<w:abstractNum w:abstractNumId="1">'.repeat(30000),
+    }));
+    ok(Date.now() - tEvil < 1500 && evilText === '', 'незакрытые абзацы и списки разбираются за один проход, а не минутами',
+      `${Date.now() - tEvil} мс`);
+    const dupZip = zipM.makeZip({ 'word/document.xml': 'a', 'word/document.xmX': 'b' });
+    dupZip.write('word/document.xml', dupZip.lastIndexOf(Buffer.from('word/document.xmX')));
+    let dupErr = '';
+    try { zipM.readZip(dupZip); } catch (e) { dupErr = e.message; }
+    ok(/повреждён/.test(dupErr), 'один файл дважды в каталоге архива — отказ, а не распаковка бомбы по кругу', dupErr);
+    const aiM = require('./lib/ai-agent');
+    const rel = aiM.aiLock(uidC);
+    ok(rel && aiM.aiLock(uidC) === null, 'второй дорогой запрос того же человека ждёт первого');
+    rel();
+    const rel2 = aiM.aiLock(uidC);
+    ok(Boolean(rel2), 'после ответа запросы снова принимаются');
+    rel2();
+
     // Подстановка: длинное раньше короткого, мусорные ключи и ненайденное — мимо.
     const rep = cai.applyReplacements('Клиент ООО «Ромашка-Плюс» и ООО «Ромашка». Сумма 5 руб. (пять рублей).', [
       { find: 'ООО «Ромашка»', key: 'them' }, { find: 'ООО «Ромашка-Плюс»', key: 'partner', label: 'Партнёр' },
