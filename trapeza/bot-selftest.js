@@ -7094,12 +7094,48 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
 
     // Имя подставлено: шаг «краткое имя» пропущен, спрашивают уже про ИНН.
     const st = bdbN.getState(fxUserId());
-    ok(st.state === 'form:cp' && st.data.values.name === 'Незнакомой Фирме',
+    ok(st.state === 'form:cpq' && st.data.values.name === 'Незнакомой Фирме',
       'имя из фразы подставлено в форму', JSON.stringify(st.data.values));
     ok(st.data.values.__then === 'sch',
       'и бот помнит, ради какого документа всё начиналось', st.data.values.__then);
 
     bdbN.clearState(fxUserId());
+  }
+
+  console.log('\n── короткие формы: клиент из ассистента и банк после документа ──');
+  {
+    const bdbQ = require('./lib/bot-db');
+    const Q = { id: 979003, first_name: 'Короткая' };
+    const qSay = (t) => handleUpdate(tg, { message: { chat: { id: Q.id }, from: Q, text: t } });
+    const qTap = (d) => handleUpdate(tg,
+      { callback_query: { id: 'c', from: Q, data: d, message: { chat: { id: Q.id } } } });
+    const qLast = () => (sent[sent.length - 1] || {}).text || '';
+    await qSay('/start');
+    const uidQ = bdbQ.getOrCreateUser(Q.id).id;
+
+    // «Добавить клиента» без имени во фразе — короткая анкета, а не 13 шагов.
+    await qTap('cp.q');
+    ok(bdbQ.getState(uidQ).state === 'form:cpq' && qLast().includes('из 3'),
+      'cp.q открывает короткую анкету клиента (3 шага)', qLast().slice(0, 30));
+    bdbQ.clearState(uidQ);
+
+    // Банк после документа: у фирмы есть всё, кроме банка; остальное не затираем.
+    bdbQ.saveMyOrg(uidQ, { name: 'ИП Тестов Т. Т.', full_name: 'Индивидуальный предприниматель Тестов Т. Т.',
+      inn: '183114389446', address: 'г Ижевск, ул Тестовая, 1', signer: 'Т. Т. Тестов' });
+    await qTap('org.bank');
+    ok(qLast().includes('Шаг 1 из 2') && qLast().includes('БИК'), 'банк: короткая форма из двух шагов, первым БИК', qLast().slice(0, 30));
+    await qSay('044525225');
+    await qSay('40702810900000012344');
+    const oq = bdbQ.currentOrg(uidQ);
+    ok(oq.bik === '044525225' && oq.acc === '40702810900000012344', 'БИК и счёт сохранены', `${oq.bik} ${oq.acc}`);
+    ok(oq.name === 'ИП Тестов Т. Т.' && oq.inn === '183114389446' && oq.signer === 'Т. Т. Тестов'
+      && oq.address === 'г Ижевск, ул Тестовая, 1' && oq.full_name.includes('Тестов'),
+    'остальные реквизиты фирмы не затёрты', JSON.stringify(oq));
+
+    // Пропуск обоих шагов ничего не стирает.
+    await qTap('org.bank');
+    ok(bdbQ.currentOrg(uidQ).acc === '40702810900000012344', 'повторное открытие не ломает сохранённое');
+    bdbQ.clearState(uidQ);
   }
 
   console.log('\n── авансы, корректировки, книга продаж ──');

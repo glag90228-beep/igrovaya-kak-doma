@@ -387,6 +387,22 @@ const ORG_QUICK = [
   },
 ];
 
+// Дозаполнение банка после первого документа: только БИК и счёт. Полная
+// анкета организации переспрашивает всё с нуля, а человеку нужна одна вещь —
+// чтобы в счёте появился QR. Остальные поля организации форма не трогает.
+const ORG_BANK = [
+  {
+    key: 'bik', auto: 'bank', skipIfFilled: true, opt: true,
+    q: '<b>БИК вашего банка</b> — по нему подставлю название банка и корр. счёт.\n\n'
+      + '<i>Он есть в реквизитах счёта в банковском приложении.</i>',
+  },
+  {
+    key: 'acc', skipIfFilled: true, opt: true,
+    q: '<b>Ваш расчётный счёт</b> — 20 цифр.\n\n'
+      + '<i>С ним в счёте появится QR-код: клиент платит, наведя камеру.</i>',
+  },
+];
+
 const CP_QUICK = [
   {
     key: 'inn', auto: 'party', opt: true,
@@ -405,6 +421,7 @@ const FORMS = {
   cp: { steps: CP_STEPS, title: 'контрагента' },
   orgq: { steps: ORG_QUICK, title: 'организации', saveAs: 'org' },
   cpq: { steps: CP_QUICK, title: 'клиента', saveAs: 'cp' },
+  orgb: { steps: ORG_BANK, title: 'банка', saveAs: 'orgb' },
 };
 
 async function startForm(tg, chatId, user, formName) {
@@ -633,6 +650,17 @@ async function finishForm(tg, chatId, user, rawForm, values) {
       + (hasBank ? '\nВ счёте будет платёжный QR.' : '\n<i>Расчётный счёт/БИК не заполнены — QR в счёте не появится.</i>'),
       then ? undefined : mainMenu());
     if (then) { await startDoc(tg, chatId, user, then); return; }
+  } else if (formName === 'orgb') {
+    // Пишем только непустое и только банковские поля: «пропустить» не должно
+    // стирать то, что уже сохранено, а остальные реквизиты фирмы не наши.
+    const patch = {};
+    for (const k of ['bik', 'bank_name', 'corr_acc', 'acc']) if (values[k]) patch[k] = values[k];
+    if (Object.keys(patch).length) bdb.updateOrg(user.id, (bdb.currentOrg(user.id) || {}).id, patch);
+    const now = bdb.currentOrg(user.id);
+    await tg.sendMessage(chatId, payable(now)
+      ? '✅ Банк сохранён. В следующих счетах будет платёжный QR.'
+      : 'Сохранил, что было. Без БИК, корр. и расчётного счёта QR в счёте не появится — '
+        + 'дополнить можно в разделе «Моя организация».', mainMenu());
   } else if (formName === 'cp') {
     if (!values.full_name) values.full_name = values.name;
     if (!values.period_end) values.period_end = todayISO();
@@ -1227,7 +1255,7 @@ async function afterDoc(tg, chatId, user, cpId) {
       data: mailbox.has(user.id) ? `doc.mail:${last.id}` : 'mb',
     }]);
   }
-  if (!payable(org)) rows.push([{ text: '🏦 Добавить банк и счёт', data: 'org.new' }]);
+  if (!payable(org)) rows.push([{ text: '🏦 Добавить банк и счёт', data: 'org.bank' }]);
   // Повторение заводится здесь, а не отдельным мастером: позиции уже
   // набраны и проверены человеком, повторять нечего — только выбрать день.
   if (last && docService.ITEM_DOCS[last.type]) {
@@ -2518,6 +2546,20 @@ function pendingCpGet(userId) {
   return row.name;
 }
 
+/**
+ * Кнопки для «клиентов ещё нет» из ассистента. Ведут в короткую анкету
+ * (ИНН, имя, кто платит), а не в полную из 13 шагов; имя из фразы кладём
+ * в память, чтобы не спрашивать его второй раз.
+ */
+function addClientKb(user, who, type) {
+  let first;
+  if (who) {
+    pendingCpPut(user.id, who);
+    first = [{ text: `➕ Завести «${who}»`.slice(0, 60), data: `cp.pre:${type || 'none'}` }];
+  } else first = [{ text: '👤 Добавить клиента', data: 'cp.q' }];
+  return keyboard([first, [{ text: '⬅️ Меню', data: 'menu' }]]);
+}
+
 /** Карточка письма: от кого, что во вложении, что с этим делать. */
 async function showInboxMessage(tg, chatId, user, index) {
   const list = inboxGet(user.id);
@@ -2914,7 +2956,7 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
     const cps = bdb.listCps(user.id);
     if (!cps.length) {
       await tg.sendMessage(chatId, 'Сначала добавьте клиента — потом внесём оплату.',
-        keyboard([[{ text: '👤 Добавить клиента', data: 'cp.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+        addClientKb(user, intent.who, 'pay'));
       return true;
     }
     const found = intent.who ? ai.matchCp(cps, intent.who) : {};
@@ -2985,7 +3027,7 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
     const cps = bdb.listCps(user.id);
     if (!cps.length) {
       await tg.sendMessage(chatId, 'Сверяться пока не с кем — сначала добавьте контрагента.',
-        keyboard([[{ text: '👤 Добавить клиента', data: 'cp.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+        addClientKb(user, intent.who, 'akt'));
       return true;
     }
     const found = ai.matchCp(cps, intent.who || '');
@@ -3029,7 +3071,7 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
     const cps = bdb.listCps(user.id);
     if (!cps.length) {
       await tg.sendMessage(chatId, 'Сначала добавьте клиента — потом выпишем документ.',
-        keyboard([[{ text: '👤 Добавить клиента', data: 'cp.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+        addClientKb(user, intent.who, intent.docType));
       return true;
     }
     const found = ai.matchCp(cps, intent.who);
@@ -6006,6 +6048,21 @@ async function handleCallback(tg, cq) {
       return;
     }
     if (data === 'org.new') { await startForm(tg, chatId, user, 'org'); return; }
+    if (data === 'org.bank') {
+      const o = bdb.currentOrg(user.id) || {};
+      // Уже известное не переспрашиваем: полный банк берём как есть, а счёт — если он есть.
+      const values = {};
+      if (o.bik && o.bank_name && o.corr_acc) Object.assign(values, { bik: o.bik, bank_name: o.bank_name, corr_acc: o.corr_acc });
+      if (o.acc) values.acc = o.acc;
+      await advanceForm(tg, chatId, user, 'orgb', values, 0);
+      return;
+    }
+    // Короткая анкета клиента — из ассистента, где полная из 13 шагов пугает.
+    if (data === 'cp.q') {
+      bdb.setState(user.id, 'form:cpq', { i: 0, values: {} });
+      await askStep(tg, chatId, 'cpq', 0);
+      return;
+    }
     if (data === 'org.pick') { await showOrgPick(tg, chatId, user); return; }
     if (data === 'org.add') { await startAddOrg(tg, chatId, user); return; }
     if (data.startsWith('org.use:')) {
@@ -6080,7 +6137,7 @@ async function handleCallback(tg, cq) {
       if (!name) {
         // Память о разговоре истекла — переспрашиваем, а не подставляем пустое.
         await tg.sendMessage(chatId, 'Забыл, о ком речь — заведём клиента с начала.');
-        await startForm(tg, chatId, user, 'cp');
+        await startForm(tg, chatId, user, 'cpq');
         return;
       }
       // __guessedName помечает имя как услышанное, а не введённое: справочник
@@ -6089,7 +6146,7 @@ async function handleCallback(tg, cq) {
       if (ITEM_DOCS[type]) values.__then = type;
       await tg.sendMessage(chatId, `Завожу клиента <b>${esc(name)}</b>. `
         + 'Имя подставил из вашей фразы — если укажете ИНН, поправлю на название из реестра.');
-      await advanceForm(tg, chatId, user, 'cp', values, 0);
+      await advanceForm(tg, chatId, user, 'cpq', values, 0);
       return;
     }
     // Проводник: «выписать счёт» с любого места, недостающее спросим по пути.
