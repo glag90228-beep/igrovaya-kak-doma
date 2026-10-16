@@ -1946,7 +1946,6 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(nLast().includes('Счёт на оплату'), 'сразу перешли к позициям счёта', nLast().slice(0, 30));
 
     await nSay('Ремонт компьютера 1 3500');
-    await nTap('items.done');
     await nTap('doc.make');
     ok(files.length === filesWas + 1, 'новичок получил файл', files.length - filesWas);
     const caption = (files[files.length - 1] || {}).caption || '';
@@ -1958,6 +1957,27 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(nLast().includes('Чем занимаетесь'),
       'после первого документа спросили про дело, а не про основание долга',
       nLast().slice(0, 40));
+  }
+
+  console.log('\n── выпуск одним нажатием: «Сформировать — итог» ──');
+  {
+    // Раньше после позиции было «Готово», потом «Сформировать». Теперь итог и
+    // выпуск — на одной кнопке; сводка с номером/датой/НДС осталась рядом.
+    const lastKb = () => ((sent[sent.length - 1] || {}).kb || []).flat();
+    for (const type of ['sch', 'usl', 'torg12', 'upd']) {
+      const before = files.length;
+      await tap(`d.${type}:${cpId}`);
+      if (type === 'upd') await tap(`upd.s2:${cpId}`);   // у УПД сначала спрашивают статус
+      ok(!lastKb().some((b) => b.callback_data === 'doc.make'), `${type}: пока нет позиций, кнопки выпуска нет`);
+      await say('Ремонт 2 по 1500');
+      const make = lastKb().find((b) => b.callback_data === 'doc.make');
+      ok(make && make.text.includes('Сформировать') && /3\s?000/.test(make.text),
+        `${type}: после позиции сразу кнопка с итогом`, make && make.text);
+      ok(lastKb().some((b) => b.callback_data === 'items.done') && lastKb().some((b) => b.callback_data === 'menu'),
+        `${type}: сводка и отмена остались рядом`);
+      await tap('doc.make');
+      ok(files.length === before + 1, `${type}: файл пришёл с одного нажатия`, files.length - before);
+    }
   }
 
   console.log('\n── проводник: реестр ответил по ИНН ──');

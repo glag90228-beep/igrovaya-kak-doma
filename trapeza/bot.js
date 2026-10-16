@@ -851,8 +851,20 @@ function itemsKb(user, data) {
   const rows = bdb.listTemplates(user.id, 6).map((t) => ([{
     text: `➕ ${t.name} · ${formatRub(t.price)}`.slice(0, 60), data: `tpl:${t.id}`,
   }]));
-  if (data.items.length) rows.push([{ text: '↩️ Убрать последнюю', data: 'items.undo' }]);
-  rows.push([{ text: '✅ Готово', data: 'items.done' }]);
+  if (data.items.length) {
+    /*
+     * Выпуск одним нажатием: раньше было «Готово», потом «Сформировать» —
+     * два шага там, где человеку нужен один файл. Итог в подписи считаем
+     * тем же vatTotals, что и сводка, чтобы кнопка не обещала одну сумму,
+     * а в документе стояла другая. Сводку с номером, датой и НДС не убрали:
+     * она за второй кнопкой для тех, кому надо поправить.
+     */
+    const doc = data.doc || {};
+    const total = vatTotals(data.items, doc.vatRate == null ? null : Number(doc.vatRate),
+      Boolean(doc.priceIncludesVat)).total;
+    rows.push([{ text: `✅ Сформировать — ${formatRub(total)}`.slice(0, 60), data: 'doc.make' }]);
+    rows.push([{ text: '↩️ Убрать последнюю', data: 'items.undo' }, { text: '✏️ Номер, дата, НДС', data: 'items.done' }]);
+  }
   rows.push([{ text: '✖️ Отмена', data: 'menu' }]);
   return keyboard(rows);
 }
@@ -5128,7 +5140,7 @@ async function handleMessage(tg, msg) {
       d.ask = ''; d.pending = null;
       bdb.setState(user.id, state.state, d);
       await tg.sendMessage(chatId,
-        `Добавлено: ${esc(p.name)} — ${p.qty} ${esc(p.unit || 'шт.')} × ${formatRub(p.price)}\nЕщё позицию или «Готово».`,
+        `Добавлено: ${esc(p.name)} — ${p.qty} ${esc(p.unit || 'шт.')} × ${formatRub(p.price)}\nЕщё позицию или «Сформировать».`,
         itemsKb(user, d));
       return;
     }
@@ -5148,7 +5160,7 @@ async function handleMessage(tg, msg) {
     d.items.push(item);
     bdb.setState(user.id, state.state, d);
     await tg.sendMessage(chatId,
-      `Добавлено: ${esc(item.name)} — ${item.qty} ${esc(item.unit)} × ${formatRub(item.price)}\nЕщё позицию или «Готово».`,
+      `Добавлено: ${esc(item.name)} — ${item.qty} ${esc(item.unit)} × ${formatRub(item.price)}\nЕщё позицию или «Сформировать».`,
       itemsKb(user, d));
     return;
   }
