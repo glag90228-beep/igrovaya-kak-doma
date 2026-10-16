@@ -172,7 +172,7 @@ async function issueDocument(userId, {
   if (!org) return fail('org', 'Сначала заполните реквизиты своей организации.');
 
   const cp = bdb.getCp(userId, Number(cpId));
-  if (!cp) return fail('cp', 'Контрагент не найден.');
+  if (!cp) return fail('cp', 'Такого клиента нет в вашем списке.');
 
   const clean = cleanItems(items);
   if (!clean.length) return fail('items', 'Добавьте хотя бы одну позицию.');
@@ -401,7 +401,7 @@ async function issueFlat(userId, {
   const org = bdb.currentOrg(userId);
   if (!org) return fail('org', 'Сначала заполните реквизиты своей организации.');
   const cp = bdb.getCp(userId, Number(cpId));
-  if (!cp) return fail('cp', 'Контрагент не найден.');
+  if (!cp) return fail('cp', 'Такого клиента нет в вашем списке.');
 
   /*
    * Счёт-фактуру не выписывает тот, кто не плательщик НДС.
@@ -507,7 +507,7 @@ async function issuePlain(userId, {
   const org = bdb.currentOrg(userId);
   if (!org) return fail('org', 'Сначала заполните реквизиты своей организации.');
   const cp = bdb.getCp(userId, Number(cpId));
-  if (!cp) return fail('cp', 'Контрагент не найден.');
+  if (!cp) return fail('cp', 'Такого клиента нет в вашем списке.');
 
   let payload;
   if (type === 'pp') {

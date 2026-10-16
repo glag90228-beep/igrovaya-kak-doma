@@ -247,7 +247,7 @@ function cpMenu(userId, cp) {
   const favour = cp.kind === 'supplier' ? 'наш долг ему' : 'в нашу пользу';
   const info = `<b>${esc(cp.name)}</b>${cp.inn ? ` · ИНН ${esc(cp.inn)}` : ''}\n`
     + `Тип: ${cp.kind === 'supplier' ? 'поставщик' : 'заказчик'} · операций: ${b ? b.ops.length : 0}\n`
-    + `Текущее сальдо: <b>${formatRub(Math.abs(closing))}</b> (${favour})`
+    + `Баланс: <b>${formatRub(Math.abs(closing))}</b> (${favour})`
     + (pre ? `\n💰 <b>${bdb.prepayLine(pre)}</b>` : '');
   const rows = [
     [{ text: '➕ Внести операцию', data: `op:${cp.id}` }],
@@ -343,8 +343,8 @@ const CP_STEPS = [
     buttons: [{ text: 'Заказчик (платит нам)', val: 'customer' }, { text: 'Поставщик (платим ему)', val: 'supplier' }],
   },
   { key: 'contract', opt: true, q: 'Договор (напр. «Договор № 5 от 01.02.2026»; или «-»):' },
-  { key: 'opening_balance', num: true, q: 'Начальное сальдо, руб. (0 — если с нуля):' },
-  { key: 'opening_date', date: true, q: 'Дата начального сальдо (ДД.ММ.ГГГГ):' },
+  { key: 'opening_balance', num: true, q: 'Баланс на начало, руб. (0 — если с нуля):' },
+  { key: 'opening_date', date: true, q: 'Дата, на которую указан баланс (ДД.ММ.ГГГГ):' },
   { key: 'bik', auto: 'bank', skipIfFilled: true, opt: true, q: 'БИК банка контрагента — подставлю банк и корр. счёт (или «-»):' },
   { key: 'bank_name', skipIfFilled: true, opt: true, q: 'Банк контрагента (или «-»):' },
   { key: 'corr_acc', skipIfFilled: true, opt: true, q: 'Корр. счёт контрагента (или «-»):' },
@@ -646,7 +646,7 @@ async function finishForm(tg, chatId, user, rawForm, values) {
     bdb.saveMyOrg(user.id, values); // заменяем организацию, а не плодим новые
     const hasBank = values.acc && values.bik && values.corr_acc;
     await tg.sendMessage(chatId,
-      `✅ Организация <b>${esc(values.name)}</b> сохранена.`
+      `✅ Ваша фирма <b>${esc(values.name)}</b> сохранена.`
       + (hasBank ? '\nВ счёте будет платёжный QR.' : '\n<i>Расчётный счёт/БИК не заполнены — QR в счёте не появится.</i>'),
       then ? undefined : mainMenu());
     if (then) { await startDoc(tg, chatId, user, then); return; }
@@ -753,7 +753,7 @@ async function sendGenerated(tg, chatId, { html, xlsxBuffer, base, caption, file
 async function requireOrg(tg, chatId, user) {
   const org = bdb.currentOrg(user.id);
   if (!org) {
-    await tg.sendMessage(chatId, 'Сначала заведите свою организацию.', mainMenu());
+    await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu());
     return null;
   }
   return org;
@@ -795,7 +795,7 @@ async function genAktSverki(tg, chatId, user, cpId, from, to) {
   await sendGenerated(tg, chatId, {
     xlsxBuffer: Buffer.from(buf), base: `Акт_сверки_${safeName(p.cp.name)}`,
     caption: `Акт сверки с <b>${esc(p.cp.name)}</b> за период ${ru(p.from)}—${ru(p.to)}.\n`
-      + `Входящее сальдо ${formatRub(Math.abs(p.opening))}, исходящее ${formatRub(Math.abs(p.closing))}.`,
+      + `На начало периода — ${formatRub(Math.abs(p.opening))}, на конец — ${formatRub(Math.abs(p.closing))}.`,
   });
   const docId = bdb.saveDoc(user.id, {
     orgId: org.id, cpId, type: 'akt', number: String(seq), seq, date: todayISO(),
@@ -848,7 +848,7 @@ async function askAktPeriod(tg, chatId, user, cpId) {
   rows.push([{ text: '⬅️ Назад', data: `cp:${cpId}` }]);
   await tg.sendMessage(chatId,
     `Акт сверки с <b>${esc(cp.name)}</b>. За какой период?\n\n`
-    + '<i>«За всё время» — от начала расчётов, с начальным сальдо из карточки.</i>',
+    + '<i>«За всё время» — от начала расчётов, с начальным балансом из карточки.</i>',
     keyboard(rows));
 }
 
@@ -1351,7 +1351,7 @@ function periodOf(name) {
  */
 async function sendKniga(tg, chatId, user, periodName) {
   const org = bdb.currentOrg(user.id);
-  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
   if (bdb.vatOf(org).rate == null) {
     await tg.sendMessage(chatId,
       'Книга продаж ведётся плательщиками НДС. У вас выбрано «без НДС» — '
@@ -1387,7 +1387,7 @@ async function sendKniga(tg, chatId, user, periodName) {
  */
 async function showTaxMode(tg, chatId, user) {
   const org = bdb.currentOrg(user.id);
-  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
 
   const cur = String(org.tax_mode || '');
   const mark = (v) => (cur === v ? '✅ ' : '');
@@ -1446,7 +1446,7 @@ function keepBankRows(user, all) {
  */
 async function sendKudir(tg, chatId, user) {
   const org = bdb.currentOrg(user.id);
-  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
 
   const d = kudir.bookFor(org);
   if (d.blocked) {
@@ -1511,7 +1511,7 @@ async function sendKudir(tg, chatId, user) {
 
 async function sendRegistry(tg, chatId, user, periodName) {
   const org = bdb.currentOrg(user.id);
-  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
   const { from, to, title } = periodOf(periodName);
   const docs = bdb.docsBetween(user.id, from, to);
 
@@ -2273,7 +2273,7 @@ async function mailDoc(tg, chatId, user, docId, emailOverride = null) {
   const d = bdb.getDoc(user.id, docId);
   if (!d) { await tg.sendMessage(chatId, 'Документ не найден.', mainMenu()); return; }
   const cp = bdb.getCp(user.id, d.cp_id);
-  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
 
   const to = String(emailOverride || cp.email || '').trim();
   if (!to) {
@@ -2348,7 +2348,7 @@ async function mailAktToSelf(user, cp) {
   const to = box.own ? String(box.options.from || box.options.user || '').trim() : '';
   if (!to) return { ok: false, error: 'Не знаю вашего адреса — подключите свой ящик.' };
   const org = bdb.currentOrg(user.id);
-  if (!org) return { ok: false, error: 'Организация не заведена.' };
+  if (!org) return { ok: false, error: 'Ваша фирма не заведена.' };
   const p = bdb.cpForPeriod(user.id, cp.id, '', '');
   if (!p) return { ok: false, error: 'Не удалось собрать акт.' };
 
@@ -2657,7 +2657,7 @@ const BASIS_LABEL = {
  */
 async function showBasis(tg, chatId, user) {
   const org = bdb.currentOrg(user.id);
-  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
   const now = bdb.basisOf(org);
   await tg.sendMessage(chatId,
     `<b>Когда контрагент становится должен</b>\n\nСейчас: <b>${esc(BASIS_LABEL[now])}</b>\n\n`
@@ -2708,7 +2708,7 @@ const oneShot = () => require('node:crypto').randomBytes(4).toString('hex');
  */
 async function doPrepay(tg, chatId, user, cpId, amount) {
   const cp = bdb.getCp(user.id, cpId);
-  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
   const sum = round2(Math.abs(Number(amount) || 0));
   if (!sum || sum >= 1e10) { await tg.sendMessage(chatId, 'Не разобрал сумму. Напишите число, например <code>140000</code>.'); return; }
   const r = bdb.addPrepay(user.id, cpId, sum, todayISO());
@@ -2729,7 +2729,7 @@ const MONTHS_RU = ['январь', 'февраль', 'март', 'апрель',
 /** Выбор месяца для акта: три последних, с суммой отгрузок на кнопке. */
 async function askMonthAct(tg, chatId, user, cpId) {
   const cp = bdb.getCp(user.id, cpId);
-  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
   const now = todayISO();
   let y = Number(now.slice(0, 4)); let m = Number(now.slice(5, 7));
   const rows = [];
@@ -2758,7 +2758,7 @@ async function issueMonthAct(tg, chatId, user, cpId, ym) {
   if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(ym)) return;
   const cp = bdb.getCp(user.id, cpId);
   const org = await requireOrg(tg, chatId, user); if (!org) return;
-  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
   const have = bdb.monthActOf(user.id, cpId, ym);
   if (have) {
     await tg.sendMessage(chatId, `Акт за этот месяц уже выписан: № ${esc(have.number)} от ${ru(have.date)}. Второй не делаю — найдёте его в документах клиента.`,
@@ -2806,7 +2806,7 @@ async function issueMonthAct(tg, chatId, user, cpId, ym) {
 
 async function recordPay(tg, chatId, user, cpId, amount, kind) {
   const cp = bdb.getCp(user.id, cpId);
-  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
   const isIncome = kind === 'Приход';
   const sum = round2(Number(amount) || 0);
 
@@ -3431,7 +3431,7 @@ async function postRecurringOp(tg, rec, month) {
   await tg.sendMessage(user.tg_id,
     `🔁 Внёс по вашему правилу:\n<b>${esc(kind)} ${formatRub(amount)}</b>${counter}\n`
     + `${esc(cp.name)}${note ? `\n<i>${esc(note)}</i>` : ''}\n\n`
-    + `Сальдо теперь: <b>${formatRub(Math.abs(round2(b ? b.closing : 0)))}</b>.`
+    + `Баланс теперь: <b>${formatRub(Math.abs(round2(b ? b.closing : 0)))}</b>.`
     + (step.finished ? '\n\n<i>Это был последний раз — правило выключено.</i>' : ''),
     keyboard(rows));
 
@@ -3599,7 +3599,7 @@ async function warnOverdue(tg, rec, on = period.todayDate()) {
  */
 async function showBizType(tg, chatId, user) {
   const org = bdb.currentOrg(user.id);
-  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
   await tg.sendMessage(chatId,
     '<b>Чем занимаетесь?</b>\n\n'
     + '<i>По ответу подберу, когда клиент становится должен, — этот вопрос '
@@ -3617,7 +3617,7 @@ async function showBizType(tg, chatId, user) {
  */
 async function showVat(tg, chatId, user) {
   const org = bdb.currentOrg(user.id);
-  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
   /*
    * Самозанятому говорим прямо, и до кнопок, а не после.
    *
@@ -3669,7 +3669,7 @@ async function showVat(tg, chatId, user) {
  */
 async function showNpd(tg, chatId, user) {
   const org = bdb.currentOrg(user.id);
-  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите организацию.', mainMenu()); return; }
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
   const on = npd.isNpd(org);
   await tg.sendMessage(chatId,
     `<b>Налог на профессиональный доход</b>\n\nСейчас: <b>${on ? 'применяю' : 'не применяю'}</b>\n\n`
@@ -4144,7 +4144,7 @@ async function photoPickKind(tg, chatId, user, cpId) {
   const state = bdb.getState(user.id);
   if (state.state !== 'photo') return;
   const cp = bdb.getCp(user.id, cpId);
-  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
   bdb.setState(user.id, 'photo', { ...state.data, cpId });
   await tg.sendMessage(chatId,
     `<b>${esc(cp.name)}</b> · ${formatRub(state.data.fields.amount)}\nЧто это за операция?`,
@@ -4175,7 +4175,7 @@ async function photoSaveOp(tg, chatId, user, kind) {
   const cp = bdb.getCp(user.id, cpId);
   await tg.sendMessage(chatId,
     `✅ ${human}: ${formatRub(f.amount)} (${ru(date)}) — занёс со снимка.\n`
-    + `Текущее сальдо: <b>${formatRub(Math.abs(round2(b.closing)))}</b>.`);
+    + `Баланс: <b>${formatRub(Math.abs(round2(b.closing)))}</b>.`);
   const { info, kb } = cpMenu(user.id, cp);
   await tg.sendMessage(chatId, info, kb);
 }
@@ -4229,7 +4229,7 @@ async function showDebts(tg, chatId, user) {
 
   if (!rows.length) {
     await tg.sendMessage(chatId,
-      `Все рассчитались — незакрытых сальдо нет. 👌${basisNote}`, mainMenu());
+      `Все рассчитались — долгов не осталось. 👌${basisNote}`, mainMenu());
     return;
   }
   const theyOwe = rows.filter((r) => r.theyOwe);
@@ -4401,7 +4401,7 @@ async function sendReminderMail(tg, chatId, user, cpId, email, tone = 'biz') {
   const box = mailbox.resolve(user.id);
   if (!box.ok) { await tg.sendMessage(chatId, esc(box.reason), mainMenu()); return; }
   const cp = bdb.getCp(user.id, cpId);
-  if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
   const to = String(email || cp.email || '').trim();
   if (!mailer.validEmail(to)) {
     await tg.sendMessage(chatId, 'Адрес почты выглядит неправильно.', mainMenu());
@@ -4881,7 +4881,7 @@ async function showOrgPick(tg, chatId, user) {
   await tg.sendMessage(chatId,
     '<b>От какой фирмы работаем</b>\n\n'
     + 'Выбор запоминается: документы, долги и отчёты дальше будут её. '
-    + 'У каждой фирмы свой ряд номеров и своё сальдо с клиентами — '
+    + 'У каждой фирмы свой ряд номеров и свои долги и расчёты с клиентами — '
     + 'смешать их нельзя, это разные юрлица.',
     keyboard(rows));
 }
@@ -4920,7 +4920,7 @@ async function startAddOrg(tg, chatId, user) {
 async function showOrg(tg, chatId, user) {
   const org = bdb.currentOrg(user.id);
   if (!org) {
-    await tg.sendMessage(chatId, 'Организация ещё не заведена.', keyboard([[{ text: '➕ Завести организацию', data: 'org.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+    await tg.sendMessage(chatId, 'Ваша фирма ещё не заведена.', keyboard([[{ text: '➕ Завести свою фирму', data: 'org.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
     return;
   }
   const txt = `<b>${esc(org.name)}</b>\n`
@@ -5389,7 +5389,7 @@ async function handleMessage(tg, msg) {
     bdb.addOp(user.id, cpId, op);
     const b = bdb.balanceOf(user.id, cpId);
     await tg.sendMessage(chatId,
-      `✅ ${op.kind}: ${formatRub(op.debit || op.credit)} (${ru(op.date)}).\nТекущее сальдо: <b>${formatRub(Math.abs(round2(b.closing)))}</b>.\n\nЕщё операция или /menu.`);
+      `✅ ${op.kind}: ${formatRub(op.debit || op.credit)} (${ru(op.date)}).\nБаланс: <b>${formatRub(Math.abs(round2(b.closing)))}</b>.\n\nЕщё операция или /menu.`);
     return;
   }
 
@@ -5442,7 +5442,7 @@ async function handleCallback(tg, cq) {
     if (data === 'menu') { await tg.sendMessage(chatId, 'Главное меню:', mainMenu()); return; }
     if (data === 'more') {
       await tg.sendMessage(chatId,
-        'Организация, клиенты, почта и настройки — здесь.', moreMenu());
+        'Ваша фирма, клиенты, почта и настройки — здесь.', moreMenu());
       return;
     }
     if (data === 'bank:take') {
@@ -5806,7 +5806,7 @@ async function handleCallback(tg, cq) {
       if (d && bdb.restoreDebt(user.id, id)) {
         const b = d.cp_id ? bdb.balanceOf(user.id, d.cp_id) : null;
         await tg.sendMessage(chatId, 'Вернул документ в долг.'
-          + (b ? ` Сальдо: <b>${formatRub(Math.abs(b.closing))}</b>.` : ''));
+          + (b ? ` Баланс: <b>${formatRub(Math.abs(b.closing))}</b>.` : ''));
       }
       await showDoc(tg, chatId, user, id);
       return;
@@ -6105,7 +6105,7 @@ async function handleCallback(tg, cq) {
       await tg.sendMessage(chatId,
         `Работаем от <b>${esc(now.name)}</b>.\n\n`
         + '<i>Документы, долги и отчёты дальше — её. У каждой фирмы свои номера '
-        + 'и своё сальдо с клиентами.</i>');
+        + 'и свои долги и расчёты с клиентами.</i>');
       await showOrg(tg, chatId, user);
       return;
     }
@@ -6124,7 +6124,7 @@ async function handleCallback(tg, cq) {
     if (data.startsWith('pp.in:')) {
       const cpId = Number(data.slice(6));
       const cp = bdb.getCp(user.id, cpId);
-      if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+      if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
       bdb.setState(user.id, `ppay:${cpId}`, {});
       await tg.sendMessage(chatId, `Сколько внёс «${esc(cp.name)}» предоплатой? Напишите сумму, например <code>140000</code>.`);
       return;
@@ -6151,7 +6151,7 @@ async function handleCallback(tg, cq) {
       const gone = opIdStr.split(',').map((id) => bdb.deleteOp(user.id, Number(id))).some(Boolean);
       const bal = bdb.balanceOf(user.id, Number(cpIdStr));
       await tg.sendMessage(chatId, gone
-        ? `↩️ Проводка убрана. Сальдо: <b>${formatRub(Math.abs(round2(bal.closing)))}</b>.`
+        ? `↩️ Проводка убрана. Баланс: <b>${formatRub(Math.abs(round2(bal.closing)))}</b>.`
         : 'Эта проводка уже убрана.',
       keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
       return;
@@ -6215,7 +6215,7 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('cp:')) {
       const cp = bdb.getCp(user.id, Number(data.slice(3)));
-      if (!cp) { await tg.sendMessage(chatId, 'Контрагент не найден.', mainMenu()); return; }
+      if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
       const { info, kb } = cpMenu(user.id, cp);
       await tg.sendMessage(chatId, info, kb);
       return;

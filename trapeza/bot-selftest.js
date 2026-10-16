@@ -294,8 +294,8 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await say('20.05 оплата 40000');
   await say('02.07 приход 26496,42');
   await say('10.07 оплата 26496,42');
-  ok(last().includes('Текущее сальдо'), 'бот считает сальдо после каждой операции');
-  const saldo = /Текущее сальдо: <b>([^<]+)<\/b>/.exec(last());
+  ok(last().includes('Баланс'), 'бот считает сальдо после каждой операции');
+  const saldo = /Баланс: <b>([^<]+)<\/b>/.exec(last());
   ok(saldo && saldo[1].replace(/\s/g, '').startsWith('54193'),
     'сальдо посчитано верно (94193 − 40000 = 54 193)', saldo && saldo[1]);
 
@@ -825,7 +825,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await tap(phBtn);
   ok(last().includes('Что это за операция'), 'бот спрашивает приход или оплата');
   await tap('ph.k:credit');
-  ok(last().includes('Текущее сальдо'), 'операция занесена со снимка');
+  ok(last().includes('Баланс'), 'операция занесена со снимка');
   ok(last().includes('занёс со снимка') || sent[sent.length - 2].text.includes('занёс со снимка'),
     'в подтверждении сказано, что это с фотографии');
 
@@ -2433,7 +2433,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const cap = norm((files[files.length - 1] || {}).caption || '');
     ok(cap.includes(`период 15.05.${Y}—20.05.${Y}`),
       'и подписан выбранным периодом, а не всем сроком', cap.slice(0, 140));
-    ok(/исходящее 54 193/.test(cap),
+    ok(/на конец — 54 193/.test(cap),
       'сальдо на конец периода — только по операциям внутри него', cap.slice(0, 200));
   }
 
@@ -6662,7 +6662,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await handleUpdate(tg, { callback_query: { id: 'c2', from: OTHER, data: 'cps', message: { chat: { id: 777002 } } } });
   ok(last().includes('Контрагентов пока нет'), 'чужой пользователь не видит наших контрагентов', last().slice(0, 50));
   await handleUpdate(tg, { callback_query: { id: 'c3', from: OTHER, data: `cp:${cpId}`, message: { chat: { id: 777002 } } } });
-  ok(last().includes('не найден'), 'по прямой ссылке чужого контрагента тоже не отдаёт');
+  ok(last().includes('Такого клиента нет в вашем списке'), 'по прямой ссылке чужого контрагента тоже не отдаёт');
 
   /*
    * Ниже — проверки на дыры, найденные ревизией.
@@ -7171,6 +7171,10 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(oq.name === 'ИП Тестов Т. Т.' && oq.inn === '183114389446' && oq.signer === 'Т. Т. Тестов'
       && oq.address === 'г Ижевск, ул Тестовая, 1' && oq.full_name.includes('Тестов'),
     'остальные реквизиты фирмы не затёрты', JSON.stringify(oq));
+
+    // Человеческие слова: «Такого клиента нет в вашем списке», а не «Контрагент не найден».
+    await qTap('cp:99999999');
+    ok(qLast().includes('Такого клиента нет в вашем списке'), 'нет клиента — по-человечески', qLast().slice(0, 50));
 
     // Пропуск обоих шагов ничего не стирает.
     await qTap('org.bank');

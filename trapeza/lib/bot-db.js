@@ -884,7 +884,7 @@ function getCp(userId, id) {
  */
 function addOp(userId, cpId, op, orgId = null) {
   const cp = getCp(userId, cpId);
-  if (!cp) throw new Error('Контрагент не найден');
+  if (!cp) throw new Error('Такого клиента нет в вашем списке');
   const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
   const sort = db.prepare(
     'SELECT COALESCE(MAX(sort),-1)+1 AS s FROM operations WHERE cp_id = ? AND org_id = ?',
