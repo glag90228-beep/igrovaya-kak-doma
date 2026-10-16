@@ -137,6 +137,30 @@ async function htmlToPng(html, filePath, opts = {}) {
   }
 }
 
+/**
+ * Страница в общем браузере — для работы, которой PDF не нужен.
+ *
+ * Сейчас это кодирование голоса: Telegram принимает голосовое только в
+ * OGG/Opus, а кодировщик Opus в Node есть лишь в виде сторонних пакетов
+ * или ffmpeg. В Chromium он встроен (WebCodecs), а Chromium на сервере уже
+ * стоит ради PDF — второй программы не понадобилось.
+ */
+async function withPage(fn) {
+  busy += 1;
+  try {
+    const b = await getBrowser();
+    const page = await b.newPage();
+    try {
+      return await fn(page);
+    } finally {
+      await page.close().catch(() => {});
+    }
+  } finally {
+    busy -= 1;
+    scheduleClose();
+  }
+}
+
 /** Закрыть браузер сразу — для тестов и корректного завершения службы. */
 async function closePdf() {
   clearTimeout(idleTimer);
@@ -148,7 +172,7 @@ async function closePdf() {
 }
 
 module.exports = {
-  pdfAvailable, htmlToPdf, htmlToPng, closePdf, loadChromium,
+  pdfAvailable, htmlToPdf, htmlToPng, closePdf, loadChromium, withPage,
   /** Сколько раз поднимался браузер — для проверки переиспользования. */
   launches: () => launches,
 };
