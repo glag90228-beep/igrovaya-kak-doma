@@ -2611,15 +2611,40 @@ async function recordPay(tg, chatId, user, cpId, amount, kind) {
   const op = { date: todayISO(), kind: isIncome ? 'Приход' : 'Оплата' };
   if (isIncome) op.credit = sum; else op.debit = sum;
   const opId = bdb.addOp(user.id, cpId, op);
+  /*
+   * Деньги в журнале — это полдела. Раньше документы после этого так и висели
+   * в «Не оплачено»: сальдо ноль, а счета «ждут оплаты». Закрываем те, что
+   * внесённая сумма покрывает целиком (старые первыми); частично покрытые не
+   * трогаем — пометка «оплачен» означала бы, что пришли все деньги. Человек
+   * нажал кнопку сам, так что подтверждение уже есть.
+   */
+  let closedDocs = [];
+  const undoIds = [opId];
+  if (!isIncome) {
+    const m = bdb.matchPaymentsToDocs(user.id, [{ opId, cpId, amount: sum, date: op.date, doc: '' }]);
+    if (m.deals.length) {
+      bdb.closeDocsFromBank(user.id, m.deals);
+      closedDocs = m.deals;
+      undoIds.length = 0;
+      for (const d of m.deals) {
+        const row = bdb.opsOfDoc(user.id, d.leadId).find((o) => o.kind === 'Оплата');
+        if (row) undoIds.push(row.id);
+      }
+      // Свободная строка могла остаться, если часть суммы никого не закрыла.
+      if (bdb.listOps(user.id, cpId).some((o) => o.id === opId)) undoIds.push(opId);
+    }
+  }
   const bal = bdb.balanceOf(user.id, cpId);
   const closing = round2(bal.closing);
   await tg.sendMessage(chatId,
     `✅ Внёс: <b>${op.kind} ${formatRub(sum)}</b> по «${esc(cp.name)}» за ${ru(op.date)}.\n\n`
+    + (closedDocs.length
+      ? `Отметил оплаченными: ${closedDocs.map((d) => esc(d.title)).join(', ')}.\n\n` : '')
     + (closing > 0 ? `Остаток долга: <b>${formatRub(closing)}</b>.`
       : closing < 0 ? `Переплата: <b>${formatRub(Math.abs(closing))}</b>.`
         : 'Расчёты закрыты — долга нет.'),
     keyboard([
-      [{ text: '↩️ Отменить проводку', data: `pay.undo:${cpId}:${opId}` }],
+      [{ text: '↩️ Отменить проводку', data: `pay.undo:${cpId}:${undoIds.join(',')}` }],
       [{ text: `📂 Карточка «${cp.name}»`.slice(0, 60), data: `cp:${cpId}` }],
     ]));
 }
@@ -5809,7 +5834,9 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('pay.undo:')) {
       const [cpIdStr, opIdStr] = data.slice(9).split(':');
-      const gone = bdb.deleteOp(user.id, Number(opIdStr));
+      // Оплата могла закрыть несколько документов — ids через запятую; отмена
+      // каждой строки сама снимает отметку «оплачено» с документа.
+      const gone = opIdStr.split(',').map((id) => bdb.deleteOp(user.id, Number(id))).some(Boolean);
       const bal = bdb.balanceOf(user.id, Number(cpIdStr));
       await tg.sendMessage(chatId, gone
         ? `↩️ Проводка убрана. Сальдо: <b>${formatRub(Math.abs(round2(bal.closing)))}</b>.`

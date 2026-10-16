@@ -3404,9 +3404,17 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       ok(bdb3.balanceOf(uid, owesCp).closing === 0, 'нажатие вносит оплату и закрывает долг',
         bdb3.balanceOf(uid, owesCp).closing);
       ok(Boolean(button('Отменить проводку')), 'и оплату можно тут же отменить');
+      // Долг закрыт — значит, и сам документ больше не «ждёт оплаты».
+      ok(!bdb3.unpaidDocs(uid).some((d) => d.cp_id === owesCp),
+        'после «Оплатил» акт пропадает из списка «Не оплачено»',
+        JSON.stringify(bdb3.unpaidDocs(uid).filter((d) => d.cp_id === owesCp).map((d) => d.number)));
+      const undoBtn = button('Отменить проводку');
       await tap(owesBtn.callback_data);
       ok(/уже внесена/.test(last()) && bdb3.balanceOf(uid, owesCp).closing === 0,
         'второе нажатие той же кнопки деньги не проводит', last());
+      await tap(undoBtn);
+      ok(bdb3.balanceOf(uid, owesCp).closing === 7000 && bdb3.unpaidDocs(uid).some((d) => d.cp_id === owesCp),
+        'отмена возвращает и долг, и «не оплачено»', bdb3.balanceOf(uid, owesCp).closing);
     }
   }
 
