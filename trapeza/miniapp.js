@@ -356,6 +356,15 @@ async function askFlow(user, text, { heard, speak }) {
   return out;
 }
 
+/** Файл договора из dataUrl приложения: {buffer, name, mime} или {error}. */
+function contractFile(body) {
+  const m = /^data:([^;,]*);base64,(.+)$/s.exec(String(body.dataUrl || ''));
+  if (!m) return { error: 'Выберите файл договора: Word, PDF или фото.' };
+  const buffer = Buffer.from(m[2], 'base64');
+  if (!buffer.length) return { error: 'Файл пустой.' };
+  return { buffer, mime: m[1], name: str(body.name, 120) || 'договор' };
+}
+
 function formatAiReply(intent, withCpRes, auto) {
   if (!intent) return 'Не понял. Попробуйте сказать иначе.';
   if (intent.source === 'limit') return 'Разбор фраз на этот месяц исчерпан. Кнопки и команды работают как обычно.';
@@ -1283,6 +1292,64 @@ const api = {
    * общий обработчик /api/doc им не подходит — у него на входе список
    * позиций. В боте они были с самого начала, в приложении их не было.
    */
+  /*
+   * Свой договор. Файл приходит dataUrl, как снимок счёта и подпись: тело
+   * запроса ограничено двумя мегабайтами, это около полутора мегабайт файла.
+   * Word-договор весит десятки килобайт; большой скан — в чат с ботом.
+   */
+  async 'GET /api/mycontract'({ user, url }) {
+    const mc = require('./lib/my-contract');
+    const cpId = Number(url.searchParams.get('cpId')) || 0;
+    const brief = (t) => (t ? { id: t.id, cpId: t.cpId, title: t.title, fields: mc.askFields(t) } : null);
+    return { active: brief(mc.getTemplate(user.id, cpId)), templates: mc.listTemplates(user.id).map(brief) };
+  },
+
+  async 'POST /api/mycontract/analyze'({ user, body }) {
+    const file = contractFile(body);
+    if (file.error) return { error: file.error };
+    const org = bdb.currentOrg(user.id);
+    const got = await require('./lib/contract-ai').detectTemplate(user.id, file,
+      { owner: org ? `${org.full_name || org.name}${org.inn ? `, ИНН ${org.inn}` : ''}` : '' });
+    if (!got.ok) {
+      if (got.detail) office.record({ kind: 'ai', where: 'приложение, свой договор', error: got.detail, userId: user.id });
+      return { error: got.error };
+    }
+    return { template: got.template, ask: require('./lib/my-contract').askFields(got.template) };
+  },
+
+  async 'POST /api/mycontract/save'({ user, body }) {
+    const t = body.template || {};
+    if (typeof t.body !== 'string' || !t.body.trim()) return { error: 'Нет текста договора — прочитайте файл заново.' };
+    const cpId = Number(body.cpId) || 0;
+    if (cpId && !bdb.getCp(user.id, cpId)) return { error: 'Контрагент не найден.' };
+    const fields = (Array.isArray(t.fields) ? t.fields : []).slice(0, 25).map((f) => ({
+      key: str(f && f.key, 31), label: str(f && f.label, 80), type: str(f && f.type, 10) || 'text', example: str(f && f.example, 80),
+    })).filter((f) => /^[a-z][a-z0-9_]{0,30}$/.test(f.key));
+    const saved = require('./lib/my-contract').saveTemplate(user.id, cpId, {
+      title: str(t.title, 120), usRole: str(t.usRole, 40), themRole: str(t.themRole, 40),
+      body: String(t.body).slice(0, 200000), fields, origName: str(t.origName, 120),
+    });
+    return { ok: true, id: saved.id, title: saved.title };
+  },
+
+  async 'POST /api/mycontract/delete'({ user, body }) {
+    return { ok: require('./lib/my-contract').removeTemplate(user.id, Number(body.cpId) || 0) };
+  },
+
+  /** Разбор чужого договора: стороны, деньги, сроки, риски. */
+  async 'POST /api/contract/review'({ user, body }) {
+    const file = contractFile(body);
+    if (file.error) return { error: file.error };
+    const got = await require('./lib/contract-ai').reviewContract(user.id, file);
+    if (!got.ok) {
+      if (got.detail) office.record({ kind: 'ai', where: 'приложение, разбор договора', error: got.detail, userId: user.id });
+      return { error: got.error };
+    }
+    const mc = require('./lib/my-contract');
+    mc.saveReview(user.id, { title: got.review.title, text: got.text, review: got.review });
+    return { review: got.review };
+  },
+
   async 'POST /api/doc/other'({ user, body }) {
     const type = str(body.type, 10);
     if (!['pp', 'dog'].includes(type)) return { error: 'Такой документ выписать нельзя.' };
@@ -1296,7 +1363,10 @@ const api = {
       number: str(body.number, 40),
       fields: type === 'pp'
         ? { amount: body.amount, purpose: str(body.purpose, 400) }
-        : { subject: str(body.subject, 500), price: body.amount, term: str(body.term, 60) },
+        // Свой шаблон: значения полей проверит issuePlain по списку полей шаблона.
+        : body.tplId
+          ? { tplId: Number(body.tplId), values: body.values && typeof body.values === 'object' ? body.values : {} }
+          : { subject: str(body.subject, 500), price: body.amount, term: str(body.term, 60) },
     });
     if (!res.ok) return { error: res.message, reason: res.reason, quota: res.quota };
 

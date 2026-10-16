@@ -559,6 +559,45 @@ async function main() {
       'занятый номер платёжки не пропускается', `${r.status} ${JSON.stringify(r.json).slice(0, 100)}`);
 
     /*
+     * Свой договор из приложения: прочитать файл, сохранить шаблон, выписать
+     * по нему. Чужой договор — разбор. Модель — заглушкой (MYCON_PROVIDER).
+     */
+    {
+      const { makeZip } = require('./lib/zip');
+      process.env.MYCON_PROVIDER = 'mock';
+      process.env.MYCON_MOCK = JSON.stringify({ title: 'Банкетный договор', replacements: [
+        { find: '12.05.2026', key: 'event_date', label: 'Дата банкета', type: 'date' },
+        { find: '90 000', key: 'price', label: 'Сумма', type: 'money' }] });
+      const docxM = makeZip({ 'word/document.xml': '<w:document><w:body><w:p><w:r><w:t>ДОГОВОР</w:t></w:r></w:p>'
+        + '<w:p><w:r><w:t>Банкет 12.05.2026 за 90 000 рублей.</w:t></w:r></w:p></w:body></w:document>' });
+      const dataUrl = `data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,${docxM.toString('base64')}`;
+      r = await call('POST', '/api/mycontract/analyze', { user: sfUser, body: { dataUrl, name: 'наш.docx' } });
+      ok(r.status === 200 && r.json.template && r.json.ask.map((f) => f.key).join(',') === 'event_date,price',
+        'приложение прочитало свой договор и нашло поля', JSON.stringify(r.json).slice(0, 120));
+      const tplM = r.json.template;
+      r = await call('POST', '/api/mycontract/save', { user: sfUser, body: { template: tplM, cpId: 0 } });
+      ok(r.status === 200 && r.json.ok, 'шаблон сохранён');
+      r = await call('GET', `/api/mycontract?cpId=${cpS}`, { user: sfUser });
+      ok(r.status === 200 && r.json.active && r.json.active.title === 'Банкетный договор' && !r.json.active.body,
+        'для клиента действует общий шаблон, текст наружу не отдаём лишний раз', JSON.stringify(r.json.active).slice(0, 100));
+      r = await call('POST', '/api/doc/other', { user: sfUser, body: {
+        type: 'dog', cpId: cpS, tplId: r.json.active.id, values: { event_date: '01.07.2026', price: '120 000', hacker: 'x' } } });
+      const bdbM = require('./lib/bot-db');
+      const dogM = r.status === 200 ? bdbM.getDoc(bdbM.getOrCreateUser(SF.id).id, r.json.doc.id) : null;
+      ok(dogM && dogM.payload.values.event_date === '01.07.2026' && dogM.payload.values.price === 120000
+        && dogM.payload.values.hacker === undefined && r.json.total === 120000,
+      'договор по шаблону выписан из приложения, лишние поля отброшены', JSON.stringify(dogM && dogM.payload.values));
+      r = await call('POST', '/api/mycontract/analyze', { user: sfUser, body: { dataUrl: 'не файл' } });
+      ok(r.status === 400, 'без файла — понятный отказ');
+      process.env.MYCON_REVIEW_MOCK = JSON.stringify({ title: 'Аренда', summary: 'Аренда зала.', risks: [{ level: 'high', text: 'Автопролонгация' }] });
+      r = await call('POST', '/api/contract/review', { user: sfUser, body: { dataUrl: `data:application/pdf;base64,${Buffer.from('%PDF-1.4').toString('base64')}`, name: 'аренда.pdf' } });
+      ok(r.status === 200 && r.json.review.risks[0].text === 'Автопролонгация', 'разбор чужого договора из приложения');
+      r = await call('POST', '/api/mycontract/delete', { user: sfUser, body: { cpId: 0 } });
+      ok(r.status === 200 && r.json.ok, 'шаблон убирается');
+      delete process.env.MYCON_PROVIDER; delete process.env.MYCON_MOCK; delete process.env.MYCON_REVIEW_MOCK;
+    }
+
+    /*
      * Имя клиента в подписи к акту сверки шло в HTML как есть. «&» или «<»
      * в названии — и Telegram отклонял сообщение целиком: акт не приходил.
      */

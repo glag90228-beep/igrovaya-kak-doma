@@ -25,6 +25,15 @@ const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
 const speech = require('./lib/speech');
 const tts = require('./lib/tts');
 const consult = require('./lib/consult');
+let contractFlowInst = null;
+/*
+ * Свой договор и разбор договора — отдельным модулем (lib/bot-contract.js).
+ * Создаём при первом обращении: помощники, которые он получает, объявлены
+ * в этом файле ниже, а к моменту первого сообщения они уже есть.
+ */
+const contractFlow = () => contractFlowInst || (contractFlowInst = require('./lib/bot-contract')({
+  keyboard, esc, mainMenu, ru, sendGenerated, cpMenu, requireQuota, requireOrg, parseAmount, replyVoice,
+}));
 const office = require('./lib/office');
 const { applySetup } = require('./lib/bot-setup');
 const { acquire: acquireLock } = require('./lib/lock');
@@ -114,6 +123,11 @@ const FLOW_BUTTONS = {
   // нажатая кнопка означает «передумал» — состояние сбрасывается.
   'av:': [],
   'ksf:': ['ksf.b'],
+  // Свой договор: ждём файл, потом «Сохранить»; файл без контекста — «Разобрать».
+  'mycon:': ['mc.cancel'],
+  'mycon.ok:': ['mc.save:', 'mc.cancel'],
+  ctfile: ['ct.rev', 'ct.tpl', 'mc.cancel'],
+  'dogx:': [],
 };
 
 // ---------- меню ----------
@@ -215,7 +229,7 @@ function cpMenu(userId, cp) {
     [{ text: '💰 Счёт на оплату', data: `d.sch:${cp.id}` }, { text: '🏦 Платёжка', data: `d.pp:${cp.id}` }],
     [{ text: '🤝 Счёт-договор', data: `d.schdog:${cp.id}` }],
     [{ text: '📦 УПД', data: `d.upd:${cp.id}` }, { text: '🚚 ТОРГ-12', data: `d.torg12:${cp.id}` }],
-    [{ text: '📝 Договор', data: `d.dog:${cp.id}` }],
+    [{ text: '📝 Договор', data: `d.dog:${cp.id}` }, { text: '📎 Свой договор', data: `mc.menu:${cp.id}` }],
   ];
   /*
    * Счета-фактуры показываем только плательщику НДС. Неплательщику они не
@@ -3743,6 +3757,8 @@ async function handlePhoto(tg, chatId, user, msg) {
   if (st && /^fx:(sign|stamp)$/.test(st.state)) {
     return acceptFacsimile(tg, chatId, user, msg, st.state.split(':')[1]);
   }
+  // Ждали свой договор или фото подписано «договор» — это не счёт.
+  if (await contractFlow().onPhoto(tg, chatId, user, msg)) return undefined;
 
   if (!visionAvailable()) {
     await tg.sendMessage(chatId,
@@ -4090,7 +4106,11 @@ const DOG_STEPS = [
   { key: 'term', q: 'До какой даты действует? Напр. «31.12.2026» или «-» = до конца года:', opt: true },
 ];
 
-async function startDogovor(tg, chatId, user, cpId) {
+async function startDogovor(tg, chatId, user, cpId, { typical = false } = {}) {
+  // Есть свой договор (для этого клиента или для всех) — выписываем по нему.
+  const tpl = typical ? null : require('./lib/my-contract').getTemplate(user.id, cpId);
+  const cpT = tpl ? bdb.getCp(user.id, cpId) : null;
+  if (tpl && cpT) { await contractFlow().startTpl(tg, chatId, user, cpT, tpl); return; }
   if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
   const cp = bdb.getCp(user.id, cpId); if (!cp) return;
@@ -4103,7 +4123,9 @@ async function startDogovor(tg, chatId, user, cpId) {
   bdb.setState(user.id, `dog:${cpId}`, { i: 0, values: {} });
   await tg.sendMessage(chatId,
     `Договор с <b>${esc(cp.name)}</b>. Реквизиты обеих сторон подставлю сам — `
-    + 'нужно три ответа.');
+    + 'нужно три ответа.'
+    + (typical ? '' : '\n\n<i>Работаете по своему договору? Пришлите его кнопкой ниже — дальше буду заполнять его.</i>'),
+    typical ? undefined : keyboard([[{ text: '📎 Загрузить свой договор', data: `mc.menu:${cpId}` }]]));
   await tg.sendMessage(chatId, esc(DOG_STEPS[0].q));
 }
 
@@ -4619,6 +4641,8 @@ async function route(tg, update) {
     const from = msg.from || {};
     const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
     bdb.markActive(user.id);
+    // PDF и Word — скорее всего договор: разобрать или сделать своим шаблоном.
+    if (await contractFlow().onFile(tg, msg.chat.id, user, msg)) return undefined;
     return handleOtherDocument(tg, msg.chat.id, user, msg);
   }
   if (msg.voice || msg.audio || msg.video_note) {
@@ -4842,6 +4866,7 @@ async function handleMessage(tg, msg) {
   if (state.state.startsWith('pp:')) { await handlePpText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('av:')) { await handleAvansText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('ksf:')) { await handleKsfText(tg, chatId, user, state, text); return; }
+  if (await contractFlow().onText(tg, chatId, user, state, text)) return;
   if (state.state.startsWith('dog:')) { await handleDogText(tg, chatId, user, state, text); return; }
   if (state.state === 'support') { await handleSupportText(tg, chatId, user, text); return; }
   if (state.state.startsWith('rm:')) {
@@ -5815,6 +5840,8 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('d.torg12:')) { await startItems(tg, chatId, user, 'torg12', Number(data.slice(9))); return; }
     if (data.startsWith('d.dog:')) { await startDogovor(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('d.dogstd:')) { await startDogovor(tg, chatId, user, Number(data.slice(9)), { typical: true }); return; }
+    if ((data.startsWith('mc.') || data.startsWith('ct.')) && await contractFlow().onCallback(tg, chatId, user, data)) return;
     if (data.startsWith('d.pp:')) { await startPp(tg, chatId, user, Number(data.slice(5))); return; }
     if (data.startsWith('d.av:')) { await startAvans(tg, chatId, user, Number(data.slice(5))); return; }
     if (data.startsWith('d.ksf:')) { await startKsf(tg, chatId, user, Number(data.slice(6))); return; }

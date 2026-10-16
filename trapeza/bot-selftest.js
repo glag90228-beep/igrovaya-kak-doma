@@ -562,6 +562,161 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'в подписи файла — номер, под которым договор записан', (files[files.length - 1] || {}).caption);
   }
 
+  console.log('\n── свой договор и разбор договора ──');
+  {
+    const zipM = require('./lib/zip');
+    const cai = require('./lib/contract-ai');
+    const mcM = require('./lib/my-contract');
+    const bdbC = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uidC = fxUserId();
+
+    // Word без зависимостей: текст, таблица и автонумерация пунктов.
+    const wp = (t, num) => `<w:p>${num ? `<w:pPr><w:numPr><w:ilvl w:val="${num[1]}"/><w:numId w:val="7"/></w:numPr></w:pPr>` : ''}<w:r><w:t xml:space="preserve">${t}</w:t></w:r></w:p>`;
+    const docXml = `<w:document><w:body>${wp('ДОГОВОР НА БАНКЕТНОЕ ОБСЛУЖИВАНИЕ')}<w:p/>`
+      + `${wp('Исполнитель оказывает услуги ООО «Ромашка» (Заказчик).')}`
+      + `${wp('Предмет договора', [7, 0])}${wp('Банкет 12 мая 2026 г. в помещении: кафе «Берёзка», ул. Ленина, 1.', [7, 1])}`
+      + `${wp('Цена', [7, 0])}${wp('Стоимость услуг 150 000 (сто пятьдесят тысяч рублей).', [7, 1])}`
+      + `<w:tbl><w:tr><w:tc>${wp('Гостей')}</w:tc><w:tc>${wp('40')}</w:tc></w:tr></w:tbl></w:body></w:document>`;
+    const numXml = '<w:numbering><w:abstractNum w:abstractNumId="3"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>'
+      + '<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2."/></w:lvl></w:abstractNum><w:num w:numId="7"><w:abstractNumId w:val="3"/></w:num></w:numbering>';
+    const docx = zipM.makeZip({ '[Content_Types].xml': '<Types/>', 'word/document.xml': docXml, 'word/numbering.xml': numXml });
+    const plain = zipM.docxText(docx);
+    ok(/^ДОГОВОР НА БАНКЕТНОЕ/.test(plain) && /1\.1\. Банкет 12 мая/.test(plain) && /2\.1\. Стоимость/.test(plain)
+      && /Гостей\t40/.test(plain), 'DOCX прочитан: пункты пронумерованы как в Word, таблица — через табуляцию', plain.slice(0, 160));
+    let broken = '';
+    try { zipM.docxText(Buffer.from('не архив')); } catch (e) { broken = e.message; }
+    ok(/не ZIP/.test(broken), 'битый файл — понятная ошибка, а не падение', broken);
+
+    // Подстановка: длинное раньше короткого, мусорные ключи и ненайденное — мимо.
+    const rep = cai.applyReplacements('Клиент ООО «Ромашка-Плюс» и ООО «Ромашка». Сумма 5 руб. (пять рублей).', [
+      { find: 'ООО «Ромашка»', key: 'them' }, { find: 'ООО «Ромашка-Плюс»', key: 'partner', label: 'Партнёр' },
+      { find: 'пять рублей', key: 'price_words' }, { find: 'нет такого', key: 'ghost' }, { find: 'Сумма', key: 'BAD KEY' },
+    ]);
+    ok(rep.body === 'Клиент {{partner}} и {{them}}. Сумма 5 руб. ({{price_words}}).'
+      && rep.fields.map((f) => f.key).join(',') === 'partner,price',
+    'метки по точному тексту; сумма прописью — спросим цифры', `${rep.body} | ${rep.fields.map((f) => f.key)}`);
+
+    // Весь путь в боте: «Свой договор» → файл → образец → сохранить → выписка по полям.
+    const keepDlC = tg.downloadFile;
+    process.env.MYCON_PROVIDER = 'mock';
+    process.env.MYCON_MOCK = JSON.stringify({
+      title: 'Договор на банкет', us_role: 'Исполнитель', them_role: 'Заказчик',
+      replacements: [
+        { find: 'ООО «Ромашка»', key: 'them' },
+        { find: '12 мая 2026 г.', key: 'event_date', label: 'Дата мероприятия', type: 'date' },
+        { find: 'кафе «Берёзка», ул. Ленина, 1', key: 'venue', label: 'Место проведения' },
+        { find: '150 000', key: 'price', label: 'Сумма договора', type: 'money' },
+        { find: 'сто пятьдесят тысяч рублей', key: 'price_words' },
+        { find: 'такого текста нет', key: 'ghost', label: 'Призрак' },
+      ],
+    });
+    await tap(`mc.menu:${cpId}`);
+    ok(Boolean(button('для всех клиентов')), 'в карточке клиента — «Свой договор» с загрузкой для всех');
+    await tap('mc.up:0');
+    tg.downloadFile = async () => docx;
+    const filesB = files.length;
+    sent.length = 0;
+    await handleUpdate(tg, { message: { chat: CHAT, from: USER,
+      document: { file_id: 'my-dog', file_name: 'Мой договор.docx', file_size: docx.length } } });
+    const seenC = norm(sent.map((m) => m.text || '').join(' | '));
+    ok(/Дата мероприятия/.test(seenC) && /Место проведения/.test(seenC) && !/Призрак/.test(seenC),
+      'бот показал, что будет спрашивать, — ненайденное отброшено', seenC.slice(0, 200));
+    const sample = files[files.length - 1] || {};
+    ok(files.length === filesB + 1 && /Образец/.test(sample.filename || '')
+      && (sample.buttons || []).flat().some((b) => b.data === 'mc.save:0'),
+    'прислал образец с кнопкой «Сохранить»', sample.filename);
+    await tap('mc.save:0');
+    ok(/Сохранил/.test(last()) && mcM.getTemplate(uidC, cpId) && mcM.getTemplate(uidC, cpId).title === 'Договор на банкет',
+      'шаблон сохранён для всех клиентов', last());
+
+    const dogsBeforeC = bdbC.listDocs(uidC, 500).filter((d) => d.type === 'dog');
+    await tap(`d.dog:${cpId}`);
+    ok(/по вашему шаблону/.test(norm(sent.slice(-2).map((m) => m.text).join(' '))), 'договор выписывается по своему шаблону');
+    ok(/Дата мероприятия/.test(last()), 'первый вопрос — первое поле шаблона', last());
+    await say('20 июня 2026 г.');
+    ok(/Место проведения/.test(last()), 'дальше — место', last());
+    await say('ресторан «Волна»');
+    await say('200000');
+    const issued = files[files.length - 1] || {};
+    ok(/^Договор/.test(issued.filename || '') && /по вашему шаблону/.test(issued.caption || ''),
+      'договор по шаблону выписан', issued.filename);
+    const dogsAfterC = bdbC.listDocs(uidC, 500).filter((d) => d.type === 'dog');
+    const newDog = bdbC.getDoc(uidC, dogsAfterC.find((d) => !dogsBeforeC.some((x) => x.id === d.id)).id);
+    ok(newDog.payload.body.includes('{{venue}}') && newDog.payload.values.venue === 'ресторан «Волна»'
+      && newDog.payload.values.price === 200000, 'в журнале — текст шаблона и ответы', JSON.stringify(newDog.payload.values));
+    ok(new Set(dogsAfterC.map((d) => d.number)).size === dogsAfterC.length, 'нумерация общая с типовым, без повторов');
+    const cpC = bdbC.getCp(uidC, cpId);
+    const html = mcM.buildHtml({ org: bdbC.currentOrg(uidC), cp: cpC, doc: { ...newDog.payload, number: newDog.number, date: newDog.date } });
+    const escName = (cpC.full_name || cpC.name).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    const checksC = [html.includes('ресторан «Волна»'), html.includes(escName), /двести тысяч/i.test(html),
+      html.includes('20 июня 2026 г.'), !html.includes('{{')];
+    ok(checksC.every(Boolean), 'в договоре — ответы, клиент и сумма прописью, ни одной пустой метки',
+      `${JSON.stringify(checksC)} ${cpC.name}`);
+    const reb = await docSvc.rebuildDocument(uidC, newDog.id);
+    ok(reb.ok && /^Договор/.test(reb.file.filename), 'копия пересобирается своим договором, а не типовым');
+
+    // Заменили шаблон — старый договор остаётся прежним.
+    mcM.saveTemplate(uidC, 0, { title: 'Совсем другой', body: 'ДРУГОЙ ТЕКСТ {{them}}', fields: [] });
+    ok(bdbC.getDoc(uidC, newDog.id).payload.body.includes('{{venue}}'), 'замена шаблона не трогает выписанные договоры');
+
+    // Приоритет: свой у клиента → общий → типовой; чужой человек шаблонов не видит.
+    mcM.saveTemplate(uidC, cpId, { title: 'Особый для клиента', body: 'ОСОБЫЙ {{them}}', fields: [] });
+    const otherCp = bdbC.createCp(uidC, { name: 'ООО «Другой клиент»', kind: 'customer', opening_date: '2026-01-01' });
+    ok(mcM.getTemplate(uidC, cpId).title === 'Особый для клиента' && mcM.getTemplate(uidC, otherCp).title === 'Совсем другой',
+      'шаблон клиента важнее общего');
+    const strangerC = bdbC.getOrCreateUser(990777, 'Чужой', 'stranger').id;
+    ok(mcM.getTemplate(strangerC, 0) === null && mcM.getTemplateById(strangerC, newDog.payload.tplId) === null,
+      'чужой человек шаблонов не видит');
+    const forged = await docSvc.issuePlain(strangerC, { type: 'dog', cpId, fields: { tplId: newDog.payload.tplId, values: {} } });
+    ok(!forged.ok, 'и выписать по чужому шаблону не может', forged.reason);
+    await tap(`d.dogstd:${cpId}`);
+    ok(/Предмет договора/.test(last()), '«Типовой вместо своего» ведёт в типовой договор', last());
+    await tap('mc.cancel');
+    await tap(`mc.del:${cpId}`);
+    await tap('mc.del:0');
+    ok(mcM.getTemplate(uidC, cpId) === null, 'шаблоны убираются кнопкой');
+
+    // Чужой договор: PDF без контекста → «Разобрать» → риски, кнопки, память для помощника.
+    process.env.MYCON_REVIEW_MOCK = JSON.stringify({
+      title: 'Договор поставки', ref: 'Договор № 17 от 01.10.2026',
+      summary: 'Поставка продуктов с отсрочкой 30 дней; штраф только для вас.',
+      parties: [{ role: 'Покупатель', name: 'ООО «Новый партнёр»', inn: '7701234567' }, { role: 'Поставщик', name: bdbC.currentOrg(uidC).name, inn: bdbC.currentOrg(uidC).inn }],
+      subject: 'поставка', amount: '500 000 руб.', payment: 'отсрочка 30 дней', dates: 'до 31.12.2026',
+      penalties: '0,5% в день только с поставщика', termination: 'покупатель — в любой момент',
+      risks: [{ level: 'high', text: 'Штраф односторонний', fix: 'Сделать неустойку взаимной' }, { level: 'weird', text: 'Нет срока приёмки' }],
+      questions: ['Кто платит за доставку?'],
+    });
+    tg.downloadFile = async () => Buffer.from('%PDF-1.7 договор');
+    await handleUpdate(tg, { message: { chat: CHAT, from: USER,
+      document: { file_id: 'their-dog', file_name: 'Договор поставки.pdf', mime_type: 'application/pdf', file_size: 20 } } });
+    ok(Boolean(button('Разобрать')) && Boolean(button('моим шаблоном')), 'на PDF-договор — выбор: разобрать или сделать шаблоном');
+    await tap('ct.rev');
+    const rv = norm(last());
+    ok(/Разбор: Договор поставки/.test(rv) && /🔴 Штраф односторонний/.test(rv) && /🟡 Нет срока приёмки/.test(rv)
+      && /юристу/.test(rv), 'разбор: риски с уровнем, неизвестный уровень — средний, оговорка про юриста', rv.slice(0, 160));
+    ok(Boolean(button('Завести')), 'вторая сторона новая — кнопка «Завести»');
+    const lastC = mcM.getLastContract(uidC);
+    ok(lastC && /Штраф односторонний/.test(lastC.text) && /Последний присланный договор/.test(require('./lib/consult').userContext(uidC)),
+      'помощник видит разобранный договор и ответит на вопросы по нему');
+    await tap('ct.addcp');
+    const added = bdbC.listCps(uidC).find((c) => c.inn === '7701234567');
+    ok(added && added.contract === 'Договор № 17 от 01.10.2026', 'контрагент заведён с ИНН и договором в карточке',
+      added ? added.contract : 'нет');
+
+    // Старый Word и исчерпанный кошелёк — честные ответы без обращения к модели.
+    const oldWord = await cai.reviewContract(uidC, { buffer: Buffer.from('xx'), name: 'старый.doc', mime: 'application/msword' });
+    ok(!oldWord.ok && /DOCX или PDF/.test(oldWord.error), 'старый .doc — просьба пересохранить', oldWord.error);
+    process.env.AI_FREE_KOPECKS = '0'; process.env.AI_USER_KOPECKS = '0';
+    const noMoney = await cai.detectTemplate(uidC, { buffer: docx, name: 'a.docx', mime: '' });
+    ok(!noMoney.ok && noMoney.reason === 'limit', 'кончился предел — модель не зовём', noMoney.reason);
+    delete process.env.AI_FREE_KOPECKS; delete process.env.AI_USER_KOPECKS;
+
+    tg.downloadFile = keepDlC;
+    delete process.env.MYCON_PROVIDER; delete process.env.MYCON_MOCK; delete process.env.MYCON_REVIEW_MOCK;
+    bdbC.clearState(uidC);
+  }
+
   console.log('\n── разбор текста счёта ──');
   const { parseInvoiceText } = require('./lib/vision');
   const SCAN = `ООО «Ромашка»

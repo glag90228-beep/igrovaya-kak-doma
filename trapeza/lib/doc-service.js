@@ -46,7 +46,15 @@ const ITEM_DOCS = {
 /** Остальные: собираются из своих полей, а не из позиций. */
 const OTHER_DOCS = {
   pp: { title: 'Платёжное поручение', build: buildPlatyozhkaHtml, file: 'Платежка' },
-  dog: { title: 'Договор', build: buildDogovorHtml, file: 'Договор' },
+  // Свой договор человека — тот же тип и тот же ряд номеров, что у типового:
+  // договор № 7 не должен оказаться и «своим», и «типовым» одновременно. В
+  // payload своего лежит его текст (body) — по нему и выбираем вёрстку, в
+  // том числе при пересборке копии через месяц.
+  dog: {
+    title: 'Договор',
+    build: (a) => (a.doc && a.doc.body ? require('./my-contract').buildHtml(a) : buildDogovorHtml(a)),
+    file: 'Договор',
+  },
   // Счёт-фактура на предоплату: позиций нет, есть полученная сумма.
   avans: { title: 'Счёт-фактура на аванс', build: buildAvansHtml, file: 'СФ_аванс' },
   // Корректировочный: строки парные «было/стало», обычными позициями не лягут.
@@ -492,13 +500,37 @@ async function issuePlain(userId, {
   const cp = bdb.getCp(userId, Number(cpId));
   if (!cp) return fail('cp', 'Контрагент не найден.');
 
-  const payload = type === 'pp'
-    ? { amount: round2(Math.abs(Number(fields.amount) || 0)), purpose: String(fields.purpose || '').trim().slice(0, 400) }
-    : {
+  let payload;
+  if (type === 'pp') {
+    payload = { amount: round2(Math.abs(Number(fields.amount) || 0)), purpose: String(fields.purpose || '').trim().slice(0, 400) };
+  } else if (fields.tplId) {
+    /*
+     * Договор по своему шаблону. Текст шаблона копируем в документ: шаблон
+     * могут заменить завтра, а этот договор уже подписан именно таким.
+     * Значения — только по полям шаблона и с потолком длины.
+     */
+    const tpl = require('./my-contract').getTemplateById(userId, fields.tplId);
+    if (!tpl) return fail('tpl', 'Шаблон договора не найден — загрузите его заново.');
+    const values = {};
+    for (const f of tpl.fields || []) {
+      const v = (fields.values || {})[f.key];
+      if (v == null || String(v).trim() === '') continue;
+      values[f.key] = f.type === 'money'
+        ? round2(Math.abs(Number(String(v).replace(/\s/g, '').replace(',', '.')) || 0))
+        : String(v).trim().slice(0, 500);
+    }
+    payload = {
+      tplId: tpl.id, title: tpl.title, usRole: tpl.usRole, themRole: tpl.themRole, body: tpl.body, values,
+      subject: String(values.subject || tpl.title).slice(0, 500),
+      price: round2(Number(values.price) || 0),
+    };
+  } else {
+    payload = {
       subject: String(fields.subject || '').trim().slice(0, 500),
       price: round2(Math.abs(Number(fields.price) || 0)),
       term: String(fields.term || '').trim().slice(0, 60),
     };
+  }
   if (type === 'pp' && !payload.amount) return fail('amount', 'Укажите сумму платежа.');
   if (type === 'pp' && !payload.purpose) return fail('purpose', 'Укажите назначение платежа.');
   if (type === 'dog' && !payload.subject) return fail('subject', 'Укажите предмет договора.');

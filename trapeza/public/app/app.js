@@ -3463,7 +3463,55 @@ screens.other = async function other({ type, cpId }) {
     h('div', { class: 'field' },
       h('label', { for: 'f-cp', text: isPp ? 'Получатель платежа' : 'Вторая сторона' }), who),
     date, num));
-  box.append(h('div', { class: 'card' }, Object.values(fields)));
+  const stdCard = h('div', { class: 'card' }, Object.values(fields));
+  box.append(stdCard);
+
+  /*
+   * Свой договор. Есть шаблон (для этого клиента или для всех) — вместо
+   * трёх полей типового спрашиваем поля шаблона. «Типовой вместо своего» —
+   * на случай, когда для этой сделки свой не подходит.
+   */
+  let tplActive = null;
+  let typical = false;
+  const tplInputs = {};
+  const tplCard = h('div', { class: 'card' });
+  const paintTpl = () => {
+    const useTpl = Boolean(tplActive) && !typical;
+    stdCard.style.display = useTpl ? 'none' : '';
+    tplCard.style.display = tplActive ? '' : 'none';
+    tplCard.replaceChildren();
+    Object.keys(tplInputs).forEach((k) => { delete tplInputs[k]; });
+    if (!tplActive) return;
+    if (useTpl) {
+      tplCard.append(h('p', { class: 'small muted', style: 'margin:12px 16px 0', text: `По вашему договору «${tplActive.title}». Реквизиты сторон подставятся сами.` }));
+      for (const f of tplActive.fields) {
+        const fl = field(`t-${f.key}`, f.label, '', {
+          inputmode: f.type === 'money' || f.type === 'number' ? 'decimal' : undefined,
+          placeholder: f.example || '',
+        });
+        tplInputs[f.key] = fl;
+        tplCard.append(fl);
+      }
+      tplCard.append(h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn secondary', onclick: () => { typical = true; paintTpl(); },
+      }, 'Типовой договор вместо своего')));
+    } else {
+      tplCard.append(h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn secondary', onclick: () => { typical = false; paintTpl(); },
+      }, `Вернуть свой договор «${tplActive.title}»`)));
+    }
+  };
+  const loadTpl = async () => {
+    if (isPp) return;
+    try { tplActive = (await api('GET', `/api/mycontract?cpId=${Number(who.value)}`)).active; } catch (_) { tplActive = null; }
+    paintTpl();
+  };
+  if (!isPp) {
+    box.append(tplCard);
+    who.addEventListener('change', loadTpl);
+    await loadTpl();
+    box.append(ownContractCard({ cpId: () => Number(who.value), cpName: () => (who.selectedOptions[0] || {}).textContent || '', reload: loadTpl }));
+  }
   box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
     text: isPp
       ? 'Форма 0401060 — та, что принимает банк. Ваши реквизиты и реквизиты получателя подставятся сами.'
@@ -3475,8 +3523,13 @@ screens.other = async function other({ type, cpId }) {
     const amount = Number(String((fields.amount.input.value) || '').replace(/\s/g, '').replace(',', '.')) || 0;
     if (isPp && !amount) { showError(fields.amount, 'Укажите сумму'); return; }
     if (isPp && !fields.purpose.input.value.trim()) { showError(fields.purpose, 'Банк не примет платёж без назначения'); return; }
-    if (!isPp && !fields.subject.input.value.trim()) { showError(fields.subject, 'Без предмета договор не собрать'); return; }
+    const useTpl = !isPp && tplActive && !typical;
+    if (!isPp && !useTpl && !fields.subject.input.value.trim()) { showError(fields.subject, 'Без предмета договор не собрать'); return; }
+    const tplPart = useTpl
+      ? { tplId: tplActive.id, values: Object.fromEntries(Object.entries(tplInputs).map(([k, fl]) => [k, fl.input.value.trim()])) }
+      : {};
     const r = await api('POST', '/api/doc/other', {
+      ...tplPart,
       type,
       cpId: Number(who.value),
       date: date.input.value,
@@ -3494,6 +3547,79 @@ screens.other = async function other({ type, cpId }) {
   box.append(h('div', { class: 'btn-wrap' }, make));
   return box;
 };
+
+/* ---------- свой договор и разбор чужого ---------- */
+
+/** Файл → dataUrl. Фото ужимаем: тело запроса не больше двух мегабайт. */
+async function fileToDataUrl(file) {
+  if (/^image\//.test(file.type)) return shrinkImage(file, 2200, 1300 * 1024);
+  if (file.size > 1400 * 1024) throw new Error('Файл больше 1,4 МБ — пришлите его в чат с ботом, там до 20 МБ.');
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(fr.result);
+    fr.onerror = () => rej(new Error('Не удалось прочитать файл.'));
+    fr.readAsDataURL(file);
+  });
+}
+
+function pickFile(accept, onFile) {
+  const inp = h('input', { type: 'file', accept, style: 'display:none' });
+  inp.onchange = () => { const f = inp.files && inp.files[0]; inp.value = ''; if (f) onFile(f); };
+  return inp;
+}
+
+/*
+ * Карточка «Свой договор» на экране договора: загрузить свой (бот найдёт,
+ * что меняется) и проверить чужой (риски, сроки, деньги).
+ */
+function ownContractCard({ cpId, cpName, reload }) {
+  const out = h('div', {});
+  const ACCEPT = '.docx,.pdf,image/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  const upInput = pickFile(ACCEPT, async (file) => {
+    out.replaceChildren(h('p', { class: 'small muted', style: 'margin:12px 18px', text: '📖 Читаю договор — это до минуты…' }));
+    try {
+      const r = await api('POST', '/api/mycontract/analyze', { dataUrl: await fileToDataUrl(file), name: file.name });
+      const t = r.template;
+      const save = async (forCp) => {
+        await api('POST', '/api/mycontract/save', { template: t, cpId: forCp ? cpId() : 0 });
+        haptic('medium');
+        toast(`Сохранил «${t.title}»`);
+        out.replaceChildren();
+        await reload();
+      };
+      out.replaceChildren(h('div', { class: 'card' },
+        h('p', { style: 'margin:12px 16px 4px', text: `📎 ${t.title} — прочитал.` }),
+        h('p', { class: 'small muted', style: 'margin:0 16px 8px', text: r.ask.length
+          ? `Буду спрашивать: ${r.ask.map((f) => f.label).join(', ')}. Клиента, реквизиты, номер и дату подставлю сам.`
+          : 'Меняющихся мест, кроме клиента и реквизитов, не нашёл.' }),
+        h('div', { class: 'btn-wrap' },
+          h('button', { class: 'btn', onclick: () => save(false) }, 'Сохранить для всех клиентов'),
+          h('button', { class: 'btn secondary', onclick: () => save(true) }, `Только для «${cpName()}»`))));
+    } catch (e) { out.replaceChildren(h('p', { class: 'small', style: 'margin:12px 18px', text: e.message })); }
+  });
+  const revInput = pickFile(ACCEPT, async (file) => {
+    out.replaceChildren(h('p', { class: 'small muted', style: 'margin:12px 18px', text: '🔎 Разбираю договор — это до минуты…' }));
+    try {
+      const { review: rv } = await api('POST', '/api/contract/review', { dataUrl: await fileToDataUrl(file), name: file.name });
+      const ICON = { high: '🔴', medium: '🟡', low: '🟢' };
+      const row = (t, v) => (v ? h('p', { class: 'small', style: 'margin:4px 16px' }, h('b', { text: `${t}: ` }), v) : null);
+      out.replaceChildren(h('div', { class: 'card' },
+        h('p', { style: 'margin:12px 16px 4px;font-weight:600', text: `🔎 ${rv.title}${rv.ref ? ` · ${rv.ref}` : ''}` }),
+        rv.summary ? h('p', { class: 'small', style: 'margin:4px 16px 8px', text: rv.summary }) : null,
+        row('Предмет', rv.subject), row('Сумма', rv.amount), row('Оплата', rv.payment),
+        row('Сроки', rv.dates), row('Штрафы', rv.penalties), row('Расторжение', rv.termination),
+        ...(rv.risks || []).map((x) => h('p', { class: 'small', style: 'margin:6px 16px' },
+          `${ICON[x.level] || '🟡'} ${x.text}`, x.fix ? h('div', { class: 'muted', text: `Как поправить: ${x.fix}` }) : null)),
+        h('p', { class: 'small muted', style: 'margin:10px 16px 14px',
+          text: 'Это справка, а не юридическое заключение — серьёзные риски покажите юристу. Вопросы по договору можно задать в «Спросить».' })));
+    } catch (e) { out.replaceChildren(h('p', { class: 'small', style: 'margin:12px 18px', text: e.message })); }
+  });
+  return h('div', {},
+    h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn secondary', onclick: () => upInput.click() }, '📤 Загрузить свой договор'),
+      h('button', { class: 'btn secondary', onclick: () => revInput.click() }, '🔎 Проверить чужой договор')),
+    upInput, revInput, out);
+}
 
 /* ---------- напоминания должникам ---------- */
 
