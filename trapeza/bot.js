@@ -2560,6 +2560,23 @@ function addClientKb(user, who, type) {
   return keyboard([first, [{ text: '⬅️ Меню', data: 'menu' }]]);
 }
 
+/**
+ * Фраза-просьба, а не строка позиции: «выставь счёт ООО Заря на 50 000».
+ *
+ * В наборе позиций любой текст — это позиция, и такая фраза превращалась в
+ * позицию с названием «выставь счёт ООО Заря» на сумму 50 000. Отличаем по
+ * двум признакам сразу: начинается с глагола просьбы или названия документа
+ * И называет клиента (из списка или с «ООО/ИП» впереди). Одного глагола мало:
+ * «Акт приёмки 1 3000» — честная позиция, клиента в ней нет.
+ */
+const REQUEST_START = /^\s*(выстав|выпиш|сдела|сформир|подготов|составь|оформи|создай|нужен|нужна|нужно|счёт|счет|акт|упд|накладн|торг)/i;
+function looksLikeRequest(text, cps) {
+  if (!REQUEST_START.test(text)) return false;
+  if (/(?:^|\s)(?:ооо|оао|зао|пао|ип|ао)\s+[«"„]?[\p{L}\p{N}]/iu.test(text)) return true;
+  const words = String(text).split(/[^\p{L}\p{N}]+/u).slice(1).filter((w) => w.length >= 3);
+  return words.some((w) => { const m = ai.matchCp(cps, w); return Boolean(m.cp || m.choices); });
+}
+
 /** Карточка письма: от кого, что во вложении, что с этим делать. */
 async function showInboxMessage(tg, chatId, user, index) {
   const list = inboxGet(user.id);
@@ -3019,7 +3036,14 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
   }
   if (intent.action === 'recurring') { logAiReply('Показываю регулярные счета'); await showRecurring(tg, chatId, user); return true; }
   if (intent.action === 'billing') { logAiReply('Показываю тарифы и оплату'); await showBilling(tg, chatId, user); return true; }
-  if (intent.action === 'help') return false;      // помощь и так в меню
+  if (intent.action === 'help') {
+    // Раньше здесь падали в общий тупик, и «что умеешь» получало «не понял».
+    logAiReply('Подсказка');
+    await tg.sendMessage(chatId,
+      'Я выписываю документы и слежу за долгами. Напишите или скажите, например: '
+      + '«счёт Заре на 30 000 за монтаж» или «кто мне должен». Остальное — в меню.', mainMenu());
+    return true;
+  }
 
   // Акт сверки собирается по конкретному контрагенту — спрашиваем, по кому.
   if (intent.action === 'akt') {
@@ -5187,6 +5211,13 @@ async function handleMessage(tg, msg) {
       return;
     }
 
+    /*
+     * Просьба посреди набора — не позиция. Отдаём её обычному разбору
+     * фраз: он начнёт новый документ (и скажет об этом сам). Если разбор
+     * не взялся — читаем как позицию, как и раньше.
+     */
+    if (looksLikeRequest(text, bdb.listCps(user.id)) && await handleFreeText(tg, chatId, user, text)) return;
+
     const item = readItemLine(text);
     // Не поняли количество и цену — не отказываем, а спрашиваем. Человек
     // пишет позицию так, как говорит; подстраиваться должны мы.
@@ -5367,7 +5398,9 @@ async function handleMessage(tg, msg) {
   // обращения к модели в пределах месячного бюджета.
   if (await handleFreeText(tg, chatId, user, text)) return;
 
-  await tg.sendMessage(chatId, 'Выберите действие:', mainMenu());
+  await tg.sendMessage(chatId,
+    'Не понял. Попробуйте, например: «счёт Заре на 30 000 за монтаж» или «кто мне должен».',
+    mainMenu());
 }
 
 async function handleCallback(tg, cq) {
@@ -6748,5 +6781,6 @@ async function main() {
 if (require.main === module) main();
 
 module.exports = {
+  looksLikeRequest,
   handleUpdate, runDaily, sendFollowups, parseOp, parseDate, parseItemLine, readItemLine, parseAmount, spellOutMagnitudes,
 };

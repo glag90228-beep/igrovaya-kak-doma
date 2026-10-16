@@ -1980,6 +1980,46 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     }
   }
 
+  console.log('\n── просьба посреди набора позиций ──');
+  {
+    // «выставь счёт ООО Заря на 50 000» посреди набора — просьба, а не позиция.
+    const { looksLikeRequest } = require('./bot');
+    const cpsR = require('./lib/bot-db').listCps(fxUserId());
+    ok(looksLikeRequest('выставь счёт ООО Заря на 50000', cpsR), 'просьба с клиентом узнаётся');
+    ok(looksLikeRequest('Акт Заре на 30 тысяч', cpsR), 'и без «ООО» — по списку клиентов');
+    ok(!looksLikeRequest('Акт приёмки 1 3000', cpsR), 'позиция с «акт» в начале остаётся позицией');
+    ok(!looksLikeRequest('Монтаж 1 30000', cpsR), 'обычная позиция — не просьба');
+
+    await tap(`d.sch:${cpId}`);
+    await say('Ремонт 1 1000');
+    const withTail = sent.length;
+    await say('выставь счёт ООО Заря на 50000');
+    const st = require('./lib/bot-db').getState(fxUserId());
+    const d = st.data || {};
+    ok(!(d.items || []).some((it) => /выстав/i.test(it.name)),
+      'фраза не стала названием позиции', JSON.stringify((d.items || []).map((it) => it.name)));
+    ok(sent.length > withTail, 'бот ответил на просьбу');
+    require('./lib/bot-db').clearState(fxUserId());
+  }
+
+  console.log('\n── непонятная фраза: не тупик ──');
+  {
+    require('./lib/bot-db').clearState(fxUserId());
+    await say('помощь');
+    ok(last().includes('кто мне должен') && !last().includes('Выберите действие'),
+      'на «помощь» бот подсказывает, что сказать', last().slice(0, 60));
+    const kbU = ((sent[sent.length - 1] || {}).kb || []).flat();
+    ok(kbU.length > 0, 'и показывает кнопки меню');
+    ok(!sent.slice(-3).some((m) => (m.text || '').includes('Выберите действие')), 'старого «Выберите действие» нет');
+    // Сам тупик (разбор вернул «не знаю»): подсказка с примерами и кнопки меню.
+    const aiU = require('./lib/ai-agent');
+    const wasU = aiU.understand;
+    aiU.understand = async () => ({ action: 'unknown', source: 'model' });
+    try { await say('фывапролдж'); } finally { aiU.understand = wasU; }
+    ok(last().includes('Не понял. Попробуйте') && last().includes('счёт Заре на 30 000'),
+      'на непонятное — «Не понял» с примерами', last().slice(0, 60));
+  }
+
   console.log('\n── проводник: реестр ответил по ИНН ──');
   {
     // Если реестр знает ИНН, название не спрашиваем — человек его не печатает.
