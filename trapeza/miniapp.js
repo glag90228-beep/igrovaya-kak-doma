@@ -41,6 +41,8 @@ const { buildRegistry } = require('./lib/xlsx-registry');
 const { fetchNew } = require('./lib/imap');
 const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
 const speech = require('./lib/speech');
+const tts = require('./lib/tts');
+const consult = require('./lib/consult');
 const ai = require('./lib/ai-agent');
 const { forwardToSupport } = require('./lib/bot-support');
 const office = require('./lib/office');
@@ -290,6 +292,68 @@ function withCp(user, intent) {
     return { ...intent, cpChoices: found.choices.map((c) => ({ id: c.id, name: c.name })) };
   }
   return { ...intent, cpMissing: true };
+}
+
+/*
+ * Общий ход разговора для текста и голоса.
+ *
+ * Раньше текстовая и голосовая ветки повторяли друг друга, и голосовая
+ * успела отстать: на налоговый вопрос голосом справку не искала вовсе.
+ * Теперь путь один: разбор команды → справка по налогам → помощник на всё,
+ * что не команда → озвучка, если приложение попросило.
+ */
+async function askFlow(user, text, { heard, speak }) {
+  const intent = await ai.understand(text, user.id);
+  if (intent.action === 'outofscope') {
+    const got = await ai.answerTax(text, user.id);
+    if (got.text) intent.taxAnswer = got.text;
+  }
+  /*
+   * Отказ модели — владельцу в журнал поддержки, а из ответа убрать: там до
+   * двухсот символов ответа провайдера, это не для клиента. И поле error
+   * router превратил бы в код 400, а api() в приложении — в исключение, и
+   * понятное объяснение при отказе модели никогда бы не показалось.
+   */
+  if (intent.source === 'error') {
+    office.record({ kind: 'ai', where: 'приложение', error: String(intent.error || ''), userId: user.id });
+    delete intent.error;
+  }
+  // Не команда — вопрос: отвечает помощник по данным человека. При отказе
+  // модели его не зовём: тот же провайдер откажет второй раз, а человек
+  // должен увидеть «не отвечает», а не «не понял».
+  let consulted = '';
+  if (intent.action === 'unknown' && !['limit', 'off', 'error'].includes(intent.source) && consult.consultAvailable()) {
+    const got = await consult.reply(user.id, text);
+    if (got.ok) consulted = got.text;
+    else if (got.from === 'error') {
+      office.record({ kind: 'ai', where: 'приложение, помощник', error: String(got.error || ''), userId: user.id });
+    }
+  }
+  const enriched = withCp(user, intent);
+  const auto = bdb.isAiEnabled(user.id);
+  const replyText = consulted || formatAiReply(intent, enriched, auto);
+  bdb.saveAiMessage({
+    userId: user.id, source: 'miniapp', role: 'assistant', type: 'text',
+    text: replyText, intent, action: intent.action,
+  });
+  const out = { ...enriched, heard, replyText, auto };
+  if (consulted) out.consult = true;
+  /*
+   * Озвучка — только по просьбе приложения (кнопка «Голосом» или режим
+   * разговора) и в пределах общего кошелька. Для браузера хватает WAV.
+   * Для долгов читаем не «Открываю список долгов», а саму сводку — ради
+   * неё и спрашивали.
+   */
+  if (speak && tts.ttsAvailable() && ai.budget(user.id).left > 0) {
+    const say = intent.action === 'debts' ? consult.spokenDebts(user.id) : replyText;
+    ai.spend(user.id);
+    const voice = await tts.synthesize(say, { format: 'wav' });
+    if (voice.spent) ai.spend(user.id, voice.spent);
+    if (voice.ok) { out.audio = voice.buffer.toString('base64'); out.audioMime = voice.mime; }
+    else office.record({ kind: 'tts', where: 'приложение', error: String(voice.error || ''), userId: user.id });
+  }
+  out.budget = ai.budget(user.id);
+  return out;
 }
 
 function formatAiReply(intent, withCpRes, auto) {
@@ -1730,42 +1794,7 @@ const api = {
     const text = str(body.text, 1000);
     if (!text) return { error: 'Напишите или скажите, что нужно.' };
     bdb.saveAiMessage({ userId: user.id, source: 'miniapp', role: 'user', type: 'text', text });
-    const intent = await ai.understand(text, user.id);
-    /*
-     * Налоговый вопрос: сначала своя база, потом — если владелец разрешил —
-     * модель с пометкой «не сверяли». Глухой отказ остался последним рубежом.
-     */
-    if (intent.action === 'outofscope') {
-      const got = await ai.answerTax(text, user.id);
-      if (got.text) intent.taxAnswer = got.text;
-    }
-    /*
-     * Отказ модели — владельцу в журнал поддержки, а из ответа убрать.
-     *
-     * Записи не было вовсе: человек видел «попробуйте позже», владелец не
-     * видел ничего. Истёкший ключ и запрет провайдера по адресу выглядят
-     * при этом одинаково, а чинятся по-разному.
-     *
-     * Убираем по двум причинам. Первая: в тексте лежит до двухсот символов
-     * ответа провайдера — не ключ, но и не то, что показывают клиенту.
-     * Вторая тише и хуже. Поле error в ответе router превращает в код 400,
-     * а api() в приложении на любой 400 бросает исключение с этим текстом.
-     * Значит ветка в app.js, написанная специально ради понятного
-     * объяснения при отказе модели, не выполнялась никогда — до неё просто
-     * не доходило. Ровно та беда, от которой её и заводили.
-     */
-    if (intent.source === 'error') {
-      office.record({ kind: 'ai', where: 'приложение', error: String(intent.error || ''), userId: user.id });
-      delete intent.error;
-    }
-    const enriched = withCp(user, intent);
-    const auto = bdb.isAiEnabled(user.id);
-    const replyText = formatAiReply(intent, enriched, auto);
-    bdb.saveAiMessage({
-      userId: user.id, source: 'miniapp', role: 'assistant', type: 'text',
-      text: replyText, intent, action: intent.action,
-    });
-    return { ...enriched, heard: text, replyText, auto, budget: ai.budget(user.id) };
+    return askFlow(user, text, { heard: text, speak: Boolean(body.speak) });
   },
 
   /** То же самое, но голосом: расшифровали и сразу разобрали. */
@@ -1805,19 +1834,8 @@ const api = {
       userId: user.id, source: 'miniapp', role: 'user', type: 'voice',
       text: got.text, audioSeconds: seconds,
     });
-    const intent = await ai.understand(got.text, user.id);
-    if (intent.source === 'error') {
-      office.record({ kind: 'ai', where: 'приложение, голос', error: String(intent.error || ''), userId: user.id });
-      delete intent.error;
-    }
-    const enriched = withCp(user, intent);
-    const auto = bdb.isAiEnabled(user.id);
-    const replyText = formatAiReply(intent, enriched, auto);
-    bdb.saveAiMessage({
-      userId: user.id, source: 'miniapp', role: 'assistant', type: 'text',
-      text: replyText, intent, action: intent.action,
-    });
-    return { ...enriched, heard: got.text, replyText, auto, budget: ai.budget(user.id) };
+    // Спросили голосом — по умолчанию и отвечаем голосом; speak:false — нет.
+    return askFlow(user, got.text, { heard: got.text, speak: body.speak !== false });
   },
 
   /** История диалога с ИИ-ассистентом для отображения в чате. */

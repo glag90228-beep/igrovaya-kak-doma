@@ -1496,6 +1496,33 @@ async function main() {
     delete process.env.SPEECH_PROVIDER;
     delete process.env.SPEECH_MOCK;
 
+    // Помощник и ответ голосом. Свободный вопрос — ответ помощника; голосом
+    // спросили — голосом и ответили (WAV: браузеру хватает); напечатали — без звука.
+    {
+      const keepA = {};
+      for (const k of ['AI_ENABLED', 'AI_PROVIDER', 'AI_MOCK', 'CONSULT_MOCK', 'TTS_PROVIDER', 'SPEECH_PROVIDER', 'SPEECH_MOCK']) keepA[k] = process.env[k];
+      Object.assign(process.env, {
+        AI_ENABLED: '1', AI_PROVIDER: 'mock', AI_MOCK: '{"action":"unknown"}', TTS_PROVIDER: 'mock',
+        CONSULT_MOCK: 'Акт — для услуг, УПД — когда покупателю нужен ещё и счёт-фактура.',
+        SPEECH_PROVIDER: 'mock', SPEECH_MOCK: 'чем акт отличается от упд',
+      });
+      r = await call('POST', '/api/ask', { user: masha, body: { text: 'чем акт отличается от упд' } });
+      ok(r.status === 200 && r.json.consult === true && /для услуг/.test(r.json.replyText || '') && !r.json.audio,
+        'на вопрос в приложении отвечает помощник, напечатанное — без звука', JSON.stringify(r.json).slice(0, 120));
+      const wavIn = Buffer.from('RIFF....WAVE').toString('base64');
+      r = await call('POST', '/api/ask/voice', { user: masha, body: { audio: wavIn, seconds: 2 } });
+      ok(r.status === 200 && r.json.consult === true && r.json.audioMime === 'audio/wav'
+        && Buffer.from(r.json.audio || '', 'base64').toString('latin1', 0, 4) === 'RIFF',
+        'спросили голосом — ответ пришёл и голосом', JSON.stringify({ c: r.json.consult, m: r.json.audioMime }));
+      r = await call('POST', '/api/ask/voice', { user: masha, body: { audio: wavIn, seconds: 2, speak: false } });
+      ok(r.status === 200 && !r.json.audio, 'выключили голос — отвечаю только текстом');
+      process.env.SPEECH_MOCK = 'кто мне должен';
+      r = await call('POST', '/api/ask/voice', { user: masha, body: { audio: wavIn, seconds: 2 } });
+      ok(r.status === 200 && r.json.action === 'debts' && r.json.audio,
+        'на «кто мне должен» голосом — сводка вслух, а экран долгов кнопкой', r.json.action);
+      for (const [k, v] of Object.entries(keepA)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    }
+
     /*
      * Снимок счёта из приложения. Путь тот же, что у бота, и кошелёк тот же
      * — а проверки до сих пор не было вовсе.

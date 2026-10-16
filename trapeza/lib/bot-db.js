@@ -199,6 +199,9 @@ function migrate() {
   // ошибка в логе и лишний запрос.
   addColumn('bot_users', 'blocked_at', "TEXT NOT NULL DEFAULT ''");
   addColumn('bot_users', 'ai_enabled', 'INTEGER NOT NULL DEFAULT 1');
+  // Отвечать ли голосом на голосовые. По умолчанию да: спросил голосом —
+  // значит, руки заняты, и читать ответ неудобно.
+  addColumn('bot_users', 'voice_reply', 'INTEGER NOT NULL DEFAULT 1');
   /*
    * От лица какой организации человек работает прямо сейчас.
    *
@@ -374,6 +377,14 @@ function isAiEnabled(userId) {
 function setAiEnabled(userId, enabled) {
   db.prepare('UPDATE bot_users SET ai_enabled = ? WHERE id = ?').run(enabled ? 1 : 0, userId);
   return Boolean(enabled);
+}
+function isVoiceReply(userId) {
+  const u = db.prepare('SELECT voice_reply FROM bot_users WHERE id = ?').get(userId);
+  return u ? u.voice_reply !== 0 : true;
+}
+function setVoiceReply(userId, on) {
+  db.prepare('UPDATE bot_users SET voice_reply = ? WHERE id = ?').run(on ? 1 : 0, userId);
+  return Boolean(on);
 }
 
 /**
@@ -2333,7 +2344,7 @@ function quota(userId) {
 
 module.exports = {
   migrate,
-  getOrCreateUser, setState, getState, clearState, isAiEnabled, setAiEnabled, setSource,
+  getOrCreateUser, setState, getState, clearState, isAiEnabled, setAiEnabled, isVoiceReply, setVoiceReply, setSource,
   saveAiMessage, listAiMessages, getAiDataset,
   createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, orgOfDoc, claimButton, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp, openAdvances, updateDocPayload,

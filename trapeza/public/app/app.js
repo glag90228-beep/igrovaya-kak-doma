@@ -2777,7 +2777,11 @@ async function recordWav(onTick) {
     }
     chunks.push(out);
     total += out.length;
-    if (onTick) onTick(total / REC_RATE);
+    // Громкость куска — для режима разговора: по ней понимаем, что человек
+    // договорил, и не заставляем его жать кнопку после каждой фразы.
+    let sq = 0;
+    for (let i = 0; i < input.length; i += 1) sq += input[i] * input[i];
+    if (onTick) onTick(total / REC_RATE, Math.sqrt(sq / (input.length || 1)));
   };
   src.connect(node);
   node.connect(ctx.destination);
@@ -2824,6 +2828,54 @@ async function recordWav(onTick) {
  * экран с заполненными полями — кнопку жмёт человек. Документ забирает
  * номер в сквозном ряду, и лишний счёт нельзя тихо удалить.
  */
+/*
+ * Ответ голосом.
+ *
+ * Играем через Web Audio, а не через <audio>: Safari на iPhone разрешает
+ * звук только из обработчика нажатия, и ответ, пришедший через три секунды
+ * после него, молчал бы. Один AudioContext, «разбуженный» нажатием на
+ * микрофон или «Разговор», дальше играет без новых нажатий.
+ */
+const voicePlayer = (() => {
+  let ctx = null;
+  let current = null;
+  const unlock = () => {
+    try {
+      if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (ctx.state === 'suspended') ctx.resume();
+      const b = ctx.createBuffer(1, 1, 22050);
+      const s = ctx.createBufferSource();
+      s.buffer = b; s.connect(ctx.destination); s.start(0);
+    } catch (_) { /* без звука — ответ всё равно есть текстом */ }
+  };
+  const stop = () => {
+    try { if (current) current.stop(); } catch (_) { /* уже кончился */ }
+    current = null;
+  };
+  const play = async (b64) => {
+    unlock();
+    stop();
+    if (!ctx) return;
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+    // Старый Safari знает только вариант с колбэками — поддерживаем оба.
+    const buf = await new Promise((res, rej) => {
+      const p = ctx.decodeAudioData(bytes.buffer, res, rej);
+      if (p && p.then) p.then(res, rej);
+    });
+    await new Promise((resolve) => {
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.onended = () => { if (current === src) current = null; resolve(); };
+      current = src;
+      src.start(0);
+    });
+  };
+  return { unlock, play, stop };
+})();
+
 const ASK_GO = {
   debts: ['Открыть долги', 'debts'],
   unpaid: ['Кто не заплатил', 'unpaid'],
@@ -2836,7 +2888,24 @@ const ASK_GO = {
 };
 
 screens.ask = async function ask() {
-  const box = h('div', {}, h('h1', { text: 'Спросить' }));
+  /*
+   * «Отвечать голосом» — на голосовой вопрос; помним в браузере, это
+   * удобство, а не данные. «Разговор» — руки свободны: сказал, помощник
+   * ответил голосом и снова слушает, пока не нажмёте ещё раз.
+   */
+  let speakOn = true;
+  try { speakOn = localStorage.getItem('ask.speak') !== '0'; } catch (_) { /* приватный режим */ }
+  let talk = false;
+  const speakBtn = h('button', { class: 'chip' });
+  const talkBtn = h('button', { class: 'chip talk' });
+  const paintChips = () => {
+    speakBtn.textContent = speakOn ? '🔊 Отвечать голосом' : '🔇 Отвечать текстом';
+    speakBtn.setAttribute('aria-pressed', String(speakOn));
+    talkBtn.textContent = talk ? '⏹ Закончить разговор' : '🎙 Разговор';
+    talkBtn.setAttribute('aria-pressed', String(talk));
+  };
+  paintChips();
+  const box = h('div', {}, h('h1', { text: 'Спросить' }), h('div', { class: 'ask-modes' }, speakBtn, talkBtn));
   const log = h('div', { class: 'chat' });
 
   /* Вносит проводку и показывает, что получилось, с отменой в одно нажатие. */
@@ -2902,6 +2971,8 @@ screens.ask = async function ask() {
   const answer = async (r) => {
     if (r.heard) say('me', r.heard);
     if (r.error) { say('bot', r.error); return; }
+    // Свободный вопрос — ответ помощника приходит готовым текстом.
+    if (r.consult) { say('bot', r.replyText); return; }
 
     if (r.action === 'draft') {
       const open = (extra) => () => {
@@ -3062,31 +3133,87 @@ screens.ask = async function ask() {
 
   const mic = h('button', { class: 'mic', 'aria-label': 'Записать голосом' }, icon('mic'));
   let rec = null;
-  mic.onclick = async () => {
-    if (rec) {
-      const r = rec; rec = null;
-      mic.classList.remove('on');
-      mic.replaceChildren(icon('mic'));
-      const { audio, seconds } = await r.stop();
-      if (!seconds) { say('bot', 'Запись пустая — кажется, микрофон не слышит.'); return; }
-      say('bot', '🎧 Слушаю…');
-      try { await answer(await api('POST', '/api/ask/voice', { audio, seconds })); } catch (e) { say('bot', e.message); }
-      return;
+  const micIdle = () => { mic.classList.remove('on'); mic.replaceChildren(icon('mic')); };
+
+  /* Остановить запись, отправить, показать ответ и, если он голосом, проиграть. */
+  const finish = async () => {
+    if (!rec) return;
+    const r0 = rec; rec = null;
+    micIdle();
+    const { audio, seconds } = await r0.stop();
+    if (!seconds) { say('bot', 'Запись пустая — кажется, микрофон не слышит.'); talk = false; paintChips(); return; }
+    say('bot', '🎧 Слушаю…');
+    let r;
+    try { r = await api('POST', '/api/ask/voice', { audio, seconds, speak: speakOn || talk }); } catch (e) {
+      say('bot', e.message); talk = false; paintChips(); return;
     }
+    await answer(r);
+    if (r.audio) await voicePlayer.play(r.audio).catch(() => {});
+    if (talk) listen();
+  };
+
+  /*
+   * Слушать. В режиме разговора запись останавливается сама: человек
+   * заговорил, потом секунду с лишним тишины — значит, договорил. Если за
+   * семь секунд не сказал ничего — выходим из разговора, а не слушаем пустоту.
+   */
+  const listen = async () => {
+    if (rec) return;
+    let spoke = false;
+    let quiet = 0;
+    let last = 0;
     try {
       haptic('medium');
       mic.classList.add('on');
-      rec = await recordWav((sec) => {
+      rec = await recordWav((sec, level) => {
         mic.replaceChildren(h('span', { class: 'rec-sec', text: String(Math.floor(sec)) }));
+        const dt = sec - last; last = sec;
+        if (talk) {
+          if (level > 0.035) { spoke = true; quiet = 0; } else if (spoke) quiet += dt;
+          if (spoke && quiet > 1.3) { finish(); return; }
+          if (!spoke && sec > 7) {
+            const r0 = rec; rec = null; micIdle();
+            if (r0) r0.stop();
+            talk = false; paintChips();
+            say('bot', 'Не слышу вас — закончил разговор. Нажмите «Разговор», чтобы продолжить.');
+            return;
+          }
+        }
         // Больше тридцати секунд «быстрый» метод не берёт, и ждать
         // распознавания пришлось бы вдвое дольше самой записи.
-        if (sec >= REC_MAX_SEC) mic.click();
+        if (sec >= REC_MAX_SEC) finish();
       });
     } catch (_) {
       rec = null;
-      mic.classList.remove('on');
-      mic.replaceChildren(icon('mic'));
+      micIdle();
+      talk = false; paintChips();
       say('bot', 'Не дали доступ к микрофону. Напишите текстом — пойму так же.');
+    }
+  };
+
+  mic.onclick = async () => {
+    voicePlayer.unlock();
+    voicePlayer.stop();
+    if (rec) { await finish(); return; }
+    listen();
+  };
+  speakBtn.onclick = () => {
+    speakOn = !speakOn;
+    try { localStorage.setItem('ask.speak', speakOn ? '1' : '0'); } catch (_) { /* не запомним — не беда */ }
+    haptic();
+    paintChips();
+  };
+  talkBtn.onclick = () => {
+    voicePlayer.unlock();
+    talk = !talk;
+    paintChips();
+    haptic('medium');
+    if (talk) {
+      say('bot', 'Слушаю. Говорите — я отвечу голосом и снова буду слушать.');
+      listen();
+    } else {
+      voicePlayer.stop();
+      if (rec) { const r0 = rec; rec = null; micIdle(); r0.stop(); }
     }
   };
 

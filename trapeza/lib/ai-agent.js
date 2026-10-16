@@ -197,6 +197,10 @@ const KOP_OUT = () => Number(process.env.AI_KOP_OUT || 4800);
 const KOP_CACHED = () => Number(process.env.AI_KOP_CACHED || 120);
 const KOP_PHOTO = () => Number(process.env.AI_KOP_PHOTO || 90);
 const KOP_VOICE = () => Number(process.env.AI_KOP_VOICE || 120);
+// Синтез речи. Gemini берёт за звуковые токены ответа (около 25 в секунду,
+// 10 $ за миллион — примерно 820 ₽), SpeechKit — за символы текста.
+const KOP_TTS_OUT = () => Number(process.env.AI_KOP_TTS_OUT || 82000);
+const KOP_TTS_CHARS = () => Number(process.env.AI_KOP_TTS_CHARS || 132);
 
 /** Предел расхода в копейках: на всех и на одного. */
 const KOP_ALL = () => Number(process.env.AI_MONTHLY_KOPECKS || 300000);   // 3000 ₽
@@ -240,7 +244,8 @@ function paidAccess(userId) {
  * токенов ушло, знает только провайдер, и он это возвращает.
  *
  * @param {{in:number,out:number,cached:number}} usage что вернул провайдер
- * @param {{photos?:number, voiceSeconds?:number}} extra снимки и речь
+ * @param {{photos?:number, voiceSeconds?:number, ttsTokens?:number, ttsChars?:number}} extra
+ *   снимки, распознанная речь и синтезированная (токены Gemini или символы SpeechKit)
  */
 function costKopecks(usage = {}, extra = {}) {
   const tin = Math.max(0, Number(usage.in) || 0);
@@ -251,7 +256,9 @@ function costKopecks(usage = {}, extra = {}) {
   const billedIn = Math.max(0, tin - tcached);
   const kop = (billedIn * KOP_IN() + tout * KOP_OUT() + tcached * KOP_CACHED()) / 1e6
     + (Number(extra.photos) || 0) * KOP_PHOTO()
-    + ((Number(extra.voiceSeconds) || 0) / 60) * KOP_VOICE();
+    + ((Number(extra.voiceSeconds) || 0) / 60) * KOP_VOICE()
+    + ((Number(extra.ttsTokens) || 0) * KOP_TTS_OUT()) / 1e6
+    + ((Number(extra.ttsChars) || 0) / 1000) * KOP_TTS_CHARS();
   // Округляем вверх: недосчитать свой расход хуже, чем пересчитать на копейку.
   return Math.ceil(kop);
 }

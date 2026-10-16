@@ -52,7 +52,8 @@ process.env.ENFORCE_LIMIT = '1';   // блок про лимит рассчит�
 for (const k of ['GEMINI_API_KEY', 'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY',
   'OPENAI_API_KEY', 'XAI_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
   'VISION_PROVIDER', 'SPEECH_PROVIDER', 'AI_PROVIDER', 'AI_ENABLED', 'AI_MODEL',
-  'AI_MOCK', 'AI_MOCK_USAGE', 'DADATA_TOKEN']) {
+  'AI_MOCK', 'AI_MOCK_USAGE', 'DADATA_TOKEN', 'TTS_PROVIDER', 'TTS_MODEL', 'TTS_VOICE',
+  'CONSULT_MOCK', 'CONSULT_ENABLED', 'CONSULT_MODEL']) {
   delete process.env[k];
 }
 
@@ -4303,6 +4304,190 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(norm(sent.map((m) => m.text).join(' ')).includes('не разбираю'),
       'без провайдера бот честно говорит, что голос не разбирает',
       norm(sent.map((m) => m.text).join(' ')).slice(0, 80));
+  }
+
+  console.log('\n── помощник отвечает голосом и помнит разговор ──');
+  {
+    const tts = require('./lib/tts');
+    const oggMod = require('./lib/ogg-opus');
+    const consultMod = require('./lib/consult');
+    const aiMod = require('./lib/ai-agent');
+    const bdbV = require('./lib/bot-db');
+    const http = require('node:http');
+
+    // Текст для глаз — не текст для голоса.
+    const said = tts.speakable('<b>Нам должны — 120 000 ₽</b>\n• Заря — 50 000 ₽ ⚠️\nГотово!\nСчёт № 5');
+    ok(!/[<>₽⚠•]/.test(said) && /120 000 руб\./.test(said) && /номер 5/.test(said) && !/!\./.test(said),
+      'разметка, эмодзи и знаки убраны, «₽» и «№» читаются словами', said);
+    const long = tts.speakable('Раз. '.repeat(400), 100);
+    ok(long.length <= 101 && /\.$/.test(long), 'длинное режется по концу фразы', long.length);
+
+    // Контейнер OGG: CRC страниц — свой, не zlib.
+    const fakeOgg = oggMod.muxOggOpus([Buffer.alloc(80, 1), Buffer.alloc(300, 2)], [20000, 20000],
+      { inputRate: 24000, samples: 960 });
+    ok(fakeOgg.toString('latin1', 0, 4) === 'OggS' && fakeOgg.includes(Buffer.from('OpusHead'))
+      && fakeOgg.includes(Buffer.from('OpusTags')), 'OGG собран: заголовки Opus на месте');
+    const firstLen = 27 + fakeOgg[26] + fakeOgg.slice(27, 27 + fakeOgg[26]).reduce((a, b) => a + b, 0);
+    const page1 = Buffer.from(fakeOgg.subarray(0, firstLen));
+    const crc = page1.readUInt32LE(22);
+    page1.writeUInt32LE(0, 22);
+    ok(oggMod.oggCrc(page1) === crc, 'контрольная сумма страницы сходится');
+
+    // Настоящее кодирование в Chromium — там, где он есть (на сервере есть: он же печатает PDF).
+    if (require('./lib/pdf').pdfAvailable()) {
+      const pcm = Buffer.alloc(24000 * 2);
+      for (let i = 0; i < 24000; i += 1) pcm.writeInt16LE(Math.round(6000 * Math.sin(i / 8)), i * 2);
+      const ogg = await oggMod.pcmToOggOpus(pcm, 24000).catch((e) => ({ err: e.message }));
+      ok(Buffer.isBuffer(ogg) && ogg.toString('latin1', 0, 4) === 'OggS' && ogg.length > 1000,
+        'секунда звука закодирована в OGG/Opus через Chromium', Buffer.isBuffer(ogg) ? ogg.length : ogg.err);
+    }
+
+    // Синтез через Gemini: модель — самая свежая flash-tts из списка, расход — по факту.
+    const seenT = [];
+    const pcmBack = Buffer.alloc(4800 * 2, 0);
+    const fakeT = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        seenT.push({ url: req.url, key: req.headers['x-goog-api-key'], body });
+        res.setHeader('content-type', 'application/json');
+        if (req.method === 'GET') {
+          res.end(JSON.stringify({ models: [
+            { name: 'models/gemini-2.5-flash-preview-tts', supportedGenerationMethods: ['generateContent'] },
+            { name: 'models/gemini-3.1-flash-tts', supportedGenerationMethods: ['generateContent'] },
+            { name: 'models/gemini-3.1-pro-tts', supportedGenerationMethods: ['generateContent'] },
+            { name: 'models/gemini-3.6-flash', supportedGenerationMethods: ['generateContent'] },
+          ] }));
+          return;
+        }
+        res.end(JSON.stringify({
+          candidates: [{ content: { parts: [{ inlineData: { mimeType: 'audio/L16;codec=pcm;rate=24000', data: pcmBack.toString('base64') } }] } }],
+          usageMetadata: { promptTokenCount: 30, candidatesTokenCount: 5000 },
+        }));
+      });
+    });
+    await new Promise((r) => fakeT.listen(0, '127.0.0.1', r));
+    const keepT = { TTS_PROVIDER: process.env.TTS_PROVIDER, GEMINI_API_KEY: process.env.GEMINI_API_KEY, GEMINI_BASE_URL: process.env.GEMINI_BASE_URL };
+    process.env.TTS_PROVIDER = 'gemini';
+    process.env.GEMINI_API_KEY = 'test-key';
+    process.env.GEMINI_BASE_URL = `http://127.0.0.1:${fakeT.address().port}`;
+    tts._resetModelCache();
+    const wav = await tts.synthesize('Вам должны тридцать тысяч.', { format: 'wav' });
+    const asked = seenT.find((x) => x.url.includes(':generateContent')) || { body: '{}', url: '' };
+    const askedBody = JSON.parse(asked.body);
+    ok(wav.ok && wav.format === 'wav' && wav.buffer.toString('latin1', 0, 4) === 'RIFF',
+      'Gemini вернул PCM — браузеру отдаём WAV', JSON.stringify({ ok: wav.ok, f: wav.format, e: wav.error }));
+    ok(asked.url.includes('gemini-3.1-flash-tts'), 'выбрана самая свежая flash-модель речи', asked.url);
+    ok(asked.key === 'test-key' && !asked.url.includes('test-key'), 'ключ — заголовком, не в адресе');
+    ok(JSON.stringify(askedBody.generationConfig.responseModalities) === '["AUDIO"]'
+      && /дружелюбно/.test(askedBody.contents[0].parts[0].text),
+      'просим звук и задаём интонацию словами', asked.body.slice(0, 160));
+    ok(wav.spent && wav.spent.ttsTokens === 5000 && Math.abs(wav.seconds - 0.2) < 0.01,
+      'звуковые токены и длительность — по ответу', JSON.stringify(wav.spent));
+    process.env.AI_KOP_TTS_OUT = '82000';
+    process.env.AI_KOP_IN = '1200';
+    const tuid = fxUserId();
+    const k0 = aiMod.budget(tuid).kopecks;
+    aiMod.spend(tuid, wav.spent);
+    ok(aiMod.budget(tuid).kopecks - k0 === 411,
+      'синтез записан в общий кошелёк: 5000 звуковых токенов ≈ 4,1 ₽', aiMod.budget(tuid).kopecks - k0);
+    delete process.env.AI_KOP_TTS_OUT;
+    delete process.env.AI_KOP_IN;
+    fakeT.close();
+    for (const [k, v] of Object.entries(keepT)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    tts._resetModelCache();
+
+    // Голосовое в Telegram — multipart с полем voice и длительностью.
+    const { Telegram } = require('./lib/tg');
+    let voiceReq = '';
+    const fakeTg = http.createServer((req, res) => {
+      let body = '';
+      req.setEncoding('latin1');
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        voiceReq = `${req.url}\n${body}`;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ ok: true, result: { message_id: 1 } }));
+      });
+    });
+    await new Promise((r) => fakeTg.listen(0, '127.0.0.1', r));
+    const tgv = new Telegram('test-token');
+    tgv.base = `http://127.0.0.1:${fakeTg.address().port}/bottest-token`;
+    await tgv.sendVoice(42, { buffer: Buffer.from('OggS голос'), duration: 3.4, buttons: [[{ text: 'x', data: 'voice.off' }]] });
+    ok(/\/sendVoice/.test(voiceReq) && /name="voice"/.test(voiceReq) && /name="duration"\r\n\r\n3/.test(voiceReq)
+      && /voice\.off/.test(voiceReq), 'sendVoice: поле voice, длительность и кнопка ушли', voiceReq.slice(0, 120));
+    fakeTg.close();
+
+    // Помощник: память разговора и данные человека.
+    process.env.AI_ENABLED = '1';
+    process.env.AI_PROVIDER = 'mock';
+    process.env.AI_MOCK = '{"action":"unknown"}';
+    process.env.CONSULT_MOCK = 'Акт подтверждает услугу, УПД — ещё и счёт-фактура. Для товаров берите УПД или накладную.';
+    process.env.TTS_PROVIDER = 'mock';
+    const cuid = fxUserId();
+    const zarya = bdbV.createCp(cuid, { name: 'ООО «Заря-Голос»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbV.addOp(cuid, zarya, { date: '2026-02-01', kind: 'Реализация', credit: 45000 });
+    const ctx = consultMod.userContext(cuid);
+    ok(/Заря-Голос/.test(ctx) && /45\s000 руб\./.test(norm(ctx)), 'помощник видит должников с суммами', ctx.slice(0, 200));
+
+    const voiceCalls = [];
+    tg.sendVoice = async (chatId, p) => { voiceCalls.push(p); return { message_id: 1 }; };
+    tg.downloadFile = async () => Buffer.from('OggS запись');
+    process.env.SPEECH_PROVIDER = 'mock';
+    process.env.SPEECH_MOCK = 'чем акт отличается от упд';
+    bdbV.setVoiceReply(cuid, true);
+    sent.length = 0;
+    await handleUpdate(tg, { message: { message_id: 950, chat: CHAT, from: USER, voice: { file_id: 'v-c', duration: 3 } } });
+    const allText = norm(sent.map((m) => m.text || '').join(' | '));
+    ok(/Акт подтверждает услугу/.test(allText) && !/Не понял/.test(allText),
+      'на вопрос голосом отвечает помощник, а не «не понял»', allText.slice(-200));
+    ok(voiceCalls.length === 1 && String(voiceCalls[0].buffer).startsWith('OggS')
+      && (voiceCalls[0].buttons || []).flat().some((b) => b.data === 'voice.off'),
+      'и отвечает голосом, с кнопкой «Отвечать текстом»', String(voiceCalls.length));
+    const hist = bdbV.listAiMessages(cuid, 5);
+    ok(hist.some((m) => m.role === 'assistant' && /Акт подтверждает/.test(m.text || '')),
+      'в историю записан настоящий ответ, а не метка');
+    const contents = consultMod.historyContents(cuid, 'а для услуг?');
+    ok(contents.length >= 2 && contents[0].role === 'user'
+      && contents.every((c, i) => i === 0 || c.role !== contents[i - 1].role),
+      'история для модели: с человека и с чередованием ролей', JSON.stringify(contents.map((c) => c.role)));
+
+    // Кнопка «Отвечать текстом» — дальше без голоса.
+    await tap('voice.off');
+    ok(!bdbV.isVoiceReply(cuid), 'кнопка выключила голос');
+    voiceCalls.length = 0;
+    await handleUpdate(tg, { message: { message_id: 951, chat: CHAT, from: USER, voice: { file_id: 'v-d', duration: 3 } } });
+    ok(voiceCalls.length === 0, 'после неё отвечаю только текстом');
+    await say('отвечай голосом');
+    ok(bdbV.isVoiceReply(cuid) && /голосом/.test(last()), 'фраза «отвечай голосом» возвращает голос', last());
+
+    // Напечатанный вопрос — ответ текстом, без голоса.
+    voiceCalls.length = 0;
+    await say('как вежливо напомнить клиенту про оплату');
+    ok(/Акт подтверждает/.test(last()) && voiceCalls.length === 0, 'на текст — текстом');
+
+    // «Кто мне должен» голосом — сводка вслух.
+    process.env.SPEECH_MOCK = 'кто мне должен';
+    voiceCalls.length = 0;
+    await handleUpdate(tg, { message: { message_id: 952, chat: CHAT, from: USER, voice: { file_id: 'v-e', duration: 2 } } });
+    const topDebtor = bdbV.debtors(cuid).filter((r) => r.theyOwe).sort((a, b) => b.amount - a.amount)[0];
+    const spokenDebt = String((voiceCalls[0] || {}).buffer || '');
+    ok(voiceCalls.length === 1 && /Вам должны \d+ клиент/.test(spokenDebt) && spokenDebt.includes(topDebtor.cp.name),
+      'долги голосом: сколько должны и кто больше всех', spokenDebt.slice(0, 120));
+
+    // Предел кончился — помощник не зовёт модель.
+    // Предел и подписчика, и бесплатный: у тестового человека бывает подписка из соседних проверок.
+    process.env.AI_FREE_KOPECKS = '0';
+    process.env.AI_USER_KOPECKS = '0';
+    const lim = await consultMod.reply(cuid, 'ещё вопрос');
+    ok(!lim.ok && lim.from === 'limit', 'кончился предел — помощник молчит, денег не тратит', JSON.stringify(lim).slice(0, 120));
+    delete process.env.AI_FREE_KOPECKS;
+    delete process.env.AI_USER_KOPECKS;
+
+    delete tg.sendVoice;
+    for (const k of ['AI_ENABLED', 'AI_PROVIDER', 'AI_MOCK', 'CONSULT_MOCK', 'TTS_PROVIDER', 'SPEECH_PROVIDER', 'SPEECH_MOCK']) {
+      delete process.env[k];
+    }
   }
 
   console.log('\n── проводка не переживает свой документ ──');

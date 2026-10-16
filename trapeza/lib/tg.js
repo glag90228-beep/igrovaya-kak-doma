@@ -305,6 +305,38 @@ class Telegram {
     throw err;
   }
 
+  /**
+   * Голосовое сообщение. Пузырь с волной Telegram рисует только для
+   * OGG/Opus — поэтому сюда приходит уже закодированный звук (lib/tts.js).
+   *
+   * @param {object} p
+   * @param {Buffer} p.buffer OGG/Opus
+   * @param {number} [p.duration] секунды — без неё у пузыря не будет длины
+   */
+  async sendVoice(chatId, { buffer, caption, buttons, duration }) {
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    if (caption) { form.append('caption', caption); form.append('parse_mode', 'HTML'); }
+    if (duration) form.append('duration', String(Math.max(1, Math.round(duration))));
+    if (buttons && buttons.length) {
+      form.append('reply_markup', JSON.stringify(keyboard(buttons).reply_markup));
+    }
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    form.append('voice', new Blob([bytes], { type: 'audio/ogg' }), 'otvet.ogg');
+    const res = await fetchRetry(`${this.base}/sendVoice`,
+      { method: 'POST', body: form, signal: AbortSignal.timeout(60000) });
+    const data = await res.json().catch(() => ({}));
+    if (data.ok) return data.result;
+    const code = data.error_code || res.status;
+    const err = new Error(`TG sendVoice: ${data.description || code}`);
+    err.code = code;
+    // Голосовые можно запретить в настройках приватности — тогда бот
+    // получает «VOICE_MESSAGES_FORBIDDEN». Это не поломка, а выбор человека.
+    err.forbidden = /VOICE_MESSAGES_FORBIDDEN/i.test(data.description || '');
+    err.blocked = code === 403 || /bot was blocked|chat not found/i.test(data.description || '');
+    throw err;
+  }
+
   /** Показать/скрыть «печатает…» */
   sendChatAction(chatId, action = 'upload_document') {
     return this.call('sendChatAction', { chat_id: chatId, action }).catch(() => {});

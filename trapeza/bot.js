@@ -23,6 +23,8 @@ const { buildTorg12Html } = require('./lib/torg12');
 const { pdfAvailable, htmlToPdf } = require('./lib/pdf');
 const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
 const speech = require('./lib/speech');
+const tts = require('./lib/tts');
+const consult = require('./lib/consult');
 const office = require('./lib/office');
 const { applySetup } = require('./lib/bot-setup');
 const { acquire: acquireLock } = require('./lib/lock');
@@ -2602,7 +2604,56 @@ async function recordPay(tg, chatId, user, cpId, amount, kind) {
     ]));
 }
 
+/*
+ * Ответ голосом.
+ *
+ * Спросили голосом — отвечаем и голосом: человек за рулём или с товаром в
+ * руках читать не будет. Текст при этом тоже приходит — его можно
+ * перечитать и переслать. Синтез стоит денег, поэтому он в общем кошельке
+ * ИИ и упирается в тот же предел; кончился предел — отвечаем текстом молча,
+ * ответ-то уже есть.
+ */
+async function replyVoice(tg, chatId, user, text) {
+  if (typeof tg.sendVoice !== 'function' || !tts.ttsAvailable() || !bdb.isVoiceReply(user.id)) return false;
+  if (ai.budget(user.id).left <= 0) return false;
+  await tg.sendChatAction(chatId, 'record_voice');
+  ai.spend(user.id);
+  const got = await tts.synthesize(text, { format: 'ogg' });
+  if (got.spent) ai.spend(user.id, got.spent);
+  if (!got.ok || got.format !== 'ogg') {
+    Promise.resolve(office.record({ kind: 'tts', where: 'бот', error: String(got.error || got.oggError || ''), userId: user.id }))
+      .catch(() => {});
+    return false;
+  }
+  try {
+    await tg.sendVoice(chatId, {
+      buffer: got.buffer, duration: got.seconds,
+      buttons: [[{ text: '🔇 Отвечать текстом', data: 'voice.off' }]],
+    });
+    return true;
+  } catch (e) {
+    // Голосовые можно запретить в приватности Telegram. Это выбор человека,
+    // а не поломка: запоминаем и дальше не пытаемся.
+    if (e.forbidden) {
+      bdb.setVoiceReply(user.id, false);
+      await tg.sendMessage(chatId, 'Голосовые сообщения у вас закрыты в настройках Telegram — дальше отвечаю текстом.');
+    }
+    return false;
+  }
+}
+
+const VOICE_OFF = /^(?:отвечай|отвечать|пиши|ответь)\s+(?:мне\s+)?(?:текстом|буквами|письменно)|^(?:не\s+отвечай|хватит\s+отвечать)\s+голосом/i;
+const VOICE_ON = /^(?:отвечай|отвечать|ответь|говори)\s+(?:мне\s+)?(?:голосом|вслух)/i;
+
 async function handleFreeText(tg, chatId, user, text, opts = {}) {
+  // «Отвечай текстом» / «отвечай голосом» — настройка словами, без меню.
+  if (VOICE_OFF.test(String(text).trim()) || VOICE_ON.test(String(text).trim())) {
+    const on = bdb.setVoiceReply(user.id, VOICE_ON.test(String(text).trim()));
+    await tg.sendMessage(chatId, on
+      ? 'Хорошо: на голосовые отвечаю голосом и текстом.'
+      : 'Хорошо: отвечаю только текстом. Вернуть голос — скажите «отвечай голосом».', mainMenu());
+    return true;
+  }
   if (!opts.isVoice) {
     bdb.saveAiMessage({ userId: user.id, source: 'bot', role: 'user', type: 'text', text });
   }
@@ -2626,7 +2677,12 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
     });
   };
 
-  if (intent.action === 'debts') { logAiReply('Показываю долги'); await showDebts(tg, chatId, user); return true; }
+  if (intent.action === 'debts') {
+    logAiReply('Показываю долги');
+    await showDebts(tg, chatId, user);
+    if (opts.isVoice) await replyVoice(tg, chatId, user, consult.spokenDebts(user.id));
+    return true;
+  }
   if (intent.action === 'unpaid') { logAiReply('Показываю неоплаченные счета'); await showUnpaid(tg, chatId, user); return true; }
   if (intent.action === 'docs') { logAiReply('Показываю документы'); await showDocs(tg, chatId, user); return true; }
   if (intent.action === 'cps') { logAiReply('Показываю контрагентов'); await showCps(tg, chatId, user); return true; }
@@ -2734,6 +2790,7 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
     if (got.text) {
       logAiReply(got.from === 'base' ? `Справка из базы (${got.id})` : 'Справка моделью, не сверено');
       await tg.sendMessage(chatId, esc(got.text), mainMenu());
+      if (opts.isVoice) await replyVoice(tg, chatId, user, got.text);
       return true;
     }
     logAiReply('Вне компетенции (налоги, зарплата)');
@@ -2884,6 +2941,26 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
    * на самом деле, и чему учить агента дальше. Команды не пишем: они
    * начинаются со слэша и ничего о живой речи не говорят.
    */
+  /*
+   * Не команда — значит, вопрос. Раньше здесь был тупик «не понял», и на
+   * «чем акт отличается от УПД» или «что написать Заре, она тянет с
+   * оплатой» человек уходил искать ответ в чужих чатах. Теперь отвечает
+   * помощник — по данным самого человека и с памятью разговора.
+   */
+  if (!String(text || '').startsWith('/') && consult.consultAvailable()) {
+    await tg.sendChatAction(chatId, 'typing');
+    const got = await consult.reply(user.id, text);
+    if (got.ok) {
+      logAiReply(got.text);
+      await tg.sendMessage(chatId, esc(got.text), mainMenu());
+      if (opts.isVoice) await replyVoice(tg, chatId, user, got.text);
+      return true;
+    }
+    if (got.from === 'error') {
+      Promise.resolve(office.record({ kind: 'ai', where: 'помощник', error: String(got.error || ''), userId: user.id }))
+        .catch(() => {});
+    }
+  }
   if (!String(text || '').startsWith('/')) {
     logAiReply('Не понял');
     office.record({ kind: 'unknown', where: 'bot', text, userId: user.id }).catch(() => {});
@@ -5864,6 +5941,14 @@ async function handleCallback(tg, cq) {
         'Пришлите код доступа — он выглядит так: <code>PRV-A3KD-9MQX</code>.\n\n'
         + '<i>Регистр и дефисы неважны.</i>',
         keyboard([[{ text: '✖️ Отмена', data: 'billing' }]]));
+      return;
+    }
+    if (data === 'voice.off' || data === 'voice.on') {
+      const on = bdb.setVoiceReply(user.id, data === 'voice.on');
+      await tg.sendMessage(chatId, on
+        ? 'Снова отвечаю на голосовые голосом.'
+        : 'Понял, дальше отвечаю только текстом.',
+      keyboard([[on ? { text: '🔇 Отвечать текстом', data: 'voice.off' } : { text: '🔊 Отвечать голосом', data: 'voice.on' }]]));
       return;
     }
     if (data === 'support') { await showSupport(tg, chatId, user); return; }

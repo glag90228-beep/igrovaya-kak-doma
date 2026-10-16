@@ -637,6 +637,16 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   background: color-mix(in srgb, var(--primary) 12%, transparent);
 }
 
+/* Режимы помощника над перепиской. «Разговор» во время работы дышит —
+   видно, что микрофон и голос включены, даже не глядя на кнопку записи. */
+.ask-modes { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 var(--pad) 10px; }
+.chip.talk[aria-pressed="true"] { animation: talk-breath 1.6s ease-in-out infinite; }
+@keyframes talk-breath {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--primary) 35%, transparent); }
+  50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--primary) 0%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) { .chip.talk[aria-pressed="true"] { animation: none; } }
+
 .total-row {
   display: flex; justify-content: space-between; align-items: baseline;
   padding: 16px var(--pad); border-top: 1px solid var(--hairline);
