@@ -1118,7 +1118,19 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
    */
   const unseen = !res.debt && res.total > 0 && bdb.DEBT_DOCS.closing.includes(type)
     && ['manual', 'invoice'].includes(res.basis);
-  const ledger = res.debt
+  /*
+   * Нулевая сумма — отдельная причина «долга нет», и она не про основание.
+   *
+   * Быстрые позиции под профессию кладутся в список без цены, и накладная из
+   * них выходит на 0 ₽: проводку на ноль не пишем, а раньше бот об этом молчал.
+   * Человек видел ноль в карточке клиента и винил основание долга, хотя
+   * переключать там нечего — нужно проставить цены.
+   */
+  const zeroSum = !res.debt && !(res.total > 0) && bdb.DEBT_DOCS.closing.includes(type);
+  const ledger = zeroSum
+    ? '\n\n<i>Сумма документа 0 ₽ — долг клиента не записан: у позиций не указана цена. '
+      + 'Выпишите документ заново с ценами.</i>'
+    : res.debt
     ? `\n<i>Долг ${formatRub(res.total)} внесён в журнал. Пришли деньги — нажмите «Оплачено».</i>`
     : (unseen ? `\n\n<i>${res.basis === 'manual'
       ? 'В долг клиента не попал: выбрано «журнал веду сам».'

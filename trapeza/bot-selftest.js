@@ -3387,6 +3387,32 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(bdb3.balanceOf(uid, paidCp).closing === 0, 'одно нажатие закрывает долг',
       bdb3.balanceOf(uid, paidCp).closing);
 
+    /*
+     * ТОРГ-12 на 0 ₽ (позиция из быстрых, цена не проставлена): долга нет, и
+     * причина не в основании. Бот обязан сказать про цены, а не про настройку
+     * и не звать переключать основание — переключать нечего.
+     */
+    const zeroCp = bdb3.createCp(uid, { name: 'ООО «Без цены»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.torg12:${zeroCp}`);
+    await say('Кабель; 2; 0');
+    await tap('items.done');
+    await tap('doc.make');
+    const zeroFile = files[files.length - 1] || {};
+    ok(bdb3.balanceOf(uid, zeroCp).closing === 0, 'накладная на 0 ₽ долга не создаёт',
+      bdb3.balanceOf(uid, zeroCp).closing);
+    ok(/0 ₽ — долг клиента не записан/.test(zeroFile.caption || '') && /цена/.test(zeroFile.caption || ''),
+      'и бот объясняет: сумма нулевая, нужны цены', (zeroFile.caption || '').slice(-200));
+    ok(!fileBtn(zeroFile, 'basis.set:closing'), 'кнопки смены основания при нулевой сумме нет');
+
+    // Чистая организация: ТОРГ-12 на 4000 ₽ сразу даёт долг 4000 (основание по умолчанию).
+    const ds4 = require('./lib/doc-service');
+    const cleanCp = bdb3.createCp(uid, { name: 'ООО «Чистый»', kind: 'customer', opening_date: '2026-01-01' });
+    const made4 = await ds4.issueDocument(uid, {
+      type: 'torg12', cpId: cleanCp, items: [{ name: 'Кабель', qty: 2, price: 2000 }],
+    });
+    ok(made4.ok && made4.debt === true && bdb3.balanceOf(uid, cleanCp).closing === 4000,
+      'ТОРГ-12 на 4000 ₽ даёт долг 4000', bdb3.balanceOf(uid, cleanCp).closing);
+
     // «Оплатил» рядом с должником в «Кто должен».
     const owesCp = bdb3.createCp(uid, { name: 'ООО «Должник»', kind: 'customer', opening_date: '2026-01-01' });
     await tap(`d.usl:${owesCp}`);
