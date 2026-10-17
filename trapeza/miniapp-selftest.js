@@ -2481,6 +2481,91 @@ async function main() {
     if (was === undefined) delete process.env.SUPPORT_CHAT_ID; else process.env.SUPPORT_CHAT_ID = was;
   }
 
+  section('CRM: вкладка, лента и напоминания');
+  {
+    /*
+     * Вкладка CRM держится на трёх запросах: список напоминаний, их закрытие
+     * и общая лента. Раньше ни один из них не проверялся вовсе — а ошибка тут
+     * самая дорогая: чужая заметка в своей ленте или чужое напоминание,
+     * которое можно закрыть по номеру.
+     */
+    const crmLib = require('./lib/crm');
+    const mu = bdb.getOrCreateUser(MASHA.id);
+    const pu = bdb.getOrCreateUser(PETYA.id);
+    const myCp = bdb.createCp(mu.id, { name: 'ООО «CRM-Клиент»', kind: 'customer' });
+    const hisCp = bdb.createCp(pu.id, { name: 'ООО «Чужой клиент»', kind: 'customer' });
+    const today = docService.todayISO();
+
+    r = await call('GET', '/api/crm/feed');
+    ok(r.status === 401, 'лента CRM без подписи не отдаётся', r.status);
+
+    r = await call('POST', '/api/crm/note', { user: masha, body: { cpId: myCp, text: 'Договорились на пятницу' } });
+    ok(r.json && r.json.id > 0, 'заметка по своему клиенту сохраняется', JSON.stringify(r.json));
+    r = await call('POST', '/api/crm/note', { user: petya, body: { cpId: hisCp, text: 'Секрет Петра' } });
+    ok(r.json && r.json.id > 0, 'у Петра своя заметка');
+
+    r = await call('GET', '/api/crm/feed', { user: masha });
+    const feedItems = (r.json && r.json.items) || [];
+    const mine = feedItems.find((i) => i.text === 'Договорились на пятницу');
+    ok(r.status === 200 && Boolean(mine), 'своя заметка в общей ленте', JSON.stringify(feedItems).slice(0, 120));
+    ok(mine && mine.kind === 'note' && mine.cpId === myCp && mine.cpName === 'ООО «CRM-Клиент»',
+      'у события есть вид, клиент и его название');
+    ok(!JSON.stringify(feedItems).includes('Секрет Петра') && !JSON.stringify(feedItems).includes('Чужой клиент'),
+      'чужих заметок и клиентов в ленте нет');
+    ok(feedItems.every((it, i) => i === 0 || String(feedItems[i - 1].at) >= String(it.at)),
+      'лента идёт от свежего к старому');
+
+    // Напоминания: просроченное, на сегодня и на потом — сервер сам помечает срок.
+    const mk = (uid, cpId, shift, text) => {
+      const f = crmLib.addFollowup(uid, cpId, { today, days: 1, text });
+      require('./db').db.prepare('UPDATE cp_followups SET due = ? WHERE id = ?').run(crmLib.plusDays(today, shift), f.id);
+      return f.id;
+    };
+    const fLate = mk(mu.id, myCp, -3, 'Просрочено: позвонить');
+    const fToday = mk(mu.id, myCp, 0, 'Сегодня: отправить акт');
+    const fSoon = mk(mu.id, myCp, 5, 'Скоро: согласовать');
+    const fHis = mk(pu.id, hisCp, 0, 'Чужое напоминание');
+
+    r = await call('GET', '/api/crm/followups', { user: masha });
+    const fl = (r.json && r.json.followups) || [];
+    const by = (id) => fl.find((f) => f.id === id) || {};
+    ok(by(fLate).overdue === true && by(fToday).today === true && !by(fSoon).overdue && !by(fSoon).today,
+      'просрочено / сегодня / скоро размечены сервером');
+    ok(!fl.some((f) => f.id === fHis), 'чужого напоминания в списке нет');
+
+    r = await call('POST', '/api/crm/followup/done', { user: masha, body: { id: fHis } });
+    ok(r.json && r.json.error, 'чужое напоминание закрыть нельзя', JSON.stringify(r.json));
+    r = await call('POST', '/api/crm/followup/snooze', { user: masha, body: { id: fHis, days: 3 } });
+    ok(r.json && r.json.error, 'и отложить его тоже', JSON.stringify(r.json));
+
+    r = await call('POST', '/api/crm/followup/done', { user: masha, body: { id: fToday } });
+    ok(r.json && r.json.ok, '«Сделано» закрывает своё напоминание');
+    r = await call('POST', '/api/crm/followup/snooze', { user: masha, body: { id: fLate, days: 3 } });
+    ok(r.json && r.json.ok, '«Отложить» сдвигает просроченное');
+    r = await call('GET', '/api/crm/followups', { user: masha });
+    const after = (r.json && r.json.followups) || [];
+    ok(!after.some((f) => f.id === fToday), 'закрытое пропало из списка');
+    const moved = after.find((f) => f.id === fLate);
+    ok(moved && moved.due === crmLib.plusDays(today, 3) && !moved.overdue,
+      'отложенное — через три дня от сегодня и уже не просрочено', moved && moved.due);
+  }
+
+  section('вкладка CRM в разметке приложения');
+  {
+    // Файл приложения в этом прогоне не исполняется, а вкладка — это строка
+    // в таблице; проверяем, что она на месте и что значок есть в спрайте.
+    const fs = require('node:fs');
+    const js = fs.readFileSync('./public/app/app.js', 'utf8');
+    const html = fs.readFileSync('./public/app/index.html', 'utf8');
+    ok(/\{ name: 'crm', label: 'CRM', icon: 'bell' \}/.test(js), 'вкладка CRM есть в нижней панели');
+    ok(/screens\.crm = async function/.test(js), 'у вкладки есть экран');
+    ok(html.includes('id="i-bell"'), 'значок вкладки есть в спрайте');
+    ok(html.includes('<nav id="tabs"'), 'нижняя панель есть в разметке');
+    // Вкладок ровно пять: шестая на узком экране уже не помещается.
+    const tabs = /const TABS = \[([\s\S]*?)\n\];/.exec(js)[1].match(/name: '/g) || [];
+    ok(tabs.length === 5, 'в панели пять вкладок', tabs.length);
+  }
+
   section('публичная ссылка /d/ не роняет сервер');
   {
     /*

@@ -129,4 +129,35 @@ function timeline(userId, cpId, limit = 25) {
   return items.slice(0, limit);
 }
 
-module.exports = { addNote, addFollowup, dueFollowups, markSent, done, snooze, openFollowups, allOpenFollowups, timeline, plusDays };
+/**
+ * Общая лента по всем клиентам — для вкладки CRM: что происходило недавно.
+ *
+ * Берём только то, что человек сам сделал руками или выписал: заметки и
+ * документы. Проводки и напоминания должникам в ленту не тянем — по каждому
+ * клиенту их пришлось бы считать отдельно, а на вкладке они только заглушили
+ * бы заметки. Полная лента одного клиента по-прежнему в timeline().
+ *
+ * Имена берём с проверкой user_id: событие не должно тащить за собой название
+ * чужой записи, даже если cp_id когда-то разошёлся. Документ или заметка
+ * удалённого клиента в ленту не попадают — открыть им нечего.
+ */
+function recentEvents(userId, limit = 30) {
+  const bdb = require('./bot-db');
+  const names = new Map(bdb.listCps(userId).map((c) => [c.id, c.name]));
+  const items = [];
+  for (const d of bdb.listDocs(userId, 80)) {
+    if (!names.has(d.cp_id)) continue;
+    items.push({
+      kind: d.paid_at ? 'paid' : 'doc', at: String(d.date || '').slice(0, 10), cpId: d.cp_id, cpName: names.get(d.cp_id),
+      text: `${d.title} № ${d.number}${d.total ? ` — ${Math.round(d.total).toLocaleString('ru-RU')} ₽` : ''}${d.paid_at ? ' · оплачен' : ''}`,
+    });
+  }
+  for (const n of db.prepare('SELECT * FROM cp_notes WHERE user_id = ? ORDER BY id DESC LIMIT 80').all(userId)) {
+    if (!names.has(n.cp_id)) continue;
+    items.push({ kind: 'note', at: String(n.at), cpId: n.cp_id, cpName: names.get(n.cp_id), text: n.text });
+  }
+  items.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+  return items.slice(0, Math.max(1, Math.min(60, Number(limit) || 30)));
+}
+
+module.exports = { addNote, addFollowup, dueFollowups, markSent, done, snooze, openFollowups, allOpenFollowups, timeline, recentEvents, plusDays };

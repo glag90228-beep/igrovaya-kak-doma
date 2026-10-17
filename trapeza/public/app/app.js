@@ -144,7 +144,12 @@ const TABS = [
   { name: 'home', label: 'Главная', icon: 'home' },
   { name: 'docs', label: 'Документы', icon: 'doc' },
   { name: 'cps', label: 'Клиенты', icon: 'users' },
-  { name: 'debts', label: 'Долги', icon: 'wallet' },
+  /*
+   * Вместо «Долгов»: мест в панели пять, а напоминания и заметки владелец
+   * искал и не находил — они жили в карточке клиента. Долги не пропали: они
+   * первой строкой на вкладке «Ещё» и под суммой на главной.
+   */
+  { name: 'crm', label: 'CRM', icon: 'bell' },
   { name: 'more', label: 'Ещё', icon: 'more' },
 ];
 
@@ -177,7 +182,24 @@ const PARENT = {
   billing: 'more', support: 'more', help: 'more', vat: 'more', basis: 'more',
   recurring: 'more', reminders: 'more', registry: 'docs', akt: 'docs',
   unpaid: 'home', scan: 'docs', ops: 'cps', ask: 'home', bankclose: 'debts',
+  debts: 'more',
 };
+
+/*
+ * Какая вкладка подсвечена. Внутри вложенного экрана панель остаётся на виду,
+ * и подсвечивать надо ту вкладку, откуда человек пришёл: карточку клиента
+ * можно открыть и из «Клиентов», и из «CRM», и из «Главной». Сама вкладка
+ * подсвечивается всегда; для вложенного экрана берём первый элемент
+ * стопки — это и есть начало пути; если он сам не вкладка (экран открыт
+ * через reset, например после внесения оплаты), идём по родителям.
+ */
+function tabOf(name) {
+  const isTab = (n) => TABS.some((t) => t.name === n);
+  if (isTab(name)) return name;
+  if (isTab(stack[0].name)) return stack[0].name;
+  for (let n = name, i = 0; n && i < 4; n = PARENT[n], i += 1) if (isTab(n)) return n;
+  return 'home';
+}
 
 function back() {
   if (stack.length > 1) { stack.pop(); render(); return; }
@@ -198,12 +220,52 @@ async function afterIssue() {
   reset(st.bizType ? 'home' : 'basis');
 }
 
+/*
+ * Счётчик на вкладке CRM: сколько напоминаний просрочено или назначено на
+ * сегодня. Это единственное, что должно звать человека во вкладку само —
+ * остальное он откроет, когда захочет.
+ *
+ * Запрашиваем не на каждый экран: счётчик не должен стоить запроса при любом
+ * переходе. Экраны, которые и так грузят напоминания, сообщают число сами
+ * (noteFollowups), а после «Сделано»/«Отложить» обновляем принудительно.
+ */
+let crmDue = 0;
+let crmAsked = 0;
+
+function crmBadgeEl() { return h('span', { class: 'tab-badge', hidden: true, 'aria-hidden': 'true' }); }
+
+function paintCrmBadge() {
+  for (const el of document.querySelectorAll('.tab-badge')) {
+    el.hidden = crmDue === 0;
+    el.textContent = crmDue > 9 ? '9+' : String(crmDue);
+  }
+  const btn = tabsBox.querySelector('[data-name="crm"]');
+  if (btn) {
+    btn.setAttribute('aria-label', crmDue
+      ? `CRM, ${crmDue} ${plural(crmDue, 'напоминание', 'напоминания', 'напоминаний')} на сегодня и раньше` : 'CRM');
+  }
+}
+
+/** Экран получил список напоминаний — заодно обновляем счётчик. */
+function noteFollowups(list) {
+  crmDue = list.filter((f) => f.overdue || f.today).length;
+  crmAsked = Date.now();
+  paintCrmBadge();
+}
+
+async function refreshCrmBadge(force) {
+  if (!initData || (!force && Date.now() - crmAsked < 30000)) return;
+  crmAsked = Date.now();
+  try { noteFollowups((await api('GET', '/api/crm/followups')).followups); } catch (_) { /* счётчик не критичен */ }
+}
+
 // Заголовок шапки для экранов, которых нет во вкладках.
 const TITLES = {
   cp: 'Клиент', op: 'Операция', doc: 'Документ', new: 'Новый документ',
   inbox: 'Почта', letter: 'Письмо', mail: 'Почта', bank: 'Банк', org: 'Организация',
   billing: 'Тариф', support: 'Поддержка', help: 'Помощь', ask: 'Помощник',
   recurring: 'По расписанию', reminders: 'Напоминания', unpaid: 'Не оплачено',
+  debts: 'Долги',
 };
 
 const topbar = document.getElementById('topbar');
@@ -290,7 +352,7 @@ function buildChrome() {
     h('nav', { 'aria-label': 'Разделы' }, TABS.map((t) => h('button', {
       class: 'drawer-item', type: 'button', dataset: { name: t.name },
       onclick: () => go1(t.name),
-    }, icon(t.icon), h('span', { text: t.label })))));
+    }, icon(t.icon), h('span', { text: t.label }), t.name === 'crm' ? crmBadgeEl() : null))));
 
   scrim.addEventListener('click', () => setDrawer(false));
   document.addEventListener('click', (e) => { if (!e.target.closest('.tb-actions')) closeActions(); });
@@ -310,12 +372,13 @@ function syncChrome() {
   tabsBox.hidden = false;
   const title = document.getElementById('tb-title');
   if (title) title.textContent = sectionTitle(name);
+  const lit = tabOf(name);
   for (const btn of drawer.querySelectorAll('.drawer-item')) {
-    if (btn.dataset.name === name) btn.setAttribute('aria-current', 'page');
+    if (btn.dataset.name === lit) btn.setAttribute('aria-current', 'page');
     else btn.removeAttribute('aria-current');
   }
   for (const btn of tabsBox.children) {
-    const active = btn.dataset.name === name;
+    const active = btn.dataset.name === lit;
     if (active) btn.setAttribute('aria-current', 'page');
     else btn.removeAttribute('aria-current');
   }
@@ -330,6 +393,7 @@ async function render() {
   // запоздавший ответ не должен затирать новый экран старым.
   const seq = ++renderSeq;
   syncChrome();
+  refreshCrmBadge();
   if (tg) tg.MainButton.hide();
   const build = screens[name] || screens.home;
   app.replaceChildren(skeleton());
@@ -642,17 +706,18 @@ screens.home = async function home() {
    * Владелец открыл приложение и мини-CRM не нашёл: она была только в боте.
    */
   const fuAll = await api('GET', '/api/crm/followups').catch(() => ({ followups: [] }));
+  noteFollowups(fuAll.followups);
   const fuNow = fuAll.followups.filter((f) => f.overdue || f.today);
   if (fuNow.length) {
     box.append(h('div', { class: 'section-title', text: 'Напоминания' }),
       h('div', { class: 'card' }, followupRows(fuNow.slice(0, 5), () => render(), true)));
   }
   box.append(h('div', { class: 'card' }, navRow({
-    icon: 'pen', title: 'Клиенты и заметки',
+    icon: 'bell', title: 'CRM: напоминания и заметки',
     sub: fuAll.followups.length
-      ? `${fuAll.followups.length} ${plural(fuAll.followups.length, 'напоминание', 'напоминания', 'напоминаний')} · история, заметки`
-      : 'история, заметки, «напомнить мне»',
-    onclick: () => reset('cps'),
+      ? `${fuAll.followups.length} ${plural(fuAll.followups.length, 'напоминание', 'напоминания', 'напоминаний')} · заметки по клиентам`
+      : 'заметки по клиентам, «напомнить мне»',
+    onclick: () => reset('crm'),
   })));
 
   if (!s.orgReady) {
@@ -1411,12 +1476,12 @@ screens.doc = async function docScreen({ id }) {
  */
 const FU_DAYS = [[1, 'Завтра'], [3, 'Через 3 дня'], [7, 'Через неделю'], [14, 'Через 2 недели']];
 
-/** Строки напоминаний с «Готово» и «Отложить на 3 дня»; after — перерисовать. */
+/** Строки напоминаний с «Сделано» и «Отложить на 3 дня»; after — перерисовать. */
 function followupRows(list, after, withCp) {
   return list.map((f) => {
     const late = f.overdue;
     const act = async (path, body, msg) => {
-      try { await api('POST', path, body); toast(msg); haptic('medium'); await after(); }
+      try { await api('POST', path, body); toast(msg); haptic('medium'); refreshCrmBadge(true); await after(); }
       catch (e) { toast(e.message, true); }
     };
     return h('div', { class: 'row fu-row' },
@@ -1426,7 +1491,7 @@ function followupRows(list, after, withCp) {
         h('div', { class: `small ${late ? 'fu-late' : 'muted'}`,
           text: `${late ? 'просрочено · ' : (f.today ? 'сегодня · ' : '')}${ru(f.due)}${withCp && f.cpName ? ` · ${f.cpName}` : ''}` }),
         h('div', { class: 'fu-btns' },
-          h('button', { class: 'btn small-btn', onclick: () => act('/api/crm/followup/done', { id: f.id }, 'Готово') }, 'Готово'),
+          h('button', { class: 'btn small-btn', onclick: () => act('/api/crm/followup/done', { id: f.id }, 'Отмечено') }, 'Сделано'),
           h('button', { class: 'btn secondary small-btn', onclick: () => act('/api/crm/followup/snooze', { id: f.id, days: 3 }, 'Отложил на 3 дня') }, 'Отложить на 3 дня'),
           withCp && f.cpId && h('button', { class: 'btn ghost small-btn', onclick: () => go('cp', { id: f.cpId }) }, 'К клиенту'))));
   });
@@ -1448,7 +1513,7 @@ function crmBlock(cpId) {
       class: 'btn secondary small-btn',
       onclick: (e) => withBusy(e.currentTarget, async () => {
         await api('POST', '/api/crm/followup', { cpId, days, text: fuText.value.trim() });
-        toast(`Напомню: ${label.toLowerCase()}`); haptic('medium'); await draw();
+        toast(`Напомню: ${label.toLowerCase()}`); haptic('medium'); refreshCrmBadge(true); await draw();
       }),
     }, label)));
     const feed = items.length
@@ -1471,14 +1536,92 @@ function crmBlock(cpId) {
   return wrap;
 }
 
+/*
+ * Вкладка CRM: всё, что нужно не забыть, и что происходило у клиентов.
+ *
+ * Раньше напоминания и заметки жили только внутри карточки клиента — зайти
+ * туда можно, лишь уже помня, о ком речь, а CRM нужна ровно наоборот: чтобы
+ * приложение само напомнило. Поэтому наверху — что горит, ниже — что скоро,
+ * в конце — свежие события по всем клиентам сразу. Править и добавлять
+ * заметки по-прежнему удобнее в карточке клиента (кнопка «К клиенту»).
+ */
+const FEED_ICON = { note: 'pen', doc: 'doc', paid: 'doc-check' };
+
+screens.crm = async function crmScreen() {
+  const [fu, feed, cpsRes] = await Promise.all([
+    api('GET', '/api/crm/followups'),
+    api('GET', '/api/crm/feed').catch(() => ({ items: [] })),
+    api('GET', '/api/cps').catch(() => ({ cps: [] })),
+  ]);
+  noteFollowups(fu.followups);
+  const box = h('div', {}, h('h1', { text: 'CRM' }));
+  const list = cpsRes.cps;
+  const redraw = () => render();
+
+  // Быстрое «напомнить»: клиент, о чём, когда. Для длинных заметок — карточка клиента.
+  if (list.length) {
+    const who = h('select', { id: 'crm-cp' }, list.map((c) => h('option', { value: c.id, text: c.name })));
+    const text = h('input', { id: 'crm-q-text', type: 'text', maxlength: '300', autocomplete: 'off', placeholder: 'Например: позвонить по счёту' });
+    const days = h('div', { class: 'fu-btns' }, FU_DAYS.map(([d, label]) => h('button', {
+      class: 'btn secondary small-btn',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        await api('POST', '/api/crm/followup', { cpId: Number(who.value), days: d, text: text.value.trim() });
+        toast(`Напомню: ${label.toLowerCase()}`); haptic('medium');
+        refreshCrmBadge(true); redraw();
+      }),
+    }, label)));
+    box.append(h('div', { class: 'section-title', text: 'Новое напоминание' }),
+      h('div', { class: 'card crm-form' },
+        h('div', { class: 'field' }, h('label', { for: 'crm-cp', text: 'Клиент' }), who),
+        h('div', { class: 'field' }, h('label', { for: 'crm-q-text', text: 'О чём напомнить' }), text, days)));
+  }
+
+  const groups = [
+    ['Просрочено', fu.followups.filter((f) => f.overdue)],
+    ['Сегодня', fu.followups.filter((f) => f.today)],
+    ['Скоро', fu.followups.filter((f) => !f.overdue && !f.today)],
+  ];
+  if (!fu.followups.length) {
+    box.append(empty('bell', 'Напоминаний пока нет',
+      list.length
+        ? 'Выберите клиента выше, напишите, о чём напомнить, и нажмите срок. В этот день бот напишет вам сам.'
+        : 'Сначала добавьте клиента — потом к нему можно привязать напоминание и заметки.',
+      list.length ? null : h('div', { class: 'btn-wrap' },
+        h('button', { class: 'btn', onclick: () => go('cp', {}) }, 'Добавить контрагента'))));
+  }
+  for (const [title, rows] of groups) {
+    if (!rows.length) continue;
+    box.append(h('div', { class: 'section-title', text: `${title} · ${rows.length}` }),
+      h('div', { class: 'card' }, followupRows(rows, redraw, true)));
+  }
+
+  box.append(h('div', { class: 'section-title', text: 'Недавно у клиентов' }));
+  box.append(h('div', { class: 'card' }, feed.items.length
+    ? feed.items.map((it) => h('button', { class: 'row', onclick: () => { haptic(); go('cp', { id: it.cpId }); } },
+      h('span', { class: 'icon-box' }, icon(FEED_ICON[it.kind] || 'doc')),
+      h('span', { class: 'grow' },
+        h('div', { class: 'feed-text', text: it.text }),
+        h('div', { class: 'small muted ellipsis', text: `${it.cpName} · ${ru(String(it.at).slice(0, 10))}` })),
+      icon('chev', 'chev')))
+    : h('div', { class: 'row muted', text: 'Пока тихо: заметки и выписанные документы появятся здесь.' })));
+  return box;
+};
+
 screens.cps = async function cps() {
   const { cps: list } = await api('GET', '/api/cps');
   const box = h('div', {}, h('h1', { text: 'Контрагенты' }));
-  // Напоминания — первым делом: в список заходят, в том числе, чтобы вспомнить, кому позвонить.
+  // Сами напоминания переехали на вкладку CRM; здесь остаётся короткая
+  // дорожка к ним — в список заходят, в том числе, чтобы вспомнить, кому позвонить.
   const fu = await api('GET', '/api/crm/followups').catch(() => ({ followups: [] }));
+  noteFollowups(fu.followups);
   if (fu.followups.length) {
-    box.append(h('div', { class: 'section-title', text: 'Напоминания' }),
-      h('div', { class: 'card' }, followupRows(fu.followups, () => render(), true)));
+    const hot = fu.followups.filter((f) => f.overdue || f.today).length;
+    box.append(h('div', { class: 'card' }, navRow({
+      icon: 'bell', tone: hot ? 'warn' : '',
+      title: `${fu.followups.length} ${plural(fu.followups.length, 'напоминание', 'напоминания', 'напоминаний')}`,
+      sub: hot ? `${hot} — срок сегодня или уже прошёл` : 'ближайшие — на вкладке CRM',
+      onclick: () => reset('crm'),
+    })));
   }
   if (list.length) box.append(h('div', { class: 'small muted crm-hint', text: 'Откройте клиента — там история, заметки и «напомнить мне».' }));
   if (!list.length) {
@@ -2171,6 +2314,14 @@ screens.more = async function more() {
     })));
   box.append(h('div', { class: 'section-title', text: 'Работа' }));
   box.append(h('div', { class: 'card' },
+    navRow({
+      icon: 'wallet',
+      title: 'Кто сколько должен',
+      sub: s.counts && s.counts.debtors
+        ? `${s.counts.debtors} ${plural(s.counts.debtors, 'контрагент', 'контрагента', 'контрагентов')} · ${money0(s.debts.owedToUs)} вам`
+        : 'долгов нет',
+      onclick: () => go('debts'),
+    }),
     navRow({
       icon: 'mail',
       tone: s.mailbox ? 'ok' : '',
@@ -4931,7 +5082,8 @@ function buildTabs() {
   tabsBox.replaceChildren(...TABS.map((t) => h('button', {
     class: 'tab', dataset: { name: t.name }, type: 'button',
     onclick: () => { haptic(); reset(t.name); },
-  }, icon(t.icon), h('span', { text: t.label }))));
+  }, h('span', { class: 'tab-ico' }, icon(t.icon), t.name === 'crm' ? crmBadgeEl() : null),
+  h('span', { text: t.label }))));
 }
 
 // Вход для снимков экранов (miniapp-preview.js): открыть любой экран без

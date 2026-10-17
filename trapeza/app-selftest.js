@@ -652,6 +652,116 @@ const ok = (c, m, extra) => {
     bdb.updateOrg(user.id, bdb.getDefaultOrg(user.id).id, { vat_rate: '', vat_gross: 0, npd: 0 });
   }
 
+  /*
+   * Нижняя панель и вкладка CRM — настоящим браузером и касаниями.
+   *
+   * Серверные проверки не видят, что панель вообще нарисована, что она не
+   * закрывает последнюю строку списка и что счётчик на значке совпадает с
+   * тем, что лежит на вкладке. Владелец когда-то не нашёл CRM именно потому,
+   * что её не было на виду, — поэтому проверяем то, что видно глазами.
+   */
+  console.log('\n── нижняя панель и CRM ──');
+  {
+    const crmLib = require(path.join(APP, 'lib/crm'));
+    const { db } = require(path.join(APP, 'db'));
+    const today = docService.todayISO();
+    const mkFu = (shift, text) => {
+      const f = crmLib.addFollowup(user.id, cp, { today, days: 1, text });
+      db.prepare('UPDATE cp_followups SET due = ? WHERE id = ?').run(crmLib.plusDays(today, shift), f.id);
+    };
+    mkFu(-2, 'Просроченное дело');
+    mkFu(0, 'Дело на сегодня');
+    mkFu(6, 'Дело на потом');
+    crmLib.addNote(user.id, cp, 'Заметка для ленты');
+
+    await page.evaluate(() => window.__go('home'));
+    await page.waitForSelector('#tabs .tab');
+    const labels = await page.$$eval('#tabs .tab', (b) => b.map((x) => x.lastElementChild.textContent.trim()));
+    ok(labels.join('|') === 'Главная|Документы|Клиенты|CRM|Ещё', 'в панели пять вкладок, среди них CRM', labels.join('|'));
+
+    const geo = await page.evaluate(() => {
+      const t = document.getElementById('tabs').getBoundingClientRect();
+      return { bottom: Math.round(t.bottom), vh: window.innerHeight, pos: getComputedStyle(document.getElementById('tabs')).position };
+    });
+    ok(geo.pos === 'fixed' && geo.bottom === geo.vh, 'панель прибита к низу экрана', JSON.stringify(geo));
+    ok(await page.evaluate(() => document.querySelectorAll('#tabs .tab svg').length) === 5, 'у каждой вкладки есть значок-SVG');
+
+    // Счётчик: просроченное и сегодняшнее — два; «на потом» не считается.
+    await page.waitForFunction(() => {
+      const b = document.querySelector('.tab-badge');
+      return b && !b.hidden && b.textContent === '2';
+    }, null, { timeout: 5000 }).catch(() => {});
+    const badge = await page.evaluate(() => {
+      const b = document.querySelector('#tabs .tab-badge');
+      return b && !b.hidden ? b.textContent : 'нет';
+    });
+    ok(badge === '2', 'на значке CRM — две срочные задачи (просрочена и сегодня)', badge);
+
+    // Переключение настоящим касанием.
+    const tap = async (sel) => {
+      const b = await page.locator(sel).first().boundingBox();
+      await page.touchscreen.tap(b.x + b.width / 2, b.y + b.height / 2);
+      await page.waitForTimeout(700);
+    };
+    await tap('#tabs .tab[data-name="crm"]');
+    await page.waitForSelector('#app .section-title');
+    ok(await page.evaluate(() => document.querySelector('#tabs .tab[aria-current="page"]').dataset.name) === 'crm',
+      'касание по CRM открывает вкладку и подсвечивает её');
+    const titles = await page.$$eval('#app .section-title', (n) => n.map((x) => x.textContent));
+    ok(titles.some((t) => t.startsWith('Просрочено')) && titles.some((t) => t.startsWith('Сегодня'))
+      && titles.some((t) => t.startsWith('Скоро')), 'напоминания разложены: просрочено / сегодня / скоро', titles.join(' | '));
+    ok(await page.getByText('Заметка для ленты').count() === 1, 'в ленте событий есть заметка по клиенту');
+
+    // Панель не закрывает последнюю строку: докрутили вниз — низ контента выше верха панели.
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(200);
+    const clear = await page.evaluate(() => {
+      const last = [...document.querySelectorAll('#app .card')].pop().getBoundingClientRect();
+      return { last: Math.round(last.bottom), tabs: Math.round(document.getElementById('tabs').getBoundingClientRect().top) };
+    });
+    ok(clear.last <= clear.tabs, 'панель не перекрывает последнюю карточку', JSON.stringify(clear));
+
+    // «Сделано» убирает дело и пересчитывает счётчик.
+    await page.getByRole('button', { name: 'Сделано' }).first().tap();
+    await page.waitForTimeout(900);
+    ok(await page.getByText('Просроченное дело').count() === 0, '«Сделано» убирает просроченное дело');
+    const badge2 = await page.evaluate(() => {
+      const b = document.querySelector('#tabs .tab-badge');
+      return b && !b.hidden ? b.textContent : 'нет';
+    });
+    ok(badge2 === '1', 'счётчик на значке уменьшился до одного', badge2);
+
+    // «Отложить»: дело уходит из «сегодня» в «скоро», счётчик гаснет.
+    await page.getByRole('button', { name: 'Отложить на 3 дня' }).first().tap();
+    await page.waitForTimeout(900);
+    const badge3 = await page.evaluate(() => {
+      const b = document.querySelector('#tabs .tab-badge');
+      return b && !b.hidden ? b.textContent : 'нет';
+    });
+    ok(badge3 === 'нет', 'после «Отложить» срочных нет — счётчик исчез', badge3);
+
+    // Вложенный экран: панель на месте, подсвечена вкладка, откуда пришли.
+    await page.getByRole('button', { name: 'К клиенту' }).first().tap();
+    await page.waitForSelector('#crm-note', { timeout: 5000 });
+    const inner = await page.evaluate(() => ({
+      shown: !document.getElementById('tabs').hidden && document.getElementById('tabs').getBoundingClientRect().height > 40,
+      lit: document.querySelector('#tabs .tab[aria-current="page"]')?.dataset.name,
+    }));
+    ok(inner.shown, 'в карточке клиента панель остаётся на виду');
+    ok(inner.lit === 'crm', 'и подсвечена CRM — туда и вернёмся', inner.lit);
+
+    await tap('#tabs .tab[data-name="cps"]');
+    ok(await page.evaluate(() => document.querySelector('#tabs .tab[aria-current="page"]').dataset.name) === 'cps',
+      'из карточки по панели можно уйти в «Клиенты»');
+
+    // «Долги» ушли из панели, но не пропали: первая строка на вкладке «Ещё».
+    await tap('#tabs .tab[data-name="more"]');
+    await page.getByText('Кто сколько должен', { exact: true }).first().tap();
+    await page.waitForTimeout(700);
+    ok(await page.evaluate(() => document.getElementById('app').textContent.includes('Кто сколько должен') || document.getElementById('app').textContent.includes('Долгов нет')),
+      'экран долгов открывается из «Ещё»');
+  }
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();

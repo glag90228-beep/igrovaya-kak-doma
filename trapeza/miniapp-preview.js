@@ -155,6 +155,28 @@ async function seed() {
     if (i < 2) bdb.updateCp(user.id, id, { email: `buh${i + 1}@client.ru` });
   }
 
+  /*
+   * Мини-CRM: без напоминаний вкладка CRM на снимке — пустая заглушка, а
+   * смотреть там надо именно просрочку, «сегодня» и счётчик на вкладке.
+   * Срок через API не поставить раньше завтрашнего (напоминание «в прошлом»
+   * человек создать не может), поэтому правим его прямо в таблице.
+   */
+  {
+    const crm = require('./lib/crm');
+    const { db } = require('./db');
+    const today = docService.todayISO();
+    const fu = (cpIdx, shift, text) => {
+      const f = crm.addFollowup(user.id, ids[cpIdx], { today, days: 1, text });
+      db.prepare('UPDATE cp_followups SET due = ? WHERE id = ?').run(crm.plusDays(today, shift), f.id);
+    };
+    fu(1, -2, 'Позвонить по счёту № 2, обещали оплатить в пятницу');
+    fu(0, 0, 'Уточнить количество гостей на банкет');
+    fu(0, 0, 'Отправить акт на подпись');
+    fu(2, 4, 'Согласовать поставку на следующую неделю');
+    crm.addNote(user.id, ids[0], 'Договорились на пятницу: 60 канапе и обслуживание, оплата сразу после банкета');
+    crm.addNote(user.id, ids[1], 'Бухгалтер просила прислать акт сверки до конца месяца');
+  }
+
   // Пара позиций про запас, чтобы было видно «частые позиции».
   bdb.rememberItems(user.id, [
     { name: 'Кофе-брейк', unit: 'шт.', price: 480 },
@@ -178,6 +200,8 @@ const SHOTS = [
   { name: 'pustoy-schet', title: 'Новый счёт (пустой)', go: ['new', { type: 'sch' }] },
   { name: 'dokumenty', title: 'Документы', go: ['docs', {}] },
   { name: 'kontragenty', title: 'Контрагенты', go: ['cps', {}] },
+  { name: 'crm', title: 'CRM', go: ['crm', {}] },
+  { name: 'crm-nizhe', title: 'CRM: лента событий', go: ['crm', {}], scroll: 'bottom' },
   { name: 'dolgi', title: 'Долги', go: ['debts', {}] },
   { name: 'organizaciya', title: 'Моя организация', go: ['org', {}] },
   { name: 'podpiska', title: 'Подписка', go: ['billing', {}] },
@@ -266,9 +290,11 @@ async function main() {
   const made = [];
 
   for (const [themeName, theme] of Object.entries(THEMES)) {
+    // PREVIEW_WIDTH_PX=1080 — снимки шириной 1080 px при той же раскладке 390 px.
+    const px = Number(process.env.PREVIEW_WIDTH_PX) || 780;
     const ctx = await browser.newContext({
       viewport: { width: 390, height: 844 },
-      deviceScaleFactor: 2,
+      deviceScaleFactor: px / 390,
       colorScheme: themeName,
       locale: 'ru-RU',
     });
@@ -349,7 +375,9 @@ async function main() {
     const page = await ctx.newPage();
     page.on('pageerror', (e) => console.log(`  ⚠️ ошибка на странице (${themeName}): ${e.message}`));
 
-    for (const shot of SHOTS) {
+    // PREVIEW_ONLY=crm,glavnaya — снять только перечисленные экраны.
+    const only = (process.env.PREVIEW_ONLY || '').split(',').filter(Boolean);
+    for (const shot of SHOTS.filter((x) => !only.length || only.includes(x.name))) {
       await page.goto(base, { waitUntil: 'domcontentloaded' });
       await page.waitForSelector('#app .screen', { timeout: 15000 });
       /*

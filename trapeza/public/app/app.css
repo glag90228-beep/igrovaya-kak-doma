@@ -819,6 +819,18 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 }
 .tab .icon { width: 24px; height: 24px; }
 .tab { letter-spacing: .01em; }
+/* Счётчик напоминаний: красный кружок на углу значка. Цифра внутри, а не
+   голая точка — «есть что-то» и «горит три дела» человеку не одно и то же. */
+.tab-ico { position: relative; display: inline-flex; }
+.tab-badge {
+  position: absolute; top: -5px; left: 55%;
+  min-width: 17px; height: 17px; padding: 0 4px; box-sizing: border-box;
+  border-radius: 9px; background: var(--danger); color: #fff;
+  font: 700 11px/17px var(--font); text-align: center;
+  box-shadow: 0 0 0 2px var(--bg);
+}
+.tab-badge[hidden] { display: none; }
+.drawer-item .tab-badge { position: static; margin-left: auto; box-shadow: none; }
 
 
 /* ---------- шапка и боковая панель ---------- */
@@ -1230,5 +1242,7 @@ body.drawer-open { overflow: hidden; }
 .crm-form .field + .field { margin-top: 14px; }
 .crm-form textarea { width: 100%; margin-bottom: 8px; }
 .crm-hint { margin: -4px 0 8px; }
+.feed-text { overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.crm-form select { width: 100%; }
 .tl-row { align-items: flex-start; }
 .tl-ico { width: 28px; text-align: center; flex: none; }

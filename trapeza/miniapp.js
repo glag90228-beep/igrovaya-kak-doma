@@ -676,6 +676,15 @@ const api = {
     return { today, followups: crm.allOpenFollowups(user.id).map(fuBrief) };
   },
 
+  /**
+   * Лента событий по всем клиентам — для вкладки CRM.
+   * Своё берём только по user.id из подписи: параметров от клиента здесь нет,
+   * поэтому и подставлять чужое нечем.
+   */
+  async 'GET /api/crm/feed'({ user }) {
+    return { items: crm.recentEvents(user.id, 30) };
+  },
+
   async 'GET /api/cps'({ user }) {
     return { cps: bdb.listCps(user.id).map((cp) => cpBrief(user.id, cp)) };
   },
