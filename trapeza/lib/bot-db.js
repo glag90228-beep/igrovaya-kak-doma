@@ -2279,13 +2279,41 @@ function shipmentsOfMonth(userId, cpId, ym, orgId = null) {
   };
 }
 
-/** Уже выписанный акт за этот месяц (payload.monthAct), чтобы не выписать второй. */
-function monthActOf(userId, cpId, ym, orgId = null) {
+/** Все акты за этот месяц (payload.monthAct) по порядку выписки. */
+function monthActsOf(userId, cpId, ym, orgId = null) {
   const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
   const rows = db.prepare(
-    "SELECT * FROM documents WHERE user_id = ? AND org_id = ? AND cp_id = ? AND type = 'usl' AND payload LIKE ?",
+    "SELECT * FROM documents WHERE user_id = ? AND org_id = ? AND cp_id = ? AND type = 'usl' AND payload LIKE ? ORDER BY id",
   ).all(userId, org, cpId, '%"monthAct"%');
-  return rows.map(withPayload).find((r) => r.payload.monthAct === ym) || null;
+  return rows.map(withPayload).filter((r) => r.payload.monthAct === ym);
+}
+
+/** Первый акт за этот месяц: по нему видно, что месяц уже закрывали. */
+function monthActOf(userId, cpId, ym, orgId = null) {
+  return monthActsOf(userId, cpId, ym, orgId)[0] || null;
+}
+
+/**
+ * Отгрузки месяца, которые ещё не вошли ни в один акт.
+ *
+ * Отдельной отметки «вошло в акт» у накладной нет, и заводить её незачем: акт
+ * складывает ВСЕ отгрузки месяца, существовавшие в момент выписки, а номера
+ * документов растут. Значит, всё, что старше последнего акта месяца (по id), уже
+ * в нём, а что новее — например накладная 30-го числа после акта 28-го или
+ * задним числом внесённая — ещё нет. Так же получается без новых колонок и
+ * для актов, выписанных старой версией. Удалили акт — его отгрузки свободны.
+ */
+function openShipmentsOfMonth(userId, cpId, ym, orgId = null) {
+  const acts = monthActsOf(userId, cpId, ym, orgId);
+  const lastAct = acts.length ? acts[acts.length - 1].id : 0;
+  const all = shipmentsOfMonth(userId, cpId, ym, orgId);
+  const docs = all.docs.filter((d) => d.id > lastAct);
+  return {
+    docs,
+    sum: round2(docs.reduce((a, r) => a + (Number(r.total) || 0), 0)),
+    acts,
+    covered: all.docs.length - docs.length,
+  };
 }
 
 /**
@@ -2532,7 +2560,7 @@ module.exports = {
   orgQuota, grantOrgSlots,
   openingFor, setOpeningFor, cpOrgs,
   prepayFor, setPrepayMode, addPrepay, prepayState, prepayLine, settleFromPrepay,
-  setNoDebt, shipmentsOfMonth, monthActOf,
+  setNoDebt, shipmentsOfMonth, monthActOf, monthActsOf, openShipmentsOfMonth,
   nextSeqForOrg, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, seedItems, listTemplates, getTemplate, forgetTemplate,
   quota, docsThisMonth, freePerMonth,

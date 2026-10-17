@@ -2735,24 +2735,22 @@ async function doPrepay(tg, chatId, user, cpId, amount) {
     ]));
 }
 
-const MONTHS_RU = ['январь', 'февраль', 'март', 'апрель', 'май', 'июнь', 'июль', 'август',
-  'сентябрь', 'октябрь', 'ноябрь', 'декабрь'];
+const monthAct = require('./lib/month-act');
 
-/** Выбор месяца для акта: три последних, с суммой отгрузок на кнопке. */
+/** Выбор месяца для акта: три последних, с суммой не вошедших в акт отгрузок на кнопке. */
 async function askMonthAct(tg, chatId, user, cpId) {
   const cp = bdb.getCp(user.id, cpId);
   if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
-  const now = todayISO();
-  let y = Number(now.slice(0, 4)); let m = Number(now.slice(5, 7));
   const rows = [];
-  for (let i = 0; i < 3; i += 1) {
-    const ym = `${y}-${String(m).padStart(2, '0')}`;
-    const sh = bdb.shipmentsOfMonth(user.id, cpId, ym);
-    if (sh.sum > 0) {
-      const done = bdb.monthActOf(user.id, cpId, ym) ? ' ✓' : '';
-      rows.push([{ text: `${MONTHS_RU[m - 1]} ${y} · ${formatMoney(sh.sum)} ₽${done}`, data: `pp.act:${cpId}:${ym}` }]);
+  for (const { ym, title } of monthAct.lastMonths(3)) {
+    const p = monthAct.preview(user.id, cpId, ym);
+    if (p.docs.length) {
+      // «(после акта)»: акт за месяц уже был, а это — отгрузки, пришедшие после него.
+      rows.push([{ text: `${title} · ${formatMoney(p.sum)} ₽${p.acts.length ? ' (после акта)' : ''}`, data: `pp.act:${cpId}:${ym}` }]);
+    } else if (p.done) {
+      const total = p.acts.reduce((a, x) => a + (Number(x.total) || 0), 0);
+      rows.push([{ text: `${title} · ${formatMoney(total)} ₽ ✓`, data: `pp.act:${cpId}:${ym}` }]);
     }
-    m -= 1; if (m === 0) { m = 12; y -= 1; }
   }
   if (!rows.length) {
     await tg.sendMessage(chatId, `У «${esc(cp.name)}» за последние три месяца нет накладных и УПД — акту не на чем строиться.`,
@@ -2760,47 +2758,30 @@ async function askMonthAct(tg, chatId, user, cpId) {
     return;
   }
   await tg.sendMessage(chatId,
-    'Акт за какой месяц? Сумма — по накладным и УПД этого клиента. Акт закрывающий: '
+    'Акт за какой месяц? Сумма — по накладным и УПД этого клиента, которые ещё не вошли в акт. Акт закрывающий: '
     + '<b>новый долг он не создаёт</b>, сумма уже учтена накладными.',
     keyboard([...rows, [{ text: '⬅️ Карточка', data: `cp:${cpId}` }]]));
 }
 
-/** Акт услуг за месяц на сумму отгрузок — без проводки, чтобы не задвоить долг. */
+/** Акт услуг за месяц на сумму отгрузок — без проводки, чтобы не задвоить долг (см. lib/month-act.js). */
 async function issueMonthAct(tg, chatId, user, cpId, ym) {
   if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(ym)) return;
   const cp = bdb.getCp(user.id, cpId);
   const org = await requireOrg(tg, chatId, user); if (!org) return;
   if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
-  const have = bdb.monthActOf(user.id, cpId, ym);
-  if (have) {
-    await tg.sendMessage(chatId, `Акт за этот месяц уже выписан: № ${esc(have.number)} от ${ru(have.date)}. Второй не делаю — найдёте его в документах клиента.`,
+  await tg.sendChatAction(chatId, 'upload_document');
+  const res = await monthAct.issue(user.id, cpId, ym);
+  if (!res.ok && res.reason === 'have') {
+    await tg.sendMessage(chatId, `${esc(res.message)} Найдёте его в документах клиента.`,
       keyboard([[{ text: '📁 Документы клиента', data: `docs.cp:${cpId}` }]]));
     return;
   }
-  const sh = bdb.shipmentsOfMonth(user.id, cpId, ym);
-  if (!(sh.sum > 0)) { await tg.sendMessage(chatId, 'За этот месяц отгрузок нет.', mainMenu()); return; }
-  const y = Number(ym.slice(0, 4)); const m = Number(ym.slice(5, 7));
-  const last = `${ym}-${String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, '0')}`;
-  const date = last > todayISO() ? todayISO() : last;
-  const nums = sh.docs.map((d) => `№ ${d.number}`).join(', ');
-  const v = bdb.vatOf(org);
-  // Цена в акте — уже итог накладных (с налогом, если он там был), поэтому
-  // «с налогом внутри»: иначе НДС лёг бы на него второй раз и сумма разошлась.
-  const extra = { monthAct: ym, ...(v.rate != null ? { vatRate: v.rate, priceIncludesVat: true } : {}) };
-  await tg.sendChatAction(chatId, 'upload_document');
-  const res = await docService.issueDocument(user.id, {
-    type: 'usl', cpId, date, extra, noDebt: true,
-    items: [{ name: `Услуги за ${MONTHS_RU[m - 1]} ${y} по накладным ${nums}`, qty: 1, unit: 'усл.', price: sh.sum }],
-  });
   if (!res.ok) { await tg.sendMessage(chatId, esc(res.message), mainMenu()); return; }
-  // Акт ничего не должен: отгрузки покрыты предоплатой или висят своими
-  // накладными. Отметка нужна, чтобы он не торчал в «Не оплачено» вторым долгом.
-  bdb.markPaid(user.id, res.doc.id, date);
   const st = bdb.prepayState(user.id, cpId);
   await tg.sendDocument(chatId, {
     filename: res.file.filename, buffer: res.file.buffer,
-    caption: `Акт № ${esc(res.doc.number)} от ${ru(date)} для <b>${esc(cp.name)}</b> на ${formatRub(res.total)} `
-      + `за ${MONTHS_RU[m - 1]} ${y}.\n<i>Долг не изменился: сумма уже в накладных.</i>`,
+    caption: `Акт № ${esc(res.doc.number)} от ${ru(res.date)} для <b>${esc(cp.name)}</b> на ${formatRub(res.total)} `
+      + `за ${res.month}.\n<i>Долг не изменился: сумма уже в накладных.</i>`,
   });
   const ended = !st || st.ended || st.low;
   await tg.sendMessage(chatId,

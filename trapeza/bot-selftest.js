@@ -7989,6 +7989,30 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await tapP(`pp.act:${cpP}:2026-10`);
     ok(bdbP.listDocs(uP.id, 200, cpP, orgA).length === docsBefore + 1, 'повторное нажатие второй акт не выписывает');
 
+    // Накладная, пришедшая ПОСЛЕ акта, в него не вошла: во второй акт идёт она одна, а не весь месяц заново.
+    const lateShip = await torg(cpP, '20', 10000);
+    const openLate = bdbP.openShipmentsOfMonth(uP.id, cpP, '2026-10', orgA);
+    ok(openLate.docs.length === 1 && openLate.docs[0].id === lateShip.doc.id && openLate.sum === 10000,
+      'не вошедшей в акт остаётся только новая накладная (10 000)', JSON.stringify(openLate.docs.map((d) => d.id)));
+    await tapP(`pp.act:${cpP}`);
+    ok((sent[sent.length - 1].kb || []).flat().some((b) => norm(b.text).includes('10 000') && b.text.includes('после акта')),
+      'выбор месяца предлагает только остаток, с пометкой «после акта»');
+    const debtBeforeSecond = bal(cpP, orgA);
+    await tapP(`pp.act:${cpP}:2026-10`);
+    const actsOct = bdbP.monthActsOf(uP.id, cpP, '2026-10', orgA);
+    ok(actsOct.length === 2 && actsOct[1].total === 10000 && actsOct[0].total === 250000,
+      'второй акт — на 10 000, только за новую накладную; первый не тронут', actsOct.map((a) => a.total).join(' / '));
+    ok(bal(cpP, orgA) === debtBeforeSecond, 'второй акт долг тоже не меняет');
+    bdbP.rebuildDebt(uP.id);
+    ok(bal(cpP, orgA) === debtBeforeSecond && bdbP.listOps(uP.id, cpP, orgA).every((o) => !actsOct.some((a) => a.id === o.doc_id)),
+      'и пересчёт не заводит проводок по актам');
+    ok(bdbP.openShipmentsOfMonth(uP.id, cpP, '2026-10', orgA).docs.length === 0, 'теперь все отгрузки месяца в актах');
+    await tapP(`pp.act:${cpP}:2026-10`);
+    ok(bdbP.monthActsOf(uP.id, cpP, '2026-10', orgA).length === 2, 'третье нажатие акт не выписывает');
+    bdbP.deleteDoc(uP.id, actsOct[1].id);
+    ok(bdbP.openShipmentsOfMonth(uP.id, cpP, '2026-10', orgA).docs.length === 1,
+      'удалили второй акт — его накладная снова свободна для акта');
+
     // Текстом: «предоплата 140000 от <клиент>».
     const ai = require('./lib/ai-agent');
     const q = ai.quickParse('предоплата 140000 от Обычный');

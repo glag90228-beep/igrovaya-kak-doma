@@ -2612,6 +2612,80 @@ async function main() {
     ok(r.json && r.json.error, 'платёжку «Повторить» не предлагает: у неё нет позиций', JSON.stringify(r.json));
   }
 
+  section('акт за месяц');
+  {
+    /*
+     * Акт складывает накладные и УПД клиента за месяц в один документ. Три вещи
+     * здесь стоят денег: чужой клиент, второй акт на те же накладные и долг,
+     * который акт обязан не менять — сумма уже в накладных.
+     */
+    const mu = bdb.getOrCreateUser(MASHA.id);
+    const cpMa = bdb.createCp(mu.id, { name: 'ООО «Месячный»', kind: 'customer', opening_date: '2026-01-01' });
+    const today = docService.todayISO();
+    const thisYm = today.slice(0, 7);
+    const prevYm = (() => {
+      const d = new Date(`${thisYm}-01T00:00:00Z`); d.setUTCMonth(d.getUTCMonth() - 1);
+      return d.toISOString().slice(0, 7);
+    })();
+    const ship = (date, price, type = 'torg12') => call('POST', '/api/doc', {
+      user: masha, body: { type, cpId: cpMa, date, items: [{ name: 'Обеды', unit: 'шт.', qty: 1, price }] },
+    });
+    const s1 = await ship(`${thisYm}-01`, 30000);
+    const s2 = await ship(`${thisYm}-02`, 20000, 'upd');
+    const s3 = await ship(`${prevYm}-15`, 7000);
+    ok(s1.json.doc && s2.json.doc && s3.json.doc, 'три отгрузки выписаны: две в этом месяце, одна в прошлом');
+    const bal = () => bdb.balanceOf(mu.id, cpMa).closing;
+
+    r = await call('GET', `/api/month-act?cpId=${cpMa}`);
+    ok(r.status === 401, 'без подписи предпросмотр не отдаётся', r.status);
+    r = await call('GET', `/api/month-act?cpId=${cpMa}`, { user: petya });
+    ok(r.json && r.json.error && !r.json.months, 'чужого клиента предпросмотр не показывает', JSON.stringify(r.json));
+    r = await call('POST', '/api/month-act', { user: petya, body: { cpId: cpMa, ym: thisYm } });
+    ok(r.json && r.json.error, 'и выписать акт на чужого клиента нельзя', JSON.stringify(r.json));
+
+    r = await call('GET', `/api/month-act?cpId=${cpMa}`, { user: masha });
+    const [cur, prev] = r.json.months || [];
+    ok(r.json.months && r.json.months.length === 2 && cur.ym === thisYm && prev.ym === prevYm,
+      'предпросмотр — два месяца: этот и прошлый', JSON.stringify((r.json.months || []).map((m) => m.ym)));
+    ok(cur.docs.length === 2 && cur.sum === 50000 && !cur.done && prev.docs.length === 1 && prev.sum === 7000,
+      'в этом месяце две отгрузки на 50 000, в прошлом одна на 7 000', `${cur.docs.length}/${cur.sum}, ${prev.docs.length}/${prev.sum}`);
+
+    const debt0 = bal();
+    r = await call('POST', '/api/month-act', { user: masha, body: { cpId: cpMa, ym: thisYm } });
+    ok(r.json && r.json.doc && r.json.total === 50000 && r.json.file && r.json.month, 'акт за этот месяц выписан на 50 000', JSON.stringify(r.json).slice(0, 120));
+    const act1 = bdb.getDoc(mu.id, r.json.doc.id);
+    ok(act1.type === 'usl' && act1.no_debt === 1 && act1.paid_at, 'акт — «без долга» и сразу отмечен');
+    ok(bal() === debt0, 'долг клиента не изменился', `${debt0} → ${bal()}`);
+    bdb.rebuildDebt(mu.id);
+    ok(bal() === debt0, 'пересчёт долга акт не удваивает');
+
+    r = await call('GET', `/api/month-act?cpId=${cpMa}`, { user: masha });
+    ok(r.json.months[0].done && r.json.months[0].docs.length === 0 && r.json.months[0].acts.length === 1,
+      'теперь месяц «в акте»: позиций нет, акт назван');
+    r = await call('POST', '/api/month-act', { user: masha, body: { cpId: cpMa, ym: thisYm } });
+    ok(r.json && r.json.reason === 'have', 'второй акт на те же накладные не выписывается', JSON.stringify(r.json));
+
+    // Новая накладная после акта: во второй акт идёт одна она.
+    await ship(`${thisYm}-03`, 5000);
+    r = await call('GET', `/api/month-act?cpId=${cpMa}`, { user: masha });
+    ok(r.json.months[0].docs.length === 1 && r.json.months[0].sum === 5000 && !r.json.months[0].done,
+      'после акта в предпросмотре — только новая накладная (5 000)');
+    r = await call('POST', '/api/month-act', { user: masha, body: { cpId: cpMa, ym: thisYm } });
+    ok(r.json && r.json.total === 5000, 'второй акт — на 5 000, а не на весь месяц заново', JSON.stringify(r.json).slice(0, 80));
+
+    // Прошлый месяц и граничные случаи.
+    r = await call('POST', '/api/month-act', { user: masha, body: { cpId: cpMa, ym: prevYm } });
+    ok(r.json && r.json.total === 7000, 'акт за прошлый месяц — на 7 000');
+    r = await call('POST', '/api/month-act', { user: masha, body: { cpId: cpMa, ym: '2099-01' } });
+    ok(r.json && r.json.reason === 'ym', 'будущий месяц отклонён', JSON.stringify(r.json));
+    r = await call('POST', '/api/month-act', { user: masha, body: { cpId: cpMa, ym: 'абв' } });
+    ok(r.json && r.json.reason === 'ym', 'кривой месяц отклонён');
+    r = await call('POST', '/api/month-act', { user: masha, body: { cpId: cpMa, ym: '2020-01' } });
+    ok(r.json && r.json.reason === 'none', 'месяц без отгрузок: акту не на чем строиться', JSON.stringify(r.json));
+    ok(bal() === debt0 + 5000 && bdb.monthActsOf(mu.id, cpMa, thisYm).length === 2,
+      'итог: долг вырос только на новую накладную, актов за месяц два', String(bal() - debt0));
+  }
+
   section('вкладка CRM в разметке приложения');
   {
     // Файл приложения в этом прогоне не исполняется, а вкладка — это строка

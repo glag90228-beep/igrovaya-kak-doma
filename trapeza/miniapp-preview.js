@@ -69,6 +69,9 @@ const THEMES = {
   },
 };
 
+/** Что заведено при посеве: идентификаторы нужны снимкам, которые открывают экран по клиенту. */
+const SEED = { cp: 0 };
+
 /** Показательные данные: пустой экран — плохая витрина. */
 async function seed() {
   const user = bdb.getOrCreateUser(USER.id, 'Мария Сарычева', 'masha');
@@ -103,6 +106,16 @@ async function seed() {
     { type: 'upd', cpId: ids[0], date: '2026-07-28', items: [
       { name: 'Кофе-брейк', unit: 'шт.', qty: 25, price: 480 }] },
   ];
+  // Отгрузки этого месяца — иначе «Акт за месяц» на снимке пустая заглушка.
+  const ym = docService.todayISO().slice(0, 7);
+  docs.push(
+    { type: 'torg12', cpId: ids[0], date: `${ym}-03`, items: [
+      { name: 'Канапе ассорти', unit: 'шт.', qty: 40, price: 650 },
+      { name: 'Пирожные', unit: 'шт.', qty: 30, price: 210 }] },
+    { type: 'upd', cpId: ids[0], date: `${ym}-09`, items: [
+      { name: 'Кофе-брейк', unit: 'шт.', qty: 25, price: 480 }] },
+  );
+  SEED.cp = ids[0];
   for (const d of docs) {
     // eslint-disable-next-line no-await-in-loop
     await docService.issueDocument(user.id, { ...d, skipQuota: true });
@@ -225,6 +238,22 @@ const SHOTS = [
       await b.waitFor({ timeout: 5000 });
       await b.click();
       await page.waitForSelector('#repeat-note', { timeout: 5000 });
+      await page.waitForTimeout(300);
+    },
+  },
+  {
+    name: 'akt-mesyaca', title: 'Акт за месяц: предпросмотр', go: null,
+    act: async (page) => {
+      await page.evaluate((id) => window.__go('monthact', { cpId: id }), SEED.cp);
+      await page.waitForSelector('#monthact-list', { timeout: 5000 });
+      await page.waitForTimeout(300);
+    },
+  },
+  {
+    name: 'akt-mesyaca-kartochka', title: 'Карточка клиента: «Акт за месяц»', go: null,
+    act: async (page) => {
+      await page.evaluate((id) => window.__go('cp', { id }), SEED.cp);
+      await page.getByText('Акт за месяц', { exact: true }).first().waitFor({ timeout: 5000 });
       await page.waitForTimeout(300);
     },
   },

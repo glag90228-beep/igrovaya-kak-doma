@@ -816,6 +816,45 @@ const ok = (c, m, extra) => {
       'сама кнопка ничего не выписала — только открыла форму');
   }
 
+  /*
+   * «Акт за месяц» из карточки клиента — касаниями: кнопка → предпросмотр
+   * позиций → «Создать» → экран честно говорит, что всё уже в акте.
+   */
+  console.log('\n── акт за месяц в карточке клиента ──');
+  {
+    const { db } = require(path.join(APP, 'db'));
+    const thisYm = docService.todayISO().slice(0, 7);
+    const cpM = bdb.createCp(user.id, { name: 'ООО «Месячный акт»', kind: 'customer', opening_date: '2026-01-01' });
+    for (const [day, price] of [['01', 30000], ['02', 20000]]) {
+      await docService.issueDocument(user.id, {
+        type: 'torg12', cpId: cpM, date: `${thisYm}-${day}`, skipQuota: true,
+        items: [{ name: 'Обеды', unit: 'шт.', qty: 1, price }],
+      });
+    }
+    const actsBefore = () => db.prepare("SELECT COUNT(*) AS n FROM documents WHERE user_id = ? AND type = 'usl' AND payload LIKE '%monthAct%'").get(user.id).n;
+    ok(actsBefore() === 0, 'до нажатия актов за месяц нет');
+
+    await page.evaluate((id) => window.__go('cp', { id }), cpM);
+    const entry = page.getByText('Акт за месяц', { exact: true }).first();
+    await entry.waitFor({ timeout: 5000 });
+    await entry.tap();
+    await page.waitForSelector('#monthact-list', { timeout: 5000 });
+    ok(await page.locator('#monthact-list .row').count() === 3, 'в предпросмотре две накладные и строка «Итого в акте»');
+    ok((await page.textContent('#monthact-make')).replace(/\s/g, ' ').includes('50 000'), 'кнопка называет сумму акта');
+    ok(await page.evaluate(() => {
+      const b = document.getElementById('monthact-make').getBoundingClientRect();
+      window.scrollTo(0, document.body.scrollHeight);
+      const tabs = document.getElementById('tabs').getBoundingClientRect();
+      const after = document.getElementById('monthact-make').getBoundingClientRect();
+      return b.height > 0 && after.bottom <= tabs.top + 1;
+    }), 'кнопку «Создать» не закрывает нижняя панель');
+    ok(actsBefore() === 0, 'предпросмотр акта не выписывает');
+    await page.locator('#monthact-make').tap();
+    await page.getByText('Всё за месяц уже в акте').waitFor({ timeout: 8000 });
+    ok(actsBefore() === 1, 'после «Создать» выписан ровно один акт');
+    ok(await page.locator('#monthact-make').count() === 0, 'второй раз создать нечего: кнопки «Создать» уже нет');
+  }
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();

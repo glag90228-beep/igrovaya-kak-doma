@@ -182,7 +182,7 @@ const PARENT = {
   billing: 'more', support: 'more', help: 'more', vat: 'more', basis: 'more',
   recurring: 'more', reminders: 'more', registry: 'docs', akt: 'docs',
   unpaid: 'home', scan: 'docs', ops: 'cps', ask: 'home', bankclose: 'debts',
-  debts: 'more',
+  debts: 'more', monthact: 'cps',
 };
 
 /*
@@ -265,7 +265,7 @@ const TITLES = {
   inbox: 'Почта', letter: 'Письмо', mail: 'Почта', bank: 'Банк', org: 'Организация',
   billing: 'Тариф', support: 'Поддержка', help: 'Помощь', ask: 'Помощник',
   recurring: 'По расписанию', reminders: 'Напоминания', unpaid: 'Не оплачено',
-  debts: 'Долги',
+  debts: 'Долги', monthact: 'Акт за месяц',
 };
 
 const topbar = document.getElementById('topbar');
@@ -1635,6 +1635,84 @@ screens.crm = async function crmScreen() {
   return box;
 };
 
+/*
+ * Акт за месяц: один акт услуг на все накладные и УПД клиента за месяц.
+ *
+ * Сначала человек видит, ЧТО войдёт (позиции и сумму), и только потом жмёт
+ * «Создать»: акт подписывает клиент, а отгрузки, уже вошедшие в прежний акт,
+ * в новый не попадают — это решает сервер (lib/month-act.js), здесь только
+ * показ. Долг акт не меняет: сумма уже учтена накладными.
+ */
+const SHIP_NAME = { torg12: 'Накладная', upd: 'УПД' };
+
+screens.monthact = async function monthActScreen({ cpId, ym }) {
+  const r = await api('GET', `/api/month-act?cpId=${cpId}`);
+  const box = h('div', {}, h('h1', { text: 'Акт за месяц' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 8px',
+    text: `${r.cp.name}. Один акт услуг на накладные и УПД за месяц, которые ещё не вошли в акт. `
+      + 'Акт закрывающий: новый долг он не создаёт — сумма уже учтена накладными.' }));
+
+  // Открываем тот месяц, что просили; иначе — первый, где есть что оформлять.
+  let cur = r.months.find((m) => m.ym === ym) || r.months.find((m) => m.docs.length) || r.months[0];
+  const LABELS = ['Этот месяц', 'Прошлый месяц'];
+  const chips = h('div', { class: 'chips' });
+  const body = h('div', {});
+  const cap = (t) => t.charAt(0).toUpperCase() + t.slice(1);
+
+  const create = async (btn) => withBusy(btn, async () => {
+    try {
+      const made = await api('POST', '/api/month-act', { cpId, ym: cur.ym });
+      haptic('heavy');
+      toast(made.sentToChat ? 'Акт выписан — файл отправлен в чат' : 'Акт выписан');
+      download(made.file);
+      current().params = { cpId, ym: cur.ym };
+      render();
+    } catch (e) {
+      if (e.payload && e.payload.reason === 'quota') { toast(e.message, true); go('billing'); return; }
+      throw e;
+    }
+  });
+
+  const draw = () => {
+    chips.replaceChildren(...r.months.map((m, i) => h('button', {
+      class: 'chip', type: 'button', 'aria-pressed': String(m.ym === cur.ym),
+      onclick: () => { cur = m; haptic(); draw(); },
+    }, LABELS[i] || cap(m.title))));
+
+    const last = cur.acts[cur.acts.length - 1];
+    const parts = [h('div', { class: 'section-title', text: cap(cur.title) })];
+    if (cur.docs.length) {
+      if (last) {
+        parts.push(h('div', { class: 'banner info', id: 'monthact-after' }, icon('doc-check'),
+          h('div', {}, `За этот месяц уже есть акт № ${last.number}. Здесь только то, что пришло после него.`)));
+      }
+      parts.push(h('div', { class: 'card', id: 'monthact-list' },
+        cur.docs.map((d) => navRow({
+          icon: 'doc', title: `${SHIP_NAME[d.type] || 'Документ'} № ${d.number}`, sub: ru(d.date),
+          right: money0(d.total), onclick: () => go('doc', { id: d.id }),
+        })),
+        h('div', { class: 'row' }, h('span', { class: 'grow', text: 'Итого в акте' }),
+          h('span', { class: 'money', text: money(cur.sum) }))),
+      h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn', id: 'monthact-make', onclick: (e) => create(e.currentTarget),
+      }, `Создать акт на ${money(cur.sum)}`)));
+    } else if (last) {
+      parts.push(empty('doc-check', 'Всё за месяц уже в акте',
+        `Акт № ${last.number} от ${ru(last.date)} на ${money(last.total)}. Новых накладных и УПД после него нет.`,
+        h('div', { class: 'btn-wrap' }, h('button', {
+          class: 'btn secondary', onclick: () => go('doc', { id: last.id }),
+        }, 'Открыть акт'))));
+    } else {
+      parts.push(empty('doc', 'Накладных и УПД за этот месяц нет',
+        'Акту не на чем строиться: он складывается из накладных и УПД этого клиента.'));
+    }
+    body.replaceChildren(...parts);
+  };
+  draw();
+  box.append(chips, body);
+  return box;
+};
+
 screens.cps = async function cps() {
   const { cps: list } = await api('GET', '/api/cps');
   const box = h('div', {}, h('h1', { text: 'Контрагенты' }));
@@ -1857,7 +1935,10 @@ screens.cp = async function cpScreen({ id, name }) {
             download(r.file);
           } catch (e) { toast(e.message, true); }
         } }),
-      navRow({ icon: 'docs2', title: 'Документы клиента', onclick: () => go('docs', { cp: id }) })));
+      navRow({ icon: 'docs2', title: 'Документы клиента', onclick: () => go('docs', { cp: id }) }),
+      // Заказчику: акт закрывает отгрузки месяца. У поставщика отгружаем не мы.
+      cp.kind === 'supplier' ? null : navRow({ icon: 'doc-check', title: 'Акт за месяц',
+        sub: 'накладные и УПД — одним актом', onclick: () => go('monthact', { cpId: id }) })));
     box.append(crmBlock(id));
     box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
   }

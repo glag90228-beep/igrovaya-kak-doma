@@ -26,6 +26,7 @@ const path = require('node:path');
 const bdb = require('./lib/bot-db');
 const billing = require('./lib/billing');
 const docService = require('./lib/doc-service');
+const monthAct = require('./lib/month-act');
 const crm = require('./lib/crm');
 // Платёжный QR по ГОСТ Р 56042: тот же модуль, что рисует его в самом счёте,
 // — иначе код на превью и код в PDF однажды разойдутся.
@@ -2233,6 +2234,42 @@ const api = {
       from: { title: src.title, number: src.number, date: src.date },
       otherOrg: Boolean(Number(src.org_id)) && Number(src.org_id) !== Number(cur.id),
       orgName: cur.name || '',
+    };
+  },
+
+  /**
+   * Акт за месяц: что в него войдёт — по двум последним месяцам сразу.
+   *
+   * Предпросмотр отдаётся целиком одним запросом, чтобы переключение «этот /
+   * прошлый» не ходило на сервер: накладных за месяц немного, а человеку нужно
+   * увидеть позиции ДО того, как нажать «Создать». Клиент берётся только своей
+   * (getCp проверяет владельца), параметров, кроме клиента, нет.
+   */
+  async 'GET /api/month-act'({ user, url }) {
+    const cp = bdb.getCp(user.id, Number(url.searchParams.get('cpId')));
+    if (!cp) return { error: 'Такого клиента нет в вашем списке.' };
+    return {
+      cp: { id: cp.id, name: cp.name },
+      months: monthAct.lastMonths(2).map(({ ym }) => monthAct.preview(user.id, cp.id, ym)),
+    };
+  },
+
+  /**
+   * Выписать акт за месяц. Долг не меняется (см. lib/month-act.js): сумма уже
+   * учтена накладными, акт ложится в журнал закрывающим и сразу «оплаченным».
+   */
+  async 'POST /api/month-act'({ user, body }) {
+    const res = await monthAct.issue(user.id, Number(body.cpId), str(body.ym, 7));
+    if (!res.ok) return { error: res.message, reason: res.reason, quota: res.quota };
+    const token = keepFile(user.id, res.file);
+    await sendToChatSafe(user, res);
+    return {
+      doc: docBrief({ ...res.doc, cp_id: res.doc.cp.id, payload: { items: [] } }),
+      total: res.total,
+      month: res.month,
+      quota: res.quota,
+      file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf },
+      sentToChat: Boolean(tg),
     };
   },
 
