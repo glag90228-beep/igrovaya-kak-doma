@@ -712,6 +712,30 @@ const ok = (c, m, extra) => {
       && titles.some((t) => t.startsWith('Скоро')), 'напоминания разложены: просрочено / сегодня / скоро', titles.join(' | '));
     ok(await page.getByText('Заметка для ленты').count() === 1, 'в ленте событий есть заметка по клиенту');
 
+    // Форма нового напоминания свёрнута: вкладку открывают за делами, а не за формой.
+    ok(await page.evaluate(() => {
+      const f = document.getElementById('crm-new'); return !!f && f.getBoundingClientRect().height === 0;
+    }), 'форма «Новое напоминание» свёрнута');
+    const order = await page.evaluate(() => {
+      const t = [...document.querySelectorAll('#app .section-title')].find((x) => x.textContent.startsWith('Просрочено'));
+      return t.getBoundingClientRect().top < document.getElementById('crm-new-btn').getBoundingClientRect().bottom + 200;
+    });
+    ok(order, 'дела видны сразу под кнопкой, форма их не вытесняет');
+    await page.locator('#crm-new-btn').tap();
+    await page.waitForTimeout(200);
+    ok(await page.evaluate(() => document.getElementById('crm-new').getBoundingClientRect().height > 40),
+      '«+ Напоминание» раскрывает форму');
+    await page.locator('#crm-new-btn').tap();
+
+    // Панель непрозрачная: текст карточек сквозь неё читаться не должен.
+    const tabsBg = await page.evaluate(() => {
+      const c = getComputedStyle(document.getElementById('tabs')).backgroundColor;
+      const m = c.match(/rgba?\(([^)]+)\)/);
+      const p = m ? m[1].split(/[ ,/]+/).filter(Boolean) : [];
+      return p.length > 3 ? Number(p[3]) : 1;
+    });
+    ok(tabsBg === 1, 'фон нижней панели непрозрачный', String(tabsBg));
+
     // Панель не закрывает последнюю строку: докрутили вниз — низ контента выше верха панели.
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(200);

@@ -202,6 +202,10 @@ const SHOTS = [
   { name: 'kontragenty', title: 'Контрагенты', go: ['cps', {}] },
   { name: 'crm', title: 'CRM', go: ['crm', {}] },
   { name: 'crm-nizhe', title: 'CRM: лента событий', go: ['crm', {}], scroll: 'bottom' },
+  {
+    name: 'crm-forma', title: 'CRM: раскрыта форма напоминания', go: ['crm', {}],
+    act: async (page) => { await page.locator('#crm-new-btn').click(); await page.waitForTimeout(250); },
+  },
   { name: 'dolgi', title: 'Долги', go: ['debts', {}] },
   { name: 'organizaciya', title: 'Моя организация', go: ['org', {}] },
   { name: 'podpiska', title: 'Подписка', go: ['billing', {}] },

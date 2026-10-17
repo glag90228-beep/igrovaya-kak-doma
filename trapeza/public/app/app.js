@@ -1558,7 +1558,9 @@ screens.crm = async function crmScreen() {
   const list = cpsRes.cps;
   const redraw = () => render();
 
-  // Быстрое «напомнить»: клиент, о чём, когда. Для длинных заметок — карточка клиента.
+  // Быстрое «напомнить»: клиент, о чём, когда. Свёрнуто в кнопку: вкладку
+  // открывают, чтобы увидеть дела, и форма над ними вытесняла сами дела.
+  // Для длинных заметок — карточка клиента.
   if (list.length) {
     const who = h('select', { id: 'crm-cp' }, list.map((c) => h('option', { value: c.id, text: c.name })));
     const text = h('input', { id: 'crm-q-text', type: 'text', maxlength: '300', autocomplete: 'off', placeholder: 'Например: позвонить по счёту' });
@@ -1570,10 +1572,20 @@ screens.crm = async function crmScreen() {
         refreshCrmBadge(true); redraw();
       }),
     }, label)));
-    box.append(h('div', { class: 'section-title', text: 'Новое напоминание' }),
-      h('div', { class: 'card crm-form' },
-        h('div', { class: 'field' }, h('label', { for: 'crm-cp', text: 'Клиент' }), who),
-        h('div', { class: 'field' }, h('label', { for: 'crm-q-text', text: 'О чём напомнить' }), text, days)));
+    const form = h('div', { class: 'card crm-form', id: 'crm-new', hidden: true },
+      h('div', { class: 'field' }, h('label', { for: 'crm-cp', text: 'Клиент' }), who),
+      h('div', { class: 'field' }, h('label', { for: 'crm-q-text', text: 'О чём напомнить' }), text, days));
+    const openBtn = h('button', {
+      class: 'btn secondary small-btn', id: 'crm-new-btn', 'aria-expanded': 'false', 'aria-controls': 'crm-new',
+      onclick: () => {
+        const show = form.hidden;
+        form.hidden = !show;
+        openBtn.setAttribute('aria-expanded', String(show));
+        openBtn.textContent = show ? 'Свернуть' : '+ Напоминание';
+        if (show) text.focus();
+      },
+    }, '+ Напоминание');
+    box.append(h('div', { class: 'btn-wrap crm-add' }, openBtn), form);
   }
 
   const groups = [
@@ -1584,7 +1596,7 @@ screens.crm = async function crmScreen() {
   if (!fu.followups.length) {
     box.append(empty('bell', 'Напоминаний пока нет',
       list.length
-        ? 'Выберите клиента выше, напишите, о чём напомнить, и нажмите срок. В этот день бот напишет вам сам.'
+        ? 'Нажмите «+ Напоминание», выберите клиента, напишите, о чём напомнить, и укажите срок. В этот день бот напишет вам сам.'
         : 'Сначала добавьте клиента — потом к нему можно привязать напоминание и заметки.',
       list.length ? null : h('div', { class: 'btn-wrap' },
         h('button', { class: 'btn', onclick: () => go('cp', {}) }, 'Добавить контрагента'))));

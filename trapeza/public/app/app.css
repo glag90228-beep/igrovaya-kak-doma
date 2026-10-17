@@ -797,7 +797,10 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .tabs {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
   display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
-  background: var(--glass-strong);
+  /* Заливка плотная, не стекло: панель стоит поверх прокручиваемых карточек,
+     и при 88% непрозрачности их текст читался сквозь подписи вкладок. Само
+     размытие оставлено — оно только смягчает край. */
+  background: var(--surface);
   -webkit-backdrop-filter: var(--glass-blur);
   backdrop-filter: var(--glass-blur);
   border-top: 1px solid var(--border);
@@ -846,7 +849,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   position: sticky; top: 0; z-index: 45;
   display: flex; align-items: center; gap: 4px;
   height: var(--top-h); padding: env(safe-area-inset-top, 0px) 8px 0;
-  background: var(--glass-strong);
+  background: var(--surface); /* плотная: под верхней полосой тоже просвечивали заголовки */
   -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
   border-bottom: 1px solid var(--border);
 }
@@ -991,7 +994,7 @@ body.drawer-open { overflow: hidden; }
   position: fixed; left: 0; right: 0; bottom: var(--tabs-h); z-index: 41;
   display: flex; gap: 8px; align-items: center;
   padding: 10px var(--pad);
-  background: var(--glass-strong);
+  background: var(--surface); /* плотная, как и сами вкладки под ней */
   -webkit-backdrop-filter: var(--glass-blur);
   backdrop-filter: var(--glass-blur);
   border-top: 1px solid var(--hairline);
@@ -1242,6 +1245,7 @@ body.drawer-open { overflow: hidden; }
 .crm-form .field + .field { margin-top: 14px; }
 .crm-form textarea { width: 100%; margin-bottom: 8px; }
 .crm-hint { margin: -4px 0 8px; }
+.crm-form[hidden] { display: none; }
 .feed-text { overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .crm-form select { width: 100%; }
 .tl-row { align-items: flex-start; }
