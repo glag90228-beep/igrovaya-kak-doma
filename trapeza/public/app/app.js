@@ -182,7 +182,7 @@ const PARENT = {
   billing: 'more', support: 'more', help: 'more', vat: 'more', basis: 'more',
   recurring: 'more', reminders: 'more', registry: 'docs', akt: 'docs',
   unpaid: 'home', scan: 'docs', ops: 'cps', ask: 'home', bankclose: 'debts',
-  debts: 'more', monthact: 'cps',
+  debts: 'more', monthact: 'cps', cheques: 'home',
 };
 
 /*
@@ -265,7 +265,7 @@ const TITLES = {
   inbox: 'Почта', letter: 'Письмо', mail: 'Почта', bank: 'Банк', org: 'Организация',
   billing: 'Тариф', support: 'Поддержка', help: 'Помощь', ask: 'Помощник',
   recurring: 'По расписанию', reminders: 'Напоминания', unpaid: 'Не оплачено',
-  debts: 'Долги', monthact: 'Акт за месяц',
+  debts: 'Долги', monthact: 'Акт за месяц', cheques: 'Чеки «Мой налог»',
 };
 
 const topbar = document.getElementById('topbar');
@@ -632,6 +632,18 @@ screens.home = async function home() {
       sumBtn,
       basisChip(s))));
 
+  // Самозанятому: чек надо пробить по каждому поступлению, срок жёсткий —
+  // поэтому напоминание стоит на виду, а не в глубине карточки документа.
+  if (s.cheques && s.cheques.open) {
+    box.append(h('div', { class: 'card', id: 'cheques-home', style: 'margin-top:12px' }, navRow({
+      icon: 'receipt', tone: 'warn',
+      title: `Чеки не пробиты: ${s.cheques.open}`,
+      // Подпись короткая: длиннее «ближайший срок …» не влезало в строку и обрезалось.
+      sub: `на ${money0(s.cheques.sum)}${s.cheques.nearest ? ` · до ${ru(s.cheques.nearest)}` : ''}`,
+      onclick: () => go('cheques'),
+    })));
+  }
+
   /*
    * Один вход вместо двух равнозначных.
    *
@@ -738,7 +750,8 @@ screens.home = async function home() {
     ['torg12', 'box', 'ТОРГ-12', 'накладная на товар'],
     ['pp', 'wallet', 'Платёжка', 'форма 0401060 для банка'],
     ['dog', 'pen', 'Договор', 'условия на бумаге'],
-  ];
+  // Самозанятому УПД не предлагаем: счёт-фактуру он выставлять не вправе (422-ФЗ).
+  ].filter(([type]) => !(type === 'upd' && Number((s.org || {}).npd)));
   box.append(h('div', { class: 'section-title', text: 'Другие документы' }));
   const OTHER = ['pp', 'dog'];   // набираются полями, а не позициями
   box.append(h('div', { class: 'tiles' }, types.map(([type, ico, title, sub]) => h('button', {
@@ -1087,14 +1100,25 @@ screens.doc = async function docScreen({ id }) {
   if (pendingCheque) {
     const note = pendingCheque;
     pendingCheque = null;
-    box.append(h('div', { class: 'banner info' }, icon('receipt'),
+    box.append(h('div', { class: 'banner info', id: 'cheque-note' }, icon('receipt'),
       h('div', {},
         h('div', { style: 'white-space:pre-line', text: note.text }),
         h('button', {
           class: 'btn secondary',
           style: 'margin-top:10px',
           onclick: () => openOutside(note.url),
-        }, 'Открыть «Мой налог»'))));
+        }, 'Открыть «Мой налог»'),
+        note.cheque ? h('button', {
+          class: 'btn', id: 'cheque-done', style: 'margin-top:8px',
+          onclick: (e) => withBusy(e.currentTarget, async () => {
+            await api('POST', '/api/cheques/done', { id: note.cheque.id });
+            haptic('medium');
+            toast('Отмечено: чек пробит');
+            render();
+          }),
+        }, 'Чек пробил') : null,
+        h('div', { class: 'small muted', style: 'margin-top:6px',
+          text: 'Не сейчас — не страшно: напомню на главной и в утренней сводке, пока чек не отмечен.' }))));
   }
   box.append(h('div', { class: 'card' },
     cpOf ? h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Кому' }),
@@ -1187,6 +1211,23 @@ screens.doc = async function docScreen({ id }) {
         render();
       }),
     }, paid ? 'Снять отметку об оплате' : 'Отметить оплату')));
+  }
+
+  // Чек «Мой налог»: пробит ли, и ссылка на него — прямо в карточке документа.
+  if (d.cheque) {
+    const c = d.cheque;
+    box.append(h('div', { class: 'section-title', text: 'Чек «Мой налог»' }));
+    box.append(h('div', { class: 'card', id: 'doc-cheque' },
+      h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Состояние' }),
+        h('span', { text: c.status === 'done' ? 'пробит' : `не пробит, до ${ru(c.due)}` })),
+      c.number ? h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Номер' }),
+        h('span', { text: c.number })) : null,
+      c.link ? navRow({ icon: 'receipt', title: 'Открыть чек', onclick: () => openOutside(c.link) }) : null,
+      navRow({
+        icon: 'receipt',
+        title: c.status === 'done' ? (c.link ? 'Заменить ссылку на чек' : 'Приложить ссылку на чек') : 'Данные для чека',
+        onclick: () => go('cheques'),
+      })));
   }
 
   if (d.items && d.items.length) {
@@ -2848,7 +2889,7 @@ screens.npd = async function npdScreen() {
   box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
     text: 'Если вы самозанятый или ИП на НПД, счёт и акт сами по себе доход не закрывают — '
       + 'его закрывает чек из «Моего налога». Включите, и после каждой отметки об оплате '
-      + 'я напомню его выдать.' }));
+      + 'я дам данные для чека и буду помнить, пока вы не отметите его пробитым.' }));
 
   const pick = async (value) => {
     await api('POST', '/api/npd', { on: value });
@@ -2874,6 +2915,56 @@ screens.npd = async function npdScreen() {
     class: 'btn secondary',
     onclick: () => openOutside('https://lknpd.nalog.ru/'),
   }, 'Открыть «Мой налог»')));
+  return box;
+};
+
+/*
+ * Чеки «Мой налог»: что самозанятому ещё надо пробить.
+ *
+ * Приложение чек не пробивает и не умеет: официального доступа к «Моему
+ * налогу» у нас нет. Оно готовит данные — что вписать в чек — и запоминает,
+ * что чек пробит. Ссылку на чек можно приложить: она потом лежит в карточке
+ * документа. Принимаются только ссылки самого сервиса (проверяет сервер).
+ */
+screens.cheques = async function chequesScreen() {
+  const r = await api('GET', '/api/cheques');
+  const box = h('div', {}, h('h1', { text: 'Чеки «Мой налог»' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 8px',
+    text: 'На каждое поступление самозанятому нужен чек. При оплате на счёт — до 9-го числа '
+      + 'следующего месяца. Пробейте его в «Мой налог» и отметьте здесь.' }));
+  if (!r.items.length) {
+    box.append(empty('check', 'Все чеки пробиты', 'Когда отметите оплату документа, чек появится здесь.'));
+    return box;
+  }
+  for (const c of r.items) {
+    const link = field(`chq-${c.id}`, 'Ссылка на чек (необязательно)', '', {
+      placeholder: 'https://lknpd.nalog.ru/…', inputmode: 'url',
+    });
+    const done = h('button', { class: 'btn', id: `cheque-ok-${c.id}` }, 'Чек пробил');
+    done.onclick = () => withBusy(done, async () => {
+      try {
+        await api('POST', '/api/cheques/done', { id: c.id, link: link.input.value.trim() });
+        haptic('medium');
+        toast('Отмечено: чек пробит');
+        render();
+      } catch (e) { showError(link, e.message); }
+    });
+    box.append(h('div', { class: 'section-title', text: `${money(c.amount)} · ${c.cpName || 'клиент'}` }),
+      h('div', { class: 'card cheque-card' },
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Наименование' }),
+          h('span', { class: 'ellipsis', text: c.service })),
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Сумма' }),
+          h('span', { class: 'money', text: money(c.amount) })),
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Покупатель' }),
+          h('span', { class: 'ellipsis', text: c.buyer })),
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Пробить до' }),
+          h('span', { text: ru(c.due) })),
+        link),
+      h('div', { class: 'btn-wrap' }, done),
+      h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn secondary', onclick: () => openOutside(r.lkUrl),
+      }, 'Открыть «Мой налог»')));
+  }
   return box;
 };
 
@@ -4352,8 +4443,8 @@ screens.bankclose = async function bankClose(params) {
       : 'Ничего не отмечено');
     // Через выписку закрывают сразу пачку, и про чек тут забывают вернее
     // всего: человек ничего не выписывал, он просто прислал файл.
-    if (res && res.npd) pendingCheque = res.npd;
-    reset('debts');
+    // Баннер карточки документа сюда не годится (документов много) — ведём на список чеков.
+    reset(res && res.npd ? 'cheques' : 'debts');
   });
   const skip = h('button', { class: 'btn ghost' }, 'Не сейчас');
   skip.onclick = () => reset('debts');

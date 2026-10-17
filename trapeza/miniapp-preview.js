@@ -308,6 +308,61 @@ async function main() {
     SHOTS.push({ name: 'napominaniya', title: 'Напоминания', go: ['reminders', {}] });
     SHOTS.push({ name: 'podderzhka', title: 'Поддержка', go: ['support', {}] });
     SHOTS.push({ name: 'snimok', title: 'Снимок счёта', go: ['scan', {}] });
+    /*
+     * Самозанятый: чеки «Мой налог». Включаем НПД и оплату прямо перед снимком —
+     * иначе остальные экраны (УПД в плитках и прочее) снялись бы уже без УПД.
+     * Ставятся в самый конец очереди из-за этой перестановки.
+     */
+    const chequeSetup = async () => {
+      const cheques = require('./lib/cheques');
+      const org = bdb.getDefaultOrg(me.id);
+      bdb.updateOrg(me.id, org.id, { npd: 1 });
+      if (cheques.openCount(me.id)) return;
+      const cpA = bdb.listCps(me.id)[0];
+      const cpB = bdb.listCps(me.id)[1];
+      for (const [cp, name, price] of [[cpA, 'Уборка помещения', 12000], [cpB, 'Консультация и выезд', 4500]]) {
+        // eslint-disable-next-line no-await-in-loop
+        const made = await docService.issueDocument(me.id, { type: 'sch', cpId: cp.id, items: [{ name, qty: 1, price }], skipQuota: true });
+        bdb.markPaid(me.id, made.doc.id);
+        cheques.owe(me.id, made.doc.id, docService.todayISO());
+      }
+    };
+    SHOTS.push({
+      name: 'cheki-glavnaya', title: 'Главная самозанятого: чеки не пробиты', go: null,
+      act: async (page) => {
+        await chequeSetup();
+        await page.evaluate(() => window.__go('home'));
+        await page.waitForSelector('#cheques-home', { timeout: 5000 });
+        await page.waitForTimeout(300);
+      },
+    });
+    SHOTS.push({
+      name: 'cheki', title: 'Чеки «Мой налог»', go: null,
+      act: async (page) => {
+        await chequeSetup();
+        await page.evaluate(() => window.__go('cheques'));
+        await page.waitForSelector('.cheque-card', { timeout: 5000 });
+        await page.waitForTimeout(300);
+      },
+    });
+    SHOTS.push({
+      name: 'cheki-nizhe', title: 'Чеки «Мой налог»: второй чек', go: null, scroll: 'bottom',
+      act: async (page) => {
+        await page.evaluate(() => window.__go('cheques'));
+        await page.waitForSelector('.cheque-card', { timeout: 5000 });
+        await page.waitForTimeout(300);
+      },
+    });
+    SHOTS.push({
+      name: 'kartochka-dokumenta-chek', title: 'Карточка документа: чек «Мой налог»', go: null, scroll: 'bottom',
+      act: async (page) => {
+        await chequeSetup();
+        const docs = bdb.listDocs(me.id, 10).filter((d) => d.paid_at);
+        await page.evaluate((id) => window.__go('doc', { id }), docs[0].id);
+        await page.waitForSelector('#doc-cheque', { timeout: 5000 });
+        await page.waitForTimeout(300);
+      },
+    });
     SHOTS.push({
       name: 'vypiska',
       title: 'Выписка из банка',
@@ -348,6 +403,13 @@ async function main() {
   const made = [];
 
   for (const [themeName, theme] of Object.entries(THEMES)) {
+    // Второй круг (тёмная тема) начинается с того же состояния, что и первый:
+    // самозанятость и чеки включаются только перед своими снимками.
+    {
+      const me = bdb.getOrCreateUser(USER.id);
+      bdb.updateOrg(me.id, bdb.getDefaultOrg(me.id).id, { npd: 0 });
+      require('./db').db.prepare('DELETE FROM npd_cheques WHERE user_id = ?').run(me.id);
+    }
     // PREVIEW_WIDTH_PX=1080 — снимки шириной 1080 px при той же раскладке 390 px.
     const px = Number(process.env.PREVIEW_WIDTH_PX) || 780;
     const ctx = await browser.newContext({

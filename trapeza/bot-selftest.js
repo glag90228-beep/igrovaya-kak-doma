@@ -6369,8 +6369,10 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     sent.length = 0;
     await tap(`doc.paid:${made.doc.id}`);
     const said = norm(sent.map((m) => m.text || '').join(' '));
-    ok(said.includes('чек в «Моём налоге»'), 'с галочкой — напомнил про чек', said.slice(0, 90));
-    ok(said.includes('ООО «Чек»'), 'и назвал, по какому клиенту');
+    ok(said.includes('Пробейте чек в «Мой налог» на 5 000 ₽ для ООО «Чек»'),
+      'с галочкой — напомнил про чек: сумма и клиент названы', said.slice(0, 120));
+    ok(said.includes('Наименование: Работа') && said.includes('Покупатель: физическое лицо'),
+      'и дал данные для чека: наименование и тип покупателя');
     /*
      * Срок считается от настоящей даты отметки об оплате, поэтому зашивать
      * сюда конкретное число нельзя: раньше здесь стояло «09.09.2026», и
@@ -6379,6 +6381,12 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
      * отдельные вызовы chequeDue выше, на неподвижных датах.
      */
     const dueIso = npdLib.chequeDue(require('./lib/period').todayISO());
+    const chequesLib = require('./lib/cheques');
+    const chqRow = chequesLib.forDoc(uid, made.doc.id);
+    ok(chqRow && chqRow.status === 'open' && chqRow.amount === 5000 && chqRow.due === dueIso,
+      'ожидание чека записано: открыто, 5 000 ₽, срок — 9-е следующего месяца', JSON.stringify(chqRow));
+    ok(buttonSince(0, 'Чек пробил') === `chq.ok:${chqRow.id}` && buttonSince(0, 'Позже') === `chq.later:${chqRow.id}`,
+      'кнопки «Чек пробил» и «Позже» под напоминанием');
     const dueRu = `${dueIso.slice(8)}.${dueIso.slice(5, 7)}.${dueIso.slice(0, 4)}`;
     ok(said.includes(dueRu), 'и назвал срок — 9-е число следующего месяца', said.slice(-120));
     const btns = sent.flatMap((m) => (m.kb || []).flat());
@@ -6392,6 +6400,149 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await tap('npd.set:0');
     ok(!Number(bdbN.getDefaultOrg(uid).npd), 'галочку можно снять');
     ok(norm(last()).includes('не применяю'), 'и экран говорит текущее состояние', norm(last()).slice(0, 80));
+  }
+
+  console.log('\n── самозанятость: учёт чеков ──');
+  {
+    /*
+     * Напоминание, которое уехало вверх по чату, ничего не гарантирует, а срок
+     * по закону жёсткий. Поэтому «ждёт чека» живёт в базе, пока человек не
+     * отметил его, и всплывает в утренней сводке, в карточке документа и в
+     * приложении. Чек сам не пробивается и в «Мой налог» мы не ходим.
+     */
+    const bdbN = require('./lib/bot-db');
+    const chq = require('./lib/cheques');
+    const digestN = require('./lib/digest');
+    const uid = fxUserId();
+    const org = bdbN.getDefaultOrg(uid);
+    bdbN.updateOrg(uid, org.id, { npd: 1 });
+    for (const c of chq.open(uid)) chq.markDone(uid, c.id);   // чистый счёт: считаем только свои
+    const cpIp = bdbN.createCp(uid, { name: 'ИП Покупатель', inn: '770123456789', kind: 'customer', opening_date: '2026-01-01' });
+    const cpOrg = bdbN.createCp(uid, { name: 'ООО «Покупатель»', inn: '7707083893', kind: 'customer', opening_date: '2026-01-01' });
+    const mk = (cp, items, date = '2026-09-01') => require('./lib/doc-service').issueDocument(uid, {
+      type: 'sch', cpId: cp, date, items, skipQuota: true,
+    });
+    const d1 = await mk(cpOrg, [{ name: 'Уборка помещения', qty: 1, price: 12000 }]);
+    const d2 = await mk(cpIp, [{ name: 'Консультация', qty: 1, price: 3000 }, { name: 'Выезд', qty: 1, price: 500 }]);
+
+    // Чеков до оплаты нет: чек нужен на поступление, а не на выставленный счёт.
+    ok(chq.forDoc(uid, d1.doc.id) === null, 'пока оплаты нет, ждать чека не от чего');
+
+    sent.length = 0;
+    await tap(`doc.paid:${d1.doc.id}`);
+    const said = norm(sent.map((m) => m.text || '').join(' '));
+    ok(said.includes('Покупатель: организация, ИНН 7707083893') && said.includes('Название покупателя: ООО «Покупатель»'),
+      'у организации в данных для чека — ИНН и название', said.slice(-260));
+    ok(said.includes('Наименование: Уборка помещения'), 'одна позиция — её название идёт в чек как есть');
+    const c1 = chq.forDoc(uid, d1.doc.id);
+
+    // Второе «Оплатил» на том же документе чек не задваивает.
+    await tap(`doc.unpaid:${d1.doc.id}`);
+    ok(chq.forDoc(uid, d1.doc.id) === null, 'сняли отметку оплаты — ждать чека больше не от чего');
+    await tap(`doc.paid:${d1.doc.id}`);
+    await tap(`doc.paid:${d1.doc.id}`);
+    ok(chq.open(uid).filter((c) => c.doc_id === d1.doc.id).length === 1, 'повторное «Оплатил» второй чек не заводит');
+    const c1b = chq.forDoc(uid, d1.doc.id);
+
+    sent.length = 0;
+    await tap(`doc.paid:${d2.doc.id}`);
+    const said2 = norm(sent.map((m) => m.text || '').join(' '));
+    ok(said2.includes('Покупатель: ИП, ИНН 770123456789') && said2.includes('Консультация и др. по документу'),
+      'у ИП тип покупателя назван, а несколько позиций сведены в одно наименование', said2.slice(-300));
+
+    // «Позже» ничего не закрывает.
+    sent.length = 0;
+    await tap(`chq.later:${c1b.id}`);
+    ok(chq.get(uid, c1b.id).status === 'open' && norm(last()).includes('утренней сводке'),
+      '«Позже»: чек остаётся открытым, бот обещает сводку');
+    ok(chq.openCount(uid) === 2, 'непробитых чеков два');
+
+    // Утренняя сводка: строка про чеки, даже когда должников нет.
+    const dg = digestN.build(uid, { force: true });
+    ok(dg && norm(dg.text).includes('Чеки не пробиты: 2'), 'в утренней сводке — «Чеки не пробиты: 2»', dg && dg.text.slice(0, 120));
+    ok(dg.rows.flat().some((b) => b.data === 'chq.list'), 'и кнопка к списку чеков');
+
+    // Список чеков.
+    sent.length = 0;
+    await tap('chq.list');
+    ok(norm(last()).includes('Чеки не пробиты: 2'), 'список чеков показывает счётчик');
+    ok(sent[sent.length - 1].kb.flat().some((b) => b.callback_data === `chq.show:${c1b.id}`), 'в списке — строка каждого чека');
+
+    // «Чек пробил» без ссылки, затем ссылка.
+    sent.length = 0;
+    await tap(`chq.ok:${c1b.id}`);
+    ok(chq.get(uid, c1b.id).status === 'done' && norm(last()).replace(/<[^>]+>/g, '').includes('Ещё не пробито: 1'),
+      '«Чек пробил»: отмечено, осталось ещё один');
+    ok(button('Приложить ссылку') === `chq.link:${c1b.id}`, 'после отметки предложено приложить ссылку');
+    await tap(`chq.link:${c1b.id}`);
+    await say('http://evil.example/receipt/1');
+    ok(chq.get(uid, c1b.id).link === '' && norm(last()).includes('не похоже на ссылку'),
+      'чужая ссылка не принимается, бот объясняет почему');
+    const url = 'https://lknpd.nalog.ru/api/v1/receipt/770123456789/203bg8kzx9/print';
+    await say(`вот: ${url}.`);
+    const got = chq.get(uid, c1b.id);
+    ok(got.link === url && got.number === '203bg8kzx9', 'ссылка из «Мой налог» принята, номер чека выделен', JSON.stringify(got));
+    ok(!bdbN.getState(uid).state, 'ожидание ссылки снято');
+
+    // Карточка документа показывает пробитый чек и ссылку.
+    sent.length = 0;
+    await tap(`doc:${d1.doc.id}`);
+    const card = norm(sent.map((m) => m.text || '').join(' ')).replace(/<[^>]+>/g, '');
+    ok(card.includes('Чек «Мой налог»: пробит') && card.includes(url), 'в карточке документа — чек пробит и ссылка', card.slice(0, 200));
+
+    // Пробитый чек оплата не стирает, непробитый — снимает.
+    bdbN.unmarkPaid(uid, d1.doc.id);
+    ok(chq.forDoc(uid, d1.doc.id) !== null, 'снятая оплата не стирает уже пробитый чек');
+    bdbN.unmarkPaid(uid, d2.doc.id);
+    ok(chq.forDoc(uid, d2.doc.id) === null && chq.openCount(uid) === 0, 'а у непробитого — снимает ожидание');
+    const dgNone = digestN.build(uid, { force: true });
+    ok(!dgNone || !norm(dgNone.text).includes('Чеки не пробиты'), 'нет непробитых чеков — строки про них в сводке нет');
+
+    // Выписка закрывает пачкой: чеки появляются по всем закрытым документам.
+    const d3 = await mk(cpOrg, [{ name: 'Окна', qty: 1, price: 7000 }], '2026-09-02');
+    const d4 = await mk(cpIp, [{ name: 'Двери', qty: 1, price: 9000 }], '2026-09-03');
+    const closed = bdbN.closeDocsFromBank(uid, [
+      { opId: 0, cpId: cpOrg, leadId: d3.doc.id, twinId: 0, total: 7000, date: '2026-09-05', doc: '' },
+      { opId: 0, cpId: cpIp, leadId: d4.doc.id, twinId: 0, total: 9000, date: '2026-09-05', doc: '' },
+    ]);
+    ok(closed.leads.length === 2, 'закрытие по выписке называет документы сделок', JSON.stringify(closed));
+    const made = chq.oweMany(uid, closed.leads, '2026-09-05');
+    ok(made.length === 2 && made.every((c) => c.due === '2026-10-09'), 'по каждому — ожидание чека со сроком 09.10', JSON.stringify(made.map((c) => c.due)));
+    ok(chq.oweMany(uid, closed.leads, '2026-09-05').length === 0, 'повторная загрузка той же выписки чеков не плодит');
+    for (const c of chq.open(uid)) chq.markDone(uid, c.id);
+
+    // Документы самозанятого.
+    const docH = require('./lib/doc-html');
+    const orgNow = bdbN.getDefaultOrg(uid);
+    ok(docH.isSelfEmployed({ ...orgNow, name: 'Иванов Иван', full_name: '', ogrnip: '' }), 'гражданин на НПД — не ИП');
+    ok(!docH.isSelfEmployed({ ...orgNow, name: 'Иванов Иван', full_name: '', ogrnip: '318183200012345' }), 'а с ОГРНИП — ИП, как бы ни назвали');
+    ok(!docH.isSelfEmployed({ ...orgNow, name: 'ИП Петров' }), 'ИП на НПД остаётся ИП');
+    const selfOrg = { ...orgNow, name: 'Иванов Иван', full_name: 'Иванов Иван Иванович', signer: 'И. И. Иванов', inn: '770123456789', npd: 1, ogrnip: '' };
+    const rows = docH.signRows(selfOrg);
+    ok(rows.length === 1 && rows[0].title === 'Исполнитель', 'у самозанятого одна подпись «Исполнитель» — без руководителя и бухгалтера');
+    ok(docH.signRows({ ...selfOrg, name: 'ИП Иванов' })[0].title === 'Индивидуальный предприниматель', 'у ИП на НПД подпись прежняя');
+    const cpDoc = { name: 'ООО «Заказчик»', inn: '7707083893' };
+    const mkHtml = (b, o, extra = {}) => b({ org: o, cp: cpDoc, doc: { number: '1', date: '2026-09-01', items: [{ name: 'Работа', qty: 1, price: 1000 }], vatRate: null, ...extra } });
+    const plain = { ...selfOrg, npd: 0, name: 'ООО «Обычное»', inn: '7707083893' };
+    for (const [title, build] of [['счёт', require('./lib/schet').buildSchetHtml], ['акт', require('./lib/akt-uslug').buildAktUslugHtml],
+      ['счёт-договор', require('./lib/schet-dogovor').buildSchetDogovorHtml]]) {
+      ok(/Без НДС, применяется НПД/.test(mkHtml(build, selfOrg)), `${title} самозанятого: «Без НДС, применяется НПД»`);
+      ok(!/применяется НПД/.test(mkHtml(build, plain)), `${title} обычной фирмы без пометки про НПД`);
+    }
+    ok(!/Бухгалтер/.test(mkHtml(require('./lib/schet').buildSchetHtml, selfOrg)), 'в счёте самозанятого нет строки бухгалтера');
+    const dogS = require('./lib/schet-dogovor').buildSchetDogovorHtml;
+    ok(/в\s+суде по месту нахождения Исполнителя/.test(mkHtml(dogS, selfOrg)) && /арбитражном суде/.test(mkHtml(dogS, plain)),
+      'спор самозанятого подсуден обычному суду, а не арбитражному');
+
+    // УПД самозанятому не предлагается: ни в карточке клиента, ни в списке документов.
+    sent.length = 0;
+    await tap(`cp:${cpOrg}`);
+    ok(!button('УПД') && Boolean(button('ТОРГ-12')), 'в карточке клиента самозанятого нет УПД, ТОРГ-12 остаётся');
+    await tap('go.any');
+    ok(!button('УПД') && Boolean(button('ТОРГ-12')), 'в списке документов самозанятого нет УПД');
+    bdbN.updateOrg(uid, org.id, { npd: 0 });
+    await tap(`cp:${cpOrg}`);
+    ok(Boolean(button('УПД')), 'у остальных УПД на месте');
   }
 
   console.log('\n── фразы через Grok (xAI) ──');

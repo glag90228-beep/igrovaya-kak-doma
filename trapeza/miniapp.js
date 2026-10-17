@@ -33,6 +33,7 @@ const crm = require('./lib/crm');
 const { payQrSvg, payProblems } = require('./lib/qr-pay');
 const docLink = require('./lib/doc-link');
 const npd = require('./lib/npd');
+const cheques = require('./lib/cheques');
 const dadata = require('./lib/dadata');
 const facsimile = require('./lib/facsimile');
 const mailer = require('./lib/mail');
@@ -477,8 +478,31 @@ function stateFor(user) {
     bizType: (org && org.biz_type) || '',
     bizTypes: bizTypes.list(),
     recurring: recurring.list(user.id).length,
+    // Самозанятому: сколько чеков «Мой налог» ещё не пробито (lib/cheques.js).
+    cheques: chequesSummary(user.id),
     features: { dadata: dadata.dadataAvailable(), pdf: true, mail: mailbox.resolve(user.id).ok },
     mailbox: mailbox.info(user.id),
+  };
+}
+
+/** Сводка по непробитым чекам для главной: сколько, на сколько и самый близкий срок. */
+function chequesSummary(userId) {
+  const list = cheques.open(userId);
+  return {
+    open: list.length,
+    sum: round2(list.reduce((a, c) => a + c.amount, 0)),
+    nearest: list.length ? list[0].due : '',
+  };
+}
+
+/** Чек для показа в приложении: готовые данные для «Моего налога» и состояние. */
+function chequeBrief(c, cpName = '') {
+  const d = cheques.details(c);
+  return {
+    id: c.id, docId: c.doc_id, cpId: c.cp_id, cpName: cpName || c.cp_name || c.buyer_name || '',
+    status: c.status, link: c.link || '', number: c.number || '',
+    amount: d.amount, service: d.service, buyer: d.buyer, buyerInn: d.buyerInn, buyerName: d.buyerName,
+    due: c.due, paidAt: c.paid_at, text: cheques.reminderText(c, cpName || c.cp_name || ''),
   };
 }
 
@@ -921,7 +945,12 @@ const api = {
     // Долг по документу — чтобы карточка могла честно сказать, изменится
     // ли сальдо при удалении. Одним запросом на весь список, не по одному.
     const debt = bdb.debtByDoc(user.id, rows.map((d) => d.id));
-    return { docs: rows.map((d) => ({ ...docBrief(d), debt: (debt.get(d.id) || {}).delta || 0 })) };
+    return {
+      docs: rows.map((d) => {
+        const chq = cheques.forDoc(user.id, d.id);
+        return { ...docBrief(d), debt: (debt.get(d.id) || {}).delta || 0, cheque: chq ? chequeBrief(chq) : null };
+      }),
+    };
   },
 
   /**
@@ -1020,16 +1049,18 @@ const api = {
     }
     const when = bdb.markPaid(user.id, id, str(body.date, 10));
     // Самозанятому в этот момент надо выдать чек: счёт и акт доход не
-    // закрывают, его закрывает чек «Моего налога» (lib/npd.js).
+    // закрывают, его закрывает чек «Моего налога» (lib/npd.js). Запись о нём
+    // остаётся, пока человек не отметит чек пробитым (lib/cheques.js).
+    // Чек нужен, если самозанятая ФИРМА ДОКУМЕНТА, а не та, что выбрана
+    // сейчас: иначе при переключённой фирме напоминание о чеке терялось.
     const cp = doc.cp_id ? bdb.getCp(user.id, doc.cp_id) : null;
+    const chq = cheques.owe(user.id, id, when);
     return {
       paidAt: when,
       doc: docBrief(bdb.getDoc(user.id, id)),
-      // Чек нужен, если самозанятая ФИРМА ДОКУМЕНТА, а не та, что выбрана
-      // сейчас: иначе при переключённой фирме напоминание о чеке терялось.
-      npd: npd.chequeReminder(bdb.orgOfDoc(user.id, doc), {
-        paidAt: when, cpName: cp && cp.name,
-      }),
+      npd: chq && chq.status === 'open'
+        ? { url: npd.LK_URL, text: cheques.reminderText(chq, cp && cp.name), cheque: chequeBrief(chq, cp && cp.name) }
+        : null,
     };
   },
 
@@ -1039,6 +1070,40 @@ const api = {
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     bdb.updateOrg(user.id, org.id, { npd: body.on ? 1 : 0 });
     return { npd: Boolean(body.on), lkUrl: npd.LK_URL };
+  },
+
+  /** Чеки «Мой налог», которые ещё надо пробить, и недавно пробитые. */
+  async 'GET /api/cheques'({ user }) {
+    return {
+      items: cheques.open(user.id).map((c) => chequeBrief(c)),
+      summary: chequesSummary(user.id),
+      lkUrl: npd.LK_URL,
+    };
+  },
+
+  /**
+   * Отметить чек пробитым. Ссылка необязательна, но если она есть, то только
+   * из «Моего налога»: она потом показывается кликабельной в карточке документа.
+   */
+  async 'POST /api/cheques/done'({ user, body }) {
+    const link = str(body.link, 400);
+    if (link && !cheques.parseLink(link)) {
+      return { error: 'Ссылка должна быть из «Моего налога»: она начинается с https://lknpd.nalog.ru/.' };
+    }
+    const c = cheques.markDone(user.id, Number(body.id), link);
+    if (!c) return { error: 'Такого чека нет в вашем списке.' };
+    return { cheque: chequeBrief(c), summary: chequesSummary(user.id) };
+  },
+
+  /** Приложить (или заменить) ссылку на уже пробитый чек. */
+  async 'POST /api/cheques/link'({ user, body }) {
+    if (!cheques.parseLink(str(body.link, 400))) {
+      return { error: 'Ссылка должна быть из «Моего налога»: она начинается с https://lknpd.nalog.ru/.' };
+    }
+    const c = cheques.get(user.id, Number(body.id));
+    if (!c) return { error: 'Такого чека нет в вашем списке.' };
+    cheques.attachLink(user.id, c.id, str(body.link, 400));
+    return { cheque: chequeBrief(cheques.markDone(user.id, c.id, str(body.link, 400))) };
   },
 
   /*
@@ -1717,8 +1782,16 @@ const api = {
      * много документов молча. Для ИП на НПД это срок из статьи 14
      * ФЗ № 422-ФЗ, а не вежливость.
      */
-    const npdNote = done.docs
-      ? npd.chequeReminder(bdb.currentOrg(user.id), { paidAt: docService.todayISO() })
+    const made = cheques.oweMany(user.id, done.leads, docService.todayISO());
+    const npdNote = made.length
+      ? {
+        url: npd.LK_URL,
+        text: made.length === 1
+          ? cheques.reminderText(made[0])
+          : `Пробейте чеки в «Мой налог»: ${made.length} шт. на ${cheques.rub(made.reduce((a, c) => a + c.amount, 0))}. `
+            + 'Данные для каждого — на экране «Чеки».',
+        cheques: made.map((c) => chequeBrief(c)),
+      }
       : null;
     return { ...done, count: left.count, sum: left.sum, npd: npdNote };
   },

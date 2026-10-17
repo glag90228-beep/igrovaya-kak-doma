@@ -4,7 +4,7 @@
 // Заказчик слева, Исполнитель справа, наименование ИП прописью CAPS, без М.П.,
 // таблица услуг, сумма прописью, при необходимости — признание задолженности.
 
-const { esc, page, fxHtml, formatMoney, amountInWords, placeDate } = require('./doc-html');
+const { esc, page, fxHtml, npdNote, formatMoney, amountInWords, placeDate } = require('./doc-html');
 const { round2, vatTotals, rateLabel } = require('./money');
 
 function party(org) {
@@ -112,6 +112,7 @@ function buildAktUslugHtml({ org, cp, doc }) {
       : (gross
         ? `, в т.ч. НДС ${esc(rateLabel(rate))} — ${formatMoney(vat)} руб.`
         : `, плюс НДС ${esc(rateLabel(rate))} — ${formatMoney(vat)} руб.`)}.</p>
+    ${rate == null ? npdNote(org) : ''}
     <p class="note">Вышеперечисленные услуги выполнены полностью и в срок. Заказчик претензий
        по объёму, качеству и срокам оказания услуг не имеет.</p>
     ${doc.note ? `<p class="note">${esc(doc.note)}</p>` : ''}

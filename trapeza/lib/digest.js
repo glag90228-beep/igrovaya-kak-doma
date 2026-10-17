@@ -22,6 +22,7 @@
 
 const { db } = require('../db');
 const bdb = require('./bot-db');
+const cheques = require('./cheques');
 const { todayISO } = require('./period');
 
 function migrate() {
@@ -78,16 +79,23 @@ const days = (n) => {
  */
 function build(userId, { force = false, today = todayISO(), now = new Date() } = {}) {
   const owe = bdb.debtors(userId).filter((r) => r.theyOwe).sort((a, b) => b.amount - a.amount);
-  if (!owe.length) return null;
+  // Непробитые чеки самозанятого: срок по закону жёсткий, и вспоминать про них
+  // надо без повода — даже когда должников нет и сводка иначе промолчала бы.
+  const chq = cheques.open(userId);
+  if (!owe.length && !chq.length) return null;
   const total = Math.round(owe.reduce((s, r) => s + r.amount, 0) * 100) / 100;
   if (!force) {
     const u = db.prepare('SELECT digest_at, digest_total FROM bot_users WHERE id = ?').get(userId) || {};
     if (u.digest_at === today) return null;
     const gap = u.digest_at ? Math.floor((new Date(today) - new Date(u.digest_at)) / 86400000) : 99;
-    if (Math.abs((u.digest_total || 0) - total) < 0.01 && gap < 3) return null;
+    // Чеки в «ту же сумму» не входят: срок у них свой, и три дня молчания —
+    // уже много, поэтому с непробитым чеком сводку по сумме не гасим.
+    if (!chq.length && Math.abs((u.digest_total || 0) - total) < 0.01 && gap < 3) return null;
   }
-  const lines = [`☀️ <b>Доброе утро!</b> Вам должны <b>${rub(total)}</b>`
-    + ` — ${owe.length} ${owe.length === 1 ? 'клиент' : owe.length < 5 ? 'клиента' : 'клиентов'}.`, ''];
+  const lines = owe.length
+    ? [`☀️ <b>Доброе утро!</b> Вам должны <b>${rub(total)}</b>`
+      + ` — ${owe.length} ${owe.length === 1 ? 'клиент' : owe.length < 5 ? 'клиента' : 'клиентов'}.`, '']
+    : ['☀️ <b>Доброе утро!</b>', ''];
   for (const r of owe.slice(0, 5)) {
     const quiet = r.days != null && r.days > 0 ? ` · без оплаты ${days(r.days)}` : '';
     const rem = lastReminded(userId, r.cp.id, now);
@@ -95,6 +103,11 @@ function build(userId, { force = false, today = todayISO(), now = new Date() } =
     lines.push(`• <b>${esc(r.cp.name)}</b> — ${rub(r.amount)}${quiet}${remTxt}`);
   }
   if (owe.length > 5) lines.push(`• и ещё ${owe.length - 5}`);
+  if (chq.length) {
+    const soon = chq[0].due;
+    lines.push('', `🧾 <b>Чеки не пробиты: ${chq.length}</b> на ${cheques.rub(chq.reduce((a, c) => a + c.amount, 0))}`
+      + (soon ? ` — ближайший срок ${soon.split('-').reverse().join('.')}.` : '.'));
+  }
   const yesterday = new Date(new Date(today).getTime() - 86400000).toISOString().slice(0, 10);
   const made = bdb.listDocs(userId, 50).filter((d) => d.date === yesterday);
   if (made.length) {
@@ -105,7 +118,9 @@ function build(userId, { force = false, today = todayISO(), now = new Date() } =
     { text: `✉️ Напомнить: ${r.cp.name}`.slice(0, 40), data: `rm.one:${r.cp.id}` },
     { text: '✅ Оплатил', data: `pay.cp:${r.cp.id}:${Math.round(r.amount * 100) / 100}:o:${require('node:crypto').randomBytes(4).toString('hex')}` },
   ]));
-  rows.push([{ text: '📄 Акты сверки всем', data: 'debt.akts' }, { text: '🔕 Не присылать', data: 'dg.off' }]);
+  if (chq.length) rows.push([{ text: '🧾 Чеки к пробитию', data: 'chq.list' }]);
+  if (owe.length) rows.push([{ text: '📄 Акты сверки всем', data: 'debt.akts' }, { text: '🔕 Не присылать', data: 'dg.off' }]);
+  else rows.push([{ text: '🔕 Не присылать', data: 'dg.off' }]);
   return { text: lines.join('\n'), rows, total };
 }
 

@@ -4,7 +4,7 @@
 // «шапка-банк» получателя, реквизиты поставщика/покупателя, таблица позиций,
 // «Без НДС», всего к оплате прописью, подписи (у ИП — одна, см. signRows).
 
-const { esc, ru, page, fxHtml, signRows, formatMoney, amountInWords } = require('./doc-html');
+const { esc, ru, page, fxHtml, signRows, npdNote, formatMoney, amountInWords } = require('./doc-html');
 const { round2, vatTotals, rateLabel } = require('./money');
 const { payQrSvg } = require('./qr-pay');
 
@@ -105,6 +105,7 @@ function buildSchetHtml({ org, cp, doc }) {
       <div class="pay__text">
         <p class="b">Всего наименований ${n} на сумму ${formatMoney(total)} руб.</p>
         <p class="b">${amountInWords(total)}.</p>
+        ${rate == null ? npdNote(org) : ''}
         <p class="note">Оплата данного счёта означает согласие с условиями поставки товара
            (оказания услуг). Счёт действителен к оплате в течение 5 банковских дней.</p>
       </div>

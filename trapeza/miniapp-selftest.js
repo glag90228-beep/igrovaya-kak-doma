@@ -957,10 +957,37 @@ async function main() {
 
     await call('POST', '/api/doc/paid', { user: masha, body: { id: unpaid.id, paid: false } });
     r = await call('POST', '/api/doc/paid', { user: masha, body: { id: unpaid.id } });
-    ok(r.json.npd && /чек в «Моём налоге»/.test(r.json.npd.text),
-      'с галочкой — напоминание про чек', r.json.npd && r.json.npd.text.slice(0, 60));
+    ok(r.json.npd && /Пробейте чек в «Мой налог» на 600 ₽/.test(r.json.npd.text),
+      'с галочкой — напоминание про чек с суммой', r.json.npd && r.json.npd.text.slice(0, 60));
     ok(r.json.npd.url === 'https://lknpd.nalog.ru/',
       'и адрес личного кабинета, а не выдуманная схема', r.json.npd.url);
+
+    // Учёт чеков: ждёт, видно на главной и в карточке, закрывается отметкой.
+    const chqId = r.json.npd.cheque.id;
+    r = await call('GET', '/api/state', { user: masha });
+    ok(r.json.cheques && r.json.cheques.open === 1 && r.json.cheques.sum === 600,
+      'главная знает: «Чеки не пробиты: 1» на 600 ₽', JSON.stringify(r.json.cheques));
+    r = await call('GET', '/api/cheques', { user: masha });
+    ok(r.json.items.length === 1 && r.json.items[0].id === chqId && r.json.items[0].service,
+      'список чеков отдаёт данные для «Мой налог»', JSON.stringify(r.json.items).slice(0, 120));
+    r = await call('GET', '/api/cheques', { user: petya });
+    ok(r.json.items.length === 0, 'чужие чеки не видны');
+    r = await call('POST', '/api/cheques/done', { user: petya, body: { id: chqId } });
+    ok(r.json.error, 'и отметить чужой чек нельзя', JSON.stringify(r.json));
+    r = await call('POST', '/api/cheques/done', { user: masha, body: { id: chqId, link: 'https://evil.example/x' } });
+    ok(r.json.error && /lknpd\.nalog\.ru/.test(r.json.error), 'ссылка не из «Моего налога» отвергается', JSON.stringify(r.json));
+    r = await call('GET', '/api/docs', { user: masha });
+    ok((r.json.docs.find((d) => d.id === unpaid.id) || {}).cheque.status === 'open', 'в карточке документа чек «не пробит»');
+    r = await call('POST', '/api/cheques/done', { user: masha,
+      body: { id: chqId, link: 'https://lknpd.nalog.ru/api/v1/receipt/770123456789/abc123/print' } });
+    ok(r.json.cheque && r.json.cheque.status === 'done' && r.json.cheque.number === 'abc123' && r.json.summary.open === 0,
+      'отметка со ссылкой: чек пробит, номер выделен, на главной чисто', JSON.stringify(r.json).slice(0, 140));
+    r = await call('GET', '/api/docs', { user: masha });
+    ok(/lknpd\.nalog\.ru/.test((r.json.docs.find((d) => d.id === unpaid.id) || {}).cheque.link), 'ссылка лежит в карточке документа');
+    // Повторное «оплачен» на документе с пробитым чеком нового чека не заводит.
+    r = await call('POST', '/api/doc/paid', { user: masha, body: { id: unpaid.id } });
+    r = await call('GET', '/api/cheques', { user: masha });
+    ok(r.json.items.length === 0, 'пробитый чек второй раз не всплывает');
 
     await call('POST', '/api/npd', { user: masha, body: { on: false } });
   }

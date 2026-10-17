@@ -21,7 +21,7 @@
  * нельзя ни при каких обстоятельствах.
  */
 
-const { esc, ru, page, fxHtml, formatMoney, amountInWords } = require('./doc-html');
+const { esc, ru, page, fxHtml, npdNote, courtOf, formatMoney, amountInWords } = require('./doc-html');
 const { round2, vatTotals, rateLabel } = require('./money');
 const { payQrSvg } = require('./qr-pay');
 
@@ -119,6 +119,7 @@ function buildSchetDogovorHtml({ org, cp, doc }) {
       <div class="pay__text">
         <p class="b">Всего наименований ${items.length} на сумму ${formatMoney(total)} руб.</p>
         <p class="b">${amountInWords(total)}.</p>
+        ${rate == null ? npdNote(org) : ''}
         <div class="accept">
           <b>Оплата настоящего счёта-договора означает акцепт оферты</b> и заключение
           договора на условиях, изложенных ниже (п. 3 ст. 438 ГК РФ). Подписание
@@ -158,7 +159,7 @@ function buildSchetDogovorHtml({ org, cp, doc }) {
       <p>5.1. Документы, переданные по электронной почте или в мессенджерах с адресов
          и номеров сторон, признаются имеющими силу оригиналов.</p>
       <p>5.2. Споры разрешаются переговорами, при недостижении согласия — в
-         арбитражном суде по месту нахождения Исполнителя.</p>
+         ${courtOf(org)} по месту нахождения Исполнителя.</p>
     </div>
 
     <div class="sign">

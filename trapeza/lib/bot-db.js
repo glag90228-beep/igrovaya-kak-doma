@@ -949,6 +949,7 @@ function deleteOp(userId, opId) {
   if (row.doc_id && row.kind === 'Оплата') {
     db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0 WHERE id = ? AND user_id = ?")
       .run(row.doc_id, userId);
+    dropChequeWait(userId, row.doc_id);
     // И со второго документа сделки, если его закрыли заодно с этим.
     db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0, paid_with = 0 WHERE paid_with = ? AND user_id = ?")
       .run(row.doc_id, userId);
@@ -1405,6 +1406,19 @@ function deleteOpsOfDoc(userId, docId, kind = null) {
   return info.changes + kept;
 }
 
+/**
+ * Оплату сняли — самозанятому не от чего ждать чека (lib/cheques.js).
+ * Пробитый чек не трогаем: он уже в налоговой. Прямой запрос, а не вызов
+ * модуля чеков: тот сам зависит от этого файла. Таблицы может не быть, если
+ * модуль не подключали, — тогда и ждать нечего.
+ */
+function dropChequeWait(userId, docId) {
+  try {
+    db.prepare("DELETE FROM npd_cheques WHERE user_id = ? AND doc_id = ? AND status = 'open'")
+      .run(userId, Number(docId));
+  } catch (_) { /* таблицы нет */ }
+}
+
 /** Отметка оплаты документа + поступление денег в журнал. */
 function markPaid(userId, docId, date) {
   const d = getDoc(userId, docId);
@@ -1492,6 +1506,7 @@ function markPaid(userId, docId, date) {
 function unmarkPaid(userId, docId) {
   const d = getDoc(userId, docId);
   if (!d) return false;
+  dropChequeWait(userId, docId);
   db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0 WHERE id = ? AND user_id = ?").run(docId, userId);
   db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0, paid_with = 0 WHERE paid_with = ? AND user_id = ?")
     .run(docId, userId);
@@ -1728,7 +1743,8 @@ function matchPaymentsToDocs(userId, payments) {
  * Номер платёжки сохраняем: в привязанной строке остаётся тот же текст, что
  * был в выписке, — иначе при сверке не найти, каким платежом закрыт счёт.
  *
- * @returns {{docs:number, deals:number}} сколько документов и сделок закрыто
+ * @returns {{docs:number, deals:number, leads:number[]}} сколько документов и сделок
+ *   закрыто; leads — id главных документов сделок (по ним самозанятому ждать чек)
  */
 function closeDocsFromBank(userId, deals) {
   /*
@@ -1783,6 +1799,7 @@ function closeDocsFromBank(userId, deals) {
   };
   let docs = 0;
   let done = 0;
+  const leads = [];
 
   db.exec('BEGIN IMMEDIATE');
   try {
@@ -1806,6 +1823,7 @@ function closeDocsFromBank(userId, deals) {
 
       mark.run(when, debt ? total : 0, lead.id, userId);
       docs += 1;
+      leads.push(lead.id);
       /*
        * У пары проводки нет и быть не должно — долг создаёт только один
        * документ сделки. Отметка нужна, чтобы второй не висел в «не оплачено»
@@ -1827,7 +1845,7 @@ function closeDocsFromBank(userId, deals) {
     db.exec('ROLLBACK');
     throw e;
   }
-  return { docs, deals: done };
+  return { docs, deals: done, leads };
 }
 
 /** Сальдо по контрагенту (переиспользует computeBalance из db.js) */

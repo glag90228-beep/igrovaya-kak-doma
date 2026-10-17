@@ -862,6 +862,51 @@ const ok = (c, m, extra) => {
     ok(await page.locator('#monthact-make').count() === 0, 'второй раз создать нечего: кнопки «Создать» уже нет');
   }
 
+  /*
+   * Самозанятый: «Чеки не пробиты» на главной → список → «Чек пробил».
+   */
+  console.log('\n── чеки «Мой налог» ──');
+  {
+    const cheques = require(path.join(APP, 'lib/cheques'));
+    const orgId = bdb.getDefaultOrg(user.id).id;
+    bdb.updateOrg(user.id, orgId, { npd: 1 });
+    const cpC = bdb.createCp(user.id, { name: 'ООО «Чековый»', inn: '7707083893', kind: 'customer', opening_date: '2026-01-01' });
+    const made = await docService.issueDocument(user.id, {
+      type: 'sch', cpId: cpC, items: [{ name: 'Уборка', qty: 1, price: 4000 }], skipQuota: true,
+    });
+    await page.evaluate(() => window.__go('home'));
+    await page.waitForSelector('#app', { timeout: 5000 });
+    ok(await page.locator('#cheques-home').count() === 0, 'пока оплаты нет, строки про чеки на главной нет');
+
+    bdb.markPaid(user.id, made.doc.id);
+    const chq = cheques.owe(user.id, made.doc.id, docService.todayISO());
+    await page.evaluate(() => window.__go('home'));
+    await page.waitForSelector('#cheques-home', { timeout: 5000 });
+    ok((await page.textContent('#cheques-home')).includes('Чеки не пробиты: 1'), 'на главной — «Чеки не пробиты: 1»');
+    await page.locator('#cheques-home .row').tap();
+    await page.waitForSelector(`#cheque-ok-${chq.id}`, { timeout: 5000 });
+    const txt = (await page.textContent('#app')).replace(/\s/g, ' ');
+    ok(txt.includes('Уборка') && txt.includes('организация, ИНН 7707083893'), 'на экране чеков — данные для «Мой налог»');
+    ok(await page.evaluate((id) => {
+      const b = document.getElementById(`cheque-ok-${id}`).getBoundingClientRect();
+      window.scrollTo(0, document.body.scrollHeight);
+      const tabs = document.getElementById('tabs').getBoundingClientRect();
+      const after = document.getElementById(`cheque-ok-${id}`).getBoundingClientRect();
+      return b.height > 0 && after.bottom <= tabs.top + 1;
+    }, chq.id), 'кнопку «Чек пробил» не закрывает нижняя панель');
+    await page.locator(`#cheque-ok-${chq.id}`).tap();
+    await page.getByText('Все чеки пробиты').waitFor({ timeout: 8000 });
+    ok(cheques.get(user.id, chq.id).status === 'done', 'после «Чек пробил» чек отмечен в базе');
+
+    await page.evaluate((id) => window.__go('doc', { id }), made.doc.id);
+    await page.waitForSelector('#doc-cheque', { timeout: 5000 });
+    ok((await page.textContent('#doc-cheque')).includes('пробит'), 'в карточке документа чек числится пробитым');
+    await page.evaluate(() => window.__go('home'));
+    await page.waitForSelector('.hero', { timeout: 5000 });
+    ok(await page.locator('#cheques-home').count() === 0, 'на главной строка про чеки исчезла');
+    bdb.updateOrg(user.id, orgId, { npd: 0 });
+  }
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();

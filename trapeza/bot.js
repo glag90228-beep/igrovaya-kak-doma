@@ -50,6 +50,7 @@ const reqCheck = require('./lib/requisites-check');
 const docService = require('./lib/doc-service');
 const docLink = require('./lib/doc-link');
 const npd = require('./lib/npd');
+const cheques = require('./lib/cheques');
 const facsimile = require('./lib/facsimile');
 const mailer = require('./lib/mail');
 const mailbox = require('./lib/mailbox');
@@ -152,6 +153,8 @@ const FLOW_BUTTONS = {
   'dogx:': [],
   'note:': [],
   'fu:': [],
+  // Ждём ссылку на чек; кнопки внутри нет, любая нажатая — «передумал».
+  'chq:': [],
 };
 
 // ---------- меню ----------
@@ -257,7 +260,11 @@ function cpMenu(userId, cp) {
     [{ text: '📄 Акт сверки', data: `d.akt:${cp.id}` }, { text: '🧾 Акт услуг', data: `d.usl:${cp.id}` }],
     [{ text: '💰 Счёт на оплату', data: `d.sch:${cp.id}` }, { text: '🏦 Платёжка', data: `d.pp:${cp.id}` }],
     [{ text: '🤝 Счёт-договор', data: `d.schdog:${cp.id}` }],
-    [{ text: '📦 УПД', data: `d.upd:${cp.id}` }, { text: '🚚 ТОРГ-12', data: `d.torg12:${cp.id}` }],
+    // Самозанятому УПД ни к чему: счёт-фактуру он выставлять не вправе, а
+    // «УПД статус 2» — тот же акт, который у него и так есть (422-ФЗ).
+    npd.isNpd(bdb.currentOrg(userId))
+      ? [{ text: '🚚 ТОРГ-12', data: `d.torg12:${cp.id}` }]
+      : [{ text: '📦 УПД', data: `d.upd:${cp.id}` }, { text: '🚚 ТОРГ-12', data: `d.torg12:${cp.id}` }],
     [{ text: '📝 Договор', data: `d.dog:${cp.id}` }, { text: '📎 Свой договор', data: `mc.menu:${cp.id}` }],
     [{ text: '🕑 История', data: `crm.h:${cp.id}` }, { text: '📝 Заметка', data: `crm.n:${cp.id}` },
       { text: '⏰ Напомнить мне', data: `crm.f:${cp.id}` }],
@@ -1662,6 +1669,13 @@ async function showDoc(tg, chatId, user, docId) {
   // Отмену проводки надо уметь отменить. Без этой кнопки документ навсегда
   // выпадал из долга, продолжая числиться в «Ждут оплаты».
   if (d.no_debt) rows.push([{ text: '↩️ Вернуть в долг', data: `doc.debt:${d.id}` }]);
+  // Самозанятому — состояние чека прямо в карточке: пробит ли и куда смотреть.
+  const chq = cheques.forDoc(user.id, d.id);
+  if (chq) {
+    rows.push([chq.status === 'done'
+      ? { text: chq.link ? '🧾 Чек пробит · приложена ссылка' : '🧾 Чек пробит · приложить ссылку', data: `chq.link:${chq.id}` }
+      : { text: `🧾 Ждёт чека до ${ru(chq.due)}`, data: `chq.show:${chq.id}` }]);
+  }
   // Акт сверки отправляют почтой чаще всех остальных: он нужен не себе, а
   // контрагенту — согласиться или возразить. Раньше кнопки у него не было,
   // потому что он не умел пересобираться; теперь умеет.
@@ -1681,6 +1695,9 @@ async function showDoc(tg, chatId, user, docId) {
     + (d.total ? `Сумма: <b>${formatRub(d.total)}</b>\n` : '')
     + (payable ? `Оплата: <b>${d.paid_at ? `получена ${ru(d.paid_at)}` : 'не отмечена'}</b>\n` : '')
     + (d.no_debt ? 'Долг по этому документу отменён вручную.\n' : '')
+    + (chq ? (chq.status === 'done'
+      ? `Чек «Мой налог»: <b>пробит</b>${chq.number ? ` (№ ${esc(chq.number)})` : ''}${chq.link ? `\n${esc(chq.link)}` : ''}\n`
+      : `Чек «Мой налог»: <b>не пробит</b>, срок до ${ru(chq.due)}\n`) : '')
     + (link ? `\n🔗 ${esc(link.url)}\nдействует до ${ru(link.expiresAt.slice(0, 10))}`
       + `, ${link.opens ? `открывали ${link.opens} ${plural(link.opens, 'раз', 'раза', 'раз')}` : 'ещё не открывали'}\n` : '')
     + (items ? `\n${items}` : ''),
@@ -1700,13 +1717,51 @@ async function showDoc(tg, chatId, user, docId) {
  */
 async function remindCheque(tg, chatId, user, docId, paidAt) {
   if (!paidAt) return;
-  const org = bdb.currentOrg(user.id);
-  const d = bdb.getDoc(user.id, docId);
-  const cp = d && d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
-  const note = npd.chequeReminder(org, { paidAt, cpName: cp && cp.name });
-  if (!note) return;
-  await tg.sendMessage(chatId, `🧾 ${esc(note.text)}`,
-    keyboard([[{ text: '🧾 Открыть «Мой налог»', url: note.url }]]));
+  const c = cheques.owe(user.id, docId, paidAt);
+  // Чек уже пробит — второй раз о нём не напоминаем.
+  if (!c || c.status === 'done') return;
+  await sendChequeCard(tg, chatId, user, c);
+}
+
+/** Карточка одного чека: готовые данные и три кнопки. Деньги пришли — человеку остаётся ввести их в «Мой налог». */
+async function sendChequeCard(tg, chatId, user, c) {
+  const cp = c.cp_id ? bdb.getCp(user.id, c.cp_id) : null;
+  await tg.sendMessage(chatId, `🧾 ${esc(cheques.reminderText(c, cp && cp.name))}`,
+    keyboard([
+      [{ text: '✅ Чек пробил', data: `chq.ok:${c.id}` }, { text: '⏳ Позже', data: `chq.later:${c.id}` }],
+      [{ text: '🧾 Открыть «Мой налог»', url: npd.LK_URL }],
+    ]));
+}
+
+/** После закрытия платежей пачкой: один чек — карточка, несколько — общий список. */
+async function remindChequesBatch(tg, chatId, user, leadIds, paidAt) {
+  const made = cheques.oweMany(user.id, leadIds, paidAt);
+  if (!made.length) return;
+  if (made.length === 1) { await sendChequeCard(tg, chatId, user, made[0]); return; }
+  const total = made.reduce((a, c) => a + c.amount, 0);
+  await tg.sendMessage(chatId,
+    `🧾 Пробейте чеки в «Мой налог»: ${made.length} шт. на ${formatRub(total)}.\n\n`
+    + made.slice(0, 8).map((c) => `• ${formatRub(c.amount)} — ${esc(c.buyer_name || c.service)}`).join('\n')
+    + (made.length > 8 ? `\n…и ещё ${made.length - 8}` : '')
+    + '\n\n<i>По переводу на счёт срок — до 9-го числа следующего месяца. '
+    + 'Данные для каждого чека — в списке.</i>',
+    keyboard([[{ text: '🧾 Чеки к пробитию', data: 'chq.list' }], [{ text: '🧾 Открыть «Мой налог»', url: npd.LK_URL }]]));
+}
+
+/** Список непробитых чеков. */
+async function showCheques(tg, chatId, user) {
+  const list = cheques.open(user.id);
+  if (!list.length) {
+    await tg.sendMessage(chatId, '🧾 Непробитых чеков нет.', mainMenu());
+    return;
+  }
+  const rows = list.slice(0, 12).map((c) => ([{
+    text: `${cheques.rub(c.amount)} · ${c.cp_name || c.buyer_name || 'клиент'} · до ${ru(c.due).slice(0, 5)}`.slice(0, 60),
+    data: `chq.show:${c.id}`,
+  }]));
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId,
+    `<b>Чеки не пробиты: ${list.length}</b>\n\nНажмите на строку — покажу данные для чека.`, keyboard(rows));
 }
 
 /**
@@ -2833,11 +2888,12 @@ async function recordPay(tg, chatId, user, cpId, amount, kind) {
    * нажал кнопку сам, так что подтверждение уже есть.
    */
   let closedDocs = [];
+  let chequeLeads = [];
   const undoIds = [opId];
   if (!isIncome) {
     const m = bdb.matchPaymentsToDocs(user.id, [{ opId, cpId, amount: sum, date: op.date, doc: '' }]);
     if (m.deals.length) {
-      bdb.closeDocsFromBank(user.id, m.deals);
+      chequeLeads = bdb.closeDocsFromBank(user.id, m.deals).leads;
       closedDocs = m.deals;
       undoIds.length = 0;
       for (const d of m.deals) {
@@ -2861,6 +2917,8 @@ async function recordPay(tg, chatId, user, cpId, amount, kind) {
       [{ text: '↩️ Отменить проводку', data: `pay.undo:${cpId}:${undoIds.join(',')}` }],
       [{ text: `📂 Карточка «${cp.name}»`.slice(0, 60), data: `cp:${cpId}` }],
     ]));
+  // Самозанятому деньги пришли — значит, пора пробить чек.
+  if (chequeLeads.length) await remindChequesBatch(tg, chatId, user, chequeLeads, op.date);
 }
 
 /*
@@ -3668,12 +3726,15 @@ async function showNpd(tg, chatId, user) {
     `<b>Налог на профессиональный доход</b>\n\nСейчас: <b>${on ? 'применяю' : 'не применяю'}</b>\n\n`
     + 'Если вы самозанятый или ИП на НПД, счёт и акт сами по себе доход не '
     + 'закрывают: его закрывает чек из «Моего налога». Включите галочку — и '
-    + 'после каждой отметки об оплате я напомню выдать чек и открою приложение.\n\n'
+    + 'после каждой отметки об оплате я дам готовые данные для чека и буду помнить, '
+    + 'пока вы не отметите его пробитым: непробитые чеки — в утренней сводке.\n\n'
     + '<i>Сам чек не выписываю и выписывать не буду: это заявление в налоговую '
     + 'от вашего имени, его делаете вы.</i>',
     keyboard([
       [{ text: on ? '✅ Применяю НПД' : 'Применяю НПД', data: 'npd.set:1' }],
       [{ text: on ? 'Не применяю' : '✅ Не применяю', data: 'npd.set:0' }],
+      ...(cheques.openCount(user.id)
+        ? [[{ text: `🧾 Чеки не пробиты: ${cheques.openCount(user.id)}`, data: 'chq.list' }]] : []),
       [{ text: '🧾 Открыть «Мой налог»', url: npd.LK_URL }],
       [{ text: '⬅️ К организации', data: 'org' }],
     ]));
@@ -4864,17 +4925,23 @@ async function startDoc(tg, chatId, user, type) {
 /** Выбор вида документа, когда нужен не счёт. */
 async function chooseDoc(tg, chatId, user) {
   bdb.clearState(user.id);
+  const self = npd.isNpd(bdb.currentOrg(user.id));   // самозанятому УПД не предлагаем
   const rows = [
     [{ text: '🧾 Счёт на оплату', data: 'go.sch' }, { text: '📝 Счёт-договор', data: 'go.schdog' }],
-    [{ text: '🧾 Акт услуг', data: 'go.usl' }, { text: '📦 УПД', data: 'go.upd' }],
-    [{ text: '🚚 ТОРГ-12', data: 'go.torg12' }, { text: '📝 Договор', data: 'go.dog' }],
+    self
+      ? [{ text: '🧾 Акт услуг', data: 'go.usl' }, { text: '🚚 ТОРГ-12', data: 'go.torg12' }]
+      : [{ text: '🧾 Акт услуг', data: 'go.usl' }, { text: '📦 УПД', data: 'go.upd' }],
+    self
+      ? [{ text: '📝 Договор', data: 'go.dog' }]
+      : [{ text: '🚚 ТОРГ-12', data: 'go.torg12' }, { text: '📝 Договор', data: 'go.dog' }],
     [{ text: '🏦 Платёжка', data: 'go.pp' }, { text: '📄 Акт сверки', data: 'go.akt' }],
     [{ text: '⬅️ Меню', data: 'menu' }],
   ];
   await tg.sendMessage(chatId,
     '<b>Какой документ нужен?</b>\n\n'
     + '<i>Счёт — попросить оплату. Акт — подтвердить, что услуга оказана. '
-    + 'УПД и ТОРГ-12 — передать товар. Счёт-договор — счёт вместо договора. '
+    + (self ? 'ТОРГ-12 — передать товар. ' : 'УПД и ТОРГ-12 — передать товар. ')
+    + 'Счёт-договор — счёт вместо договора. '
     + 'Платёжка — заплатить самому. Сверка — кто сколько должен.</i>',
     keyboard(rows));
 }
@@ -5282,6 +5349,22 @@ async function handleMessage(tg, msg) {
       keyboard([[{ text: '🕑 История', data: `crm.h:${cpId}` }, { text: '⏰ Напомнить мне', data: `crm.f:${cpId}` }]]));
     return;
   }
+  if (state.state.startsWith('chq:')) {
+    const id = Number(state.state.slice(4));
+    if (!cheques.attachLink(user.id, id, text)) {
+      await tg.sendMessage(chatId,
+        'Это не похоже на ссылку из «Моего налога». Она должна начинаться с '
+        + '<code>https://lknpd.nalog.ru/</code>. Пришлите её ещё раз или нажмите «Не нужно».',
+        keyboard([[{ text: 'Не нужно', data: 'menu' }]]));
+      return;
+    }
+    bdb.clearState(user.id);
+    const c = cheques.get(user.id, id);
+    // Ссылка на чек говорит, что он пробит, — отдельно отмечать не просят.
+    if (c && c.status !== 'done') cheques.markDone(user.id, id, text);
+    await tg.sendMessage(chatId, '🔗 Ссылку на чек приложил к документу.', mainMenu());
+    return;
+  }
   if (state.state.startsWith('fu:')) {
     const [, cpIdStr, daysStr] = state.state.split(':');
     bdb.clearState(user.id);
@@ -5525,11 +5608,7 @@ async function handleCallback(tg, cq) {
         mainMenu());
       // Через выписку закрывают сразу пачку — и именно тут про чек забывают
       // вернее всего: человек ничего не выписывал, он просто прислал файл.
-      const npdNote = npd.chequeReminder(bdb.currentOrg(user.id), { paidAt: todayISO() });
-      if (done.docs && npdNote) {
-        await tg.sendMessage(chatId, `🧾 ${esc(npdNote.text)}`,
-          keyboard([[{ text: '🧾 Открыть «Мой налог»', url: npdNote.url }]]));
-      }
+      await remindChequesBatch(tg, chatId, user, done.leads, todayISO());
       return;
     }
     if (data === 'help') {
@@ -5811,6 +5890,51 @@ async function handleCallback(tg, cq) {
       recurring.off(user.id, Number(data.slice(8)));
       await tg.sendMessage(chatId, 'Больше напоминать не буду.');
       await showRecurring(tg, chatId, user);
+      return;
+    }
+    // --- чеки «Мой налог» (самозанятые) ---
+    if (data === 'chq.list') { await showCheques(tg, chatId, user); return; }
+    if (data.startsWith('chq.show:')) {
+      const c = cheques.get(user.id, Number(data.slice(9)));
+      if (!c) { await tg.sendMessage(chatId, 'Этого чека уже нет в списке.', mainMenu()); return; }
+      if (c.status === 'done') {
+        await tg.sendMessage(chatId, `🧾 Чек на ${formatRub(c.amount)} уже пробит.`,
+          keyboard([[{ text: c.link ? '🔗 Заменить ссылку' : '🔗 Приложить ссылку', data: `chq.link:${c.id}` }]]));
+        return;
+      }
+      await sendChequeCard(tg, chatId, user, c);
+      return;
+    }
+    if (data.startsWith('chq.ok:')) {
+      const c = cheques.markDone(user.id, Number(data.slice(7)));
+      if (!c) { await tg.sendMessage(chatId, 'Этого чека уже нет в списке.', mainMenu()); return; }
+      const left = cheques.openCount(user.id);
+      await tg.sendMessage(chatId,
+        `✅ Отметил: чек на ${formatRub(c.amount)} пробит.`
+        + (left ? `\n\nЕщё не пробито: <b>${left}</b>.` : '\n\nБольше непробитых чеков нет.')
+        + '\n\n<i>Ссылку на чек можно приложить к документу — тогда она будет в его карточке.</i>',
+        keyboard([
+          [{ text: '🔗 Приложить ссылку', data: `chq.link:${c.id}` }],
+          ...(left ? [[{ text: '🧾 Чеки к пробитию', data: 'chq.list' }]] : []),
+          [{ text: '⬅️ Меню', data: 'menu' }],
+        ]));
+      return;
+    }
+    if (data.startsWith('chq.later:')) {
+      await tg.sendMessage(chatId,
+        'Хорошо. Напомню в утренней сводке, пока чек не отмечен. '
+        + 'Список — «Ещё» → «Моя организация» → «Самозанятость».',
+        keyboard([[{ text: '🧾 Чеки к пробитию', data: 'chq.list' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
+    if (data.startsWith('chq.link:')) {
+      const c = cheques.get(user.id, Number(data.slice(9)));
+      if (!c) { await tg.sendMessage(chatId, 'Этого чека уже нет в списке.', mainMenu()); return; }
+      bdb.setState(user.id, `chq:${c.id}`, {});
+      await tg.sendMessage(chatId,
+        'Пришлите ссылку на чек. В приложении «Мой налог» откройте чек и нажмите «Поделиться» — '
+        + 'ссылка начинается с <code>https://lknpd.nalog.ru/</code>.',
+        keyboard([[{ text: 'Не нужно', data: 'menu' }]]));
       return;
     }
     if (data.startsWith('doc.paid:')) {
