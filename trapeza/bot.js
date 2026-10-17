@@ -1259,6 +1259,12 @@ async function afterDoc(tg, chatId, user, cpId) {
   // Повторение заводится здесь, а не отдельным мастером: позиции уже
   // набраны и проверены человеком, повторять нечего — только выбрать день.
   if (last && docService.ITEM_DOCS[last.type]) {
+    /*
+     * «Повторить» — разовая копия прямо сейчас: у кого счёта два на неделю,
+     * тому не до расписания. Выходит тот же документ тому же клиенту, но
+     * сначала сводка на проверку — как у любого нового (см. repeatDoc).
+     */
+    rows.push([{ text: '🔁 Повторить', data: `d.rep:${last.id}` }]);
     rows.push([{ text: '🔁 Повторять каждый месяц', data: `rec.new:${last.id}` }]);
   }
   rows.push([{ text: '🧾 Выписать ещё', data: 'go.sch' },
@@ -1312,7 +1318,7 @@ async function repeatDoc(tg, chatId, user, docId) {
   bdb.setState(user.id, `items:${src.type}:${src.cp_id}`, data);
   const otherOrg = Number(src.org_id) && Number(src.org_id) !== Number(cur.id);
   await tg.sendMessage(chatId,
-    `Повторяю <b>${esc(src.title.toLowerCase())} № ${esc(src.number)}</b>: ${items.length} поз., `
+    `Повторяю <b>${esc(src.title.split(' ').map((w) => (/^[А-ЯЁ0-9-]{2,}$/.test(w) ? w : w.toLowerCase())).join(' '))} № ${esc(src.number)}</b>: ${items.length} поз., `
     + `${formatRub(src.total)}\nНовый номер — ${esc(data.number)}, дата — ${ru(data.date)}.`
     + (otherOrg ? `\n\n⚠️ Исходный документ выписан от другой организации. Повтор выйдет от `
       + `текущей — <b>${esc(cur.name || 'без названия')}</b>. Нужна прежняя — переключитесь на неё и повторите.` : ''));
@@ -1579,10 +1585,16 @@ async function showDocs(tg, chatId, user, cpId = null) {
   const rows = docs.map((d) => {
     const cp = d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
     const money = d.total ? ` · ${formatRub(d.total)}` : '';
-    return [{
-      text: `${d.title} № ${d.number} от ${ru(d.date)}${cp ? ` · ${cp.name}` : ''}${money}`.slice(0, 60),
-      data: `doc:${d.id}`,
-    }];
+    const label = `${d.title} № ${d.number} от ${ru(d.date)}${cp ? ` · ${cp.name}` : ''}${money}`;
+    /*
+     * «🔁» — рядом со строкой, а не внутри карточки: так выписывают одинаковые
+     * счета каждый месяц, и лишний экран на каждом из них — это раздражает.
+     * Строка при этом короче: Telegram делит ширину поровну, длинная подпись
+     * обрезалась бы на середине.
+     */
+    return ITEM_DOCS[d.type]
+      ? [{ text: label.slice(0, 44), data: `doc:${d.id}` }, { text: '🔁', data: `d.rep:${d.id}` }]
+      : [{ text: label.slice(0, 60), data: `doc:${d.id}` }];
   });
   rows.push([{ text: '📊 Реестр за период (Excel)', data: 'reg' }]);
   const repeats = recurring.list(user.id).length;

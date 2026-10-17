@@ -2550,6 +2550,68 @@ async function main() {
       'отложенное — через три дня от сегодня и уже не просрочено', moved && moved.due);
   }
 
+  section('«Повторить»: данные для формы');
+  {
+    /*
+     * Раньше «Повторить» брало из списка документов одни позиции: ставка НДС и
+     * основание накладной терялись, и копия выходила не такой, как оригинал.
+     * Теперь форме отдаёт данные сервер — и обязан делать это только владельцу.
+     */
+    const mu = bdb.getOrCreateUser(MASHA.id);
+    const cpRep = bdb.createCp(mu.id, { name: 'ООО «Повторяемый»', kind: 'customer' });
+    const items = [{ name: 'Бумага А4', unit: 'пачка', qty: 10, price: 300 }];
+    const issued = await call('POST', '/api/doc', {
+      user: masha, body: { type: 'torg12', cpId: cpRep, date: '2026-09-11', items, vatRate: null, basis: 'Заказ № 77' },
+    });
+    ok(issued.json && issued.json.doc, 'исходная накладная выписана', JSON.stringify(issued.json).slice(0, 100));
+    const srcId = issued.json.doc.id;
+    bdb.markPaid(mu.id, srcId, '2026-09-20');
+
+    r = await call('GET', `/api/doc/repeat?id=${srcId}`);
+    ok(r.status === 401, 'без подписи данные для повтора не отдаются', r.status);
+    r = await call('GET', `/api/doc/repeat?id=${srcId}`, { user: petya });
+    ok(r.json && r.json.error && !r.json.draft, 'чужой документ повторить нельзя', JSON.stringify(r.json));
+    r = await call('GET', '/api/doc/repeat?id=999999', { user: masha });
+    ok(r.json && r.json.error, 'несуществующий документ — понятный отказ', JSON.stringify(r.json));
+
+    r = await call('GET', `/api/doc/repeat?id=${srcId}`, { user: masha });
+    const dr = (r.json || {}).draft || {};
+    ok(dr.type === 'torg12' && dr.cpId === cpRep, 'тот же тип и клиент', JSON.stringify(dr).slice(0, 100));
+    ok(dr.items && dr.items.length === 1 && dr.items[0].name === 'Бумага А4' && dr.items[0].qty === 10 && dr.items[0].price === 300,
+      'те же позиции');
+    ok(dr.basis === 'Заказ № 77', 'основание накладной переезжает в форму', dr.basis);
+    ok(Object.prototype.hasOwnProperty.call(dr, 'vatRate') && dr.vatRate === null,
+      '«без НДС» остаётся явным null, а не «возьми ставку фирмы»', JSON.stringify(dr.vatRate));
+    ok(!('paidAt' in dr) && !('paid_at' in dr) && !('number' in dr) && !('date' in dr),
+      'оплата, номер и дата в копию не едут — номер возьмёт сервер, дата сегодняшняя', Object.keys(dr).join());
+    ok(r.json.from.number === issued.json.doc.number && r.json.otherOrg === false,
+      'сказано, что повторяем, и что фирма та же');
+
+    // Повтор через форму — обычная выписка: документ новый, неоплаченный, с номером по порядку.
+    const again = await call('POST', '/api/doc', { user: masha, body: { ...dr } });
+    ok(again.json && again.json.doc && again.json.doc.id !== srcId, 'выписка по данным повтора проходит как обычная',
+      JSON.stringify(again.json).slice(0, 100));
+    const copy = bdb.getDoc(mu.id, again.json.doc.id);
+    ok(!copy.paid_at && copy.date === docService.todayISO(), 'у копии нет отметки оплаты и сегодняшняя дата',
+      `${copy.paid_at} / ${copy.date}`);
+    ok(Number(copy.seq) > Number(bdb.getDoc(mu.id, srcId).seq), 'номер — следующий по порядку',
+      `${bdb.getDoc(mu.id, srcId).seq} → ${copy.seq}`);
+
+    // Другая фирма: повтор выйдет от текущей, и приложение об этом предупреждает.
+    const orgOld = bdb.currentOrg(mu.id).id;
+    const orgNew = bdb.createOrg(mu.id, { name: 'ООО «Вторая фирма»', inn: '7707083893' });
+    bdb.setActiveOrg(mu.id, orgNew);
+    r = await call('GET', `/api/doc/repeat?id=${srcId}`, { user: masha });
+    ok(r.json && r.json.otherOrg === true && r.json.orgName === 'ООО «Вторая фирма»',
+      'документ другой фирмы: приложение знает об этом и называет текущую', JSON.stringify(r.json).slice(-90));
+    bdb.setActiveOrg(mu.id, orgOld);
+
+    // Не-позиционный документ повторять нельзя.
+    const pay = bdb.saveDoc(mu.id, { orgId: orgOld, cpId: cpRep, type: 'pp', number: '1', seq: 9001, date: '2026-09-01', total: 100, payload: {} });
+    r = await call('GET', `/api/doc/repeat?id=${pay}`, { user: masha });
+    ok(r.json && r.json.error, 'платёжку «Повторить» не предлагает: у неё нет позиций', JSON.stringify(r.json));
+  }
+
   section('вкладка CRM в разметке приложения');
   {
     // Файл приложения в этом прогоне не исполняется, а вкладка — это строка

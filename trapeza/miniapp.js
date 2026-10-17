@@ -2192,6 +2192,50 @@ const api = {
     return svg ? { svg } : { problems: ['не удалось собрать код'] };
   },
 
+  /**
+   * Всё, что нужно экрану «Новый документ», чтобы повторить уже выписанный.
+   *
+   * Раньше «Повторить» брало из списка документов одни позиции, и ставка НДС
+   * с основанием накладной терялись: копия выходила не такой, как оригинал.
+   * Здесь тот же reusablePayload, что у бота и у ежемесячного повторения, —
+   * без ссылки на закрытый аванс и отметки об исправлении (почему, написано у
+   * самой функции). Ничего не выписывается: приложение откроет обычную форму
+   * с этими полями, и документ появится только по кнопке. Номер форма не
+   * спрашивает — его возьмёт следующий свободный сервер при выписке, дата —
+   * сегодняшняя. Оплата у копии своя: paid_at не переносится, потому что
+   * сюда не попадает вовсе.
+   */
+  async 'GET /api/doc/repeat'({ user, url }) {
+    const src = bdb.getDoc(user.id, Number(url.searchParams.get('id')));
+    if (!src || !docService.ITEM_DOCS[src.type]) return { error: 'Такой документ повторить нельзя.' };
+    if (!src.cp_id || !bdb.getCp(user.id, src.cp_id)) {
+      return { error: 'Клиента из этого документа уже нет в списке — выберите его заново в новом документе.' };
+    }
+    const { items, extra } = docService.reusablePayload(src.payload);
+    if (!items.length) return { error: 'В документе нет позиций.' };
+    const has = (k) => Object.prototype.hasOwnProperty.call(extra, k);
+    const draft = {
+      type: src.type, cpId: src.cp_id,
+      items: items.map((it) => ({ name: it.name, unit: it.unit || 'шт.', qty: it.qty, price: it.price })),
+    };
+    // Ключ ставим, только если он был: «нет ключа» (бери ставку фирмы) и null
+    // («этот документ без НДС») — разные вещи, как и при обычной выписке.
+    if (has('vatRate')) {
+      draft.vatRate = extra.vatRate == null ? null : Number(extra.vatRate);
+      draft.priceIncludesVat = Boolean(extra.priceIncludesVat);
+    }
+    if (extra.basis && ['torg12', 'upd'].includes(src.type)) draft.basis = String(extra.basis).slice(0, 200);
+    // Повтор выходит от текущей фирмы (issueDocument), и если исходный документ
+    // был от другой, об этом говорим вслух: заметят иначе уже у клиента.
+    const cur = bdb.currentOrg(user.id) || {};
+    return {
+      draft,
+      from: { title: src.title, number: src.number, date: src.date },
+      otherOrg: Boolean(Number(src.org_id)) && Number(src.org_id) !== Number(cur.id),
+      orgName: cur.name || '',
+    };
+  },
+
   /** Какие счета-фактуры этого клиента можно корректировать. */
   async 'GET /api/doc/correctable'({ user, url }) {
     const cpId = Number(url.searchParams.get('cpId'));

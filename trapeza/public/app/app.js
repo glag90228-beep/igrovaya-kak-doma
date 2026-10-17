@@ -691,12 +691,9 @@ screens.home = async function home() {
         h('div', { class: 'small muted ellipsis',
           text: `№ ${lastSch.number} · ${money0(lastSch.total)} · сегодняшней датой` })),
       icon('chev', 'chev'));
-    again.onclick = () => {
-      haptic('medium');
-      // Позиции и клиента берём из прошлого счёта, дату — сегодняшнюю: это
-      // повтор регулярной работы, а не копия документа задним числом.
-      go('new', { type: 'sch', cpId: lastSch.cpId, items: lastSch.items });
-    };
+    // Позиции и клиента берём из прошлого счёта, дату — сегодняшнюю: это
+    // повтор регулярной работы, а не копия документа задним числом.
+    again.onclick = () => repeatDoc(lastSch.id);
     box.append(h('div', { class: 'card' }, again));
   }
 
@@ -909,6 +906,25 @@ screens.why = async function why() {
   }
   return box;
 };
+
+/** «Счёт на оплату» → «счёт на оплату», но «УПД» и «ТОРГ-12» остаются как есть. */
+function lowerTitle(t) {
+  return String(t || '').split(' ').map((w) => (/^[А-ЯЁ0-9-]{2,}$/.test(w) ? w : w.toLowerCase())).join(' ');
+}
+
+/**
+ * «Повторить»: открывает форму нового документа с теми же клиентом, позициями,
+ * ставкой НДС и основанием. Данные берём с сервера, а не из списка документов:
+ * в списке одни позиции, и копия теряла бы налог и основание накладной.
+ * Выписывает по-прежнему человек — кнопкой в форме, после проверки.
+ */
+async function repeatDoc(docId) {
+  try {
+    const r = await api('GET', `/api/doc/repeat?id=${docId}`);
+    haptic('medium');
+    go('new', { ...r.draft, repeat: { ...r.from, otherOrg: r.otherOrg, orgName: r.orgName } });
+  } catch (e) { toast(e.message, true); }
+}
 
 screens.docs = async function docs({ cp } = {}) {
   // Сервер умеет отдавать журнал по одному клиенту — в приложении этим
@@ -1375,8 +1391,8 @@ screens.doc = async function docScreen({ id }) {
     box.append(h('div', { class: 'btn-wrap' },
       h('button', {
         class: 'btn secondary',
-        onclick: () => go('new', { type: d.type, cpId: d.cpId, items: d.items }),
-      }, 'Повторить новым номером')));
+        onclick: (e) => withBusy(e.currentTarget, () => repeatDoc(d.id)),
+      }, 'Повторить')));
 
     /*
      * Повторение заводится отсюда: позиции уже проверены человеком, остаётся
@@ -4730,6 +4746,20 @@ screens.new = async function newDoc(params) {
   const box = h('div', {}, h('h1', { text: TITLES[type] }));
 
   /*
+   * Повтор: говорим, чей это документ и что будет с номером и датой. Форма
+   * ниже обычная — поправить можно всё, а выпишется он только по кнопке.
+   */
+  if (params.repeat) {
+    const rp = params.repeat;
+    box.append(h('div', { class: 'banner info', id: 'repeat-note' }, icon('repeat'),
+      h('div', {},
+        h('div', { text: `Повтор: ${lowerTitle(rp.title)} № ${rp.number} от ${ru(rp.date)}` }),
+        h('div', { class: 'small muted', text: 'Те же клиент и позиции. Номер — следующий по порядку, дата — сегодняшняя; проверьте и поправьте.' }),
+        rp.otherOrg ? h('div', { class: 'small', style: 'margin-top:6px',
+          text: `Исходный документ выписан от другой фирмы. Повтор выйдет от «${rp.orgName || 'текущей'}»; нужна прежняя — смените фирму в «Моя организация».` }) : null)));
+  }
+
+  /*
    * От какой фирмы выписываем — надписью под заголовком, и только когда их
    * несколько. Ошибиться организацией тут дороже всего: документ уйдёт
    * клиенту с чужими реквизитами и чужим номером, а заметят это у него.
@@ -4765,7 +4795,7 @@ screens.new = async function newDoc(params) {
    * выйдет, пишем под полем, чтобы пустое поле не выглядело забытым.
    */
   const basisInput = ['torg12', 'upd'].includes(type)
-    ? h('input', { id: 'f-basis', autocomplete: 'off', maxlength: 200, placeholder: 'Договор № … от …' })
+    ? h('input', { id: 'f-basis', autocomplete: 'off', maxlength: 200, placeholder: 'Договор № … от …', value: params.basis || '' })
     : null;
   const basisHint = h('div', { class: 'small muted', style: 'margin-top:4px' });
   function drawBasisHint() {

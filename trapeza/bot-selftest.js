@@ -437,6 +437,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   ok(files.length === 7, 'повторный документ выписан', files[6].filename);
   ok(!files[6].filename.includes('СЧ-2026'), 'у повтора новый номер, не старый', files[6].filename);
 
+
   await tap(`d.pp:${cpId}`);
   await say('26496,42');
   await say('Оплата по счёту № 1 от 10.08.2026');
@@ -7995,6 +7996,92 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'фраза «предоплата 140000 от Обычный» разбирается', JSON.stringify(q));
     const q2 = ai.quickParse('договор с предоплатой 30%');
     ok(!q2 || !q2.prepay, 'слово «предоплатой» внутри фразы режим не включает');
+  }
+
+  console.log('\n── «Повторить»: под выданным документом, в журнале, у оплаченного ──');
+  {
+    const bdbX = require('./lib/bot-db');
+    const dsX = require('./lib/doc-service');
+    const periodX = require('./lib/period');
+    const uX = fxUserId();
+    const orgX = bdbX.currentOrg(uX).id;
+    const today = periodX.todayISO();
+    const todayRu = today.split('-').reverse().join('.');
+
+    // Свой клиент и свой счёт, выписанный через бота: блок стоит в конце прогона и не зависит от прежних шагов.
+    const cpX = bdbX.createCp(uX, { name: 'ООО «Повторный»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.sch:${cpX}`);
+    await say('Услуги; 2; 1500');
+    await tap('items.done');
+    await tap('doc.make');
+
+    // 1) Кнопка стоит сразу под выданным документом (последнее сообщение — «Что дальше?»).
+    // (после него бот может спросить «чем занимаетесь», поэтому ищем экран «Что дальше?», а не последнее сообщение)
+    const nextScreen = [...sent].reverse().find((m) => String(m.text).includes('Что дальше'));
+    const repBtn = buttonIn(nextScreen, 'Повторить');
+    ok(Boolean(repBtn) && repBtn.startsWith('d.rep:'), 'под выданным документом есть «🔁 Повторить»', repBtn);
+    ok(Boolean(buttonIn(nextScreen, 'Повторять каждый месяц')), 'и ежемесячное повторение осталось рядом');
+
+    // 2) Повтор оплаченного документа: оплата не копируется, номер — следующий свободный.
+    const srcId = Number(repBtn.split(':')[1]);
+    bdbX.markPaid(uX, srcId, '2026-08-20');
+    const seqNext = bdbX.nextSeqForOrg(orgX, bdbX.getDoc(uX, srcId).type, Number(today.slice(0, 4)));
+    const mark = sent.length;
+    await tap(repBtn);
+    ok(sent.slice(mark).some((m) => m.text.includes(`дата — ${todayRu}`)),
+      'повтор называет сегодняшнюю дату', todayRu);
+    ok(sent.slice(mark).some((m) => m.text.includes(`Новый номер — ${seqNext}`)),
+      'и следующий свободный номер', String(seqNext));
+    ok(last().includes('Проверьте документ') && Boolean(button('Сформировать')),
+      'документ показан на проверку, а не выписан сразу');
+    ok(Boolean(button('Номер')) && Boolean(button('Дата')) && Boolean(button('Ещё позиция')),
+      'его можно поправить: номер, дата, позиции');
+    const countBefore = bdbX.listDocs(uX, 500).length;
+    await tap('doc.make');
+    const docsNow = bdbX.listDocs(uX, 500);
+    ok(docsNow.length === countBefore + 1, 'после «Сформировать» выписан ровно один документ');
+    const copy = docsNow.reduce((a, b) => (b.id > a.id ? b : a));
+    ok(!copy.paid_at, 'у копии нет отметки оплаты — она не переехала с оригинала', copy.paid_at);
+    ok(copy.date === today && String(copy.number) === String(seqNext), 'у копии сегодняшняя дата и ожидаемый номер',
+      `${copy.date} / ${copy.number}`);
+    ok(copy.id !== srcId && copy.total === bdbX.getDoc(uX, srcId).total, 'сумма та же, документ новый');
+
+    // 3) В журнале рядом со строкой — «🔁»: повтор в одно касание.
+    await tap('docs');
+    const listMsg = sent[sent.length - 1];
+    const rowWithRep = (listMsg.kb || []).find((row) => row.some((b) => b.callback_data === `d.rep:${copy.id}`));
+    ok(Boolean(rowWithRep) && rowWithRep.some((b) => b.callback_data === `doc:${copy.id}`),
+      'в «Последних документах» рядом со строкой есть «🔁»');
+    ok(!(listMsg.kb || []).flat().some((b) => b.callback_data === 'd.rep:undefined'), 'и ни одной битой кнопки');
+
+    // 4) УПД статус 1 и накладная: статус, ставка и основание едут в копию, чужой аванс и исправление — нет.
+    const cpU = bdbX.createCp(uX, { name: 'ООО «Повтор-УПД»', inn: '7707083893', kind: 'customer', opening_date: '2026-01-01' });
+    const srcUpd = await dsX.issueDocument(uX, {
+      type: 'upd', cpId: cpU, date: '2026-09-10', skipQuota: true,
+      items: [{ name: 'Товар', unit: 'шт.', qty: 2, price: 600 }],
+      extra: { status: 1, vatRate: 20, priceIncludesVat: true, basis: 'Договор № 5 от 01.02.2026', advDoc: '№ 9 от 01.03.2026' },
+    });
+    ok(srcUpd.ok, 'исходный УПД статуса 1 выписан', srcUpd.message);
+    await tap(`d.rep:${srcUpd.doc.id}`);
+    ok(last().includes('статус 1') && last().includes('НДС 20%') && last().includes('Договор № 5 от 01.02.2026'),
+      'в сводке повтора УПД — статус 1, ставка и основание прежние', last().slice(0, 140));
+    await tap('doc.make');
+    const updCopy = bdbX.listDocs(uX, 500).filter((d) => d.type === 'upd').reduce((a, b) => (b.id > a.id ? b : a));
+    const upl = bdbX.getDoc(uX, updCopy.id).payload;
+    ok(updCopy.id !== srcUpd.doc.id && Number(upl.status) === 1 && Number(upl.vatRate) === 20 && upl.priceIncludesVat === true
+      && upl.basis === 'Договор № 5 от 01.02.2026', 'копия УПД: тот же статус, ставка, «цены с НДС» и основание', JSON.stringify(upl));
+    ok(upl.advDoc !== '№ 9 от 01.03.2026', 'ссылка на закрытый аванс в копию не переехала', upl.advDoc);
+
+    const srcT = await dsX.issueDocument(uX, {
+      type: 'torg12', cpId: cpU, date: '2026-09-11', skipQuota: true,
+      items: [{ name: 'Бумага', unit: 'пачка', qty: 10, price: 300 }], extra: { basis: 'Заказ № 77' },
+    });
+    await tap(`d.rep:${srcT.doc.id}`);
+    ok(last().includes('Основание: <b>Заказ № 77</b>'), 'у накладной основание сохранилось в сводке повтора', last().slice(0, 120));
+    await tap('doc.make');
+    const tCopy = bdbX.listDocs(uX, 500).filter((d) => d.type === 'torg12').reduce((a, b) => (b.id > a.id ? b : a));
+    ok(tCopy.id !== srcT.doc.id && tCopy.date === today && !tCopy.paid_at, 'повтор накладной — новый документ сегодняшним числом, без оплаты');
+    bdbX.clearState(uX);
   }
 
   console.log('\n── общий браузер для PDF ──');

@@ -786,6 +786,36 @@ const ok = (c, m, extra) => {
       'экран долгов открывается из «Ещё»');
   }
 
+  /*
+   * «Повторить» в карточке документа — настоящим касанием.
+   *
+   * Раньше кнопка уносила в форму одни позиции, и основание накладной с
+   * ставкой НДС терялись. Проверяем то, что человек видит: форма открылась
+   * с теми же клиентом, позициями и основанием, подписана как повтор и
+   * ничего сама не выписала.
+   */
+  console.log('\n── «Повторить» в карточке документа ──');
+  {
+    const { db } = require(path.join(APP, 'db'));
+    const src = await docService.issueDocument(user.id, {
+      type: 'torg12', cpId: cp, date: '2026-09-11', skipQuota: true,
+      items: [{ name: 'Бумага А4', unit: 'пачка', qty: 10, price: 300 }], extra: { basis: 'Заказ № 77' },
+    });
+    const docsBefore = db.prepare('SELECT COUNT(*) AS n FROM documents WHERE user_id = ?').get(user.id).n;
+    await page.evaluate((id) => window.__go('doc', { id }), src.doc.id);
+    const btn = page.getByRole('button', { name: 'Повторить', exact: true });
+    await btn.waitFor({ timeout: 5000 });
+    await btn.tap();
+    await page.waitForSelector('#repeat-note', { timeout: 5000 });
+    ok((await page.textContent('#repeat-note')).includes(`№ ${src.doc.number}`), 'форма подписана как повтор исходного документа');
+    ok(await page.inputValue('#f-basis') === 'Заказ № 77', 'основание накладной перенесено в форму');
+    const vals = await page.$$eval('#app input', (n) => n.map((x) => x.value));
+    ok(vals.includes('Бумага А4'), 'позиция на месте и её можно править', vals.join('|'));
+    ok(await page.inputValue('#f-date') === docService.todayISO(), 'дата в форме — сегодняшняя');
+    ok(db.prepare('SELECT COUNT(*) AS n FROM documents WHERE user_id = ?').get(user.id).n === docsBefore,
+      'сама кнопка ничего не выписала — только открыла форму');
+  }
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();

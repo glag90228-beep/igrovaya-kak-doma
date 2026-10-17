@@ -206,6 +206,28 @@ const SHOTS = [
     name: 'crm-forma', title: 'CRM: раскрыта форма напоминания', go: ['crm', {}],
     act: async (page) => { await page.locator('#crm-new-btn').click(); await page.waitForTimeout(250); },
   },
+  {
+    // Карточка документа: внизу кнопка «Повторить», и форма, которую она открывает.
+    name: 'dokument-povtor', title: 'Карточка документа: «Повторить»', go: ['docs', {}], scroll: 'bottom',
+    act: async (page) => {
+      await page.locator('#app .card .row').first().click();
+      const b = page.getByRole('button', { name: 'Повторить', exact: true });
+      await b.waitFor({ timeout: 5000 });
+      await b.scrollIntoViewIfNeeded();
+      await page.waitForTimeout(300);
+    },
+  },
+  {
+    name: 'povtor-forma', title: 'Форма повтора документа', go: ['docs', {}],
+    act: async (page) => {
+      await page.locator('#app .card .row').first().click();
+      const b = page.getByRole('button', { name: 'Повторить', exact: true });
+      await b.waitFor({ timeout: 5000 });
+      await b.click();
+      await page.waitForSelector('#repeat-note', { timeout: 5000 });
+      await page.waitForTimeout(300);
+    },
+  },
   { name: 'dolgi', title: 'Долги', go: ['debts', {}] },
   { name: 'organizaciya', title: 'Моя организация', go: ['org', {}] },
   { name: 'podpiska', title: 'Подписка', go: ['billing', {}] },
