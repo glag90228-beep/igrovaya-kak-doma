@@ -13,6 +13,12 @@
  * no_debt, которую пересчёт `rebuildDebt` уважает, и сразу отмечается
  * оплаченным — иначе он висел бы в «Не оплачено» вторым долгом на ту же
  * сумму. Всё это проверено в bot-selftest («акт не добавил долг»).
+ *
+ * Только для клиентов на предоплате. Отметка «оплачен» верна там, где отгрузки
+ * покрыты авансом. У клиента без предоплаты накладные висят долгом, и акт,
+ * показанный «оплаченным», вводил бы в заблуждение: человек решил бы, что
+ * деньги получены. Поэтому отказ живёт здесь, в общей функции, а не в кнопках:
+ * бот и приложение прячут кнопку, но запрос можно прислать и мимо неё.
  */
 
 const bdb = require('./bot-db');
@@ -43,6 +49,17 @@ function lastMonths(n, today = todayISO()) {
   return out;
 }
 
+/** Отказ для клиента без предоплаты — общий для предпросмотра и выписки. */
+function prepayRefusal(userId, cp) {
+  if (bdb.prepayState(userId, cp.id)) return null;
+  return {
+    ok: false, reason: 'noprepay',
+    message: `Акт за месяц выписывается клиентам на предоплате. У «${cp.name}» её нет: накладные идут долгом, `
+      + 'а такой акт сразу помечается оплаченным — это было бы неправдой. Включите предоплату у клиента '
+      + 'или закройте накладные оплатой.',
+  };
+}
+
 /** Что войдёт в акт за месяц: отгрузки, ещё не попавшие ни в один акт. */
 function preview(userId, cpId, ym) {
   const open = bdb.openShipmentsOfMonth(userId, cpId, ym);
@@ -63,8 +80,9 @@ function preview(userId, cpId, ym) {
  * Выписать акт за месяц на отгрузки, которых в актах ещё нет.
  *
  * @returns {Promise<object>} как у issueDocument плюс `ym`, `month` («октябрь 2026»), `docs`;
- *   при отказе `{ok:false, reason, message}`, где reason — 'ym', 'cp', 'have'
- *   (всё уже вошло в акт, `act` — последний из них) или 'none' (отгрузок нет).
+ *   при отказе `{ok:false, reason, message}`, где reason — 'ym', 'cp', 'noprepay'
+ *   (клиент не на предоплате), 'have' (всё уже вошло в акт, `act` — последний из
+ *   них) или 'none' (отгрузок нет).
  */
 async function issue(userId, cpId, ym) {
   // Будущий месяц акту не основание: выпустить акт «на вырост» значило бы
@@ -74,6 +92,8 @@ async function issue(userId, cpId, ym) {
   }
   const cp = bdb.getCp(userId, Number(cpId));
   if (!cp) return { ok: false, reason: 'cp', message: 'Такого клиента нет в вашем списке.' };
+  const refuse = prepayRefusal(userId, cp);
+  if (refuse) return refuse;
   const org = bdb.currentOrg(userId);
   if (!org) return { ok: false, reason: 'org', message: 'Сначала заполните реквизиты своей организации.' };
 
@@ -109,4 +129,4 @@ async function issue(userId, cpId, ym) {
   return { ...res, ym, month: p.title, docs: p.docs, date };
 }
 
-module.exports = { MONTHS_RU, monthTitle, lastMonths, preview, issue };
+module.exports = { MONTHS_RU, monthTitle, lastMonths, preview, prepayRefusal, issue };

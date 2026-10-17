@@ -2248,6 +2248,8 @@ const api = {
   async 'GET /api/month-act'({ user, url }) {
     const cp = bdb.getCp(user.id, Number(url.searchParams.get('cpId')));
     if (!cp) return { error: 'Такого клиента нет в вашем списке.' };
+    const refuse = monthAct.prepayRefusal(user.id, cp);
+    if (refuse) return { error: refuse.message, reason: refuse.reason };
     return {
       cp: { id: cp.id, name: cp.name },
       months: monthAct.lastMonths(2).map(({ ym }) => monthAct.preview(user.id, cp.id, ym)),

@@ -834,6 +834,13 @@ const ok = (c, m, extra) => {
     const actsBefore = () => db.prepare("SELECT COUNT(*) AS n FROM documents WHERE user_id = ? AND type = 'usl' AND payload LIKE '%monthAct%'").get(user.id).n;
     ok(actsBefore() === 0, 'до нажатия актов за месяц нет');
 
+    // Без предоплаты кнопки нет: акт сразу «оплачен», а накладные висят долгом.
+    await page.evaluate((id) => window.__go('cp', { id }), cpM);
+    await page.getByText('Акт сверки', { exact: true }).first().waitFor({ timeout: 5000 });
+    ok(await page.getByText('Акт за месяц', { exact: true }).count() === 0,
+      'у клиента без предоплаты в карточке нет «Акт за месяц»');
+
+    bdb.setPrepayMode(user.id, cpM, bdb.currentOrgId(user.id), true);
     await page.evaluate((id) => window.__go('cp', { id }), cpM);
     const entry = page.getByText('Акт за месяц', { exact: true }).first();
     await entry.waitFor({ timeout: 5000 });

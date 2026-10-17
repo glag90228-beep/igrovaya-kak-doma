@@ -121,6 +121,9 @@ async function seed() {
     await docService.issueDocument(user.id, { ...d, skipQuota: true });
   }
 
+  // «Акт за месяц» есть только у клиентов на предоплате.
+  bdb.setPrepayMode(user.id, SEED.cp, bdb.currentOrgId(user.id), true);
+
   // Пара повторений — иначе экран «Каждый месяц» на снимке пустой.
   require('./lib/recurring').add(user.id, {
     cpId: ids[0], type: 'sch', payDay: 5, leadDays: 3,

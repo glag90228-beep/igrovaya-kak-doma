@@ -2635,6 +2635,20 @@ async function main() {
     const s3 = await ship(`${prevYm}-15`, 7000);
     ok(s1.json.doc && s2.json.doc && s3.json.doc, 'три отгрузки выписаны: две в этом месяце, одна в прошлом');
     const bal = () => bdb.balanceOf(mu.id, cpMa).closing;
+    const actsOf = () => bdb.listDocs(mu.id, 200, cpMa).filter((d) => d.type === 'usl').length;
+
+    // Клиент без предоплаты: накладные висят долгом, акт «оплачен» был бы неправдой.
+    r = await call('GET', `/api/month-act?cpId=${cpMa}`, { user: masha });
+    ok(r.json && r.json.reason === 'noprepay' && !r.json.months && /предоплат/.test(r.json.error || ''),
+      'клиенту без предоплаты предпросмотр акта за месяц отказывает понятным текстом', JSON.stringify(r.json));
+    const debtPlain = bal();
+    r = await call('POST', '/api/month-act', { user: masha, body: { cpId: cpMa, ym: thisYm } });
+    ok(r.json && r.json.reason === 'noprepay' && !r.json.doc, 'и выписать такой акт нельзя', JSON.stringify(r.json));
+    ok(actsOf() === 0 && bal() === debtPlain, 'отказ ничего не выписал и долг не тронул');
+    const cardOf = async () => ((await call('GET', '/api/cps', { user: masha })).json.cps || []).find((c) => c.id === cpMa);
+    ok((await cardOf()).prepay === null, 'в карточке клиента без предоплаты prepay пуст — кнопки «Акт за месяц» не будет');
+    bdb.setPrepayMode(mu.id, cpMa, bdb.currentOrgId(mu.id), true);
+    ok((await cardOf()).prepay, 'включили предоплату — в карточке она есть и кнопка появится');
 
     r = await call('GET', `/api/month-act?cpId=${cpMa}`);
     ok(r.status === 401, 'без подписи предпросмотр не отдаётся', r.status);

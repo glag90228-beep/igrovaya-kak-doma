@@ -7956,6 +7956,13 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(!rp.prepaid && !paidAt(rp) && bal(cpPlain) === 50000 && rp.prepay === null,
       'клиент без предоплаты: накладная неоплачена, долг как раньше');
     ok(bdbP.prepayState(uP.id, cpPlain) === null, 'у обычного клиента нет состояния предоплаты');
+    // Старая кнопка «Акт за месяц» у клиента без предоплаты: акт был бы «оплачен» при долге по накладным.
+    {
+      const before = bdbP.listDocs(uP.id, 200, cpPlain).length;
+      await tapP(`pp.act:${cpPlain}:2026-10`);
+      ok(bdbP.listDocs(uP.id, 200, cpPlain).length === before && norm(last()).includes('на предоплате'),
+        'клиенту без предоплаты акт за месяц не выписывается, бот объясняет почему', norm(last()).slice(0, 80));
+    }
 
     // Две организации не путаются.
     const orgB = bdbP.createOrg(uP.id, { name: 'ООО «Вторая»', inn: '7707083893', acc: '40702810900000000002', ...bank });

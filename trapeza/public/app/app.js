@@ -1936,8 +1936,9 @@ screens.cp = async function cpScreen({ id, name }) {
           } catch (e) { toast(e.message, true); }
         } }),
       navRow({ icon: 'docs2', title: 'Документы клиента', onclick: () => go('docs', { cp: id }) }),
-      // Заказчику: акт закрывает отгрузки месяца. У поставщика отгружаем не мы.
-      cp.kind === 'supplier' ? null : navRow({ icon: 'doc-check', title: 'Акт за месяц',
+      // Только клиенту на предоплате: акт сразу «оплачен», а это верно, лишь когда
+      // отгрузки покрыты авансом. У поставщика отгружаем не мы.
+      cp.kind === 'supplier' || !cp.prepay ? null : navRow({ icon: 'doc-check', title: 'Акт за месяц',
         sub: 'накладные и УПД — одним актом', onclick: () => go('monthact', { cpId: id }) })));
     box.append(crmBlock(id));
     box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
