@@ -1859,10 +1859,11 @@ const api = {
     return { key, basis: t.basis, why: t.why, fixed };
   },
 
-  /** Что повторяется каждый месяц. */
-  async 'GET /api/recurring'({ user }) {
+  /** Что повторяется: каждый день, по будням, раз в неделю, раз в месяц. cp — только одного клиента. */
+  async 'GET /api/recurring'({ user, url }) {
+    const only = Number(url.searchParams.get('cp')) || 0;
     return {
-      items: recurring.list(user.id).map((r) => ({
+      items: recurring.list(user.id).filter((r) => !only || r.cp_id === only).map((r) => ({
         id: r.id,
         cpId: r.cp_id,
         cpName: r.cp_name,
@@ -1874,6 +1875,11 @@ const api = {
           : (docService.ITEM_DOCS[r.type] || {}).title || r.type,
         isOp: recurring.isOp(r),
         op: recurring.isOp(r) ? r.op : null,
+        period: r.period,
+        weekday: r.weekday,
+        periodic: r.periodic,
+        // Когда придёт следующее предложение — для коротких расписаний; у месячных своя логика.
+        next: r.periodic ? recurring.nextDate(r) : '',
         day: r.day,
         dayText: r.dayText,
         offerDay: r.offerDay,
@@ -1897,6 +1903,26 @@ const api = {
     if (!src || !docService.ITEM_DOCS[src.type]) return { error: 'Такой документ повторять нельзя.' };
     const { items, extra } = docService.reusablePayload(src.payload);
     if (!items.length) return { error: 'В документе нет позиций.' };
+    // Период приходит из браузера — берём только из известного списка.
+    if (body.period && !recurring.PERIODS.includes(body.period)) return { error: 'Не понял, как часто повторять.' };
+    const period = body.period || 'month';
+    if (period !== 'month') {
+      const weekday = recurring.normalizeWeekday(body.weekday);
+      if (period === 'week' && !(Number(body.weekday) >= 1 && Number(body.weekday) <= 7)) {
+        return { error: 'Выберите день недели.' };
+      }
+      // Второе такое же расписание в свой день прислало бы два одинаковых предложения.
+      const twin = recurring.list(user.id).find((r) => r.cp_id === src.cp_id && r.type === src.type
+        && r.period === period && (period !== 'week' || r.weekday === weekday));
+      if (twin) return { error: 'Такое расписание уже есть — смотрите «По расписанию».', id: twin.id };
+      const id = recurring.add(user.id, {
+        cpId: src.cp_id, type: src.type, items, extra, period, weekday,
+        // Сегодняшнюю доставку пропускаем, только если документ за сегодня уже выписан.
+        offeredThisMonth: src.date === docService.todayISO(),
+      });
+      const rec = recurring.get(user.id, id);
+      return { id, period, dayText: rec.dayText, next: recurring.nextDate(rec) };
+    }
     // payDay задан — это цикл аренды: платят к числу договора, счёт уходит
     // заранее, а на следующий день после срока приходит сигнал о просрочке.
     const when = Number(body.payDay)

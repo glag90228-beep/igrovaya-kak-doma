@@ -1711,6 +1711,48 @@ async function main() {
     r = await call('GET', '/api/recurring', { user: masha });
     ok(!r.json.items.some((x) => x.id === recId), 'после выключения его нет в списке');
 
+    // Короткие периоды: каждый день, по будням, раз в неделю.
+    const recLib = require('./lib/recurring');
+    r = await call('POST', '/api/recurring', { user: masha, body: { docId: lastDoc.id, period: 'day' } });
+    ok(r.status === 200 && r.json.dayText === 'каждый день' && r.json.period === 'day' && /^\d{4}-\d{2}-\d{2}$/.test(r.json.next),
+      '«каждый день»: расписание заведено, названо словами, известен следующий день', JSON.stringify(r.json));
+    const dayRec = r.json.id;
+    r = await call('POST', '/api/recurring', { user: masha, body: { docId: lastDoc.id, period: 'day' } });
+    ok(r.status === 400 && /уже есть/.test(r.json.error), 'второе такое же расписание не заводится', JSON.stringify(r.json));
+    r = await call('POST', '/api/recurring', { user: masha, body: { docId: lastDoc.id, period: 'weekdays' } });
+    ok(r.status === 200 && r.json.dayText === 'по будням (пн–пт)', '«по будням» заведено');
+    const wdRec = r.json.id;
+    r = await call('POST', '/api/recurring', { user: masha, body: { docId: lastDoc.id, period: 'week' } });
+    ok(r.status === 400 && /день недели/.test(r.json.error), 'раз в неделю без дня недели отклонено');
+    r = await call('POST', '/api/recurring', { user: masha, body: { docId: lastDoc.id, period: 'week', weekday: 3 } });
+    ok(r.status === 200 && r.json.dayText === 'раз в неделю, в среду', '«раз в неделю» — в среду', JSON.stringify(r.json));
+    const wkRec = r.json.id;
+    r = await call('POST', '/api/recurring', { user: masha, body: { docId: lastDoc.id, period: 'hourly' } });
+    ok(r.status === 400, 'выдуманный период отклонён');
+    r = await call('POST', '/api/recurring', { user: petya, body: { docId: lastDoc.id, period: 'day' } });
+    ok(r.status === 400, 'по чужому документу расписание не завести');
+
+    r = await call('GET', '/api/recurring', { user: masha });
+    const dayItem = r.json.items.find((x) => x.id === dayRec);
+    ok(dayItem && dayItem.periodic && dayItem.period === 'day' && dayItem.next, 'в списке: период и следующий день', JSON.stringify(dayItem));
+    ok(r.json.items.find((x) => x.id === wkRec).weekday === 3, 'и день недели у недельного');
+    r = await call('GET', `/api/recurring?cp=${lastDoc.cpId}`, { user: masha });
+    ok(r.json.items.length >= 3 && r.json.items.every((x) => x.cpId === lastDoc.cpId), 'список можно сузить до одного клиента');
+    r = await call('GET', '/api/recurring?cp=999999', { user: masha });
+    ok(r.json.items.length === 0, 'у чужого или несуществующего клиента — пусто');
+    r = await call('POST', '/api/recurring/off', { user: petya, body: { id: dayRec } });
+    ok(r.status === 400, 'чужое расписание не остановить');
+    for (const id of [dayRec, wdRec, wkRec]) await call('POST', '/api/recurring/off', { user: masha, body: { id } });
+    r = await call('GET', '/api/recurring', { user: masha });
+    ok(![dayRec, wdRec, wkRec].some((id) => r.json.items.some((x) => x.id === id)), 'остановленные расписания пропали из списка');
+    // Документ за сегодня уже выписан — сегодняшнюю доставку не предлагаем второй раз.
+    const todayDoc = (await call('POST', '/api/doc', { user: masha, body: {
+      type: 'torg12', cpId: lastDoc.cpId, date: docService.todayISO(), items: [{ name: 'Обеды', unit: 'шт.', qty: 1, price: 100 }] } })).json.doc;
+    r = await call('POST', '/api/recurring', { user: masha, body: { docId: todayDoc.id, period: 'day' } });
+    ok(recLib.get(bdb.getOrCreateUser(MASHA.id).id, r.json.id).last_offer === docService.todayISO(),
+      'если документ выписан сегодня, сегодняшняя доставка уже закрыта');
+    await call('POST', '/api/recurring/off', { user: masha, body: { id: r.json.id } });
+
     await call('POST', '/api/basis', { user: masha, body: { basis: 'closing' } });
   }
 

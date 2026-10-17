@@ -169,6 +169,11 @@ function migrate() {
   // YYYY-MM, за какой месяц документ по правилу уже выписан. Защита кнопки
   // «Выписать» от второго нажатия — см. recurring.claimIssue.
   addColumn('recurring', 'last_issued', "TEXT NOT NULL DEFAULT ''");
+  // Период расписания: month (как было), day, weekdays, week — и день недели для week.
+  addColumn('recurring', 'period', "TEXT NOT NULL DEFAULT 'month'");
+  addColumn('recurring', 'weekday', 'INTEGER NOT NULL DEFAULT 0');
+  // За какой день/неделю человек нажал «Пропустить»: выписать по такому предложению уже нельзя.
+  addColumn('recurring', 'last_skip', "TEXT NOT NULL DEFAULT ''");
 
   /*
    * Одноразовые кнопки — см. claimButton. Первичный ключ и есть защита:

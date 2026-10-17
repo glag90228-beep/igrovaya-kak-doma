@@ -133,6 +133,15 @@ async function seed() {
     cpId: ids[1], type: 'usl', day: 0,
     items: [{ name: 'Кофе-брейк по договору', unit: 'усл.', qty: 1, price: 12000 }],
   });
+  // Короткие расписания — иначе список «По расписанию» и блок в карточке клиента на снимке пусты.
+  require('./lib/recurring').add(user.id, {
+    cpId: ids[0], type: 'torg12', period: 'weekdays', offeredThisMonth: false,
+    items: [{ name: 'Обед комплексный', unit: 'шт.', qty: 20, price: 350 }],
+  });
+  require('./lib/recurring').add(user.id, {
+    cpId: ids[1], type: 'sch', period: 'week', weekday: 3, offeredThisMonth: false,
+    items: [{ name: 'Доставка воды', unit: 'шт.', qty: 12, price: 280 }],
+  });
   // Подпись и печать: без них экран реквизитов на снимке выглядит пустым,
   // а это заметная часть работы. Рисуем их тут же, чтобы не тащить файлы.
   const fx = require('./lib/facsimile');
@@ -297,7 +306,25 @@ async function main() {
     SHOTS.push({ name: 'nds', title: 'НДС', go: ['vat', {}] });
     SHOTS.push({ name: 'osnovanie-dolga', title: 'Откуда долг', go: ['basis', {}] });
     SHOTS.push({ name: 'osnovanie-dolga-nizhe', title: 'Откуда долг: вид дела', go: ['basis', {}], scroll: 'bottom' });
-    SHOTS.push({ name: 'kazhdyy-mesyac', title: 'Каждый месяц', go: ['recurring', {}] });
+    SHOTS.push({ name: 'kazhdyy-mesyac', title: 'По расписанию: список', go: ['recurring', {}] });
+    if (lastDoc) {
+      SHOTS.push({
+        name: 'raspisanie-vybor', title: 'Карточка документа: «Повторять по расписанию»', go: ['doc', { id: lastDoc.id }],
+        act: async (page) => {
+          await page.locator('#rec-open').click();
+          await page.waitForSelector('#rec-day', { timeout: 5000 });
+          await page.locator('#rec-week').click();
+          await page.waitForSelector('#rec-wd-3', { timeout: 5000 });
+          await page.locator('#rec-wd-3').scrollIntoViewIfNeeded();
+          await page.waitForTimeout(300);
+        },
+      });
+    }
+    if (firstCp) {
+      SHOTS.push({
+        name: 'raspisanie-klient', title: 'Карточка клиента: его расписания', go: ['cp', { id: firstCp.id }], scroll: null,
+      });
+    }
     SHOTS.push({ name: 'zhdut-oplaty', title: 'Ждут оплаты', go: ['unpaid', {}] });
     SHOTS.push({ name: 'reestr', title: 'Реестр', go: ['registry', {}] });
     SHOTS.push({ name: 'akt-sverki', title: 'Акт сверки', go: ['akt', {}] });

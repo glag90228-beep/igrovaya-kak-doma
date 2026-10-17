@@ -1444,12 +1444,14 @@ screens.doc = async function docScreen({ id }) {
      * о просрочке. Одно число задаёт весь цикл.
      */
     const isBill = ['sch', 'schdog'].includes(d.type);
+    // panel — «раз в месяц» (числа); над ним выбор частоты: день, будни, неделя, месяц.
     const panel = h('div', { hidden: true });
 
     const save = (body, done) => withBusy(done, async () => {
       const r = await api('POST', '/api/recurring', { docId: d.id, ...body });
       haptic('medium');
-      toast(r.payDay ? `Счёт ${r.offerDay}-го, оплата ${r.payDay}-го` : `Напомню ${r.dayText}`);
+      toast(r.payDay ? `Счёт ${r.offerDay}-го, оплата ${r.payDay}-го`
+        : body.period && body.period !== 'month' ? `Расписание: ${r.dayText}` : `Напомню ${r.dayText}`);
       go('recurring');
     });
 
@@ -1491,12 +1493,53 @@ screens.doc = async function docScreen({ id }) {
       );
     }
 
-    const repeat = h('button', { class: 'btn ghost' }, 'Повторять каждый месяц');
+    /*
+     * Частота. «Каждый день», «по будням» и «раз в неделю» — для тех, кто возит
+     * одно и то же одному клиенту: обеды, воду, хлеб. Бот пришлёт документ на
+     * проверку, а выпишется он по «Всё верно» — не заранее, чтобы пропущенный
+     * день не оставил дыру в нумерации.
+     */
+    const weekPanel = h('div', { hidden: true },
+      h('div', { class: 'section-title', text: 'В какой день недели' }),
+      h('div', { class: 'card' }, ['понедельник', 'вторник', 'среду', 'четверг', 'пятницу', 'субботу', 'воскресенье']
+        .map((name, i) => h('button', {
+          class: 'row', id: `rec-wd-${i + 1}`,
+          onclick: (e) => save({ period: 'week', weekday: i + 1 }, e.currentTarget),
+        },
+        h('span', { class: 'icon-box' }, icon('clock')),
+        h('span', { class: 'grow', text: `${i === 1 ? 'Во' : 'В'} ${name}` })))));
+    const monthPanel = h('div', { hidden: true }, panel);
+    panel.hidden = false;
+
+    const pickPeriod = (title, sub, ico, onclick, id) => h('button', { class: 'row', id, onclick },
+      h('span', { class: 'icon-box' }, icon(ico)),
+      h('span', { class: 'grow' },
+        h('div', { text: title }),
+        sub ? h('div', { class: 'small muted', text: sub }) : null));
+    const outer = h('div', { hidden: true },
+      h('div', { class: 'section-title', text: 'Как часто' }),
+      h('div', { class: 'card' },
+        pickPeriod('Каждый день', 'и по выходным', 'repeat',
+          (e) => save({ period: 'day' }, e.currentTarget), 'rec-day'),
+        pickPeriod('По будням', 'с понедельника по пятницу', 'repeat',
+          (e) => save({ period: 'weekdays' }, e.currentTarget), 'rec-weekdays'),
+        pickPeriod('Раз в неделю', 'в выбранный день', 'clock', () => {
+          weekPanel.hidden = !weekPanel.hidden; monthPanel.hidden = true; haptic();
+        }, 'rec-week'),
+        pickPeriod('Раз в месяц', 'в выбранное число', 'clock', () => {
+          monthPanel.hidden = !monthPanel.hidden; weekPanel.hidden = true; haptic();
+        }, 'rec-month')),
+      h('p', { class: 'small muted', style: 'margin:8px 18px',
+        text: 'Документ сам не выпишется и клиенту не уйдёт: утром придёт предложение с проверкой — '
+          + '«Всё верно», «Поправить» или «Пропустить сегодня».' }),
+      weekPanel, monthPanel);
+
+    const repeat = h('button', { class: 'btn ghost', id: 'rec-open' }, 'Повторять по расписанию');
     repeat.onclick = () => {
-      panel.hidden = !panel.hidden;
+      outer.hidden = !outer.hidden;
       haptic();
     };
-    box.append(h('div', { class: 'btn-wrap' }, repeat), panel);
+    box.append(h('div', { class: 'btn-wrap' }, repeat), outer);
   }
 
   /*
@@ -1842,6 +1885,34 @@ function clearErrors(fields) {
   }
 }
 
+/**
+ * Расписания клиента: что и как часто повторяется именно для него. Без блока
+ * человек видел их только общим списком в «Ещё», а искать расписание «обедов
+ * для ООО Заря» удобнее там, где живёт сам клиент. Остановить — одним касанием.
+ */
+async function schedulesBlock(cpId) {
+  const { items } = await api('GET', `/api/recurring?cp=${cpId}`);
+  const list = items.filter((r) => !r.isOp);
+  if (!list.length) return null;
+  const wrap = h('div', { id: 'cp-schedules' }, h('div', { class: 'section-title', text: 'По расписанию' }));
+  wrap.append(h('div', { class: 'card' }, list.map((r) => h('div', { class: 'row' },
+    h('span', { class: 'icon-box' }, icon('repeat')),
+    h('span', { class: 'grow' },
+      h('div', { class: 'ellipsis', text: r.title }),
+      h('div', { class: 'small muted ellipsis', text: r.periodic && r.next ? `${r.dayText} · дальше ${ru(r.next)}` : r.dayText })),
+    h('span', { class: 'money nowrap', text: money0(r.total) }),
+    h('button', {
+      class: 'row-act', 'aria-label': `Остановить: ${r.title}`,
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        await api('POST', '/api/recurring/off', { id: r.id });
+        haptic('medium');
+        toast('Расписание остановлено');
+        render();
+      }),
+    }, icon('trash'))))));
+  return wrap;
+}
+
 screens.cp = async function cpScreen({ id, name }) {
   let cp = {};
   if (id) {
@@ -1981,6 +2052,8 @@ screens.cp = async function cpScreen({ id, name }) {
       // отгрузки покрыты авансом. У поставщика отгружаем не мы.
       cp.kind === 'supplier' || !cp.prepay ? null : navRow({ icon: 'doc-check', title: 'Акт за месяц',
         sub: 'накладные и УПД — одним актом', onclick: () => go('monthact', { cpId: id }) })));
+    const schedules = await schedulesBlock(id);
+    if (schedules) box.append(schedules);
     box.append(crmBlock(id));
     box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
   }
@@ -3023,20 +3096,20 @@ screens.basis = async function basis() {
  */
 screens.recurring = async function recurringScreen() {
   const { items } = await api('GET', '/api/recurring');
-  const box = h('div', {}, h('h1', { text: 'Каждый месяц' }));
+  const box = h('div', {}, h('h1', { text: 'По расписанию' }));
   if (!items.length) {
     box.append(empty('repeat', 'Пока ничего не повторяется',
-      'Откройте выписанный счёт или акт и нажмите «Повторять каждый месяц» — '
-      + 'в нужный день бот напомнит и предложит выписать такой же.'));
+      'Откройте выписанный счёт, накладную или акт и нажмите «Повторять по расписанию» — '
+      + 'каждый день, по будням, раз в неделю или раз в месяц бот пришлёт такой же документ на проверку.'));
     return box;
   }
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 10px',
     text: items.some((r) => r.isOp)
       ? 'Документы сами не выписываются и клиенту бот не пишет: в нужный день придёт '
         + 'предложение с кнопкой. Операции журнала бот вносит сам — они внутренние, '
         + 'никуда не уходят, — но каждый раз сообщает и даёт отменить.'
       : 'Ничего не выписывается само и клиенту бот не пишет: в нужный день '
-        + 'придёт предложение с кнопкой.' }));
+        + 'придёт предложение с проверкой — документ выпишется после «Всё верно».' }));
 
   for (const r of items) {
     const card = h('div', { class: 'card' });
@@ -3051,11 +3124,11 @@ screens.recurring = async function recurringScreen() {
       h('span', { class: 'money nowrap', text: money0(r.total) }),
       h('button', {
         class: 'row-act',
-        'aria-label': `Перестать напоминать: ${r.title} для ${r.cpName}`,
+        'aria-label': `Остановить: ${r.title} для ${r.cpName}`,
         onclick: (e) => withBusy(e.currentTarget, async () => {
           await api('POST', '/api/recurring/off', { id: r.id });
           haptic('medium');
-          toast('Больше напоминать не буду');
+          toast('Расписание остановлено');
           render();
         }),
       }, icon('trash'))));
@@ -3080,7 +3153,9 @@ screens.recurring = async function recurringScreen() {
         ? [[`${r.offerDay}-го`, 'выставить счёт'],
           [`${r.payDay}-го`, 'срок оплаты по договору'],
           [`${r.payDay + 1}-го`, 'напомню, если денег нет']]
-        : [[r.dayText, 'выписать документ']];
+        : r.periodic
+          ? [[r.dayText, 'пришлю на проверку'], ...(r.next ? [[ru(r.next), 'следующее предложение']] : [])]
+          : [[r.dayText, 'выписать документ']];
     card.append(h('div', { class: 'plan' }, steps.map(([when, what]) => h('div', { class: 'plan-row' },
       h('span', { class: 'plan-when', text: when }),
       h('span', { class: 'plan-what', text: what })))));

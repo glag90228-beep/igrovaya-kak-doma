@@ -907,6 +907,53 @@ const ok = (c, m, extra) => {
     bdb.updateOrg(user.id, orgId, { npd: 0 });
   }
 
+  /*
+   * Расписания: в карточке документа выбрать «Каждый день», увидеть его в списке
+   * и в карточке клиента, остановить. Выписывать при этом нечего — документ
+   * появляется только по «Всё верно» в боте.
+   */
+  console.log('\n── расписания: период в карточке документа ──');
+  {
+    const recLib = require(path.join(APP, 'lib/recurring'));
+    const { db } = require(path.join(APP, 'db'));
+    const cpS = bdb.createCp(user.id, { name: 'ООО «Обеды»', kind: 'customer', opening_date: '2026-01-01' });
+    const srcS = await docService.issueDocument(user.id, {
+      type: 'torg12', cpId: cpS, date: '2026-09-11', skipQuota: true,
+      items: [{ name: 'Обед комплексный', unit: 'шт.', qty: 20, price: 350 }],
+    });
+    const docsN = () => db.prepare('SELECT COUNT(*) AS n FROM documents WHERE user_id = ?').get(user.id).n;
+    const n0 = docsN();
+    await page.evaluate((id) => window.__go('doc', { id }), srcS.doc.id);
+    await page.waitForSelector('#rec-open', { timeout: 5000 });
+    await page.locator('#rec-open').tap();
+    await page.waitForSelector('#rec-day', { timeout: 5000 });
+    const names = (await page.textContent('#app')).replace(/\s/g, ' ');
+    ok(names.includes('Каждый день') && names.includes('По будням') && names.includes('Раз в неделю') && names.includes('Раз в месяц'),
+      'в карточке документа — выбор: каждый день, по будням, раз в неделю, раз в месяц');
+    ok(await page.evaluate(() => {
+      const b = document.getElementById('rec-month').getBoundingClientRect();
+      return b.height >= 44;
+    }), 'строки выбора — крупные цели нажатия');
+    await page.locator('#rec-week').tap();
+    await page.waitForSelector('#rec-wd-3', { timeout: 5000 });
+    ok(await page.locator('[id^=rec-wd-]').count() === 7, 'раз в неделю — семь дней недели');
+    await page.locator('#rec-day').tap();
+    await page.waitForSelector('.plan', { timeout: 8000 });
+    const list = (await page.textContent('#app')).replace(/\s/g, ' ');
+    ok(list.includes('каждый день') && list.includes('пришлю на проверку') && list.includes('следующее предложение'),
+      'расписание появилось в списке: «каждый день», проверка, дата следующего');
+    ok(docsN() === n0, 'настройка расписания ничего не выписала');
+    const rec = recLib.list(user.id).find((r) => r.cp_id === cpS);
+    ok(rec && rec.period === 'day', 'в базе расписание «day»');
+
+    await page.evaluate((id) => window.__go('cp', { id }), cpS);
+    await page.waitForSelector('#cp-schedules', { timeout: 5000 });
+    ok((await page.textContent('#cp-schedules')).includes('каждый день'), 'в карточке клиента — его расписание');
+    await page.locator('#cp-schedules .row-act').tap();
+    await page.waitForFunction(() => !document.getElementById('cp-schedules'), null, { timeout: 8000 });
+    ok(!recLib.list(user.id).some((r) => r.cp_id === cpS), 'остановка из карточки клиента сняла расписание');
+  }
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();

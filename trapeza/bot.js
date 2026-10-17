@@ -1272,7 +1272,7 @@ async function afterDoc(tg, chatId, user, cpId) {
      * сначала сводка на проверку — как у любого нового (см. repeatDoc).
      */
     rows.push([{ text: '🔁 Повторить', data: `d.rep:${last.id}` }]);
-    rows.push([{ text: '🔁 Повторять каждый месяц', data: `rec.new:${last.id}` }]);
+    rows.push([{ text: '🔁 Повторять по расписанию', data: `rec.new:${last.id}` }]);
   }
   rows.push([{ text: '🧾 Выписать ещё', data: 'go.sch' },
     { text: '📄 Другой документ', data: 'go.any' }]);
@@ -1330,6 +1330,30 @@ async function repeatDoc(tg, chatId, user, docId) {
     + (otherOrg ? `\n\n⚠️ Исходный документ выписан от другой организации. Повтор выйдет от `
       + `текущей — <b>${esc(cur.name || 'без названия')}</b>. Нужна прежняя — переключитесь на неё и повторите.` : ''));
   await showPreview(tg, chatId, user, bdb.getState(user.id));
+}
+
+/**
+ * «Поправить» в предложении по расписанию: позиции расписания в обычном мастере.
+ * Номер и дату назначает сводка перед выпуском — как у «Повторить», — так что
+ * правка идёт тем же путём, что и ручная выписка, а не особым.
+ * @returns {Promise<boolean>} открылся ли мастер (нет — отметку дня надо вернуть)
+ */
+async function openRecurringForEdit(tg, chatId, user, rec) {
+  if (!(await requireQuota(tg, chatId, user))) return false;
+  if (!docService.ITEM_DOCS[rec.type] || !rec.items.length) {
+    await tg.sendMessage(chatId, 'Из этого расписания документ не собрать.', mainMenu());
+    return false;
+  }
+  const cur = bdb.currentOrg(user.id) || {};
+  const seq = bdb.nextSeqForOrg(cur.id, rec.type, currentYear());
+  bdb.setState(user.id, `items:${rec.type}:${rec.cp_id}`, {
+    seq, number: String(seq), date: todayISO(), items: rec.items, ask: '', doc: rec.extra || {},
+  });
+  await tg.sendMessage(chatId,
+    `Правьте позиции для <b>${esc(rec.cp_name)}</b> и выпускайте. Новый номер — ${esc(String(seq))}, дата — ${ru(todayISO())}.\n`
+    + '<i>Предложение на сегодня закрыто: второй «Всё верно» по нему не сработает.</i>');
+  await showPreview(tg, chatId, user, bdb.getState(user.id));
+  return true;
 }
 
 /**
@@ -3327,8 +3351,9 @@ async function showRecurring(tg, chatId, user) {
     await tg.sendMessage(chatId,
       '<b>Регулярные документы</b>\n\n'
       + 'Пока ничего не повторяется.\n\n'
-      + 'Выпишите счёт или акт и нажмите «🔁 Повторять каждый месяц» — '
-      + 'в нужный день я напомню и предложу выписать такой же.\n\n'
+      + 'Выпишите счёт, накладную или акт и нажмите «🔁 Повторять по расписанию» — '
+      + 'каждый день, по будням, раз в неделю или раз в месяц я пришлю такой же документ '
+      + 'на проверку.\n\n'
       + 'А в карточке клиента есть «🔁 Повторять операцию каждый месяц» — '
       + 'для зачётов и списаний, которых в банковской выписке не бывает.', mainMenu());
     return;
@@ -3339,13 +3364,13 @@ async function showRecurring(tg, chatId, user) {
     ? `${r.op.kind} ${formatRub(r.op.amount).replace(/<[^>]+>/g, '')}`
     : (docService.ITEM_DOCS[r.type] ? docService.ITEM_DOCS[r.type].title : r.type));
   const rows = list.map((r) => ([{
-    text: `✖️ ${label(r)} · ${r.cp_name}`.slice(0, 60),
+    text: `⏹ Остановить: ${label(r)} · ${r.cp_name}`.slice(0, 60),
     data: `rec.off:${r.id}`,
   }]));
   rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
   const hasOps = list.some((r) => recurring.isOp(r));
   await tg.sendMessage(chatId,
-    '<b>Что повторяется каждый месяц</b>\n\n'
+    '<b>Что повторяется</b>\n\n'
     + list.map((r) => {
       if (recurring.isOp(r)) {
         const left = r.op.times ? ` · осталось ${r.op.left} из ${r.op.times}` : '';
@@ -3356,12 +3381,12 @@ async function showRecurring(tg, chatId, user) {
       return `• <b>${esc(label(r))}</b> для ${esc(r.cp_name)} — ${formatRub(sum)}, ${r.dayText}`;
     }).join('\n')
     + '\n\n<i>Документы сами не выписываются: в нужный день придёт предложение '
-    + 'с кнопкой.</i>'
+    + 'с проверкой — выпишу после «Всё верно».</i>'
     + (hasOps
       ? '\n<i>Операции журнала вношу сам — они внутренние и никуда не уходят, — '
         + 'но каждый раз сообщу и дам отменить.</i>'
       : '')
-    + '\n\nНажмите на строку ниже, чтобы выключить.',
+    + '\n\nНажмите на строку ниже, чтобы остановить.',
     keyboard(rows));
 }
 
@@ -3511,7 +3536,9 @@ async function postRecurringOp(tg, rec, month) {
 async function runDaily(tg, at = new Date()) {
   const on = todayDate(at);
   let sent = 0;
-  for (const rec of recurring.due(on)) {
+  // Только месячные: короткие периоды («обеды каждый день») приходят утром, а не в
+  // полночь, — для них отдельный обход runPeriodic.
+  for (const rec of recurring.due(on, { periodic: false })) {
     try {
       // За какой месяц это предложение — не всегда текущий (догонялка
       // «последнего дня», см. recurring.offerMonth). Им же и отмечаем.
@@ -3541,6 +3568,65 @@ async function runDaily(tg, at = new Date()) {
   return sent;
 }
 
+/**
+ * Предложение документа «на сегодня» по короткому расписанию.
+ *
+ * Документа ещё нет: он получит номер только по «Всё верно». Выписанный заранее
+ * и «пропущенный» документ оставил бы дыру в нумерации, а удалить его бесследно
+ * нельзя (см. шапку lib/recurring.js). Поэтому здесь проверка, а не готовая
+ * бумага, и клиенту отсюда не уходит ничего: отправку человек нажимает сам.
+ */
+async function offerPeriodic(tg, rec, key, on = todayDate()) {
+  const user = bdb.userById(rec.user_id);
+  if (!user || user.blocked_at) return false;
+  const kind = docService.ITEM_DOCS[rec.type];
+  // Расписание без позиций выписать нечем: оно заводится только по готовому документу.
+  if (!kind || !rec.items.length) return false;
+  const sum = rec.items.reduce((a, it) => a + round2((Number(it.qty) || 0) * (Number(it.price) || 0)), 0);
+  await tg.sendMessage(user.tg_id,
+    `🔁 <b>${esc(kind.title)} на сегодня</b> · ${recurring.dayCaption(on)}\n\n`
+    + `Клиент: <b>${esc(rec.cp_name)}</b>\n`
+    + `Сумма: <b>${formatRub(sum)}</b>\n`
+    + `${rec.items.slice(0, 6).map((it) => `• ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n')}`
+    + (rec.items.length > 6 ? `\n…и ещё ${rec.items.length - 6}` : '')
+    + '\n\n<i>Пока ничего не выписано и клиенту не отправлено. Проверьте и нажмите «Всё верно» — '
+    + 'документ получит новый номер и сегодняшнюю дату.</i>',
+    keyboard([
+      [{ text: '✅ Всё верно', data: `rec.go:${rec.id}:${key}` }],
+      [{ text: '✏️ Поправить', data: `rec.fix:${rec.id}:${key}` },
+        { text: '⏭ Пропустить сегодня', data: `rec.skip:${rec.id}:${key}` }],
+      [{ text: '⏹ Остановить расписание', data: `rec.off:${rec.id}` }],
+    ]));
+  return true;
+}
+
+/**
+ * Утренний обход коротких расписаний: каждый день, по будням, раз в неделю.
+ *
+ * Отметку «предложено» ставим сразу после отправки — как у месячных, — и она же
+ * делает обход безопасным для повторов: цикл бота вызывает его много раз за
+ * утро, а перезапуск днём не пришлёт то, что уже приходило. Час и пояс —
+ * московские, как у сводки: пояса пользователя мы нигде не храним.
+ *
+ * @param {Date} at момент, от которого считается «сегодня» (для проверки)
+ */
+async function runPeriodic(tg, at = new Date()) {
+  const on = todayDate(at);
+  let sent = 0;
+  for (const rec of recurring.due(on, { periodic: true })) {
+    try {
+      const key = recurring.periodKey(rec, on);
+      // eslint-disable-next-line no-await-in-loop
+      if (await offerPeriodic(tg, rec, key, on)) sent += 1;
+      recurring.markOffered(rec.user_id, rec.id, on, key);
+    } catch (e) {
+      console.error('расписания:', e.message);
+    }
+  }
+  if (sent) console.log(`Расписания: отправлено предложений — ${sent}`);
+  return sent;
+}
+
 /** «Напомнить мне» по клиентам — утром, вместе со сводкой. */
 async function sendFollowups(tg, today = todayISO()) {
   let n = 0;
@@ -3563,11 +3649,44 @@ async function sendFollowups(tg, today = todayISO()) {
 /** Завести повторение по уже выписанному документу и рассказать, что будет. */
 async function addRecurring(tg, chatId, user, src, when) {
   const { items, extra } = docService.reusablePayload(src.payload);
+  const periodic = Boolean(when.period) && when.period !== 'month';
+  if (periodic) {
+    // Нажатие по кнопке из старого сообщения не должно заводить второе такое же
+    // расписание: в свой день пришли бы два одинаковых предложения.
+    const twin = recurring.list(user.id).find((r) => r.cp_id === src.cp_id && r.type === src.type
+      && r.period === when.period && (r.period !== 'week' || r.weekday === recurring.normalizeWeekday(when.weekday)));
+    if (twin) {
+      await tg.sendMessage(chatId, 'Такое расписание уже есть.', keyboard([
+        [{ text: '🔁 Все повторения', data: 'rec' }], [{ text: '⬅️ Меню', data: 'menu' }],
+      ]));
+      return;
+    }
+    // Сегодняшнее предложение пропускаем, только если документ за сегодня уже выписан:
+    // иначе расписание, заведённое по старому документу, молча съело бы сегодняшнюю доставку.
+    when = { ...when, offeredThisMonth: src.date === todayISO() };
+  }
   const id = recurring.add(user.id, {
     cpId: src.cp_id, type: src.type, items, extra, ...when,
   });
   const rec = recurring.get(user.id, id);
   const title = docService.ITEM_DOCS[src.type].title;
+
+  if (periodic) {
+    const next = rec.last_offer && rec.last_offer >= recurring.periodKey(rec)
+      ? `Следующее предложение: ${recurring.dayCaption(recurring.nextDate(rec))}.`
+      : 'Если сегодня день по расписанию, предложение придёт в течение минуты.';
+    await tg.sendMessage(chatId,
+      `✅ Настроил для <b>${esc(rec.cp_name)}</b>: «${esc(title)}», ${esc(rec.dayText)}.\n\n`
+      + '• Утром пришлю такой же документ на проверку: «Всё верно», «Поправить» или «Пропустить сегодня»\n'
+      + `• ${next}\n\n`
+      + '<i>Сам ничего не выпишу и клиенту не отправлю: выписывается по «Всё верно», '
+      + 'а письмо клиенту уходит только по вашему нажатию. Остановить можно в «Все повторения».</i>',
+      keyboard([
+        [{ text: '🔁 Все повторения', data: 'rec' }],
+        [{ text: '⬅️ Меню', data: 'menu' }],
+      ]));
+    return;
+  }
 
   // Показываем весь цикл, а не только ближайшее действие: человек должен
   // понимать, за чем бот теперь следит, иначе напоминание о просрочке
@@ -5779,14 +5898,19 @@ async function handleCallback(tg, cq) {
       // счёт нужен заранее. Остальные документы просто привязаны к числу.
       const rent = ['sch', 'schdog'].includes(src.type);
       await tg.sendMessage(chatId,
-        `<b>Повторять «${esc(docService.ITEM_DOCS[src.type].title)}» каждый месяц</b>\n\n`
+        `<b>Повторять «${esc(docService.ITEM_DOCS[src.type].title)}» по расписанию</b>\n\n`
+        + 'Как часто? Каждый день, по будням и раз в неделю я утром пришлю такой же документ '
+        + '<b>на проверку</b> — выпишу только после «Всё верно».\n\n'
         + (rent
-          ? 'Какого числа клиент должен платить? Это число из договора — счёт пришлю '
+          ? 'Раз в месяц: какого числа клиент должен платить? Это число из договора — счёт пришлю '
             + 'заранее, а на следующий день после срока напомню, если денег не будет.\n\n'
-          : 'Какого числа напоминать?\n\n')
+          : 'Раз в месяц: какого числа напоминать?\n\n')
         + '<i>29, 30 и 31 наступают не в каждом месяце — если нужен конец месяца, '
         + 'выберите «в последний день».</i>',
         keyboard([
+          [{ text: '📅 Каждый день', data: `rec.per:${src.id}:d` }],
+          [{ text: '💼 По будням (пн–пт)', data: `rec.per:${src.id}:w` }],
+          [{ text: '🗓 Раз в неделю', data: `rec.per:${src.id}:k` }],
           [{ text: '1-го', data: `rec.add:${src.id}:1` }, { text: '5-го', data: `rec.add:${src.id}:5` },
             { text: '10-го', data: `rec.add:${src.id}:10` }],
           [{ text: '15-го', data: `rec.add:${src.id}:15` }, { text: '20-го', data: `rec.add:${src.id}:20` },
@@ -5794,6 +5918,28 @@ async function handleCallback(tg, cq) {
           [{ text: 'В последний день месяца', data: `rec.add:${src.id}:0` }],
           [{ text: '⬅️ Меню', data: 'menu' }],
         ]));
+      return;
+    }
+    // Каждый день / по будням / раз в неделю.
+    if (data.startsWith('rec.per:')) {
+      const [, idStr, kind] = data.split(':');
+      const src = bdb.getDoc(user.id, Number(idStr));
+      if (!src || !docService.ITEM_DOCS[src.type]) return;
+      if (kind === 'k') {
+        const wd = (n) => ({ text: ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'][n - 1], data: `rec.pw:${src.id}:${n}` });
+        await tg.sendMessage(chatId, 'В какой день недели?', keyboard([
+          [1, 2, 3, 4].map(wd), [5, 6, 7].map(wd), [{ text: '⬅️ Меню', data: 'menu' }],
+        ]));
+        return;
+      }
+      await addRecurring(tg, chatId, user, src, { period: kind === 'd' ? 'day' : 'weekdays' });
+      return;
+    }
+    if (data.startsWith('rec.pw:')) {
+      const [, idStr, wd] = data.split(':');
+      const src = bdb.getDoc(user.id, Number(idStr));
+      if (!src || !docService.ITEM_DOCS[src.type]) return;
+      await addRecurring(tg, chatId, user, src, { period: 'week', weekday: Number(wd) });
       return;
     }
     if (data.startsWith('rec.add:')) {
@@ -5850,21 +5996,58 @@ async function handleCallback(tg, cq) {
         { payDay: Number(dayStr), leadDays: Number(leadStr) });
       return;
     }
-    if (data.startsWith('rec.go:')) {
-      // rec.go:<id>:<YYYY-MM>. Старые кнопки без месяца — за текущий.
-      const [idStr, monthStr] = data.slice(7).split(':');
-      const month = /^\d{4}-\d{2}$/.test(monthStr || '') ? monthStr : recurring.monthKey();
+    if (data.startsWith('rec.go:') || data.startsWith('rec.fix:') || data.startsWith('rec.skip:')) {
+      // rec.go|fix|skip:<id>:<ключ периода>: месяц для месячных, дата для коротких.
+      const act = data.slice(4, data.indexOf(':'));
+      const [idStr, keyStr] = data.slice(data.indexOf(':') + 1).split(':');
       const rec = recurring.get(user.id, Number(idStr));
       if (!rec) { await tg.sendMessage(chatId, 'Это повторение уже удалено.', mainMenu()); return; }
+      // Ключ из кнопки годится, только если он того же вида, что у расписания; старые
+      // кнопки без ключа — за текущий период.
+      const keyRe = rec.periodic ? /^\d{4}-\d{2}-\d{2}$/ : /^\d{4}-\d{2}$/;
+      const key = keyRe.test(keyStr || '') ? keyStr : recurring.periodKey(rec);
+
+      if (act === 'skip') {
+        if (rec.periodic) {
+          recurring.skip(user.id, rec.id, key);
+          const next = recurring.nextDate(rec);
+          await tg.sendMessage(chatId,
+            `Пропустил — документа не будет. Следующее предложение: ${recurring.dayCaption(next)}.`, mainMenu());
+          return;
+        }
+        recurring.markOffered(user.id, rec.id, undefined, key);
+        await tg.sendMessage(chatId, 'Пропустил. Напомню в следующем месяце.', mainMenu());
+        return;
+      }
+
       /*
-       * Одно нажатие — один документ за месяц напоминания. Кнопка не гаснет,
+       * Предложение за прошлый день выписывать нельзя: документ выйдет с
+       * сегодняшней датой, а доставка была вчера. Кнопка не гаснет сама,
+       * и под вчерашним сообщением её легко нажать утром.
+       */
+      if (rec.periodic && key !== recurring.periodKey(rec, todayDate())) {
+        await tg.sendMessage(chatId,
+          'Это предложение устарело — оно было на другой день. Нужен документ на сегодня — '
+          + 'выпишите его кнопкой «Повторить».', mainMenu());
+        return;
+      }
+      /*
+       * Одно нажатие — один документ за период напоминания. Кнопка не гаснет,
        * и раньше двойной тап или возврат к вчерашнему сообщению выпускали
        * второй счёт с новым номером: долг клиента удваивался.
        */
-      const claim = recurring.claimIssue(user.id, rec.id, month);
+      const claim = recurring.claimIssue(user.id, rec.id, key);
       if (!claim.ok) {
-        await tg.sendMessage(chatId, 'По этому напоминанию документ уже выписан — второй не делаю. '
-          + 'Нужен ещё один — выпишите его обычным путём.', mainMenu());
+        await tg.sendMessage(chatId, claim.skipped
+          ? 'Вы пропустили это предложение — документ не выписываю.'
+          : 'По этому напоминанию документ уже выписан — второй не делаю. '
+            + 'Нужен ещё один — выпишите его обычным путём.', mainMenu());
+        return;
+      }
+      if (act === 'fix') {
+        // Те же позиции открываем в мастере: поправить количество и выпустить самому.
+        const opened = await openRecurringForEdit(tg, chatId, user, rec);
+        if (!opened) recurring.releaseIssue(user.id, rec.id, key, claim.prev);
         return;
       }
       const done = await issueDoc(tg, chatId, user, {
@@ -5875,15 +6058,11 @@ async function handleCallback(tg, cq) {
       });
       // Не вышло (лимит, ошибка сборки) — возвращаем отметку, чтобы кнопка
       // сработала, когда причину уберут.
-      if (!done) recurring.releaseIssue(user.id, rec.id, month, claim.prev);
+      if (!done) recurring.releaseIssue(user.id, rec.id, key, claim.prev);
+      if (done && rec.periodic) {
+        await tg.sendMessage(chatId, `Следующее предложение: ${recurring.dayCaption(recurring.nextDate(rec))}.`);
+      }
       if (done) await afterDoc(tg, chatId, user, rec.cp_id);
-      return;
-    }
-    if (data.startsWith('rec.skip:')) {
-      const [idStr, monthStr] = data.slice(9).split(':');
-      const month = /^\d{4}-\d{2}$/.test(monthStr || '') ? monthStr : recurring.monthKey();
-      recurring.markOffered(user.id, Number(idStr), undefined, month);
-      await tg.sendMessage(chatId, 'Пропустил. Напомню в следующем месяце.', mainMenu());
       return;
     }
     if (data.startsWith('rec.off:')) {
@@ -6871,11 +7050,18 @@ async function main() {
   // Сводка — с 9 утра по Москве. Отметка «отправлено сегодня» у каждого
   // человека лежит в базе, поэтому перезапуск днём сводку не повторит.
   let digestDone = '';
+  let periodicAt = 0;
   // eslint-disable-next-line no-constant-condition
   while (true) {
     if (dailyDone !== todayISO()) {
       dailyDone = todayISO();
       try { await runDaily(tg); } catch (e) { console.error('ежедневные дела:', e.message); }
+    }
+    // Короткие расписания — утром и не чаще раза в минуту: расписание, заведённое днём
+    // и не выписанное сегодня, должно прийти сразу, а не ждать завтрашнего утра.
+    if (Date.now() - periodicAt > 60000 && digest.isMorning()) {
+      periodicAt = Date.now();
+      try { await runPeriodic(tg); } catch (e) { console.error('расписания:', e.message); }
     }
     if (digestDone !== todayISO() && digest.isMorning()) {
       digestDone = todayISO();
@@ -6939,5 +7125,5 @@ if (require.main === module) main();
 
 module.exports = {
   looksLikeRequest,
-  handleUpdate, runDaily, sendFollowups, parseOp, parseDate, parseItemLine, readItemLine, parseAmount, spellOutMagnitudes,
+  handleUpdate, runDaily, runPeriodic, sendFollowups, parseOp, parseDate, parseItemLine, readItemLine, parseAmount, spellOutMagnitudes,
 };

@@ -18,12 +18,29 @@
  * напоминание, а решение — всегда за человеком. По той же причине никакие
  * письма контрагентам отсюда не уходят: отправку клиенту человек
  * подтверждает отдельно и видит текст.
+ *
+ * Периоды. Кроме «раз в месяц» бывает «каждый день», «по будням» и «раз в
+ * неделю»: ИП, который каждый день возит обеды одному клиенту, не станет
+ * выписывать накладные руками. Механика та же — предложение с проверкой
+ * («Всё верно» / «Поправить» / «Пропустить сегодня»), а не готовый документ:
+ * выписанный и тут же «пропущенный» документ оставил бы дыру в нумерации.
+ * Выписывается он по «Всё верно» обычным путём — долг считается тем же
+ * местом, что и при ручной выписке, и не задваивается.
  */
 
 const { db } = require('../db');
 
 /** День «последнее число месяца» — 30-е и 31-е есть не в каждом месяце. */
 const LAST_DAY = 0;
+
+/** Как часто повторять. month — как было с самого начала. */
+const PERIODS = ['month', 'day', 'weekdays', 'week'];
+const isPeriodic = (rec) => Boolean(rec) && rec.period !== 'month' && PERIODS.includes(rec.period);
+
+const WEEKDAYS = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье'];
+// «в» или «во» и винительный падеж: «в среду», «во вторник» — как говорят.
+const WEEKDAYS_ON = ['в понедельник', 'во вторник', 'в среду', 'в четверг', 'в пятницу', 'в субботу', 'в воскресенье'];
+const WEEKDAYS_SHORT = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс'];
 
 /*
  * Повторяющаяся операция журнала — второй вид правила, рядом с документами.
@@ -74,6 +91,31 @@ function isLastDayOfMonth(date) {
   return next.getMonth() !== date.getMonth();
 }
 
+/** День недели 1 (пн) … 7 (вс). Date.getDay() считает с воскресенья — для людей это не так. */
+const dowOf = (date) => ((date.getDay() + 6) % 7) + 1;
+
+/** Понедельник недели, в которую попадает дата, — ключ недели. */
+function weekStart(date) {
+  const d = new Date(date.getFullYear(), date.getMonth(), date.getDate() - (dowOf(date) - 1), 12);
+  return iso(d);
+}
+
+/**
+ * Ключ периода: по нему помним, что предложение за этот период уже было.
+ * Месяц — «2026-10», день и неделя — дата (для недели — её понедельник).
+ * Строки одного периода сравниваются как строки, поэтому формат ISO обязателен.
+ */
+function periodKey(rec, date = todayDate()) {
+  if (!isPeriodic(rec)) return monthKey(date);
+  return rec.period === 'week' ? weekStart(date) : iso(date);
+}
+
+/** Допустимый день недели 1–7; всё остальное — понедельник, а не ошибка на ровном месте. */
+function normalizeWeekday(value) {
+  const n = Math.round(Number(value));
+  return n >= 1 && n <= 7 ? n : 1;
+}
+
 /** Допустимый день: 1–28 или 0 (последнее число). */
 function normalizeDay(value) {
   const n = Number(value);
@@ -88,6 +130,14 @@ function normalizeDay(value) {
  *  и «в последний день месяца» вытесняло бы его целиком. */
 function dayLabel(day) {
   return day === LAST_DAY ? 'в конце месяца' : `${day}-го числа`;
+}
+
+/** Расписание словами: «каждый день», «по будням (пн–пт)», «раз в неделю, в среду». */
+function periodText(rec) {
+  if (rec.period === 'day') return 'каждый день';
+  if (rec.period === 'weekdays') return 'по будням (пн–пт)';
+  if (rec.period === 'week') return `раз в неделю, ${WEEKDAYS_ON[normalizeWeekday(rec.weekday) - 1]}`;
+  return dayLabel(rec.day);
 }
 
 /**
@@ -121,6 +171,7 @@ function dueDate(rec, date = todayDate()) {
  */
 function isDue(rec, date = todayDate()) {
   if (!rec.active) return false;
+  if (isPeriodic(rec)) return isDuePeriodic(rec, date);
   if (rec.last_offer === monthKey(date)) return false;
   const day = offerDay(rec);
   if (day === LAST_DAY) {
@@ -151,6 +202,51 @@ function isDue(rec, date = todayDate()) {
 }
 
 /**
+ * Пора ли предлагать по расписанию с короткой частотой.
+ *
+ * День — каждый день; будни — с понедельника по пятницу; неделя — в свой день
+ * недели, а если он пропущен (бот не работал), то в любой следующий день той же
+ * недели: накладную «на понедельник» лучше привезти во вторник, чем потерять
+ * на неделю. Вчерашний день не догоняем: накладная на вчерашнюю доставку с
+ * сегодняшней датой была бы неправдой, а за дату задним числом отвечает человек.
+ */
+function isDuePeriodic(rec, date) {
+  // Строки ISO упорядочены как даты: «уже предлагали за этот или более поздний период».
+  if (rec.last_offer && rec.last_offer >= periodKey(rec, date)) return false;
+  const dow = dowOf(date);
+  if (rec.period === 'day') return true;
+  if (rec.period === 'weekdays') return dow <= 5;
+  return dow >= normalizeWeekday(rec.weekday);
+}
+
+/**
+ * Ближайший день, в который предложение придёт после `date` (не считая её самой).
+ * Нужен, чтобы после «Пропустить» и после настройки сказать человеку конкретную
+ * дату, а не «потом». Для месячных не считается — у них свои правила.
+ * @returns {string} YYYY-MM-DD или '' для месячного расписания
+ */
+function nextDate(rec, date = todayDate()) {
+  if (!isPeriodic(rec)) return '';
+  const next = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n, 12);
+  if (rec.period === 'day') return iso(next(date, 1));
+  if (rec.period === 'weekdays') {
+    let d = next(date, 1);
+    while (dowOf(d) > 5) d = next(d, 1);
+    return iso(d);
+  }
+  const want = normalizeWeekday(rec.weekday);
+  let d = next(date, 1);
+  while (dowOf(d) !== want) d = next(d, 1);
+  return iso(d);
+}
+
+/** «чт, 17.10» — подпись дня в предложении: по ней видно, на какую доставку документ. */
+function dayCaption(date) {
+  const d = typeof date === 'string' ? new Date(`${date}T12:00:00`) : date;
+  return `${WEEKDAYS_SHORT[dowOf(d) - 1]}, ${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+/**
  * За какой месяц предложение, которое isDue разрешило в этот день.
  *
  * Обычно — за текущий. Но «последний день», пойманный не в последний день,
@@ -161,6 +257,7 @@ function isDue(rec, date = todayDate()) {
  * модуля обещано не терять.
  */
 function offerMonth(rec, date = todayDate()) {
+  if (isPeriodic(rec)) return periodKey(rec, date);
   if (offerDay(rec) === LAST_DAY && !isLastDayOfMonth(date)) return prevMonthKey(date);
   return monthKey(date);
 }
@@ -229,16 +326,30 @@ function dayPassed(day, date = todayDate()) {
  */
 function add(userId, {
   cpId, type, items, extra = {}, note = '', day = 1, payDay = 0, leadDays = 0,
-  offeredThisMonth = true,
+  offeredThisMonth = true, period = 'month', weekday = 0,
 }) {
-  const pay = payDay ? normalizeDay(payDay) : 0;
+  const per = PERIODS.includes(period) ? period : 'month';
+  const wd = per === 'week' ? normalizeWeekday(weekday) : 0;
+  // Срок оплаты и «за сколько дней» — понятия аренды, у коротких периодов их нет.
+  const pay = per === 'month' && payDay ? normalizeDay(payDay) : 0;
+  /*
+   * «Этот период уже отработан» у коротких расписаний ставится осторожнее, чем у
+   * месячных. Неделя целиком отработанной считается, только если нужный день
+   * уже наступил: заведи человек «по пятницам» в понедельник, и отметка за всю
+   * неделю съела бы ближайшую пятницу.
+   */
+  let lastOffer = '';
+  if (offeredThisMonth) {
+    if (per === 'month') lastOffer = monthKey();
+    else if (per !== 'week' || dowOf(todayDate()) >= wd) lastOffer = periodKey({ period: per }, todayDate());
+  }
   const info = db.prepare(`INSERT INTO recurring(user_id, cp_id, type, day, pay_day, lead_days,
-      items, extra, note, active, last_offer, created_at) VALUES(?,?,?,?,?,?,?,?,?,1,?,?)`)
+      items, extra, note, active, last_offer, created_at, period, weekday) VALUES(?,?,?,?,?,?,?,?,?,1,?,?,?,?)`)
     .run(userId, Number(cpId), String(type), normalizeDay(day),
       pay, pay ? Math.min(27, Math.max(0, Math.round(Number(leadDays) || 0))) : 0,
       JSON.stringify(Array.isArray(items) ? items : []),
       JSON.stringify(extra && typeof extra === 'object' ? extra : {}),
-      String(note).slice(0, 200), offeredThisMonth ? monthKey() : '', new Date().toISOString());
+      String(note).slice(0, 200), lastOffer, new Date().toISOString(), per, wd);
   return Number(info.lastInsertRowid);
 }
 
@@ -256,7 +367,8 @@ function parse(row) {
     extra: json(row.extra, {}),
   };
   rec.offerDay = offerDay(rec);
-  rec.dayText = row.pay_day
+  rec.periodic = isPeriodic(rec);
+  rec.dayText = rec.periodic ? periodText(rec) : row.pay_day
     ? `${dayLabel(rec.offerDay)} (оплата ${row.pay_day}-го)`
     : dayLabel(row.day);
   if (isOp(rec)) {
@@ -350,11 +462,14 @@ function off(userId, id) {
  * JOIN с контрагентами не для красоты: удалённый контрагент оставил бы
  * повторение, которое каждый месяц предлагает выписать документ в пустоту.
  */
-function due(date = todayDate()) {
+function due(date = todayDate(), { periodic = null } = {}) {
   return db.prepare(`SELECT r.*, c.name AS cp_name FROM recurring r
       JOIN counterparties c ON c.id = r.cp_id
       WHERE r.active = 1 ORDER BY r.user_id, r.day`)
-    .all().map(parse).filter((r) => isDue(r, date));
+    .all().map(parse)
+    // periodic: true — только короткие периоды (утренний обход), false — только месячные
+    // (ночной), null — все. Раздельно, потому что ночью «обеды на сегодня» никому не нужны.
+    .filter((r) => (periodic == null || r.periodic === periodic) && isDue(r, date));
 }
 
 /**
@@ -378,9 +493,12 @@ function due(date = todayDate()) {
  * @returns {{ok: boolean, prev: string}} prev — чтобы вернуть, если выпуск не удался
  */
 function claimIssue(userId, id, month) {
-  const row = db.prepare('SELECT last_issued FROM recurring WHERE id = ? AND user_id = ?')
+  const row = db.prepare('SELECT last_issued, last_skip FROM recurring WHERE id = ? AND user_id = ?')
     .get(Number(id), userId);
   if (!row) return { ok: false, prev: '' };
+  // «Пропустить сегодня» нажато — по этому предложению документ не выписывается,
+  // даже если вернуться к нему кнопкой «Всё верно» из того же сообщения.
+  if (row.last_skip === month) return { ok: false, prev: row.last_issued, skipped: true };
   const r = db.prepare('UPDATE recurring SET last_issued = ? WHERE id = ? AND user_id = ? AND last_issued <> ?')
     .run(month, Number(id), userId, month);
   return { ok: r.changes === 1, prev: row.last_issued };
@@ -390,6 +508,16 @@ function claimIssue(userId, id, month) {
 function releaseIssue(userId, id, month, prev) {
   db.prepare('UPDATE recurring SET last_issued = ? WHERE id = ? AND user_id = ? AND last_issued = ?')
     .run(prev || '', Number(id), userId, month);
+}
+
+/**
+ * Пропустить период: документа не будет, и вернуть его кнопкой из старого
+ * сообщения нельзя. Документ к этому моменту не создавался, так что в номерах
+ * и в долге следов нет. Владельца проверяем, как у всех действий над правилом.
+ */
+function skip(userId, id, key) {
+  return db.prepare('UPDATE recurring SET last_skip = ?, last_offer = ? WHERE id = ? AND user_id = ?')
+    .run(String(key), String(key), Number(id), userId).changes === 1;
 }
 
 /** month — за какой месяц предложение (offerMonth); по умолчанию текущий. */
@@ -428,9 +556,11 @@ function setSchedule(userId, id, { payDay, leadDays }) {
 }
 
 module.exports = {
-  add, list, get, setDay, setSchedule, off,
+  add, list, get, setDay, setSchedule, off, skip,
   due, markOffered, claimIssue, releaseIssue, overdue, markDueNoticed, offerMonth, dueMonth,
   isDue, isOverdue, offerDay, dueDate, dayPassed,
   OP_TYPE, isOp, bumpOp,
   monthKey, prevMonthKey, normalizeDay, dayLabel, LAST_DAY,
+  PERIODS, WEEKDAYS, WEEKDAYS_ON, isPeriodic, periodKey, periodText, normalizeWeekday,
+  nextDate, dayCaption, dowOf, weekStart,
 };

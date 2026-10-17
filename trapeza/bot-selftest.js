@@ -5574,10 +5574,10 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await say('Аренда, сентябрь; 1; 45000');
     await tap('items.done');
     await tap('doc.make');
-    ok(Boolean(button('Повторять каждый месяц')), 'после выписки предложено повторять');
+    ok(Boolean(button('Повторять по расписанию')), 'после выписки предложено повторять');
 
-    await tap(button('Повторять каждый месяц'));
-    ok(norm(last()).includes('Какого числа клиент должен платить'),
+    await tap(button('Повторять по расписанию'));
+    ok(norm(last()).includes('какого числа клиент должен платить'),
       'у счёта спрашивают число из договора, а не «когда напомнить»', norm(last()).slice(0, 50));
     await tap(button('5-го'));
     ok(last().includes('За сколько дней выставлять счёт'), 'второй шаг — насколько заранее',
@@ -5652,6 +5652,195 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const alienRow = require('./db').db.prepare('SELECT last_offer FROM recurring WHERE id = ?').get(alien);
     ok(alienRow.last_offer === '2000-01',
       'чужое напоминание нельзя пропустить за владельца', `last_offer=«${alienRow.last_offer}»`);
+  }
+
+  console.log('\n── расписания: каждый день, по будням, раз в неделю ──');
+  {
+    /*
+     * ИП, который каждый день возит обеды одному клиенту, не станет выписывать
+     * накладные руками. Бот утром присылает ту же накладную на проверку. Правила:
+     * выписывается только по «Всё верно» (иначе «пропустить» оставляло бы дыру в
+     * нумерации), клиенту ничего не уходит, долг считается обычным путём и не
+     * задваивается, вчерашнюю кнопку нажать нельзя.
+     */
+    const rec = require('./lib/recurring');
+    const bdbP = require('./lib/bot-db');
+    const { runPeriodic, runDaily } = require('./bot.js');
+    const { db: rawP } = require('./db');
+    const uid = fxUserId();
+    const msk = (iso, hh = '09') => new Date(`${iso}T${hh}:00:00+03:00`);   // «сейчас» в Москве
+    const proposals = () => sent.filter((m) => /на сегодня/.test(m.text || ''));
+    const resetRules = () => { for (const r of rec.list(uid)) rec.off(uid, r.id); };
+
+    // --- календарь: чистая арифметика на неподвижных датах (2026-10-19 — понедельник) ---
+    const D = (iso) => new Date(`${iso}T12:00:00`);
+    const R = (period, weekday = 0, last = '') => ({ active: 1, period, weekday, last_offer: last, day: 1 });
+    ok(rec.isDue(R('day'), D('2026-10-17')) && rec.isDue(R('day'), D('2026-10-18')), 'каждый день — и по выходным');
+    ok(!rec.isDue(R('weekdays'), D('2026-10-17')) && !rec.isDue(R('weekdays'), D('2026-10-18')), 'по будням: суббота и воскресенье пропущены');
+    ok(rec.isDue(R('weekdays'), D('2026-10-19')) && rec.isDue(R('weekdays'), D('2026-10-23')), 'по будням: понедельник и пятница — на месте');
+    ok(!rec.isDue(R('week', 3), D('2026-10-19')) && rec.isDue(R('week', 3), D('2026-10-21')), 'раз в неделю (ср): в понедельник рано, в среду пора');
+    ok(rec.isDue(R('week', 3), D('2026-10-22')), 'пропущенную среду догоняем в четверг той же недели');
+    ok(!rec.isDue(R('week', 3, '2026-10-19'), D('2026-10-22')), 'но если за эту неделю уже предлагали — второй раз нет');
+    ok(rec.isDue(R('week', 3, '2026-10-19'), D('2026-10-28')), 'на следующей неделе — снова');
+    ok(rec.nextDate(R('weekdays'), D('2026-10-23')) === '2026-10-26', 'после пятницы будни продолжаются в понедельник');
+    ok(rec.nextDate(R('week', 3), D('2026-10-21')) === '2026-10-28', 'раз в неделю — через семь дней');
+    ok(rec.nextDate(R('day'), D('2026-10-17')) === '2026-10-18', 'каждый день — завтра');
+    ok(rec.periodText({ period: 'week', weekday: 2 }) === 'раз в неделю, во вторник' && rec.periodText(R('weekdays')) === 'по будням (пн–пт)',
+      'расписание называется словами');
+    ok(rec.dayCaption('2026-10-19') === 'пн, 19.10', 'подпись дня в предложении: «пн, 19.10»');
+
+    // --- заведение из бота ---
+    resetRules();
+    const cpL = bdbP.createCp(uid, { name: 'ООО «Обеды»', kind: 'customer', opening_date: '2026-01-01' });
+    const items = [{ name: 'Обед комплексный', unit: 'шт.', qty: 20, price: 350 }];   // 7 000 ₽
+    const src = await require('./lib/doc-service').issueDocument(uid, {
+      type: 'torg12', cpId: cpL, date: '2026-10-12', items, skipQuota: true,
+    });
+    sent.length = 0;
+    await tap(`rec.new:${src.doc.id}`);
+    ok(Boolean(button('Каждый день')) && Boolean(button('По будням')) && Boolean(button('Раз в неделю')) && Boolean(button('5-го')),
+      'выбор: каждый день, по будням, раз в неделю — и месячные числа рядом');
+    await tap(`rec.per:${src.doc.id}:d`);
+    const day1 = rec.list(uid).find((r) => r.cp_id === cpL);
+    ok(day1 && day1.period === 'day' && day1.dayText === 'каждый день' && day1.pay_day === 0, 'расписание «каждый день» заведено');
+    ok(day1.last_offer === '', 'документ исходный не сегодняшний — сегодняшняя доставка не съедена');
+    ok(norm(last()).includes('Всё верно') && last().includes('не отправлю'), 'бот объясняет порядок: проверка, и клиенту ничего не уходит');
+    await tap(`rec.per:${src.doc.id}:d`);
+    ok(last().includes('уже есть') && rec.list(uid).filter((r) => r.cp_id === cpL).length === 1, 'повторное нажатие второе такое же не заводит');
+    await tap(`rec.per:${src.doc.id}:k`);
+    ok(['Пн', 'Ср', 'Вс'].every((w) => Boolean(button(w))), 'раз в неделю: выбор дня недели');
+    await tap(`rec.pw:${src.doc.id}:3`);
+    const wk = rec.list(uid).find((r) => r.period === 'week');
+    ok(wk && wk.weekday === 3 && wk.dayText === 'раз в неделю, в среду', 'раз в неделю — в среду');
+    rec.off(uid, wk.id);
+    await tap(`rec.per:${src.doc.id}:w`);
+    const wd = rec.list(uid).find((r) => r.period === 'weekdays');
+    ok(Boolean(wd) && wd.dayText === 'по будням (пн–пт)', 'по будням заведено');
+    rec.off(uid, wd.id);
+    // Месячное по-прежнему рядом и ни с чем не путается.
+    await tap(`rec.add:${src.doc.id}:5`);
+    const mo = rec.list(uid).find((r) => r.period === 'month');
+    ok(mo && mo.day === 5 && !mo.periodic, 'месячное расписание работает как раньше');
+    rec.off(uid, mo.id);
+
+    // --- обход: что и когда предлагается ---
+    const docsCount = () => bdbP.listDocs(uid, 500, cpL).length;
+    const makeRule = (period, weekday = 0) => rec.add(uid, { cpId: cpL, type: 'torg12', items, period, weekday, offeredThisMonth: false });
+    const only = (id) => { for (const r of rec.list(uid)) if (r.id !== id) rec.off(uid, r.id); };
+
+    let id = makeRule('day'); only(id);
+    sent.length = 0;
+    const docs0 = docsCount();
+    ok(await runPeriodic(tg, msk('2026-10-19')) === 1, 'каждый день: в понедельник одно предложение');
+    const p1 = proposals()[0];
+    ok(p1 && p1.text.includes('ТОРГ-12') && p1.text.includes('пн, 19.10') && p1.text.includes('ООО «Обеды»') && norm(p1.text).includes('7 000'),
+      'в предложении: что за документ, день, клиент и сумма', p1 && norm(p1.text).slice(0, 80));
+    const btns = p1.kb.flat().map((b) => b.callback_data);
+    ok(btns.includes(`rec.go:${id}:2026-10-19`) && btns.includes(`rec.fix:${id}:2026-10-19`) && btns.includes(`rec.skip:${id}:2026-10-19`),
+      'кнопки «Всё верно», «Поправить», «Пропустить сегодня» несут день предложения');
+    ok(p1.kb.flat().some((b) => b.text.includes('Всё верно')) && p1.kb.flat().some((b) => b.text.includes('Пропустить сегодня')),
+      'и подписаны так, как просили');
+    ok(docsCount() === docs0, 'предложение ничего не выписало — номер не занят');
+    ok(await runPeriodic(tg, msk('2026-10-19', '15')) === 0, 'тот же день ещё раз — ничего (перезапуск не задваивает)');
+    ok(await runPeriodic(tg, msk('2026-10-24')) === 1, 'каждый день: суббота тоже');
+    await runDaily(tg, msk('2026-10-26'));
+    ok(proposals().length === 2, 'ночной обход месячных коротких расписаний не трогает');
+    rec.off(uid, id);
+
+    id = makeRule('weekdays'); only(id);
+    sent.length = 0;
+    ok(await runPeriodic(tg, msk('2026-10-24')) === 0 && await runPeriodic(tg, msk('2026-10-25')) === 0, 'по будням: суббота и воскресенье без предложений');
+    ok(await runPeriodic(tg, msk('2026-10-26')) === 1 && await runPeriodic(tg, msk('2026-10-30')) === 1, 'по будням: понедельник и пятница — предложения');
+    rec.off(uid, id);
+
+    id = makeRule('week', 3); only(id);
+    sent.length = 0;
+    ok(await runPeriodic(tg, msk('2026-10-26')) === 0, 'раз в неделю (ср): в понедельник тихо');
+    ok(await runPeriodic(tg, msk('2026-10-28')) === 1 && proposals()[0].text.includes('ср, 28.10'), 'в среду — предложение с подписью дня');
+    ok(await runPeriodic(tg, msk('2026-10-29')) === 0, 'в четверг той же недели — уже было');
+    ok(await runPeriodic(tg, msk('2026-11-04')) === 1, 'на следующей неделе — снова');
+    rec.off(uid, id);
+    id = makeRule('week', 1); only(id);
+    ok(await runPeriodic(tg, msk('2026-11-11')) === 1, 'пропущенный понедельник догоняется в среду той же недели');
+    rec.off(uid, id);
+
+    // --- «Всё верно»: выпуск, долг, повторное нажатие ---
+    const todayIso = require('./lib/period').todayISO();
+    const balOf = () => (bdbP.balanceOf(uid, cpL) || { closing: 0 }).closing;
+    id = makeRule('day'); only(id);
+    sent.length = 0;
+    await runPeriodic(tg);
+    const keyNow = rec.periodKey(rec.get(uid, id), require('./lib/period').todayDate());
+    ok(keyNow === todayIso && Boolean(proposals()[0]), 'сегодняшнее предложение пришло и ключ — сегодняшняя дата');
+    const bal0 = balOf();
+    const n0 = docsCount();
+    await tap(`rec.go:${id}:${keyNow}`);
+    ok(docsCount() === n0 + 1, '«Всё верно» выписывает ровно один документ');
+    const made = bdbP.listDocs(uid, 1, cpL)[0];
+    ok(made.type === 'torg12' && made.date === todayIso && made.total === 7000 && made.number !== src.doc.number,
+      'новый номер, сегодняшняя дата, те же позиции', `${made.number}/${made.date}/${made.total}`);
+    ok(balOf() === bal0 + 7000, 'долг вырос на сумму накладной один раз', `${bal0} → ${balOf()}`);
+    ok(sent.some((m) => m.document || m.filename || /Следующее предложение/.test(m.text || '')), 'владельцу пришёл файл и дата следующего предложения');
+    await tap(`rec.go:${id}:${keyNow}`);
+    ok(docsCount() === n0 + 1 && balOf() === bal0 + 7000 && norm(last()).includes('уже выписан'),
+      'второе нажатие документа не добавляет, долг не задваивается');
+    bdbP.rebuildDebt(uid);
+    ok(balOf() === bal0 + 7000, 'и пересчёт долга ничего не меняет');
+    rec.off(uid, id);
+
+    // --- «Пропустить сегодня»: ни документа, ни следа в долге ---
+    id = makeRule('day'); only(id);
+    rawP.prepare("UPDATE recurring SET last_offer = '' WHERE id = ?").run(id);
+    await runPeriodic(tg);
+    const balS = balOf(); const nS = docsCount();
+    const opsS = bdbP.listOps(uid, cpL).length;
+    const seqS = bdbP.nextSeqForOrg(bdbP.currentOrg(uid).id, 'torg12', require('./lib/period').currentYear());
+    await tap(`rec.skip:${id}:${keyNow}`);
+    ok(docsCount() === nS && balOf() === balS && bdbP.listOps(uid, cpL).length === opsS, 'пропуск: документа нет, долг и журнал не тронуты');
+    ok(bdbP.nextSeqForOrg(bdbP.currentOrg(uid).id, 'torg12', require('./lib/period').currentYear()) === seqS, 'номер не занят — дыры в нумерации нет');
+    ok(norm(last()).includes('Следующее предложение'), 'бот называет, когда придёт следующее');
+    await tap(`rec.go:${id}:${keyNow}`);
+    ok(docsCount() === nS && norm(last()).includes('пропустили'), 'после пропуска старой кнопкой «Всё верно» выписать нельзя');
+    ok(await runPeriodic(tg) === 0, 'и в тот же день предложение второй раз не приходит');
+    rec.off(uid, id);
+
+    // --- «Поправить»: те же позиции в мастере, день закрыт ---
+    id = makeRule('day'); only(id);
+    sent.length = 0;
+    await runPeriodic(tg);
+    const nF = docsCount(); const balF = balOf();
+    await tap(`rec.fix:${id}:${keyNow}`);
+    ok(norm(last()).includes('Обед комплексный') || norm(sent.map((m) => m.text).join(' ')).includes('Обед комплексный'), 'мастер открыт с позициями расписания');
+    ok(bdbP.getState(uid).state === `items:torg12:${cpL}`, 'состояние — обычный мастер накладной');
+    await tap('doc.make');
+    ok(docsCount() === nF + 1 && balOf() === balF + 7000, 'после выпуска из мастера — один документ и долг один раз');
+    await tap(`rec.go:${id}:${keyNow}`);
+    ok(docsCount() === nF + 1 && balOf() === balF + 7000 && norm(last()).includes('уже выписан'),
+      '«Всё верно» по тому же предложению после правки второй документ не выпишет');
+    rec.off(uid, id);
+
+    // --- устаревшая кнопка и чужое правило ---
+    id = makeRule('day'); only(id);
+    const nOld = docsCount();
+    await tap(`rec.go:${id}:2020-01-01`);
+    ok(docsCount() === nOld && norm(last()).includes('устарело'), 'вчерашняя кнопка документ не выпишет');
+    const other2 = bdbP.getOrCreateUser(880077, 'Чужой2', 'alien2');
+    const otherCp2 = bdbP.createCp(other2.id, { name: 'Их клиент', kind: 'customer', opening_date: '2026-01-01' });
+    const alien2 = rec.add(other2.id, { cpId: otherCp2, type: 'torg12', items, period: 'day', offeredThisMonth: false });
+    await tap(`rec.go:${alien2}:${todayIso}`);
+    await tap(`rec.skip:${alien2}:${todayIso}`);
+    const alRow = rawP.prepare('SELECT last_skip, last_issued FROM recurring WHERE id = ?').get(alien2);
+    ok(alRow.last_skip === '' && alRow.last_issued === '' && bdbP.listDocs(other2.id, 5).length === 0, 'чужое расписание ни выписать, ни пропустить нельзя');
+
+    // --- список и остановка ---
+    sent.length = 0;
+    await tap('rec');
+    ok(norm(last()).includes('каждый день') && Boolean(button('Остановить')), 'в списке расписание названо словами, у него кнопка «Остановить»');
+    await tap(button('Остановить'));
+    ok(!rec.list(uid).some((r) => r.id === id), 'остановленное расписание больше не предлагается');
+    rec.off(other2.id, alien2);   // чужое — выключаем его владельцем, чтобы не мешало обходу
+    ok(await runPeriodic(tg) === 0, 'и обход его не видит');
+    resetRules();
   }
 
   console.log('\n── напоминания подряду, торговле и производству ──');
@@ -8202,7 +8391,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const nextScreen = [...sent].reverse().find((m) => String(m.text).includes('Что дальше'));
     const repBtn = buttonIn(nextScreen, 'Повторить');
     ok(Boolean(repBtn) && repBtn.startsWith('d.rep:'), 'под выданным документом есть «🔁 Повторить»', repBtn);
-    ok(Boolean(buttonIn(nextScreen, 'Повторять каждый месяц')), 'и ежемесячное повторение осталось рядом');
+    ok(Boolean(buttonIn(nextScreen, 'Повторять по расписанию')), 'и ежемесячное повторение осталось рядом');
 
     // 2) Повтор оплаченного документа: оплата не копируется, номер — следующий свободный.
     const srcId = Number(repBtn.split(':')[1]);
