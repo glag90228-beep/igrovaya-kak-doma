@@ -13,7 +13,36 @@
 -->
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'><rect width='200' height='200' rx='40' fill='%2316233A'/><g transform='translate(100 100) scale(1.12) translate(-97 -99)'><path fill='%23F5F8FF' d='M46 24H128L156 52V166a8 8 0 0 1-8 8H46a8 8 0 0 1-8-8V32a8 8 0 0 1 8-8Z'/><path fill='%234C9AFF' d='M128 24L156 52H128Z'/><g fill='none' stroke='%234C9AFF' stroke-width='13' stroke-linejoin='round'><path d='M84 132V72a17 17 0 0 1 0 34'/><path d='M72 117H103'/></g></g></svg>">
 <link rel="stylesheet" href="app.css">
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<!--
+  Скрипт Telegram грузим только там, где он нужен. В обычном браузере он не
+  даёт ничего (initData пуст), зато лежит на telegram.org: где этот адрес
+  медленный или закрыт, страница «висела» бы на нём, не показывая даже вход.
+  В самом Telegram запуск всегда оставляет след: tgWebApp... в адресе (все
+  клиенты), сохранённые параметры, TelegramWebviewProxy (Android), рамка
+  веб-версии. Нет ни одного — это обычный сайт.
+
+  Вставляем сами и с async=false: такой скрипт выполняется в порядке вставки,
+  то есть раньше app.js, как и при обычном теге, но без document.write,
+  который Chrome местами отключает. Стоит в <head>, чтобы цвета темы
+  Telegram были готовы до первой отрисовки.
+-->
+<script>
+(function () {
+  var inTg = false;
+  try {
+    inTg = !!(window.Telegram && window.Telegram.WebApp)
+      || /tgWebApp/.test(location.hash + location.search)
+      || !!window.TelegramWebviewProxy
+      || !!sessionStorage.getItem('__telegram__initParams')
+      || window.parent !== window;
+  } catch (e) { inTg = true; }          // не смогли проверить — лучше загрузить, чем потерять Telegram
+  if (!inTg) return;
+  var el = document.createElement('script');
+  el.src = 'https://telegram.org/js/telegram-web-app.js';
+  el.async = false;
+  document.head.appendChild(el);
+})();
+</script>
 </head>
 <body>
 
@@ -33,6 +62,7 @@
     <g id="i-users"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M16 5.2a3.2 3.2 0 0 1 0 5.6"/><path d="M17.5 14.4A5.5 5.5 0 0 1 20.5 20"/></g>
     <g id="i-wallet"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H18a2 2 0 0 1 2 2v1"/><path d="M3 7.5V18a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-2"/><path d="M21 10.5h-4a2.5 2.5 0 0 0 0 5h4z"/></g>
     <g id="i-bell"><path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 2h-15z"/><path d="M10 21h4"/></g>
+    <g id="i-logout"><path d="M10 4H6.5A2.5 2.5 0 0 0 4 6.5v11A2.5 2.5 0 0 0 6.5 20H10"/><path d="m15.5 8 4 4-4 4"/><path d="M19.5 12H9.5"/></g>
     <g id="i-more"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></g>
     <g id="i-plus"><path d="M12 5v14M5 12h14"/></g>
     <g id="i-minus"><path d="M5 12h14"/></g>
@@ -119,6 +149,15 @@
 
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
-<script src="app.js"></script>
+<script>
+/* Приложение — тоже вставкой с async=false: обычный тег мог бы выполниться раньше
+   скрипта Telegram, вставленного в <head>. */
+(function () {
+  var el = document.createElement('script');
+  el.src = 'app.js';
+  el.async = false;
+  document.body.appendChild(el);
+})();
+</script>
 </body>
 </html>

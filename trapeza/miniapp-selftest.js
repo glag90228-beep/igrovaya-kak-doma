@@ -2812,6 +2812,436 @@ async function main() {
     ok(limited, 'подмена X-Forwarded-For не обходит ограничение частоты');
   }
 
+  section('вход с сайта: одноразовый вход и сессия');
+  {
+    const webAuth = require('./lib/web-auth');
+    const { db } = require('./db');
+    const web = bdb.getOrCreateUser(610001, 'Вера Веб', 'vera');
+    const anna = bdb.getOrCreateUser(ANNA.id, 'Анна', 'anna');
+    const XRW = { 'X-Requested-With': 'pervichka' };
+    const hostOf = () => base;                  // «свой» Origin — адрес этого же сервера
+    const sha = (s2) => crypto.createHash('sha256').update(s2).digest('hex');
+    const ASCII_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+    webAuth.resetLimits();
+
+    // --- старт ---
+    r = await call('POST', '/api/login/start', { body: {} });
+    ok(r.status === 403, 'старт входа без заголовка приложения отвергнут', r.status);
+    r = await call('POST', '/api/login/start', { body: {}, headers: { ...XRW, Origin: 'https://evil.example' } });
+    ok(r.status === 403, 'старт входа с чужого сайта (Origin) отвергнут', r.status);
+    r = await call('GET', '/api/login/start', { headers: XRW });
+    ok(r.status === 405, 'старт входа только POST', r.status);
+
+    r = await call('POST', '/api/login/start', { body: {}, headers: { ...XRW, Origin: hostOf(), 'User-Agent': ASCII_UA } });
+    ok(r.status === 200 && /^[A-Za-z0-9_-]{32}$/.test(r.json.nonce), 'старт входа выдаёт nonce в 32 знака base64url', JSON.stringify(r.json).slice(0, 120));
+    const nonce = r.json.nonce;
+    ok(r.json.link === `https://t.me/pervichka_app_bot?start=login_${nonce}`, 'ссылка ведёт в бота с параметром login_<nonce>', r.json.link);
+    ok(/^<svg[\s\S]*<\/svg>$/.test(r.json.qr) && r.json.qr.includes('для входа через Telegram'), 'вместе со ссылкой приходит QR для неё');
+    ok(r.json.ttl === 300, 'вход живёт пять минут', r.json.ttl);
+    const startCode = r.json.code;
+    ok(Number.isInteger(startCode) && startCode >= 10 && startCode <= 99, 'вместе с входом приходит двузначное число для сверки в боте', startCode);
+    ok(!/\d/.test(/aria-label="([^"]*)"/.exec(r.json.qr)[1]) && !r.json.link.endsWith(String(startCode)),
+      'числа нет ни в подписи QR, ни в ссылке (QR могут сфотографировать)');
+    ok(db.prepare('SELECT code FROM web_logins WHERE nonce_hash = ?').get(sha(nonce)).code === startCode, 'число записано во вход');
+    {
+      // Сто входов: число всегда двузначное и не залипает на одном значении.
+      const seen = new Set();
+      for (let i = 0; i < 100; i += 1) {
+        const t = webAuth.startLogin({ ip: '203.0.113.1' });
+        seen.add(t.code);
+        if (t.code < 10 || t.code > 99) { ok(false, 'число вне 10–99', t.code); break; }
+      }
+      ok(seen.size > 30, 'числа разные от входа к входу', seen.size);
+    }
+
+    // Имя бота берётся из окружения, но только если оно похоже на имя.
+    process.env.BOT_USERNAME = '@my_test_bot';
+    webAuth.resetLimits();
+    const rb = await call('POST', '/api/login/start', { body: {}, headers: XRW });
+    ok(rb.json.link.startsWith('https://t.me/my_test_bot?start=login_'), 'имя бота берётся из BOT_USERNAME', rb.json.link);
+    process.env.BOT_USERNAME = 'bad name/with?junk';
+    const rb2 = await call('POST', '/api/login/start', { body: {}, headers: XRW });
+    ok(rb2.json.link.startsWith('https://t.me/pervichka_app_bot?'), 'кривое имя бота не попадает в адрес', rb2.json.link);
+    delete process.env.BOT_USERNAME;
+
+    // --- в базе только хэш ---
+    {
+      const rows = db.prepare('SELECT * FROM web_logins').all();
+      const mine = rows.find((x) => x.nonce_hash === sha(nonce));
+      ok(mine && mine.confirmed === 0 && mine.used === 0 && mine.user_id === null, 'вход записан хэшем: не подтверждён, не использован, user_id пуст');
+      ok(!rows.some((x) => Object.values(x).some((v) => String(v).includes(nonce))), 'самого nonce нет ни в одном поле таблицы');
+      ok(mine && mine.ua.includes('Chrome') && mine.expires_at > mine.created_at, 'браузер и срок записаны для показа в боте');
+    }
+
+    // --- сверка числа (то, что делает бот при нажатии на кнопку) ---
+    {
+      const t = webAuth.startLogin({ ip: '203.0.113.2', ua: ASCII_UA });
+      const pv = webAuth.previewLogin(t.nonce);
+      ok(pv.choices.length === 3 && new Set(pv.choices).size === 3 && pv.choices.includes(t.code), 'три разных числа, верное среди них', JSON.stringify(pv.choices));
+      ok(JSON.stringify(webAuth.previewLogin(t.nonce).choices) === JSON.stringify(pv.choices), 'повторный показ даёт те же числа в том же порядке');
+      const good = pv.choices.indexOf(t.code);
+      const bad = [0, 1, 2].find((i) => i !== good);
+      ok(webAuth.answerLogin(pv.id, 3, web.id) === 'stale' && webAuth.answerLogin(pv.id, -1, web.id) === 'stale'
+        && webAuth.answerLogin(pv.id, 1.5, web.id) === 'stale' && webAuth.answerLogin(pv.id, '1', web.id) === 'stale', 'номер кнопки вне 0–2 или не целый — отказ, вход цел');
+      ok(webAuth.answerLogin(pv.id, bad, web.id) === 'wrong', 'неверное число — «не совпало»');
+      ok(webAuth.answerLogin(pv.id, good, web.id) === 'stale', 'после ошибки верное уже не принимается');
+      ok(webAuth.checkLogin(t.nonce).status === 'denied', 'вход отклонён навсегда');
+      const t2 = webAuth.startLogin({ ip: '203.0.113.2' });
+      const pv2 = webAuth.previewLogin(t2.nonce);
+      ok(webAuth.answerLogin(pv2.id, pv2.choices.indexOf(t2.code), web.id) === 'ok', 'верное число — подтверждено');
+      ok(webAuth.answerLogin(pv2.id, pv2.choices.indexOf(t2.code), web.id) === 'stale', 'и второй раз — уже нет');
+      ok(webAuth.checkLogin(t2.nonce).status === 'ok', 'сайт получает сессию');
+      webAuth.logoutAll(web.id);
+      // Без показа кнопок отвечать нечем: числа ещё не выбраны.
+      const t3 = webAuth.startLogin({});
+      ok(webAuth.answerLogin(webAuth.sha(t3.nonce).slice(0, 20), 0, web.id) === 'stale', 'ответ на вход, которого боту ещё не показывали, — отказ');
+      // Среднее по неверным ответам: без знания числа проходит не больше трети.
+      let pass = 0;
+      const N = 300;
+      for (let i = 0; i < N; i += 1) {
+        const x = webAuth.startLogin({});
+        const px = webAuth.previewLogin(x.nonce);
+        if (webAuth.answerLogin(px.id, crypto.randomInt(0, 3), web.id) === 'ok') pass += 1;
+      }
+      ok(pass > 0.2 * N && pass < 0.47 * N, 'слепой выбор из трёх проходит примерно в трети случаев и без второй попытки', `${pass} из ${N}`);
+      webAuth.logoutAll(web.id);
+    }
+
+    // --- миграция: у старой базы таблица была без числа ---
+    {
+      const { DatabaseSync } = require('node:sqlite');
+      const old = new DatabaseSync(':memory:');
+      old.exec(`CREATE TABLE web_logins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, nonce_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL, user_id INTEGER, confirmed INTEGER NOT NULL DEFAULT 0,
+        denied INTEGER NOT NULL DEFAULT 0, used INTEGER NOT NULL DEFAULT 0,
+        ip TEXT NOT NULL DEFAULT '', ua TEXT NOT NULL DEFAULT '')`);
+      old.prepare('INSERT INTO web_logins (nonce_hash, created_at, expires_at) VALUES (?,?,?)').run('h1', 'a', 'b');
+      webAuth.migrate(old);
+      webAuth.migrate(old);                      // повторный запуск ничего не ломает
+      const cols = old.prepare('PRAGMA table_info(web_logins)').all().map((c) => c.name);
+      const row = old.prepare('SELECT * FROM web_logins').get();
+      ok(cols.includes('code') && cols.includes('choices') && row.nonce_hash === 'h1' && row.code === 0 && row.choices === '',
+        'миграция добавляет code и choices, старая строка цела (число 0), повторный запуск безопасен');
+      old.close();
+      // Вход старой строки без числа боту не предлагается.
+      const legacy = crypto.randomBytes(24).toString('base64url');
+      db.prepare('INSERT INTO web_logins (nonce_hash, created_at, expires_at, code) VALUES (?,?,?,0)')
+        .run(sha(legacy), new Date().toISOString(), new Date(Date.now() + 60000).toISOString());
+      ok(webAuth.previewLogin(legacy) === null, 'вход, заведённый до сверки чисел (code = 0), боту не предлагается');
+    }
+
+    // --- опрос до подтверждения ---
+    webAuth.resetLimits();
+    r = await call('POST', '/api/login/check', { body: { nonce }, headers: XRW });
+    ok(r.status === 200 && r.json.status === 'wait' && !r.headers.get('set-cookie'), 'пока не подтвердили — ждём, cookie нет', JSON.stringify(r.json));
+    r = await call('POST', '/api/login/check', { body: { nonce }, headers: XRW });
+    ok(r.status === 429, 'опрос чаще раза в секунду на один вход — 429', r.status);
+
+    // --- кривой и чужой nonce ---
+    webAuth.resetLimits();
+    for (const bad of ['', 'short', 'x'.repeat(33), `${nonce.slice(0, 31)}!`, 12345, null, ['a'], { a: 1 }]) {
+      const rr = await call('POST', '/api/login/check', { body: { nonce: bad }, headers: XRW });
+      if (rr.status !== 400) { ok(false, `кривой nonce ${JSON.stringify(bad)} → 400`, rr.status); break; }
+      webAuth.resetLimits();
+    }
+    ok(true, 'кривые nonce (пустой, короткий, длинный, не base64url, не строка) отвергаются 400');
+    const stranger = crypto.randomBytes(24).toString('base64url');
+    r = await call('POST', '/api/login/check', { body: { nonce: stranger }, headers: XRW });
+    ok(r.status === 404 && r.json.status === 'gone', 'чужой правильной формы nonce — «не действует», cookie нет', r.status);
+    r = await call('POST', '/api/login/check', { body: {}, headers: { ...XRW, Origin: 'https://evil.example' } });
+    ok(r.status === 403, 'опрос с чужого сайта отвергнут раньше любых проверок nonce', r.status);
+    r = await call('POST', '/api/login/check', { body: { nonce }, headers: {} });
+    ok(r.status === 403, 'опрос без заголовка приложения отвергнут (иначе чужая страница подсадила бы чужую cookie)', r.status);
+
+    // --- подтверждение и выдача сессии ---
+    const pre = webAuth.previewLogin(nonce);
+    ok(pre && /^[0-9a-f]{20}$/.test(pre.id) && pre.shortUa === 'Chrome, Windows', 'бот видит вход: короткий идентификатор и «Chrome, Windows»', JSON.stringify(pre));
+    ok(webAuth.confirmLogin(pre.id, web.id) === true, 'подтверждение записывает того, кто нажал');
+    ok(webAuth.confirmLogin(pre.id, anna.id) === false, 'второе подтверждение того же входа — отказ (подтвердившего не переписать)');
+    ok(webAuth.denyLogin(pre.id) === false, 'и «Нет» после «Да» уже ничего не меняет');
+    ok(webAuth.previewLogin(nonce) === null, 'решённый вход боту больше не предлагается');
+
+    webAuth.resetLimits();
+    r = await call('POST', '/api/login/check', { body: { nonce }, headers: { ...XRW, Origin: hostOf(), 'User-Agent': ASCII_UA } });
+    const setCookie = r.headers.get('set-cookie') || '';
+    ok(r.status === 200 && r.json.status === 'ok', 'после подтверждения опрос отвечает «ок»', JSON.stringify(r.json));
+    ok(/^pv_sid=[A-Za-z0-9_-]{43};/.test(setCookie), 'cookie с токеном в 43 знака', setCookie.slice(0, 40));
+    for (const flag of ['HttpOnly', 'Secure', 'SameSite=Lax', 'Path=/', 'Max-Age=2592000']) {
+      ok(setCookie.split('; ').includes(flag), `cookie: ${flag}`, setCookie);
+    }
+    const token = /pv_sid=([^;]+)/.exec(setCookie)[1];
+    ok(!r.text.includes(token), 'сам токен в тело ответа не попадает — только в cookie');
+    const cookie = `pv_sid=${token}`;
+
+    webAuth.resetLimits();
+    r = await call('POST', '/api/login/check', { body: { nonce }, headers: XRW });
+    ok(r.status === 404 && !r.headers.get('set-cookie'), 'второй опрос по тому же входу — отказ, второй сессии нет', r.status);
+
+    {
+      const rows = db.prepare('SELECT * FROM web_sessions WHERE user_id = ?').all(web.id);
+      ok(rows.length === 1 && rows[0].token_hash === sha(token), 'в базе лежит SHA-256 токена');
+      ok(!rows.some((x) => Object.values(x).some((v) => String(v).includes(token))), 'самого токена в таблице сессий нет');
+      const span = Date.parse(rows[0].expires_at) - Date.parse(rows[0].created_at);
+      ok(Math.abs(span - 30 * 86400000) < 5000, 'сессия живёт 30 дней', span);
+      ok(rows[0].ua.includes('Chrome') && rows[0].last_seen_at, 'у сессии есть браузер и «был в сети»');
+      const lg = db.prepare('SELECT * FROM web_logins WHERE nonce_hash = ?').get(sha(nonce));
+      ok(lg.used === 1 && lg.user_id === web.id, 'вход помечен использованным');
+    }
+
+    // --- API по cookie ---
+    r = await call('GET', '/api/state', { headers: { ...XRW, Cookie: cookie } });
+    ok(r.status === 200 && r.json.user.tgId === 610001, 'по cookie API отвечает и узнаёт именно этого человека', r.status);
+    r = await call('GET', '/api/state', { headers: { Cookie: cookie } });
+    ok(r.status === 403, 'чтение по cookie без заголовка приложения отвергнуто', r.status);
+    r = await call('GET', '/api/state');
+    ok(r.status === 401, 'без cookie и без подписи — 401', r.status);
+    r = await call('GET', '/api/state', { headers: { ...XRW, Cookie: `pv_sid=${crypto.randomBytes(32).toString('base64url')}` } });
+    ok(r.status === 401 && /Max-Age=0/.test(r.headers.get('set-cookie') || ''), 'выдуманная cookie — 401, и браузеру велено её забыть', r.status);
+    r = await call('GET', '/api/state', { headers: { ...XRW, Cookie: 'pv_sid=short' } });
+    ok(r.status === 401, 'cookie кривой формы — 401', r.status);
+    r = await call('GET', '/api/state', { headers: { ...XRW, Cookie: `other=1; pv_sid=${token}; x=2` } });
+    ok(r.status === 200, 'cookie находится среди прочих');
+
+    r = await call('POST', '/api/user/ai', { body: { enabled: true }, headers: { Cookie: cookie } });
+    ok(r.status === 403, 'POST по cookie без X-Requested-With отвергнут', r.status);
+    r = await call('POST', '/api/user/ai', { body: { enabled: true }, headers: { ...XRW, Cookie: cookie, Origin: 'https://evil.example' } });
+    ok(r.status === 403, 'POST по cookie с чужим Origin отвергнут', r.status);
+    r = await call('POST', '/api/user/ai', { body: { enabled: true }, headers: { ...XRW, Cookie: cookie, Origin: 'null' } });
+    ok(r.status === 403, 'Origin: null (песочница, data:-страница) отвергнут', r.status);
+    r = await call('POST', '/api/user/ai', { body: { enabled: true }, headers: { ...XRW, Cookie: cookie, Origin: `http://127.0.0.1.evil.example:${new URL(base).port}` } });
+    ok(r.status === 403, 'Origin с похожим, но чужим хостом отвергнут', r.status);
+    r = await call('POST', '/api/user/ai', { body: { enabled: true }, headers: { ...XRW, Cookie: cookie, Referer: 'https://evil.example/page' } });
+    ok(r.status === 403, 'без Origin, но с чужим Referer — отвергнут', r.status);
+    r = await call('POST', '/api/user/ai', { body: { enabled: true }, headers: { ...XRW, Cookie: cookie, 'Sec-Fetch-Site': 'cross-site' } });
+    ok(r.status === 403, 'Sec-Fetch-Site: cross-site отвергнут', r.status);
+    r = await call('POST', '/api/user/ai', { body: { enabled: true }, headers: { ...XRW, Cookie: cookie, 'Sec-Fetch-Site': 'same-site' } });
+    ok(r.status === 403, 'Sec-Fetch-Site: same-site (соседний поддомен) отвергнут', r.status);
+    r = await call('POST', '/api/user/ai', { body: { enabled: true }, headers: { ...XRW, Cookie: cookie, Origin: hostOf(), 'Sec-Fetch-Site': 'same-origin' } });
+    ok(r.status === 200 && r.json.aiEnabled === true, 'свой Origin и заголовок — POST проходит', r.status);
+    r = await call('POST', '/api/user/ai', { body: { enabled: false }, headers: { ...XRW, Cookie: cookie } });
+    ok(r.status === 200 && r.json.aiEnabled === false, 'без Origin (не браузер) при заголовке — тоже проходит');
+
+    // Подпись Telegram и cookie не смешиваются: плохая подпись не спасается cookie.
+    r = await call('GET', '/api/state', { raw: 'tma user=%7B%22id%22%3A1%7D&hash=deadbeef', headers: { ...XRW, Cookie: cookie } });
+    ok(r.status === 401, 'неверная подпись при действующей cookie — всё равно 401', r.status);
+    // А с верной подписью cookie не нужна и CSRF-заголовок не требуется: как раньше.
+    r = await call('GET', '/api/state', { user: masha });
+    ok(r.status === 200 && r.json.user.tgId === MASHA.id, 'вход из Telegram работает как прежде');
+    r = await call('GET', '/api/state', { user: masha, headers: { Cookie: cookie } });
+    ok(r.status === 200 && r.json.user.tgId === MASHA.id, 'с подписью и чужой cookie отвечает подпись, а не cookie');
+
+    // --- данные изолированы ---
+    {
+      const orgA = await call('POST', '/api/org', { headers: { ...XRW, Cookie: cookie },
+        body: { name: 'ИП Вера', inn: '183209316100', signer: 'В. В. Веб', address: 'г. Ижевск',
+          bank_name: 'АО «ТБанк»', bik: '044525974', acc: '40802810700005555552', corr_acc: '30101810145250000974' } });
+      const mine = await call('GET', '/api/state', { headers: { ...XRW, Cookie: cookie } });
+      const hers = await call('GET', '/api/state', { user: masha });
+      ok(orgA.status === 200, 'человек с сайта сохраняет организацию по cookie', JSON.stringify(orgA.json));
+      ok(mine.json.org && mine.json.org.name === 'ИП Вера'
+        && !(hers.json.org && hers.json.org.name === 'ИП Вера'), 'человек с сайта видит и правит только свои данные');
+    }
+
+    // --- страница и заголовки ---
+    r = await call('GET', '/');
+    ok(r.status === 200 && /frame-ancestors 'self' https:\/\/\*\.telegram\.org/.test(r.headers.get('content-security-policy') || ''),
+      'страница не вставляется в чужую рамку (кроме Telegram)', r.headers.get('content-security-policy'));
+    r = await call('GET', '/app.js');
+    ok(r.status === 200 && !r.headers.get('content-security-policy'), 'скрипту рамочная политика не нужна');
+
+    // --- выход ---
+    r = await call('POST', '/api/logout', { body: {}, headers: { Cookie: cookie } });
+    ok(r.status === 403, 'выход по cookie без заголовка приложения — отказ (чужая страница не выкинет из приложения)', r.status);
+    r = await call('POST', '/api/logout', { body: {}, headers: { ...XRW, Cookie: cookie } });
+    ok(r.status === 200 && /Max-Age=0/.test(r.headers.get('set-cookie') || '') && /HttpOnly/.test(r.headers.get('set-cookie')),
+      'выход очищает cookie', r.headers.get('set-cookie'));
+    ok(db.prepare('SELECT COUNT(*) AS n FROM web_sessions WHERE user_id = ?').get(web.id).n === 0, 'сессия удалена из базы');
+    r = await call('GET', '/api/state', { headers: { ...XRW, Cookie: cookie } });
+    ok(r.status === 401, 'после выхода тот же токен не работает', r.status);
+
+    // --- «выйти на всех устройствах» ---
+    async function loginAs(userRow, ua = ASCII_UA) {
+      webAuth.resetLimits();
+      const s0 = await call('POST', '/api/login/start', { body: {}, headers: { ...XRW, 'User-Agent': ua } });
+      const p0 = webAuth.previewLogin(s0.json.nonce);
+      webAuth.confirmLogin(p0.id, userRow.id);
+      webAuth.resetLimits();
+      const c0 = await call('POST', '/api/login/check', { body: { nonce: s0.json.nonce }, headers: { ...XRW, 'User-Agent': ua } });
+      return `pv_sid=${/pv_sid=([^;]+)/.exec(c0.headers.get('set-cookie') || '')[1]}`;
+    }
+    const ck1 = await loginAs(web);
+    const ck2 = await loginAs(web, 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1');
+    const other = bdb.getOrCreateUser(610002, 'Олег Другой', 'oleg');
+    const ckOther = await loginAs(other);
+    ok(webAuth.listSessions(web.id).length === 2, 'у человека два живых сеанса');
+    ok(webAuth.listSessions(web.id).map((x) => x.shortUa).sort().join('|') === 'Chrome, Windows|Safari, iPhone', 'в списке узнаются Chrome/Windows и Safari/iPhone',
+      webAuth.listSessions(web.id).map((x) => x.shortUa).join('|'));
+    r = await call('POST', '/api/logout/all', { body: {}, headers: { ...XRW, Cookie: ck1 } });
+    ok(r.status === 200 && r.json.ended === 2, '«выйти везде» закрывает оба сеанса', JSON.stringify(r.json));
+    r = await call('GET', '/api/state', { headers: { ...XRW, Cookie: ck2 } });
+    ok(r.status === 401, 'второй браузер тоже вышел', r.status);
+    r = await call('GET', '/api/state', { headers: { ...XRW, Cookie: ckOther } });
+    ok(r.status === 200 && r.json.user.tgId === 610002, 'сеанс другого человека «выйти везде» не тронуло', r.status);
+
+    // «Выйти везде» гасит и подтверждённый, но ещё не забранный вход.
+    {
+      webAuth.resetLimits();
+      const s1 = await call('POST', '/api/login/start', { body: {}, headers: XRW });
+      webAuth.confirmLogin(webAuth.previewLogin(s1.json.nonce).id, web.id);
+      webAuth.logoutAll(web.id);
+      webAuth.resetLimits();
+      const c1 = await call('POST', '/api/login/check', { body: { nonce: s1.json.nonce }, headers: XRW });
+      ok(c1.status === 404 && !c1.headers.get('set-cookie'), '«выйти везде» отменяет и подтверждённый, но не забранный вход', c1.status);
+    }
+
+    // --- истёкшее, отклонённое, повторное ---
+    {
+      webAuth.resetLimits();
+      const s2 = await call('POST', '/api/login/start', { body: {}, headers: XRW });
+      const id2 = webAuth.previewLogin(s2.json.nonce).id;
+      db.prepare('UPDATE web_logins SET expires_at = ? WHERE nonce_hash = ?').run(new Date(Date.now() - 1000).toISOString(), sha(s2.json.nonce));
+      ok(webAuth.previewLogin(s2.json.nonce) === null, 'истёкший вход боту не предлагается');
+      ok(webAuth.confirmLogin(id2, web.id) === false, 'истёкший вход подтвердить нельзя');
+      webAuth.resetLimits();
+      const c2 = await call('POST', '/api/login/check', { body: { nonce: s2.json.nonce }, headers: XRW });
+      ok(c2.status === 200 && c2.json.status === 'expired' && !c2.headers.get('set-cookie'), 'истёкший вход: «время вышло», cookie нет', JSON.stringify(c2.json));
+
+      // Подтвердили вовремя, но сайт забрал после срока — сессию уже не выдаём.
+      const s3 = await call('POST', '/api/login/start', { body: {}, headers: XRW });
+      webAuth.confirmLogin(webAuth.previewLogin(s3.json.nonce).id, web.id);
+      db.prepare('UPDATE web_logins SET expires_at = ? WHERE nonce_hash = ?').run(new Date(Date.now() - 1000).toISOString(), sha(s3.json.nonce));
+      webAuth.resetLimits();
+      const c3 = await call('POST', '/api/login/check', { body: { nonce: s3.json.nonce }, headers: XRW });
+      ok(c3.json.status === 'expired' && !c3.headers.get('set-cookie'), 'подтверждённый, но забранный после срока вход сессии не даёт');
+
+      webAuth.resetLimits();
+      const s4 = await call('POST', '/api/login/start', { body: {}, headers: XRW });
+      const id4 = webAuth.previewLogin(s4.json.nonce).id;
+      ok(webAuth.denyLogin(id4) === true, '«Нет» отклоняет вход');
+      ok(webAuth.confirmLogin(id4, web.id) === false, 'отклонённый вход подтвердить нельзя');
+      webAuth.resetLimits();
+      const c4 = await call('POST', '/api/login/check', { body: { nonce: s4.json.nonce }, headers: XRW });
+      ok(c4.status === 200 && c4.json.status === 'denied' && !c4.headers.get('set-cookie'), 'сайт узнаёт об отказе, cookie нет', JSON.stringify(c4.json));
+    }
+
+    // --- два опроса подряд на одном подтверждённом входе: сессия одна ---
+    {
+      webAuth.resetLimits();
+      const s5 = await call('POST', '/api/login/start', { body: {}, headers: XRW });
+      webAuth.confirmLogin(webAuth.previewLogin(s5.json.nonce).id, other.id);
+      const before = db.prepare('SELECT COUNT(*) AS n FROM web_sessions WHERE user_id = ?').get(other.id).n;
+      const a1 = webAuth.checkLogin(s5.json.nonce);
+      const a2 = webAuth.checkLogin(s5.json.nonce);
+      const after = db.prepare('SELECT COUNT(*) AS n FROM web_sessions WHERE user_id = ?').get(other.id).n;
+      ok(a1.status === 'ok' && a2.status === 'gone' && after === before + 1, 'вход отдаёт сессию ровно один раз', `${a1.status}/${a2.status} ${before}->${after}`);
+    }
+
+    // --- просроченная сессия ---
+    {
+      const ck3 = await loginAs(web);
+      db.prepare('UPDATE web_sessions SET expires_at = ? WHERE user_id = ?').run(new Date(Date.now() - 1000).toISOString(), web.id);
+      r = await call('GET', '/api/state', { headers: { ...XRW, Cookie: ck3 } });
+      ok(r.status === 401, 'просроченная сессия не пускает', r.status);
+      ok(db.prepare('SELECT COUNT(*) AS n FROM web_sessions WHERE user_id = ?').get(web.id).n === 0, 'и стирается при обращении');
+    }
+
+    // --- «был в сети» не чаще раза в минуту ---
+    {
+      const ck4 = await loginAs(web);
+      const row0 = db.prepare('SELECT last_seen_at FROM web_sessions WHERE user_id = ?').get(web.id);
+      await call('GET', '/api/state', { headers: { ...XRW, Cookie: ck4 } });
+      const row1 = db.prepare('SELECT last_seen_at FROM web_sessions WHERE user_id = ?').get(web.id);
+      ok(row0.last_seen_at === row1.last_seen_at, 'в пределах минуты «был в сети» не переписывается');
+      db.prepare('UPDATE web_sessions SET last_seen_at = ? WHERE user_id = ?').run(new Date(Date.now() - 120000).toISOString(), web.id);
+      await call('GET', '/api/state', { headers: { ...XRW, Cookie: ck4 } });
+      const row2 = db.prepare('SELECT last_seen_at FROM web_sessions WHERE user_id = ?').get(web.id);
+      ok(Date.now() - Date.parse(row2.last_seen_at) < 5000, 'через две минуты — обновляется');
+      webAuth.logoutAll(web.id);
+    }
+
+    // --- потолок сессий на человека ---
+    {
+      const capUser = bdb.getOrCreateUser(610003, 'Много Браузеров', 'many');
+      for (let i = 0; i < 23; i += 1) {
+        const s6 = webAuth.startLogin({ ip: '203.0.113.9', ua: ASCII_UA });
+        webAuth.confirmLogin(webAuth.previewLogin(s6.nonce).id, capUser.id);
+        webAuth.checkLogin(s6.nonce);
+      }
+      ok(webAuth.listSessions(capUser.id).length === 20, 'сессий на человека не больше двадцати: старые уходят', webAuth.listSessions(capUser.id).length);
+    }
+
+    // --- Secure можно отключить только явно ---
+    {
+      process.env.WEB_COOKIE_INSECURE = '1';
+      const ck5 = await loginAs(web);
+      webAuth.resetLimits();
+      const s7 = await call('POST', '/api/login/start', { body: {}, headers: XRW });
+      webAuth.confirmLogin(webAuth.previewLogin(s7.json.nonce).id, web.id);
+      webAuth.resetLimits();
+      const c7 = await call('POST', '/api/login/check', { body: { nonce: s7.json.nonce }, headers: XRW });
+      const sc = c7.headers.get('set-cookie') || '';
+      ok(!sc.includes('Secure') && sc.includes('HttpOnly') && sc.includes('SameSite=Lax'), 'WEB_COOKIE_INSECURE=1 снимает только Secure (для разработки без https)', sc);
+      ok(typeof ck5 === 'string', 'вход при этом работает');
+      delete process.env.WEB_COOKIE_INSECURE;
+      webAuth.logoutAll(web.id);
+    }
+
+    // --- ограничения частоты ---
+    {
+      webAuth.resetLimits();
+      let last = 0;
+      let firstLimited = 0;
+      for (let i = 1; i <= 11; i += 1) {
+        const rr = await call('POST', '/api/login/start', { body: {}, headers: XRW });
+        last = rr.status;
+        if (rr.status === 429 && !firstLimited) firstLimited = i;
+      }
+      ok(firstLimited === 11 && last === 429, 'десять стартов входа с адреса пропускаются, одиннадцатый — 429', `первый отказ на ${firstLimited}`);
+      // X-Forwarded-For пишет сам клиент — счётчик им не обнуляется.
+      const spoof = await call('POST', '/api/login/start', { body: {}, headers: { ...XRW, 'X-Forwarded-For': '198.51.100.7' } });
+      ok(spoof.status === 429, 'подмена X-Forwarded-For лимит входа не обходит', spoof.status);
+      // А X-Real-IP от своего nginx (запрос здесь идёт с петли) — настоящий адрес: у другого адреса свой счётчик.
+      const real = await call('POST', '/api/login/start', { body: {}, headers: { ...XRW, 'X-Real-IP': '198.51.100.8' } });
+      ok(real.status === 200, 'другой адрес от nginx считается отдельно', real.status);
+      webAuth.resetLimits();
+    }
+
+    // --- тело ---
+    {
+      webAuth.resetLimits();
+      const rr = await call('POST', '/api/login/start', { body: { junk: 'x'.repeat(5000) }, headers: XRW });
+      ok(rr.status === 413, 'большое тело на входе отвергается (4 КБ хватает с запасом)', rr.status);
+      const rr2 = await fetch(`${base}/api/login/start`, { method: 'POST', headers: { ...XRW, 'Content-Type': 'application/json' }, body: '{oops' });
+      ok(rr2.status === 400, 'битый JSON — 400');
+      const rr3 = await fetch(`${base}/api/login/nonsense`, { method: 'POST', headers: { ...XRW, 'Content-Type': 'application/json' }, body: '{}' });
+      ok(rr3.status === 404, 'неизвестный адрес входа — 404', rr3.status);
+    }
+
+    // --- уборка ---
+    {
+      const old = new Date(Date.now() - 3600 * 1000).toISOString();
+      db.prepare('INSERT INTO web_logins (nonce_hash, created_at, expires_at) VALUES (?,?,?)').run(sha('old-login'), old, old);
+      db.prepare('INSERT INTO web_sessions (token_hash, user_id, created_at, expires_at, last_seen_at) VALUES (?,?,?,?,?)')
+        .run(sha('old-session'), web.id, old, old, old);
+      const gone = webAuth.purge();
+      const live = webAuth.startLogin({});
+      ok(gone.logins >= 1 && gone.sessions >= 1, 'уборка стирает просроченные входы и сессии', JSON.stringify(gone));
+      ok(webAuth.previewLogin(live.nonce) !== null, 'живой вход уборка не трогает');
+    }
+
+    // --- короткое имя браузера ---
+    {
+      const u = webAuth.shortUa;
+      ok(u('Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0') === 'Firefox, Linux', 'Firefox, Linux');
+      ok(u('Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/126 Safari/537.36 Edg/126') === 'Edge, Windows', 'Edge, а не Chrome');
+      ok(u('Mozilla/5.0 (Windows NT 10.0) Chrome/126 YaBrowser/24.6 Safari/537.36') === 'Яндекс Браузер, Windows', 'Яндекс Браузер');
+      ok(u('Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126 Mobile Safari/537.36') === 'Chrome, Android', 'Chrome, Android');
+      ok(u('') === 'неизвестный браузер' && u('curl/8') === 'неизвестный браузер', 'пустое и незнакомое — «неизвестный браузер»');
+      ok(!/[<>&"]/.test(u('<script>alert(1)</script> Chrome/1')), 'чужой текст в короткое имя не попадает');
+    }
+  }
+
   // Сервер держим до конца: проверки выше ходят к нему по HTTP, и закрытый
   // раньше времени он давал ECONNREFUSED вместо внятного провала.
   await new Promise((r2) => server.close(r2));

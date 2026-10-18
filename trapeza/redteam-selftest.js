@@ -367,6 +367,255 @@ async function startSmeta(env = {}) {
     if (!haveRsync) console.log('  — rsync на этой машине нет: раскладку проверит прогон на сервере');
   }
 
+  console.log('\n=== Вход на сайт: подбор, повтор, подделка запроса ===');
+  {
+    process.env.BOT_TOKEN = process.env.BOT_TOKEN || '111:REDTEAM';
+    const cryptoW = require('node:crypto');
+    const webAuth = require('./lib/web-auth');
+    const { db: dbW } = require('./db');
+    const { server: srvW } = require('./miniapp');
+    await new Promise((r) => srvW.listen(0, r));
+    const base = `http://127.0.0.1:${srvW.address().port}`;
+    const XRW = { 'X-Requested-With': 'pervichka' };
+    const sha = (v) => cryptoW.createHash('sha256').update(v).digest('hex');
+    const post = (p, body, headers = {}) => fetch(base + p, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body),
+    }).then(async (res) => ({ status: res.status, headers: res.headers, text: await res.text() }));
+    const get = (p, headers = {}) => fetch(base + p, { headers }).then(async (res) => ({
+      status: res.status, headers: res.headers, text: await res.text(),
+    }));
+    const victim = bdb.getOrCreateUser(990001, 'Жертва', 'victim');
+    const cookieOf = (res) => /pv_sid=([^;]+)/.exec(res.headers.get('set-cookie') || '');
+
+    /** Вход, подтверждённый жертвой, — получаем её cookie. */
+    async function victimCookie() {
+      webAuth.resetLimits();
+      const s = await post('/api/login/start', {}, XRW);
+      const nonce = JSON.parse(s.text).nonce;
+      webAuth.confirmLogin(webAuth.previewLogin(nonce).id, victim.id);
+      webAuth.resetLimits();
+      const c = await post('/api/login/check', { nonce }, XRW);
+      return { cookie: `pv_sid=${cookieOf(c)[1]}`, token: cookieOf(c)[1], nonce };
+    }
+
+    // --- подбор nonce ---
+    {
+      webAuth.resetLimits();
+      let ok200 = 0;
+      let limited = 0;
+      let first429 = 0;
+      for (let i = 1; i <= 160; i += 1) {
+        const guess = cryptoW.randomBytes(24).toString('base64url');
+        const res = await post('/api/login/check', { nonce: guess }, XRW);
+        if (res.status === 200) ok200 += 1;
+        if (res.status === 429) { limited += 1; if (!first429) first429 = i; }
+        if (cookieOf(res)) ok200 += 1000;
+      }
+      ok(ok200 === 0, 'подбор nonce: ни одной удачи и ни одной cookie за 160 попыток', ok200);
+      ok(first429 === 121 && limited === 40, 'с одного адреса после 120 попыток в минуту — 429 (запас на несколько вкладок, не на перебор)', `первый отказ на ${first429}, всего ${limited}`);
+      webAuth.resetLimits();
+    }
+
+    // --- хэши из базы не заменяют секреты ---
+    {
+      const { cookie, token, nonce } = await victimCookie();
+      const sessRow = dbW.prepare('SELECT token_hash FROM web_sessions WHERE user_id = ?').get(victim.id);
+      const loginRow = dbW.prepare('SELECT nonce_hash FROM web_logins WHERE nonce_hash = ?').get(sha(nonce));
+      const viaHash = await get('/api/state', { ...XRW, Cookie: `pv_sid=${sessRow.token_hash}` });
+      ok(viaHash.status === 401, 'утёкший хэш токена из копии базы войти не позволяет', viaHash.status);
+      webAuth.resetLimits();
+      const viaNonceHash = await post('/api/login/check', { nonce: loginRow.nonce_hash }, XRW);
+      ok(viaNonceHash.status === 400, 'и хэш nonce — не nonce', viaNonceHash.status);
+      const viaId = await post('/api/login/check', { nonce: webAuth.sha(nonce).slice(0, 20) }, XRW);
+      ok(viaId.status === 400 || viaId.status === 429, 'идентификатор из кнопки бота тоже не годится как nonce', viaId.status);
+      const dump = JSON.stringify(dbW.prepare('SELECT * FROM web_sessions').all()) + JSON.stringify(dbW.prepare('SELECT * FROM web_logins').all());
+      ok(!dump.includes(token) && !dump.includes(nonce), 'ни токена, ни nonce нет в таблицах целиком');
+      void cookie;
+    }
+
+    // --- повтор ---
+    {
+      const { cookie, nonce } = await victimCookie();
+      webAuth.resetLimits();
+      const again = await post('/api/login/check', { nonce }, XRW);
+      ok(again.status === 404 && !cookieOf(again), 'повтор опроса по использованному nonce сессии не выдаёт', again.status);
+      const out = await post('/api/logout', {}, { ...XRW, Cookie: cookie });
+      const replay = await get('/api/state', { ...XRW, Cookie: cookie });
+      ok(out.status === 200 && replay.status === 401, 'украденная и «проигранная» после выхода cookie не работает', replay.status);
+    }
+
+    // --- подделка запроса с чужого сайта ---
+    {
+      const { cookie } = await victimCookie();
+      const ai = () => dbW.prepare('SELECT ai_enabled FROM bot_users WHERE id = ?').get(victim.id).ai_enabled;
+      await post('/api/user/ai', { enabled: true }, { ...XRW, Cookie: cookie });
+      const before = ai();
+      const attempts = [
+        ['форма с чужого сайта (text/plain, без заголовка)', { 'Content-Type': 'text/plain', Cookie: cookie, Origin: 'https://evil.example' }],
+        ['fetch с чужого сайта (заголовок есть, Origin чужой)', { ...XRW, Cookie: cookie, Origin: 'https://evil.example' }],
+        ['без Origin, Referer чужой', { ...XRW, Cookie: cookie, Referer: 'https://evil.example/x' }],
+        ['Sec-Fetch-Site: cross-site', { ...XRW, Cookie: cookie, 'Sec-Fetch-Site': 'cross-site' }],
+        ['только cookie, без заголовка и Origin', { Cookie: cookie }],
+      ];
+      for (const [name, headers] of attempts) {
+        const res = await post('/api/user/ai', { enabled: false }, headers);
+        ok(res.status === 403 && ai() === before, `подделка: ${name} — отказ, данные не тронуты`, `${res.status}`);
+      }
+      const rm = await post('/api/logout/all', {}, { Cookie: cookie, Origin: 'https://evil.example' });
+      ok(rm.status === 403 && webAuth.listSessions(victim.id).length >= 1, 'чужой сайт не может выбросить человека из приложения (logout)', rm.status);
+
+      // Подмена входа: чужая страница не подсадит браузеру жертвы cookie атакующего.
+      webAuth.resetLimits();
+      const mine = await post('/api/login/start', {}, XRW);
+      const attackerNonce = JSON.parse(mine.text).nonce;
+      const attacker = bdb.getOrCreateUser(990002, 'Атакующий', 'mallory');
+      webAuth.confirmLogin(webAuth.previewLogin(attackerNonce).id, attacker.id);
+      webAuth.resetLimits();
+      const cross = await post('/api/login/check', { nonce: attackerNonce }, { ...XRW, Origin: 'https://evil.example', 'Sec-Fetch-Site': 'cross-site' });
+      const form = await post('/api/login/check', { nonce: attackerNonce }, { 'Content-Type': 'text/plain', Origin: 'https://evil.example' });
+      ok(cross.status === 403 && form.status === 403 && !cookieOf(cross) && !cookieOf(form),
+        'login CSRF: чужая страница не может подсадить браузеру cookie чужого входа', `${cross.status}/${form.status}`);
+      ok(webAuth.checkLogin(attackerNonce).status === 'ok', 'а настоящему браузеру тот вход всё ещё отдаётся (отказы его не сожгли)');
+    }
+
+    // --- подмена сессии до входа ---
+    {
+      const planted = cryptoW.randomBytes(32).toString('base64url');
+      const noAuth = await get('/api/state', { ...XRW, Cookie: `pv_sid=${planted}` });
+      ok(noAuth.status === 401, 'подброшенная заранее cookie не даёт ничего', noAuth.status);
+      webAuth.resetLimits();
+      const s = await post('/api/login/start', {}, { ...XRW, Cookie: `pv_sid=${planted}` });
+      const nonce = JSON.parse(s.text).nonce;
+      webAuth.confirmLogin(webAuth.previewLogin(nonce).id, victim.id);
+      webAuth.resetLimits();
+      const c = await post('/api/login/check', { nonce }, { ...XRW, Cookie: `pv_sid=${planted}` });
+      ok(cookieOf(c)[1] !== planted, 'после входа выдан новый токен, подброшенный не принимается (фиксации сессии нет)');
+      const still = await get('/api/state', { ...XRW, Cookie: `pv_sid=${planted}` });
+      ok(still.status === 401, 'подброшенный токен остаётся мёртвым', still.status);
+    }
+
+    // --- жертва по чужой ссылке: числа она не видела ---
+    {
+      const { offer, answer } = require('./lib/bot-web-login');
+      const sentW = [];
+      const fakeTg = {
+        async sendMessage(_c, text, opts) { sentW.push({ text, kb: ((opts || {}).reply_markup || {}).inline_keyboard || [] }); return {}; },
+        async call() { return {}; },
+      };
+      const N = 300;
+      let landed = 0;          // вход подтверждён жертвой вслепую
+      let secondTry = 0;       // удалось нажать ещё раз после ошибки
+      let wrongKept = 0;       // неверный выбор оставил вход живым
+      for (let i = 0; i < N; i += 1) {
+        webAuth.resetLimits();
+        // Атакующий открывает сайт у себя и получает ссылку; число видит только он.
+        const s = await post('/api/login/start', {}, { ...XRW, 'X-Real-IP': `198.51.100.${i % 250 + 1}` });
+        const { nonce, code } = JSON.parse(s.text);
+        // Жертва открывает бота по присланной ссылке и тыкает, не зная числа.
+        sentW.length = 0;
+        await offer(fakeTg, { id: victim.id }, nonce);
+        const buttons = sentW[0].kb[0];
+        const pick = cryptoW.randomInt(0, 3);
+        sentW.length = 0;
+        await answer(fakeTg, { id: victim.id }, victim, buttons[pick].callback_data, 1, undefined);
+        const verdict = sentW[0].text;
+        const right = Number(buttons[pick].text) === code;
+        if (right && verdict.includes('Вход подтверждён')) landed += 1;
+        if (!right) {
+          // Ошибка отменяет вход: ни другая кнопка, ни верная, ни повторное открытие ссылки не помогают.
+          for (let k = 0; k < 3; k += 1) {
+            if (k === pick) continue;
+            sentW.length = 0;
+            await answer(fakeTg, { id: victim.id }, victim, buttons[k].callback_data, 1, undefined);
+            if (!sentW[0].text.includes('Ссылка устарела')) secondTry += 1;
+          }
+          sentW.length = 0;
+          await offer(fakeTg, { id: victim.id }, nonce);
+          if (sentW[0].kb.length) secondTry += 1;
+          webAuth.resetLimits();
+          if (webAuth.checkLogin(nonce).status !== 'denied') wrongKept += 1;
+        }
+      }
+      ok(secondTry === 0 && wrongKept === 0, 'после неверного числа второй попытки нет: ни другие кнопки, ни верная, ни повторное открытие ссылки', `${secondTry}/${wrongKept}`);
+      ok(landed > 0.2 * N && landed < 0.47 * N, 'жертва, не видевшая экрана, проходит в среднем в одном случае из трёх (кнопок три), не чаще', `${landed} из ${N}`);
+
+      // Знающий число (сам владелец у своего экрана) проходит всегда.
+      webAuth.resetLimits();
+      const s2 = await post('/api/login/start', {}, XRW);
+      const { nonce: n2, code: c2 } = JSON.parse(s2.text);
+      sentW.length = 0;
+      await offer(fakeTg, { id: victim.id }, n2);
+      const btn2 = sentW[0].kb[0].find((b) => Number(b.text) === c2);
+      await answer(fakeTg, { id: victim.id }, victim, btn2.callback_data, 1, undefined);
+      webAuth.resetLimits();
+      const ck2 = await post('/api/login/check', { nonce: n2 }, XRW);
+      ok(ck2.status === 200 && cookieOf(ck2), 'тот, кто видит экран и выбрал верное число, входит');
+
+      // Из сообщения бота верное число не прочитать: ни в тексте, ни в данных кнопок нет указания на верную.
+      const flat = JSON.stringify(sentW);
+      ok(!flat.includes(n2) && sentW[0].kb[0].every((b) => /^wl\.n[0-2]:[0-9a-f]{20}$/.test(b.callback_data)),
+        'в кнопках бота нет nonce, а данные кнопок не выдают, какая из них верная');
+    }
+
+    // --- мусор вместо токена и nonce ---
+    {
+      const junk = ["' OR 1=1 --", '%00', '../../etc/passwd', 'a'.repeat(5000), '<script>', '\u0000'];
+      let bad401 = true;
+      for (const j of junk) {
+        let res;
+        try { res = await get('/api/state', { ...XRW, Cookie: `pv_sid=${encodeURIComponent(j)}` }); } catch (_) { continue; }
+        if (res.status !== 401) bad401 = false;
+      }
+      ok(bad401, 'мусор в cookie (SQL, нули, путь, мегабайты) — всегда 401, сервер жив');
+      webAuth.resetLimits();
+      let bad400 = true;
+      for (const j of junk) {
+        const res = await post('/api/login/check', { nonce: j }, XRW);
+        // 413 — тело в пять килобайт не читается вовсе: на входе хватает четырёх.
+        if (res.status !== 400 && res.status !== 413) bad400 = false;
+        webAuth.resetLimits();
+      }
+      ok(bad400, 'мусор вместо nonce — всегда 400 (а слишком большое тело — 413)');
+      const alive = await get('/health');
+      ok(alive.status === 200, 'сервер после всего жив');
+    }
+
+    // --- чужой User-Agent не попадает в сообщение бота разметкой ---
+    {
+      const { offer } = require('./lib/bot-web-login');
+      const said = [];
+      const fakeTg = { async sendMessage(_c, text) { said.push(text); return {}; } };
+      const evil = webAuth.startLogin({ ip: '203.0.113.77', ua: '<img src=x onerror=alert(1)> <a href="https://evil.example">нажми</a> Chrome/1 Windows' });
+      await offer(fakeTg, { id: 1 }, evil.nonce);
+      ok(said.length === 1 && !/<img|<a |evil\.example|onerror/.test(said[0]) && said[0].includes('Chrome, Windows'),
+        'User-Agent с разметкой и ссылками показывается только как «Chrome, Windows»', said[0]);
+    }
+
+    // --- залив ожидающими входами ---
+    {
+      const now = new Date();
+      const later = new Date(Date.now() + 300000).toISOString();
+      const ins = dbW.prepare('INSERT INTO web_logins (nonce_hash, created_at, expires_at) VALUES (?,?,?)');
+      dbW.exec('BEGIN');
+      for (let i = 0; i < 3000; i += 1) ins.run(sha(`flood-${i}`), now.toISOString(), later);
+      dbW.exec('COMMIT');
+      webAuth.resetLimits();
+      const res = await post('/api/login/start', {}, { ...XRW, 'X-Real-IP': '198.51.100.99' });
+      ok(res.status === 503, 'когда ожидающих входов слишком много (залив с разных адресов), новые не принимаются', res.status);
+      dbW.prepare('DELETE FROM web_logins WHERE created_at = ?').run(now.toISOString());
+      webAuth.resetLimits();
+      const fine = await post('/api/login/start', {}, XRW);
+      ok(fine.status === 200, 'после уборки вход снова открыт', fine.status);
+    }
+
+    // --- рамка ---
+    {
+      const page = await get('/');
+      ok(/frame-ancestors/.test(page.headers.get('content-security-policy') || ''), 'страницу нельзя вставить в чужую рамку (кликджекинг)');
+    }
+    await new Promise((r) => srvW.close(r));
+  }
+
   console.log(bad ? `\nне прошло: ${bad}` : '\nвсе атаки отражены ✅');
   process.exit(bad ? 1 : 0);
 })().catch((e) => {

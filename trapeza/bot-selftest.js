@@ -8455,6 +8455,190 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     bdbX.clearState(uX);
   }
 
+  console.log('\n── вход на сайт: подтверждение в боте и сеансы ──');
+  {
+    const webAuth = require('./lib/web-auth');
+    const bdb = require('./lib/bot-db');
+    const { db: dbW } = require('./db');
+    const VERA = { id: 777881, first_name: 'Вера', username: 'vera_web' };
+    const sayAs = (u, text, chat) => handleUpdate(tg, { message: { chat: chat || { id: u.id }, from: u, text } });
+    const tapAs = (u, data, chat) => handleUpdate(tg,
+      { callback_query: { id: 'cb', from: u, data, message: { chat: chat || { id: u.id }, message_id: 42 } } });
+    const vera = bdb.getOrCreateUser(VERA.id, 'Вера', 'vera_web');
+    const UA_WIN = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+    const UA_IOS = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1';
+    const mark0 = sent.length;
+    const newLogin = (ua = UA_WIN) => webAuth.startLogin({ ip: '203.0.113.5', ua });
+
+    // Кнопки с числами под вопросом: [{n, data}] в порядке показа.
+    const numbersOf = (msg) => ((msg.kb[0]) || []).map((x) => ({ n: Number(x.text), data: x.callback_data }));
+    const idxOf = (msg, code) => numbersOf(msg).findIndex((x) => x.n === code);
+
+    // --- ссылка входа ---
+    const a = newLogin();
+    await sayAs(VERA, `/start login_${a.nonce}`);
+    const ask = sent[sent.length - 1];
+    ok(ask.text.includes('Вход в Первичку на сайте') && ask.text.includes('Chrome, Windows'),
+      'ссылка входа: бот называет вход и браузер', ask.text.slice(0, 120));
+    ok(/время: <b>\d\d:\d\d<\/b>/.test(ask.text), 'и время входа (чч:мм)', ask.text);
+    ok(ask.text.includes('нажмите число, которое сейчас крупно написано на экране сайта')
+      && ask.text.includes('нажмите «Нет» и никому не пересылайте это сообщение'),
+    'просит выбрать число с экрана сайта; «Нет» и «никому не пересылайте» на месте', ask.text);
+    const nums = numbersOf(ask);
+    ok(nums.length === 3 && new Set(nums.map((x) => x.n)).size === 3 && nums.every((x) => x.n >= 10 && x.n <= 99),
+      'три разные кнопки с двузначными числами', JSON.stringify(nums));
+    ok(nums.some((x) => x.n === a.code), 'верное число — среди трёх', `${a.code} ∈ ${nums.map((x) => x.n)}`);
+    ok(ask.kb[1] && ask.kb[1].length === 1 && ask.kb[1][0].text.includes('Нет') && /^wl\.no:[0-9a-f]{20}$/.test(ask.kb[1][0].callback_data),
+      'вторым рядом — «❌ Нет»');
+    ok(nums.every((x, i) => new RegExp(`^wl\\.n${i}:[0-9a-f]{20}$`).test(x.data)),
+      'в данных кнопки — её номер и идентификатор входа', JSON.stringify(nums.map((x) => x.data)));
+    ok(nums.every((x) => !x.data.includes(a.nonce) && Buffer.byteLength(x.data) <= 64),
+      'в данных кнопок нет nonce, и они короче 64 байт');
+    ok(!ask.text.includes(a.nonce), 'и в тексте сообщения nonce не повторяется');
+    ok(webAuth.checkLogin(a.nonce).status === 'wait', 'пока никто не нажал — вход ждёт');
+
+    // Повторное открытие той же ссылки — те же кнопки в том же порядке: перебрасывать нельзя.
+    await sayAs(VERA, `/start login_${a.nonce}`);
+    ok(JSON.stringify(numbersOf(sent[sent.length - 1]).map((x) => x.n)) === JSON.stringify(nums.map((x) => x.n)),
+      'ссылку открыли снова — числа и порядок те же (не перетасовать, пока не повезёт)');
+
+    // Числа выбираются случайно, а не по кругу: на двадцати входах верное стоит не всегда на одном месте.
+    {
+      const places = new Set();
+      const seenCodes = new Set();
+      for (let i = 0; i < 20; i += 1) {
+        const t = newLogin();
+        const pv = webAuth.previewLogin(t.nonce);
+        places.add(pv.choices.indexOf(t.code));
+        seenCodes.add(t.code);
+      }
+      ok(places.size > 1 && seenCodes.size > 5, 'верное число и его место меняются от входа к входу', `мест ${places.size}, чисел ${seenCodes.size}`);
+    }
+
+    // --- верное число ---
+    await tapAs(VERA, nums[idxOf(ask, a.code)].data);
+    ok(last().includes('Вход подтверждён') && last().includes('Сеансы на сайте'), 'верное число: вход подтверждён, сказано, где его закрыть', last().slice(0, 100));
+    const got = webAuth.checkLogin(a.nonce);
+    ok(got.status === 'ok' && got.userId === vera.id, 'сайт получает сессию того, кто нажал', JSON.stringify(got));
+    await tapAs(VERA, nums[idxOf(ask, a.code)].data);
+    ok(last().includes('Ссылка устарела'), 'повторное нажатие после подтверждения — «ссылка устарела»', last());
+    await sayAs(VERA, `/start login_${a.nonce}`);
+    ok(last().includes('Ссылка устарела') && !(sent[sent.length - 1].kb || []).length, 'использованную ссылку повторно не предлагают', last());
+
+    // --- неверное число отклоняет навсегда ---
+    const w = newLogin();
+    await sayAs(VERA, `/start login_${w.nonce}`);
+    const askW = sent[sent.length - 1];
+    const numsW = numbersOf(askW);
+    const wrongIdx = numsW.findIndex((x) => x.n !== w.code);
+    const rightIdx = idxOf(askW, w.code);
+    await tapAs(VERA, numsW[wrongIdx].data);
+    ok(last().includes('Число не совпало — вход отменён') && last().includes('кто-то пытался зайти в ваш аккаунт') && last().includes('ничего не делайте'),
+      'неверное число: «вход отменён», предупреждение, что делать', last());
+    ok(webAuth.checkLogin(w.nonce).status === 'denied', 'сайт узнаёт, что вход отклонён');
+    await tapAs(VERA, numsW[rightIdx].data);
+    ok(last().includes('Ссылка устарела'), 'после ошибки верное число уже не принимается — второй попытки нет', last());
+    ok(webAuth.checkLogin(w.nonce).status === 'denied', 'вход остался отклонённым');
+    await sayAs(VERA, `/start login_${w.nonce}`);
+    ok(last().includes('Ссылка устарела') && !(sent[sent.length - 1].kb || []).length, 'и открыть ту же ссылку заново нельзя');
+    for (let i = 0; i < 3; i += 1) {
+      if (i === wrongIdx) continue;
+      await tapAs(VERA, numsW[i].data);
+      if (!last().includes('Ссылка устарела')) { ok(false, `кнопка ${i} после ошибки сработала`, last()); break; }
+    }
+    ok(webAuth.listSessions(vera.id).length === 1, 'неверное число сессии не дало (осталась только первая)');
+
+    // Кнопка «Да, это я» из сообщений прежней версии ничего не подтверждает.
+    const old = newLogin();
+    await sayAs(VERA, `/start login_${old.nonce}`);
+    const oldId = webAuth.previewLogin(old.nonce).id;
+    await tapAs(VERA, `wl.ok:${oldId}`);
+    ok(last().includes('Ссылка устарела') && webAuth.checkLogin(old.nonce).status === 'wait', 'старая кнопка «wl.ok:» вход не подтверждает');
+
+    // --- «Нет» ---
+    const b = newLogin();
+    await sayAs(VERA, `/start login_${b.nonce}`);
+    const askB = sent[sent.length - 1];
+    await tapAs(VERA, askB.kb[1][0].callback_data);
+    ok(last().includes('вход отклонил') && last().includes('никому не пересылайте'), '«Нет»: вход отклонён, предупреждение про пересылку', last().slice(0, 100));
+    ok(webAuth.checkLogin(b.nonce).status === 'denied', 'сайт узнаёт, что вход отклонён');
+    await tapAs(VERA, numbersOf(askB)[idxOf(askB, b.code)].data);
+    ok(last().includes('Ссылка устарела'), 'после «Нет» число уже не принимается', last());
+
+    // --- истёкший, чужой и подложный ---
+    const c = newLogin();
+    dbW.prepare('UPDATE web_logins SET expires_at = ? WHERE nonce_hash = ?').run(new Date(Date.now() - 1000).toISOString(), webAuth.sha(c.nonce));
+    await sayAs(VERA, `/start login_${c.nonce}`);
+    ok(last().includes('Ссылка устарела, начните вход на сайте заново') || last().includes('Ссылка устарела. Начните вход на сайте заново'),
+      'истёкшая ссылка — понятный ответ', last());
+    ok(!(sent[sent.length - 1].kb || []).length, 'и без кнопок подтверждения');
+    await sayAs(VERA, '/start login_нетТакого');
+    ok(last().includes('Ссылка устарела'), 'ссылка с мусором вместо nonce — тот же ответ', last());
+    await sayAs(VERA, `/start login_${'A'.repeat(32)}`);
+    ok(last().includes('Ссылка устарела'), 'выдуманный nonce правильной формы — тот же ответ');
+    for (const bad of ['wl.n0:' + 'f'.repeat(20), 'wl.n1:zzz', 'wl.no:', 'wl.n2:' + 'a'.repeat(64), 'wl.n3:' + 'a'.repeat(20), 'wl.n-1:' + 'a'.repeat(20), 'wl.n0:%27%20OR%201=1', 'wl.']) {
+      await tapAs(VERA, bad);
+      if (!last().includes('Ссылка устарела')) { ok(false, `кнопка ${bad} не должна ничего подтверждать`, last()); break; }
+    }
+    ok(true, 'подложные данные кнопок (мусор, чужой или длинный id, номер кнопки вне 0–2) ничего не подтверждают');
+
+    // --- общий чат ---
+    const g = newLogin();
+    const GROUP = { id: -100500, type: 'supergroup' };
+    await sayAs(VERA, `/start login_${g.nonce}`, GROUP);
+    ok(last().includes('только в личной переписке') && !(sent[sent.length - 1].kb || []).length, 'в общем чате вход не предлагается', last());
+    ok(webAuth.checkLogin(g.nonce).status === 'wait', 'и остаётся неподтверждённым');
+    const gpre = webAuth.previewLogin(g.nonce);
+    const gid = gpre.id;
+    const gIdx = gpre.choices.indexOf(g.code);
+    await tapAs(VERA, `wl.n${gIdx}:${gid}`, GROUP);
+    ok(webAuth.checkLogin(g.nonce).status === 'wait', 'верное число, нажатое в общем чате, тоже ничего не подтверждает');
+
+    // Подтверждает тот, кто нажал, а не тот, кто открыл сайт.
+    const OLEG = { id: 777882, first_name: 'Олег' };
+    const olegRow = bdb.getOrCreateUser(OLEG.id, 'Олег', '');
+    await tapAs(OLEG, `wl.n${gIdx}:${gid}`);
+    const forOleg = webAuth.checkLogin(g.nonce);
+    ok(forOleg.status === 'ok' && forOleg.userId === olegRow.id, 'сессию получает тот, кто выбрал верное число в своём чате');
+
+    // --- обычный /start не сломан ---
+    await sayAs(VERA, '/start');
+    ok(last().includes('Первичка') && !last().includes('Вход в Первичку на сайте'), 'обычный /start показывает приветствие');
+
+    // --- сеансы на сайте ---
+    webAuth.logoutAll(vera.id);
+    await tapAs(VERA, 'ws');
+    ok(last().includes('нигде не вошли'), 'нет сеансов — так и сказано', last());
+    for (const ua of [UA_WIN, UA_IOS]) {
+      const n = newLogin(ua);
+      webAuth.confirmLogin(webAuth.previewLogin(n.nonce).id, vera.id);
+      webAuth.checkLogin(n.nonce, { ua });
+    }
+    await tapAs(VERA, 'more');
+    ok(button('Сеансы на сайте') === 'ws', 'в «Ещё» есть «Сеансы на сайте»');
+    await tapAs(VERA, 'ws');
+    const list = sent[sent.length - 1];
+    ok(list.text.includes('Сеансы на сайте') && list.text.includes('Chrome, Windows') && list.text.includes('Safari, iPhone'),
+      'список сеансов: браузеры узнаются', list.text);
+    ok(/последний раз \d\d\.\d\d в \d\d:\d\d/.test(list.text), 'у каждого — когда был последний раз', list.text);
+    ok(buttonIn(list, 'Завершить все') === 'ws.all', 'есть «Завершить все»');
+    await sayAs(VERA, '/sessions');
+    ok(last().includes('Сеансы на сайте'), 'команда /sessions открывает тот же список');
+    await tapAs(VERA, 'ws.all');
+    ok(last().includes('Завершил сеансы на сайте: 2'), '«Завершить все» закрывает оба', last());
+    ok(webAuth.listSessions(vera.id).length === 0, 'в базе сессий не осталось');
+    await tapAs(VERA, 'ws.all');
+    ok(last().includes('Открытых сеансов на сайте не было'), 'повторное «Завершить все» — честное «не было»');
+    // Чужие сеансы «Завершить все» не трогает.
+    ok(webAuth.listSessions(olegRow.id).length === 1, 'сеансы другого человека не затронуты');
+
+    // --- ничего секретного в сообщениях ---
+    const everything = sent.slice(mark0).map((m) => m.text + JSON.stringify(m.kb)).join('\n');
+    ok(!everything.includes(a.nonce) && !everything.includes(b.nonce) && !everything.includes(g.nonce),
+      'ни один nonce не попал в сообщения бота');
+    bdb.clearState(vera.id);
+  }
+
   console.log('\n── общий браузер для PDF ──');
   const pdf = require('./lib/pdf');
   if (pdf.pdfAvailable()) {

@@ -49,6 +49,7 @@ const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
 const reqCheck = require('./lib/requisites-check');
 const docService = require('./lib/doc-service');
 const docLink = require('./lib/doc-link');
+const webLogin = require('./lib/bot-web-login');
 const npd = require('./lib/npd');
 const cheques = require('./lib/cheques');
 const facsimile = require('./lib/facsimile');
@@ -212,6 +213,7 @@ function moreMenu() {
     // среди прочего, а не последней.
     [{ text: '✉️ Почта', data: 'mb' }],
     [{ text: '⭐ Подписка и тарифы', data: 'billing' }],
+    [{ text: '🖥 Сеансы на сайте', data: 'ws' }],
     [{ text: '❓ Помощь', data: 'help' }, { text: '💬 Поддержка', data: 'support' }],
     [{ text: '📄 Документы и правила', data: 'legal' }],
     [{ text: '⬅️ Меню', data: 'menu' }],
@@ -5268,6 +5270,14 @@ async function handleMessage(tg, msg) {
     const rawPayload = (startMatch[1] || '').trim();
     const payload = rawPayload.slice(0, 64);
 
+    // 0. Вход на сайт: /start login_<nonce>. Раньше всех прочих меток: это не
+    // реклама и не промокод, а запрос на доступ к данным человека, и метку
+    // источника он не заводит.
+    if (/^login_/i.test(payload)) {
+      await webLogin.offer(tg, msg.chat, payload.slice(6));
+      return;
+    }
+
     // 1. Активация промокода: /start promo_PRV123 или /start promo-PRV123
     if (/^promo[_-]/i.test(payload)) {
       const code = payload.replace(/^promo[_-]/i, '');
@@ -5333,7 +5343,8 @@ async function handleMessage(tg, msg) {
   // выбрал команду в середине формы, шаг сбрасываем: он передумал.
   const SLASH = { '/org': 'org', '/cps': 'cps', '/debts': 'debts', '/docs': 'docs',
     '/help': 'help', '/support': 'support', '/subscription': 'billing',
-    '/legal': 'legal', '/terms': 'legal', '/privacy': 'legal', '/tariffs': 'legal', '/oferta': 'legal' };
+    '/legal': 'legal', '/terms': 'legal', '/privacy': 'legal', '/tariffs': 'legal', '/oferta': 'legal',
+    '/sessions': 'ws' };
   if (SLASH[text]) {
     bdb.clearState(user.id);
     await handleCallback(tg, {
@@ -5675,6 +5686,14 @@ async function handleCallback(tg, cq) {
     }
 
     if (data === 'menu') { await tg.sendMessage(chatId, 'Главное меню:', mainMenu()); return; }
+    // Вход на сайт. Подтверждает тот, кто нажал: id берём из кнопки, а личность —
+    // из самого нажатия (cq.from), так что чужой чат подтвердить вход не может.
+    if (data.startsWith('wl.')) {
+      await webLogin.answer(tg, cq.message.chat, user, data, cq.message.message_id, mainMenu());
+      return;
+    }
+    if (data === 'ws') { await webLogin.sessions(tg, cq.message.chat, user, mainMenu()); return; }
+    if (data === 'ws.all') { await webLogin.endAll(tg, cq.message.chat, user, mainMenu()); return; }
     if (data === 'more') {
       await tg.sendMessage(chatId,
         'Ваша фирма, клиенты, почта и настройки — здесь.', moreMenu());

@@ -15,6 +15,10 @@
  * в самом приложении. Это осознанно: в чате файл переживёт закрытие
  * приложения, а из приложения его можно сохранить, не переключая экран.
  *
+ * Кроме подписи Telegram пускает ещё и сессия с обычного сайта (cookie): человек
+ * подтверждает вход в боте, см. lib/web-auth.js. Это второй способ узнать, кто
+ * пришёл, а не отмена первого: внутри Telegram всё работает как раньше.
+ *
  * Наружу — только по HTTPS (nginx перед этим портом): Telegram открывает
  * мини-приложения исключительно по https.
  */
@@ -59,6 +63,8 @@ const { round2 } = require('./lib/money');
 const { advanceVat } = require('./lib/avans');
 const { correctionRow, correctionTotals, correctionNet } = require('./lib/ksf');
 const { verifyInitData, initDataFrom } = require('./lib/webapp-auth');
+const webAuth = require('./lib/web-auth');
+const { encodeQr, qrSvg } = require('./lib/qr');
 const { payLink, priceText, yearSaving, planTitle, plans: lavaPlans } = require('./lib/lava');
 const platega = require('./lib/platega');
 const { currentYear, isoDay } = require('./lib/period');
@@ -93,12 +99,13 @@ const MIME = {
   '.woff2': 'font/woff2',
 };
 
-function sendJson(res, code, obj) {
+function sendJson(res, code, obj, extra = {}) {
   const body = JSON.stringify(obj);
   res.writeHead(code, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
     'Cache-Control': 'no-store',
+    ...extra,
   });
   res.end(body);
 }
@@ -221,14 +228,14 @@ function tooOften(userId, limit = 120) {
   return rec.n > limit;
 }
 
-function readBody(req) {
+function readBody(req, max = MAX_BODY) {
   return new Promise((resolve, reject) => {
     let body = '';
     let over = false;
     req.on('data', (chunk) => {
       if (over) return;            // дочитываем и выбрасываем, но не копим
       body += chunk;
-      if (body.length > MAX_BODY) { over = true; body = ''; }
+      if (body.length > max) { over = true; body = ''; }
     });
     // Рвать соединение нельзя: браузер покажет «сетевая ошибка» вместо
     // объяснения. Дочитываем до конца и отвечаем понятным отказом.
@@ -2637,6 +2644,11 @@ function serveStatic(req, res, pathname) {
       'Content-Type': type,
       'Cache-Control': ext === '.woff2' ? 'public, max-age=31536000, immutable' : 'no-cache',
       'X-Content-Type-Options': 'nosniff',
+      // Страницу можно вставлять в рамку только своему сайту и веб-версиям
+      // Telegram. Раньше это было неважно — без подписи Telegram чужая рамка
+      // ничего не получала. С входом по cookie она показала бы настоящее
+      // приложение под невидимой кнопкой («кликджекинг»).
+      ...(ext === '.html' ? { 'Content-Security-Policy': "frame-ancestors 'self' https://*.telegram.org https://telegram.org" } : {}),
     });
     return res.end(data);
   });
@@ -2662,6 +2674,123 @@ function clientIp(req) {
     if (real) return real;
   }
   return peer || 'нет-адреса';
+}
+
+// ---------- вход с обычного сайта (cookie-сессия) ----------
+
+/**
+ * Имя бота для ссылки входа. Берётся из BOT_USERNAME; если не задано — тот же
+ * бот, что прописан в оферте и в ссылках оплаты (lib/legal.js, lib/platega.js).
+ * Значение проверяем по форме: оно попадает в адрес, который покажем человеку.
+ */
+function botUsername() {
+  const v = String(process.env.BOT_USERNAME || '').trim().replace(/^@/, '');
+  return /^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(v) ? v : 'pervichka_app_bot';
+}
+
+/**
+ * Ставить ли Secure на cookie. По умолчанию да: сессия не должна уходить по
+ * голому http. Выключается только явно (WEB_COOKIE_INSECURE=1) — для запуска
+ * на своей машине без https. Читаем при каждом запросе, а не при загрузке:
+ * так это видно и прогонам, и тому, кто правит .env и перезапускает службу.
+ */
+const cookieSecure = () => process.env.WEB_COOKIE_INSECURE !== '1';
+
+/** Имя хоста из заголовка Host или адреса: без порта и скобок IPv6, в нижнем регистре. */
+const hostnameOf = (h) => String(h || '').trim().toLowerCase().replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
+
+/** Адрес (Origin или Referer) указывает на тот хост, к которому обратились. */
+function sameSite(req, value) {
+  try {
+    const mine = hostnameOf(req.headers.host);
+    return Boolean(mine) && hostnameOf(new URL(value).hostname) === mine;
+  } catch (_) { return false; }
+}
+
+/**
+ * Защита от подделки запроса с чужого сайта — для всего, что идёт по cookie.
+ *
+ * Cookie браузер прикладывает сам, на любой запрос к нашему адресу, откуда бы
+ * тот ни начался. Подпись Telegram такой дыры не имеет: её кладёт в заголовок
+ * наш же скрипт. Поэтому для cookie три условия подряд:
+ *   • заголовок X-Requested-With: pervichka. Чужая страница не может его
+ *     поставить без разрешения нашего сервера (а мы его не даём), так что
+ *     обычная форма или картинка на чужом сайте отсекаются;
+ *   • если браузер прислал Origin (а на POST он присылает всегда) — он должен
+ *     быть нашего хоста; нет Origin — смотрим Referer;
+ *   • Sec-Fetch-Site, если есть, обязан быть «same-origin» или «none».
+ * Заголовок требуем и у чтения, не только у POST: у части GET в приложении
+ * есть побочное действие, и страховаться тут дешевле, чем разбирать каждый.
+ *
+ * @returns {string} пустая строка — можно; иначе причина отказа
+ */
+function csrfProblem(req) {
+  if (String(req.headers['x-requested-with'] || '') !== 'pervichka') return 'нет заголовка приложения';
+  const site = String(req.headers['sec-fetch-site'] || '');
+  if (site && site !== 'same-origin' && site !== 'none') return 'запрос с другого сайта';
+  const origin = req.headers.origin;
+  if (origin !== undefined) return sameSite(req, origin) ? '' : 'чужой Origin';
+  const referer = req.headers.referer;
+  if (referer && !sameSite(req, referer)) return 'чужой Referer';
+  return '';
+}
+
+const COOKIE_REFUSAL = 'Запрос пришёл не из приложения. Обновите страницу и повторите.';
+
+/** Ответ на login/start и login/check. Отдельно от api{}: тут ещё нет пользователя. */
+async function handleLogin(req, res, pathname) {
+  if (req.method !== 'POST') return sendJson(res, 405, { error: 'Только POST.' });
+  const bad = csrfProblem(req);
+  if (bad) return sendJson(res, 403, { error: COOKIE_REFUSAL });
+
+  let body = {};
+  try {
+    // Тело тут — одно короткое поле; два мегабайта от незнакомца незачем.
+    const raw = await readBody(req, 4096);
+    body = raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    return sendJson(res, e && e.tooBig ? 413 : 400, { error: 'Тело запроса не разобралось.' });
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return sendJson(res, 400, { error: 'Ожидался объект.' });
+  }
+  const ip = clientIp(req);
+
+  if (pathname === '/api/login/start') {
+    if (webAuth.startTooOften(ip)) {
+      return sendJson(res, 429, { error: 'Слишком много попыток входа. Подождите несколько минут.' }, { 'Retry-After': '600' });
+    }
+    const made = webAuth.startLogin({ ip, ua: req.headers['user-agent'] });
+    if (made.busy) return sendJson(res, 503, { error: 'Сейчас много входов. Попробуйте через пару минут.' });
+    const link = `https://t.me/${botUsername()}?start=login_${made.nonce}`;
+    return sendJson(res, 200, {
+      nonce: made.nonce,
+      // Число для сверки в боте. Только в ответе браузеру: ни в ссылке, ни в QR
+      // его нет — QR могут сфотографировать, а число видно лишь на экране.
+      code: made.code,
+      link,
+      qr: qrSvg(encodeQr(link, { ecc: 'M' }), { size: 200, label: 'QR-код для входа через Telegram' }),
+      expiresAt: made.expiresAt,
+      ttl: Math.floor(webAuth.LOGIN_TTL_MS / 1000),
+    });
+  }
+
+  if (pathname === '/api/login/check') {
+    const nonce = typeof body.nonce === 'string' ? body.nonce : '';
+    if (!webAuth.NONCE_RE.test(nonce)) return sendJson(res, 400, { error: 'Неверный код входа.' });
+    if (webAuth.checkIpTooOften(ip) || webAuth.checkTooOften(webAuth.sha(nonce))) {
+      return sendJson(res, 429, { error: 'Слишком часто.' }, { 'Retry-After': '1' });
+    }
+    const r = webAuth.checkLogin(nonce, { ua: req.headers['user-agent'] });
+    if (r.status === 'ok') {
+      return sendJson(res, 200, { status: 'ok' }, { 'Set-Cookie': webAuth.setCookie(r.token, { secure: cookieSecure() }) });
+    }
+    if (r.status === 'gone') {
+      return sendJson(res, 404, { status: 'gone', error: 'Этот вход уже не действует. Начните заново.' });
+    }
+    return sendJson(res, 200, { status: r.status });
+  }
+  return sendJson(res, 404, { error: 'Нет такого метода.' });
 }
 
 /*
@@ -2759,17 +2888,49 @@ async function handle(req, res) {
     return serveStatic(req, res, pathname);
   }
 
-  // --- дальше только API, и только со своей подписью ---
-  const check = verifyInitData(initDataFrom(req));
-  if (!check.ok) return sendJson(res, 401, { error: `Не удалось вас опознать: ${check.reason}` });
+  // Вход с сайта: до проверки личности, потому что личности ещё нет.
+  if (pathname.startsWith('/api/login/')) return handleLogin(req, res, pathname);
 
-  const user = bdb.getOrCreateUser(
-    check.user.id,
-    [check.user.first_name, check.user.last_name].filter(Boolean).join(' '),
-    check.user.username,
-  );
+  // --- дальше только API: подпись Telegram или сессия с сайта ---
+  let user;
+  let cookieToken = '';       // непусто, если пришли по cookie
+  const rawInit = initDataFrom(req);
+  if (rawInit) {
+    // Подпись приложена — решает только она. Подмешивать к неверной подписи
+    // cookie нельзя: ошибка в одном способе не должна превращаться в другой.
+    const check = verifyInitData(rawInit);
+    if (!check.ok) return sendJson(res, 401, { error: `Не удалось вас опознать: ${check.reason}` });
+    user = bdb.getOrCreateUser(
+      check.user.id,
+      [check.user.first_name, check.user.last_name].filter(Boolean).join(' '),
+      check.user.username,
+    );
+  } else {
+    cookieToken = webAuth.tokenFromCookie(req.headers.cookie);
+    const sess = cookieToken ? webAuth.sessionFor(cookieToken) : null;
+    const owner = sess ? bdb.userById(sess.userId) : null;
+    if (!owner) {
+      // Протухшую cookie заодно убираем из браузера — иначе она ездила бы
+      // с каждым запросом до конца срока.
+      return sendJson(res, 401, { error: 'Войдите в приложение.' },
+        cookieToken ? { 'Set-Cookie': webAuth.clearCookie({ secure: cookieSecure() }) } : {});
+    }
+    user = owner;
+    const bad = csrfProblem(req);
+    if (bad) return sendJson(res, 403, { error: COOKIE_REFUSAL });
+  }
   if (tooOften(user.id)) return sendJson(res, 429, { error: 'Слишком много запросов, подождите минуту.' });
   bdb.markActive(user.id);
+
+  // Выход трогает cookie, а обработчики api{} заголовков не отдают, поэтому здесь.
+  if (req.method === 'POST' && (pathname === '/api/logout' || pathname === '/api/logout/all')) {
+    const gone = { 'Set-Cookie': webAuth.clearCookie({ secure: cookieSecure() }) };
+    if (pathname === '/api/logout/all') {
+      return sendJson(res, 200, { ok: true, ended: webAuth.logoutAll(user.id) }, gone);
+    }
+    if (cookieToken) webAuth.logoutToken(cookieToken);
+    return sendJson(res, 200, { ok: true }, gone);
+  }
 
   let body = {};
   if (req.method === 'POST') {
@@ -2828,6 +2989,15 @@ if (require.main === module) {
     process.exit(1);
   });
   server.listen(PORT, HOST, () => console.log(`Мини-приложение слушает ${HOST}:${PORT}`));
+
+  // Просроченные входы и сессии убираем при старте и раз в час. Дело не во
+  // вместимости, а в гигиене: просроченная запись никому не нужна, а таблица
+  // с чужими браузерами и адресами не должна жить дольше своей надобности.
+  const sweep = () => {
+    try { webAuth.purge(); } catch (e) { console.error('miniapp: уборка входов:', e.message); }
+  };
+  sweep();
+  setInterval(sweep, 60 * 60 * 1000).unref();
 }
 
 module.exports = { server, api, stateFor, setTelegram, forgetRate, sendToChat, sendToChatSafe };

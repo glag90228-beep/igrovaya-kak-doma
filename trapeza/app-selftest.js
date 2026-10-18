@@ -954,6 +954,130 @@ const ok = (c, m, extra) => {
     ok(!recLib.list(user.id).some((r) => r.cp_id === cpS), 'остановка из карточки клиента сняла расписание');
   }
 
+  console.log('\n── вход с обычного сайта, без Telegram ──');
+  {
+    const webAuth = require(path.join(APP, 'lib/web-auth'));
+    const { db: dbW } = require(path.join(APP, 'db'));
+    const webUser = bdb.getOrCreateUser(515252, 'Вера Сайтова', 'vera');
+    bdb.saveMyOrg(webUser.id, { name: 'ИП Вера', inn: '183209316119', signer: 'В. С.' });
+
+    // Новый контекст без заглушки Telegram: так открывает приложение браузер на компьютере.
+    const wctx = await browser.newContext({
+      viewport: { width: 1280, height: 800 }, locale: 'ru-RU', colorScheme: 'light',
+    });
+    await wctx.route('https://telegram.org/**', (route) => route.abort());
+    const wp = await wctx.newPage();
+    wp.on('pageerror', (e) => ok(false, `ошибка страницы: ${e.message}`));
+    const asked = [];
+    wp.on('request', (rq) => { if (rq.url().includes('telegram.org')) asked.push(rq.url()); });
+    await wp.goto(base, { waitUntil: 'domcontentloaded' });
+    await wp.waitForSelector('.login-card', { timeout: 8000 });
+    const t0 = (await wp.textContent('#app')).replace(/\s/g, ' ');
+    ok(t0.includes('Вход в Первичку') && t0.includes('Войти через Telegram'), 'без Telegram — экран «Войти через Telegram»');
+    ok(!t0.includes('Откройте из Telegram') && !t0.includes('Не удалось вас опознать'), 'старых тупиковых сообщений нет');
+    ok(!t0.includes('undefined') && !t0.includes('null'), 'в тексте экрана нет «undefined»/«null»');
+    ok(asked.length === 0, 'скрипт telegram.org в обычном браузере не запрашивается', asked.join(','));
+    ok(await wp.evaluate(() => document.getElementById('tabs').hidden && document.getElementById('topbar').hidden
+      && getComputedStyle(document.getElementById('tabs')).display === 'none'), 'нижней панели и шапки на экране входа нет');
+
+    await wp.click('.login-card .btn');
+    await wp.waitForSelector('.login-wait', { timeout: 8000 });
+    const href = await wp.getAttribute('.login-card a.btn', 'href');
+    const m = /^https:\/\/t\.me\/[A-Za-z0-9_]+\?start=login_([A-Za-z0-9_-]{32})$/.exec(href || '');
+    ok(m, 'кнопка «Открыть Telegram» ведёт в бота с кодом входа', href);
+    ok(await wp.locator('.login-qr svg').count() === 1 && await wp.isVisible('.login-qr'), 'на широком экране рядом QR');
+    ok((await wp.textContent('.login-wait')).includes('Ждём подтверждения в Telegram'), 'написано «Ждём подтверждения в Telegram…»');
+    ok(await wp.getAttribute('.login-card a.btn', 'rel') === 'noopener noreferrer', 'ссылка открывается без доступа к странице (noopener)');
+
+    // Число для сверки — крупно на экране, а в ссылке и QR его нет.
+    const nonce = m[1];
+    const shown = await wp.textContent('.login-code-num');
+    const real = dbW.prepare('SELECT code FROM web_logins WHERE nonce_hash = ?').get(webAuth.sha(nonce)).code;
+    ok(String(real) === shown.trim() && /^\d\d$/.test(shown.trim()), 'на экране ожидания крупно число для сверки, то же, что ждёт бот', `${shown} / ${real}`);
+    ok((await wp.textContent('.login-code')).includes('Нажмите в боте число'), 'подпись: «Нажмите в боте число …»');
+    ok(await wp.evaluate(() => parseFloat(getComputedStyle(document.querySelector('.login-code-num')).fontSize) >= 48), 'число набрано крупно');
+    ok(await wp.evaluate(() => !/\d/.test(document.querySelector('.login-qr svg').getAttribute('aria-label'))),
+      'в подписи QR числа нет');
+
+    // Человек в боте выбирает число — тот же путь, что у кнопки бота.
+    const pre = webAuth.previewLogin(nonce);
+    ok(webAuth.answerLogin(pre.id, pre.choices.indexOf(real), webUser.id) === 'ok', 'верное число выбрано «в боте»');
+
+    await wp.waitForSelector('#app .screen', { timeout: 15000 });
+    ok(await wp.evaluate(() => !document.getElementById('tabs').hidden || !document.getElementById('topbar').hidden),
+      'через пару секунд страница сама открыла приложение');
+    const cookies = (await wctx.cookies()).filter((c) => c.name === 'pv_sid');
+    ok(cookies.length === 1 && cookies[0].httpOnly && cookies[0].secure && cookies[0].sameSite === 'Lax',
+      'в браузере cookie: HttpOnly, Secure, SameSite=Lax', JSON.stringify(cookies));
+    ok(await wp.evaluate(() => !document.cookie.includes('pv_sid')), 'скрипт страницы токена не видит');
+    const head = (await wp.textContent('#topbar')).replace(/\s/g, ' ');
+    ok(head.includes('Вера Сайтова'), 'в шапке имя человека, пришедшее с сервера', head);
+
+    // Нижняя панель и всё приложение на месте, а Telegram-вызовы не падают.
+    await wp.setViewportSize({ width: 390, height: 844 });
+    await wp.waitForSelector('#tabs:not([hidden])', { timeout: 5000 });
+    ok(await wp.locator('#tabs .tab').count() === 5, 'на телефоне — те же пять вкладок');
+
+    // Кнопка «назад» браузера.
+    await wp.setViewportSize({ width: 1280, height: 800 });
+    const where = () => wp.evaluate(() => document.getElementById('tb-title').textContent);
+    await wp.evaluate(() => window.__go('docs', {}));
+    await wp.waitForFunction(() => document.getElementById('tb-title').textContent === 'Документы');
+    await wp.evaluate(() => window.__go('billing', {}));
+    await wp.waitForFunction(() => document.getElementById('tb-title').textContent === 'Тариф');
+    await wp.goBack();
+    await wp.waitForFunction(() => document.getElementById('tb-title').textContent === 'Документы', null, { timeout: 5000 });
+    ok((await where()) === 'Документы' && wp.url().startsWith(base), 'стрелка браузера «назад»: на предыдущий экран, а не с сайта', await where());
+    await wp.goBack();
+    await wp.waitForFunction(() => document.getElementById('tb-title').textContent === 'Главная', null, { timeout: 5000 });
+    ok((await where()) === 'Главная' && wp.url().startsWith(base), 'и ещё раз — на главную');
+
+    // Вкладка «Ещё»: выход.
+    await wp.evaluate(() => window.__go('more', {}));
+    await wp.waitForSelector('text=Вход на сайте', { timeout: 5000 });
+    const more = (await wp.textContent('#app')).replace(/\s/g, ' ');
+    ok(more.includes('Выйти на всех устройствах') && more.includes('Выйти'), 'в «Ещё» есть «Выйти» и «Выйти на всех устройствах»');
+
+    // Сеанс закрыт на другом устройстве — следующее действие показывает вход, а не ошибки.
+    webAuth.logoutAll(webUser.id);
+    await wp.evaluate(() => window.__go('docs', {}));
+    await wp.waitForSelector('.login-card', { timeout: 8000 });
+    const lost = (await wp.textContent('#app')).replace(/\s/g, ' ');
+    ok(lost.includes('Вход закончился') && !lost.includes('Не получилось загрузить'), 'сеанс закрыт в другом месте: «Вход закончился — войдите снова», без экрана ошибки', lost.slice(0, 120));
+    await wctx.close();
+
+    // Обратный путь: возвращаемся по готовой cookie, проходить вход заново не нужно.
+    const cookieFor = async () => {
+      const n = webAuth.startLogin({ ip: '127.0.0.1', ua: 'Mozilla/5.0 Chrome/126' });
+      webAuth.confirmLogin(webAuth.previewLogin(n.nonce).id, webUser.id);
+      return webAuth.checkLogin(n.nonce).token;
+    };
+    const tok = await cookieFor();
+    const sctx = await browser.newContext({ viewport: { width: 390, height: 844 }, locale: 'ru-RU', colorScheme: 'dark', isMobile: true });
+    await sctx.route('https://telegram.org/**', (route) => route.abort());
+    await sctx.addCookies([{ name: 'pv_sid', value: tok, url: base, httpOnly: true, sameSite: 'Lax' }]);
+    const sp = await sctx.newPage();
+    sp.on('pageerror', (e) => ok(false, `ошибка страницы: ${e.message}`));
+    await sp.goto(base, { waitUntil: 'domcontentloaded' });
+    await sp.waitForSelector('#app .screen', { timeout: 10000 });
+    ok(await sp.locator('.login-card').count() === 0 && await sp.locator('#tabs .tab').count() === 5, 'с cookie — сразу главная, без экрана входа');
+    ok(await sp.evaluate(() => {
+      const c = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() || getComputedStyle(document.body).backgroundColor;
+      return window.matchMedia('(prefers-color-scheme: dark)').matches && /#17212b|rgb\(23, 33, 43\)/i.test(c);
+    }), 'тема следует системной: в тёмной — тёмный фон');
+
+    // «Выйти» из «Ещё»: страница перезагружается и просит войти.
+    await sp.evaluate(() => window.__go('more', {}));
+    await sp.waitForSelector('text=Выйти на всех устройствах', { timeout: 5000 });
+    await sp.locator('#app .row', { hasText: 'закрыть вход в этом браузере' }).first().click();
+    await sp.waitForSelector('.login-card', { timeout: 10000 });
+    ok(webAuth.listSessions(webUser.id).length === 0, '«Выйти» стёрло сессию на сервере');
+    ok((await sctx.cookies()).filter((c) => c.name === 'pv_sid').length === 0, 'и cookie в браузере');
+    await sctx.close();
+
+    ok(dbW.prepare('SELECT COUNT(*) AS n FROM web_sessions').get().n === 0, 'после выхода живых сессий нет');
+  }
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();

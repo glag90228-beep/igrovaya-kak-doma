@@ -853,7 +853,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
   border-bottom: 1px solid var(--border);
 }
-.topbar[hidden], .drawer[hidden], .scrim[hidden] { display: none; }
+.topbar[hidden], .drawer[hidden], .scrim[hidden], .tabs[hidden] { display: none; }
 .tb-btn {
   display: grid; place-items: center; flex: none;
   width: var(--tap); height: var(--tap); border: 0; border-radius: var(--r-btn);
@@ -1250,3 +1250,66 @@ body.drawer-open { overflow: hidden; }
 .crm-form select { width: 100%; }
 .tl-row { align-items: flex-start; }
 .tl-ico { width: 28px; text-align: center; flex: none; }
+
+/* ---------- вход с сайта (вне Telegram) ---------- */
+
+/*
+ * Панели и вкладок на экране входа нет, поэтому отступ под боковую панель,
+ * который на компьютере стоит у #app, здесь лишний: карточка встаёт строго по
+ * центру окна.
+ */
+body.is-login #app {
+  max-width: none; margin: 0; padding: 24px var(--pad);
+  min-height: 100dvh; display: flex; align-items: center; justify-content: center;
+}
+.login { width: 100%; display: flex; justify-content: center; }
+.login-card {
+  width: 100%; max-width: 440px; text-align: center;
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-card, 20px);
+  box-shadow: var(--shadow-2);
+  padding: 32px 20px 20px;
+}
+.login-card h1 { margin: 0 0 12px; font-size: 24px; }
+.login-mark {
+  width: 56px; height: 56px; margin: 0 auto 16px; border-radius: 18px;
+  display: flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--primary) 12%, transparent); color: var(--primary);
+}
+.login-mark .icon { width: 30px; height: 30px; }
+.login-text { margin: 0 auto 18px; max-width: 34ch; color: var(--muted); }
+.login-note { margin: 0 0 14px; padding: 10px 12px; border-radius: 12px; font-size: 14px;
+  background: color-mix(in srgb, var(--primary) 10%, transparent); }
+.login-note.err {
+  background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger);
+}
+.login-card .btn-wrap { padding: 4px 0 12px; }
+.login-card a.btn { text-decoration: none; }
+.login-card .btn.secondary { margin-top: 4px; }
+.login-foot { margin: 8px 0 12px; }
+.login-qr {
+  width: 168px; height: 168px; margin: 0 auto 4px; border-radius: 14px; overflow: hidden;
+  background: #fff; line-height: 0;
+  box-shadow: 0 0 0 1px var(--hairline);       /* на светлой теме белое на белом иначе теряет край */
+}
+.login-qr svg { width: 100%; height: 100%; display: block; }
+/* На телефоне наводить камеру на собственный экран некуда — там работает кнопка. */
+@media (max-width: 699px) { .login-qr, .login-qr-cap { display: none; } }
+.login-wait {
+  display: flex; align-items: center; justify-content: center; gap: 8px; flex-wrap: wrap;
+  margin: 6px 0 4px; color: var(--text); font-weight: 500;
+}
+.login-left { color: var(--muted); font-weight: 400; font-variant-numeric: tabular-nums; }
+
+/* Число для сверки: главное на экране ожидания, его читают с другого устройства. */
+.login-code {
+  margin: 0 0 14px; padding: 14px 12px 10px; border-radius: 16px;
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+}
+.login-code-lead { display: block; font: 600 15px/1.3 var(--font); color: var(--muted); }
+.login-code-num {
+  display: block; margin-top: 2px; color: var(--primary);
+  font: 800 64px/1.1 var(--font-num); letter-spacing: .04em; font-variant-numeric: tabular-nums;
+}

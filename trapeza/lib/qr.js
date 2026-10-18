@@ -447,6 +447,9 @@ function encodeQr(text, opts = {}) {
 /**
  * SVG-картинка кода. Рисуем одним путём — так PDF получается лёгким,
  * а на печати нет швов между соседними квадратами.
+ *
+ * opts.label — подпись для скринридера; по умолчанию «для оплаты», потому что
+ * код родился в счёте. Вход на сайт подписывает его по-своему.
  */
 function qrSvg(qr, opts = {}) {
   const px = opts.size || 200;
@@ -460,7 +463,7 @@ function qrSvg(qr, opts = {}) {
   }
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${px}" height="${px}" `
     + `viewBox="0 0 ${total} ${total}" shape-rendering="crispEdges" role="img" `
-    + `aria-label="QR-код для оплаты">`
+    + `aria-label="${String(opts.label || 'QR-код для оплаты').replace(/[^\p{L}\p{N} .,:-]/gu, '')}">`
     + `<rect width="${total}" height="${total}" fill="#fff"/>`
     + `<path d="${parts.join('')}" fill="#000"/></svg>`;
 }

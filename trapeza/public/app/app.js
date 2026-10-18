@@ -12,7 +12,19 @@
  * Telegram: в мессенджере ждут именно её, а не своей стрелки в углу.
  */
 
-const tg = window.Telegram && window.Telegram.WebApp;
+/*
+ * Вне Telegram объект WebApp всё равно может существовать (скрипт мессенджера
+ * определяет его везде), но initData в нём пуст — подписать запрос нечем. Такой
+ * объект считаем отсутствующим: тогда все проверки «if (tg)» ниже сами
+ * превращаются в «это обычный браузер» и не дёргают то, чего там нет
+ * (MainButton, BackButton, haptic, openLink).
+ */
+const tgRaw = window.Telegram && window.Telegram.WebApp;
+const tg = tgRaw && tgRaw.initData ? tgRaw : null;
+// Открыто в обычном браузере: узнаём человека по сессии (cookie), а не по подписи.
+const WEB = !tg;
+// Узнал ли нас сервер. В Telegram подпись есть всегда; в вебе ответит первый запрос.
+let loggedIn = !WEB;
 
 // Момент запуска: от него считается, сколько заставке осталось висеть.
 const START = performance.now();
@@ -98,11 +110,22 @@ function toast(text, isError = false, ms = 0) {
 
 const initData = (tg && tg.initData) || '';
 
-async function api(method, path, body) {
+/*
+ * X-Requested-With ставим на каждый запрос, и в Telegram тоже. Для запросов по
+ * cookie сервер без него отвечает отказом: чужая страница не может добавить
+ * свой заголовок к запросу на наш адрес, а значит, не сможет и воспользоваться
+ * нашей cookie (защита от подделки запросов с других сайтов).
+ *
+ * anon — запросы самого входа: они идут до сессии, и ответ 401 для них не
+ * «сеанс кончился».
+ */
+async function api(method, path, body, opts = {}) {
   const res = await fetch(path, {
     method,
+    credentials: 'same-origin',
     headers: {
-      Authorization: `tma ${initData}`,
+      'X-Requested-With': 'pervichka',
+      ...(initData ? { Authorization: `tma ${initData}` } : {}),
       ...(body ? { 'Content-Type': 'application/json' } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
@@ -112,6 +135,13 @@ async function api(method, path, body) {
   if (!res.ok || data.error) {
     const err = new Error(data.error || `Ошибка ${res.status}`);
     err.payload = data;
+    err.status = res.status;
+    // Сессия на сайте кончилась (вышли на другом устройстве, истёк срок):
+    // вместо ошибки на каждом экране показываем вход.
+    if (WEB && res.status === 401 && !opts.anon) {
+      err.unauth = true;
+      sessionLost();
+    }
     throw err;
   }
   return data;
@@ -162,8 +192,20 @@ const screens = {};      // заполняется ниже
 
 function current() { return stack[stack.length - 1]; }
 
+/*
+ * Кнопка «назад» браузера.
+ *
+ * В Telegram возвращает системная BackButton, в браузере её нет — и стрелка
+ * браузера выбрасывала бы человека с сайта, хотя он всего лишь открыл карточку
+ * клиента. Поэтому в вебе каждый переход вперёд кладёт запись в историю, а
+ * возврат (своей стрелкой или браузерной) идёт через неё: так обе стрелки
+ * делают одно и то же и не расходятся со стопкой экранов.
+ */
+let histDepth = 0;
+
 function go(name, params = {}) {
   stack.push({ name, params });
+  if (WEB) { histDepth += 1; try { history.pushState({ d: histDepth }, ''); } catch (_) { /* песочница */ } }
   render();
 }
 
@@ -202,7 +244,10 @@ function tabOf(name) {
 }
 
 function back() {
-  if (stack.length > 1) { stack.pop(); render(); return; }
+  if (stack.length > 1) {
+    if (WEB && histDepth > 0) { history.back(); return; }   // дальше поработает popstate
+    stack.pop(); render(); return;
+  }
   const { name } = current();
   if (TABS.some((t) => t.name === name)) return;   // вкладка — возвращаться некуда
   reset(PARENT[name] || 'home');
@@ -211,6 +256,19 @@ function back() {
 function reset(name, params = {}) {
   stack = [{ name, params }];
   render();
+}
+
+if (WEB) {
+  try { history.replaceState({ d: 0 }, ''); } catch (_) { /* песочница */ }
+  window.addEventListener('popstate', (e) => {
+    const d = (e.state && e.state.d) || 0;
+    const wasDeeper = d < histDepth;
+    histDepth = d;
+    if (!wasDeeper || !loggedIn) return;     // «вперёд» стопку не восстанавливает
+    if (stack.length > 1) { stack.pop(); render(); return; }
+    const { name } = current();
+    if (!TABS.some((t) => t.name === name)) reset(PARENT[name] || 'home');
+  });
 }
 
 async function afterIssue() {
@@ -254,7 +312,7 @@ function noteFollowups(list) {
 }
 
 async function refreshCrmBadge(force) {
-  if (!initData || (!force && Date.now() - crmAsked < 30000)) return;
+  if (!loggedIn || (!force && Date.now() - crmAsked < 30000)) return;
   crmAsked = Date.now();
   try { noteFollowups((await api('GET', '/api/crm/followups')).followups); } catch (_) { /* счётчик не критичен */ }
 }
@@ -294,7 +352,9 @@ function setDrawer(open) {
 
 function userInfo() {
   const u = (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) || {};
-  const name = [u.first_name, u.last_name].filter(Boolean).join(' ') || 'Профиль';
+  // В вебе подписанных данных нет — имя приходит с сервера вместе с состоянием.
+  const webName = WEB && cache.user && cache.user.name;
+  const name = webName || [u.first_name, u.last_name].filter(Boolean).join(' ') || 'Профиль';
   return { name, initial: name.trim().charAt(0).toUpperCase() || '·', photo: u.photo_url };
 }
 
@@ -405,6 +465,7 @@ async function render() {
     window.scrollTo(0, 0);
   } catch (e) {
     if (seq !== renderSeq) return;
+    if (e && e.unauth) return;       // уже показан вход — ошибку поверх него не рисуем
     app.replaceChildren(errorScreen(e));
   }
   dropSplash();
@@ -2641,6 +2702,26 @@ screens.more = async function more() {
       },
     })));
 
+  // Выход нужен только тому, кто вошёл с сайта: в Telegram «выйти» — закрыть окно.
+  if (WEB) {
+    box.append(h('div', { class: 'section-title', text: 'Вход на сайте' }));
+    box.append(h('div', { class: 'card' },
+      navRow({
+        icon: 'logout',
+        title: 'Выйти',
+        sub: 'закрыть вход в этом браузере',
+        onclick: () => signOut(false),
+      }),
+      navRow({
+        icon: 'logout',
+        title: 'Выйти на всех устройствах',
+        sub: 'закрыть все входы с сайта, в том числе чужие',
+        onclick: () => {
+          if (window.confirm('Выйти на всех устройствах? Входить придётся заново, через Telegram.')) signOut(true);
+        },
+      })));
+  }
+
   box.append(h('div', { class: 'section-title', text: 'Помощь' }));
   box.append(h('div', { class: 'card' },
     navRow({
@@ -2657,6 +2738,17 @@ screens.more = async function more() {
     })));
   return box;
 };
+
+/** Выйти с сайта: на этом устройстве или везде. После — страница загружается заново и просит войти. */
+async function signOut(everywhere) {
+  try {
+    await api('POST', everywhere ? '/api/logout/all' : '/api/logout', {}, { anon: true });
+  } catch (e) {
+    // Сессии уже нет — выходить не из чего, остальное покажем как есть.
+    if (e.status !== 401) { toast(e.message, true); return; }
+  }
+  location.reload();
+}
 
 /** Человеческое название режима НДС — то же, что в боте. */
 function vatLabel(org) {
@@ -5381,36 +5473,166 @@ function buildTabs() {
 // и так может нажать сам, — поэтому оставлен и в рабочей сборке.
 window.__go = (name, params) => go(name, params || {});
 
+/* ---------- вход с сайта ---------- */
+
+/** Сессия кончилась посреди работы: показываем вход, а не ошибку на каждом экране. */
+function sessionLost() {
+  if (!loggedIn) return;
+  showLogin('Вход закончился — войдите снова.');
+}
+
+function hideChrome() {
+  tabsBox.hidden = true;
+  topbar.hidden = true;
+  drawer.hidden = true;
+  scrim.hidden = true;
+  document.body.classList.remove('drawer-open');
+}
+
+function showLogin(note) {
+  loggedIn = false;
+  renderSeq += 1;                 // запоздавшие ответы старого экрана не должны его затереть
+  document.body.classList.add('is-login');
+  hideChrome();
+  app.replaceChildren(loginScreen(note));
+  window.scrollTo(0, 0);
+  dropSplash();
+}
+
+/**
+ * Экран «Войти через Telegram».
+ *
+ * Пароля нет: человека узнаёт сам Telegram. Сайт получает одноразовый код,
+ * человек открывает бота по ссылке с этим кодом и выбирает там число, которое
+ * крупно показано на этом экране (так чужая ссылка, присланная вслепую, не проходит);
+ * страница каждые две секунды спрашивает, подтвердили ли, и как только
+ * подтвердили — перезагружается уже со входом.
+ *
+ * QR показываем только на широком экране: на телефоне наводить камеру
+ * на собственный экран некуда, там нужна кнопка.
+ */
+function loginScreen(note) {
+  const box = h('div', { class: 'login' });
+  const card = h('div', { class: 'login-card' });
+  box.append(card);
+  let timer = 0;
+
+  const stop = () => { clearTimeout(timer); timer = 0; };
+  const alive = () => box.isConnected;
+
+  function intro(message, isError) {
+    stop();
+    // replaceChildren сам превращает undefined в слово «undefined», поэтому пустое отсеиваем.
+    card.replaceChildren(...[
+      h('div', { class: 'login-mark', 'aria-hidden': 'true' }, icon('doc-check')),
+      h('h1', { text: 'Вход в Первичку' }),
+      message ? h('p', { class: `login-note${isError ? ' err' : ''}`, role: isError ? 'alert' : null, text: message }) : null,
+      h('p', { class: 'login-text', text: 'Пароль не нужен: вход подтверждается в Telegram. Нажмите кнопку — здесь появится число, его нужно будет выбрать в боте.' }),
+      h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn', type: 'button', onclick: (e) => withBusy(e.currentTarget, begin),
+      }, icon('send'), 'Войти через Telegram')),
+      h('p', { class: 'small muted login-foot', text: 'Если приложение открывается у вас прямо в Telegram, входить здесь не нужно.' }),
+    ].filter(Boolean));
+  }
+
+  async function begin() {
+    let r;
+    try {
+      r = await api('POST', '/api/login/start', {}, { anon: true });
+    } catch (e) {
+      intro(e.message || 'Не получилось начать вход. Попробуйте ещё раз.', true);
+      return;
+    }
+    waiting(r);
+  }
+
+  function waiting(r) {
+    const until = Date.parse(r.expiresAt) || (Date.now() + (r.ttl || 300) * 1000);
+    const left = h('span', { class: 'login-left' });
+    card.replaceChildren(
+      h('h1', { text: 'Подтвердите вход в Telegram' }),
+      // Число видно только здесь: в ссылке и в QR его нет. Кто пришёл в бота
+      // по чужой ссылке, экрана не видел и верное число не знает.
+      h('div', { class: 'login-code', role: 'status', 'aria-label': `Нажмите в боте число ${r.code}` },
+        h('span', { class: 'login-code-lead', text: 'Нажмите в боте число' }),
+        h('span', { class: 'login-code-num', text: String(r.code) })),
+      h('p', { class: 'login-text', text: 'Откройте бота по кнопке: он покажет три числа. Эта страница откроется сама.' }),
+      h('div', { class: 'btn-wrap' }, h('a', {
+        class: 'btn', href: r.link, target: '_blank', rel: 'noopener noreferrer',
+      }, icon('send'), 'Открыть Telegram')),
+      // QR рисует сервер из нашей же ссылки, в нём только пути и квадраты.
+      h('div', { class: 'login-qr', html: r.qr }),
+      h('p', { class: 'small muted login-qr-cap', text: 'Или наведите на код камеру телефона.' }),
+      h('p', { class: 'login-wait', role: 'status' }, h('span', { class: 'spinner', 'aria-hidden': 'true' }), 'Ждём подтверждения в Telegram… ', left),
+      h('p', { class: 'small muted login-foot', text: 'Если вы ничего не нажимали на сайте — нажмите в боте «Нет». Выбирайте число только с этого экрана, даже если просят.' }),
+      h('button', { class: 'btn secondary', type: 'button', onclick: () => intro() }, 'Отмена'));
+
+    const paintLeft = () => {
+      const secs = Math.max(0, Math.round((until - Date.now()) / 1000));
+      left.textContent = `(осталось ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')})`;
+      return secs;
+    };
+    paintLeft();
+    const tick = async () => {
+      if (!alive()) return;
+      if (paintLeft() <= 0) { intro('Время вышло. Начните вход заново.', true); return; }
+      try {
+        const st = await api('POST', '/api/login/check', { nonce: r.nonce }, { anon: true });
+        if (!alive()) return;
+        if (st.status === 'ok') {
+          // Cookie уже стоит. Перезагрузка — самый простой способ начать
+          // приложение с чистого листа уже как вошедший.
+          location.reload();
+          return;
+        }
+        if (st.status === 'denied') { intro('Вход отклонён в Telegram. Если это были вы — начните заново.', true); return; }
+        if (st.status === 'expired') { intro('Время вышло. Начните вход заново.', true); return; }
+      } catch (e) {
+        if (!alive()) return;
+        // 404 — такого входа уже нет. Остальное (429, обрыв сети) — просто ждём дальше.
+        if (e.status === 404) { intro('Этот вход уже не действует. Начните заново.', true); return; }
+      }
+      timer = setTimeout(tick, 2000);
+    };
+    timer = setTimeout(tick, 2000);
+  }
+
+  intro(note, Boolean(note));
+  return box;
+}
+
 function start() {
   buildTabs();
-  buildChrome();
 
-  if (!tg) {
-    app.replaceChildren(empty('warn', 'Откройте из Telegram',
-      'Это приложение работает внутри Telegram: оттуда оно получает, кто вы.'));
-    tabsBox.hidden = true;
-    topbar.hidden = true;
-    drawer.hidden = true;
-    dropSplash();            // иначе заставка останется висеть поверх ответа
+  if (WEB) {
+    // Обычный браузер. Спрашиваем сервер, помнит ли он нас: да — рисуем
+    // приложение, нет (401) — вход. buildChrome после ответа, а не до: в шапке
+    // имя человека, а оно приходит с сервера.
+    api('GET', '/api/state', null, { anon: true }).then((st) => {
+      cache = st;
+      loggedIn = true;
+      buildChrome();
+      render();
+    }).catch((e) => {
+      if (e.status === 401) { showLogin(); return; }
+      hideChrome();
+      app.replaceChildren(h('div', { class: 'empty' },
+        h('div', { class: 'icon-box warn' }, icon('warn')),
+        h('h2', { text: 'Не получилось загрузить' }),
+        h('p', { class: 'small', text: e.message }),
+        h('div', { class: 'btn-wrap' }, h('button', { class: 'btn secondary', onclick: () => location.reload() }, 'Повторить'))));
+      dropSplash();
+    });
     return;
   }
 
+  buildChrome();
   tg.ready();
   tg.expand();
   tg.BackButton.onClick(back);
   edgeSwipeBack();
   if (tg.setHeaderColor) { try { tg.setHeaderColor('secondary_bg_color'); } catch (_) { /* старый клиент */ } }
   if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); // чтобы список не закрывал окно
-
-  if (!initData) {
-    app.replaceChildren(empty('warn', 'Не удалось вас опознать',
-      'Закройте приложение и откройте его заново из чата с ботом.'));
-    tabsBox.hidden = true;
-    topbar.hidden = true;
-    drawer.hidden = true;
-    dropSplash();            // иначе заставка останется висеть поверх ответа
-    return;
-  }
 
   render();
 }
