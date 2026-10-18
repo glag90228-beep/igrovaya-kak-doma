@@ -1054,7 +1054,11 @@ const api = {
       const un = bdb.unmarkPaid(user.id, id);
       return { doc: docBrief(bdb.getDoc(user.id, id)), kept: (un && un.kept) || 0 };
     }
-    const when = bdb.markPaid(user.id, id, str(body.date, 10));
+    // Дату оплаты проверяем по календарю: «2026-02-30» раньше молча заменялось
+    // сегодняшним днём, и оплата ложилась не тем числом, что назвал человек.
+    const payDate = body.date ? isoDay(str(body.date, 10)) : '';
+    if (body.date && !payDate) return { error: 'Такой даты не бывает. Укажите существующую дату оплаты.' };
+    const when = bdb.markPaid(user.id, id, payDate);
     // Самозанятому в этот момент надо выдать чек: счёт и акт доход не
     // закрывают, его закрывает чек «Моего налога» (lib/npd.js). Запись о нём
     // остаётся, пока человек не отметит чек пробитым (lib/cheques.js).
@@ -1894,7 +1898,7 @@ const api = {
         leadDays: r.lead_days,
         total: recurring.isOp(r)
           ? r.op.amount
-          : round2(r.items.reduce((a, it) => a + (Number(it.qty) || 0) * (Number(it.price) || 0), 0)),
+          : docService.plannedTotal(user.id, r),
       })),
     };
   },

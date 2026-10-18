@@ -3,7 +3,7 @@
 // Общая обёртка и стиль для документов-PDF «Трапезы» (акт услуг, счёт, платёжка).
 // Палитра бренда, официальный сдержанный вид, печать под А4.
 
-const { formatMoney, formatRub, amountInWords } = require('./money');
+const { formatMoney, formatPrice, formatRub, amountInWords } = require('./money');
 
 /*
  * Кавычки экранируются наравне с угловыми скобками.
@@ -326,5 +326,5 @@ function page(title, body) {
 
 module.exports = {
   esc, ru, page, fxHtml, stampsHtml, withStamps, isIp, isSelfEmployed, npdNote, courtOf, signRows, usnNote, cityOf, placeDate,
-  formatMoney, formatRub, amountInWords,
+  formatMoney, formatPrice, formatRub, amountInWords,
 };

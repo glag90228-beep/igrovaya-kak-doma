@@ -7,7 +7,7 @@
 
 const { Telegram, keyboard } = require('./lib/tg');
 const bdb = require('./lib/bot-db');
-const { formatRub, formatMoney, amountInWords, round2, vatTotals } = require('./lib/money');
+const { formatRub, formatMoney, formatPrice, amountInWords, round2, vatTotals } = require('./lib/money');
 const { buildAkt } = require('./lib/xlsx-akt');
 const { buildRegistry } = require('./lib/xlsx-registry');
 const { buildKnigaProdazh, bookRow } = require('./lib/xlsx-kniga');
@@ -987,11 +987,14 @@ async function showPreview(tg, chatId, user, state) {
     : '';
   // Итог считаем тем же кодом, что и сам документ: иначе сводка покажет
   // одно, а в PDF попадёт другое — на НДС «сверху» разница заметная.
-  const sums = vatTotals(d.items, extra.vatRate == null ? null : Number(extra.vatRate),
+  // Количество и цену берём в том виде, в каком они лягут в документ (три и
+  // четыре знака, см. cleanItems): иначе в сводке 0,3333 кг, а в бланке 0,333.
+  const items = docService.cleanItems(d.items);
+  const sums = vatTotals(items, extra.vatRate == null ? null : Number(extra.vatRate),
     Boolean(extra.priceIncludesVat));
   const total = sums.total;
-  const lines = d.items.map((it, i) =>
-    `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)} = <b>${formatRub(round2(it.qty * it.price))}</b>`);
+  const lines = items.map((it, i) =>
+    `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatPrice(it.price)} руб. = <b>${formatRub(round2(it.qty * it.price))}</b>`);
   const head = extra.status
     ? ` · статус ${extra.status}${extra.status === 1
       ? `, НДС ${extra.vatRate == null ? 'не облагается' : `${extra.vatRate}%`}`
@@ -3379,7 +3382,8 @@ async function showRecurring(tg, chatId, user) {
         return `• <b>${esc(r.op.kind)} ${formatRub(r.op.amount)}</b> — ${esc(r.cp_name)}, `
           + `${r.dayText}${left}${r.op.note ? `\n  <i>${esc(r.op.note)}</i>` : ''}`;
       }
-      const sum = r.items.reduce((a, it) => a + round2((Number(it.qty) || 0) * (Number(it.price) || 0)), 0);
+      // С НДС, как у будущего документа: см. docService.plannedTotal.
+      const sum = docService.plannedTotal(user.id, r);
       return `• <b>${esc(label(r))}</b> для ${esc(r.cp_name)} — ${formatRub(sum)}, ${r.dayText}`;
     }).join('\n')
     + '\n\n<i>Документы сами не выписываются: в нужный день придёт предложение '
@@ -3428,7 +3432,8 @@ async function offerRecurring(tg, rec, month = recurring.monthKey()) {
   if (!user || user.blocked_at) return false;
   const kind = docService.ITEM_DOCS[rec.type];
   if (!kind) return false;
-  const sum = rec.items.reduce((a, it) => a + round2((Number(it.qty) || 0) * (Number(it.price) || 0)), 0);
+  // Сумма — как у будущего документа, с НДС организации (plannedTotal), а не qty × price.
+  const sum = docService.plannedTotal(user.id, rec);
 
   /*
    * Повторение без позиций — это напоминание, а не готовый документ.
@@ -3584,7 +3589,8 @@ async function offerPeriodic(tg, rec, key, on = todayDate()) {
   const kind = docService.ITEM_DOCS[rec.type];
   // Расписание без позиций выписать нечем: оно заводится только по готовому документу.
   if (!kind || !rec.items.length) return false;
-  const sum = rec.items.reduce((a, it) => a + round2((Number(it.qty) || 0) * (Number(it.price) || 0)), 0);
+  // Сумма — как у будущего документа, с НДС организации (plannedTotal), а не qty × price.
+  const sum = docService.plannedTotal(user.id, rec);
   await tg.sendMessage(user.tg_id,
     `🔁 <b>${esc(kind.title)} на сегодня</b> · ${recurring.dayCaption(on)}\n\n`
     + `Клиент: <b>${esc(rec.cp_name)}</b>\n`

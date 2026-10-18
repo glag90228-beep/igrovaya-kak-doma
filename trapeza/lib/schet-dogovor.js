@@ -21,7 +21,7 @@
  * нельзя ни при каких обстоятельствах.
  */
 
-const { esc, ru, page, fxHtml, npdNote, courtOf, formatMoney, amountInWords } = require('./doc-html');
+const { esc, ru, page, fxHtml, npdNote, courtOf, formatMoney, formatPrice, amountInWords } = require('./doc-html');
 const { round2, vatTotals, rateLabel } = require('./money');
 const { payQrSvg } = require('./qr-pay');
 
@@ -51,7 +51,7 @@ function buildSchetDogovorHtml({ org, cp, doc }) {
       <td>${esc(it.name)}</td>
       <td class="c">${esc(it.qty ?? '')}</td>
       <td class="c">${esc(it.unit || 'шт.')}</td>
-      <td class="r">${formatMoney(it.price)}</td>
+      <td class="r">${formatPrice(it.price)}</td>
       <td class="r">${formatMoney(sum)}</td>
     </tr>`;
   }).join('');

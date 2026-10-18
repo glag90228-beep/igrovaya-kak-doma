@@ -16,7 +16,7 @@
 
 const bdb = require('./bot-db');
 const { withStamps } = require('./doc-html');
-const { round2, vatTotals } = require('./money');
+const { round2, round3, round4, vatTotals } = require('./money');
 const facsimile = require('./facsimile');
 const { pdfAvailable, htmlToPdf } = require('./pdf');
 const { buildAktUslugHtml } = require('./akt-uslug');
@@ -64,7 +64,7 @@ const OTHER_DOCS = {
 const ALL_DOCS = { ...ITEM_DOCS, ...OTHER_DOCS };
 
 // «Сегодня» — по Москве, а не по поясу сервера (пояснение в lib/period.js).
-const { todayISO } = require('./period');
+const { todayISO, isoDay } = require('./period');
 
 /** ДД.ММ.ГГГГ — так дата пишется во всех наших бланках. */
 const ruDate = (iso) => {
@@ -111,16 +111,69 @@ function totalOf(items, extra = {}) {
 }
 
 /**
+ * Число из того, что прислали: «1,5», «1 500,25» и обычное 1.5 читаются одинаково.
+ *
+ * Приложение шлёт то, что человек набрал, и запятая там — норма. Number('1,5')
+ * даёт NaN, и позиция молча превращалась в «одну штуку».
+ * Пустое и не-число — NaN, чтобы вызывающий мог отличить «не указано».
+ */
+function parseNum(v) {
+  if (typeof v === 'number') return v;
+  if (v == null) return NaN;
+  const t = String(v).replace(/[\s\u00A0\u202F]/g, '').replace(',', '.');
+  return t === '' ? NaN : Number(t);
+}
+
+/** Потолок количества и цены: защита от переполнения, см. cleanItems. */
+const ITEM_MAX = 1e9;
+
+/**
+ * Что не так с присланными позициями — человеческим текстом, или '' если всё в порядке.
+ *
+ * Тихая подмена опаснее отказа. Количество «0», «−2» или «abc» раньше
+ * становилось единицей, и клиент получал документ на сумму, которой человек
+ * не называл. Не указанное вовсе количество по-прежнему считаем единицей
+ * (так заведено в «Услуге на 30 тысяч»), а указанное, но неверное — отказ.
+ * Цена не указана — ноль (бывают документы на ноль), указана и отрицательна
+ * или не число — отказ.
+ */
+function itemsProblem(raw) {
+  for (const it of Array.isArray(raw) ? raw.slice(0, 200) : []) {
+    const name = String((it && it.name) || '').trim();
+    if (!name) continue;
+    const label = name.length > 40 ? `${name.slice(0, 40)}…` : name;
+    const q = it.qty;
+    if (q != null && String(q).trim() !== '') {
+      const qty = parseNum(q);
+      if (!Number.isFinite(qty) || qty <= 0 || round3(qty) <= 0) {
+        return `Позиция «${label}»: количество должно быть числом больше нуля (можно с запятой, до трёх знаков).`;
+      }
+    }
+    const p = it.price;
+    if (p != null && String(p).trim() !== '') {
+      const price = parseNum(p);
+      if (!Number.isFinite(price) || price < 0) {
+        return `Позиция «${label}»: цена должна быть числом, не меньше нуля.`;
+      }
+    }
+  }
+  return '';
+}
+
+/**
  * Приводит присланные позиции к нашему виду и отбрасывает мусор.
  * Данные приходят из браузера, поэтому доверять типам нельзя.
+ *
+ * Количество — до трёх знаков, цена — до четырёх (см. money.round3): суммы
+ * строк и итог округляются до копеек уже потом, при расчёте.
  */
 function cleanItems(raw) {
   const out = [];
   for (const it of Array.isArray(raw) ? raw.slice(0, 200) : []) {
     const name = String((it && it.name) || '').trim().slice(0, 300);
     if (!name) continue;
-    const qty = Number(it.qty);
-    const price = Number(it.price);
+    const qty = parseNum(it.qty);
+    const price = parseNum(it.price);
     out.push({
       name,
       unit: String((it && it.unit) || 'шт.').trim().slice(0, 20) || 'шт.',
@@ -132,11 +185,32 @@ function cleanItems(raw) {
        * миллиарду рублей — заведомо больше всего, что бывает в первичке,
        * и произведение таких чисел double держит с запасом.
        */
-      qty: Number.isFinite(qty) && qty > 0 ? round2(Math.min(qty, 1e9)) : 1,
-      price: Number.isFinite(price) && price >= 0 ? round2(Math.min(price, 1e9)) : 0,
+      qty: Number.isFinite(qty) && qty > 0 ? Math.max(0.001, round3(Math.min(qty, ITEM_MAX))) : 1,
+      price: Number.isFinite(price) && price >= 0 ? round4(Math.min(price, ITEM_MAX)) : 0,
     });
   }
   return out;
+}
+
+/**
+ * Дата документа: пусто — сегодня, настоящая дата — она, выдуманная — отказ.
+ *
+ * Одного шаблона ГГГГ-ММ-ДД мало: «2026-02-30» ему подходит, а в журнале и в
+ * нумерации по годам такая строка ломает отбор по периоду. Раньше её молча
+ * принимали, а любую непохожую строку молча заменяли сегодняшним днём — то
+ * есть документ с датой «вчера» выходил сегодняшним.
+ *
+ * @returns {{ok:true, date:string}|{ok:false, message:string}}
+ */
+function pickDate(date) {
+  if (date == null || String(date).trim() === '') return { ok: true, date: todayISO() };
+  const day = isoDay(String(date).trim());
+  if (day) return { ok: true, date: day };
+  const raw = String(date).trim().slice(0, 20);
+  return {
+    ok: false,
+    message: `Такой даты нет в календаре: ${raw}. Укажите существующую дату, например 2026-10-18.`,
+  };
 }
 
 /** Ошибка выпуска с понятной человеку причиной. */
@@ -157,6 +231,40 @@ function withFx(userId, org, docType, doc) {
 }
 
 /**
+ * Поля НДС документа: то, что назвали явно, иначе ставка организации.
+ *
+ * Вынесено из issueDocument, чтобы «сколько будет стоить документ» (см.
+ * plannedTotal) считалось ровно тем же правилом, что и сам выпуск: иначе
+ * предложение по расписанию обещает одну сумму, а выходит другая.
+ *
+ * Самозанятому ставка обнуляется: итог считается по ней, и долг вырастал бы
+ * на налог, которого он брать не вправе.
+ */
+function vatFieldsFor(org, type, extra = {}) {
+  let fields = extra || {};
+  if (['sch', 'schdog', 'torg12', 'upd', 'usl'].includes(type)
+      && !Object.prototype.hasOwnProperty.call(fields, 'vatRate')) {
+    const v = bdb.vatOf(org);
+    if (v.rate != null) fields = { ...fields, vatRate: v.rate, priceIncludesVat: v.gross };
+  }
+  if (isNpd(org)) fields = { ...fields, vatRate: null };
+  return fields;
+}
+
+/**
+ * Сумма, на которую выйдет документ, если выписать его сейчас: с НДС, как у
+ * будущего документа, а не «количество на цену».
+ *
+ * Для предложений по расписанию. Они показывали qty × price, а документ потом
+ * выходил на 122 000 при обещанных 100 000 — у плательщика НДС, где ставка
+ * берётся из настроек фирмы.
+ */
+function plannedTotal(userId, { type, items, extra = {} }) {
+  const org = bdb.currentOrg(userId);
+  return totalOf(cleanItems(items), org ? vatFieldsFor(org, type, extra) : extra);
+}
+
+/**
  * Выпускает документ: собирает файл и кладёт запись в журнал.
  *
  * @returns {{ok:true, doc:object, file:object, total:number, title:string}
@@ -174,8 +282,23 @@ async function issueDocument(userId, {
   const cp = bdb.getCp(userId, Number(cpId));
   if (!cp) return fail('cp', 'Такого клиента нет в вашем списке.');
 
+  const problem = itemsProblem(items);
+  if (problem) return fail('items', problem);
   const clean = cleanItems(items);
   if (!clean.length) return fail('items', 'Добавьте хотя бы одну позицию.');
+
+  /*
+   * УПД самозанятому не выписывается — ни из бота, ни из приложения.
+   *
+   * В боте кнопки УПД у него нет, но запрос можно прислать и мимо кнопки,
+   * а правило «статус всегда 2» ниже лишь прятало беду: УПД — документ тех,
+   * кто работает с НДС и счетами-фактурами, самозанятому он не нужен, а
+   * выписанный по ошибке уходил контрагенту под видом счёта-фактуры.
+   */
+  if (type === 'upd' && isNpd(org)) {
+    return fail('npd', 'Самозанятый не выставляет УПД: он нужен тем, кто работает с НДС. '
+      + 'Выпишите счёт, акт или товарную накладную.');
+  }
 
   // Режим НДС организации применяем здесь, а не в боте: иначе мини-приложение
   // выписывало бы счета всегда без налога, игнорируя настройку.
@@ -193,12 +316,7 @@ async function issueDocument(userId, {
   // подписывал документ, заниженный ровно на налог, долг в журнале занижался
   // тоже, а ставка undefined уезжала в payload — то есть «Повторить» и
   // ежемесячное повторение этого акта оставались без налога навсегда.
-  let fields = extra;
-  if (['sch', 'schdog', 'torg12', 'upd', 'usl'].includes(type)
-      && !Object.prototype.hasOwnProperty.call(extra, 'vatRate')) {
-    const v = bdb.vatOf(org);
-    if (v.rate != null) fields = { ...extra, vatRate: v.rate, priceIncludesVat: v.gross };
-  }
+  let fields = vatFieldsFor(org, type, extra);
 
   /*
    * Статус УПД, когда его не назвали, выводим из режима НДС организации.
@@ -233,6 +351,9 @@ async function issueDocument(userId, {
    * контрагента вырастал на налог, которого самозанятый брать не вправе:
    * бланк показывал одно, долг — другое, и требовал он больше, чем должен.
    * Ставка без права её выделять не значит ничего, поэтому её здесь и нет.
+   *
+   * УПД самозанятому теперь не выписывается вовсе (см. выше), и это правило
+   * осталось только страховкой.
    */
   if (type === 'upd' && !Object.prototype.hasOwnProperty.call(fields, 'status')) {
     const payer = bdb.vatOf(org).rate != null && !isNpd(org);
@@ -240,7 +361,6 @@ async function issueDocument(userId, {
   }
   // И явно попрошенная единица самозанятому не достаётся: кнопка «Статус 1»
   // в боте и поле status в приложении раньше проходили мимо правила выше.
-  if (isNpd(org)) fields = { ...fields, vatRate: null, ...(type === 'upd' ? { status: 2 } : {}) };
 
   /*
    * Строка 5б: чем закрываем ранее полученный аванс.
@@ -267,7 +387,9 @@ async function issueDocument(userId, {
     return { ...fail('quota', `Бесплатные документы на этот месяц закончились (${quota.limit}).`), quota };
   }
 
-  const when = /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? String(date) : todayISO();
+  const picked = pickDate(date);
+  if (!picked.ok) return fail('date', picked.message);
+  const when = picked.date;
   const year = Number(when.slice(0, 4));
   const total = totalOf(clean, fields);
 
@@ -436,7 +558,9 @@ async function issueFlat(userId, {
     return { ...fail('quota', `Бесплатные документы на этот месяц закончились (${quota.limit}).`), quota };
   }
 
-  const when = /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? String(date) : todayISO();
+  const picked = pickDate(date);
+  if (!picked.ok) return fail('date', picked.message);
+  const when = picked.date;
   const year = Number(when.slice(0, 4));
   const wanted = number == null || number === '' ? '' : String(number).slice(0, 40);
   if (wanted && bdb.numberTakenInOrg(org.id, type, year, wanted)) {
@@ -549,7 +673,9 @@ async function issuePlain(userId, {
     return { ...fail('quota', `Бесплатные документы на этот месяц закончились (${quota.limit}).`), quota };
   }
 
-  const when = /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? String(date) : todayISO();
+  const picked = pickDate(date);
+  if (!picked.ok) return fail('date', picked.message);
+  const when = picked.date;
   const year = Number(when.slice(0, 4));
   const wanted = number == null || number === '' ? '' : String(number).slice(0, 40);
   if (wanted && bdb.numberTakenInOrg(org.id, type, year, wanted)) {
@@ -700,5 +826,5 @@ function reusablePayload(payload) {
 module.exports = {
   ITEM_DOCS, OTHER_DOCS, ALL_DOCS,
   issueDocument, issueFlat, issuePlain, rebuildDocument, renderFile, stampFor,
-  totalOf, cleanItems, safeName, todayISO, reusablePayload,
+  totalOf, plannedTotal, vatFieldsFor, cleanItems, itemsProblem, pickDate, safeName, todayISO, reusablePayload,
 };

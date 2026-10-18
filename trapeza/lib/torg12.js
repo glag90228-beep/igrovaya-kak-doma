@@ -9,7 +9,7 @@
  * Отпуск разрешил / отпустил / груз принял оформлены как в бланке.
  */
 
-const { esc, ru, page, fxHtml, usnNote, formatMoney, amountInWords } = require('./doc-html');
+const { esc, ru, page, fxHtml, usnNote, formatMoney, formatPrice, amountInWords } = require('./doc-html');
 const { round2, vatSplit, vatTotals, rateLabel } = require('./money');
 
 const LAND = `
@@ -56,7 +56,7 @@ function buildTorg12Html({ org, cp, doc }) {
       <td class="c">${esc(it.code || '')}</td>
       <td class="c">${esc(it.unit || 'шт.')}</td>
       <td class="c">${esc(it.qty ?? '')}</td>
-      <td class="r">${formatMoney(s1.unitNet)}</td>
+      <td class="r">${formatPrice(s1.unitNet)}</td>
       <td class="r">${formatMoney(s1.net)}</td>
       <td class="c">${rate == null ? 'без НДС' : formatMoney(s1.vat)}</td>
       <td class="r">${formatMoney(s1.total)}</td>

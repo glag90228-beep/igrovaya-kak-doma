@@ -4,7 +4,7 @@
 // Заказчик слева, Исполнитель справа, наименование ИП прописью CAPS, без М.П.,
 // таблица услуг, сумма прописью, при необходимости — признание задолженности.
 
-const { esc, page, fxHtml, npdNote, formatMoney, amountInWords, placeDate } = require('./doc-html');
+const { esc, page, fxHtml, npdNote, formatMoney, formatPrice, amountInWords, placeDate } = require('./doc-html');
 const { round2, vatTotals, rateLabel } = require('./money');
 
 function party(org) {
@@ -56,7 +56,7 @@ function buildAktUslugHtml({ org, cp, doc }) {
       <td>${esc(it.name)}</td>
       <td class="c">${esc(it.qty ?? '')}</td>
       <td class="c">${esc(it.unit || 'усл.')}</td>
-      <td class="r">${formatMoney(it.price)}</td>
+      <td class="r">${formatPrice(it.price)}</td>
       <td class="r">${formatMoney(sum)}</td>
     </tr>`;
   }).join('');

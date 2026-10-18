@@ -19,7 +19,7 @@
  * применением сверьтесь с действующей редакцией постановления № 1137.
  */
 
-const { esc, ru, page, fxHtml, isIp, usnNote, formatMoney, amountInWords } = require('./doc-html');
+const { esc, ru, page, fxHtml, isIp, usnNote, formatMoney, formatPrice, amountInWords } = require('./doc-html');
 const { round2, vatSplit, rateLabel } = require('./money');
 const { fixNote } = require('./ksf');
 
@@ -147,7 +147,7 @@ function buildUpdHtml({ org, cp, doc }) {
         <td class="c">${esc(okei(it.unit))}</td>
         <td class="c">${esc(it.unit || 'шт.')}</td>
         <td class="c">${esc(it.qty ?? '')}</td>
-        <td class="r">${formatMoney(s.unitNet)}</td>
+        <td class="r">${formatPrice(s.unitNet)}</td>
         <td class="r">${formatMoney(s.net)}</td>
         <td class="c">без акциза</td>
         <td class="c">${esc(rateLabel(rate))}</td>
@@ -165,7 +165,7 @@ function buildUpdHtml({ org, cp, doc }) {
       <td class="c">${esc(it.code || '')}</td>
       <td class="c">${esc(it.unit || 'шт.')}</td>
       <td class="c">${esc(it.qty ?? '')}</td>
-      <td class="r">${formatMoney(it.price)}</td>
+      <td class="r">${formatPrice(it.price)}</td>
       <td class="r">${formatMoney(s.net)}</td>
       <td class="c">${rate == null ? 'без НДС' : esc(rateLabel(rate))}</td>
       <td class="r">${s.vat == null ? '—' : formatMoney(s.vat)}</td>

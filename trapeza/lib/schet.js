@@ -4,7 +4,7 @@
 // «шапка-банк» получателя, реквизиты поставщика/покупателя, таблица позиций,
 // «Без НДС», всего к оплате прописью, подписи (у ИП — одна, см. signRows).
 
-const { esc, ru, page, fxHtml, signRows, npdNote, formatMoney, amountInWords } = require('./doc-html');
+const { esc, ru, page, fxHtml, signRows, npdNote, formatMoney, formatPrice, amountInWords } = require('./doc-html');
 const { round2, vatTotals, rateLabel } = require('./money');
 const { payQrSvg } = require('./qr-pay');
 
@@ -33,7 +33,7 @@ function buildSchetHtml({ org, cp, doc }) {
       <td>${esc(it.name)}</td>
       <td class="c">${esc(it.qty ?? '')}</td>
       <td class="c">${esc(it.unit || 'шт.')}</td>
-      <td class="r">${formatMoney(it.price)}</td>
+      <td class="r">${formatPrice(it.price)}</td>
       <td class="r">${formatMoney(sum)}</td>
     </tr>`;
   }).join('');

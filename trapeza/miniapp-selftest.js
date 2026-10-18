@@ -625,6 +625,64 @@ async function main() {
     bdbS.updateOrg(mid, orgS.id, { npd: 0, vat_rate: '' });
   }
 
+  section('деньги: проверки на входе (количество, даты, УПД)');
+  {
+    /*
+     * То, что ревизор присылал в API мимо формы: количество «0» и «abc»,
+     * запятая вместо точки, 30 февраля, УПД от самозанятого.
+     */
+    const GU = { id: 500505, first_name: 'Глеб', username: 'gleb' };
+    const gUser = initDataFor(GU);
+    const bdbG = require('./lib/bot-db');
+    const gid = bdbG.getOrCreateUser(GU.id).id;
+    bdbG.saveMyOrg(gid, { name: 'ИП Глеб', inn: '183209316100' });
+    const orgG = bdbG.getDefaultOrg(gid);
+    require('./lib/billing').grantDays(gid, 30);
+    const cpG = bdbG.createCp(gid, { name: 'ООО «Вход»', kind: 'customer', opening_date: '2026-01-01' });
+    const post = (body) => call('POST', '/api/doc', { user: gUser, body: { type: 'sch', cpId: cpG, ...body } });
+
+    for (const [qty, price] of [[0, 100], [-1, 100], ['abc', 100], [1, -5]]) {
+      // eslint-disable-next-line no-await-in-loop
+      r = await post({ items: [{ name: 'Мусор', qty, price }] });
+      ok(r.status === 400 && /Мусор/.test(r.json.error || ''), `Р12: qty=${JSON.stringify(qty)} price=${JSON.stringify(price)} — отказ`, r.json.error);
+    }
+    r = await post({ items: [{ name: 'Дробная', qty: '1,5', price: '100,50' }] });
+    ok(r.status === 200 && r.json.total === 150.75, 'Р12: «1,5 × 100,50» с запятой читается — 150,75', JSON.stringify(r.json.total || r.json.error));
+    r = await post({ items: [{ name: 'Весовой', qty: 0.333, price: 10.01 }] });
+    ok(r.status === 200 && r.json.total === 3.33, 'Р1: 0,333 × 10,01 = 3,33 (а не 3,30 от 0,33)', r.json.total);
+
+    for (const d of ['2026-02-30', '2026-04-31', '2026-13-01', 'вчера']) {
+      // eslint-disable-next-line no-await-in-loop
+      r = await post({ items: [{ name: 'Х', qty: 1, price: 1 }], date: d });
+      ok(r.status === 400 && /календар/.test(r.json.error || ''), `Р11: дата «${d}» в /api/doc отвергается`, r.json.error);
+    }
+    r = await post({ items: [{ name: 'Х', qty: 1, price: 10 }], date: '2026-10-05' });
+    ok(r.status === 200, 'Р11: настоящая дата проходит', r.json.error);
+    const paidDoc = r.json.doc.id;
+    r = await call('POST', '/api/doc/paid', { user: gUser, body: { id: paidDoc, date: '2026-02-30' } });
+    ok(r.status === 400 && /не бывает/.test(r.json.error || '') && !bdbG.getDoc(gid, paidDoc).paid_at,
+      'Р11: «Оплатил» с выдуманной датой отвергается и ничего не отмечает', r.json.error);
+    r = await call('POST', '/api/doc/paid', { user: gUser, body: { id: paidDoc, date: '2026-10-06' } });
+    ok(r.status === 200 && r.json.paidAt === '2026-10-06', 'Р11: настоящая дата оплаты принята');
+
+    bdbG.updateOrg(gid, orgG.id, { npd: 1 });
+    r = await post({ type: 'upd', items: [{ name: 'Х', qty: 1, price: 100 }] });
+    ok(r.status === 400 && r.json.reason === 'npd' && /УПД/.test(r.json.error || ''), 'Р20: УПД самозанятого через API — отказ', r.json.error);
+    r = await post({ type: 'upd', items: [{ name: 'Х', qty: 1, price: 100 }], status: 1, vatRate: 22 });
+    ok(r.status === 400 && r.json.reason === 'npd', 'Р20: и со статусом 1 тоже', r.json.error);
+    bdbG.updateOrg(gid, orgG.id, { npd: 0 });
+
+    // Р8: сумма расписания в списке приложения — с НДС, как у будущего документа.
+    bdbG.updateOrg(gid, orgG.id, { vat_rate: '22', vat_gross: 0 });
+    const recG = require('./lib/recurring').add(gid, { cpId: cpG, type: 'torg12', period: 'day', weekday: 0,
+      items: [{ name: 'Обед', unit: 'шт.', qty: 20, price: 350 }], offeredThisMonth: false });
+    r = await call('GET', '/api/recurring', { user: gUser });
+    const recRow = (r.json.items || []).find((x) => x.id === recG);
+    ok(recRow && recRow.total === 8540, 'Р8: в списке расписаний 8 540 (7 000 + НДС 22%), а не 7 000', recRow && recRow.total);
+    require('./lib/recurring').off(gid, recG);
+    bdbG.updateOrg(gid, orgG.id, { vat_rate: '' });
+  }
+
   section('переключатель ИИ-ассистента');
   {
     /*

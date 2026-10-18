@@ -5843,6 +5843,90 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     resetRules();
   }
 
+  console.log('\n── деньги: количество, цена, даты, УПД, сумма в расписании ──');
+  {
+    /*
+     * Находки ревизора (партия 1). Каждая проверка — воспроизведение того, что
+     * он видел своими глазами: дробное количество, выдуманная дата, «0 штук»,
+     * УПД самозанятому, предложение по расписанию без НДС.
+     */
+    const bdbQ = require('./lib/bot-db');
+    const dsQ = require('./lib/doc-service');
+    const moneyQ = require('./lib/money');
+    const recQ = require('./lib/recurring');
+    const { runPeriodic } = require('./bot.js');
+    const uQ = bdbQ.getOrCreateUser(781001, 'Деньги');
+    bdbQ.saveMyOrg(uQ.id, { name: 'ИП Деньги', inn: '183209316100' });
+    const orgQ = bdbQ.getDefaultOrg(uQ.id);
+    const cpQ = bdbQ.createCp(uQ.id, { name: 'ООО «Весы»', kind: 'customer', opening_date: '2026-01-01' });
+    const issue = (items, more = {}) => dsQ.issueDocument(uQ.id, {
+      type: 'torg12', cpId: cpQ, items, skipQuota: true, ...more,
+    });
+
+    // Р1: 0,333 кг по 10,01 — это 3,33, а не «0,33 кг → 3,30».
+    const r1 = await issue([{ name: 'Мясо', unit: 'кг', qty: 0.333, price: 10.01 }]);
+    const it1 = bdbQ.getDoc(uQ.id, r1.doc.id).payload.items[0];
+    ok(r1.total === 3.33 && it1.qty === 0.333, 'Р1: количество 0,333 хранится с тремя знаками, сумма 3,33',
+      `${r1.total} / ${it1.qty}`);
+    const r1b = await issue([{ name: 'Крупа', unit: 'кг', qty: 3, price: 33.3333 }]);
+    const it1b = bdbQ.getDoc(uQ.id, r1b.doc.id).payload.items[0];
+    ok(it1b.price === 33.3333 && r1b.total === 100, 'Р1: цена хранится с четырьмя знаками, до копеек округляется только сумма',
+      `${it1b.price} / ${r1b.total}`);
+    ok(/33,3333/.test(require('./lib/torg12').buildTorg12Html({
+      org: bdbQ.getDefaultOrg(uQ.id), cp: bdbQ.getCp(uQ.id, cpQ), doc: { number: '1', date: '2026-10-01', items: [it1b] },
+    })), 'Р1: в бланке цена напечатана со всеми знаками, иначе графы не перемножить');
+    ok(moneyQ.round3(1.0005) === 1.001 && moneyQ.round4(2.00005) === 2.0001, 'Р1: округление «половина вверх» без сдвига двоичной дроби');
+    ok(dsQ.cleanItems([{ name: 'х', qty: '0,125', price: '99,5' }]).every((x) => x.qty === 0.125 && x.price === 99.5),
+      'Р12: запятая как разделитель читается');
+
+    // Р12: количество «0», «−2», «abc» и цена «abc» — отказ словами, а не молчаливая единица.
+    for (const [qty, price] of [[0, 100], [-2, 100], ['abc', 100], [1, 'abc'], [1, -5], [0.0001, 100]]) {
+      // eslint-disable-next-line no-await-in-loop
+      const bad = await issue([{ name: 'Мусор', qty, price }]);
+      ok(!bad.ok && bad.reason === 'items' && /Мусор/.test(bad.message),
+        `Р12: qty=${JSON.stringify(qty)} price=${JSON.stringify(price)} — отказ с названием позиции`, bad.message);
+    }
+    const noQty = await issue([{ name: 'Услуга', price: 500 }]);
+    ok(noQty.ok && noQty.total === 500, 'Р12: не указанное количество по-прежнему единица');
+
+    // Р11: выдуманная календарная дата — отказ во всех трёх выпусках.
+    for (const d of ['2026-02-30', '2026-04-31', '2026-13-01']) {
+      // eslint-disable-next-line no-await-in-loop
+      const bad = await issue([{ name: 'Х', qty: 1, price: 1 }], { date: d });
+      ok(!bad.ok && bad.reason === 'date' && bad.message.includes(d), `Р11: дата ${d} отвергается`, bad.message);
+    }
+    const badPp = await dsQ.issuePlain(uQ.id, { type: 'pp', cpId: cpQ, date: '2026-02-30', fields: { amount: 100, purpose: 'Оплата' }, skipQuota: true });
+    ok(!badPp.ok && badPp.reason === 'date', 'Р11: платёжка с выдуманной датой не выписывается', badPp.message);
+    bdbQ.updateOrg(uQ.id, orgQ.id, { vat_rate: '22' });
+    const badAv = await dsQ.issueFlat(uQ.id, { type: 'avans', cpId: cpQ, date: '2026-02-30', total: 1000, payload: { sum: 1000, vatRate: 22, payDoc: '№ 1' }, skipQuota: true });
+    ok(!badAv.ok && badAv.reason === 'date', 'Р11: счёт-фактура на аванс с выдуманной датой не выписывается', badAv.message);
+    bdbQ.updateOrg(uQ.id, orgQ.id, { vat_rate: '' });
+    const goodLeap = await issue([{ name: 'Х', qty: 1, price: 1 }], { date: '2028-02-29' });
+    ok(goodLeap.ok && bdbQ.getDoc(uQ.id, goodLeap.doc.id).date === '2028-02-29', 'Р11: 29 февраля високосного года принимается');
+    const noDate = await issue([{ name: 'Х', qty: 1, price: 1 }], { date: '' });
+    ok(noDate.ok && bdbQ.getDoc(uQ.id, noDate.doc.id).date === dsQ.todayISO(), 'Р11: пустая дата — сегодня');
+
+    // Р20: УПД самозанятому не выписывается.
+    bdbQ.updateOrg(uQ.id, orgQ.id, { npd: 1 });
+    const npdUpd = await dsQ.issueDocument(uQ.id, { type: 'upd', cpId: cpQ, items: [{ name: 'Х', qty: 1, price: 1 }], skipQuota: true });
+    ok(!npdUpd.ok && npdUpd.reason === 'npd' && /УПД/.test(npdUpd.message), 'Р20: УПД самозанятому — отказ', npdUpd.message);
+    bdbQ.updateOrg(uQ.id, orgQ.id, { npd: 0 });
+
+    // Р8: предложение по расписанию называет сумму с НДС, как у будущего документа.
+    bdbQ.updateOrg(uQ.id, orgQ.id, { vat_rate: '22', vat_gross: 0 });
+    const ruleItems = [{ name: 'Обед', unit: 'шт.', qty: 20, price: 350 }];   // 7 000 без НДС → 8 540
+    ok(dsQ.plannedTotal(uQ.id, { type: 'torg12', items: ruleItems, extra: {} }) === 8540, 'Р8: сумма будущего документа — 8 540 с НДС 22%');
+    ok(dsQ.plannedTotal(uQ.id, { type: 'torg12', items: ruleItems, extra: { vatRate: null } }) === 7000, 'Р8: «этот документ без НДС» — 7 000');
+    const ruleQ = recQ.add(uQ.id, { cpId: cpQ, type: 'torg12', items: ruleItems, period: 'day', weekday: 0, offeredThisMonth: false });
+    const before = sent.length;
+    await runPeriodic(tg, new Date('2026-10-21T09:00:00+03:00'));
+    const prop = sent.slice(before).filter((m) => /на сегодня/.test(m.text || '') && /Весы/.test(m.text || ''));
+    ok(prop.length === 1 && norm(prop[0].text).includes('8 540'), 'Р8: в предложении по расписанию сумма с НДС — 8 540',
+      prop[0] && norm(prop[0].text).slice(0, 120));
+    recQ.off(uQ.id, ruleQ);
+    bdbQ.updateOrg(uQ.id, orgQ.id, { vat_rate: '' });
+  }
+
   console.log('\n── напоминания подряду, торговле и производству ──');
   {
     /*
@@ -7223,6 +7307,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       const r = await dsu.issueDocument(u.id, {
         type: 'upd', cpId: cpU, items: [{ name: 'Товар', qty: 1, price: 10000 }], skipQuota: true,
       });
+      if (!r.ok) return { refused: r };
       return { total: r.total, saved: bdbU.getDoc(u.id, r.doc.id).payload || {} };
     };
     const vat = await one(779040, '20');
@@ -7251,10 +7336,11 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
      * этот НДС в бюджет и подать декларацию. Заказчик вычет при этом всё
      * равно не получит.
      */
+    // Р20: теперь УПД самозанятому не выписывается вовсе — ни кнопкой, ни запросом мимо неё.
     const npdVat = await one(779043, '22', 1);
-    ok(Number(npdVat.saved.status) === 2,
-      'самозанятому со ставкой НДС счёт-фактура не выписывается',
-      `ст.${npdVat.saved.status} ставка ${npdVat.saved.vatRate}`);
+    ok(npdVat.refused && npdVat.refused.reason === 'npd' && /УПД/.test(npdVat.refused.message),
+      'самозанятому УПД не выписывается совсем — отказ со словами, а не документ',
+      npdVat.refused && npdVat.refused.message);
   }
 
   console.log('\n── акт услуг: бот и приложение считают одинаково ──');
@@ -7614,8 +7700,9 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const npdOrg = bdbK.getDefaultOrg(npdU.id);
     bdbK.updateOrg(npdU.id, npdOrg.id, { vat_rate: '22', npd: 1 });
     const npdCp = bdbK.createCp(npdU.id, { name: 'ООО «Заказчик»', inn: '7707654321', kind: 'customer', opening_date: '2026-01-01' });
+    // УПД самозанятому не выписывается (Р20) — проверяем то же самое на акте.
     const npdDoc = await dsK.issueDocument(npdU.id, {
-      type: 'upd', cpId: npdCp, date: '2026-09-20', skipQuota: true,
+      type: 'usl', cpId: npdCp, date: '2026-09-20', skipQuota: true,
       items: [{ name: 'Работы', qty: 1, price: 100000, unit: 'шт' }],
     });
     if (npdDoc.ok) {
@@ -7623,21 +7710,22 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       ok(nd.total === 100000, 'самозанятому налог в долг не приписан', String(nd.total));
       ok(nd.payload.vatRate == null, 'и ставка в документе обнулена', String(nd.payload.vatRate));
     } else {
-      ok(false, 'УПД самозанятого выписывается', npdDoc.message);
+      ok(false, 'акт самозанятого выписывается', npdDoc.message);
     }
 
     /*
      * Статус 1, попрошенный явно — кнопкой «Статус 1» в боте или полем status
      * в приложении, — проходил мимо правила: самозанятый получал счёт-фактуру,
-     * а по п. 5 ст. 173 НК за выставленный счёт-фактуру платят налог.
+     * а по п. 5 ст. 173 НК за выставленный счёт-фактуру платят налог. Теперь
+     * УПД ему не выписывается вовсе, с любым статусом.
      */
     const npdS1 = await dsK.issueDocument(npdU.id, {
       type: 'upd', cpId: npdCp, date: '2026-09-20', skipQuota: true,
       extra: { status: 1, vatRate: 22, priceIncludesVat: false },
       items: [{ name: 'Работы', qty: 1, price: 1000, unit: 'шт' }],
     });
-    ok(npdS1.ok && bdbK.getDoc(npdU.id, npdS1.doc.id).payload.status === 2,
-      'явно попрошенный статус 1 самозанятому всё равно не достаётся',
+    ok(!npdS1.ok && npdS1.reason === 'npd',
+      'явно попрошенный УПД со статусом 1 самозанятому не выписывается',
       npdS1.ok ? bdbK.getDoc(npdU.id, npdS1.doc.id).payload.status : npdS1.message);
     const npdOrgNow = bdbK.getDefaultOrg(npdU.id);
     const npdDog = require('./lib/dogovor').buildDogovorHtml({
