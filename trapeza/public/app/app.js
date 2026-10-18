@@ -1141,7 +1141,17 @@ function swipeToDelete(row, opts) {
   return wrap;
 }
 
-screens.doc = async function docScreen({ id }) {
+/** Что сказать, когда свободная оплата привязана к документу («Да, это она»). */
+function linkedToast(r) {
+  const l = (r && r.linked) || {};
+  const head = l.partial
+    ? `Привязал ${money(l.amount)}. Осталось получить ${money(l.left)}`
+    : `Привязал оплату ${money(l.amount)} — документ оплачен`;
+  return `${head}. Новой оплаты в журнал не добавлено.`
+    + (l.rest ? ` Ещё ${money(l.rest)} остались оплатой клиента без документа.` : '');
+}
+
+screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
   const { docs: list } = await api('GET', '/api/docs');
   const d = list.find((x) => x.id === Number(id));
   if (!d) return empty('warn', 'Документ не найден', 'Возможно, он был убран из журнала.');
@@ -1257,21 +1267,52 @@ screens.doc = async function docScreen({ id }) {
         }),
       }, 'Вернуть в долг')));
     }
-    box.append(h('div', { class: 'btn-wrap' }, h('button', {
+    /*
+     * Есть свободная оплата клиента — сервер сначала спрашивает, не она ли это
+     * (`ask`), и вопрос рисуется на месте кнопки. Иначе те же деньги
+     * записались бы вторым разом: человек внёс «пришло 3 000» строкой, а потом
+     * нажал «Оплатил» на накладной на те же 3 000.
+     */
+    const payZone = h('div', {});
+    const afterPay = (r, text) => {
+      haptic('medium');
+      toast(text);
+      // Самозанятому именно сейчас надо выдать чек: счёт и акт доход не
+      // закрывают. Момент единственный — деньги переводом приходят молча,
+      // документ уже выписан, и всё выглядит законченным.
+      if (r && r.npd) pendingCheque = r.npd;
+      // Верхняя плашка «Документ выписан» своё сказала — после действия она не нужна.
+      Object.assign(current().params, { fresh: false, askBiz: false });
+      render();
+    };
+    const askFree = (ask) => {
+      const answer = (free) => (e) => withBusy(e.currentTarget, async () => {
+        const r = await api('POST', '/api/doc/paid', { id: d.id, free });
+        afterPay(r, free === 'new' ? 'Отмечено как оплаченный' : linkedToast(r));
+      });
+      const several = ask.options.length > 1;
+      payZone.replaceChildren(h('div', { class: 'banner info', id: 'free-pay-ask' }, icon('wallet'),
+        h('div', {},
+          h('div', { text: ask.question }),
+          h('div', { class: 'btn-col', style: 'margin-top:10px' },
+            ...ask.options.map((o) => h('button', { class: 'btn', onclick: answer(o.opId) },
+              several ? `Да: ${o.label}` : 'Да, это она')),
+            h('button', { class: 'btn secondary', onclick: answer('new') }, 'Нет, это новая оплата'),
+            h('div', { class: 'small muted',
+              text: 'Если «да» — новой оплаты в журнал не добавится: эти деньги там уже есть.' })))));
+    };
+    payZone.append(h('div', { class: 'btn-wrap' }, h('button', {
+      id: 'pay-main',
       class: paid ? 'btn ghost' : 'btn',
       onclick: (e) => withBusy(e.currentTarget, async () => {
         const r = await api('POST', '/api/doc/paid', { id: d.id, paid: !paid });
-        haptic('medium');
-        toast(!paid ? 'Отмечено как оплаченный'
+        if (r && r.ask) { haptic(); askFree(r.ask); return; }
+        afterPay(r, !paid ? 'Отмечено как оплаченный'
           : r && r.kept ? `Отметка снята. ${money(r.kept)} из выписки остались в журнале оплатой клиента`
             : 'Отметка снята');
-        // Самозанятому именно сейчас надо выдать чек: счёт и акт доход не
-        // закрывают. Момент единственный — деньги переводом приходят молча,
-        // документ уже выписан, и всё выглядит законченным.
-        if (r && r.npd) pendingCheque = r.npd;
-        render();
       }),
     }, paid ? 'Снять отметку об оплате' : 'Отметить оплату')));
+    box.append(payZone);
   }
 
   // Чек «Мой налог»: пробит ли, и ссылка на него — прямо в карточке документа.

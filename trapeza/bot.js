@@ -1658,6 +1658,39 @@ function rebuildText(fixed) {
   return parts.length ? `Пересчитал журнал: ${parts.join(', ')}.` : '';
 }
 
+/** «Оплатил» как новая оплата: проводка по документу, долг клиента уменьшается. */
+async function payDocAsNew(tg, chatId, user, id) {
+  const when = bdb.markPaid(user.id, id);
+  if (when) await tg.sendMessage(chatId, `✅ Отметил оплату ${ru(when)} — долг закрыт.`);
+  await remindCheque(tg, chatId, user);
+  await showDoc(tg, chatId, user, id);
+}
+
+/**
+ * «Оплатил» при свободных оплатах клиента: спрашиваем, не одна ли из них.
+ * Один и тот же вопрос и одна и та же функция привязки (lib/bot-db.js) — у
+ * бота и у приложения, чтобы они не разошлись в ответе.
+ */
+async function askFreePayment(tg, chatId, user, id, free) {
+  const d = bdb.getDoc(user.id, id);
+  const cp = d && d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
+  const rows = free.length === 1
+    ? [[{ text: 'Да, это она', data: `doc.pfree:${id}:${free[0].opId}` }]]
+    : free.map((p) => [{ text: `Да: ${bdb.freePaymentLabel(p)}`, data: `doc.pfree:${id}:${p.opId}` }]);
+  rows.push([{ text: 'Нет, это новая оплата', data: `doc.pnew:${id}` }]);
+  rows.push([{ text: '⬅️ К документу', data: `doc:${id}` }]);
+  await tg.sendMessage(chatId, esc(bdb.freePaymentQuestion(cp && cp.name, free)), keyboard(rows));
+}
+
+/** Что сказать после привязки свободной оплаты к документу. */
+function linkedText(r) {
+  const head = r.partial
+    ? `✅ Привязал ${formatRub(r.linked)} к документу. Осталось получить ${formatRub(r.left)} — отметьте оплату, когда придёт остальное.`
+    : `✅ Привязал оплату ${formatRub(r.linked)} к документу и отметил его оплаченным ${ru(r.paidAt)}.`;
+  return `${head} Новой оплаты в журнал не добавлял — эти деньги там уже были.`
+    + (r.rest ? ` Ещё ${formatRub(r.rest)} остались оплатой клиента без документа.` : '');
+}
+
 async function showDoc(tg, chatId, user, docId) {
   const d = bdb.getDoc(user.id, docId);
   if (!d) { await tg.sendMessage(chatId, 'Документ не найден.', mainMenu()); return; }
@@ -6176,9 +6209,27 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('doc.paid:')) {
       const id = Number(data.slice(9));
-      const when = bdb.markPaid(user.id, id);
-      if (when) await tg.sendMessage(chatId, `✅ Отметил оплату ${ru(when)} — долг закрыт.`);
-      await remindCheque(tg, chatId, user);
+      // Есть свободная оплата клиента — сначала спрашиваем, не она ли это:
+      // иначе те же деньги записались бы второй раз.
+      const free = bdb.freePaymentsFor(user.id, id);
+      if (free.length) { await askFreePayment(tg, chatId, user, id, free); return; }
+      await payDocAsNew(tg, chatId, user, id);
+      return;
+    }
+    if (data.startsWith('doc.pnew:')) {
+      await payDocAsNew(tg, chatId, user, Number(data.slice(9)));
+      return;
+    }
+    if (data.startsWith('doc.pfree:')) {
+      const [id, opId] = data.slice(10).split(':').map(Number);
+      const r = bdb.linkFreePayment(user.id, id, opId);
+      if (!r) {
+        await tg.sendMessage(chatId, 'Эта оплата уже привязана к документу или удалена. '
+          + 'Нажмите «Отметить оплаченным» ещё раз.');
+      } else {
+        await tg.sendMessage(chatId, linkedText(r));
+        await remindCheque(tg, chatId, user);
+      }
       await showDoc(tg, chatId, user, id);
       return;
     }

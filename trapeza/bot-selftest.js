@@ -9074,6 +9074,87 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     bdb.clearState(vera.id);
   }
 
+  console.log('\n── «Оплатил» при свободной оплате: «Это она?» (Р2) ──');
+  {
+    /*
+     * Сценарий ревизора: накладные 3 000 и 4 000, оплата 3 000 внесена строкой,
+     * «Оплатил» на первой. Раньше те же деньги писались второй раз, и долг
+     * выходил 1 000 вместо 4 000. Теперь бот спрашивает, не она ли это.
+     */
+    const bdbR = require('./lib/bot-db');
+    const dsR = require('./lib/doc-service');
+    const uid = fxUserId();
+    const mk = async (cpId, price, date) => (await dsR.issueDocument(uid, {
+      type: 'torg12', cpId, date, skipQuota: true, items: [{ name: 'Обед', qty: 1, price }],
+    })).doc;
+    const bal = (cpId) => Math.round(bdbR.balanceOf(uid, cpId).closing * 100) / 100;
+    const mkCp = (name) => bdbR.createCp(uid, { name, kind: 'customer', opening_date: '2026-01-01' });
+
+    // «Да, это она»
+    const cpY = mkCp('ООО «Заря-Да»');
+    const y1 = await mk(cpY, 3000, '2026-10-01');
+    const y2 = await mk(cpY, 4000, '2026-10-02');
+    bdbR.addOp(uid, cpY, { date: '2026-10-12', kind: 'Оплата', doc: 'п/п 7', debit: 3000 });
+    ok(bal(cpY) === 4000, 'до отметки долг 4 000 (7 000 минус внесённые 3 000)', bal(cpY));
+    sent.length = 0;
+    await tap(`doc.paid:${y1.id}`);
+    ok(norm(last()).includes('уже есть оплата 3 000 ₽ от 12.10') && last().includes('Это она?'),
+      'вместо отметки — вопрос: «У клиента … есть оплата 3 000 ₽ от 12.10 … Это она?»', norm(last()).slice(0, 140));
+    ok(Boolean(button('Да, это она')) && Boolean(button('Нет, это новая оплата')), 'две кнопки: «Да, это она» и «Нет, это новая оплата»');
+    ok(!bdbR.getDoc(uid, y1.id).paid_at && bal(cpY) === 4000, 'пока человек не ответил, ничего не записано');
+    await tap(button('Да, это она'));
+    ok(bal(cpY) === 4000, 'Да: долг остался 4 000 — новой проводки нет', bal(cpY));
+    ok(bdbR.getDoc(uid, y1.id).paid_at === '2026-10-12', 'документ отмечен оплаченным датой самой оплаты');
+    ok(bdbR.listOps(uid, cpY).filter((o) => o.debit > 0).length === 1, 'проводка оплаты одна — прежняя, привязанная к документу');
+    ok(norm(sent.map((m) => m.text || '').join(' ')).includes('Привязал оплату 3 000'), 'бот сказал, что привязал оплату');
+    ok(bdbR.unpaidSummary(uid).docs.filter((d) => d.cp_id === cpY).map((d) => d.id).join() === String(y2.id),
+      'в «Не оплачено» у клиента осталась вторая накладная');
+
+    // «Нет, это новая оплата» — прежнее поведение
+    const cpN = mkCp('ООО «Заря-Нет»');
+    const n1 = await mk(cpN, 3000, '2026-10-01');
+    await mk(cpN, 4000, '2026-10-02');
+    bdbR.addOp(uid, cpN, { date: '2026-10-12', kind: 'Оплата', doc: 'п/п 8', debit: 3000 });
+    await tap(`doc.paid:${n1.id}`);
+    await tap(button('Нет, это новая оплата'));
+    ok(bal(cpN) === 1000, 'Нет: прежнее поведение — оплата записана заново, долг 1 000', bal(cpN));
+
+    // Несколько свободных оплат: до трёх, самые подходящие по сумме
+    const cpM = mkCp('ООО «Заря-Много»');
+    const m1 = await mk(cpM, 3000, '2026-10-01');
+    for (const amount of [1000, 3000, 5000, 3500]) bdbR.addOp(uid, cpM, { date: '2026-10-05', kind: 'Оплата', doc: `п/п ${amount}`, debit: amount });
+    sent.length = 0;
+    await tap(`doc.paid:${m1.id}`);
+    const many = sent[sent.length - 1];
+    const yes = many.kb.flat().filter((b) => /^Да:/.test(b.text));
+    ok(yes.length === 3, 'несколько оплат — предложено ровно три', yes.map((b) => b.text).join(' | '));
+    ok(norm(yes[0].text).includes('3 000'), 'первой — та, что точно равна остатку документа', yes[0].text);
+    ok(norm(many.text).includes('Какая из них'), 'вопрос про выбор, а не «Это она?»', norm(many.text).slice(0, 100));
+
+    // Оплата меньше остатка — частичная; больше — привязывается часть
+    const cpP = mkCp('ООО «Заря-Часть»');
+    const p1 = await mk(cpP, 3000, '2026-10-01');
+    bdbR.addOp(uid, cpP, { date: '2026-10-06', kind: 'Оплата', doc: 'п/п 1', debit: 1000 });
+    await tap(`doc.paid:${p1.id}`);
+    await tap(button('Да, это она'));
+    ok(!bdbR.getDoc(uid, p1.id).paid_at && bdbR.linkedPaid(p1.id) === 1000 && bal(cpP) === 2000,
+      'меньше остатка — частичная оплата: привязано 1 000, документ ещё ждёт', `${bdbR.linkedPaid(p1.id)} / ${bal(cpP)}`);
+    ok(norm(sent.map((m) => m.text || '').join(' ')).includes('Осталось получить 2 000'), 'бот назвал остаток');
+    const cpB = mkCp('ООО «Заря-Больше»');
+    const b1 = await mk(cpB, 3000, '2026-10-01');
+    bdbR.addOp(uid, cpB, { date: '2026-10-07', kind: 'Оплата', doc: 'п/п 2', debit: 5000 });
+    await tap(`doc.paid:${b1.id}`);
+    await tap(button('Да, это она'));
+    ok(bdbR.getDoc(uid, b1.id).paid_at && bdbR.linkedPaid(b1.id) === 3000 && bal(cpB) === -2000,
+      'больше остатка — привязано 3 000, ещё 2 000 свободны (сальдо те же)', `${bdbR.linkedPaid(b1.id)} / ${bal(cpB)}`);
+    ok(bdbR.freePaymentsFor(uid, (await mk(cpB, 1000, '2026-10-08')).id).some((x) => x.amount === 2000),
+      'остаток свободной оплатой предложится следующему документу');
+    // Снятие отметки не стирает деньги, которые пришли на самом деле
+    await tap(`doc.unpaid:${y1.id}`);
+    ok(bal(cpY) === 4000 && bdbR.listOps(uid, cpY).some((o) => o.debit === 3000 && !o.doc_id),
+      'снятие отметки возвращает оплату в свободные — деньги не пропадают', bal(cpY));
+  }
+
   console.log('\n── общий браузер для PDF ──');
   const pdf = require('./lib/pdf');
   if (pdf.pdfAvailable()) {

@@ -302,6 +302,14 @@ function migrate() {
    * два бизнеса на одном аккаунте видели бы одно перемешанное сальдо.
    */
   addColumn('operations', 'org_id', 'INTEGER NOT NULL DEFAULT 0');
+  /*
+   * Оплата, которая раньше висела свободной строкой, а потом была привязана к
+   * документу словами человека («Да, это она», см. linkFreePayment). Деньги
+   * пришли на самом деле, и привязка — только наше решение, какой документ они
+   * закрыли: снимая отметку или удаляя документ, строку надо отвязать, а не
+   * стереть. Банковские строки узнаём по пометке, а эти — по этой графе.
+   */
+  addColumn('operations', 'was_free', 'INTEGER NOT NULL DEFAULT 0');
 
   /*
    * Начальное сальдо принадлежит ПАРЕ «организация — клиент», а не клиенту.
@@ -1316,7 +1324,7 @@ function rebuildDebtInner(userId) {
     'SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = ?',
   ).get(docId, kind).n > 0;
   const hasManualPay = (docId) => db.prepare(
-    "SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = 'Оплата' AND note <> ?",
+    "SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = 'Оплата' AND note <> ? AND was_free = 0",
   ).get(docId, BANK_NOTE).n > 0;
 
   // Одной транзакцией: на середине пересчёта журнал показывал бы долг
@@ -1450,12 +1458,17 @@ function opsOfDoc(userId, docId) {
  */
 const BANK_NOTE = 'банковская выписка';
 function releaseBankPay(userId, docId) {
+  // Свободные оплаты, привязанные словами человека, отвязываются так же, как
+  // банковские: деньги пришли на самом деле, а привязка — только наше решение.
   const where = `doc_id = ? AND kind = 'Оплата'
-    AND (note = ? OR id IN (SELECT op_id FROM bank_imports WHERE user_id = ?))`;
+    AND (note = ? OR was_free = 1 OR id IN (SELECT op_id FROM bank_imports WHERE user_id = ?))`;
   const { s } = db.prepare(`SELECT COALESCE(SUM(debit), 0) AS s FROM operations WHERE ${where}`)
     .get(docId, BANK_NOTE, userId);
   const ids = db.prepare(`SELECT id FROM operations WHERE ${where}`).all(docId, BANK_NOTE, userId).map((r) => r.id);
-  const n = db.prepare(`UPDATE operations SET doc_id = 0, note = ? WHERE ${where}`)
+  // Пометку «банковская выписка» ставим только строкам из банка; у свободной
+  // оплаты остаётся её собственная подпись.
+  const n = db.prepare(`UPDATE operations SET doc_id = 0, note = CASE WHEN was_free = 1 THEN note ELSE ? END,
+      was_free = 0 WHERE ${where}`)
     .run(BANK_NOTE, docId, BANK_NOTE, userId).changes;
   // Деньги пришли на самом деле — чек по ним остаётся, но уже не «за документ».
   if (ids.length) {
@@ -1734,6 +1747,137 @@ function markPaid(userId, docId, date) {
   }
   settleMonthActs(userId, d.cp_id);
   return when;
+}
+
+/**
+ * Свободные оплаты клиента, одну из которых человек мог иметь в виду, нажимая
+ * «Оплатил»: до трёх, самые подходящие по сумме.
+ *
+ * Почему вообще спрашиваем. Человек вносит оплату строкой («пришло 3 000»), а
+ * потом, выписав накладные, жмёт «Оплатил» на первой — и по смыслу это та же
+ * самая оплата. Новая проводка поверх неё записывала те же деньги дважды: при
+ * накладных 3 000 и 4 000 долг после этого был 1 000 вместо 4 000. Угадать
+ * за человека нельзя — оплата могла быть и за что-то другое, — поэтому
+ * спрашиваем и привязываем только по его слову.
+ *
+ * Спрашиваем лишь там, где ответ меняет учёт: документ создаёт долг (иначе
+ * оплата привязывать не к чему — см. closeDocsFromBank) и остаток по нему
+ * не нулевой. Предоплату не предлагаем: она предназначена для отгрузок и
+ * гасится сама.
+ *
+ * @returns {Array<{opId:number, amount:number, date:string, doc:string, rem:number, enough:boolean}>}
+ *   enough — сумма покрывает остаток документа целиком
+ */
+function freePaymentsFor(userId, docId, limit = 3) {
+  const d = getDoc(userId, docId);
+  if (!d || d.paid_at || !d.cp_id || !(Number(d.total) > 0)) return [];
+  const cp = getCp(userId, d.cp_id);
+  if (!cp || cp.kind === 'supplier') return [];
+  const { lead } = dealOf(userId, d);
+  const org = orgOfDoc(userId, d) || {};
+  if (lead.no_debt || !lead.cp_id || !(Number(lead.total) > 0) || !makesDebt(org, lead.type)) return [];
+  const rem = Math.max(0, round2(Number(lead.total) - linkedPaid(lead.id)));
+  if (rem <= 0.004) return [];
+  const orgId = Number(d.org_id) || currentOrgId(userId);
+  const rows = db.prepare(`
+    SELECT id, date, doc, debit FROM operations
+     WHERE cp_id = ? AND org_id = ? AND kind = 'Оплата' AND doc_id = 0 AND debit > 0 AND note <> 'Предоплата'
+     ORDER BY date DESC, id DESC`).all(d.cp_id, orgId);
+  return rows
+    .map((o) => ({
+      opId: o.id, amount: round2(o.debit), date: o.date, doc: o.doc || '', rem,
+      enough: round2(o.debit) >= rem - 0.004,
+    }))
+    // Ближе всего к остатку — первой; при равенстве свежая оплата вероятнее старой.
+    .sort((a, b) => Math.abs(a.amount - rem) - Math.abs(b.amount - rem))
+    .slice(0, limit);
+}
+
+const dayMonth = (iso) => `${String(iso).slice(8, 10)}.${String(iso).slice(5, 7)}`;
+
+/** Подпись кнопки: «3 000 ₽ от 12.10». */
+const freePaymentLabel = (p) => `${fmtRub(p.amount)} от ${dayMonth(p.date)}`;
+
+/**
+ * Вопрос человеку: «Это она?» — одним текстом для бота и приложения.
+ * Названия клиента не склоняем (ООО «Заря» в родительный не поставить), поэтому
+ * «у клиента …», а не «у Зари».
+ */
+function freePaymentQuestion(cpName, list) {
+  const day = dayMonth;
+  const who = cpName ? `клиента ${cpName}` : 'клиента';
+  if (list.length === 1) {
+    const p = list[0];
+    return `У ${who} уже есть оплата ${fmtRub(p.amount)} от ${day(p.date)}, `
+      + 'не привязанная к документу. Это она?';
+  }
+  return `У ${who} есть оплаты, не привязанные к документу. Какая из них за этот документ?`;
+}
+
+/**
+ * Привязать свободную оплату к документу — по слову человека «Да, это она».
+ *
+ * Новой проводки нет: деньги уже в журнале, сальдо не меняется ни на копейку.
+ * Меняется только то, что известно про эти деньги, — за какой они документ.
+ *
+ *   • Оплата не больше остатка документа — привязывается вся строка (doc_id).
+ *     Меньше остатка — это частичная оплата, документ остаётся в «Ждут оплаты»
+ *     с остатком, как при частичной оплате из выписки.
+ *   • Оплата больше остатка — привязывается часть, остальное остаётся
+ *     свободной строкой, как делает закрытие из выписки (closeDocsFromBank).
+ *
+ * Чек самозанятого по этим деньгам уже заведён при внесении оплаты и переезжает
+ * вместе со строкой — второй не появляется (moveCheque).
+ *
+ * @returns {null|{linked:number, left:number, partial:boolean, paidAt:string, rest:number}}
+ *   null — такой свободной оплаты для этого документа нет (уже привязали,
+ *   удалили, другой клиент); left — сколько осталось закрыть по документу
+ */
+function linkFreePayment(userId, docId, opId) {
+  const d = getDoc(userId, docId);
+  if (!d || d.paid_at) return null;
+  // Проверяем, что это действительно свободная оплата ЭТОГО клиента и фирмы: opId приходит из запроса.
+  const p = freePaymentsFor(userId, docId, 1000).find((x) => x.opId === Number(opId));
+  if (!p) return null;
+  const { lead, twin } = dealOf(userId, d);
+  const src = db.prepare('SELECT * FROM operations WHERE id = ?').get(p.opId);
+  const amount = Math.min(p.amount, p.rem);
+  const whole = amount >= round2(src.debit) - 0.004;
+  const full = amount >= p.rem - 0.004;
+  const rest = whole ? 0 : round2(src.debit - amount);
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if (whole) {
+      db.prepare('UPDATE operations SET doc_id = ?, was_free = 1 WHERE id = ?').run(lead.id, src.id);
+      try {
+        db.prepare('UPDATE npd_cheques SET doc_id = ? WHERE user_id = ? AND op_id = ?').run(lead.id, userId, src.id);
+      } catch (_) { /* таблицы нет */ }
+    } else {
+      db.prepare('UPDATE operations SET debit = ? WHERE id = ?').run(rest, src.id);
+      // Новая строка — те же деньги, а не новые: чек за них не заводим заново.
+      const freshId = quietly(() => addOpForDoc(userId, lead.cp_id, {
+        date: src.date, kind: 'Оплата', doc: src.doc, debit: amount, note: src.note,
+      }, lead.id, true));
+      db.prepare('UPDATE operations SET was_free = 1 WHERE id = ?').run(freshId);
+      moveCheque(userId, src.id, { dropped: false, rest, freshId, docId: lead.id, total: amount });
+    }
+    if (full) {
+      const mark = db.prepare('UPDATE documents SET paid_at = ?, paid_with = ? WHERE id = ? AND user_id = ?');
+      mark.run(p.date, lead.id === d.id ? 0 : lead.id, d.id, userId);
+      if (lead.id !== d.id) mark.run(p.date, 0, lead.id, userId);
+      if (twin && twin.id !== d.id) mark.run(p.date, lead.id, twin.id, userId);
+    }
+    settleMonthActs(userId, d.cp_id);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return {
+    linked: amount, rest, partial: !full, paidAt: full ? p.date : '',
+    left: full ? 0 : round2(p.rem - amount), leadId: lead.id,
+  };
 }
 
 /**
@@ -3033,6 +3177,7 @@ module.exports = {
   debtByDoc, rebuildDebt, restoreDebt,
   markPaid, unmarkPaid, matchPaymentsToDocs, closeDocsFromBank, docNumbersIn, linkedPaid, dealOf, settleMonthActs,
   unpaidDocs, unpaidSummary, dealTotals, docsBetween,
+  freePaymentsFor, freePaymentQuestion, freePaymentLabel, linkFreePayment,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
   isSeqTaken, guardSeq, numberTakenInOrg, currentOrgId, currentOrg, setActiveOrg,
   orgQuota, grantOrgSlots,

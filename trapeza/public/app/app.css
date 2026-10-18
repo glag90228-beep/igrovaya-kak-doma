@@ -692,6 +692,13 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .banner.info { background: color-mix(in srgb, var(--primary) 12%, var(--surface)); }
 .banner .icon { color: var(--danger); }
 .banner.info .icon { color: var(--primary); }
+/* Текст баннера занимает всё место справа от значка — иначе кнопки внутри
+   сжимаются по содержимому и перестают быть цельной полосой. */
+.banner > div { flex: 1; min-width: 0; }
+.banner > .icon { flex: none; }
+/* Кнопки столбиком внутри баннера: каждая на всю ширину, не меньше 44 px в высоту. */
+.btn-col { display: flex; flex-direction: column; gap: 8px; }
+.btn-col .btn { min-height: 48px; }
 
 .badge {
   font-size: 12px; font-weight: 500;

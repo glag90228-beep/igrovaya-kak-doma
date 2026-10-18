@@ -1088,6 +1088,39 @@ const api = {
     // сегодняшним днём, и оплата ложилась не тем числом, что назвал человек.
     const payDate = body.date ? isoDay(str(body.date, 10)) : '';
     if (body.date && !payDate) return { error: 'Такой даты не бывает. Укажите существующую дату оплаты.' };
+    /*
+     * Есть свободная оплата клиента — сначала спрашиваем, не она ли это.
+     *
+     * Человек внёс «пришло 3 000» строкой, а потом жмёт «Оплатил» на
+     * накладной на те же 3 000: деньги одни, а записались бы дважды. Угадывать
+     * нельзя, поэтому ответ приходит из приложения следующим запросом:
+     * free — id оплаты («Да, это она») или 'new' («Нет, это новая оплата»).
+     * Бот спрашивает ровно так же и ровно той же функцией.
+     */
+    if (body.free === undefined) {
+      const list = bdb.freePaymentsFor(user.id, id);
+      if (list.length) {
+        const cp = bdb.getCp(user.id, doc.cp_id);
+        return {
+          ask: {
+            question: bdb.freePaymentQuestion(cp && cp.name, list),
+            options: list.map((p) => ({
+              opId: p.opId, amount: p.amount, date: p.date, enough: p.enough,
+              label: bdb.freePaymentLabel(p),
+            })),
+          },
+        };
+      }
+    } else if (body.free !== 'new') {
+      const r = bdb.linkFreePayment(user.id, id, Number(body.free));
+      if (!r) return { error: 'Эта оплата уже привязана к документу или удалена. Отметьте оплату заново.' };
+      return {
+        paidAt: r.paidAt,
+        linked: { amount: r.linked, left: r.left, partial: r.partial, rest: r.rest },
+        doc: docBrief(bdb.getDoc(user.id, id)),
+        npd: npdNoteFor(user.id, id),
+      };
+    }
     const when = bdb.markPaid(user.id, id, payDate);
     // Самозанятому в этот момент надо выдать чек: счёт и акт доход не
     // закрывают, его закрывает чек «Моего налога» (lib/npd.js). Запись о нём

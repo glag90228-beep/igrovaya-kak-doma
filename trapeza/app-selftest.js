@@ -38,12 +38,12 @@ const TOKEN = process.env.BOT_TOKEN;
 const APP = __dirname;
 const bdb = require(path.join(APP, 'lib/bot-db'));
 const docService = require(path.join(APP, 'lib/doc-service'));
-const { server, setTelegram } = require(path.join(APP, 'miniapp'));
+const { server, setTelegram, forgetRate } = require(path.join(APP, 'miniapp'));
 
 const USER = { id: 515151, first_name: 'Мария', username: 'masha' };
 
-function initData() {
-  const fields = { auth_date: String(Math.floor(Date.now() / 1000)), user: JSON.stringify(USER) };
+function initData(who = USER) {
+  const fields = { auth_date: String(Math.floor(Date.now() / 1000)), user: JSON.stringify(who) };
   const check = Object.entries(fields).map(([k, v]) => `${k}=${v}`).sort().join('\n');
   const secret = crypto.createHmac('sha256', 'WebAppData').update(TOKEN).digest();
   const q = new URLSearchParams(fields);
@@ -105,8 +105,9 @@ const ok = (c, m, extra) => {
       ready: noop, expand: noop, close: noop, openLink: noop, setHeaderColor: noop,
       disableVerticalSwipes: noop,
       BackButton: { show: noop, hide: noop, onClick: noop },
+      // Обработчик главной кнопки запоминаем: настоящая кнопка живёт в Telegram, а проверке надо её «нажать».
       MainButton: { setParams() { return this; }, show() { return this; }, hide() { return this; },
-        onClick: noop, offClick: noop, showProgress: noop, hideProgress: noop },
+        onClick: (f) => { window.__mainClick = f; }, offClick: noop, showProgress: noop, hideProgress: noop },
       HapticFeedback: { impactOccurred: noop, notificationOccurred: noop },
     } };
   }, initData());
@@ -953,6 +954,51 @@ const ok = (c, m, extra) => {
     await page.waitForFunction(() => !document.getElementById('cp-schedules'), null, { timeout: 8000 });
     ok(!recLib.list(user.id).some((r) => r.cp_id === cpS), 'остановка из карточки клиента сняла расписание');
   }
+
+  console.log('\n── «Оплатил»: «Это она?» (Р2) ──');
+  {
+    forgetRate();
+    const cpP = bdb.createCp(user.id, { name: 'ООО «Заря-Р2»', kind: 'customer', opening_date: '2026-01-01' });
+    const tdoc = await docService.issueDocument(user.id, { type: 'torg12', cpId: cpP, date: '2026-10-01', skipQuota: true,
+      items: [{ name: 'Обед', qty: 1, price: 3000 }] });
+    await docService.issueDocument(user.id, { type: 'torg12', cpId: cpP, date: '2026-10-02', skipQuota: true,
+      items: [{ name: 'Обед', qty: 1, price: 4000 }] });
+    bdb.addOp(user.id, cpP, { date: '2026-10-12', kind: 'Оплата', doc: 'п/п 41', debit: 3000 });
+    await page.evaluate((id) => window.__go('doc', { id }), tdoc.doc.id);
+    await page.waitForSelector('#pay-main', { timeout: 5000 });
+    await page.locator('#pay-main').tap();
+    await page.waitForSelector('#free-pay-ask', { timeout: 5000 });
+    const q = (await page.textContent('#free-pay-ask')).replace(/\s/g, ' ');
+    ok(q.includes('уже есть оплата 3 000 ₽ от 12.10, не привязанная к документу. Это она?'), 'вопрос: «У клиента … есть оплата 3 000 ₽ от 12.10 … Это она?»', q);
+    ok(q.includes('Да, это она') && q.includes('Нет, это новая оплата'), 'кнопки «Да, это она» и «Нет, это новая оплата»');
+    ok(!bdb.getDoc(user.id, tdoc.doc.id).paid_at, 'пока не ответили — документ не отмечен');
+    ok(await page.evaluate(() => [...document.querySelectorAll('#free-pay-ask .btn')].every((b) => b.getBoundingClientRect().height >= 44)), 'кнопки ответа ≥ 44 px');
+    await page.getByRole('button', { name: 'Да, это она', exact: true }).tap();
+    await page.waitForFunction((id) => !document.getElementById('free-pay-ask') && /Оплачен/.test(document.querySelector('#app').innerText), null, { timeout: 8000 });
+    const bal = Math.round(bdb.balanceOf(user.id, cpP).closing * 100) / 100;
+    ok(bdb.getDoc(user.id, tdoc.doc.id).paid_at === '2026-10-12' && bal === 4000, 'Да: документ оплачен, долг клиента остался 4 000', bal);
+    ok(/Привязал оплату 3 000,00 ₽/.test((await page.locator('#toast').textContent()).replace(/\s/g, ' ')), 'сказано, что оплата привязана, а не добавлена');
+  }
+
+  /** Новая страница в телефонном размере от имени другого человека — для проверок «с нуля». */
+  const openAs = async (who) => {
+    const c = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, locale: 'ru-RU' });
+    await c.route('https://telegram.org/**', (route) => route.abort());
+    await c.addInitScript((data) => {
+      const noop = () => {};
+      window.Telegram = { WebApp: { initData: data, initDataUnsafe: {}, themeParams: {}, colorScheme: 'light',
+        ready: noop, expand: noop, close: noop, openLink: noop, setHeaderColor: noop, disableVerticalSwipes: noop,
+        BackButton: { show: noop, hide: noop, onClick: noop },
+        MainButton: { setParams() { return this; }, show() { return this; }, hide() { return this; },
+          onClick: (f) => { window.__mainClick = f; }, offClick: noop, showProgress: noop, hideProgress: noop },
+        HapticFeedback: { impactOccurred: noop, notificationOccurred: noop } } };
+    }, initData(who));
+    const pg = await c.newPage();
+    pg.on('pageerror', (e) => ok(false, `ошибка страницы: ${e.message}`));
+    await pg.goto(base, { waitUntil: 'domcontentloaded' });
+    await pg.waitForSelector('#app .screen', { timeout: 10000 });
+    return { page: pg, close: () => c.close() };
+  };
 
   console.log('\n── вход с обычного сайта, без Telegram ──');
   {

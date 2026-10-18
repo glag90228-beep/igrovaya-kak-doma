@@ -722,7 +722,7 @@ async function main() {
     r = await call('POST', '/api/op', { user: nUser, body: { cpId: cpN, kind: 'payment', amount: 20000, date: '2026-10-02', doc: 'п/п 1' } });
     ok(r.status === 200 && r.json.npd && /на 20 000 ₽/.test(r.json.npd.text.replace(/\s/g, ' ')),
       'Р3: оплата 20 000 руками — приложение сразу напоминает про чек на 20 000', JSON.stringify(r.json.npd && r.json.npd.text));
-    r = await call('POST', '/api/doc/paid', { user: nUser, body: { id: invN, date: '2026-10-03' } });
+    r = await call('POST', '/api/doc/paid', { user: nUser, body: { id: invN, date: '2026-10-03', free: 'new' } });
     ok(r.json.npd && /на 30 000 ₽/.test(r.json.npd.text.replace(/\s/g, ' ')) && r.json.npd.cheque.amount === 30000,
       'Р3: «Оплатил» после частичной — чек на остаток 30 000, а не на 50 000', JSON.stringify(r.json.npd && r.json.npd.cheque && r.json.npd.cheque.amount));
     r = await call('GET', '/api/cheques', { user: nUser });
@@ -3372,6 +3372,128 @@ async function main() {
       ok(u('') === 'неизвестный браузер' && u('curl/8') === 'неизвестный браузер', 'пустое и незнакомое — «неизвестный браузер»');
       ok(!/[<>&"]/.test(u('<script>alert(1)</script> Chrome/1')), 'чужой текст в короткое имя не попадает');
     }
+  }
+
+  section('«Оплатил» спрашивает про свободную оплату (Р2)');
+  {
+    const U = { id: 500707, first_name: 'Олег', username: 'oleg' };
+    const ud = initDataFor(U);
+    const bdbF = require('./lib/bot-db');
+    const uid = bdbF.getOrCreateUser(U.id).id;
+    bdbF.saveMyOrg(uid, { name: 'ИП Олегов', inn: '183209316100', signer: 'О. О. Олегов' });
+    const bal = (cpId) => Math.round(bdbF.balanceOf(uid, cpId).closing * 100) / 100;
+    const mkCp = (name) => bdbF.createCp(uid, { name, kind: 'customer', opening_date: '2026-01-01' });
+    const mk = async (cpId, price, date) => (await docService.issueDocument(uid, {
+      type: 'torg12', cpId, date, skipQuota: true, items: [{ name: 'Обед', qty: 1, price }],
+    })).doc;
+    const pay = (id, extra = {}) => call('POST', '/api/doc/paid', { user: ud, body: { id, ...extra } });
+    const freeOp = (cpId, amount, date = '2026-10-12') => call('POST', '/api/op', { user: ud, body: { cpId, kind: 'payment', amount, date } });
+
+    // Сценарий ревизора: накладные 3 000 и 4 000, оплата 3 000 внесена строкой.
+    const cpA = mkCp('ООО «Заря»');
+    const a1 = await mk(cpA, 3000, '2026-10-01');
+    const a2 = await mk(cpA, 4000, '2026-10-02');
+    await freeOp(cpA, 3000);
+    ok(bal(cpA) === 4000, 'до отметки долг 4 000', bal(cpA));
+    r = await pay(a1.id);
+    ok(r.status === 200 && r.json.ask && r.json.ask.options.length === 1 && !r.json.paidAt,
+      '«Оплатил» вместо отметки спрашивает: есть свободная оплата', JSON.stringify(r.json));
+    ok(/У клиента ООО «Заря» уже есть оплата 3 000 ₽ от 12\.10, не привязанная к документу\. Это она\?/.test(r.json.ask.question.replace(/\s/g, ' ')),
+      'вопрос назван словами из задачи', r.json.ask.question);
+    ok(!bdbF.getDoc(uid, a1.id).paid_at && bal(cpA) === 4000, 'вопрос ничего не записал');
+    const opA = r.json.ask.options[0].opId;
+    r = await pay(a1.id, { free: opA });
+    ok(r.status === 200 && r.json.paidAt === '2026-10-12' && r.json.linked.amount === 3000 && !r.json.linked.partial,
+      'Да, это она: документ оплачен датой поступления', JSON.stringify(r.json.linked));
+    ok(bal(cpA) === 4000, 'долг остался 4 000: проводки новой нет', bal(cpA));
+    ok(bdbF.listOps(uid, cpA).filter((o) => o.debit > 0).length === 1, 'проводка оплаты одна');
+    const us = bdbF.unpaidSummary(uid);
+    ok(us.docs.filter((d) => d.cp_id === cpA).length === 1 && us.docs.find((d) => d.cp_id === cpA).id === a2.id,
+      'в «Ждут оплаты» у клиента осталась вторая накладная');
+    // Повторно привязать ту же оплату нельзя.
+    r = await pay(a2.id, { free: opA });
+    ok(r.status === 400 && /уже привязана/.test(r.json.error), 'уже привязанную оплату второй раз не привязать', (r.json || {}).error);
+    // Снятие отметки возвращает деньги свободной строкой.
+    r = await pay(a1.id, { paid: false });
+    ok(r.json.kept === 3000 && bal(cpA) === 4000, 'снятие отметки: оплата осталась свободной, долг прежний', JSON.stringify(r.json));
+    ok(bdbF.rebuildDebt(uid).added === 0 && bal(cpA) === 4000, 'пересчёт долга ничего не двигает');
+
+    // «Нет, это новая оплата» — прежние 1 000.
+    const cpB = mkCp('ООО «Заря-Нет»');
+    const b1 = await mk(cpB, 3000, '2026-10-01');
+    await mk(cpB, 4000, '2026-10-02');
+    await freeOp(cpB, 3000);
+    r = await pay(b1.id, { free: 'new' });
+    ok(r.status === 200 && r.json.paidAt && bal(cpB) === 1000, 'Нет: оплата записана заново, долг 1 000', bal(cpB));
+
+    // Предоплату не предлагаем: она предназначена для отгрузок.
+    const cpPre = mkCp('ООО «Аванс»');
+    const pr1 = await mk(cpPre, 3000, '2026-10-01');
+    bdbF.addPrepay(uid, cpPre, 3000, '2026-09-30');
+    ok(bdbF.freePaymentsFor(uid, pr1.id).length === 0, 'предоплату в свободные оплаты не предлагаем');
+
+    // Меньше остатка — частичная оплата; потом «Оплатил» на остаток без вопроса.
+    const cpC = mkCp('ООО «Заря-Часть»');
+    const c1 = await mk(cpC, 3000, '2026-10-01');
+    await freeOp(cpC, 1000, '2026-10-06');
+    r = await pay(c1.id);
+    r = await pay(c1.id, { free: r.json.ask.options[0].opId });
+    ok(r.json.linked.partial && r.json.linked.left === 2000 && !r.json.paidAt && !bdbF.getDoc(uid, c1.id).paid_at,
+      'меньше остатка: частичная оплата, осталось 2 000', JSON.stringify(r.json.linked));
+    const us2 = bdbF.unpaidSummary(uid).docs.find((d) => d.id === c1.id);
+    ok(us2 && us2.paid === 1000 && us2.left === 2000, '«Ждут оплаты»: оплачено 1 000, осталось 2 000');
+    r = await pay(c1.id);
+    ok(!r.json.ask && r.json.paidAt && bal(cpC) === 0, 'свободных больше нет — «Оплатил» закрывает остаток без вопроса', JSON.stringify(r.json));
+
+    // Больше остатка — привязывается часть, остальное свободно.
+    const cpD = mkCp('ООО «Заря-Больше»');
+    const d1 = await mk(cpD, 3000, '2026-10-01');
+    await freeOp(cpD, 5000, '2026-10-07');
+    r = await pay(d1.id);
+    r = await pay(d1.id, { free: r.json.ask.options[0].opId });
+    ok(r.json.paidAt && r.json.linked.amount === 3000 && r.json.linked.rest === 2000, 'больше остатка: привязано 3 000, 2 000 свободны', JSON.stringify(r.json.linked));
+    ok(bal(cpD) === -2000 && bdbF.linkedPaid(d1.id) === 3000, 'сальдо те же: -2 000, на документе 3 000');
+
+    // Несколько оплат: до трёх, ближайшая по сумме — первой.
+    const cpE = mkCp('ООО «Заря-Много»');
+    const e1 = await mk(cpE, 3000, '2026-10-01');
+    for (const amount of [1000, 3000, 5000, 3500]) await freeOp(cpE, amount, '2026-10-05');
+    r = await pay(e1.id);
+    ok(r.json.ask.options.length === 3 && r.json.ask.options[0].amount === 3000 && /Какая из них/.test(r.json.ask.question),
+      'несколько оплат: три варианта, первый — ровно по сумме', JSON.stringify(r.json.ask.options.map((o) => o.amount)));
+
+    // Чужая оплата: её id в запросе другого человека не принимается.
+    const cpF = mkCp('ООО «Заря-Чужая»');
+    const f1 = await mk(cpF, 1000, '2026-10-01');
+    const otherUser = initDataFor({ id: 500808, first_name: 'Чужой' });
+    await call('GET', '/api/state', { user: otherUser });
+    r = await call('POST', '/api/doc/paid', { user: otherUser, body: { id: f1.id, free: opA } });
+    ok(r.status === 400, 'чужой документ с чужой оплатой не отметить', (r.json || {}).error);
+    r = await pay(f1.id, { free: 99999999 });
+    ok(r.status === 400 && /уже привязана|удалена/.test(r.json.error), 'выдуманный номер оплаты — отказ', (r.json || {}).error);
+  }
+
+  section('самозанятый: «Да, это она» не задваивает чек (Р2)');
+  {
+    const U = { id: 500909, first_name: 'Нина', username: 'nina2' };
+    const ud = initDataFor(U);
+    const bdbF = require('./lib/bot-db');
+    const uid = bdbF.getOrCreateUser(U.id).id;
+    bdbF.saveMyOrg(uid, { name: 'Иванова Н. Н.', inn: '183200000011' });
+    const org = bdbF.getDefaultOrg(uid);
+    bdbF.updateOrg(uid, org.id, { npd: 1, debt_basis: 'invoice' });
+    const cpN = bdbF.createCp(uid, { name: 'Петров П. П.', kind: 'customer', inn: '183100000099', opening_date: '2026-01-01' });
+    const inv = (await docService.issueDocument(uid, { type: 'sch', cpId: cpN, date: '2026-10-01', skipQuota: true,
+      items: [{ name: 'Консультация', qty: 1, price: 20000 }] })).doc;
+    r = await call('POST', '/api/op', { user: ud, body: { cpId: cpN, kind: 'payment', amount: 20000, date: '2026-10-02' } });
+    ok(r.json.npd && r.json.npd.cheque.amount === 20000, 'оплата руками — чек на 20 000 заведён сразу');
+    r = await call('POST', '/api/doc/paid', { user: ud, body: { id: inv.id } });
+    ok(r.json.ask, 'при «Оплатил» спрашивает про свободную оплату');
+    r = await call('POST', '/api/doc/paid', { user: ud, body: { id: inv.id, free: r.json.ask.options[0].opId } });
+    const open = require('./lib/cheques').open(uid);
+    ok(open.length === 1 && open[0].amount === 20000 && open[0].doc_id === inv.id,
+      'после «Да, это она» чек один — прежний, и он теперь «за документ»', JSON.stringify(open.map((c) => [c.amount, c.doc_id])));
+    ok(r.json.npd === null || !r.json.npd, 'про чек второй раз не напоминаем: человек уже знает');
   }
 
   // Сервер держим до конца: проверки выше ходят к нему по HTTP, и закрытый
