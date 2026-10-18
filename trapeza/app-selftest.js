@@ -1028,6 +1028,44 @@ const ok = (c, m, extra) => {
     return { page: pg, close: () => c.close() };
   };
 
+  console.log('\n── главная: новичку — три шага, а не «0 ₽» (Д1) ──');
+  {
+    forgetRate();
+    const NB = { id: 515353, first_name: 'Игорь', username: 'igor_nb' };
+    const nbUser = bdb.getOrCreateUser(NB.id, 'Игорь', 'igor_nb');
+    const nbPage = await openAs(NB);
+    const np = nbPage.page;
+    const home = async () => {
+      await np.goto(base, { waitUntil: 'domcontentloaded' });
+      await np.waitForSelector('#app .screen', { timeout: 10000 });
+      await np.waitForSelector('#steps', { timeout: 5000 });
+    };
+    await home();
+    let t = (await np.textContent('#app')).replace(/\s/g, ' ');
+    ok(t.includes('1. Ваши реквизиты') && t.includes('2. Первый клиент') && t.includes('3. Первый документ'), 'Д1: на главной новичка — три шага по порядку', t.slice(0, 200));
+    ok(!t.includes('К получению') && !t.includes('все рассчитались'), 'Д1: «0 ₽ · все рассчитались» не показано');
+    ok(await np.locator('#steps .step.now').count() === 1 && (await np.textContent('#steps .step.now .step-n')).trim() === '1', 'ближайший шаг — первый');
+    ok((await np.textContent('#steps-go')).trim() === 'Заполнить реквизиты', 'единственная кнопка ведёт к ближайшему шагу');
+    ok(await np.getByText('Ваш первый счёт за 30 секунд').count() === 0 && await np.locator('.cta').count() === 0, 'Д1: дубля «Выписать счёт» нет');
+    ok(await np.locator('#org-banner').count() === 0, 'и плашки про неполные реквизиты у новичка нет — шаг 1 уже про это');
+
+    // Реквизиты начаты, банка нет: шаг не «готово» и не тупик — янтарный, с кнопкой «Дописать», а дальше можно идти.
+    bdb.saveMyOrg(nbUser.id, { name: 'ИП Новичков', inn: '183209316100', signer: 'И. Н.', address: 'г. Ижевск' });
+    await home();
+    ok(await np.locator('#steps .step.part').count() === 1 && await np.locator('#steps .step.done').count() === 0
+      && await np.locator('#steps-finish-org').count() === 1 && (await np.textContent('#steps-go')).trim() === 'Добавить клиента',
+    'реквизиты без банка: шаг 1 «начат» (кнопка «Дописать»), главная кнопка ведёт к клиенту');
+    bdb.saveMyOrg(nbUser.id, { name: 'ИП Новичков', inn: '183209316100', signer: 'И. Н.', address: 'г. Ижевск',
+      bank_name: 'АО «ТБанк»', bik: '044525974', acc: '40802810600005555555', corr_acc: '30101810145250000974' });
+    await home();
+    ok(await np.locator('#steps .step.done').count() === 1 && (await np.textContent('#steps-go')).trim() === 'Добавить клиента', 'реквизиты есть — ближайший шаг «Добавить клиента»');
+    bdb.createCp(nbUser.id, { name: 'ООО «Заря»', kind: 'customer', opening_date: '2026-01-01' });
+    await home();
+    ok(await np.locator('#steps .step.done').count() === 2 && (await np.textContent('#steps-go')).trim() === 'Выписать счёт', 'клиент есть — «Выписать счёт»');
+
+    await nbPage.close();
+  }
+
   console.log('\n── форма документа без реквизитов (Д2) ──');
   {
     forgetRate();
@@ -1093,6 +1131,25 @@ const ok = (c, m, extra) => {
     await page.waitForSelector('.cp-chip', { timeout: 5000 });
     ok((await page.textContent('.cp-chip')).includes('Ромашка-3'), 'после нажатия клиент заведён и выбран в поле «Кому»');
     ok(bdb.listCps(user.id).some((c) => c.name === 'Ромашка-3' && c.kind === 'customer'), 'в списке клиентов он появился');
+  }
+
+  console.log('\n── главная: плашка про реквизиты — сверху (Д1) ──');
+  {
+    forgetRate();
+    await page.evaluate(() => window.__go('home', {}));
+    await page.waitForSelector('.hero', { timeout: 5000 });
+    const info = await page.evaluate(() => {
+      const banner = document.getElementById('org-banner');
+      const hero = document.querySelector('.hero');
+      if (!banner) return null;
+      return {
+        before: Boolean(banner.compareDocumentPosition(hero) & Node.DOCUMENT_POSITION_FOLLOWING),
+        h: document.querySelector('#org-banner .pill-btn').getBoundingClientRect().height,
+        dupes: document.querySelectorAll('#org-banner').length,
+      };
+    });
+    ok(info && info.before && info.dupes === 1, 'Д1: плашка «Реквизиты заполнены не полностью» стоит выше суммы', JSON.stringify(info));
+    ok(info && info.h >= 44, 'и её кнопка не ниже 44 px', info && info.h);
   }
 
   console.log('\n── письмо не ушло: понятная причина и «Настройки почты» (Д14) ──');

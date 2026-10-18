@@ -720,15 +720,82 @@ screens.home = async function home() {
    * не про деньги, и внутрь они бы шумели.
    */
   const q0 = s.quota || {};
-  box.append(h('div', { class: 'hero' },
-    h('div', { class: 'greet-row' },
-      h('span', { class: 'greet ellipsis', text: greetName(s.user.name) }),
-      h('span', { class: `badge ${q0.paid ? 'ok' : ''}`,
-        text: q0.paid ? 'подписка' : `${q0.left ?? 0}/${q0.limit ?? 0} бесплатно` })),
-    h('div', { class: 'hero-card' },
-      h('div', { class: 'cap', text: 'К получению' }),
-      sumBtn,
-      basisChip(s))));
+  /*
+   * Новичок — тот, у кого ещё нет ни одного документа.
+   *
+   * Ему «К получению 0 ₽ · все рассчитались» говорит ложное: рассчитываться
+   * ещё не с кем, и «все» — это никто. А три блока подряд про счёт («Выписать
+   * счёт», «Ваш первый счёт за 30 секунд», пример во фразе) не подсказывают
+   * порядка: с чего начать — с клиента? с реквизитов? Поэтому вместо суммы —
+   * три шага по порядку и одна кнопка, ведущая к ближайшему.
+   */
+  const newbie = !(s.docs || []).length;
+  const greetRow = h('div', { class: 'greet-row' },
+    h('span', { class: 'greet ellipsis', text: greetName(s.user.name) }),
+    h('span', { class: `badge ${q0.paid ? 'ok' : ''}`,
+      text: q0.paid ? 'подписка' : `${q0.left ?? 0}/${q0.limit ?? 0} бесплатно` }));
+
+  /*
+   * Неполные реквизиты — сверху, до суммы: это единственное, что мешает
+   * документам выходить с оплатой по QR. Раньше плашка стояла в самом низу
+   * длинной главной, а кнопка в ней была ниже пальца (32 px). Новичку она не
+   * нужна: первый шаг ниже и так про реквизиты.
+   */
+  if (!s.orgReady && !newbie) {
+    box.append(h('div', { class: 'banner', id: 'org-banner' }, icon('warn'),
+      h('div', {},
+        h('div', { text: 'Реквизиты заполнены не полностью' }),
+        h('div', { class: 'small muted', style: 'margin:2px 0 8px',
+          text: 'Без банка и счёта в документе не будет QR для оплаты.' }),
+        h('button', { class: 'pill-btn', onclick: () => { haptic(); go('org'); } }, 'Заполнить'))));
+  }
+
+  if (newbie) {
+    const hasOrg = Boolean(s.org && s.org.name);
+    const cpCount = (s.counts && s.counts.cps) || 0;
+    // Реквизиты «начаты», но без банка и счёта: шаг не выполнен, и в то же время дальше идти можно —
+    // счёт выпишется и без QR. Поэтому такой шаг помечаем янтарным и даём маленькую кнопку «Дописать»,
+    // а главная кнопка ведёт к следующему шагу.
+    const partial = hasOrg && !s.orgReady;
+    const steps = [
+      { done: s.orgReady, partial, title: 'Ваши реквизиты',
+        sub: !hasOrg ? 'Название, ИНН и счёт — они печатаются в документах'
+          : (s.orgReady ? 'Готово' : 'Название есть. Банк и счёт допишите — иначе в счёте не будет QR') },
+      { done: cpCount > 0, title: 'Первый клиент',
+        sub: cpCount ? `В списке: ${cpCount}` : 'Кому выписываем. Можно добавить и прямо в документе' },
+      { done: false, title: 'Первый документ', sub: 'Счёт с QR — клиент платит камерой банка' },
+    ];
+    // Ближайший шаг — первый невыполненный и не «начатый»; он подсвечен, и на нём единственная кнопка.
+    const now = steps.findIndex((x) => !x.done && !x.partial);
+    const go1 = [
+      ['Заполнить реквизиты', () => go('org')],
+      ['Добавить клиента', () => go('cp', {})],
+      ['Выписать счёт', () => go('new', { type: 'sch' })],
+    ][now];
+    box.append(h('div', { class: 'hero' }, greetRow));
+    box.append(h('div', { class: 'card steps', id: 'steps' }, steps.map((x, i) => h('div', {
+      class: `row step${x.done ? ' done' : ''}${x.partial ? ' part' : ''}${i === now ? ' now' : ''}`,
+    },
+    h('span', { class: `step-n${x.done ? ' ok' : ''}`, 'aria-hidden': 'true' },
+      x.done ? icon('check') : String(i + 1)),
+    h('span', { class: 'grow' },
+      h('div', { text: `${i + 1}. ${x.title}` }),
+      h('div', { class: 'small muted step-sub', text: x.sub }),
+      x.partial ? h('button', {
+        class: 'pill-btn', id: 'steps-finish-org', style: 'margin-top:8px',
+        onclick: () => { haptic(); go('org'); },
+      }, 'Дописать реквизиты') : null)))));
+    box.append(h('div', { class: 'btn-wrap' }, h('button', {
+      class: 'btn', id: 'steps-go', onclick: () => { haptic('medium'); go1[1](); },
+    }, go1[0])));
+  } else {
+    box.append(h('div', { class: 'hero' },
+      greetRow,
+      h('div', { class: 'hero-card' },
+        h('div', { class: 'cap', text: 'К получению' }),
+        sumBtn,
+        basisChip(s))));
+  }
 
   // Самозанятому: чек надо пробить по каждому поступлению, срок жёсткий —
   // поэтому напоминание стоит на виду, а не в глубине карточки документа.
@@ -759,15 +826,18 @@ screens.home = async function home() {
   askRow.onclick = () => { haptic(); go('ask'); };
   box.append(askRow);
 
-  // Одно главное действие, крупнее всего остального.
-  const cta = h('button', { class: 'cta' },
+  // Одно главное действие, крупнее всего остального. У новичка его роль у
+  // кнопки шага выше — второй такой же «Выписать счёт» только путал бы.
+  const cta = newbie ? null : h('button', { class: 'cta' },
     h('span', { class: 'cta-ico' }, icon('receipt')),
     h('span', { class: 'grow' },
       h('div', { class: 'cta-t', text: 'Выписать счёт' }),
       h('div', { class: 'cta-s', text: 'с QR — клиент платит камерой банка' })),
     icon('chev', 'chev'));
-  cta.onclick = () => { haptic('medium'); go('new', { type: 'sch' }); };
-  box.append(cta);
+  if (cta) {
+    cta.onclick = () => { haptic('medium'); go('new', { type: 'sch' }); };
+    box.append(cta);
+  }
 
   /*
    * Быстрое действие — от состояния, а не сеткой плиток.
@@ -782,15 +852,9 @@ screens.home = async function home() {
    * вкладке «Долги», просто перестал занимать половину главного экрана.
    */
   const lastSch = (s.docs || []).find((d) => d.type === 'sch' && d.cpId);
-  if (!(s.docs || []).length) {
-    const start = h('button', { class: 'row' },
-      h('span', { class: 'icon-box ok' }, icon('receipt')),
-      h('span', { class: 'grow' },
-        h('div', { text: 'Ваш первый счёт за 30 секунд' }),
-        h('div', { class: 'small muted', text: 'с печатью и QR — клиент платит камерой банка' })),
-      icon('chev', 'chev'));
-    start.onclick = () => { haptic('medium'); go('new', { type: 'sch' }); };
-    box.append(h('div', { class: 'card' }, start));
+  // Новичку — шаги наверху, второй «первый счёт» здесь был бы дублем.
+  if (newbie) {
+    // ничего: шаги и кнопка уже на экране
   } else if (lastSch) {
     // Сумму держим в подписи, а не отдельной колонкой справа: колонка
     // отжимала название, и «ООО «Заря»» обрезалось до «ООО «З…».
@@ -826,16 +890,6 @@ screens.home = async function home() {
       : 'заметки по клиентам, «напомнить мне»',
     onclick: () => reset('crm'),
   })));
-
-  if (!s.orgReady) {
-    box.append(h('div', { class: 'banner' }, icon('warn'),
-      h('div', {},
-        h('div', { text: 'Реквизиты заполнены не полностью' }),
-        h('button', {
-          class: 'btn ghost', style: 'width:auto;padding:6px 0;min-height:32px',
-          onclick: () => go('org'),
-        }, 'Заполнить'))));
-  }
 
   // У каждого типа своя иконка: четыре одинаковых листа бумаги не помогают
   // выбрать, а взгляд цепляется за форму раньше, чем прочтёт подпись.

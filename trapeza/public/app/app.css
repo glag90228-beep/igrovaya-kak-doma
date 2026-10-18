@@ -761,6 +761,34 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .row-act:active { background: color-mix(in srgb, var(--danger) 12%, transparent); }
 .row-act[disabled] { opacity: .5; }
 
+/* Три шага новичка: номер в кружке, у выполненного — галочка, у ближайшего — акцент. */
+.step { align-items: flex-start; }
+.step-n {
+  flex: none; width: 36px; height: 36px; border-radius: 50%;
+  display: grid; place-items: center;
+  background: var(--group); color: var(--muted);
+  font: 700 16px/1 var(--font-num);
+}
+.step-n.ok { background: color-mix(in srgb, var(--money-in) 16%, transparent); color: var(--money-in); }
+.step.now .step-n { background: var(--primary); color: var(--on-primary); }
+.step.part .step-n { background: color-mix(in srgb, var(--wait) 20%, transparent); color: var(--wait); }
+.step.now .grow > div:first-child { font-weight: 700; }
+.step:not(.now):not(.done):not(.part) .grow > div:first-child { color: var(--muted); }
+.step-sub { margin-top: 2px; }
+
+/* Строка со вторым действием: сверху обычная строка, под ней кнопка, выровненная по тексту. */
+.row-block + .row-block, .row-block + .row, .row + .row-block { border-top: 1px solid var(--hairline); }
+.row-block .row + .row-actions { margin-top: -6px; }
+.row-actions { padding: 0 var(--pad) 12px calc(var(--pad) + 36px + 14px); }
+.pill-btn {
+  min-height: var(--tap); padding: 0 16px;
+  border: 0; border-radius: var(--r-btn);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--link); font: 600 15px/1 var(--font);
+  cursor: pointer;
+}
+.pill-btn:active { filter: brightness(.96); }
+
 /* Календарь повторения: что и какого числа произойдёт. Даты выровнены в
    колонку — по ней читают цикл сверху вниз, не вчитываясь в подписи. */
 .plan { padding: 2px var(--pad) 12px; border-top: 1px solid var(--hairline); }
