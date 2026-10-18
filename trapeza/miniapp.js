@@ -2020,7 +2020,8 @@ const api = {
   async 'GET /api/unpaid'({ user }) {
     const s = bdb.unpaidSummary(user.id);
     return {
-      docs: s.docs.map((d) => ({ ...docBrief(d), pair: Boolean(d.pair) })),
+      // paid/left: сколько по документу уже привязано оплатами и сколько осталось (частичная оплата из выписки).
+      docs: s.docs.map((d) => ({ ...docBrief(d), pair: Boolean(d.pair), paid: d.paid || 0, left: d.left == null ? d.total : d.left })),
       count: s.count,
       sum: s.sum,
     };

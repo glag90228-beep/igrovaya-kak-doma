@@ -3890,8 +3890,11 @@ screens.unpaid = async function unpaid() {
     title: `${d.title} № ${d.number}`,
     // Второй документ сделки показываем, но помечаем: иначе непонятно,
     // почему пять строк складываются в сумму четырёх.
-    sub: d.pair ? `${ru(d.date)} · та же сделка` : ru(d.date),
-    right: money0(d.total),
+    // Акт за месяц сам долга не создаёт — его деньги уже в накладных месяца, — и суммой не считается.
+    sub: d.pair && d.noDebt ? `${ru(d.date)} · деньги уже в накладных`
+      : d.pair ? `${ru(d.date)} · та же сделка`
+        : d.paid > 0 ? `${ru(d.date)} · оплачено ${money0(d.paid)} из ${money0(d.total)}` : ru(d.date),
+    right: money0(d.pair ? d.total : (d.left == null ? d.total : d.left)),
     rightTone: d.pair ? 'muted' : '',
     onclick: () => go('doc', { id: d.id }),
   }))));

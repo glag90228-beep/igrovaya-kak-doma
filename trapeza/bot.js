@@ -1596,8 +1596,9 @@ async function showUnpaid(tg, chatId, user) {
     const days = Math.floor((new Date(today) - new Date(d.date)) / 86400000);
     return [{
       text: `${d.pair ? '↳ ' : ''}${d.title} № ${d.number} · ${cp ? cp.name : '—'} · `
-        + `${formatRub(d.total).replace(/<[^>]+>/g, '')}`
-        + (d.pair ? ' · та же сделка' : (days > 0 ? ` · ${days} дн.` : '')),
+        + `${formatRub(d.paid > 0 ? d.left : d.total).replace(/<[^>]+>/g, '')}`
+        + (d.pair ? (d.no_debt ? ' · уже в накладных' : ' · та же сделка')
+          : (d.paid > 0 ? ' · частично оплачен' : '') + (days > 0 ? ` · ${days} дн.` : '')),
       data: `doc:${d.id}`,
     }];
   }).map((r) => [{ ...r[0], text: r[0].text.slice(0, 60) }]);
