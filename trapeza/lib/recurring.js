@@ -555,6 +555,38 @@ function setSchedule(userId, id, { payDay, leadDays }) {
       Number(id), userId);
 }
 
+/** Сколько документов в месяц даёт расписание: по одному на каждый срок. */
+const PER_MONTH = { day: 30, weekdays: 22, week: 4, month: 1 };
+const PERIOD_NAME = { day: 'Каждый день', weekdays: 'По будням', week: 'Раз в неделю' };
+
+/**
+ * Предупреждение о бесплатном лимите при выборе расписания — или '' если его нет.
+ *
+ * «Каждый день» на бесплатном тарифе съедает пять документов за пять дней, и
+ * человек, которому обещали «первые 5 документов бесплатно», узнаёт об этом на
+ * шестое утро, когда предложение приходит, а выписать его не получается.
+ * Говорим до сохранения расписания, с цифрами: сколько в месяц это даёт и на
+ * сколько хватит оставшихся бесплатных.
+ *
+ * Только для тех, у кого нет подписки и лимит действует: подписчику
+ * предупреждать не о чем.
+ */
+function freeLimitNote(userId, period) {
+  const per = PER_MONTH[period];
+  if (!per) return '';
+  const bdb = require('./bot-db');
+  const q = bdb.quota(userId);
+  if (q.paid || String(process.env.ENFORCE_LIMIT || '1') === '0' || per <= q.left) return '';
+  const unit = period === 'weekdays' ? ['рабочий день', 'рабочих дня', 'рабочих дней']
+    : period === 'week' ? ['неделя', 'недели', 'недель'] : ['день', 'дня', 'дней'];
+  const { plural } = require('./money');
+  const tail = q.left > 0
+    ? `Бесплатных в этом месяце осталось ${q.left} из ${q.limit} — хватит на ${q.left} ${plural(q.left, ...unit)}, `
+      + 'дальше нужна подписка.'
+    : `Бесплатные ${q.limit} на этот месяц уже закончились — для расписания нужна подписка.`;
+  return `«${PERIOD_NAME[period]}» — это около ${per} документов в месяц. ${tail}`;
+}
+
 module.exports = {
   add, list, get, setDay, setSchedule, off, skip,
   due, markOffered, claimIssue, releaseIssue, overdue, markDueNoticed, offerMonth, dueMonth,
@@ -562,5 +594,5 @@ module.exports = {
   OP_TYPE, isOp, bumpOp,
   monthKey, prevMonthKey, normalizeDay, dayLabel, LAST_DAY,
   PERIODS, WEEKDAYS, WEEKDAYS_ON, isPeriodic, periodKey, periodText, normalizeWeekday,
-  nextDate, dayCaption, dowOf, weekStart,
+  nextDate, dayCaption, dowOf, weekStart, freeLimitNote,
 };

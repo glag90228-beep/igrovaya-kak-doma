@@ -1716,8 +1716,25 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
     // panel — «раз в месяц» (числа); над ним выбор частоты: день, будни, неделя, месяц.
     const panel = h('div', { hidden: true });
 
+    // Предупреждение о бесплатном лимите: «Каждый день» съедает его за несколько дней.
+    const warnBox = h('div', {});
+    const askFreeLimit = (text, body) => { warnBox.replaceChildren(h('div', { class: 'banner', id: 'rec-warn' },
+      icon('warn'),
+      h('div', {},
+        h('div', { text }),
+        h('div', { class: 'btn-col', style: 'margin-top:10px' },
+          h('button', {
+            class: 'btn', id: 'rec-warn-ok',
+            onclick: (e) => save({ ...body, confirmFree: true }, e.currentTarget),
+          }, 'Всё равно создать расписание'),
+          h('button', { class: 'btn secondary', onclick: () => warnBox.replaceChildren() }, 'Выбрать другое')))));
+      // Строка, которую нажали, ниже плашки: без прокрутки её можно не заметить.
+      warnBox.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    };
+
     const save = (body, done) => withBusy(done, async () => {
       const r = await api('POST', '/api/recurring', { docId: d.id, ...body });
+      if (r.warn) { haptic(); askFreeLimit(r.warn, body); return; }
       haptic('medium');
       toast(r.payDay ? `Счёт ${r.offerDay}-го, оплата ${r.payDay}-го`
         : body.period && body.period !== 'month' ? `Расписание: ${r.dayText}` : `Напомню ${r.dayText}`);
@@ -1787,6 +1804,7 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
         sub ? h('div', { class: 'small muted', text: sub }) : null));
     const outer = h('div', { hidden: true },
       h('div', { class: 'section-title', text: 'Как часто' }),
+      warnBox,
       h('div', { class: 'card' },
         pickPeriod('Каждый день', 'и по выходным', 'repeat',
           (e) => save({ period: 'day' }, e.currentTarget), 'rec-day'),

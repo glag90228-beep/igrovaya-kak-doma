@@ -3732,12 +3732,26 @@ async function addRecurring(tg, chatId, user, src, when) {
       ]));
       return;
     }
+    // «Каждый день» на бесплатном тарифе съест лимит за несколько дней — говорим
+    // до, с цифрами, а не на шестое утро, когда документ не выпишется.
+    if (!when.confirmFree) {
+      const warn = recurring.freeLimitNote(user.id, when.period);
+      if (warn) {
+        const code = when.period === 'day' ? 'd' : when.period === 'weekdays' ? 'w' : `k${when.weekday}`;
+        await tg.sendMessage(chatId, `⚠️ ${esc(warn)}`, keyboard([
+          [{ text: 'Всё равно создать расписание', data: `rec.pok:${src.id}:${code}` }],
+          [{ text: '⬅️ Выбрать другое', data: `rec.new:${src.id}` }],
+        ]));
+        return;
+      }
+    }
     // Сегодняшнее предложение пропускаем, только если документ за сегодня уже выписан:
     // иначе расписание, заведённое по старому документу, молча съело бы сегодняшнюю доставку.
     when = { ...when, offeredThisMonth: src.date === todayISO() };
   }
+  const { confirmFree, ...schedule } = when;
   const id = recurring.add(user.id, {
-    cpId: src.cp_id, type: src.type, items, extra, ...when,
+    cpId: src.cp_id, type: src.type, items, extra, ...schedule,
   });
   const rec = recurring.get(user.id, id);
   const title = docService.ITEM_DOCS[src.type].title;
@@ -6059,6 +6073,16 @@ async function handleCallback(tg, cq) {
         return;
       }
       await addRecurring(tg, chatId, user, src, { period: kind === 'd' ? 'day' : 'weekdays' });
+      return;
+    }
+    // «Всё равно создать» после предупреждения о бесплатном лимите.
+    if (data.startsWith('rec.pok:')) {
+      const [, idStr, code] = data.split(':');
+      const src = bdb.getDoc(user.id, Number(idStr));
+      if (!src || !docService.ITEM_DOCS[src.type]) return;
+      const when = code === 'd' ? { period: 'day' } : code === 'w' ? { period: 'weekdays' }
+        : { period: 'week', weekday: Number(code.slice(1)) };
+      await addRecurring(tg, chatId, user, src, { ...when, confirmFree: true });
       return;
     }
     if (data.startsWith('rec.pw:')) {

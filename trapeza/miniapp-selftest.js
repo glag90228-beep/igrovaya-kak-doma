@@ -3572,6 +3572,31 @@ async function main() {
     ok(t3.includes('С учётом уже поступивших оплат к оплате 16 000,00 руб.'), 'Р9: если часть оплат не привязана к документам, итог к оплате назван отдельной строкой', t3.slice(0, 300));
   }
 
+  section('расписание «каждый день» и бесплатный лимит (Д19)');
+  {
+    const U = { id: 501212, first_name: 'Дина', username: 'dina2' };
+    const ud = initDataFor(U);
+    const bdbF = require('./lib/bot-db');
+    const recur = require('./lib/recurring');
+    const uid = bdbF.getOrCreateUser(U.id).id;
+    bdbF.saveMyOrg(uid, { name: 'ИП Динин', inn: '183209316100', signer: 'Д. Д.' });
+    const cp0 = bdbF.createCp(uid, { name: 'ООО «Обеды»', kind: 'customer', opening_date: '2026-01-01' });
+    // Лимит прогона — два документа: выписываем оба, и бесплатных на месяц не осталось.
+    let src = null;
+    for (const day of ['02', '03']) {
+      // eslint-disable-next-line no-await-in-loop
+      src = (await docService.issueDocument(uid, { type: 'torg12', cpId: cp0, date: `2026-09-${day}`,
+        items: [{ name: 'Обеды', qty: 20, price: 350 }] })).doc;
+    }
+    r = await call('POST', '/api/recurring', { user: ud, body: { docId: src.id, period: 'day' } });
+    ok(r.status === 200 && /около 30 документов в месяц/.test(r.json.warn) && !r.json.id, 'Д19: «каждый день» без подтверждения — предупреждение, расписание не создано', JSON.stringify(r.json));
+    ok(recur.list(uid).length === 0, 'в списке расписаний пусто');
+    r = await call('POST', '/api/recurring', { user: ud, body: { docId: src.id, period: 'day', confirmFree: true } });
+    ok(r.status === 200 && r.json.id && !r.json.warn, 'Д19: после подтверждения расписание создано', JSON.stringify(r.json));
+    r = await call('POST', '/api/recurring', { user: ud, body: { docId: src.id, day: 10 } });
+    ok(r.status === 200 && r.json.id && !r.json.warn, 'раз в месяц предупреждения нет');
+  }
+
   // Сервер держим до конца: проверки выше ходят к нему по HTTP, и закрытый
   // раньше времени он давал ECONNREFUSED вместо внятного провала.
   await new Promise((r2) => server.close(r2));

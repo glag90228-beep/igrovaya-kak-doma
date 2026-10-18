@@ -9203,6 +9203,40 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(letter.includes('оплата на 21 000,00 руб'), 'и общая сумма долга, как раньше', letter.slice(0, 160));
   }
 
+  console.log('\n── расписание «каждый день» и бесплатный лимит (Д19) ──');
+  {
+    const bdbR = require('./lib/bot-db');
+    const dsR = require('./lib/doc-service');
+    const recur = require('./lib/recurring');
+    const LIM19 = { id: 779301, first_name: 'Лимитчик', username: 'lim19' };
+    const lSay = (t) => handleUpdate(tg, { message: { chat: { id: LIM19.id }, from: LIM19, text: t } });
+    const lTap = (d) => handleUpdate(tg, { callback_query: { id: 'l19', from: LIM19, data: d, message: { chat: { id: LIM19.id } } } });
+    const lid = bdbR.getOrCreateUser(LIM19.id, 'Лимитчик', 'lim19').id;
+    bdbR.saveMyOrg(lid, { name: 'ИП Лимитов', inn: '183209316100', signer: 'Л. Л.' });
+    const cpL = bdbR.createCp(lid, { name: 'ООО «Обеды»', kind: 'customer', opening_date: '2026-01-01' });
+    const wasFree = process.env.FREE_DOCS;
+    process.env.FREE_DOCS = '3';
+    const made = await dsR.issueDocument(lid, { type: 'torg12', cpId: cpL, items: [{ name: 'Обед', qty: 20, price: 350 }] });
+    sent.length = 0;
+    await lTap(`rec.per:${made.doc.id}:d`);
+    const warn = norm(sent.map((m) => m.text || '').join(' '));
+    ok(warn.includes('около 30 документов в месяц') && warn.includes('осталось 2 из 3') && warn.includes('хватит на 2 дня'),
+      'Д19: «Каждый день» на бесплатном — предупреждение с цифрами', warn.slice(0, 220));
+    ok(recur.list(lid).length === 0, 'пока человек не подтвердил, расписания нет');
+    const okBtn = buttonIn(sent[sent.length - 1], 'Всё равно создать');
+    ok(Boolean(okBtn), 'есть кнопка «Всё равно создать расписание»');
+    await lTap(okBtn);
+    ok(recur.list(lid).length === 1 && recur.list(lid)[0].period === 'day', 'после подтверждения расписание создано');
+    // «По будням» — тоже предупреждение, но другой счёт; месячное — без вопросов.
+    sent.length = 0;
+    await lTap(`rec.per:${made.doc.id}:w`);
+    ok(norm(last()).includes('около 22 документов') && norm(last()).includes('рабочих дня'), 'по будням — около 22 документов', norm(last()).slice(0, 120));
+    sent.length = 0;
+    await lTap(`rec.add:${made.doc.id}:10`);
+    ok(!norm(sent.map((m) => m.text || '').join(' ')).includes('документов в месяц'), 'раз в месяц предупреждения нет');
+    process.env.FREE_DOCS = wasFree;
+  }
+
   console.log('\n── письмо не ушло: человеческим языком и кнопка «Настройки почты» (Д14) ──');
   {
     const bdbR = require('./lib/bot-db');

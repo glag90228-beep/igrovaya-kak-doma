@@ -1188,6 +1188,33 @@ const ok = (c, m, extra) => {
     ok(info && info.h >= 44, 'и её кнопка не ниже 44 px', info && info.h);
   }
 
+  console.log('\n── расписание «каждый день» и бесплатный лимит (Д19) ──');
+  {
+    forgetRate();
+    const cpR = bdb.createCp(user.id, { name: 'ООО «Лимитное»', kind: 'customer', opening_date: '2026-01-01' });
+    const src = await docService.issueDocument(user.id, { type: 'torg12', cpId: cpR, date: '2026-09-11', skipQuota: true,
+      items: [{ name: 'Обеды', unit: 'шт.', qty: 20, price: 350 }] });
+    const wasFree = process.env.FREE_DOCS;
+    process.env.FREE_DOCS = '1';
+    const recLib = require(path.join(APP, 'lib/recurring'));
+    await page.evaluate((id) => window.__go('doc', { id }), src.doc.id);
+    await page.waitForSelector('#rec-open', { timeout: 5000 });
+    await page.locator('#rec-open').tap();
+    await page.locator('#rec-day').tap();
+    await page.waitForSelector('#rec-warn', { timeout: 5000 });
+    const w = (await page.textContent('#rec-warn')).replace(/\s/g, ' ');
+    ok(w.includes('около 30 документов в месяц') && w.includes('закончились'), 'Д19: «Каждый день» — предупреждение, сколько документов это съест', w);
+    ok(!recLib.list(user.id).some((r) => r.cp_id === cpR), 'пока не подтвердили — расписания нет');
+    await page.getByRole('button', { name: 'Выбрать другое', exact: true }).tap();
+    ok(await page.locator('#rec-warn').count() === 0, '«Выбрать другое» убирает предупреждение');
+    await page.locator('#rec-day').tap();
+    await page.waitForSelector('#rec-warn-ok', { timeout: 5000 });
+    await page.locator('#rec-warn-ok').tap();
+    await page.waitForSelector('.plan', { timeout: 8000 });
+    ok(recLib.list(user.id).some((r) => r.cp_id === cpR && r.period === 'day'), '«Всё равно создать» заводит расписание');
+    process.env.FREE_DOCS = wasFree;
+  }
+
   console.log('\n── письмо не ушло: понятная причина и «Настройки почты» (Д14) ──');
   {
     forgetRate();

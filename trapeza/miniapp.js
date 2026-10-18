@@ -1986,6 +1986,11 @@ const api = {
       const twin = recurring.list(user.id).find((r) => r.cp_id === src.cp_id && r.type === src.type
         && r.period === period && (period !== 'week' || r.weekday === weekday));
       if (twin) return { error: 'Такое расписание уже есть — смотрите «По расписанию».', id: twin.id };
+      // «Каждый день» на бесплатном тарифе съест лимит за несколько дней — говорим до, а не на шестое утро.
+      if (!body.confirmFree) {
+        const warn = recurring.freeLimitNote(user.id, period);
+        if (warn) return { warn };
+      }
       const id = recurring.add(user.id, {
         cpId: src.cp_id, type: src.type, items, extra, period, weekday,
         // Сегодняшнюю доставку пропускаем, только если документ за сегодня уже выписан.
