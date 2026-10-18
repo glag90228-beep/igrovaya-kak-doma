@@ -4530,6 +4530,8 @@ function bankRows(r, cps) {
     const rows = fresh.filter((t) => chosen.has(t.key)).map((t) => ({
       key: t.key, cpId: chosen.get(t.key), amount: t.amount, date: t.date,
       doc: t.doc ? `Оплата, п/п № ${t.doc}` : 'Оплата по выписке',
+      // Назначение платежа нужно серверу, чтобы найти документ по номеру («по накладной № 3»).
+      purpose: t.purpose || '',
     }));
     if (!rows.length) { toast('Не выбран ни один клиент', true); return; }
     const res = await api('POST', '/api/bank/import', { rows });
@@ -4590,24 +4592,28 @@ screens.bankclose = async function bankClose(params) {
       sub && h('div', { class: 'sub-line' }, h('span', { class: 'small muted', text: sub }))),
     h('span', { class: 'money nowrap', text: right }));
 
+  // Частичная оплата: плательщик назвал документ в назначении, но денег пришло
+  // меньше, чем надо. Документ остаётся неоплаченным на остаток.
   box.append(h('div', { class: 'card' }, deals.map((d) => line(
     'doc-check', d.title,
-    d.alsoTitle ? `${d.cpName} · и ${d.alsoTitle} — та же сделка` : d.cpName,
-    money0(d.total), 'ok'))));
+    d.partial
+      ? `${d.cpName} · частично, останется ${money0(d.left)}`
+      : (d.alsoTitle ? `${d.cpName} · и ${d.alsoTitle} — та же сделка` : d.cpName),
+    money0(d.total), d.partial ? '' : 'ok'))));
   if (leftovers.length) {
     box.append(h('div', { class: 'section-title', text: 'Не легло ни на один счёт' }));
     box.append(h('div', { class: 'card' }, leftovers.map((l) => line(
       'wallet', l.cpName, 'счёт не выписан или оплата частичная', money0(l.amount)))));
   }
 
-  const docs = deals.reduce((n, d) => n + (d.twinId ? 2 : 1), 0);
-  const done = h('button', { class: 'btn' }, `Отметить оплаченными (${docs})`);
+  const docs = deals.filter((d) => !d.partial).reduce((n, d) => n + (d.twinId ? 2 : 1), 0);
+  const done = h('button', { class: 'btn' }, docs ? `Отметить оплаченными (${docs})` : 'Привязать оплату');
   done.onclick = () => withBusy(done, async () => {
     const res = await api('POST', '/api/bank/close', { deals });
     haptic('medium');
     toast(res.docs
       ? `Отмечено ${res.docs} ${plural(res.docs, 'документ', 'документа', 'документов')}`
-      : 'Ничего не отмечено');
+      : (res.partial ? 'Оплата привязана к документу' : 'Ничего не отмечено'));
     // Через выписку закрывают сразу пачку, и про чек тут забывают вернее
     // всего: человек ничего не выписывал, он просто прислал файл.
     // Баннер карточки документа сюда не годится (документов много) — ведём на список чеков.

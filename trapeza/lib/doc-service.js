@@ -460,9 +460,9 @@ async function issueDocument(userId, {
   // пересчёта, иначе rebuildDebt заведёт её сам.
   if (noDebt) bdb.setNoDebt(userId, id);
   const debt = !noDebt && bdb.makesDebt(org, type) && total > 0
-    ? bdb.addOpForDoc(userId, cp.id, {
+    ? Boolean(bdb.addOpForDoc(userId, cp.id, {
       date: when, kind: 'Реализация', doc: `${kind.title} № ${num}`, credit: total,
-    }, id)
+    }, id))
     : false;
   // Клиент на предоплате: пока остаток её покрывает, документ сразу оплачен.
   const prepaid = debt ? bdb.settleFromPrepay(userId, id) : false;

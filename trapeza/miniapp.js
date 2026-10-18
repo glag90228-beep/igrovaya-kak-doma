@@ -1760,6 +1760,7 @@ const api = {
       amount: Number(r.amount),
       date: str(r.date, 10),
       doc: str(r.doc, 120),
+      purpose: str(r.purpose, 300),
     })));
     /*
      * Заодно смотрим, какие счета эти деньги закрывают. Только предлагаем:

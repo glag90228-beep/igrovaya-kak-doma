@@ -4090,7 +4090,7 @@ async function handleStatement(tg, chatId, user, msg) {
   // Строки кладём в состояние: кнопка нажимается позже, а файла к тому
   // времени уже нет.
   bdb.setState(user.id, 'bank', {
-    rows: sure.map((t) => ({ key: t.key, cpId: t.cp.id, amount: t.amount, date: t.date, doc: t.doc })),
+    rows: sure.map((t) => ({ key: t.key, cpId: t.cp.id, amount: t.amount, date: t.date, doc: t.doc, purpose: t.purpose || '' })),
     all,
   });
 
@@ -4124,12 +4124,30 @@ async function offerClosedDocs(tg, chatId, user, rows, head) {
   const { deals, leftovers } = bdb.matchPaymentsToDocs(user.id, rows);
   if (!deals.length) return false;
 
-  const lines = [head, '', `<b>Эти документы закрыты (${deals.length}):</b>`];
-  for (const d of deals.slice(0, 15)) {
-    lines.push(`• ${esc(d.title)} · ${esc(d.cpName)} · <b>${formatRub(d.total)}</b>`
-      + (d.alsoTitle ? `\n  <i>и ${esc(d.alsoTitle)} — та же сделка</i>` : ''));
+  // Закрытые целиком и оплаченные частично — разные решения, и показываем их
+  // по отдельности: «закрыт» значит, что пришли все деньги по документу.
+  const whole = deals.filter((d) => !d.partial);
+  const part = deals.filter((d) => d.partial);
+  const lines = [head, ''];
+  if (whole.length) {
+    lines.push(`<b>Эти документы закрыты (${whole.length}):</b>`);
+    for (const d of whole.slice(0, 15)) {
+      lines.push(`• ${esc(d.title)} · ${esc(d.cpName)} · <b>${formatRub(d.total)}</b>`
+        + (d.alsoTitle ? `\n  <i>и ${esc(d.alsoTitle)} — та же сделка</i>` : ''));
+    }
+    if (whole.length > 15) lines.push(`…и ещё ${whole.length - 15}`);
   }
-  if (deals.length > 15) lines.push(`…и ещё ${deals.length - 15}`);
+  if (part.length) {
+    // Номер документа назвал сам плательщик в назначении платежа — поэтому деньги
+    // привязываем к нему, но документ остаётся неоплаченным до последней копейки.
+    if (whole.length) lines.push('');
+    lines.push(`<b>Оплачены частично (${part.length}):</b>`);
+    for (const d of part.slice(0, 15)) {
+      lines.push(`• ${esc(d.title)} · ${esc(d.cpName)} · пришло <b>${formatRub(d.total)}</b>, `
+        + `осталось <b>${formatRub(d.left)}</b>`);
+    }
+    lines.push('<i>Документ назван в назначении платежа. Он останется в «Ждут оплаты» на остаток.</i>');
+  }
 
   // Остаток называем вслух: человеку важно понять, ждёт ли он ещё денег от
   // этого клиента, или пришло больше, чем было выставлено.
@@ -4142,10 +4160,10 @@ async function offerClosedDocs(tg, chatId, user, rows, head) {
     lines.push('<i>Либо счёт ещё не выписан, либо оплата частичная — такие не закрываю.</i>');
   }
 
-  const count = deals.reduce((n, d) => n + (d.twinId ? 2 : 1), 0);
+  const count = whole.reduce((n, d) => n + (d.twinId ? 2 : 1), 0);
   bdb.setState(user.id, 'bank-paid', { deals, all: bankRows(user) });
   await tg.sendMessage(chatId, lines.join('\n'), keyboard([
-    [{ text: `✅ Отметить оплаченными (${count})`, data: 'bank:paid' }],
+    [{ text: whole.length ? `✅ Отметить оплаченными (${count})` : '✅ Привязать оплату', data: 'bank:paid' }],
     [{ text: 'Не надо', data: 'menu' }],
   ]));
   return true;
@@ -5744,7 +5762,11 @@ async function handleCallback(tg, cq) {
       const done = bdb.closeDocsFromBank(user.id, deals);
       const s = bdb.unpaidSummary(user.id);
       await tg.sendMessage(chatId,
-        `✅ Отметил оплаченными: ${done.docs} ${plural(done.docs, 'документ', 'документа', 'документов')}.\n\n`
+        '✅ '
+        + (done.docs || !done.partial
+          ? `Отметил оплаченными: ${done.docs} ${plural(done.docs, 'документ', 'документа', 'документов')}.` : '')
+        + (done.partial ? `${done.docs ? '\n' : ''}Частично оплачено: ${done.partial} — остаток виден в «Ждут оплаты».` : '')
+        + '\n\n'
         + (s.count
           ? `Осталось не оплачено: <b>${formatRub(s.sum)}</b> — `
             + `${s.count} ${plural(s.count, 'сделка', 'сделки', 'сделок')}.`

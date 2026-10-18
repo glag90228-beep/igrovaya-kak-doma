@@ -681,6 +681,28 @@ async function main() {
     ok(recRow && recRow.total === 8540, 'Р8: в списке расписаний 8 540 (7 000 + НДС 22%), а не 7 000', recRow && recRow.total);
     require('./lib/recurring').off(gid, recG);
     bdbG.updateOrg(gid, orgG.id, { vat_rate: '' });
+
+    // Р5/Р6 через API: платёж «по накладной № N» привязывается к названному документу,
+    // а частичная оплата остаётся частичной, пока не набралась вся сумма.
+    const base = bdbG.unpaidSummary(gid);       // до этого в разделе уже выписано и не оплачено кое-что
+    const cpB = bdbG.createCp(gid, { name: 'ООО «Выписка»', kind: 'customer', inn: '7707654321', opening_date: '2026-01-01' });
+    r = await call('POST', '/api/doc', { user: gUser, body: { type: 'torg12', cpId: cpB, date: '2026-10-01', items: [{ name: 'Работы', qty: 1, price: 50000 }] } });
+    const bigId = r.json.doc.id;
+    const bigNo = bdbG.getDoc(gid, bigId).number;
+    r = await call('POST', '/api/bank/import', { user: gUser, body: { rows: [
+      { key: 'g-part-1', cpId: cpB, amount: 20000, date: '2026-10-05', doc: 'Оплата, п/п № 5', purpose: `Оплата по накладной № ${bigNo} частично` }] } });
+    ok(r.json.added === 1 && r.json.deals.length === 1 && r.json.deals[0].partial && r.json.deals[0].left === 30000,
+      'Р5/Р6: платёж с номером документа предлагается как частичная оплата (осталось 30 000)', JSON.stringify(r.json.deals));
+    r = await call('POST', '/api/bank/close', { user: gUser, body: { deals: r.json.deals } });
+    ok(r.json.docs === 0 && r.json.partial === 1 && bdbG.linkedPaid(bigId) === 20000 && !bdbG.getDoc(gid, bigId).paid_at,
+      'Р6: подтвердили — оплата привязана, документ не закрыт', JSON.stringify(r.json));
+    ok(Math.round((r.json.sum - base.sum) * 100) / 100 === 30000, 'и «ждут оплаты» выросло на 30 000, а не на 50 000', r.json.sum - base.sum);
+    r = await call('POST', '/api/bank/import', { user: gUser, body: { rows: [
+      { key: 'g-part-2', cpId: cpB, amount: 30000, date: '2026-10-12', doc: 'Оплата, п/п № 9', purpose: `Доплата по накладной № ${bigNo}` }] } });
+    ok(r.json.deals.length === 1 && !r.json.deals[0].partial && r.json.deals[0].total === 30000, 'Р6: доплата 30 000 закрывает документ целиком', JSON.stringify(r.json.deals));
+    r = await call('POST', '/api/bank/close', { user: gUser, body: { deals: r.json.deals } });
+    ok(r.json.docs === 1 && bdbG.getDoc(gid, bigId).paid_at && bdbG.balanceOf(gid, cpB).closing === 0 && r.json.count === base.count && r.json.sum === base.sum,
+      'Р6: документ, оплаченный двумя платежами, закрыт и из «ждут оплаты» ушёл', JSON.stringify(r.json));
   }
 
   section('переключатель ИИ-ассистента');
@@ -2795,7 +2817,10 @@ async function main() {
     r = await call('POST', '/api/month-act', { user: masha, body: { cpId: cpMa, ym: thisYm } });
     ok(r.json && r.json.doc && r.json.total === 50000 && r.json.file && r.json.month, 'акт за этот месяц выписан на 50 000', JSON.stringify(r.json).slice(0, 120));
     const act1 = bdb.getDoc(mu.id, r.json.doc.id);
-    ok(act1.type === 'usl' && act1.no_debt === 1 && act1.paid_at, 'акт — «без долга» и сразу отмечен');
+    // Р10: акт отмечается оплаченным только тогда, когда оплачены накладные месяца. Здесь предоплата
+    // включена, но денег на ней нет — накладные висят долгом, и «оплачен» на акте было бы неправдой.
+    ok(act1.type === 'usl' && act1.no_debt === 1 && !act1.paid_at,
+      'акт — «без долга», но не оплачен, пока по накладным месяца долг');
     ok(bal() === debt0, 'долг клиента не изменился', `${debt0} → ${bal()}`);
     bdb.rebuildDebt(mu.id);
     ok(bal() === debt0, 'пересчёт долга акт не удваивает');
@@ -2825,6 +2850,18 @@ async function main() {
     ok(r.json && r.json.reason === 'none', 'месяц без отгрузок: акту не на чем строиться', JSON.stringify(r.json));
     ok(bal() === debt0 + 5000 && bdb.monthActsOf(mu.id, cpMa, thisYm).length === 2,
       'итог: долг вырос только на новую накладную, актов за месяц два', String(bal() - debt0));
+
+    // Р10: оплатили накладные первого акта — он оплачен; отменили оплату одной — снова нет.
+    const actPaid = () => Boolean(bdb.getDoc(mu.id, act1.id).paid_at);
+    await call('POST', '/api/doc/paid', { user: masha, body: { id: s1.json.doc.id } });
+    ok(!actPaid(), 'Р10: оплачена одна накладная из двух — акт ещё не оплачен');
+    await call('POST', '/api/doc/paid', { user: masha, body: { id: s2.json.doc.id } });
+    ok(actPaid(), 'Р10: оплачены обе — акт за месяц оплачен сам');
+    ok(bdb.unpaidSummary(mu.id).docs.every((d) => d.id !== act1.id), 'и из «ждут оплаты» он ушёл');
+    await call('POST', '/api/doc/paid', { user: masha, body: { id: s1.json.doc.id, paid: false } });
+    ok(!actPaid(), 'Р10: оплату накладной отменили — акт снова не оплачен');
+    ok(bdb.getDoc(mu.id, act1.id).no_debt === 1 && bdb.listOps(mu.id, cpMa).every((o) => o.doc_id !== act1.id),
+      'при этом акт по-прежнему долга не создаёт и проводок не имеет');
   }
 
   section('вкладка CRM в разметке приложения');

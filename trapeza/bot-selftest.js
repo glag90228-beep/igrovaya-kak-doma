@@ -5927,6 +5927,182 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     bdbQ.updateOrg(uQ.id, orgQ.id, { vat_rate: '' });
   }
 
+  console.log('\n── деньги: «Оплатил», сделка, выписка по номеру, частичные оплаты ──');
+  {
+    /*
+     * Находки ревизора Р2, Р4, Р5, Р6: «Оплатил» дважды, смена основания,
+     * оживляющая оплаченную сделку, подбор по сумме вместо номера и счёт,
+     * оплаченный двумя платежами, но висящий «неоплаченным».
+     */
+    const bdbM = require('./lib/bot-db');
+    const dsM = require('./lib/doc-service');
+    let keyN = 0;
+    const world = async (tg, basis = 'closing') => {
+      const u = bdbM.getOrCreateUser(tg, 'Сделка');
+      bdbM.saveMyOrg(u.id, { name: `ИП Сделка ${tg}`, inn: '183209316100' });
+      const org = bdbM.getDefaultOrg(u.id);
+      bdbM.updateOrg(u.id, org.id, { debt_basis: basis });
+      const cp = bdbM.createCp(u.id, { name: 'ООО «Заря»', kind: 'customer', inn: '7701234567', opening_date: '2026-01-01' });
+      const mk = async (type, price, date = '2026-10-01') => (await dsM.issueDocument(u.id, {
+        type, cpId: cp, date, items: [{ name: 'Обед', qty: 1, price }], skipQuota: true,
+      })).doc;
+      const bal = () => bdbM.balanceOf(u.id, cp).closing;
+      const setBasis = (b) => { bdbM.updateOrg(u.id, org.id, { debt_basis: b }); bdbM.rebuildDebt(u.id); };
+      // Платёж из выписки: занести, подобрать документы, подтвердить (как делает человек двумя нажатиями).
+      const bank = (amount, purpose = '', confirm = true) => {
+        keyN += 1;
+        const res = bdbM.importBankRows(u.id, [{ key: `m${tg}-${keyN}`, cpId: cp, amount, date: '2026-10-05', doc: `п/п ${keyN}`, purpose }]);
+        const m = bdbM.matchPaymentsToDocs(u.id, res.addedRows);
+        const done = confirm && m.deals.length ? bdbM.closeDocsFromBank(u.id, m.deals) : null;
+        return { ...m, done };
+      };
+      return { u, org, cp, mk, bal, setBasis, bank };
+    };
+
+    // --- Р2: «Оплатил» вносит только остаток по документу и только один раз ---
+    {
+      const w = await world(781010);
+      const d1 = await w.mk('torg12', 3000);
+      await w.mk('torg12', 4000);
+      bdbM.markPaid(w.u.id, d1.id, '2026-10-05');
+      bdbM.markPaid(w.u.id, d1.id, '2026-10-09');
+      ok(w.bal() === 4000 && bdbM.linkedPaid(d1.id) === 3000,
+        'Р2: «Оплатил» дважды подряд вносит оплату один раз', `${w.bal()} / ${bdbM.linkedPaid(d1.id)}`);
+      ok(bdbM.getDoc(w.u.id, d1.id).paid_at === '2026-10-05', 'и дату первой отметки не сдвигает');
+
+      // Частичная оплата уже лежит на документе: «Оплатил» добавляет только остаток.
+      const w2 = await world(781011);
+      const big = await w2.mk('torg12', 50000);
+      w2.bank(20000, 'Оплата по накладной № 1 частично');
+      ok(bdbM.linkedPaid(big.id) === 20000 && !bdbM.getDoc(w2.u.id, big.id).paid_at,
+        'Р2/Р6: частичная оплата из выписки привязана к документу, он остаётся неоплаченным');
+      bdbM.markPaid(w2.u.id, big.id, '2026-10-06');
+      ok(w2.bal() === 0 && bdbM.linkedPaid(big.id) === 50000,
+        'Р2: «Оплатил» после частичной вносит остаток 30 000, а не 50 000', `${w2.bal()} / ${bdbM.linkedPaid(big.id)}`);
+      w2.setBasis('invoice'); w2.setBasis('closing');
+      ok(w2.bal() === 0, 'Р2: туда-обратно по основаниям сальдо не меняет', w2.bal());
+      // При смене основания привязка из выписки отпускается: деньги остаются в журнале свободной строкой.
+      const un = bdbM.unmarkPaid(w2.u.id, big.id);
+      ok(w2.bal() === 30000 && un.kept === 0,
+        'Р2: снятие отметки возвращает долг на внесённое «Оплатил»; деньги из выписки остаются', `${w2.bal()} / ${un.kept}`);
+      const w2b = await world(781013);
+      const big2 = await w2b.mk('torg12', 50000);
+      w2b.bank(20000, 'Оплата по накладной № 1 частично');
+      bdbM.markPaid(w2b.u.id, big2.id, '2026-10-06');
+      const un2 = bdbM.unmarkPaid(w2b.u.id, big2.id);
+      ok(w2b.bal() === 30000 && un2.kept === 20000,
+        'Р2: снятие без смены основания — деньги из выписки (20 000) остаются, «Оплатил» (30 000) возвращается в долг', `${w2b.bal()} / ${un2.kept}`);
+
+      // Свободная оплата, как и прежде, не уводит сальдо в минус.
+      const w3 = await world(781012);
+      const solo = await w3.mk('sch', 50000);
+      bdbM.updateOrg(w3.u.id, w3.org.id, { debt_basis: 'invoice' }); bdbM.rebuildDebt(w3.u.id);
+      bdbM.addOp(w3.u.id, w3.cp, { date: '2026-10-02', kind: 'Оплата', doc: 'п/п 1', debit: 20000 });
+      bdbM.markPaid(w3.u.id, solo.id, '2026-10-03');
+      ok(w3.bal() === 0, 'Р2: «Оплатил» после свободной частичной оплаты закрывает только остаток', w3.bal());
+    }
+
+    // --- Р4: оплата сделки отмечает и парный документ, смена основания её не оживляет ---
+    {
+      const w = await world(781020);
+      const act = await w.mk('usl', 3000);
+      const inv = await w.mk('sch', 3000);
+      ok(w.bal() === 3000 && bdbM.unpaidSummary(w.u.id).sum === 3000, 'Р4: акт и счёт на 3 000 — одна сделка, долг 3 000');
+      bdbM.markPaid(w.u.id, act.id, '2026-10-05');
+      ok(bdbM.getDoc(w.u.id, inv.id).paid_at && Number(bdbM.getDoc(w.u.id, inv.id).paid_with) === act.id,
+        'Р4: «Оплатил» на акте отметил и парный счёт (paid_with)');
+      ok(w.bal() === 0 && bdbM.unpaidSummary(w.u.id).sum === 0 && bdbM.unpaidDocs(w.u.id).length === 0,
+        'Р4: сделка закрыта целиком — ни долга, ни «ждут оплаты»');
+      w.setBasis('invoice');
+      ok(w.bal() === 0 && bdbM.unpaidSummary(w.u.id).sum === 0, 'Р4: смена основания на «по счёту» оплаченную сделку не оживила', w.bal());
+      w.setBasis('closing');
+      ok(w.bal() === 0, 'Р4: и обратно тоже', w.bal());
+      // Нажали на парный документ: деньги всё равно кладутся на главный, оба отмечены.
+      const w2 = await world(781021);
+      const act2 = await w2.mk('usl', 3000);
+      const inv2 = await w2.mk('sch', 3000);
+      bdbM.markPaid(w2.u.id, inv2.id, '2026-10-05');
+      ok(w2.bal() === 0 && bdbM.getDoc(w2.u.id, act2.id).paid_at, 'Р4: «Оплатил» на счёте оплачивает сделку и закрывает акт', w2.bal());
+      w2.setBasis('invoice');
+      ok(w2.bal() === 0, 'Р4: переключение при отметке с парного документа тоже ничего не оживляет', w2.bal());
+      bdbM.unmarkPaid(w2.u.id, act2.id);
+      ok(w2.bal() === 3000 && !bdbM.getDoc(w2.u.id, inv2.id).paid_at, 'Р4: снятие отметки с одного документа возвращает сделку целиком', w2.bal());
+      // Закрытая из выписки сделка: туда-обратно оплату не задваивает.
+      const w3 = await world(781022);
+      await w3.mk('usl', 3000); await w3.mk('sch', 3000);
+      const b3 = w3.bank(3000);
+      ok(b3.done && b3.done.docs === 2 && w3.bal() === 0, 'Р4: выписка закрыла сделку из двух документов', JSON.stringify(b3.done));
+      w3.setBasis('invoice'); w3.setBasis('closing');
+      ok(w3.bal() === 0, 'Р4: сделка, закрытая выпиской, после смены основания туда-обратно остаётся закрытой', w3.bal());
+    }
+
+    // --- Р5: документ ищем по номеру из назначения, потом по сумме ---
+    {
+      const nums = bdbM.docNumbersIn('Оплата по накладной № 3 от 03.10.2026. Без НДС');
+      ok(nums.length === 1 && nums[0].num === '3' && nums[0].types.includes('torg12'), 'Р5: номер читается из «по накладной № 3 от …»', JSON.stringify(nums));
+      ok(bdbM.docNumbersIn('Оплата по договору № 17, счёт 5').map((x) => x.num).join() === '5', 'Р5: номер договора за номер документа не принимается');
+      ok(bdbM.docNumbersIn('Аванс. НДС не облагается').length === 0, 'Р5: без номера — ничего');
+
+      const w = await world(781030);
+      await w.mk('torg12', 3000, '2026-10-01');
+      await w.mk('torg12', 3000, '2026-10-02');
+      const d3 = await w.mk('torg12', 8000, '2026-10-03');
+      let m = w.bank(8000, 'Оплата по накладной № 3 от 03.10.2026', false);
+      ok(m.deals.length === 1 && m.deals[0].leadId === d3.id, 'Р5: платёж 8 000 «по накладной № 3» закрывает № 3, а не № 1 и № 2',
+        m.deals.map((d) => d.title).join());
+      const w2 = await world(781031);
+      await w2.mk('torg12', 3000, '2026-10-01');
+      const n2 = await w2.mk('torg12', 3000, '2026-10-02');
+      m = w2.bank(3000, 'Оплата по накладной № 2', false);
+      ok(m.deals.length === 1 && m.deals[0].leadId === n2.id, 'Р5: при двух накладных на 3 000 «по № 2» закрывает именно № 2, а не старшую');
+      const w3 = await world(781032);
+      const e1 = await w3.mk('torg12', 3000, '2026-10-01');
+      await w3.mk('torg12', 3000, '2026-10-02');
+      m = w3.bank(3000, 'Оплата по договору № 2', false);
+      ok(m.deals.length === 1 && m.deals[0].leadId === e1.id, 'Р5: «по договору № 2» к документам не относится — подбор по сумме, как раньше');
+      m = w3.bank(3000, '', false);
+      ok(m.deals.length === 1 && m.deals[0].leadId === e1.id, 'Р5: без номера всё как раньше — по сумме, старые первыми');
+      // Счёт № 3 и накладная № 3 — без слова, которое их различает, номер не угадываем.
+      const w4 = await world(781033);
+      await w4.mk('usl', 1000, '2026-10-01'); await w4.mk('usl', 1000, '2026-10-02');
+      const t3 = await w4.mk('usl', 2000, '2026-10-03');
+      await w4.setBasis('closing');
+      m = w4.bank(2000, 'Оплата по акту №3', false);
+      ok(m.deals.length === 1 && m.deals[0].leadId === t3.id, 'Р5: «по акту №3» без пробела после знака читается');
+    }
+
+    // --- Р6: частичные оплаты считаем по привязанным проводкам ---
+    {
+      const w = await world(781040);
+      const d = await w.mk('torg12', 50000);
+      const first = w.bank(20000, 'Оплата по накладной № 1 частично', false);
+      ok(first.deals.length === 1 && first.deals[0].partial && first.deals[0].total === 20000 && first.deals[0].left === 30000,
+        'Р6: платёж меньше остатка по названному документу предлагается как частичный', JSON.stringify(first.deals[0]));
+      ok(bdbM.linkedPaid(d.id) === 0, 'Р6: пока человек не подтвердил, ничего не привязано');
+      const closed = bdbM.closeDocsFromBank(w.u.id, first.deals);
+      ok(closed.docs === 0 && closed.partial === 1 && bdbM.linkedPaid(d.id) === 20000 && w.bal() === 30000,
+        'Р6: подтвердили — 20 000 привязаны к документу, он не закрыт', JSON.stringify(closed));
+      ok(bdbM.unpaidSummary(w.u.id).sum === 30000 && bdbM.unpaidDocs(w.u.id)[0].left === 30000,
+        'Р6: «Ждут оплаты» = 30 000 = долгу клиента, а не полная сумма документа');
+      bdbM.rebuildDebt(w.u.id);
+      ok(bdbM.linkedPaid(d.id) === 20000 && w.bal() === 30000, 'Р6: пересчёт частичную привязку не теряет');
+      const second = w.bank(30000, 'Доплата по накладной № 1');
+      ok(second.done.docs === 1 && bdbM.getDoc(w.u.id, d.id).paid_at && bdbM.linkedPaid(d.id) === 50000 && w.bal() === 0,
+        'Р6: второй платёж довёл привязанное до суммы — документ закрыт', JSON.stringify(second.done));
+      ok(bdbM.unpaidDocs(w.u.id).length === 0 && bdbM.unpaidSummary(w.u.id).sum === 0, 'Р6: оплаченный двумя платежами документ из «Ждут оплаты» ушёл');
+      w.setBasis('invoice'); w.setBasis('closing');
+      ok(w.bal() === 0, 'Р6: смена основания туда-обратно сальдо не меняет', w.bal());
+      // Платёж без номера и меньше документа ничего не предлагает (как раньше).
+      const w2 = await world(781041);
+      await w2.mk('torg12', 50000);
+      const none = w2.bank(20000, 'Оплата частично', false);
+      ok(none.deals.length === 0 && none.leftovers[0].amount === 20000, 'Р6: частичная оплата без номера документа по-прежнему только остаток, без привязки');
+      // «Ждут оплаты» не больше долга: свободная оплата уменьшает итог, документы остаются в списке.
+      ok(bdbM.unpaidSummary(w2.u.id).sum === 30000 && bdbM.unpaidSummary(w2.u.id).docs.length === 1,
+        'Р6: свободная оплата 20 000 уменьшает итог «ждут» до долга 30 000, документ в списке остаётся');
+    }
+  }
+
   console.log('\n── напоминания подряду, торговле и производству ──');
   {
     /*
@@ -8416,7 +8592,13 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'акт не добавил долг и не создал проводку');
     bdbP.rebuildDebt(uP.id);
     ok(bal(cpP, orgA) === debtBeforeAct, 'пересчёт тоже не добавляет долг по акту');
-    ok(!bdbP.unpaidDocs(uP.id).some((d) => d.id === act.id), 'акт не лежит в «Не оплачено»');
+    // Р10: акт оплачен, только когда оплачены накладные месяца. Пока нет — он виден в списке,
+    // но суммой не считается: его деньги уже лежат в накладных, второй раз их ждать нельзя.
+    {
+      const us = bdbP.unpaidSummary(uP.id);
+      const row = us.docs.find((d) => d.id === act.id);
+      ok(!row || (row.pair === true && !act.paid_at), 'акт не считается вторым долгом в «Ждут оплаты»');
+    }
     ok(bdbP.listDocs(uP.id, 200, cpP, orgA).length === docsBefore + 1, 'выписан ровно один акт');
     ok(sent.slice(-3).some((m) => m.kb.some((row) => row.some((b) => b.callback_data === `d.sch:${cpP}`))
       && m.kb.some((row) => row.some((b) => b.callback_data === `d.dog:${cpP}`))),
