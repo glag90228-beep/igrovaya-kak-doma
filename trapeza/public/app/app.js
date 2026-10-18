@@ -3296,12 +3296,13 @@ screens.op = async function op({ cpId, doc }) {
     clearErrors({ amount });
     const sum = Number(String(amount.input.value).replace(/\s/g, '').replace(',', '.'));
     if (!sum) { showError(amount, 'Укажите сумму'); return; }
-    await api('POST', '/api/op', {
+    const saved = await api('POST', '/api/op', {
       cpId: cp.id, amount: sum, kind, date: date.input.value, doc: docF.input.value.trim(),
     });
     haptic('medium');
     toast('Записано в журнал');
-    reset('cp', { id: cp.id });
+    // Самозанятому поступление — это чек «Мой налог»; говорим сразу, не через неделю.
+    reset(saved && saved.npd ? 'cheques' : 'cp', saved && saved.npd ? {} : { id: cp.id });
   });
   box.append(h('div', { class: 'btn-wrap' }, save));
   return box;
@@ -3557,7 +3558,8 @@ screens.ask = async function ask() {
       const left = Number(res.balance) || 0;
       say('bot', `Внёс: ${res.kind} ${money(res.sum)} по «${res.cpName}». `
         + (left > 0 ? `Остаток долга ${money(left)}.`
-          : left < 0 ? `Переплата ${money(Math.abs(left))}.` : 'Расчёты закрыты.'), undo);
+          : left < 0 ? `Переплата ${money(Math.abs(left))}.` : 'Расчёты закрыты.')
+        + (res.npd ? ' Не забудьте пробить чек в «Мой налог» — данные на экране «Чеки».' : ''), undo);
     } catch (e) { say('bot', e.message); }
   };
 
@@ -4547,11 +4549,12 @@ function bankRows(r, cps) {
      * Показываем и ждём нажатия: закрыть долг за человека нельзя. Ошибку
      * заметят через месяц, когда клиент не заплатит, а счёт уже помечен.
      */
+    // Самозанятому каждое поступление — отдельный чек; про него говорим сразу, как только деньги легли.
     if (Array.isArray(res.deals) && res.deals.length) {
-      reset('bankclose', { deals: res.deals, leftovers: res.leftovers || [] });
+      reset('bankclose', { deals: res.deals, leftovers: res.leftovers || [], npd: Boolean(res.npd) });
       return;
     }
-    reset('debts');
+    reset(res.npd ? 'cheques' : 'debts');
   });
   box.append(card, h('div', { class: 'btn-wrap' }, save));
   return box;
@@ -4617,7 +4620,7 @@ screens.bankclose = async function bankClose(params) {
     // Через выписку закрывают сразу пачку, и про чек тут забывают вернее
     // всего: человек ничего не выписывал, он просто прислал файл.
     // Баннер карточки документа сюда не годится (документов много) — ведём на список чеков.
-    reset(res && res.npd ? 'cheques' : 'debts');
+    reset((res && res.npd) || params.npd ? 'cheques' : 'debts');
   });
   const skip = h('button', { class: 'btn ghost' }, 'Не сейчас');
   skip.onclick = () => reset('debts');

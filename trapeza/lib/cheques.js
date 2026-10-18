@@ -15,8 +15,18 @@
  * владельца продукта, не код. Мы готовим данные для чека, которые остаётся
  * ввести руками, и запоминаем, что чек пробит (по желанию — с его ссылкой).
  *
- * Одна запись на документ. Повторное «Оплатил» на том же документе второй
- * чек не заводит: деньги пришли один раз.
+ * Одна запись на каждое поступление денег, а не на документ. Чек самозанятый
+ * обязан пробить на каждый полученный платёж: аванс, часть суммы, оплату в два
+ * приёма — по каждому отдельно и на его сумму. Раньше запись была одна на
+ * документ и на всю его сумму, и частичная оплата, аванс и платёж без документа
+ * чеков не давали вовсе (а «Оплатил» после частичной называл полную сумму, хотя
+ * часть денег уже была учтена). Теперь запись привязана к проводке «Оплата»
+ * (`op_id`) и создаётся сама в момент её появления (`recordIncome` из
+ * lib/bot-db.js), с какого бы экрана деньги ни вносили. Повторное «Оплатил»
+ * новой проводки не делает, поэтому и второй записи не заводит.
+ *
+ * Снятие проводки снимает ожидание чека по ней; уже пробитый чек не трогаем —
+ * он есть в налоговой, и стереть его у себя значило бы потерять след.
  */
 
 const { db } = require('../db');
@@ -28,7 +38,7 @@ db.exec(`
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
     org_id     INTEGER NOT NULL DEFAULT 0,
-    doc_id     INTEGER NOT NULL DEFAULT 0,   -- за какой документ пришли деньги
+    doc_id     INTEGER NOT NULL DEFAULT 0,   -- за какой документ пришли деньги (0 — свободная оплата)
     cp_id      INTEGER NOT NULL DEFAULT 0,
     amount     REAL    NOT NULL DEFAULT 0,
     service    TEXT    NOT NULL DEFAULT '',  -- наименование для чека
@@ -43,8 +53,30 @@ db.exec(`
     created_at TEXT    NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_cheq_user ON npd_cheques(user_id, status);
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_cheq_doc ON npd_cheques(user_id, doc_id) WHERE doc_id > 0;
 `);
+
+/*
+ * Миграция к чекам «по проводке».
+ *
+ * op_id — проводка «Оплата», по которой надо чек. notified — сказали ли уже
+ * человеку (старым записям — да: он о них знает). Уникальность раньше стояла на
+ * документе, а у документа теперь может быть несколько платежей, поэтому
+ * старый индекс снимаем и ставим уникальность на проводку. Записи старого вида
+ * (op_id = 0) остаются как есть — к проводке привязываем те, у которых она есть.
+ */
+{
+  const cols = db.prepare('PRAGMA table_info(npd_cheques)').all().map((c) => c.name);
+  if (!cols.includes('op_id')) db.exec('ALTER TABLE npd_cheques ADD COLUMN op_id INTEGER NOT NULL DEFAULT 0');
+  if (!cols.includes('notified')) db.exec('ALTER TABLE npd_cheques ADD COLUMN notified INTEGER NOT NULL DEFAULT 1');
+  db.exec(`
+    DROP INDEX IF EXISTS idx_cheq_doc;
+    CREATE INDEX IF NOT EXISTS idx_cheq_doc2 ON npd_cheques(user_id, doc_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_cheq_op ON npd_cheques(user_id, op_id) WHERE op_id > 0;
+    UPDATE npd_cheques SET op_id = COALESCE((
+        SELECT MIN(o.id) FROM operations o WHERE o.doc_id = npd_cheques.doc_id AND o.kind = 'Оплата'), 0)
+      WHERE op_id = 0 AND doc_id > 0;
+  `);
+}
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 const digits = (s) => String(s || '').replace(/\D/g, '');
@@ -84,50 +116,138 @@ function serviceName(doc) {
   return `Услуги ${tail}`.slice(0, 200);
 }
 
+/** Наименование для чека по свободной оплате (без документа). */
+function freeServiceName(op) {
+  const note = String(op.doc || '').trim();
+  const generic = !note || /^(оплата|предоплата|оплата по выписке)$/i.test(note);
+  if (/предоплат/i.test(`${op.note} ${op.doc}`)) return 'Услуги (предоплата)';
+  return generic ? 'Услуги' : `Услуги — ${note}`.slice(0, 200);
+}
+
 /**
- * Записать «надо пробить чек» по оплаченному документу.
+ * Записать «надо пробить чек» по поступлению — проводке «Оплата».
  *
- * Молчит, если организация документа не на НПД: чеки нужны только там.
- * Фирма берётся документа, а не выбранная сейчас — как и везде, где деньги
- * привязаны к документу (иначе при переключённой фирме чек терялся).
+ * Чек нужен на каждый полученный платёж и на его сумму: частичную оплату, оплату
+ * частями, аванс, платёж из выписки. Молчит, если это не поступление (не
+ * «Оплата», нет суммы, поставщик — это наша оплата ему), если фирма проводки не
+ * на НПД, и если запись по этой проводке уже есть.
  *
- * @returns {object|null} запись (новая или уже существующая) либо null
+ * Фирма берётся из самой проводки, а не выбранная сейчас — как и везде, где
+ * деньги привязаны к фирме (иначе при переключённой фирме чек терялся).
+ *
+ * @returns {object|null} запись (новая или уже существующая — `existed`) либо null
  */
-function owe(userId, docId, paidAt) {
+function recordIncome(userId, opId) {
+  const op = db.prepare(`
+    SELECT o.*, c.kind AS cp_kind FROM operations o
+      JOIN counterparties c ON c.id = o.cp_id
+     WHERE o.id = ? AND c.user_id = ?`).get(Number(opId), userId);
+  if (!op || op.kind !== 'Оплата' || !(Number(op.debit) > 0) || op.cp_kind === 'supplier') return null;
+  const org = bdb.getOrg(userId, op.org_id) || bdb.currentOrg(userId);
+  if (!npd.isNpd(org)) return null;
+  const old = db.prepare('SELECT * FROM npd_cheques WHERE user_id = ? AND op_id = ?').get(userId, op.id);
+  if (old) return { ...old, existed: true };
+
+  const doc = op.doc_id ? bdb.getDoc(userId, op.doc_id) : null;
+  const cp = bdb.getCp(userId, op.cp_id);
+  const inn = digits(cp && cp.inn);
+  const when = /^\d{4}-\d{2}-\d{2}$/.test(String(op.date)) ? op.date : new Date().toISOString().slice(0, 10);
+  const info = db.prepare(`INSERT INTO npd_cheques(user_id, org_id, doc_id, cp_id, amount, service,
+      buyer_inn, buyer_name, paid_at, due, status, created_at, op_id, notified) VALUES(?,?,?,?,?,?,?,?,?,?,'open',?,?,0)`)
+    .run(userId, Number(org.id) || 0, doc ? doc.id : 0, cp ? cp.id : 0, round2(op.debit),
+      doc ? serviceName(doc) : freeServiceName(op),
+      inn.length === 10 || inn.length === 12 ? inn : '', cp ? String(cp.full_name || cp.name || '') : '',
+      when, npd.chequeDue(when), new Date().toISOString(), op.id);
+  return get(userId, Number(info.lastInsertRowid));
+}
+
+/**
+ * Чек по документу, оплату которого отметили, но проводки в журнале не вышло.
+ *
+ * Бывает, когда документ долга не создаёт (счёт при долге «по акту», ручной
+ * режим, отменённый вручную долг): «Оплатил» только ставит отметку, а деньги
+ * самозанятый получил, и чек ему всё равно нужен. Записей по проводке тут нет,
+ * поэтому запись одна на документ и на его сумму, как раньше. Повторная отметка
+ * второй записи не заводит.
+ *
+ * @returns {object|null}
+ */
+function recordForDoc(userId, docId) {
   const doc = bdb.getDoc(userId, Number(docId));
   if (!doc || !(Number(doc.total) > 0)) return null;
   const org = bdb.orgOfDoc(userId, doc);
   if (!npd.isNpd(org)) return null;
-  const old = db.prepare('SELECT * FROM npd_cheques WHERE user_id = ? AND doc_id = ?').get(userId, doc.id);
+  const old = db.prepare('SELECT * FROM npd_cheques WHERE user_id = ? AND doc_id = ? AND op_id = 0').get(userId, doc.id);
   if (old) return { ...old, existed: true };
-
   const cp = doc.cp_id ? bdb.getCp(userId, doc.cp_id) : null;
   const inn = digits(cp && cp.inn);
-  const when = /^\d{4}-\d{2}-\d{2}$/.test(String(paidAt)) ? paidAt : doc.paid_at || doc.date;
+  const when = /^\d{4}-\d{2}-\d{2}$/.test(String(doc.paid_at)) ? doc.paid_at : doc.date;
   const info = db.prepare(`INSERT INTO npd_cheques(user_id, org_id, doc_id, cp_id, amount, service,
-      buyer_inn, buyer_name, paid_at, due, status, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,'open',?)`)
+      buyer_inn, buyer_name, paid_at, due, status, created_at, op_id, notified) VALUES(?,?,?,?,?,?,?,?,?,?,'open',?,0,0)`)
     .run(userId, Number(org.id) || 0, doc.id, cp ? cp.id : 0, round2(doc.total), serviceName(doc),
       inn.length === 10 || inn.length === 12 ? inn : '', cp ? String(cp.full_name || cp.name || '') : '',
       when, npd.chequeDue(when), new Date().toISOString());
   return get(userId, Number(info.lastInsertRowid));
 }
 
-/** Несколько документов сразу — закрытие пачкой по выписке. Ничего не знает о Telegram. */
-function oweMany(userId, docIds, paidAt) {
+/**
+ * Чеки по оплате документа — для тех, кто спрашивает «есть ли ожидание чека по
+ * этому документу». Каждая проводка «Оплата» документа уже имеет запись (её
+ * завёл recordIncome в момент появления проводки); здесь подстраховка для
+ * проводок, появившихся мимо него, а если проводок нет вовсе, — запись по
+ * документу (recordForDoc). Экраны сами эту функцию не вызывают.
+ *
+ * @returns {object|null} первая запись по документу
+ */
+function owe(userId, docId) {
+  const doc = bdb.getDoc(userId, Number(docId));
+  if (!doc) return null;
+  const ops = db.prepare("SELECT id FROM operations WHERE doc_id = ? AND kind = 'Оплата' ORDER BY id").all(doc.id);
+  let first = null;
+  for (const o of ops) {
+    const c = recordIncome(userId, o.id);
+    if (c && !first) first = c;
+  }
+  return first || recordForDoc(userId, doc.id);
+}
+
+/** Несколько документов сразу. Возвращает только новые записи. */
+function oweMany(userId, docIds) {
   const out = [];
   for (const id of docIds || []) {
-    const c = owe(userId, id, paidAt);
+    const c = owe(userId, id);
     if (c && !c.existed) out.push(c);
   }
   return out;
+}
+
+/**
+ * Записи, о которых человеку ещё не говорили, — и пометка, что теперь сказали.
+ *
+ * Запись заводится в момент появления проводки, с любого экрана, а сказать об
+ * этом надо там, где человек сейчас: экран, который внёс деньги, забирает
+ * новые записи и показывает напоминание. Забрал — второй раз не покажет.
+ */
+function takeFresh(userId) {
+  const rows = db.prepare("SELECT * FROM npd_cheques WHERE user_id = ? AND status = 'open' AND notified = 0 ORDER BY id")
+    .all(userId);
+  if (rows.length) {
+    db.prepare("UPDATE npd_cheques SET notified = 1 WHERE user_id = ? AND status = 'open' AND notified = 0").run(userId);
+  }
+  return rows;
 }
 
 function get(userId, id) {
   return db.prepare('SELECT * FROM npd_cheques WHERE id = ? AND user_id = ?').get(Number(id), userId) || null;
 }
 
+/**
+ * Чек по документу для карточки. Платежей может быть несколько — показываем тот,
+ * что ещё не пробит (он срочнее), иначе последний пробитый.
+ */
 function forDoc(userId, docId) {
-  return db.prepare('SELECT * FROM npd_cheques WHERE user_id = ? AND doc_id = ?').get(userId, Number(docId)) || null;
+  return db.prepare(`SELECT * FROM npd_cheques WHERE user_id = ? AND doc_id = ?
+      ORDER BY (status = 'open') DESC, id DESC LIMIT 1`).get(userId, Number(docId)) || null;
 }
 
 /** Непробитые — самые срочные первыми. */
@@ -170,10 +290,21 @@ function attachLink(userId, id, linkText) {
 /**
  * Оплату сняли — ждать чека не от чего. Пробитый чек не трогаем: он уже есть
  * в налоговой, и стереть его у себя значило бы потерять след.
+ *
+ * Снимает ожидание по проводкам (opIds) и по старым записям документа без
+ * проводки (docId, op_id = 0).
  */
-function cancelForDoc(userId, docId) {
-  return db.prepare("DELETE FROM npd_cheques WHERE user_id = ? AND doc_id = ? AND status = 'open'")
-    .run(userId, Number(docId)).changes;
+function cancelFor(userId, { opIds = [], docId = 0 } = {}) {
+  let n = 0;
+  for (const id of opIds) {
+    n += db.prepare("DELETE FROM npd_cheques WHERE user_id = ? AND op_id = ? AND status = 'open'")
+      .run(userId, Number(id)).changes;
+  }
+  if (docId) {
+    n += db.prepare("DELETE FROM npd_cheques WHERE user_id = ? AND doc_id = ? AND op_id = 0 AND status = 'open'")
+      .run(userId, Number(docId)).changes;
+  }
+  return n;
 }
 
 const rub = (n) => `${new Intl.NumberFormat('ru-RU').format(round2(n)).replace(/[  ]/g, ' ')} ₽`;
@@ -220,6 +351,6 @@ function reminderText(row, cpName = '') {
 }
 
 module.exports = {
-  parseLink, serviceName, owe, oweMany, get, forDoc, open, openCount,
-  markDone, attachLink, cancelForDoc, details, reminderText, rub, LK_URL: npd.LK_URL,
+  parseLink, serviceName, recordIncome, recordForDoc, owe, oweMany, takeFresh, get, forDoc, open, openCount,
+  markDone, attachLink, cancelFor, details, reminderText, rub, LK_URL: npd.LK_URL,
 };

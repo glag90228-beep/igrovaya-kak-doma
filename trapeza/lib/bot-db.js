@@ -898,7 +898,9 @@ function addOp(userId, cpId, op, orgId = null) {
               VALUES(?,?,?,?,?,?,?,?,?)`)
     .run(cpId, org, op.date, op.kind || '', op.doc || '', Number(op.debit) || 0, Number(op.credit) || 0,
       op.note || '', sort);
-  return Number(info.lastInsertRowid);
+  const id = Number(info.lastInsertRowid);
+  noteIncome(userId, id, op);
+  return id;
 }
 function listOps(userId, cpId, orgId = null) {
   const cp = getCp(userId, cpId);
@@ -933,6 +935,7 @@ function deleteOp(userId, opId) {
      WHERE o.id = ? AND c.user_id = ?`).get(Number(opId), userId);
   if (!row) return false;
   db.prepare('DELETE FROM operations WHERE id = ?').run(row.id);
+  dropChequeWait(userId, { opIds: [row.id] });
   /*
    * Проводка пришла из документа — значит, отменили не строку в журнале, а
    * решение по документу, и хранить это надо на нём. Иначе ближайший
@@ -954,7 +957,6 @@ function deleteOp(userId, opId) {
   if (row.doc_id && row.kind === 'Оплата') {
     db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0 WHERE id = ? AND user_id = ?")
       .run(row.doc_id, userId);
-    dropChequeWait(userId, row.doc_id);
     // И со второго документа сделки, если его закрыли заодно с этим.
     db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0, paid_with = 0 WHERE paid_with = ? AND user_id = ?")
       .run(row.doc_id, userId);
@@ -1241,7 +1243,9 @@ function addOpForDoc(userId, cpId, op, docId, many = false) {
               VALUES(?,?,?,?,?,?,?,?,?,?)`)
     .run(cpId, org, op.date, op.kind || '', op.doc || '', Number(op.debit) || 0,
       Number(op.credit) || 0, op.note || '', sort, docId);
-  return Number(info.lastInsertRowid);
+  const id = Number(info.lastInsertRowid);
+  noteIncome(userId, id, op);
+  return id;
 }
 
 /** Сколько рублей привязано к документу строками «Оплата» — его оплаченная часть. */
@@ -1276,6 +1280,11 @@ function linkedPaid(docId) {
  * его решение — не то же самое, что «мы ещё не создали».
  */
 function rebuildDebt(userId) {
+  // Пересчёт снимает и возвращает проводки не потому, что деньги пришли или
+  // ушли, — чеки самозанятого он не создаёт и не стирает (adoptCheque).
+  return quietly(() => rebuildDebtInner(userId));
+}
+function rebuildDebtInner(userId) {
   /*
    * Основание долга — у каждой организации своё.
    *
@@ -1296,12 +1305,13 @@ function rebuildDebt(userId) {
     return basisCache.get(orgId);
   };
   const docs = db.prepare(
-    'SELECT id, cp_id, org_id, type, date, total, number, paid_at, paid_sum, no_debt FROM documents WHERE user_id = ? AND total > 0',
+    'SELECT id, cp_id, org_id, type, date, total, number, paid_at, paid_sum, paid_with, no_debt FROM documents WHERE user_id = ? AND total > 0',
   ).all(userId);
 
   let added = 0;
   let removed = 0;
   let paid = 0;                            // сколько строк оплаты поправили
+  const revived = [];                      // восстановленные проводки оплаты — чекам за ними надо найти хозяина
   const hasOp = (docId, kind) => db.prepare(
     'SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = ?',
   ).get(docId, kind).n > 0;
@@ -1361,12 +1371,16 @@ function rebuildDebt(userId) {
        * «есть ли что-то привязанное» спрашиваем только про такие, ручные, строки.
        */
       if (shouldPay && !hasManualPay(d.id)) {
-        if (addOpForDoc(userId, d.cp_id, {
+        const restored = addOpForDoc(userId, d.cp_id, {
           date: d.paid_at,
           kind: 'Оплата',
           doc: `${title} № ${d.number}`,
           debit: paySum,
-        }, d.id, true)) paid += 1;
+        }, d.id, true);
+        if (restored) {
+          paid += 1;
+          revived.push({ d, opId: restored, sum: paySum });
+        }
       } else if (!should && hasOp(d.id, 'Оплата')) {
         // Документ долга больше не создаёт — оплата без пары не нужна.
         paid += deleteOpsOfDoc(userId, d.id, 'Оплата');
@@ -1377,6 +1391,16 @@ function rebuildDebt(userId) {
        * не трогаем: раньше пересчёт снимал любую привязанную оплату у
        * неотмеченного документа, и частичная оплата терялась.
        */
+    }
+    // Чек прежней проводки переезжает на новую. Делаем это после обхода всех документов:
+    // пока он идёт, старая проводка пары может ещё существовать (порядок документов любой).
+    for (const r of revived) {
+      if (adoptCheque(userId, r.d, r.opId, r.sum)) continue;
+      // Хозяина у чека не нашлось (его ожидание снимали раньше), а деньги в журнале снова есть —
+      // чек на них нужен, как на любое поступление.
+      try { require('./cheques').recordIncome(userId, r.opId); } catch (e) {
+        console.error('чек самозанятого не записан:', e && e.message);
+      }
     }
     db.exec('COMMIT');
   } catch (e) {
@@ -1430,8 +1454,16 @@ function releaseBankPay(userId, docId) {
     AND (note = ? OR id IN (SELECT op_id FROM bank_imports WHERE user_id = ?))`;
   const { s } = db.prepare(`SELECT COALESCE(SUM(debit), 0) AS s FROM operations WHERE ${where}`)
     .get(docId, BANK_NOTE, userId);
+  const ids = db.prepare(`SELECT id FROM operations WHERE ${where}`).all(docId, BANK_NOTE, userId).map((r) => r.id);
   const n = db.prepare(`UPDATE operations SET doc_id = 0, note = ? WHERE ${where}`)
     .run(BANK_NOTE, docId, BANK_NOTE, userId).changes;
+  // Деньги пришли на самом деле — чек по ним остаётся, но уже не «за документ».
+  if (ids.length) {
+    try {
+      db.prepare(`UPDATE npd_cheques SET doc_id = 0 WHERE user_id = ? AND op_id IN (${ids.map(() => '?').join(',')})`)
+        .run(userId, ...ids);
+    } catch (_) { /* таблицы нет */ }
+  }
   return { n, sum: round2(Number(s) || 0) };
 }
 
@@ -1439,22 +1471,130 @@ function deleteOpsOfDoc(userId, docId, kind = null) {
   const d = getDoc(userId, docId);
   if (!d) return 0;
   const kept = !kind || kind === 'Оплата' ? releaseBankPay(userId, docId).n : 0;
+  // Чек ждали по оплате, которой больше нет, — ожидание снимаем вместе с ней.
+  const payIds = !kind || kind === 'Оплата'
+    ? db.prepare("SELECT id FROM operations WHERE doc_id = ? AND kind = 'Оплата'").all(docId).map((r) => r.id)
+    : [];
+  dropChequeWait(userId, { opIds: payIds });
   const info = kind
     ? db.prepare('DELETE FROM operations WHERE doc_id = ? AND kind = ?').run(docId, kind)
     : db.prepare('DELETE FROM operations WHERE doc_id = ?').run(docId);
   return info.changes + kept;
 }
 
-/**
- * Оплату сняли — самозанятому не от чего ждать чека (lib/cheques.js).
- * Пробитый чек не трогаем: он уже в налоговой. Прямой запрос, а не вызов
- * модуля чеков: тот сам зависит от этого файла. Таблицы может не быть, если
- * модуль не подключали, — тогда и ждать нечего.
+/*
+ * Чеки самозанятого (lib/cheques.js) — по каждому поступлению.
+ *
+ * Деньги вносят из десятка мест: «Оплатил», оплата словами, выписка, предоплата,
+ * повторяющаяся операция, фото. Чек нужен на каждое поступление, поэтому запись
+ * заводим здесь, в момент появления проводки «Оплата», а не в каждом экране
+ * отдельно — забытый экран означал бы потерянный чек, а срок по закону жёсткий.
+ *
+ * Модуль чеков зависит от этого файла, поэтому подключаем его по требованию.
+ * Ошибка учёта чеков не должна ронять учёт денег: проводка уже записана, а
+ * чек можно завести и позже — пишем в журнал ошибок и идём дальше.
+ *
+ * chequesQuiet — пересчёт и перестановка денег внутри выписки: там проводки
+ * создаются и удаляются не потому, что пришли или ушли деньги, и чекам про это
+ * знать незачем (они переезжают сами, см. moveCheque и adoptCheque).
  */
-function dropChequeWait(userId, docId) {
+let chequesQuiet = 0;
+function quietly(fn) {
+  chequesQuiet += 1;
+  try { return fn(); } finally { chequesQuiet -= 1; }
+}
+function noteIncome(userId, opId, op) {
+  if (chequesQuiet || !(Number(op && op.debit) > 0) || (op.kind || '') !== 'Оплата') return;
+  try { require('./cheques').recordIncome(userId, opId); } catch (e) {
+    console.error('чек самозанятого не записан:', e && e.message);
+  }
+}
+
+/** Отметили оплату документа, который в журнал деньгами не лёг: чек самозанятому всё равно нужен. */
+function noteDocIncome(userId, docId) {
+  if (chequesQuiet) return;
+  try { require('./cheques').recordForDoc(userId, docId); } catch (e) {
+    console.error('чек самозанятого не записан:', e && e.message);
+  }
+}
+
+/**
+ * Проводки сняли — самозанятому не от чего ждать чека по ним. Пробитый чек не
+ * трогаем: он уже в налоговой. Прямой запрос, а не вызов модуля чеков: тот сам
+ * зависит от этого файла. Таблицы может не быть, если модуль не подключали, —
+ * тогда и ждать нечего.
+ *
+ * @param {{opIds?: number[], docId?: number}} what проводки; docId — ещё и
+ *   записи документа без живой проводки: старые (op_id = 0) и оставшиеся от
+ *   проводки, которую пересчёт основания снял
+ */
+function dropChequeWait(userId, { opIds = [], docId = 0 } = {}) {
+  if (chequesQuiet) return;
   try {
-    db.prepare("DELETE FROM npd_cheques WHERE user_id = ? AND doc_id = ? AND status = 'open'")
-      .run(userId, Number(docId));
+    for (const id of opIds) {
+      db.prepare("DELETE FROM npd_cheques WHERE user_id = ? AND op_id = ? AND status = 'open'")
+        .run(userId, Number(id));
+    }
+    if (docId) {
+      // Старые записи без проводки и записи, чья проводка исчезла при пересчёте основания.
+      db.prepare(`DELETE FROM npd_cheques WHERE user_id = ? AND doc_id = ? AND status = 'open'
+                    AND (op_id = 0 OR op_id NOT IN (SELECT id FROM operations))`)
+        .run(userId, Number(docId));
+    }
+  } catch (_) { /* таблицы нет */ }
+}
+
+/**
+ * Пересчёт восстановил проводку оплаты под новым номером — чек, оставшийся от
+ * прежней (проводки уже нет), переезжает на неё. Ищем сначала среди чеков самого
+ * документа и его пары, потом по клиенту и сумме. Новый чек не заводим: деньги
+ * те же, а не новые.
+ */
+function adoptCheque(userId, doc, newOpId, amount) {
+  try {
+    const gone = 'op_id > 0 AND op_id NOT IN (SELECT id FROM operations)';
+    const kin = db.prepare('SELECT id FROM documents WHERE user_id = ? AND (id = ? OR paid_with = ? OR id = ?)')
+      .all(userId, doc.id, doc.id, Number(doc.paid_with) || 0).map((r) => r.id);
+    let row = kin.length
+      ? db.prepare(`SELECT id FROM npd_cheques WHERE user_id = ? AND ${gone} AND doc_id IN (${kin.map(() => '?').join(',')})
+                     AND ABS(amount - ?) < 0.005 ORDER BY id LIMIT 1`).get(userId, ...kin, amount)
+      : null;
+    if (!row) {
+      row = db.prepare(`SELECT id FROM npd_cheques WHERE user_id = ? AND ${gone} AND cp_id = ?
+                         AND ABS(amount - ?) < 0.005 ORDER BY id LIMIT 1`).get(userId, doc.cp_id, amount);
+    }
+    if (row) {
+      db.prepare('UPDATE npd_cheques SET op_id = ?, doc_id = ? WHERE id = ?').run(newOpId, doc.id, row.id);
+      return true;
+    }
+  } catch (_) { /* таблицы нет */ }
+  return false;
+}
+
+/**
+ * Часть денег (или все) переехала со свободной строки выписки на документ.
+ *
+ * Чек самозанятого относится к деньгам, а не к строке: платёж целиком — чек
+ * переезжает вместе с ним; переехала часть — непробитый чек делится на две
+ * записи (остаток на старой строке и переехавшая сумма на новой). Уже пробитый
+ * чек покрывает платёж целиком, делить его не нужно и нельзя.
+ */
+function moveCheque(userId, srcOpId, { dropped, rest, freshId, docId, total }) {
+  try {
+    const old = db.prepare('SELECT * FROM npd_cheques WHERE user_id = ? AND op_id = ?').get(userId, srcOpId);
+    if (!old) {
+      if (freshId) noteIncome(userId, freshId, { debit: total, kind: 'Оплата' });
+      return;
+    }
+    if (dropped) {
+      db.prepare('UPDATE npd_cheques SET op_id = ?, doc_id = ? WHERE id = ?').run(freshId, docId, old.id);
+    } else if (old.status === 'open') {
+      db.prepare('UPDATE npd_cheques SET amount = ? WHERE id = ?').run(rest, old.id);
+      db.prepare(`INSERT INTO npd_cheques(user_id, org_id, doc_id, cp_id, amount, service, buyer_inn, buyer_name,
+          paid_at, due, status, created_at, op_id, notified) VALUES(?,?,?,?,?,?,?,?,?,?,'open',?,?,?)`)
+        .run(userId, old.org_id, docId, old.cp_id, total, old.service, old.buyer_inn, old.buyer_name,
+          old.paid_at, old.due, new Date().toISOString(), freshId, old.notified);
+    }
   } catch (_) { /* таблицы нет */ }
 }
 
@@ -1528,7 +1668,11 @@ function markPaid(userId, docId, date) {
   if (lead.id !== d.id) mark.run(when, 0, lead.id, userId);
   if (twin && twin.id !== d.id) mark.run(when, lead.id, twin.id, userId);
 
-  if (basisOf(org || {}) === 'manual') { settleMonthActs(userId, d.cp_id); return when; }
+  if (basisOf(org || {}) === 'manual') {
+    settleMonthActs(userId, d.cp_id);
+    noteDocIncome(userId, lead.id);
+    return when;
+  }
 
   /*
    * Проводку оплаты делаем только по тому документу, который создаёт долг.
@@ -1584,6 +1728,9 @@ function markPaid(userId, docId, date) {
      */
     db.prepare('UPDATE documents SET paid_sum = ? WHERE id = ? AND user_id = ?').run(left, lead.id, userId);
     if (twin) db.prepare('UPDATE documents SET paid_sum = ? WHERE id = ? AND user_id = ?').run(left, twin.id, userId);
+  } else {
+    // В журнале денег не видно, а получены они — самозанятому чек всё равно нужен.
+    noteDocIncome(userId, lead.id);
   }
   settleMonthActs(userId, d.cp_id);
   return when;
@@ -1616,7 +1763,7 @@ function unmarkPaid(userId, docId) {
     .run(docId, userId);
   let kept = 0;
   for (const id of [docId, ...twins]) {
-    dropChequeWait(userId, id);
+    dropChequeWait(userId, { docId: id });            // старые записи без проводки
     kept += releaseBankPay(userId, id).sum;
     deleteOpsOfDoc(userId, id, 'Оплата');
   }
@@ -2064,15 +2211,19 @@ function closeDocsFromBank(userId, deals) {
   const moveBankPay = (d, lead, when, total) => {
     const src = d.opId ? amountOf.get(Number(d.opId), userId) : null;
     let dropped = false;
+    let rest = 0;
     if (src) {
-      const rest = round2((Number(src.debit) || 0) - total);
+      rest = round2((Number(src.debit) || 0) - total);
       if (rest > 0.004) cut.run(rest, Number(d.opId), userId);
       else { drop.run(Number(d.opId), userId); dropped = true; }
     }
-    const freshId = addOpForDoc(userId, d.cpId, {
+    // Новая строка — те же деньги, а не новые: чек самозанятого за них не заводим заново.
+    const freshId = quietly(() => addOpForDoc(userId, d.cpId, {
       date: when, kind: 'Оплата', doc: d.doc || `${lead.title} № ${lead.number}`, debit: total,
       note: BANK_NOTE,
-    }, lead.id, true);
+    }, lead.id, true));
+    if (src) moveCheque(userId, Number(d.opId), { dropped, rest, freshId, docId: lead.id, total });
+    else if (freshId) noteIncome(userId, freshId, { debit: total, kind: 'Оплата' });
     /*
      * Отметку о загрузке переставляем на новую строку. По ней deleteOp
      * узнаёт, что операция пришла из выписки, и при отмене разрешает
@@ -2114,6 +2265,9 @@ function closeDocsFromBank(userId, deals) {
       const amount = debt ? Math.min(round2(Number(d.total) || 0), rem) : round2(Number(d.total) || 0);
       if (debt && amount > 0) moveBankPay(d, lead, when, amount);
       const full = !debt || amount >= rem - 0.004;
+      // Документ долга не создаёт, а строки выписки в журнале нет (её не заносили):
+      // денег в учёте не видно, но получены они — самозанятому нужен чек по документу.
+      if (!debt && full && !(d.opId && amountOf.get(Number(d.opId), userId))) noteDocIncome(userId, lead.id);
 
       if (!full) { partial += 1; cps.add(lead.cp_id); continue; }
       markDone.run(when, lead.id, userId);
@@ -2731,6 +2885,15 @@ function deleteDoc(userId, id) {
   // его удаления она уже ничего не найдёт.
   if (!getDoc(userId, id)) return false;
   deleteOpsOfDoc(userId, id);
+  dropChequeWait(userId, { docId: id });
+  /*
+   * Парный документ сделки, оплаченной через удаляемый, возвращается в неоплаченные:
+   * оплата лежала на удаляемом и уходит вместе с ним. Иначе отметка с суммой
+   * оставалась бы у второго документа, и при смене основания пересчёт
+   * «восстановил» бы оплату, которой уже нет.
+   */
+  db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0, paid_with = 0 WHERE paid_with = ? AND user_id = ?")
+    .run(id, userId);
   return db.prepare('DELETE FROM documents WHERE id = ? AND user_id = ?').run(id, userId).changes > 0;
 }
 

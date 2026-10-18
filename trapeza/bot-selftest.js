@@ -6027,6 +6027,16 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       ok(w2.bal() === 0, 'Р4: переключение при отметке с парного документа тоже ничего не оживляет', w2.bal());
       bdbM.unmarkPaid(w2.u.id, act2.id);
       ok(w2.bal() === 3000 && !bdbM.getDoc(w2.u.id, inv2.id).paid_at, 'Р4: снятие отметки с одного документа возвращает сделку целиком', w2.bal());
+      // Удалили главный документ оплаченной сделки: оплата ушла с ним, парный снова не оплачен
+      // (и смена основания не «восстанавливает» оплату, которой уже нет).
+      const w2b = await world(781023);
+      const actB = await w2b.mk('usl', 3000);
+      const invB = await w2b.mk('sch', 3000);
+      bdbM.markPaid(w2b.u.id, actB.id, '2026-10-05');
+      bdbM.deleteDoc(w2b.u.id, actB.id);
+      ok(!bdbM.getDoc(w2b.u.id, invB.id).paid_at && w2b.bal() === 0, 'Р4: удалили главный документ сделки — парный снова неоплачен', w2b.bal());
+      w2b.setBasis('invoice');
+      ok(w2b.bal() === 3000, 'Р4: и счёт при долге «по счёту» честно висит долгом, а не «оплачен призраком»', w2b.bal());
       // Закрытая из выписки сделка: туда-обратно оплату не задваивает.
       const w3 = await world(781022);
       await w3.mk('usl', 3000); await w3.mk('sch', 3000);
@@ -6100,6 +6110,160 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       // «Ждут оплаты» не больше долга: свободная оплата уменьшает итог, документы остаются в списке.
       ok(bdbM.unpaidSummary(w2.u.id).sum === 30000 && bdbM.unpaidSummary(w2.u.id).docs.length === 1,
         'Р6: свободная оплата 20 000 уменьшает итог «ждут» до долга 30 000, документ в списке остаётся');
+    }
+  }
+
+  console.log('\n── деньги: чек самозанятого на каждое поступление ──');
+  {
+    /*
+     * Находка Р3: чек заводился один на документ и на всю его сумму, поэтому
+     * частичная оплата, оплата частями, аванс и платёж из выписки чеков не
+     * давали, а «Оплатил» после частичной называл полную сумму. Теперь запись —
+     * на каждую приходную проводку, на её сумму.
+     */
+    const bdbC = require('./lib/bot-db');
+    const dsC = require('./lib/doc-service');
+    const chqC = require('./lib/cheques');
+    const rawC = require('./db').db;
+    let seq = 0;
+    const world = async (basis = 'invoice') => {
+      seq += 1;
+      const u = bdbC.getOrCreateUser(781100 + seq, 'Чек');
+      bdbC.saveMyOrg(u.id, { name: `Иванов И. И. ${seq}`, inn: '183200000011' });
+      const org = bdbC.getDefaultOrg(u.id);
+      bdbC.updateOrg(u.id, org.id, { npd: 1, debt_basis: basis });
+      const cp = bdbC.createCp(u.id, { name: 'Петров П. П.', kind: 'customer', inn: '183100000099', opening_date: '2026-01-01' });
+      const mk = async (price, date = '2026-10-01', type = 'sch') => (await dsC.issueDocument(u.id, {
+        type, cpId: cp, date, items: [{ name: 'Консультация', qty: 1, price }], skipQuota: true,
+      })).doc;
+      const all = () => rawC.prepare('SELECT * FROM npd_cheques WHERE user_id = ? ORDER BY id').all(u.id);
+      const sum = () => Math.round(all().reduce((a, c) => a + c.amount, 0) * 100) / 100;
+      return { u, org, cp, mk, all, sum };
+    };
+
+    // Частичная оплата, затем «Оплатил»: два чека — на 20 000 и на 30 000, а не 50 000 и ничего.
+    {
+      const w = await world();
+      const inv = await w.mk(50000);
+      bdbC.addOp(w.u.id, w.cp, { date: '2026-10-02', kind: 'Оплата', doc: 'п/п 1', debit: 20000 });
+      ok(w.all().length === 1 && w.all()[0].amount === 20000 && w.all()[0].status === 'open',
+        'Р3: свободная частичная оплата 20 000 сразу даёт чек на 20 000', JSON.stringify(w.all().map((c) => c.amount)));
+      bdbC.markPaid(w.u.id, inv.id, '2026-10-03');
+      ok(w.all().length === 2 && w.sum() === 50000 && w.all()[1].amount === 30000 && w.all()[1].doc_id === inv.id,
+        'Р3: «Оплатил» после частичной — чек на остаток 30 000, всего 50 000 (по полученным деньгам)', JSON.stringify(w.all().map((c) => c.amount)));
+      bdbC.markPaid(w.u.id, inv.id, '2026-10-04');
+      ok(w.all().length === 2, 'Р3: повторное «Оплатил» чек не задваивает');
+      // Снятие отметки снимает ожидание чека по этой проводке, а чек за свободную оплату остаётся.
+      bdbC.unmarkPaid(w.u.id, inv.id);
+      ok(w.all().length === 1 && w.all()[0].amount === 20000, 'Р3: снятие оплаты убрало ожидание чека на 30 000; чек на 20 000 остался', JSON.stringify(w.all().map((c) => c.amount)));
+      // Пробитый чек оплата не стирает.
+      chqC.markDone(w.u.id, w.all()[0].id);
+      const op = bdbC.listOps(w.u.id, w.cp).find((o) => o.kind === 'Оплата');
+      bdbC.deleteOp(w.u.id, op.id);
+      ok(w.all().length === 1 && w.all()[0].status === 'done', 'Р3: пробитый чек при снятии проводки не трогаем');
+    }
+
+    // Оплата частями, аванс и накладные, закрытые авансом.
+    {
+      const w = await world('closing');
+      bdbC.addOp(w.u.id, w.cp, { date: '2026-10-02', kind: 'Оплата', doc: 'п/п 1', debit: 20000 });
+      bdbC.addOp(w.u.id, w.cp, { date: '2026-10-09', kind: 'Оплата', doc: 'п/п 2', debit: 30000 });
+      ok(w.all().length === 2 && w.sum() === 50000, 'Р3: оплата частями 20 000 + 30 000 — два чека, в сумме 50 000', JSON.stringify(w.all().map((c) => c.amount)));
+      ok(w.all()[0].due === '2026-11-09', 'Р3: срок — 9-е число следующего месяца от даты поступления');
+
+      const p = await world('closing');
+      bdbC.addPrepay(p.u.id, p.cp, 140000, '2026-10-01');
+      ok(p.all().length === 1 && p.all()[0].amount === 140000 && /предоплат/i.test(p.all()[0].service),
+        'Р3: аванс 140 000 — чек на аванс', JSON.stringify(p.all().map((c) => [c.amount, c.service])));
+      const a1 = await p.mk(50000, '2026-10-05', 'torg12');
+      const a2 = await p.mk(50000, '2026-10-06', 'torg12');
+      ok(bdbC.getDoc(p.u.id, a1.id).paid_at && bdbC.getDoc(p.u.id, a2.id).paid_at, 'накладные закрыты из аванса');
+      ok(p.all().length === 1 && p.sum() === 140000, 'Р3: накладные, закрытые авансом, новых чеков не дают — деньги пришли один раз', JSON.stringify(p.all().map((c) => c.amount)));
+      // Отмена аванса снимает ожидание чека.
+      const advOp = bdbC.listOps(p.u.id, p.cp).find((o) => o.note === 'Предоплата');
+      bdbC.deleteOp(p.u.id, advOp.id);
+      ok(p.all().length === 0, 'Р3: отменили аванс — ожидание чека на него снято');
+    }
+
+    // Выписка: чек — в момент занесения; закрытие документов его переносит, а не задваивает.
+    {
+      const w = await world('closing');
+      const d = await w.mk(50000, '2026-10-01', 'torg12');
+      const res = bdbC.importBankRows(w.u.id, [{ key: 'chq-1', cpId: w.cp, amount: 80000, date: '2026-10-05', doc: 'п/п 7', purpose: `Оплата по накладной № ${d.number}` }]);
+      ok(w.all().length === 1 && w.all()[0].amount === 80000 && w.all()[0].doc_id === 0 && w.all()[0].notified === 0,
+        'Р3: платёж из выписки сразу даёт чек на всю сумму поступления', JSON.stringify(w.all()));
+      const m = bdbC.matchPaymentsToDocs(w.u.id, res.addedRows);
+      bdbC.closeDocsFromBank(w.u.id, m.deals);
+      ok(w.sum() === 80000 && w.all().length === 2, 'Р3: платёж 80 000 разошёлся на документ (50 000) и остаток (30 000) — чеки делятся, сумма та же',
+        JSON.stringify(w.all().map((c) => [c.amount, c.doc_id])));
+      const linked = w.all().find((c) => c.doc_id === d.id);
+      ok(linked && linked.amount === 50000, 'и чек на 50 000 теперь «за документ»', JSON.stringify(linked));
+      // Платёж целиком — чек просто переезжает.
+      const w2 = await world('closing');
+      const d2 = await w2.mk(50000, '2026-10-01', 'torg12');
+      const res2 = bdbC.importBankRows(w2.u.id, [{ key: 'chq-2', cpId: w2.cp, amount: 50000, date: '2026-10-05', doc: 'п/п 8' }]);
+      bdbC.closeDocsFromBank(w2.u.id, bdbC.matchPaymentsToDocs(w2.u.id, res2.addedRows).deals);
+      ok(w2.all().length === 1 && w2.all()[0].doc_id === d2.id, 'Р3: платёж ровно на документ — тот же чек, привязанный к документу', JSON.stringify(w2.all().map((c) => [c.amount, c.doc_id])));
+      // Туда-обратно по основаниям чеки не множит.
+      bdbC.updateOrg(w2.u.id, w2.org.id, { debt_basis: 'invoice' }); bdbC.rebuildDebt(w2.u.id);
+      bdbC.updateOrg(w2.u.id, w2.org.id, { debt_basis: 'closing' }); bdbC.rebuildDebt(w2.u.id);
+      ok(w2.all().length === 1, 'Р3: смена основания туда-обратно чеков не множит и не теряет');
+    }
+
+    // Оплата сделки отмечена, основание сменили: чек остаётся один и едет за деньгами.
+    {
+      const w = await world('closing');
+      const act = await w.mk(3000, '2026-10-01', 'usl');
+      await w.mk(3000, '2026-10-01', 'sch');
+      bdbC.markPaid(w.u.id, act.id, '2026-10-05');
+      ok(w.all().length === 1 && w.all()[0].amount === 3000, 'Р3: «Оплатил» на сделке из счёта и акта — один чек на 3 000');
+      bdbC.updateOrg(w.u.id, w.org.id, { debt_basis: 'invoice' }); bdbC.rebuildDebt(w.u.id);
+      const op = bdbC.listOps(w.u.id, w.cp).find((o) => o.kind === 'Оплата');
+      ok(w.all().length === 1 && w.all()[0].op_id === op.id, 'Р3: после смены основания чек привязан к восстановленной проводке', JSON.stringify(w.all().map((c) => c.op_id)));
+      bdbC.unmarkPaid(w.u.id, act.id);
+      ok(w.all().length === 0, 'Р3: снятие оплаты сделки снимает ожидание чека');
+    }
+
+    // Документ долга не создаёт: денег в журнале нет, но «Оплатил» — получены; чек по документу, один.
+    {
+      const w = await world('closing');
+      const inv = await w.mk(7000, '2026-10-01', 'sch');
+      bdbC.markPaid(w.u.id, inv.id, '2026-10-05');
+      bdbC.markPaid(w.u.id, inv.id, '2026-10-06');
+      ok(w.all().length === 1 && w.all()[0].amount === 7000 && w.all()[0].doc_id === inv.id, 'Р3: счёт при долге «по акту» — «Оплатил» даёт один чек по документу');
+    }
+
+    // Не самозанятый и поставщик чеков не получают.
+    {
+      const w = await world('closing');
+      bdbC.updateOrg(w.u.id, w.org.id, { npd: 0 });
+      bdbC.addOp(w.u.id, w.cp, { date: '2026-10-02', kind: 'Оплата', doc: 'п/п 1', debit: 1000 });
+      ok(w.all().length === 0, 'Р3: не самозанятому чеки не заводятся');
+      bdbC.updateOrg(w.u.id, w.org.id, { npd: 1 });
+      const sup = bdbC.createCp(w.u.id, { name: 'ООО «Поставщик»', kind: 'supplier', opening_date: '2026-01-01' });
+      bdbC.addOp(w.u.id, sup, { date: '2026-10-02', kind: 'Оплата', doc: 'наша оплата', debit: 5000 });
+      ok(w.all().length === 0, 'Р3: оплата поставщику — не доход, чек не нужен');
+    }
+
+    // Бот: «оплата 20000», затем «оплата 30000» — по каждой своё напоминание.
+    {
+      const uid = fxUserId();
+      const org = bdbC.getDefaultOrg(uid);
+      const wasNpd = org.npd; const wasBasis = org.debt_basis;
+      bdbC.updateOrg(uid, org.id, { npd: 1, debt_basis: 'invoice' });
+      const cpB = bdbC.createCp(uid, { name: 'ООО «Частями»', kind: 'customer', inn: '7707083893', opening_date: '2026-01-01' });
+      await dsC.issueDocument(uid, { type: 'sch', cpId: cpB, date: '2026-10-01', items: [{ name: 'Работа', qty: 1, price: 50000 }], skipQuota: true });
+      sent.length = 0;
+      await tap(`pay.cp:${cpB}:20000:o:chqtok1`);
+      ok(norm(sent.map((m) => m.text || '').join(' ')).includes('Пробейте чек в «Мой налог» на 20 000 ₽'),
+        'Р3: бот после «оплата 20000» напоминает про чек на 20 000', norm(sent.map((m) => m.text || '').join(' ')).slice(-160));
+      sent.length = 0;
+      await tap(`pay.cp:${cpB}:30000:o:chqtok2`);
+      ok(norm(sent.map((m) => m.text || '').join(' ')).includes('Пробейте чек в «Мой налог» на 30 000 ₽'),
+        'Р3: и после второй части — на 30 000', norm(sent.map((m) => m.text || '').join(' ')).slice(-160));
+      const mine = rawC.prepare('SELECT amount FROM npd_cheques WHERE user_id = ? AND cp_id = ? ORDER BY id').all(uid, cpB).map((c) => c.amount);
+      ok(mine.join() === '20000,30000', 'Р3: в списке чеков два: 20 000 и 30 000', mine.join());
+      bdbC.updateOrg(uid, org.id, { npd: wasNpd, debt_basis: wasBasis });
     }
   }
 
@@ -6955,7 +7119,8 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       { opId: 0, cpId: cpIp, leadId: d4.doc.id, twinId: 0, total: 9000, date: '2026-09-05', doc: '' },
     ]);
     ok(closed.leads.length === 2, 'закрытие по выписке называет документы сделок', JSON.stringify(closed));
-    const made = chq.oweMany(uid, closed.leads, '2026-09-05');
+    // Чек заводится сам, в момент появления проводки оплаты (а не отдельным вызовом после закрытия).
+    const made = chq.open(uid).filter((c) => closed.leads.includes(c.doc_id));
     ok(made.length === 2 && made.every((c) => c.due === '2026-10-09'), 'по каждому — ожидание чека со сроком 09.10', JSON.stringify(made.map((c) => c.due)));
     ok(chq.oweMany(uid, closed.leads, '2026-09-05').length === 0, 'повторная загрузка той же выписки чеков не плодит');
     for (const c of chq.open(uid)) chq.markDone(uid, c.id);

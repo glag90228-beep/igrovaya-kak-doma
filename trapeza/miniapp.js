@@ -514,6 +514,33 @@ function chequeBrief(c, cpName = '') {
 }
 
 /**
+ * Напоминание про чеки по свежим поступлениям — или null, если нечего.
+ *
+ * Запись о чеке самозанятого заводится сама в момент появления проводки
+ * «Оплата» (lib/cheques.js), а сказать об этом надо тому запросу, который
+ * внёс деньги. Он забирает записи, о которых ещё не говорили: «Оплатил»,
+ * оплата словами, предоплата, выписка. Одна запись — её текст, несколько —
+ * общий («Данные для каждого — на экране „Чеки“»).
+ *
+ * @param {number} [docId] документ, по которому нажали, — его чек идёт первым
+ */
+function npdNoteFor(userId, docId = 0) {
+  const fresh = cheques.takeFresh(userId);
+  if (!fresh.length) return null;
+  const first = fresh.find((c) => c.doc_id === docId) || fresh[0];
+  const cp = first.cp_id ? bdb.getCp(userId, first.cp_id) : null;
+  return {
+    url: npd.LK_URL,
+    text: fresh.length === 1
+      ? cheques.reminderText(first, cp && cp.name)
+      : `Пробейте чеки в «Мой налог»: ${fresh.length} шт. на ${cheques.rub(fresh.reduce((a, c) => a + c.amount, 0))}. `
+        + 'Данные для каждого — на экране «Чеки».',
+    cheque: chequeBrief(first, cp && cp.name),
+    cheques: fresh.map((c) => chequeBrief(c)),
+  };
+}
+
+/**
  * Что показать на экране реквизитов: загружены ли картинки и куда ставим.
  * Сами картинки наружу отдаём предпросмотром — они маленькие, а видеть,
  * что именно загружено, важнее лишней экономии трафика.
@@ -656,7 +683,10 @@ const api = {
     const op = { date, kind: isIncome ? 'Приход' : 'Оплата' };
     if (isIncome) op.credit = sum; else op.debit = sum;
     const id = bdb.addOp(user.id, cpId, op);
-    return { id, kind: op.kind, sum, cpName: cp.name, balance: round2(bdb.balanceOf(user.id, cpId).closing) };
+    return {
+      id, kind: op.kind, sum, cpName: cp.name, balance: round2(bdb.balanceOf(user.id, cpId).closing),
+      npd: isIncome ? null : npdNoteFor(user.id),
+    };
   },
 
   /** Переключатель ИИ-ассистента: то же, что кнопка в боте. */
@@ -1061,17 +1091,13 @@ const api = {
     const when = bdb.markPaid(user.id, id, payDate);
     // Самозанятому в этот момент надо выдать чек: счёт и акт доход не
     // закрывают, его закрывает чек «Моего налога» (lib/npd.js). Запись о нём
-    // остаётся, пока человек не отметит чек пробитым (lib/cheques.js).
-    // Чек нужен, если самозанятая ФИРМА ДОКУМЕНТА, а не та, что выбрана
-    // сейчас: иначе при переключённой фирме напоминание о чеке терялось.
-    const cp = doc.cp_id ? bdb.getCp(user.id, doc.cp_id) : null;
-    const chq = cheques.owe(user.id, id, when);
+    // завела сама проводка оплаты — на ту сумму, что пришла сейчас, а не на
+    // весь документ (часть денег могла прийти раньше и уже учтена своим чеком).
+    // Остаётся, пока человек не отметит чек пробитым (lib/cheques.js).
     return {
       paidAt: when,
       doc: docBrief(bdb.getDoc(user.id, id)),
-      npd: chq && chq.status === 'open'
-        ? { url: npd.LK_URL, text: cheques.reminderText(chq, cp && cp.name), cheque: chequeBrief(chq, cp && cp.name) }
-        : null,
+      npd: npdNoteFor(user.id, id),
     };
   },
 
@@ -1206,7 +1232,7 @@ const api = {
     // дальше закрываются сами (см. bdb.settleFromPrepay).
     if (body.kind === 'prepay') {
       bdb.addPrepay(user.id, cp.id, amount, date);
-      return { cp: cpBrief(user.id, bdb.getCp(user.id, cp.id)) };
+      return { cp: cpBrief(user.id, bdb.getCp(user.id, cp.id)), npd: npdNoteFor(user.id) };
     }
     bdb.addOp(user.id, cp.id, {
       date,
@@ -1215,7 +1241,8 @@ const api = {
       debit: paid ? amount : 0,
       credit: paid ? 0 : amount,
     });
-    return { cp: cpBrief(user.id, bdb.getCp(user.id, cp.id)) };
+    // Самозанятому каждое поступление — отдельный чек, и сказать об этом надо сейчас.
+    return { cp: cpBrief(user.id, bdb.getCp(user.id, cp.id)), npd: paid ? npdNoteFor(user.id) : null };
   },
 
   /** Акт сверки в Excel — по журналу операций контрагента. */
@@ -1767,7 +1794,8 @@ const api = {
      * решает человек следующим нажатием — как и в боте.
      */
     const { deals, leftovers } = bdb.matchPaymentsToDocs(user.id, res.addedRows);
-    return { ...res, deals, leftovers, unpaid: bdb.debtors(user.id).length };
+    // Деньги пришли сейчас — самозанятому по каждому поступлению свой чек.
+    return { ...res, deals, leftovers, unpaid: bdb.debtors(user.id).length, npd: npdNoteFor(user.id) };
   },
 
   /** Отметить закрытыми счета, которые человек подтвердил после выписки. */
@@ -1785,26 +1813,11 @@ const api = {
     })));
     const left = bdb.unpaidSummary(user.id);
     /*
-     * Про чек напоминаем и здесь — как это давно делает бот.
-     *
-     * Через выписку закрывают сразу пачку, и именно тут про чек забывают
-     * вернее всего: человек ничего не выписывал, он просто прислал файл.
-     * Отметка оплаты по одному документу напоминание отдавала, а закрытие
-     * пачки — нет, то есть пропущен был ровно тот путь, который закрывает
-     * много документов молча. Для ИП на НПД это срок из статьи 14
-     * ФЗ № 422-ФЗ, а не вежливость.
+     * Про чек напоминание обычно уже прозвучало при занесении выписки: деньги
+     * пришли тогда. Здесь это только страховка — если запись появилась уже при
+     * закрытии (платёж без строки в журнале), скажем сейчас.
      */
-    const made = cheques.oweMany(user.id, done.leads, docService.todayISO());
-    const npdNote = made.length
-      ? {
-        url: npd.LK_URL,
-        text: made.length === 1
-          ? cheques.reminderText(made[0])
-          : `Пробейте чеки в «Мой налог»: ${made.length} шт. на ${cheques.rub(made.reduce((a, c) => a + c.amount, 0))}. `
-            + 'Данные для каждого — на экране «Чеки».',
-        cheques: made.map((c) => chequeBrief(c)),
-      }
-      : null;
+    const npdNote = npdNoteFor(user.id);
     return { ...done, count: left.count, sum: left.sum, npd: npdNote };
   },
 

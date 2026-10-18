@@ -705,6 +705,43 @@ async function main() {
       'Р6: документ, оплаченный двумя платежами, закрыт и из «ждут оплаты» ушёл', JSON.stringify(r.json));
   }
 
+  section('деньги: чек самозанятого на каждое поступление (API)');
+  {
+    // Р3 через приложение: частичная оплата руками → чек на 20 000; «Оплатил» → чек на остаток 30 000.
+    const NU = { id: 500606, first_name: 'Нина', username: 'nina' };
+    const nUser = initDataFor(NU);
+    const bdbN = require('./lib/bot-db');
+    const nid = bdbN.getOrCreateUser(NU.id).id;
+    bdbN.saveMyOrg(nid, { name: 'Иванова Н. Н.', inn: '183200000011' });
+    const orgN = bdbN.getDefaultOrg(nid);
+    bdbN.updateOrg(nid, orgN.id, { npd: 1, debt_basis: 'invoice' });
+    require('./lib/billing').grantDays(nid, 30);
+    const cpN = bdbN.createCp(nid, { name: 'Петров П. П.', kind: 'customer', inn: '183100000099', opening_date: '2026-01-01' });
+    r = await call('POST', '/api/doc', { user: nUser, body: { type: 'sch', cpId: cpN, date: '2026-10-01', items: [{ name: 'Консультация', qty: 1, price: 50000 }] } });
+    const invN = r.json.doc.id;
+    r = await call('POST', '/api/op', { user: nUser, body: { cpId: cpN, kind: 'payment', amount: 20000, date: '2026-10-02', doc: 'п/п 1' } });
+    ok(r.status === 200 && r.json.npd && /на 20 000 ₽/.test(r.json.npd.text.replace(/\s/g, ' ')),
+      'Р3: оплата 20 000 руками — приложение сразу напоминает про чек на 20 000', JSON.stringify(r.json.npd && r.json.npd.text));
+    r = await call('POST', '/api/doc/paid', { user: nUser, body: { id: invN, date: '2026-10-03' } });
+    ok(r.json.npd && /на 30 000 ₽/.test(r.json.npd.text.replace(/\s/g, ' ')) && r.json.npd.cheque.amount === 30000,
+      'Р3: «Оплатил» после частичной — чек на остаток 30 000, а не на 50 000', JSON.stringify(r.json.npd && r.json.npd.cheque && r.json.npd.cheque.amount));
+    r = await call('GET', '/api/cheques', { user: nUser });
+    ok(r.json.items.length === 2 && r.json.items.reduce((a, c) => a + c.amount, 0) === 50000,
+      'Р3: в списке чеков два (20 000 и 30 000) — всего 50 000, как и получено', JSON.stringify(r.json.items.map((c) => c.amount)));
+    r = await call('POST', '/api/doc/paid', { user: nUser, body: { id: invN, date: '2026-10-04' } });
+    ok(r.json.npd === null, 'Р3: повторное «Оплатил» нового напоминания не даёт');
+    r = await call('POST', '/api/op', { user: nUser, body: { cpId: cpN, kind: 'prepay', amount: 10000, date: '2026-10-05' } });
+    ok(r.json.npd && r.json.npd.cheque.amount === 10000, 'Р3: аванс 10 000 — чек на аванс', JSON.stringify(r.json.npd));
+    r = await call('POST', '/api/doc/paid', { user: nUser, body: { id: invN, paid: false } });
+    r = await call('GET', '/api/cheques', { user: nUser });
+    ok(r.json.items.length === 2 && r.json.items.map((c) => c.amount).sort((a, b) => a - b).join() === '10000,20000',
+      'Р3: снятие оплаты сняло ожидание чека на 30 000; чеки на 20 000 и аванс 10 000 остались', JSON.stringify(r.json.items.map((c) => c.amount)));
+    // Выписка: чек в момент занесения.
+    r = await call('POST', '/api/bank/import', { user: nUser, body: { rows: [
+      { key: 'nina-1', cpId: cpN, amount: 7000, date: '2026-10-06', doc: 'Оплата, п/п № 3', purpose: 'Оплата консультации' }] } });
+    ok(r.json.added === 1 && r.json.npd && r.json.npd.cheque.amount === 7000, 'Р3: платёж из выписки — чек сразу при занесении', JSON.stringify(r.json.npd && r.json.npd.cheque));
+  }
+
   section('переключатель ИИ-ассистента');
   {
     /*

@@ -1744,27 +1744,21 @@ async function showDoc(tg, chatId, user, docId) {
  * Чек за человека не формируем: это заявление в налоговую от его имени.
  * Открываем приложение и уходим — дальше он сам.
  */
-async function remindCheque(tg, chatId, user, docId, paidAt) {
-  if (!paidAt) return;
-  const c = cheques.owe(user.id, docId, paidAt);
-  // Чек уже пробит — второй раз о нём не напоминаем.
-  if (!c || c.status === 'done') return;
-  await sendChequeCard(tg, chatId, user, c);
+async function remindCheque(tg, chatId, user) {
+  await remindFresh(tg, chatId, user);
 }
 
-/** Карточка одного чека: готовые данные и три кнопки. Деньги пришли — человеку остаётся ввести их в «Мой налог». */
-async function sendChequeCard(tg, chatId, user, c) {
-  const cp = c.cp_id ? bdb.getCp(user.id, c.cp_id) : null;
-  await tg.sendMessage(chatId, `🧾 ${esc(cheques.reminderText(c, cp && cp.name))}`,
-    keyboard([
-      [{ text: '✅ Чек пробил', data: `chq.ok:${c.id}` }, { text: '⏳ Позже', data: `chq.later:${c.id}` }],
-      [{ text: '🧾 Открыть «Мой налог»', url: npd.LK_URL }],
-    ]));
-}
-
-/** После закрытия платежей пачкой: один чек — карточка, несколько — общий список. */
-async function remindChequesBatch(tg, chatId, user, leadIds, paidAt) {
-  const made = cheques.oweMany(user.id, leadIds, paidAt);
+/**
+ * Напоминания про чеки по свежим поступлениям — теми словами, что и раньше.
+ *
+ * Запись о чеке заводится сама в момент появления проводки «Оплата» (см.
+ * lib/cheques.js): с любого экрана, на любую сумму, включая частичную оплату,
+ * аванс и платёж из выписки. Здесь мы только забираем записи, о которых
+ * человеку ещё не говорили, и показываем: одна — карточкой, несколько — общим
+ * списком. Забрали — второй раз не покажем.
+ */
+async function remindFresh(tg, chatId, user) {
+  const made = cheques.takeFresh(user.id);
   if (!made.length) return;
   if (made.length === 1) { await sendChequeCard(tg, chatId, user, made[0]); return; }
   const total = made.reduce((a, c) => a + c.amount, 0);
@@ -1775,6 +1769,16 @@ async function remindChequesBatch(tg, chatId, user, leadIds, paidAt) {
     + '\n\n<i>По переводу на счёт срок — до 9-го числа следующего месяца. '
     + 'Данные для каждого чека — в списке.</i>',
     keyboard([[{ text: '🧾 Чеки к пробитию', data: 'chq.list' }], [{ text: '🧾 Открыть «Мой налог»', url: npd.LK_URL }]]));
+}
+
+/** Карточка одного чека: готовые данные и три кнопки. Деньги пришли — человеку остаётся ввести их в «Мой налог». */
+async function sendChequeCard(tg, chatId, user, c) {
+  const cp = c.cp_id ? bdb.getCp(user.id, c.cp_id) : null;
+  await tg.sendMessage(chatId, `🧾 ${esc(cheques.reminderText(c, cp && cp.name))}`,
+    keyboard([
+      [{ text: '✅ Чек пробил', data: `chq.ok:${c.id}` }, { text: '⏳ Позже', data: `chq.later:${c.id}` }],
+      [{ text: '🧾 Открыть «Мой налог»', url: npd.LK_URL }],
+    ]));
 }
 
 /** Список непробитых чеков. */
@@ -2817,6 +2821,8 @@ async function doPrepay(tg, chatId, user, cpId, amount) {
       [{ text: '↩️ Отменить проводку', data: `pay.undo:${cpId}:${r.opId}` }],
       [{ text: `📂 Карточка «${cp.name}»`.slice(0, 60), data: `cp:${cpId}` }],
     ]));
+  // Аванс самозанятому — такое же поступление, как любое другое: чек на него нужен сразу.
+  await remindFresh(tg, chatId, user);
 }
 
 const monthAct = require('./lib/month-act');
@@ -2917,12 +2923,11 @@ async function recordPay(tg, chatId, user, cpId, amount, kind) {
    * нажал кнопку сам, так что подтверждение уже есть.
    */
   let closedDocs = [];
-  let chequeLeads = [];
   const undoIds = [opId];
   if (!isIncome) {
     const m = bdb.matchPaymentsToDocs(user.id, [{ opId, cpId, amount: sum, date: op.date, doc: '' }]);
     if (m.deals.length) {
-      chequeLeads = bdb.closeDocsFromBank(user.id, m.deals).leads;
+      bdb.closeDocsFromBank(user.id, m.deals);
       closedDocs = m.deals;
       undoIds.length = 0;
       for (const d of m.deals) {
@@ -2947,7 +2952,7 @@ async function recordPay(tg, chatId, user, cpId, amount, kind) {
       [{ text: `📂 Карточка «${cp.name}»`.slice(0, 60), data: `cp:${cpId}` }],
     ]));
   // Самозанятому деньги пришли — значит, пора пробить чек.
-  if (chequeLeads.length) await remindChequesBatch(tg, chatId, user, chequeLeads, op.date);
+  if (!isIncome) await remindFresh(tg, chatId, user);
 }
 
 /*
@@ -3523,6 +3528,7 @@ async function postRecurringOp(tg, rec, month) {
   // видит текст (правило проекта, и оно не формальное — акт сверки
   // двусторонний, на него отвечают).
   if (rec.op.mailSelf) await mailAktToSelf(user, cp).catch(() => {});
+  if (kind === 'Оплата') await remindFresh(tg, user.tg_id, user);
   return true;
 }
 
@@ -4377,6 +4383,7 @@ async function photoSaveOp(tg, chatId, user, kind) {
     + `Баланс: <b>${formatRub(Math.abs(round2(b.closing)))}</b>.`);
   const { info, kb } = cpMenu(user.id, cp);
   await tg.sendMessage(chatId, info, kb);
+  if (human === 'Оплата') await remindFresh(tg, chatId, user);
 }
 
 // ---------- дебиторка ----------
@@ -5660,6 +5667,7 @@ async function handleMessage(tg, msg) {
     const b = bdb.balanceOf(user.id, cpId);
     await tg.sendMessage(chatId,
       `✅ ${op.kind}: ${formatRub(op.debit || op.credit)} (${ru(op.date)}).\nБаланс: <b>${formatRub(Math.abs(round2(b.closing)))}</b>.\n\nЕщё операция или /menu.`);
+    if (op.debit) await remindFresh(tg, chatId, user);
     return;
   }
 
@@ -5742,6 +5750,8 @@ async function handleCallback(tg, cq) {
       if (!(await offerClosedDocs(tg, chatId, user, res.addedRows, head))) {
         await tg.sendMessage(chatId, head, mainMenu());
       }
+      // Каждое поступление самозанятого — отдельный чек, и деньги пришли именно сейчас.
+      await remindFresh(tg, chatId, user);
       return;
     }
     /*
@@ -5774,7 +5784,7 @@ async function handleCallback(tg, cq) {
         mainMenu());
       // Через выписку закрывают сразу пачку — и именно тут про чек забывают
       // вернее всего: человек ничего не выписывал, он просто прислал файл.
-      await remindChequesBatch(tg, chatId, user, done.leads, todayISO());
+      await remindFresh(tg, chatId, user);
       return;
     }
     if (data === 'help') {
@@ -6167,7 +6177,7 @@ async function handleCallback(tg, cq) {
       const id = Number(data.slice(9));
       const when = bdb.markPaid(user.id, id);
       if (when) await tg.sendMessage(chatId, `✅ Отметил оплату ${ru(when)} — долг закрыт.`);
-      await remindCheque(tg, chatId, user, id, when);
+      await remindCheque(tg, chatId, user);
       await showDoc(tg, chatId, user, id);
       return;
     }
