@@ -2187,6 +2187,11 @@ async function main() {
     ok(r.status === 400 && /^Письмо не ушло: не удалось связаться/.test(r.json.error) && !rawErr.test(r.json.error),
       'Д14: проверочное письмо — то же', (r.json || {}).error);
 
+    // Входящие тем же образом: ящик не отвечает — человеку слова, коды сервера уходят в журнал.
+    r = await call('GET', '/api/inbox', { user: masha });
+    ok(r.json && typeof r.json.error === 'string' && !rawErr.test(r.json.error) && !/errno|connect /i.test(r.json.error),
+      'GET /api/inbox: ящик не отвечает — человеческая причина без кодов', JSON.stringify(r.json));
+
     r = await call('POST', '/api/mailbox/delete', { user: masha });
     ok(r.status === 200, 'ящик можно отключить');
     r = await call('GET', '/api/state', { user: masha });

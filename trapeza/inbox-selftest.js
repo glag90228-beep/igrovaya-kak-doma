@@ -185,7 +185,8 @@ async function main() {
   const badLogin = fakeImap([], { rejectLogin: true });
   const p2 = await listen(badLogin.server);
   const r2 = await fetchNew({ ...cfg, port: p2 });
-  ok(!r2.ok && /AUTHENTICATIONFAILED|Invalid/i.test(r2.error), 'неверный пароль — понятная ошибка', r2.error);
+  ok(!r2.ok && /не принял логин или пароль/.test(r2.error) && !/AUTHENTICATIONFAILED|Invalid|NO\b/.test(r2.error),
+    'неверный пароль — понятная ошибка человеческим языком, без текста сервера', r2.error);
   ok(!r2.error.includes('пароль-приложения'), 'пароль не попал в текст ошибки');
   badLogin.server.close();
 
