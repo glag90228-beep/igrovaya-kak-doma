@@ -561,6 +561,8 @@ function fxState(userId) {
 function docBrief(d, cpName = '') {
   return {
     id: d.id, type: d.type, title: d.title, number: d.number, date: d.date,
+    // Короткое название («ТОРГ-12») — для строки списка, где полное не влезает.
+    short: bdb.docShort(d.type),
     total: d.total, cpId: d.cp_id, paidAt: d.paid_at || '',
     // Имя клиента: на главной по нему подписана кнопка повтора, а список
     // документов без него читается как «Счёт № 4» без ответа на «кому».
@@ -984,10 +986,12 @@ const api = {
     // Долг по документу — чтобы карточка могла честно сказать, изменится
     // ли сальдо при удалении. Одним запросом на весь список, не по одному.
     const debt = bdb.debtByDoc(user.id, rows.map((d) => d.id));
+    // Клиента подписываем в строке списка: «Счёт № 4» без ответа на «кому» ничего не говорит.
+    const names = new Map(bdb.listCps(user.id).map((c) => [c.id, c.name]));
     return {
       docs: rows.map((d) => {
         const chq = cheques.forDoc(user.id, d.id);
-        return { ...docBrief(d), debt: (debt.get(d.id) || {}).delta || 0, cheque: chq ? chequeBrief(chq) : null };
+        return { ...docBrief(d, names.get(d.cp_id) || ''), debt: (debt.get(d.id) || {}).delta || 0, cheque: chq ? chequeBrief(chq) : null };
       }),
     };
   },
@@ -1602,19 +1606,26 @@ const api = {
       : '';
     return {
       canMail: mailbox.resolve(user.id).ok,
-      reminders: rows.slice(0, 20).map((r) => ({
-        cpId: r.cp.id,
-        name: r.cp.name,
-        amount: r.amount,
-        email: r.cp.email || '',
-        text: 'Здравствуйте!\n\n'
-          + `По нашим данным на ${ruDate(docService.todayISO())} за вами числится задолженность `
-          + `${formatRub(r.amount).replace(/\sруб\.$/, ' руб')}`
-          + `${r.cp.contract ? ` по ${r.cp.contract}` : ''}.\n\n`
-          + 'Направляем акт сверки. Просим подтвердить сумму и сообщить срок оплаты. '
-          + 'Если платёж уже прошёл — пришлите, пожалуйста, платёжное поручение.'
-          + `${bank}\n\nС уважением,\n${org.full_name || org.name || ''}`,
-      })),
+      reminders: rows.slice(0, 20).map((r) => {
+        // Какие документы не оплачены — должник первым делом спрашивает «за что?».
+        const { lines } = bdb.unpaidLinesFor(user.id, r.cp.id);
+        const listed = bdb.debtListText(lines, r.amount);
+        return {
+          cpId: r.cp.id,
+          name: r.cp.name,
+          amount: r.amount,
+          email: r.cp.email || '',
+          docs: lines.length,
+          text: 'Здравствуйте!\n\n'
+            + `По нашим данным на ${ruDate(docService.todayISO())} за вами числится задолженность `
+            + `${formatRub(r.amount).replace(/\sруб\.$/, ' руб')}`
+            + `${r.cp.contract ? ` по ${r.cp.contract}` : ''}.\n\n`
+            + `${listed ? `${listed}\n\n` : ''}`
+            + 'Направляем акт сверки. Просим подтвердить сумму и сообщить срок оплаты. '
+            + 'Если платёж уже прошёл — пришлите, пожалуйста, платёжное поручение.'
+            + `${bank}\n\nС уважением,\n${org.full_name || org.name || ''}`,
+        };
+      }),
     };
   },
 
@@ -2060,9 +2071,13 @@ const api = {
    */
   async 'GET /api/unpaid'({ user }) {
     const s = bdb.unpaidSummary(user.id);
+    const names = new Map(bdb.listCps(user.id).map((c) => [c.id, c.name]));
     return {
       // paid/left: сколько по документу уже привязано оплатами и сколько осталось (частичная оплата из выписки).
-      docs: s.docs.map((d) => ({ ...docBrief(d), pair: Boolean(d.pair), paid: d.paid || 0, left: d.left == null ? d.total : d.left })),
+      docs: s.docs.map((d) => ({
+        ...docBrief(d, names.get(d.cp_id) || ''),
+        pair: Boolean(d.pair), paid: d.paid || 0, left: d.left == null ? d.total : d.left,
+      })),
       count: s.count,
       sum: s.sum,
     };

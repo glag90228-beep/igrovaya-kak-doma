@@ -359,7 +359,7 @@ const TITLES = {
   cp: 'Клиент', op: 'Операция', doc: 'Документ', new: 'Новый документ',
   inbox: 'Почта', letter: 'Письмо', mail: 'Почта', bank: 'Банк', org: 'Организация',
   billing: 'Тариф', support: 'Поддержка', help: 'Помощь', ask: 'Помощник',
-  recurring: 'По расписанию', reminders: 'Напоминания', unpaid: 'Не оплачено',
+  recurring: 'По расписанию', reminders: 'Напомнить о долге', unpaid: 'Не оплачено',
   debts: 'Долги', monthact: 'Акт за месяц', cheques: 'Чеки «Мой налог»',
 };
 
@@ -590,6 +590,45 @@ function navRow(opts) {
         opts.badge && h('span', { class: `badge ${opts.badgeTone || ''}`, text: opts.badge }))),
     opts.right && h('span', { class: `money nowrap ${opts.rightTone || ''}`, text: opts.right }),
     icon('chev', 'chev'));
+}
+
+/** «02.09» — день и месяц. Год в строке списка лишний: он и так понятен. */
+const dm = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(iso || '') ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}` : (iso || ''));
+
+/*
+ * Строка документа в списках: заголовок — КЛИЕНТ, подпись — «ТОРГ-12 № 2 · 02.09 · 14 000 ₽».
+ *
+ * Раньше заголовком шло полное название («Товарная накладная ТОРГ-12 № 2»),
+ * и на узком экране оно обрезалось многоточием на самом нужном: непонятно ни
+ * кому, ни когда. Люди ищут документ по клиенту, а тип, номер, дату и сумму
+ * читают уже в подписи — она переносится на вторую строку, но не режется.
+ * Статус («Ждёт оплаты», «Оплачен») — отдельной строкой, чтобы ничего не отжимать.
+ */
+function docRow(d, opts = {}) {
+  const who = d.cpName || '';
+  const sum = opts.sum != null ? opts.sum : (d.total ? money0(d.total) : '');
+  const sub = opts.sub || [who ? `${d.short || d.title} № ${d.number}` : '', dm(d.date), sum]
+    .filter(Boolean).join(' · ');
+  return h('button', { class: 'row doc-row', onclick: () => { haptic(); opts.onclick(); } },
+    h('span', { class: `icon-box ${opts.tone || ''}` }, icon(opts.icon || 'doc')),
+    h('span', { class: 'grow' },
+      h('div', { class: 'ellipsis', text: who || `${d.title} № ${d.number}` }),
+      h('div', { class: 'small muted doc-sub', text: sub || ru(d.date) }),
+      opts.badge && h('div', { class: 'sub-line' }, h('span', { class: `badge ${opts.badgeTone || ''}`, text: opts.badge }))),
+    icon('chev', 'chev'));
+}
+
+/**
+ * Строка со вторым действием под ней — «Напомнить» у должника.
+ *
+ * Кнопка внутри кнопки в разметке нельзя, а вставлять действие справа
+ * нечем: имя клиента и сумма и так занимают всю ширину. Поэтому строка — это
+ * контейнер: сверху обычная строка-ссылка, под ней кнопка во всю ширину текста.
+ */
+function actionRow(rowEl, label, onAct) {
+  return h('div', { class: 'row-block' }, rowEl,
+    h('div', { class: 'row-actions' },
+      h('button', { class: 'pill-btn', onclick: (e) => { haptic(); onAct(e); } }, label)));
 }
 
 /**
@@ -1138,14 +1177,7 @@ screens.docs = async function docs({ cp } = {}) {
   }
 
   box.append(h('div', { class: 'card' }, list.map((d) => swipeToDelete(
-    navRow({
-      icon: 'doc',
-      title: `${d.title} № ${d.number}`,
-      sub: ru(d.date),
-      ...paidBadge(d),
-      right: d.total ? money0(d.total) : '',
-      onclick: () => go('doc', { id: d.id }),
-    }),
+    docRow(d, { ...paidBadge(d), onclick: () => go('doc', { id: d.id }) }),
     {
       label: `Удалить ${d.title} № ${d.number}`,
       onDelete: async () => {
@@ -2729,15 +2761,20 @@ screens.debts = async function debts() {
   // Одинаково окрашенные столбцы цифр заставляют читать заголовок раздела.
   const block = (title, list, tone) => (list.length ? [
     h('div', { class: 'section-title', text: title }),
-    h('div', { class: 'card' }, list.map((d) => navRow({
-      icon: 'users',
-      title: d.name,
-      sub: d.days == null ? '' : `без движения ${d.days} ${plural(d.days, 'день', 'дня', 'дней')}`,
-      right: money(d.amount),
-      rightTone: tone,
-      tone: d.days > 30 ? 'warn' : '',
-      onclick: () => go('cp', { id: d.cpId }),
-    }))),
+    h('div', { class: 'card' }, list.map((d) => {
+      const row = navRow({
+        icon: 'users',
+        title: d.name,
+        sub: d.days == null ? '' : `без движения ${d.days} ${plural(d.days, 'день', 'дня', 'дней')}`,
+        right: money(d.amount),
+        rightTone: tone,
+        tone: d.days > 30 ? 'warn' : '',
+        onclick: () => go('cp', { id: d.cpId }),
+      });
+      // Напомнить — прямо из строки должника: раньше путь шёл через общую
+      // кнопку внизу и список всех сразу, а нужен был один клиент.
+      return d.theyOwe ? actionRow(row, 'Напомнить', () => go('reminders', { cpId: d.cpId })) : row;
+    })),
   ] : []);
   // append массив не разворачивает — он бы превратился в строку.
   box.append(...block('Должны нам', them, 'in'), ...block('Должны мы', us, 'out'));
@@ -2754,7 +2791,7 @@ screens.debts = async function debts() {
     }, `Акты сверки всем должникам (${them.length})`)));
     box.append(h('div', { class: 'btn-wrap', style: 'padding-top:0' }, h('button', {
       class: 'btn secondary', onclick: () => go('reminders'),
-    }, 'Текст напоминания должникам')));
+    }, 'Напомнить всем должникам')));
     box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
       text: 'Файлы и тексты бот присылает вам — вашим клиентам он не пишет.' }));
   }
@@ -4039,7 +4076,10 @@ screens.ask = async function ask() {
 
 /** Счета, по которым не отметили оплату. */
 screens.unpaid = async function unpaid() {
-  const { docs: list, count, sum } = await api('GET', '/api/unpaid');
+  const [{ docs: list, count, sum }, { debtors }] = await Promise.all([
+    api('GET', '/api/unpaid'),
+    api('GET', '/api/debtors'),
+  ]);
   const box = h('div', {}, h('h1', { text: 'Ждут оплаты' }));
   if (!list.length) {
     box.append(empty('check', 'Всё оплачено', 'Здесь появятся счета, по которым не отмечена оплата.'));
@@ -4061,19 +4101,26 @@ screens.unpaid = async function unpaid() {
         + (list.length > count
           ? ` · ${list.length} ${plural(list.length, 'документ', 'документа', 'документов')}` : ''),
     })));
-  box.append(h('div', { class: 'card' }, list.map((d) => navRow({
-    icon: 'clock',
-    title: `${d.title} № ${d.number}`,
-    // Второй документ сделки показываем, но помечаем: иначе непонятно,
-    // почему пять строк складываются в сумму четырёх.
-    // Акт за месяц сам долга не создаёт — его деньги уже в накладных месяца, — и суммой не считается.
-    sub: d.pair && d.noDebt ? `${ru(d.date)} · деньги уже в накладных`
-      : d.pair ? `${ru(d.date)} · та же сделка`
-        : d.paid > 0 ? `${ru(d.date)} · оплачено ${money0(d.paid)} из ${money0(d.total)}` : ru(d.date),
-    right: money0(d.pair ? d.total : (d.left == null ? d.total : d.left)),
-    rightTone: d.pair ? 'muted' : '',
-    onclick: () => go('doc', { id: d.id }),
-  }))));
+  // Напомнить можно только тому, кто сейчас действительно должен: без долга
+  // у клиента экран напоминаний был бы пустым, и кнопка вела бы в тупик.
+  const owing = new Set(debtors.filter((x) => x.theyOwe).map((x) => x.cpId));
+  box.append(h('div', { class: 'card' }, list.map((d) => {
+    /*
+     * Подпись — «ТОРГ-12 № 2 · 02.09 · 14 000 ₽», а клиент — заголовок.
+     * Второй документ сделки показываем, но помечаем: иначе непонятно,
+     * почему пять строк складываются в сумму четырёх.
+     * Акт за месяц сам долга не создаёт — его деньги уже в накладных месяца, — и суммой не считается.
+     */
+    const head = `${d.short} № ${d.number} · ${dm(d.date)}`;
+    const sub = d.pair && d.noDebt ? `${head} · деньги уже в накладных`
+      : d.pair ? `${head} · та же сделка`
+        : d.paid > 0 ? `${head} · осталось ${money0(d.left)} из ${money0(d.total)}`
+          : `${head} · ${money0(d.total)}`;
+    const row = docRow(d, { icon: 'clock', sub, onclick: () => go('doc', { id: d.id }) });
+    return !d.pair && owing.has(d.cpId)
+      ? actionRow(row, 'Напомнить', () => go('reminders', { cpId: d.cpId }))
+      : row;
+  })));
   return box;
 };
 
@@ -4458,8 +4505,11 @@ function ownContractCard({ cpId, cpName, reload }) {
  * Писать контрагентам сами мы не будем: согласия на это они не давали, а
  * адресов у нас нет. Отдаём текст — человек отправит его от своего имени.
  */
-screens.reminders = async function reminders() {
-  const { reminders: list, canMail } = await api('GET', '/api/reminders');
+screens.reminders = async function reminders({ cpId } = {}) {
+  const all = await api('GET', '/api/reminders');
+  const { canMail } = all;
+  // Пришли из строки одного должника — показываем только его.
+  const list = cpId ? all.reminders.filter((r) => r.cpId === Number(cpId)) : all.reminders;
   const box = h('div', {}, h('h1', { text: 'Напомнить о долге' }));
   if (!list.length) {
     box.append(empty('check', 'Должников нет', 'Некому напоминать — все рассчитались.'));

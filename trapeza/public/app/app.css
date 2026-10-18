@@ -776,6 +776,9 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .step:not(.now):not(.done):not(.part) .grow > div:first-child { color: var(--muted); }
 .step-sub { margin-top: 2px; }
 
+/* Строка документа: подпись переносится, а не режется — в ней тип, номер, дата и сумма. */
+.doc-row .doc-sub { white-space: normal; overflow-wrap: anywhere; margin-top: 2px; }
+
 /* Строка со вторым действием: сверху обычная строка, под ней кнопка, выровненная по тексту. */
 .row-block + .row-block, .row-block + .row, .row + .row-block { border-top: 1px solid var(--hairline); }
 .row-block .row + .row-actions { margin-top: -6px; }

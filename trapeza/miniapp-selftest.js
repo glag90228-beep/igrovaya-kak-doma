@@ -3535,6 +3535,43 @@ async function main() {
     ok(r.json.bizAsked === true, 'и состояние это помнит (bizAsked)');
   }
 
+  section('списки с клиентом и напоминание со списком документов (Д11, Р9)');
+  {
+    const U = { id: 501111, first_name: 'Глеб', username: 'gleb2' };
+    const ud = initDataFor(U);
+    const bdbF = require('./lib/bot-db');
+    const uid = bdbF.getOrCreateUser(U.id).id;
+    bdbF.saveMyOrg(uid, { name: 'ИП Глебов', inn: '183209316100', signer: 'Г. Г.' });
+    const cp0 = bdbF.createCp(uid, { name: 'ООО «Ромашка»', kind: 'customer', opening_date: '2026-01-01' });
+    const mk = async (price, date) => (await docService.issueDocument(uid, {
+      type: 'torg12', cpId: cp0, date, skipQuota: true, items: [{ name: 'Канапе', qty: 1, price }],
+    })).doc;
+    const t1 = await mk(14000, '2026-09-02');
+    const t2 = await mk(7000, '2026-09-25');
+    // Д11: подпись клиента и короткое название в списках
+    r = await call('GET', '/api/docs', { user: ud });
+    const row = r.json.docs.find((d) => d.id === t1.id);
+    ok(row && row.cpName === 'ООО «Ромашка»' && row.short === 'ТОРГ-12', 'Д11: в журнале у документа есть клиент и короткое имя «ТОРГ-12»', JSON.stringify(row && [row.cpName, row.short]));
+    r = await call('GET', '/api/unpaid', { user: ud });
+    const un = r.json.docs.find((d) => d.id === t1.id);
+    ok(un && un.cpName === 'ООО «Ромашка»' && un.short === 'ТОРГ-12', 'Д11: и в «Ждут оплаты»');
+
+    // Р9: в напоминании — список неоплаченных документов
+    r = await call('GET', '/api/reminders', { user: ud });
+    const rem = r.json.reminders.find((x) => x.cpId === cp0);
+    const t = rem.text.replace(/\s/g, ' ');
+    ok(t.includes('Не оплачено:') && t.includes(`ТОРГ-12 № ${t1.number} от 02.09.2026 — 14 000,00 руб.`) && t.includes(`ТОРГ-12 № ${t2.number} от 25.09.2026 — 7 000,00 руб.`),
+      'Р9: текст напоминания называет документы: номер, дату, сумму', t.slice(0, 260));
+    ok(t.indexOf('Не оплачено:') < t.indexOf('Направляем акт сверки'), 'список стоит до просьбы подтвердить сумму');
+    ok(rem.docs === 2, 'приложению сказано, сколько документов в списке');
+
+    // Свободная оплата меньше долга: сумма списка больше долга — это оговорено в тексте.
+    bdbF.addOp(uid, cp0, { date: '2026-10-01', kind: 'Оплата', doc: 'п/п', debit: 5000 });
+    r = await call('GET', '/api/reminders', { user: ud });
+    const t3 = r.json.reminders.find((x) => x.cpId === cp0).text.replace(/\s/g, ' ');
+    ok(t3.includes('С учётом уже поступивших оплат к оплате 16 000,00 руб.'), 'Р9: если часть оплат не привязана к документам, итог к оплате назван отдельной строкой', t3.slice(0, 300));
+  }
+
   // Сервер держим до конца: проверки выше ходят к нему по HTTP, и закрытый
   // раньше времени он давал ECONNREFUSED вместо внятного провала.
   await new Promise((r2) => server.close(r2));

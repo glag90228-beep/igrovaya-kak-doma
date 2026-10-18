@@ -5,7 +5,7 @@
 // никогда не видит чужие данные. Надстройка над существующей базой (db.js).
 
 const { db, computeBalance } = require('../db');
-const { round2 } = require('./money');
+const { round2, formatRub } = require('./money');
 
 // «Сегодня» — по Москве, а не по поясу сервера (пояснение в lib/period.js).
 const { todayISO, currentYear } = require('./period');
@@ -2622,6 +2622,62 @@ const DOC_TITLES = {
 };
 
 /**
+ * Короткое название документа для строки списка: «ТОРГ-12», «Акт», «Счёт».
+ * Полное название («Товарная накладная ТОРГ-12») в строку не влезает, и на
+ * узком экране его хвост с номером и датой обрезался многоточием.
+ */
+const DOC_SHORT = {
+  sch: 'Счёт', schdog: 'Счёт-договор', usl: 'Акт', pp: 'Платёжка', akt: 'Акт сверки', upd: 'УПД',
+  torg12: 'ТОРГ-12', dog: 'Договор', avans: 'СФ на аванс', ksf: 'Корректировочный СФ',
+};
+const docShort = (type) => DOC_SHORT[type] || DOC_TITLES[type] || type;
+
+/** Дата «02.09.2026» из ISO; не дата — как есть. */
+const ruDay = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(String(iso || ''))
+  ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : String(iso || ''));
+
+/**
+ * Неоплаченные документы одного клиента — для напоминания о долге.
+ *
+ * Тот же разбор, что у «Ждут оплаты» (dealTotals): документ-пара сделки в
+ * список не идёт, у частично оплаченного указан остаток. Должник получает
+ * письмо «за вами числится 54 250 руб.» и первым делом спрашивает «за что?» —
+ * номера, даты и суммы отвечают на это заранее.
+ *
+ * @returns {{lines: Array<{short:string, number:string, date:string, left:number}>, sum:number}}
+ */
+function unpaidLinesFor(userId, cpId) {
+  const docs = unpaidDocs(userId, 200).filter((d) => d.cp_id === cpId);
+  dealTotals(userId, docs);
+  const lines = docs
+    .filter((d) => !d.pair && d.left > 0.004)
+    .map((d) => ({ short: docShort(d.type), number: String(d.number), date: d.date, left: round2(d.left) }));
+  return { lines, sum: round2(lines.reduce((a, l) => a + l.left, 0)) };
+}
+
+/**
+ * Список для текста напоминания: «• ТОРГ-12 № 2 от 02.09.2026 — 14 000,00 руб.».
+ * Пустая строка, если документов нет (долг — из журнала, по начальному сальдо).
+ *
+ * Если оплаты клиента, не отнесённые к документам, уменьшили долг, сумма списка
+ * больше долга — и должник, сложив строки, решил бы, что ему насчитали лишнее.
+ * Поэтому в этом случае пишем итог отдельной строкой.
+ */
+function debtListText(lines, amount) {
+  if (!lines || !lines.length) return '';
+  const rub = (n) => formatRub(n).replace(/\sруб\.$/, ' руб.');
+  const shown = lines.slice(0, 10);
+  const total = round2(lines.reduce((a, l) => a + l.left, 0));
+  let out = 'Не оплачено:\n'
+    + shown.map((l) => `• ${l.short} № ${l.number} от ${ruDay(l.date)} — ${rub(l.left)}`).join('\n');
+  if (lines.length > shown.length) out += `\n• и ещё ${lines.length - shown.length}`;
+  if (amount != null && Math.abs(total - Number(amount)) > 0.5) {
+    out += `\nС учётом уже поступивших оплат к оплате ${rub(amount)}.`;
+  }
+  return out;
+}
+
+/**
  * Следующий номер документа этого типа в этом году.
  * Нумерация у каждого пользователя своя и не зависит от контрагента —
  * так требует практика: сквозной ряд по журналу, а не по клиентам.
@@ -3197,6 +3253,7 @@ module.exports = {
   markPaid, unmarkPaid, matchPaymentsToDocs, closeDocsFromBank, docNumbersIn, linkedPaid, dealOf, settleMonthActs,
   unpaidDocs, unpaidSummary, dealTotals, docsBetween,
   freePaymentsFor, freePaymentQuestion, freePaymentLabel, linkFreePayment,
+  docShort, unpaidLinesFor, debtListText,
   askBizOnce,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
   isSeqTaken, guardSeq, numberTakenInOrg, currentOrgId, currentOrg, setActiveOrg,

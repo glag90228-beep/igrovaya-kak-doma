@@ -216,14 +216,15 @@ const ok = (c, m, extra) => {
 
   console.log('\n── удаление ──');
   await swipe(-120, 0);
-  const first = await page.evaluate(() => document.querySelector('.swipe-face .ellipsis').textContent);
+  // В строке журнала заголовок — клиент (у всех здесь один), а отличает документы подпись: тип, номер, сумма.
+  const first = await page.evaluate(() => document.querySelector('.swipe-face .doc-sub').textContent);
   const btn = await page.locator('.swipe-del').first().boundingBox();
   await page.touchscreen.tap(btn.x + btn.width / 2, btn.y + btn.height / 2);
   await page.waitForTimeout(900);
 
   const after = await page.evaluate(() => document.querySelectorAll('.swipe').length);
   ok(after === 2, 'после нажатия на кнопку документ удалён', `${before} → ${after}`);
-  const nowFirst = await page.evaluate(() => document.querySelector('.swipe-face .ellipsis').textContent);
+  const nowFirst = await page.evaluate(() => document.querySelector('.swipe-face .doc-sub').textContent);
   ok(nowFirst !== first, 'удалился именно тот, что смахнули', `${first} → ${nowFirst}`);
   ok(bdb.listDocs(user.id, 50).length === 2, 'в базе тоже два', bdb.listDocs(user.id, 50).length);
 
@@ -1131,6 +1132,41 @@ const ok = (c, m, extra) => {
     await page.waitForSelector('.cp-chip', { timeout: 5000 });
     ok((await page.textContent('.cp-chip')).includes('Ромашка-3'), 'после нажатия клиент заведён и выбран в поле «Кому»');
     ok(bdb.listCps(user.id).some((c) => c.name === 'Ромашка-3' && c.kind === 'customer'), 'в списке клиентов он появился');
+  }
+
+  console.log('\n── списки: клиент в заголовке, «Напомнить» в строке (Д11, Д12, Р9) ──');
+  {
+    forgetRate();
+    const cpL = bdb.createCp(user.id, { name: 'ООО «Список»', kind: 'customer', opening_date: '2026-01-01' });
+    const l1 = await docService.issueDocument(user.id, { type: 'torg12', cpId: cpL, date: '2026-09-02', skipQuota: true,
+      items: [{ name: 'Канапе', qty: 1, price: 14000 }] });
+    await page.evaluate(() => window.__go('unpaid', {}));
+    await page.waitForSelector('.doc-row', { timeout: 5000 });
+    const rowTxt = await page.locator('.doc-row', { hasText: 'ООО «Список»' }).first().innerText();
+    ok(/ООО «Список»/.test(rowTxt.split('\n')[0]), 'Д11: «Ждут оплаты» — заголовок строки это клиент', rowTxt);
+    ok(rowTxt.replace(/\s/g, ' ').includes(`ТОРГ-12 № ${l1.doc.number} · 02.09 · 14 000 ₽`), 'Д11: подпись «ТОРГ-12 № N · 02.09 · 14 000 ₽»', rowTxt.replace(/\n/g, ' | '));
+    ok(await page.evaluate(() => [...document.querySelectorAll('.doc-row .ellipsis')].every((e) => e.scrollWidth <= e.clientWidth + 1)), 'Д11: заголовки строк не обрезаны многоточием');
+    ok(await page.evaluate(() => [...document.querySelectorAll('.doc-row .doc-sub')].every((e) => e.scrollWidth <= e.clientWidth + 1)), 'Д11: подписи не обрезаны');
+    ok(await page.locator('.pill-btn', { hasText: 'Напомнить' }).count() >= 1, 'Д12: в «Ждут оплаты» у должника есть кнопка «Напомнить»');
+    ok(await page.evaluate(() => [...document.querySelectorAll('.pill-btn')].every((b) => b.getBoundingClientRect().height >= 44)), 'кнопки «Напомнить» ≥ 44 px');
+
+    await page.evaluate(() => window.__go('docs', {}));
+    await page.waitForSelector('.doc-row', { timeout: 5000 });
+    const dRow = (await page.locator('.doc-row', { hasText: 'ООО «Список»' }).first().innerText()).replace(/\s/g, ' ');
+    ok(dRow.startsWith('ООО «Список»') && dRow.includes(`ТОРГ-12 № ${l1.doc.number} · 02.09 · 14 000 ₽`) && dRow.includes('Ждёт оплаты'),
+      'Д11: «Документы» — клиент, потом «ТОРГ-12 № N · 02.09 · 14 000 ₽» и статус целиком', dRow);
+
+    // Д12: «Напомнить» в строке должника открывает «Напомнить о долге» по одному клиенту
+    await page.evaluate(() => window.__go('debts', {}));
+    await page.waitForSelector('.row-block', { timeout: 5000 });
+    const block = page.locator('.row-block', { hasText: 'ООО «Список»' }).first();
+    await block.locator('.pill-btn').tap();
+    await page.waitForSelector('textarea.remind-text', { timeout: 5000 });
+    ok(await page.locator('textarea.remind-text').count() === 1, 'Д12: открылся один клиент, а не весь список');
+    ok((await page.textContent('h1')).trim() === 'Напомнить о долге', 'Д12: экран называется «Напомнить о долге»');
+    ok((await page.locator('.topbar, #topbar').first().innerText()).includes('Напомнить о долге'), 'и в шапке то же название');
+    const txt = (await page.inputValue('textarea.remind-text')).replace(/\s/g, ' ');
+    ok(txt.includes('Не оплачено:') && txt.includes(`ТОРГ-12 № ${l1.doc.number} от 02.09.2026 — 14 000,00 руб.`), 'Р9: в тексте — список неоплаченных документов', txt.slice(0, 250));
   }
 
   console.log('\n── главная: плашка про реквизиты — сверху (Д1) ──');

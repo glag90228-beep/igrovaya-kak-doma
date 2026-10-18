@@ -973,7 +973,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   // Прежняя формулировка — «бот не пишет вашим контрагентам, у него нет их
   // контактов» — перестала быть правдой: письмо должнику отправляется по
   // кнопке. Осталось главное: без нажатия человека не уходит ничего.
-  ok(Boolean(button('Текст напоминания')), 'отсюда можно перейти к отправке напоминаний');
+  ok(Boolean(button('Напомнить о долге')), 'отсюда можно перейти к отправке напоминаний');
   ok(files.length > before, 'файлы отданы пользователю, а не отправлены за него');
 
   await tap('debt.remind');
@@ -3538,10 +3538,13 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await tap('doc.make');
     await tap('debts');
     const debtsMsg = sent.slice(-3).find((m) => (m.kb || []).flat().some((b) => /Оплатил/.test(b.text))) || {};
-    const owesRow = (debtsMsg.kb || []).find((row) => row.some((b) => b.callback_data === `cp:${owesCp}`)) || [];
+    // «Оплатил» и «Напомнить» — отдельной строкой под карточкой должника (в одну строку три кнопки не влезают).
+    const owesRow = (debtsMsg.kb || []).find((row) => row.some((b) => b.callback_data.startsWith(`pay.cp:${owesCp}:`))) || [];
     const owesBtn = owesRow.find((b) => /Оплатил/.test(b.text));
     ok(owesBtn && owesBtn.callback_data.startsWith(`pay.cp:${owesCp}:7000:o:`),
       'в списке долгов рядом с должником — «Оплатил» на весь долг', JSON.stringify(owesRow));
+    ok(owesRow.some((b) => b.callback_data === `rm.one:${owesCp}` && /Напомнить/.test(b.text)),
+      'и «Напомнить» — текст письма именно этому должнику', JSON.stringify(owesRow));
     if (owesBtn) {
       await tap(owesBtn.callback_data);
       ok(bdb3.balanceOf(uid, owesCp).closing === 0, 'нажатие вносит оплату и закрывает долг',
@@ -9170,6 +9173,34 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await tap(`doc.unpaid:${y1.id}`);
     ok(bal(cpY) === 4000 && bdbR.listOps(uid, cpY).some((o) => o.debit === 3000 && !o.doc_id),
       'снятие отметки возвращает оплату в свободные — деньги не пропадают', bal(cpY));
+  }
+
+  console.log('\n── напоминание о долге: список документов и «Напомнить» (Р9, Д11, Д12) ──');
+  {
+    const bdbR = require('./lib/bot-db');
+    const dsR = require('./lib/doc-service');
+    const uid = fxUserId();
+    const cpR = bdbR.createCp(uid, { name: 'ООО «Напоминаемый»', kind: 'customer', opening_date: '2026-01-01' });
+    const mk = async (price, date) => (await dsR.issueDocument(uid, {
+      type: 'torg12', cpId: cpR, date, skipQuota: true, items: [{ name: 'Канапе', qty: 1, price }],
+    })).doc;
+    const r1 = await mk(14000, '2026-09-02');
+    const r2 = await mk(7000, '2026-09-25');
+    sent.length = 0;
+    await tap('unpaid');
+    const un = sent[sent.length - 1];
+    const row = un.kb.flat().find((b) => b.callback_data === `doc:${r1.id}`);
+    ok(row && row.text.startsWith('ООО «Напоминаемый»'), 'Д11: в «Не оплачено» строка начинается с клиента', row && row.text);
+    ok(row && norm(row.text).includes(`ТОРГ-12 № ${r1.number} · 02.09 · 14 000 ₽`), 'Д11: дальше «ТОРГ-12 № N · 02.09 · 14 000 ₽» — без обрезки даты и суммы', row && row.text);
+    const rmBtn = un.kb.flat().find((b) => b.callback_data === `rm.one:${cpR}`);
+    ok(rmBtn && /Напомнить/.test(rmBtn.text), 'Д12: в «Не оплачено» есть «Напомнить» по этому клиенту', JSON.stringify(rmBtn));
+    sent.length = 0;
+    await tap(`rm.one:${cpR}`);
+    const letter = norm(sent.map((m) => m.text || '').join('\n'));
+    ok(letter.includes('Не оплачено:'), 'Р9: в напоминании есть список неоплаченных документов', letter.slice(0, 200));
+    ok(letter.includes(`ТОРГ-12 № ${r1.number} от 02.09.2026 — 14 000,00 руб.`) && letter.includes(`ТОРГ-12 № ${r2.number} от 25.09.2026 — 7 000,00 руб.`),
+      'Р9: номера, даты и суммы документов названы', letter.slice(0, 300));
+    ok(letter.includes('оплата на 21 000,00 руб'), 'и общая сумма долга, как раньше', letter.slice(0, 160));
   }
 
   console.log('\n── письмо не ушло: человеческим языком и кнопка «Настройки почты» (Д14) ──');

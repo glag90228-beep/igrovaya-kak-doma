@@ -1587,7 +1587,6 @@ async function showUnpaid(tg, chatId, user) {
       keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
     return;
   }
-  const today = todayISO();
   /*
    * Сумма — сделками, а не документами: счёт и закрывающий его акт на одну
    * сделку иначе складывались, и сводка расходилась с плиткой в приложении.
@@ -1598,17 +1597,32 @@ async function showUnpaid(tg, chatId, user) {
    * такую пометку рисует давно, бот — теперь тоже.
    */
   const { count, sum } = bdb.dealTotals(user.id, list);
+  /*
+   * Строка кнопки — «Заря · ТОРГ-12 № 2 · 02.09 · 14 000 ₽»: клиент первым,
+   * потому что по нему ищут. Раньше первым шло полное название документа, и на
+   * 60 знаках кнопки до клиента и суммы дело не доходило.
+   */
   const rows = list.map((d) => {
     const cp = d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
-    const days = Math.floor((new Date(today) - new Date(d.date)) / 86400000);
-    return [{
-      text: `${d.pair ? '↳ ' : ''}${d.title} № ${d.number} · ${cp ? cp.name : '—'} · `
-        + `${formatRub(d.paid > 0 ? d.left : d.total).replace(/<[^>]+>/g, '')}`
-        + (d.pair ? (d.no_debt ? ' · уже в накладных' : ' · та же сделка')
-          : (d.paid > 0 ? ' · частично оплачен' : '') + (days > 0 ? ` · ${days} дн.` : '')),
-      data: `doc:${d.id}`,
-    }];
-  }).map((r) => [{ ...r[0], text: r[0].text.slice(0, 60) }]);
+    // Сумма без копеек и «руб.»: на кнопке считается каждый знак, а копейки в сводке только мешают.
+    const left = `${new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(d.paid > 0 ? d.left : d.total)} ₽`;
+    // Сколько дней висит — в карточке документа; на кнопке этому места нет.
+    const tail = d.pair ? (d.no_debt ? ' · уже в накладных' : ' · та же сделка') : (d.paid > 0 ? ' · частично' : '');
+    const head = `${d.pair ? '↳ ' : ''}${cp ? cp.name : '—'}`;
+    const body = ` · ${bdb.docShort(d.type)} № ${d.number} · ${ru(d.date).slice(0, 5)} · ${left}`;
+    // Имя уступает место, а не сумма с датой: клиента можно узнать и по обрезку, цифры — нет.
+    const room = Math.max(8, 60 - body.length - tail.length);
+    const name = head.length > room ? `${head.slice(0, room - 1)}…` : head;
+    return [{ text: `${name}${body}${tail}`, data: `doc:${d.id}` }];
+  });
+  // «Напомнить» — клиентам, которые сейчас действительно должны (по журналу, а не по списку документов).
+  const owing = new Map(bdb.debtors(user.id).filter((x) => x.theyOwe).map((x) => [x.cp.id, x.cp.name]));
+  const askedAbout = new Set();
+  for (const d of list) {
+    if (d.pair || !owing.has(d.cp_id) || askedAbout.has(d.cp_id) || askedAbout.size >= 5) continue;
+    askedAbout.add(d.cp_id);
+    rows.push([{ text: `🔔 Напомнить: ${owing.get(d.cp_id)}`.slice(0, 60), data: `rm.one:${d.cp_id}` }]);
+  }
   rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
   const twins = list.length - count;
   await tg.sendMessage(chatId,
@@ -4515,18 +4529,21 @@ async function showDebts(tg, chatId, user) {
   const kb = [];
   if (theyOwe.length) {
     kb.push([{ text: `📄 Акты сверки всем должникам (${theyOwe.length})`, data: 'debt.akts' }]);
-    kb.push([{ text: '✉️ Текст напоминания', data: 'debt.remind' }]);
+    kb.push([{ text: '🔔 Напомнить о долге', data: 'debt.remind' }]);
   }
   /*
    * Рядом с должником — «Оплатил»: одно нажатие вносит оплату на весь долг,
    * а под ответом есть «Отменить проводку». Токен одноразовый, чтобы
-   * двойное нажатие не провело деньги дважды.
+   * двойное нажатие не провело деньги дважды. И «Напомнить»: текст письма
+   * именно этому клиенту, а не общий список всех должников.
    */
   for (const r of rows.slice(0, 6)) {
     const card = { text: `${r.theyOwe ? '🧑‍💼' : '📦'} ${r.cp.name} · ${formatRub(r.amount)}`.slice(0, 60), data: `cp:${r.cp.id}` };
-    kb.push(r.theyOwe
-      ? [card, { text: '✅ Оплатил', data: `pay.cp:${r.cp.id}:${round2(r.amount)}:o:${oneShot()}` }]
-      : [card]);
+    kb.push([card]);
+    if (r.theyOwe) {
+      kb.push([{ text: '✅ Оплатил', data: `pay.cp:${r.cp.id}:${round2(r.amount)}:o:${oneShot()}` },
+        { text: '🔔 Напомнить', data: `rm.one:${r.cp.id}` }]);
+    }
   }
   kb.push([{ text: '⬅️ Меню', data: 'menu' }]);
   await tg.sendMessage(chatId, text, keyboard(kb));
@@ -4543,9 +4560,9 @@ async function sendDebtAkts(tg, chatId, user) {
     await genAktSverki(tg, chatId, user, r.cp.id);
   }
   await tg.sendMessage(chatId,
-    'Готово. Перешлите файлы должникам — или отправьте письмом из «Текста напоминания»: '
+    'Готово. Перешлите файлы должникам — или отправьте письмом из «Напомнить о долге»: '
     + 'акт сверки уйдёт вложением.',
-    keyboard([[{ text: '✉️ Текст напоминания', data: 'debt.remind' }],
+    keyboard([[{ text: '🔔 Напомнить о долге', data: 'debt.remind' }],
       [{ text: '⬅️ Меню', data: 'menu' }]]));
 }
 
@@ -4567,22 +4584,30 @@ function reminderText(org, r, tone = 'biz') {
   const sum = `${formatRub(r.amount).replace(/ /g, ' ').replace(/\sруб\.$/, ' руб')}`;
   const by = r.cp.contract ? ` по ${r.cp.contract}` : '';
   const sign = `${bank}\n\nС уважением,\n${(org && (org.full_name || org.name)) || ''}`;
+  /*
+   * Какие именно документы не оплачены — номерами, датами и суммами.
+   * Должник, получив «числится задолженность 54 250 руб», первым делом
+   * спрашивает «за что?», и письмо без списка заставляет его искать ответ
+   * самому. Список один на все тона: меняется тон, а не факты.
+   */
+  const listed = r.cp.user_id ? bdb.debtListText(bdb.unpaidLinesFor(r.cp.user_id, r.cp.id).lines, r.amount) : '';
+  const list = listed ? `\n\n${listed}` : '';
   if (tone === 'soft') {
     return 'Здравствуйте!\n\n'
-      + `Небольшое напоминание: у нас не отмечена оплата на ${sum}${by}. `
+      + `Небольшое напоминание: у нас не отмечена оплата на ${sum}${by}.${list}\n\n`
       + 'Возможно, платёж уже в пути — тогда просто пришлите, пожалуйста, платёжку, и я закрою вопрос.'
       + `${sign}`;
   }
   if (tone === 'firm') {
     return 'Здравствуйте!\n\n'
-      + `На ${ru(todayISO())} задолженность ${sum}${by} не погашена, хотя мы уже напоминали о ней. `
+      + `На ${ru(todayISO())} задолженность ${sum}${by} не погашена, хотя мы уже напоминали о ней.${list}\n\n`
       + 'Просим оплатить её в течение 5 рабочих дней или сообщить точный срок оплаты.\n\n'
       + 'Если оплаты не будет, мы будем вынуждены направить претензию и взыскивать долг '
       + 'вместе с процентами за пользование чужими денежными средствами (ст. 395 ГК РФ).'
       + `${sign}`;
   }
   return 'Здравствуйте!\n\n'
-    + `По нашим данным на ${ru(todayISO())} за вами числится задолженность ${sum}${by}.\n\n`
+    + `По нашим данным на ${ru(todayISO())} за вами числится задолженность ${sum}${by}.${list}\n\n`
     + 'Направляем акт сверки. Просим подтвердить сумму и сообщить срок оплаты. '
     + 'Если платёж уже прошёл — пришлите, пожалуйста, платёжное поручение.'
     + `${sign}`;
