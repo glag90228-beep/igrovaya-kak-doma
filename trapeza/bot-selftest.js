@@ -859,6 +859,17 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
   ok(!looksLikeBlock('7707083893') && looksLikeBlock('ООО Х ИНН 7707083893 р/с 40702810900000012345 БИК 044525225'),
     'блок реквизитов отличается от чистого ИНН');
+  {
+    // Д29: фраза-просьба из приветствия не блок реквизитов, а «Выставочный центр» — не просьба.
+    const { looksLikeAsk } = require('./lib/reqs');
+    const phrase = 'Выставь счёт ООО Заря на 50 000 руб за оказание услуг';
+    ok(!looksLikeBlock(phrase), 'Д29: «Выставь счёт …» не принимается за блок реквизитов (в нём нет ни ИНН, ни счёта, ни БИК)');
+    ok(looksLikeAsk(phrase) && looksLikeAsk('Сделайте счёт на 5000', { numeric: true }) && looksLikeAsk('счёт на 5000 руб', { numeric: true }),
+      'Д29: просьбу узнаём — по глаголу, а в числовом поле ещё и по «счёт … 5000 руб»');
+    ok(!looksLikeAsk('Выставочный центр') && !looksLikeAsk('ИП Нужный') && !looksLikeAsk('7707083893', { numeric: true })
+      && !looksLikeAsk('счёт 40702810900000012345 в Сбере'),
+    'Д29: название, ИНН и строка с длинным счётом просьбой не считаются');
+  }
   const blob = 'ИНДИВИДУАЛЬНЫЙ ПРЕДПРИНИМАТЕЛЬ САРЫЧЕВА МАРИЯ ВИТАЛЬЕВНА ИНН: 183111485159 '
     + 'ОГРНИП: 325180000069852 Расчётный счёт: 40802810468710003890 '
     + 'Банк: БАШКИРСКОЕ ОТДЕЛЕНИЕ N8598 ПАО СБЕРБАНК БИК банка: 048073601 '
@@ -1924,6 +1935,21 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'проводник спрашивает ИНН первым и показывает, сколько шагов', nLast().slice(0, 40));
     ok(nBtn('Отмена'), 'из формы есть выход');
 
+    /*
+     * Д29: просьба из приветствия на шаге «Ваш ИНН» — не реквизиты и не ИНН.
+     * Приветствие советует написать «Выставь счёт ООО Заря на 50 000 руб», и
+     * новичок так и делает — на первом же вопросе формы.
+     */
+    const askedAt = sent.length;
+    await nSay('Выставь счёт ООО Заря на 50 000 руб за оказание услуг');
+    const askedSaid = sent.slice(askedAt).map((m) => m.text || '').join('\n');
+    ok(askedSaid.includes('Сначала закончим реквизиты, потом выпишем счёт'),
+      'Д29: фраза-просьба на шаге ИНН — «сначала закончим реквизиты»', askedSaid.slice(0, 120));
+    ok(!askedSaid.includes('Разобрал реквизиты') && !askedSaid.includes('В ИНН должно быть'),
+      'Д29: фраза не принята ни за блок реквизитов, ни за ИНН', askedSaid.slice(0, 120));
+    ok(nLast().includes('Ваш ИНН') && nLast().includes('Шаг 1 из 4'),
+      'Д29: вопрос про ИНН повторён тем же шагом', nLast().slice(0, 40));
+
     // Реестр не подключён (в прогоне ключа нет) — тогда, и только тогда, название спрашиваем сами.
     await nTap(nBtn('Пропустить'));
     ok(nLast().includes('Как называется ваша'), 'реестр не ответил — спросили название', nLast().slice(0, 40));
@@ -1975,6 +2001,11 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(!sent.slice(mark2).some((m) => (m.text || '').includes('Чем занимаетесь')),
       'Д4: про дело второй раз не спрашиваем', nLast().slice(0, 40));
 
+    // Д29: длинное приветствие — только новому. У вернувшегося — одна строка и кнопки.
+    await nSay('/start');
+    ok(nLast().includes('С возвращением') && !nLast().includes('Первые 5 документов'),
+      'Д29: вернувшемуся — короткое приветствие, без оферты и рекламы', nLast().slice(0, 60));
+    ok(Boolean(nBtn('Выписать счёт')), 'и кнопки меню на месте');
   }
 
   console.log('\n── выпуск одним нажатием: «Сформировать — итог» ──');
@@ -9173,6 +9204,34 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await tap(`doc.unpaid:${y1.id}`);
     ok(bal(cpY) === 4000 && bdbR.listOps(uid, cpY).some((o) => o.debit === 3000 && !o.doc_id),
       'снятие отметки возвращает оплату в свободные — деньги не пропадают', bal(cpY));
+  }
+
+  console.log('\n── баланс клиента по знаку (Д30) ──');
+  {
+    const bdbR = require('./lib/bot-db');
+    const uid = fxUserId();
+    const mkC = (name, kind) => bdbR.createCp(uid, { name, kind, opening_date: '2026-01-01' });
+    const pre = mkC('ООО «Предоплатный»', 'customer');
+    bdbR.addPrepay(uid, pre, 15000, '2026-10-01');
+    sent.length = 0;
+    await tap(`cp:${pre}`);
+    ok(norm(sent.map((m) => m.text || '').join(' ')).includes('мы должны ему 15 000'),
+      'Д30: при предоплате — «мы должны ему 15 000», а не «в нашу пользу»', norm(last()).slice(0, 160));
+    ok(!sent.map((m) => m.text || '').join(' ').includes('в нашу пользу'), 'старой подписи нет');
+    const dbtr = mkC('ООО «Должник-знак»', 'customer');
+    bdbR.addOp(uid, dbtr, { date: '2026-10-01', kind: 'Приход', doc: 'Счёт', credit: 54250 });
+    sent.length = 0;
+    await tap(`cp:${dbtr}`);
+    ok(norm(sent.map((m) => m.text || '').join(' ')).includes('должен нам 54 250'), 'должник — «должен нам 54 250»');
+    const sup = mkC('ИП Поставщик-знак', 'supplier');
+    bdbR.addOp(uid, sup, { date: '2026-10-01', kind: 'Приход', doc: 'ТН 1', credit: 5000 });
+    sent.length = 0;
+    await tap(`cp:${sup}`);
+    ok(norm(sent.map((m) => m.text || '').join(' ')).includes('мы должны ему 5 000'), 'поставщик с приходом — «мы должны ему 5 000»');
+    const zero = mkC('ООО «Нулевой»', 'customer');
+    sent.length = 0;
+    await tap(`cp:${zero}`);
+    ok(norm(sent.map((m) => m.text || '').join(' ')).includes('взаимных долгов нет'), 'ноль — «взаимных долгов нет»');
   }
 
   console.log('\n── напоминание о долге: список документов и «Напомнить» (Р9, Д11, Д12) ──');

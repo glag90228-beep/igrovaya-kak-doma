@@ -45,7 +45,7 @@ const billing = require('./lib/billing');
 const { payLink, daysFor, priceText, yearSaving } = require('./lib/lava');
 const platega = require('./lib/platega');
 const dadata = require('./lib/dadata');
-const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
+const { parseRequisites, looksLikeBlock, looksLikeAsk } = require('./lib/reqs');
 const reqCheck = require('./lib/requisites-check');
 const docService = require('./lib/doc-service');
 const docLink = require('./lib/doc-link');
@@ -237,6 +237,22 @@ const GREETING =
   + '<i>Счёт сразу с факсимиле, печатью и QR-кодом для быстрой оплаты клиентом через банковское приложение. '
   + 'Первые 5 документов в месяц — бесплатно. Без 1С и бухгалтера.</i>';
 
+/*
+ * Длинное приветствие — только тому, кто пришёл впервые.
+ *
+ * Тот, у кого уже есть фирма или документы, читал его в первый раз; на каждое
+ * «/start» оно превращалось в стену текста с оффертой и «первые 5 документов
+ * бесплатно», а нужна одна строка и кнопки.
+ */
+function greetingFor(user) {
+  const returning = Boolean(user && (bdb.currentOrg(user.id) || bdb.listDocs(user.id, 1).length));
+  if (!returning) return greeting();
+  const app = webAppUrl() ? ' То же самое удобнее в приложении — кнопка ниже.' : '';
+  return '<b>С возвращением!</b> Что делаем?\n\n'
+    + 'Кнопки ниже — или напишите словами, например: <code>Выставь счёт ООО Заря на 50 000 руб</code>.'
+    + app;
+}
+
 function greeting() {
   const legal = legalLine();
   const app = webAppUrl()
@@ -245,14 +261,28 @@ function greeting() {
   return GREETING + app + (legal ? `\n\n<i>${legal}</i>` : '');
 }
 
+/**
+ * Баланс клиента словами — по знаку, а не одной и той же подписью.
+ *
+ * Раньше у заказчика всегда стояло «(в нашу пользу)», даже когда он внёс
+ * предоплату и долг на самом деле наш: «Баланс: 15 000 руб. (в нашу пользу)»
+ * читалось как «нам должны», хотя это мы должны ему. У поставщика знак
+ * читается наоборот: положительное сальдо — наш долг.
+ */
+function balanceLine(cp, closing) {
+  const sum = formatRub(Math.abs(closing));
+  if (!closing) return `Баланс: <b>${sum}</b> — взаимных долгов нет`;
+  const theyOwe = cp.kind === 'supplier' ? closing < 0 : closing > 0;
+  return `Баланс: <b>${theyOwe ? 'должен нам' : 'мы должны ему'} ${sum}</b>`;
+}
+
 function cpMenu(userId, cp) {
   const b = bdb.balanceOf(userId, cp.id);
   const pre = bdb.prepayState(userId, cp.id);
   const closing = b ? round2(b.closing) : 0;
-  const favour = cp.kind === 'supplier' ? 'наш долг ему' : 'в нашу пользу';
   const info = `<b>${esc(cp.name)}</b>${cp.inn ? ` · ИНН ${esc(cp.inn)}` : ''}\n`
     + `Тип: ${cp.kind === 'supplier' ? 'поставщик' : 'заказчик'} · операций: ${b ? b.ops.length : 0}\n`
-    + `Баланс: <b>${formatRub(Math.abs(closing))}</b> (${favour})`
+    + balanceLine(cp, closing)
     + (pre ? `\n💰 <b>${bdb.prepayLine(pre)}</b>` : '');
   const rows = [
     [{ text: '➕ Внести операцию', data: `op:${cp.id}` }],
@@ -559,6 +589,23 @@ async function applyFormValue(tg, chatId, user, state, rawValue) {
   const form = FORMS[formName];
   const { i, values } = state.data;
   const step = form.steps[i];
+
+  /*
+   * Просьба «Выставь счёт…» посреди формы — не ответ на вопрос.
+   *
+   * Новичок читает в приветствии «просто напишите: Выставь счёт ООО Заря на
+   * 50 000 руб» и пишет это в ответ на «Ваш ИНН». Раньше фраза принималась за
+   * блок реквизитов («Разобрал…») или за ИНН («должно быть 10 цифр, а здесь
+   * 4»). Теперь бот говорит, что сначала дело с реквизитами, и повторяет вопрос.
+   */
+  const numericStep = Boolean(step.auto || step.num) || ['inn', 'kpp', 'bik', 'acc', 'corr_acc'].includes(step.key);
+  if (looksLikeAsk(rawValue, { numeric: numericStep })) {
+    await tg.sendMessage(chatId, formName.startsWith('org')
+      ? 'Сначала закончим реквизиты, потом выпишем счёт.'
+      : 'Сначала закончим с клиентом, потом выпишем счёт.');
+    await askStep(tg, chatId, formName, i);
+    return;
+  }
 
   let value = rawValue;
   if (step.date) {
@@ -5410,7 +5457,7 @@ async function handleMessage(tg, msg) {
         return;
       }
       // Невалидный docId — не падаем в AI, показываем приветствие
-      await tg.sendMessage(chatId, greeting(), mainMenu());
+      await tg.sendMessage(chatId, greetingFor(user), mainMenu());
       return;
     }
 
@@ -5419,7 +5466,7 @@ async function handleMessage(tg, msg) {
       if (!user.source) {
         try { user.source = bdb.setSource(user.id, payload); } catch (_) {}
       }
-      await tg.sendMessage(chatId, greeting(), mainMenu());
+      await tg.sendMessage(chatId, greetingFor(user), mainMenu());
       return;
     }
 
@@ -5428,12 +5475,12 @@ async function handleMessage(tg, msg) {
       if (!user.source) {
         try { user.source = bdb.setSource(user.id, payload); } catch (_) {}
       }
-      await tg.sendMessage(chatId, greeting(), mainMenu());
+      await tg.sendMessage(chatId, greetingFor(user), mainMenu());
       return;
     }
 
     // 5. Обычный /start без параметров
-    await tg.sendMessage(chatId, greeting(), mainMenu());
+    await tg.sendMessage(chatId, greetingFor(user), mainMenu());
     return;
   }
   // Свой номер нужен, чтобы владелец выдал доступ: имя в Telegram есть не у
