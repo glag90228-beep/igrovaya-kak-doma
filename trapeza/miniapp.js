@@ -483,6 +483,8 @@ function stateFor(user) {
      */
     basisMismatch: bdb.basisMismatch(user.id, org, owedToUs),
     bizType: (org && org.biz_type) || '',
+    // Вопрос «чем занимаетесь» уже задавали — повторять его после каждого документа не надо.
+    bizAsked: Boolean(org && org.biz_asked),
     bizTypes: bizTypes.list(),
     recurring: recurring.list(user.id).length,
     // Самозанятому: сколько чеков «Мой налог» ещё не пробито (lib/cheques.js).
@@ -2293,6 +2295,8 @@ const api = {
       prepaid: Boolean(res.prepaid),
       prepay: res.prepay ? { ...res.prepay, text: bdb.prepayLine(res.prepay) } : null,
       debtBasis: res.basis,
+      // Вопрос «чем занимаетесь» — один раз за всё время, не после каждого документа.
+      askBiz: bdb.askBizOnce(user.id),
     };
   },
 

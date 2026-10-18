@@ -1958,6 +1958,23 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(nLast().includes('Чем занимаетесь'),
       'после первого документа спросили про дело, а не про основание долга',
       nLast().slice(0, 40));
+
+    // Д4: в «Что дальше» — оплата, а не только «выписать ещё».
+    const next1 = [...sent].reverse().find((m) => (m.text || '').includes('Что дальше'));
+    ok(next1 && buttonIn(next1, 'Отметить оплату'), 'Д4: после выписки есть кнопка «Отметить оплату»');
+
+    // Д4: вопрос «чем занимаетесь» — один раз за всё время. Человек ответа не дал —
+    // второй документ его не возвращает.
+    const uidN = require('./lib/bot-db').getOrCreateUser(N.id).id;
+    const cpN = require('./lib/bot-db').listCps(uidN)[0].id;
+    const mark2 = sent.length;
+    await nTap(`d.sch:${cpN}`);
+    await nSay('Ремонт принтера 1 2000');
+    await nTap('doc.make');
+    ok(sent.slice(mark2).some((m) => (m.text || '').includes('Что дальше')), 'второй документ выписан');
+    ok(!sent.slice(mark2).some((m) => (m.text || '').includes('Чем занимаетесь')),
+      'Д4: про дело второй раз не спрашиваем', nLast().slice(0, 40));
+
   }
 
   console.log('\n── выпуск одним нажатием: «Сформировать — итог» ──');

@@ -3514,6 +3514,27 @@ async function main() {
     ok(r.json.npd === null || !r.json.npd, 'про чек второй раз не напоминаем: человек уже знает');
   }
 
+  section('после выписки: вопрос про дело один раз, без реквизитов — reason=org (Д4, Д2)');
+  {
+    const U = { id: 501010, first_name: 'Вера', username: 'vera2' };
+    const ud = initDataFor(U);
+    const bdbF = require('./lib/bot-db');
+    const uid = bdbF.getOrCreateUser(U.id).id;
+    r = await call('GET', '/api/state', { user: ud });
+    ok(r.json.bizAsked === false && r.json.bizType === '', 'Д4: вопрос про дело ещё не задавали');
+    // Без реквизитов документ не выписать — приложение получает признак reason=org.
+    const cp0 = bdbF.createCp(uid, { name: 'ООО «Ромашка»', kind: 'customer', opening_date: '2026-01-01' });
+    r = await call('POST', '/api/doc', { user: ud, body: { type: 'sch', cpId: cp0, items: [{ name: 'Обед', qty: 1, price: 100 }] } });
+    ok(r.status === 400 && r.json.reason === 'org', 'Д2: без реквизитов выписка отвечает reason=org — по нему приложение ведёт на реквизиты', JSON.stringify(r.json));
+    bdbF.saveMyOrg(uid, { name: 'ИП Веров', inn: '183209316100', signer: 'В. В.' });
+    r = await call('POST', '/api/doc', { user: ud, body: { type: 'torg12', cpId: cp0, date: '2026-09-02', items: [{ name: 'Канапе', qty: 1, price: 14000 }] } });
+    ok(r.status === 200 && r.json.askBiz === true, 'Д4: первая выписка — вопрос про дело задать (askBiz)');
+    r = await call('POST', '/api/doc', { user: ud, body: { type: 'torg12', cpId: cp0, date: '2026-09-25', items: [{ name: 'Кофе', qty: 1, price: 7000 }] } });
+    ok(r.status === 200 && r.json.askBiz === false, 'Д4: вторая — уже не спрашиваем', JSON.stringify(r.json.askBiz));
+    r = await call('GET', '/api/state', { user: ud });
+    ok(r.json.bizAsked === true, 'и состояние это помнит (bizAsked)');
+  }
+
   // Сервер держим до конца: проверки выше ходят к нему по HTTP, и закрытый
   // раньше времени он давал ECONNREFUSED вместо внятного провала.
   await new Promise((r2) => server.close(r2));

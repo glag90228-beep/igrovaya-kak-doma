@@ -298,11 +298,21 @@ if (WEB) {
   });
 }
 
-async function afterIssue() {
+/**
+ * После выписки — карточка самого документа, а не вопрос про устройство дела.
+ *
+ * Раньше человек, выписавший первый счёт, попадал на экран «Чем занимаетесь» —
+ * вопрос бухгалтерский, а он только что сделал то, за чем пришёл, и ждал, что
+ * будет дальше с документом. Теперь он видит документ и два действия: отметить
+ * оплату и прислать файл в чат. «Чем занимаетесь» спрашиваем один раз, мягко и
+ * здесь же (`askBiz` приходит с сервера один раз за всё время).
+ */
+async function afterIssue(docId = 0, askBiz = false) {
   cache = {};
   const st = await api('GET', '/api/state');
   cache = st;
-  reset(st.bizType ? 'home' : 'basis');
+  if (docId) { reset('doc', { id: docId, fresh: true, askBiz }); return; }
+  reset('home');
 }
 
 /*
@@ -1189,6 +1199,50 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
   const cpOf = cpsList.find((x) => x.id === d.cpId) || null;
 
   const box = h('div', {}, h('h1', { text: `${d.title} № ${d.number}` }));
+
+  /*
+   * Только что выписанный документ: сверху — что с ним делать дальше.
+   *
+   * Это и есть ответ на «выписал — а дальше?». Два действия, ради которых
+   * документ заводят: отметить оплату, когда она придёт, и прислать файл ещё
+   * раз (в чат с ботом — оттуда его пересылают клиенту). Остальное — ниже, на
+   * той же карточке. Вопрос «чем занимаетесь» — отдельной тихой строкой после
+   * них, один раз: ответ не обязателен, документ уже выписан.
+   */
+  if (fresh) {
+    const payable = ['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) && d.total && !d.paidAt;
+    box.append(h('div', { class: 'banner info', id: 'fresh-doc' }, icon('check'),
+      h('div', {},
+        h('div', { text: 'Документ выписан' }),
+        h('div', { class: 'small muted', style: 'margin-top:2px', text: 'Что дальше?' }),
+        h('div', { class: 'btn-col', style: 'margin-top:10px' },
+          payable ? h('button', {
+            class: 'btn', id: 'fresh-pay',
+            // Нажимаем настоящую кнопку оплаты ниже: вопрос «это она?» живёт там.
+            onclick: () => {
+              const real = box.querySelector('#pay-main');
+              if (!real) return;
+              real.scrollIntoView({ block: 'center', behavior: 'smooth' });
+              real.click();
+            },
+          }, 'Отметить оплату') : null,
+          h('button', {
+            class: payable ? 'btn secondary' : 'btn', id: 'fresh-send',
+            onclick: (e) => withBusy(e.currentTarget, async () => {
+              const r = await api('POST', '/api/doc/resend', { id: d.id });
+              haptic('medium');
+              toast('Файл отправлен в чат с ботом');
+              download(r.file);
+            }),
+          }, 'Прислать в чат')))));
+    if (askBiz) {
+      box.append(h('div', { class: 'card', id: 'ask-biz' }, navRow({
+        icon: 'office', title: 'Чем занимаетесь?',
+        sub: 'Один вопрос — спрашиваю один раз',
+        onclick: () => go('basis'),
+      })));
+    }
+  }
 
   /*
    * Напоминание про чек «Моего налога». Живёт до следующего перерисовывания
@@ -4142,6 +4196,19 @@ screens.other = async function other({ type, cpId }) {
   }
 
   const box = h('div', {}, h('h1', { text: isPp ? 'Платёжное поручение' : 'Договор' }));
+  // Реквизитов своей организации нет — документ без них не собрать; говорим об этом до формы (как в новом документе).
+  const stO = cache.user ? cache : await api('GET', '/api/state').catch(() => ({}));
+  if (stO && stO.user && !stO.org) {
+    box.append(h('div', { class: 'banner', id: 'need-org' }, icon('warn'),
+      h('div', {},
+        h('div', { text: 'Сначала — ваши реквизиты' }),
+        h('div', { class: 'small muted', style: 'margin-top:2px',
+          text: 'В документе печатаются ваше название и расчётный счёт. Это один раз.' }),
+        h('button', {
+          class: 'btn', style: 'margin-top:10px', id: 'need-org-go',
+          onclick: () => { haptic(); go('org'); },
+        }, 'Заполнить реквизиты'))));
+  }
   const who = h('select', { id: 'f-cp' }, cps.map((c) => h('option', {
     value: c.id, selected: Number(cpId) === c.id,
   }, c.name)));
@@ -4250,7 +4317,7 @@ screens.other = async function other({ type, cpId }) {
     haptic('medium');
     toast('Готово — файл в чате с ботом');
     download(r.file);
-    await afterIssue();
+    await afterIssue(r.doc && r.doc.id);
   });
   box.append(h('div', { class: 'btn-wrap' }, make));
   return box;
@@ -5153,7 +5220,7 @@ screens.new = async function newDoc(params) {
      * когда их несколько — пусть лучше поле будет пустым и потребует ответа.
      */
     cpId: Number(params.cpId) || (cps.length === 1 ? cps[0].id : 0),
-    date: todayISO(),
+    date: params.date || todayISO(),
     items: (params.items || []).map((it) => ({ ...it })),
     // Ставка, названную во фразе («…с НДС 22%»), доносим до выпуска. Не
     // передали — поля не будет вовсе, и документ возьмёт ставку организации:
@@ -5185,6 +5252,26 @@ screens.new = async function newDoc(params) {
    * клиенту с чужими реквизитами и чужим номером, а заметят это у него.
    * При одной фирме строка была бы шумом на каждой выписке.
    */
+  /*
+   * Своих реквизитов ещё нет — говорим об этом ДО формы, а не ответом на
+   * «Выписать». Документ без них не собрать: в нём печатаются название и счёт
+   * продавца. Форму при этом открытой оставляем — позиции можно набрать, они
+   * сохранятся (см. saveDraft), а кнопка ведёт прямо на реквизиты.
+   */
+  // Состояние не загрузилось (st пуст) — молчим: ложное «нет реквизитов» хуже отсутствия подсказки.
+  if (st && st.user && !st.org) {
+    box.append(h('div', { class: 'banner', id: 'need-org' }, icon('warn'),
+      h('div', {},
+        h('div', { text: 'Сначала — ваши реквизиты' }),
+        h('div', { class: 'small muted', style: 'margin-top:2px',
+          text: 'В документе печатаются ваше название и расчётный счёт. Это один раз; '
+            + 'форму можно заполнить уже сейчас — она сохранится.' }),
+        h('button', {
+          class: 'btn', style: 'margin-top:10px', id: 'need-org-go',
+          onclick: () => { haptic(); Object.assign(current().params, saveDraft()); go('org'); },
+        }, 'Заполнить реквизиты'))));
+  }
+
   const mineOrgs = (st && st.orgs) || [];
   if (mineOrgs.length > 1) {
     box.append(h('div', { class: 'banner info' }, icon('receipt'),
@@ -5274,6 +5361,37 @@ screens.new = async function newDoc(params) {
   }
 
   let lookupTimer = 0;
+  // ИНН, которого не нашлось в реестре: человек вводит название, и клиент заводится с ним.
+  let pendingInn = '';
+
+  /*
+   * «Добавить «Ромашка»» — когда такого клиента среди своих нет.
+   *
+   * Раньше поле «Кому» на незнакомое имя отвечало молчанием: пустой список, и
+   * человек не знал, что делать дальше — идти в «Клиенты» и терять форму или
+   * искать другое написание. Теперь тут же предлагается завести клиента по
+   * одному названию. Нажатие — и есть подтверждение: тихо созданный дубль
+   * («Заря» рядом с «ООО „Заря“») потом расходится по документам, поэтому молча
+   * ничего не заводим. ИНН и адрес допишутся в карточке, когда понадобятся.
+   */
+  function addOption(q) {
+    const name = q.trim().slice(0, 200);
+    const btn = h('button', { class: 'cp-opt add', id: 'cp-add' },
+      h('span', { class: 'grow ellipsis', text: `Добавить «${name}»` }),
+      h('span', { class: 'small muted nowrap', text: pendingInn ? `ИНН ${pendingInn}` : 'новый клиент' }));
+    btn.onclick = () => withBusy(btn, async () => {
+      // Берём то, что в поле сейчас: подпись кнопки обновляется с паузой, и быстрый палец мог опередить её.
+      const made = await api('POST', '/api/cp', { name: search.value.trim().slice(0, 200) || name, inn: pendingInn, kind: 'customer' });
+      const cp = made.cp || made;
+      const row = { id: cp.id, name: cp.name || name, inn: pendingInn };
+      known.push(row);
+      pendingInn = '';
+      toast(`Добавил «${row.name}». ИНН и адрес допишите в карточке клиента, когда понадобятся.`);
+      pick(row);
+    });
+    return btn;
+  }
+
   async function suggest() {
     const q = search.value;
     const digits = q.replace(/\D/g, '');
@@ -5286,6 +5404,12 @@ screens.new = async function newDoc(params) {
       row.onclick = () => pick(c);
       found.append(row);
     }
+    if (!q.trim()) pendingInn = '';
+    // Название с буквами, которого нет среди своих (в точности), — можно добавить.
+    const typed = q.trim();
+    const exact = known.some((c) => String(c.name || '').trim().toLowerCase() === typed.toLowerCase());
+    const canAdd = typed.length >= 2 && /[A-Za-zА-Яа-яЁё]/.test(typed) && !exact;
+    if (canAdd) { found.append(addOption(typed)); found.hidden = false; }
 
     /*
      * ИНН — заодно способ завести клиента, не уходя с формы.
@@ -5322,11 +5446,12 @@ screens.new = async function newDoc(params) {
         });
         found.append(add);
       } catch (_) {
-        wait.textContent = 'В реестре не нашёл — заведите клиента вручную.';
+        pendingInn = digits;
+        wait.textContent = 'В реестре такого ИНН нет. Впишите название клиента — добавлю его с этим ИНН.';
       }
       return;
     }
-    found.hidden = !list.length;
+    found.hidden = !list.length && !canAdd;
   }
 
   search.addEventListener('input', () => {
@@ -5459,6 +5584,13 @@ screens.new = async function newDoc(params) {
     }, icon('plus'), t.name))));
   }
 
+  // Что набрано в форме — в виде параметров экрана, чтобы вернуться к ней без потерь.
+  const saveDraft = () => ({
+    items: draft.items.map((it) => ({ ...it })), cpId: draft.cpId, date: dateInput.value,
+    vatRate: draft.vatRate, priceIncludesVat: draft.priceIncludesVat,
+    basis: basisInput ? basisInput.value : params.basis,
+  });
+
   const issue = async () => {
     const items = draft.items.filter((it) => it.name.trim());
     if (!items.length) { toast('Добавьте хотя бы одну позицию', true); return; }
@@ -5477,9 +5609,24 @@ screens.new = async function newDoc(params) {
       if (note) toast(`Документ выписан. ${note}`, false, 8000);
       else toast(r.sentToChat ? 'Готово — файл отправлен в чат' : 'Документ выписан');
       download(r.file);
-      await afterIssue();
+      await afterIssue(r.doc && r.doc.id, Boolean(r.askBiz));
     } catch (e) {
       if (e.payload && e.payload.reason === 'quota') { toast(e.message, true); go('billing'); return; }
+      /*
+       * Реквизитов своей организации нет — ведём их заполнять, а форму
+       * сохраняем. Раньше человек, набравший позиции, видел красную
+       * всплывашку «заполните реквизиты» и оставался с формой, из которой
+       * некуда идти; уйдя сам, он возвращался к пустой.
+       *
+       * Черновик кладём в параметры текущего экрана: «назад» из реквизитов
+       * перерисует эту форму уже с ним.
+       */
+      if (e.payload && e.payload.reason === 'org') {
+        Object.assign(current().params, saveDraft());
+        toast('Сначала заполните реквизиты — форма сохранена', true);
+        go('org');
+        return;
+      }
       toast(e.message, true);
     } finally {
       if (tg) tg.MainButton.hideProgress();

@@ -199,6 +199,9 @@ function migrate() {
    * бы правку. Место колонки — здесь.
    */
   addColumn('orgs', 'biz_type', "TEXT NOT NULL DEFAULT ''");
+  // Вопрос «чем занимаетесь» уже задавали. Без этой отметки его повторяли
+  // после каждого выписанного документа, пока человек не ответит.
+  addColumn('orgs', 'biz_asked', 'INTEGER NOT NULL DEFAULT 0');
 
   // Заблокировавшие бота: рассылать им бессмысленно, а каждая попытка —
   // ошибка в логе и лишний запрос.
@@ -560,12 +563,28 @@ function vatOf(org) {
 function updateOrg(userId, id, fields) {
   const allowed = ['name', 'full_name', 'inn', 'kpp', 'signer', 'address',
     'bank_name', 'bik', 'acc', 'corr_acc', 'ogrnip', 'vat_rate', 'vat_gross', 'debt_basis',
-    'biz_type', 'npd', 'tax_mode'];
+    'biz_type', 'biz_asked', 'npd', 'tax_mode'];
   const sets = [], vals = [];
   for (const k of allowed) if (k in fields) { sets.push(`${k} = ?`); vals.push(fields[k]); }
   if (!sets.length) return;
   vals.push(id, userId);
   db.prepare(`UPDATE orgs SET ${sets.join(', ')} WHERE id = ? AND user_id = ?`).run(...vals);
+}
+/**
+ * Спросить «чем занимаетесь» — один раз, а не после каждого документа.
+ *
+ * Раньше вопрос возвращался, пока человек не ответит: пропустил — получил его
+ * снова после следующего счёта, и после следующего. Теперь «задавали» —
+ * отдельная отметка на организации, и ответ «не сейчас» тоже запоминается.
+ * Передумать можно в любой момент — «Ещё» → «Откуда берётся долг».
+ *
+ * @returns {boolean} true — вопрос надо задать сейчас (и отметка уже поставлена)
+ */
+function askBizOnce(userId) {
+  const org = currentOrg(userId);
+  if (!org || org.biz_type || org.biz_asked) return false;
+  updateOrg(userId, org.id, { biz_asked: 1 });
+  return true;
 }
 function listOrgs(userId) {
   return db.prepare('SELECT * FROM orgs WHERE user_id = ? ORDER BY is_default DESC, id').all(userId);
@@ -3178,6 +3197,7 @@ module.exports = {
   markPaid, unmarkPaid, matchPaymentsToDocs, closeDocsFromBank, docNumbersIn, linkedPaid, dealOf, settleMonthActs,
   unpaidDocs, unpaidSummary, dealTotals, docsBetween,
   freePaymentsFor, freePaymentQuestion, freePaymentLabel, linkFreePayment,
+  askBizOnce,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
   isSeqTaken, guardSeq, numberTakenInOrg, currentOrgId, currentOrg, setActiveOrg,
   orgQuota, grantOrgSlots,

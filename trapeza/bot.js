@@ -1267,6 +1267,11 @@ async function afterDoc(tg, chatId, user, cpId) {
       data: mailbox.has(user.id) ? `doc.mail:${last.id}` : 'mb',
     }]);
   }
+  // Что дальше с выписанным: отметить оплату, когда придёт. Раньше этой кнопки
+  // здесь не было — до карточки документа приходилось идти через «Документы».
+  if (last && ['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(last.type) && last.total > 0) {
+    rows.push([{ text: '✅ Отметить оплату', data: `doc.paid:${last.id}` }]);
+  }
   if (!payable(org)) rows.push([{ text: '🏦 Добавить банк и счёт', data: 'org.bank' }]);
   // Повторение заводится здесь, а не отдельным мастером: позиции уже
   // набраны и проверены человеком, повторять нечего — только выбрать день.
@@ -1284,7 +1289,9 @@ async function afterDoc(tg, chatId, user, cpId) {
   rows.push([{ text: '👤 Карточка клиента', data: `cp:${cpId}` }]);
   rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
   await tg.sendMessage(chatId, '<b>Готово.</b> Что дальше?', keyboard(rows));
-  if (org && !org.biz_type) await showBizType(tg, chatId, user);
+  // «Чем занимаетесь» — один раз за всё время, а не после каждого документа,
+  // пока человек не ответит. Передумать можно в «Ещё» → «Откуда берётся долг».
+  if (bdb.askBizOnce(user.id)) await showBizType(tg, chatId, user);
 }
 
 async function finishItems(tg, chatId, user, state) {

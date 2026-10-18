@@ -955,6 +955,34 @@ const ok = (c, m, extra) => {
     ok(!recLib.list(user.id).some((r) => r.cp_id === cpS), 'остановка из карточки клиента сняла расписание');
   }
 
+  /*
+   * Партия 2: тупики клиента — всё касаниями, как это видит человек.
+   */
+  console.log('\n── после выписки — карточка документа, а не «Чем занимаетесь» (Д4) ──');
+  {
+    forgetRate();   // предел частоты рассчитан на человека, а проверка до этого места сделала сотню запросов
+    const cp4 = bdb.createCp(user.id, { name: 'ООО «Ромашка-4»', kind: 'customer', opening_date: '2026-01-01' });
+    const issueNow = async (price) => {
+      await page.evaluate(([id, pr]) => window.__go('new', { type: 'sch', cpId: id,
+        items: [{ name: 'Обеды', unit: 'шт.', qty: 1, price: pr }] }), [cp4, price]);
+      await page.waitForSelector('.item .name', { timeout: 5000 });
+      await page.evaluate(() => window.__mainClick());
+      await page.waitForSelector('#fresh-doc', { timeout: 10000 });
+    };
+    await issueNow(500);
+    const fresh = (await page.textContent('#fresh-doc')).replace(/\s/g, ' ');
+    ok(fresh.includes('Документ выписан') && fresh.includes('Отметить оплату') && fresh.includes('Прислать в чат'),
+      'Д4: после выписки открылась карточка документа с кнопками «Отметить оплату» и «Прислать в чат»', fresh);
+    ok(await page.locator('#ask-biz').count() === 1, 'Д4: первый раз под ними — тихая строка «Чем занимаетесь?»');
+    ok(!(await page.textContent('#app')).includes('Это про устройство вашего дела'), 'Д4: экран «Чем занимаетесь» не открыт сам');
+    ok(await page.evaluate(() => {
+      const b = document.querySelector('#fresh-doc .btn').getBoundingClientRect();
+      return b.height >= 44;
+    }), 'кнопки на карточке — не ниже 44 px');
+    await issueNow(700);
+    ok(await page.locator('#ask-biz').count() === 0, 'Д4: второй раз вопрос про дело не повторяется');
+  }
+
   console.log('\n── «Оплатил»: «Это она?» (Р2) ──');
   {
     forgetRate();
@@ -999,6 +1027,73 @@ const ok = (c, m, extra) => {
     await pg.waitForSelector('#app .screen', { timeout: 10000 });
     return { page: pg, close: () => c.close() };
   };
+
+  console.log('\n── форма документа без реквизитов (Д2) ──');
+  {
+    forgetRate();
+    // Д2: без реквизитов форма предупреждает сразу, а не ответом на «Выписать»
+    const NB2 = { id: 515454, first_name: 'Пётр', username: 'petr_nb' };
+    const nb2User = bdb.getOrCreateUser(NB2.id, 'Пётр', 'petr_nb');
+    const cpNb2 = bdb.createCp(nb2User.id, { name: 'ООО «Заря»', kind: 'customer', opening_date: '2026-01-01' });
+    const nb2Page = await openAs(NB2);
+    const p2 = nb2Page.page;
+    await p2.evaluate((id) => window.__go('new', { type: 'sch', cpId: id,
+      items: [{ name: 'Обеды набранные', unit: 'шт.', qty: 2, price: 450 }] }), cpNb2);
+    await p2.waitForSelector('#need-org', { timeout: 5000 });
+    ok((await p2.textContent('#need-org')).includes('Сначала — ваши реквизиты'), 'Д2: форма документа без реквизитов сразу говорит «Сначала — ваши реквизиты»');
+    ok(await p2.evaluate(() => document.getElementById('need-org-go').getBoundingClientRect().height >= 44), 'кнопка «Заполнить реквизиты» ≥ 44 px');
+    // Если всё же нажали «Выписать» — ведём на реквизиты, форма сохраняется.
+    await p2.evaluate(() => window.__mainClick());
+    await p2.waitForSelector('#f-name', { timeout: 8000 });
+    ok((await p2.locator('#toast').textContent()).includes('форма сохранена'), 'Д2: ответ сервера «нужны реквизиты» ведёт на экран реквизитов');
+    await p2.fill('#f-name', 'ИП Петров');
+    await p2.fill('#f-inn', '183209316100');
+    await p2.getByRole('button', { name: 'Сохранить', exact: true }).tap();
+    await p2.waitForSelector('.item .name', { timeout: 8000 });
+    ok(await p2.inputValue('.item .name') === 'Обеды набранные', 'Д2: после реквизитов форма вернулась с набранной позицией');
+    ok((await p2.textContent('.cp-chip')).includes('ООО «Заря»'), 'и с выбранным клиентом');
+    ok(await p2.locator('#need-org').count() === 0, 'плашки про реквизиты больше нет');
+    await nb2Page.close();
+
+    // Платёжка без реквизитов: та же плашка, а нажатие «Выписать» ведёт на реквизиты (ответ сервера reason=org).
+    const NB3 = { id: 515555, first_name: 'Ольга', username: 'olga_nb' };
+    const nb3User = bdb.getOrCreateUser(NB3.id, 'Ольга', 'olga_nb');
+    const cpNb3 = bdb.createCp(nb3User.id, { name: 'ООО «Заря»', kind: 'customer', opening_date: '2026-01-01' });
+    const nb3Page = await openAs(NB3);
+    const p3 = nb3Page.page;
+    await p3.evaluate((id) => window.__go('other', { type: 'pp', cpId: id }), cpNb3);
+    await p3.waitForSelector('#need-org', { timeout: 5000 });
+    ok((await p3.textContent('#need-org')).includes('Сначала — ваши реквизиты'), 'Д2: у платёжки без реквизитов тоже плашка «Сначала — ваши реквизиты»');
+    await p3.fill('#f-amount', '1000');
+    await p3.fill('#f-purpose', 'Оплата по счёту № 1');
+    await p3.getByRole('button', { name: 'Выписать', exact: true }).tap();
+    await p3.waitForSelector('#f-name', { timeout: 8000 });
+    ok((await p3.locator('#toast').textContent()).includes('заполните реквизиты'), 'Д2: ответ «нужны реквизиты» у платёжки ведёт на экран реквизитов');
+    await nb3Page.close();
+  }
+
+  console.log('\n── «Кому»: незнакомое имя — «Добавить «…»» (Д3) ──');
+  {
+    forgetRate();
+    bdb.createCp(user.id, { name: 'ООО «Пирамида-3»', kind: 'customer', opening_date: '2026-01-01' });
+    bdb.createCp(user.id, { name: 'ООО «Заря-3»', kind: 'customer', opening_date: '2026-01-01' });
+    await page.evaluate(() => window.__go('new', { type: 'sch' }));
+    await page.waitForSelector('#f-cp', { timeout: 5000 });
+    await page.fill('#f-cp', 'Ромашка-3');
+    await page.waitForSelector('#cp-add', { timeout: 5000 });
+    ok((await page.textContent('#cp-add')).includes('Добавить «Ромашка-3»'), 'Д3: на незнакомое имя — кнопка «Добавить «Ромашка-3»»');
+    ok(await page.evaluate(() => document.getElementById('cp-add').getBoundingClientRect().height >= 44), 'кнопка ≥ 44 px');
+    await page.fill('#f-cp', 'Заря-3');
+    await page.waitForTimeout(400);
+    ok(await page.locator('.cp-opt', { hasText: 'ООО «Заря-3»' }).count() === 1, 'среди своих найденное показано как раньше');
+    await page.fill('#f-cp', 'Ромашка-3');
+    // Список обновляется с паузой после ввода — ждём подпись, а не просто кнопку: она могла остаться от прошлого текста.
+    await page.waitForFunction(() => /Ромашка-3/.test((document.getElementById('cp-add') || {}).textContent || ''), null, { timeout: 5000 });
+    await page.locator('#cp-add').tap();
+    await page.waitForSelector('.cp-chip', { timeout: 5000 });
+    ok((await page.textContent('.cp-chip')).includes('Ромашка-3'), 'после нажатия клиент заведён и выбран в поле «Кому»');
+    ok(bdb.listCps(user.id).some((c) => c.name === 'Ромашка-3' && c.kind === 'customer'), 'в списке клиентов он появился');
+  }
 
   console.log('\n── письмо не ушло: понятная причина и «Настройки почты» (Д14) ──');
   {
