@@ -137,7 +137,7 @@ function buildSchetDogovorHtml({ org, cp, doc }) {
 
       <h2>2. Цена и оплата</h2>
       <p>2.1. Стоимость составляет ${formatMoney(total)} руб.
-         (${amountInWords(total)})${rate == null ? ', НДС не облагается' : `, в том числе НДС ${rateLabel(rate)} — ${formatMoney(vat)} руб.`}.</p>
+         (${amountInWords(total)})${rate == null ? ', НДС не облагается.' : `, в том числе НДС ${rateLabel(rate)} — ${formatMoney(vat)} руб.`}</p>
       <p>2.2. ${prepay}</p>
       <p>2.3. Обязательство по оплате считается исполненным с момента зачисления
          денежных средств на расчётный счёт Исполнителя.</p>

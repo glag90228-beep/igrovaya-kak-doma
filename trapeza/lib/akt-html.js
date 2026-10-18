@@ -21,7 +21,7 @@
  */
 
 const {
-  esc, ru, page, formatMoney, formatRub, amountInWords,
+  esc, ru, periodLabel, openingLabel, page, formatMoney, formatRub, amountInWords,
 } = require('./doc-html');
 
 /** ISO yyyy-mm-dd → dd.mm.yy — в таблице год занимает место зря. */
@@ -109,7 +109,7 @@ function buildAktHtml({ org, cp, ops = [] }) {
   const body = `
     <h1 class="center">Акт сверки</h1>
     <p class="center small" style="margin:2px 0">взаимных расчётов за период:
-       ${ru(cp.opening_date)} — ${ru(cp.period_end)}</p>
+       ${periodLabel(cp.opening_date, cp.period_end)}</p>
     <p class="center small" style="margin:2px 0">между ${esc(orgFull)}${orgInn ? ` (ИНН ${esc(orgInn)})` : ''}</p>
     <p class="center small" style="margin:2px 0">и ${esc(cpTitle(cp))}</p>
     ${cp.contract ? `<p class="center small" style="margin:2px 0">по договору ${esc(cp.contract)}</p>` : ''}
@@ -136,10 +136,10 @@ function buildAktHtml({ org, cp, ops = [] }) {
       </thead>
       <tbody>
         <tr>
-          <td></td><td>Сальдо начальное на ${ru(cp.opening_date)}</td>
+          <td></td><td>${openingLabel(cp.opening_date)}</td>
           <td class="r"></td><td class="r">${money(opening)}</td>
           <td class="gap"></td>
-          <td></td><td>Сальдо начальное на ${ru(cp.opening_date)}</td>
+          <td></td><td>${openingLabel(cp.opening_date)}</td>
           <td class="r"></td><td class="r"></td>
         </tr>
         ${rows}
@@ -178,7 +178,7 @@ function buildAktHtml({ org, cp, ops = [] }) {
     <p class="note">Правая половина заполняется контрагентом. Если расхождений нет —
        подпишите и пришлите скан в ответ; если что-то не сходится, укажите строку.</p>`;
 
-  return page(`Акт сверки ${ru(cp.opening_date)} — ${ru(cp.period_end)}`, body)
+  return page(`Акт сверки ${periodLabel(cp.opening_date, cp.period_end)}`, body)
     .replace('</style>', `${CSS}</style>`);
 }
 

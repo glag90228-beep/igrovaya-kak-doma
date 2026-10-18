@@ -127,6 +127,26 @@ function parseNum(v) {
 /** Потолок количества и цены: защита от переполнения, см. cleanItems. */
 const ITEM_MAX = 1e9;
 
+/** Длиннее название позиции не помещается в графу бланка; дальше его резали молча. */
+const NAME_MAX = 300;
+
+/**
+ * Потолок суммы документа — триллион рублей.
+ *
+ * Потолки количества и цены по миллиарду допускали произведение в 1e18, а
+ * сумма прописью от 1e15 выходила «Один рублей 00 копеек»: слов для триллионов
+ * и дальше в словаре нет. Триллион заведомо больше любой первички малого
+ * бизнеса и ещё читается словами верно.
+ */
+const DOC_MAX_TOTAL = 1e12;
+
+/** Отказ по слишком большой сумме — или '' если сумма в пределах. */
+function totalProblem(total) {
+  if (Number(total) <= DOC_MAX_TOTAL) return '';
+  return 'Сумма документа больше 1 000 000 000 000 ₽ — такой бланк не напечатать верно '
+    + '(сумма прописью не поместится). Проверьте количество и цену: возможно, лишний ноль.';
+}
+
 /**
  * Что не так с присланными позициями — человеческим текстом, или '' если всё в порядке.
  *
@@ -142,6 +162,16 @@ function itemsProblem(raw) {
     const name = String((it && it.name) || '').trim();
     if (!name) continue;
     const label = name.length > 40 ? `${name.slice(0, 40)}…` : name;
+    /*
+     * Длинное название раньше молча обрезалось на 300-м знаке — прямо в
+     * юридическом документе, который уходит контрагенту. Человек не узнавал,
+     * что в бланке не всё, что он написал. Теперь отказ с цифрами: пусть
+     * сократит сам, чем получит обрезанное «Поставка продукции по догов».
+     */
+    if (name.length > NAME_MAX) {
+      return `Позиция «${label}»: название длиннее ${NAME_MAX} знаков (сейчас ${name.length}). `
+        + 'Сократите его — в бланк такое не помещается, и обрезать молча мы не будем.';
+    }
     const q = it.qty;
     if (q != null && String(q).trim() !== '') {
       const qty = parseNum(q);
@@ -170,7 +200,7 @@ function itemsProblem(raw) {
 function cleanItems(raw) {
   const out = [];
   for (const it of Array.isArray(raw) ? raw.slice(0, 200) : []) {
-    const name = String((it && it.name) || '').trim().slice(0, 300);
+    const name = String((it && it.name) || '').trim().slice(0, NAME_MAX);
     if (!name) continue;
     const qty = parseNum(it.qty);
     const price = parseNum(it.price);
@@ -212,6 +242,29 @@ function pickDate(date) {
     message: `Такой даты нет в календаре: ${raw}. Укажите существующую дату, например 2026-10-18.`,
   };
 }
+
+/*
+ * Очередь выписки по ряду номеров (организация + вид документа).
+ *
+ * Номер берётся до сборки файла, а сборка идёт около секунды. Четыре выписки
+ * разом брали один и тот же номер, одна проходила, остальные три перебирали
+ * попытки по одной — и четвёртая падала на «UNIQUE constraint failed». Теперь
+ * выписки одного ряда идут друг за другом внутри процесса: каждая видит уже
+ * занятый номер предыдущей. От второго процесса (бот и приложение могут жить
+ * отдельно) по-прежнему защищает уникальный индекс и повтор с запасом попыток.
+ */
+const numberQueues = new Map();
+function inNumberQueue(key, job) {
+  const prev = numberQueues.get(key) || Promise.resolve();
+  const run = prev.then(job, job);
+  const tail = run.catch(() => {});
+  numberQueues.set(key, tail);
+  tail.then(() => { if (numberQueues.get(key) === tail) numberQueues.delete(key); });
+  return run;
+}
+
+/** Попыток взять номер, когда его перехватил другой процесс. */
+const SEQ_ATTEMPTS = 6;
 
 /** Ошибка выпуска с понятной человеку причиной. */
 function fail(reason, message) {
@@ -392,6 +445,8 @@ async function issueDocument(userId, {
   const when = picked.date;
   const year = Number(when.slice(0, 4));
   const total = totalOf(clean, fields);
+  const tooBig = totalProblem(total);
+  if (tooBig) return fail('total', tooBig);
 
   /*
    * Заданный руками номер проверяем на занятость.
@@ -420,35 +475,37 @@ async function issueDocument(userId, {
    * бывает, а бесконечный цикл в проде хуже отказа.
    */
   let num; let file; let id;
-  for (let attempt = 0; ; attempt += 1) {
-    let seq = bdb.nextSeqForOrg(org.id, type, year);
-    /*
-     * Порядковый номер и номер документа — разные вещи, и совпадают они лишь
-     * пока никто не вводил номер руками. Стоит человеку выписать счёт № 3
-     * своей рукой, и присвоенная тройка через две выписки столкнётся с ним:
-     * порядковый свободен, а номер занят. Сдвигаемся до свободного — ряд от
-     * этого прерывается, но два документа с одним номером хуже пропуска.
-     */
-    if (!wanted) {
-      while (bdb.numberTakenInOrg(org.id, type, year, String(seq))) seq += 1;
+  await inNumberQueue(`${org.id}:${type}:${year}`, async () => {
+    for (let attempt = 0; ; attempt += 1) {
+      let seq = bdb.nextSeqForOrg(org.id, type, year);
+      /*
+       * Порядковый номер и номер документа — разные вещи, и совпадают они лишь
+       * пока никто не вводил номер руками. Стоит человеку выписать счёт № 3
+       * своей рукой, и присвоенная тройка через две выписки столкнётся с ним:
+       * порядковый свободен, а номер занят. Сдвигаемся до свободного — ряд от
+       * этого прерывается, но два документа с одним номером хуже пропуска.
+       */
+      if (!wanted) {
+        while (bdb.numberTakenInOrg(org.id, type, year, String(seq))) seq += 1;
+      }
+      num = String(wanted || seq).slice(0, 40);
+      const doc = { number: num, date: when, items: clean, ...fields };
+      // eslint-disable-next-line no-await-in-loop
+      file = await renderFile(
+        kind.build({ org: withFx(userId, org, type, doc), cp, doc }),
+        `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
+      );
+      try {
+        id = bdb.saveDoc(userId, {
+          orgId: org.id, cpId: cp.id, type, number: num, seq, date: when, total,
+          payload: { items: clean, ...fields },
+        });
+        break;
+      } catch (e) {
+        if (!bdb.isSeqTaken(e) || attempt >= SEQ_ATTEMPTS - 1) throw e;
+      }
     }
-    num = String(wanted || seq).slice(0, 40);
-    const doc = { number: num, date: when, items: clean, ...fields };
-    // eslint-disable-next-line no-await-in-loop
-    file = await renderFile(
-      kind.build({ org: withFx(userId, org, type, doc), cp, doc }),
-      `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
-    );
-    try {
-      id = bdb.saveDoc(userId, {
-        orgId: org.id, cpId: cp.id, type, number: num, seq, date: when, total,
-        payload: { items: clean, ...fields },
-      });
-      break;
-    } catch (e) {
-      if (!bdb.isSeqTaken(e) || attempt >= 2) throw e;
-    }
-  }
+  });
 
   bdb.rememberItems(userId, clean);
 
@@ -586,27 +643,29 @@ async function issueFlat(userId, {
  */
 async function saveNumbered(userId, { org, cp, kind, type, when, wanted, payload, total }) {
   const year = Number(when.slice(0, 4));
-  for (let attempt = 0; ; attempt += 1) {
-    let seq = bdb.nextSeqForOrg(org.id, type, year);
-    if (!wanted) {
-      while (bdb.numberTakenInOrg(org.id, type, year, String(seq))) seq += 1;
+  return inNumberQueue(`${org.id}:${type}:${year}`, async () => {
+    for (let attempt = 0; ; attempt += 1) {
+      let seq = bdb.nextSeqForOrg(org.id, type, year);
+      if (!wanted) {
+        while (bdb.numberTakenInOrg(org.id, type, year, String(seq))) seq += 1;
+      }
+      const num = String(wanted || seq).slice(0, 40);
+      const doc = { number: num, date: when, ...payload };
+      // eslint-disable-next-line no-await-in-loop
+      const file = await renderFile(
+        kind.build({ org: withFx(userId, org, type, doc), cp, doc }),
+        `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
+      );
+      try {
+        const id = bdb.saveDoc(userId, {
+          orgId: org.id, cpId: cp.id, type, number: num, seq, date: when, total, payload,
+        });
+        return { num, file, id };
+      } catch (e) {
+        if (!bdb.isSeqTaken(e) || attempt >= SEQ_ATTEMPTS - 1) throw e;
+      }
     }
-    const num = String(wanted || seq).slice(0, 40);
-    const doc = { number: num, date: when, ...payload };
-    // eslint-disable-next-line no-await-in-loop
-    const file = await renderFile(
-      kind.build({ org: withFx(userId, org, type, doc), cp, doc }),
-      `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
-    );
-    try {
-      const id = bdb.saveDoc(userId, {
-        orgId: org.id, cpId: cp.id, type, number: num, seq, date: when, total, payload,
-      });
-      return { num, file, id };
-    } catch (e) {
-      if (!bdb.isSeqTaken(e) || attempt >= 2) throw e;
-    }
-  }
+  });
 }
 
 /**

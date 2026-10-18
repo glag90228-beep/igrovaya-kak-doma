@@ -9323,6 +9323,109 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     mailboxLib.remove(uid);
   }
 
+  console.log('\n── копейки, предел суммы, длинное название, номера, реестр, бланки (Р13–Р19, Р7) ──');
+  {
+    const bdbR = require('./lib/bot-db');
+    const dsR = require('./lib/doc-service');
+    const mR = require('./lib/money');
+    const ExcelJS3 = require('exceljs');
+    const uid = fxUserId();
+    bdbR.saveMyOrg(uid, { name: 'ООО «Партия три»', inn: '7712345678', kpp: '771201001', signer: 'Иванов И. И.' });
+    const cpR = bdbR.createCp(uid, { name: 'ООО «Весы-3»', kind: 'customer', opening_date: '2026-01-01' });
+    const issueR = (items, more = {}) => dsR.issueDocument(uid, { type: 'torg12', cpId: cpR, items, skipQuota: true, ...more });
+
+    // Р13: половина копейки считается как на бумаге, а не как двоичная дробь.
+    ok(mR.lineSum(1.5, 99.99) === 149.99, 'Р13: 1,5 × 99,99 = 149,99 (раньше 149,98)', mR.lineSum(1.5, 99.99));
+    ok(mR.round2(1.005) === 1.01 && mR.round2(-1.005) === -1.01 && mR.round2(0.1 + 0.2) === 0.3,
+      'Р13: round2 — половина копейки от нуля, шум двоичной дроби не мешает');
+    ok(mR.round2(1e11 + 0.005) === 100000000000.01, 'Р13: и на больших суммах');
+    const sp = mR.vatSplit({ qty: 3, price: 100 }, 22, true);
+    ok(sp.total === 300 && sp.net === 245.9 && sp.vat === 54.1, 'Р13: НДС «в том числе»: 300 = 245,90 + 54,10', JSON.stringify(sp));
+    ok(mR.vatTotals([{ qty: 0.125, price: 800 }, { qty: 1.5, price: 99.99 }], null, false).total === 249.99,
+      'Р13: итог складывается копейками');
+
+    // Р14: сумма больше триллиона — отказ, а не «Один рублей».
+    const huge = await issueR([{ name: 'Золото', qty: 1e9, price: 1e9 }]);
+    ok(!huge.ok && huge.reason === 'total' && /лишний ноль/.test(huge.message), 'Р14: сумма 1e18 — понятный отказ', huge.message);
+    const edge = await issueR([{ name: 'Много', qty: 1e6, price: 1e6 }]);
+    ok(edge.ok && edge.total === 1e12 && /Один триллион рублей/.test(mR.amountInWords(edge.total)),
+      'Р14: ровно триллион ещё выписывается, прописью верно');
+
+    // Р15: длинное название — отказ с цифрами, а не молчаливая обрезка.
+    const longName = 'Поставка продукции '.repeat(20);   // 380 знаков
+    const longR = await issueR([{ name: longName, qty: 1, price: 10 }]);
+    ok(!longR.ok && longR.reason === 'items' && /300/.test(longR.message) && new RegExp(String(longName.trim().length)).test(longR.message),
+      'Р15: название длиннее 300 знаков — отказ с числами', longR.message);
+    const okName = await issueR([{ name: 'я'.repeat(300), qty: 1, price: 10 }]);
+    ok(okName.ok, 'Р15: ровно 300 знаков принимается');
+
+    // Р16: шесть выписок разом — шесть разных подряд идущих номеров, без исключений.
+    const many = await Promise.allSettled(Array.from({ length: 6 }, () => dsR.issueDocument(uid, {
+      type: 'sch', cpId: cpR, skipQuota: true, items: [{ name: 'Обед', qty: 1, price: 100 }] })));
+    const nums = many.filter((x) => x.status === 'fulfilled' && x.value.ok).map((x) => Number(x.value.doc.number)).sort((a, b) => a - b);
+    ok(nums.length === 6 && new Set(nums).size === 6 && nums[5] - nums[0] === 5,
+      'Р16: шесть одновременных выписок — шесть номеров подряд', JSON.stringify(many.map((x) => x.status === 'fulfilled' ? x.value.doc && x.value.doc.number : String(x.reason && x.reason.message))));
+
+    // Р17: акт сверки «за всё время» без пустой даты.
+    const { buildAktHtml } = require('./lib/akt-html');
+    const orgFull = bdbR.getDefaultOrg(uid);
+    const aktCp = { name: 'ООО «Весы-3»', opening_balance: 0, opening_date: '', period_end: '2026-10-18' };
+    const aktHtml = buildAktHtml({ org: orgFull, cp: aktCp, ops: [] });
+    ok(/с начала расчётов по 18\.10\.2026/.test(aktHtml) && !/на\s*<\/td>/.test(aktHtml) && !/— 18\.10\.2026/.test(aktHtml.replace(/\s+/g, ' ').replace(/с начала расчётов по 18\.10\.2026/g, '')),
+      'Р17: акт сверки без даты начала — «с начала расчётов по …», без пустого места');
+    ok(/Сальдо начальное \(на начало расчётов\)/.test(aktHtml), 'Р17: и строка начального сальдо читается');
+    const wbA = new ExcelJS3.Workbook();
+    await wbA.xlsx.load(await require('./lib/xlsx-akt').buildAkt({ org: orgFull, cp: aktCp, ops: [] }));
+    const aktText = [];
+    wbA.eachSheet((ws) => ws.eachRow((row) => row.eachCell((c) => aktText.push(String(c.value && c.value.result != null ? c.value.result : c.value)))));
+    ok(aktText.some((t) => /с начала расчётов по 18\.10\.2026/.test(t)) && !aktText.some((t) => /период: –|на\s*$/.test(t)),
+      'Р17: и в Excel-акте то же');
+
+    // Р18: двойной точки нет ни в одном бланке с НДС.
+    const { buildAktUslugHtml } = require('./lib/akt-uslug');
+    for (const [rate, gross] of [[20, false], [20, true], [null, false]]) {
+      const h = buildAktUslugHtml({ org: orgFull, cp: bdbR.getCp(uid, cpR), doc: { number: '1', date: '2026-10-01', items: [{ name: 'Услуга', qty: 1, price: 583.42 }], vatRate: rate, priceIncludesVat: gross } });
+      ok(!/руб\.\./.test(h) && !/НДС\.\./.test(h), `Р18: акт услуг, НДС ${rate}${gross ? ' в т.ч.' : ''} — без двойной точки`);
+      ok(/(руб\.|без НДС\.)<\/p>/.test(h.replace(/\s+/g, ' ')), `Р18: и предложение закрыто одной точкой (${rate})`);
+    }
+    const { buildSchetDogovorHtml } = require('./lib/schet-dogovor');
+    const sdH = buildSchetDogovorHtml({ org: orgFull, cp: bdbR.getCp(uid, cpR), doc: { number: '1', date: '2026-10-01', items: [{ name: 'Услуга', qty: 1, price: 100 }], vatRate: 20 } });
+    ok(!/руб\.\./.test(sdH), 'Р18: счёт-договор с НДС — без двойной точки');
+
+    // Р19: ТОРГ-12 — «Всего мест» без данных не печатаем, у организации есть строка бухгалтера.
+    const { buildTorg12Html } = require('./lib/torg12');
+    const docT = { number: '1', date: '2026-10-01', items: [{ name: 'Мясо', unit: 'кг', qty: 0.125, price: 800 }, { name: 'Доставка', unit: 'усл.', qty: 1, price: 100 }] };
+    const tOoo = buildTorg12Html({ org: orgFull, cp: bdbR.getCp(uid, cpR), doc: docT });
+    ok(!/Всего мест/.test(tOoo) && !/мест\b/.test(tOoo.replace(/Отпущено/g, '')), 'Р19: «Всего мест» без данных не печатается', (tOoo.match(/[^.]*мест[^.]*/) || [''])[0]);
+    ok(/Главный \(старший\) бухгалтер/.test(tOoo) && /Руководитель, Иванов И\. И\./.test(tOoo), 'Р19: у организации есть строка бухгалтера и должность руководителя');
+    ok(/Всего мест: 3 места/.test(buildTorg12Html({ org: orgFull, cp: bdbR.getCp(uid, cpR), doc: { ...docT, places: 3 } })), 'Р19: если число мест передали — печатаем');
+    const tIp = buildTorg12Html({ org: { ...orgFull, inn: '183209316100' }, cp: bdbR.getCp(uid, cpR), doc: docT });
+    ok(!/бухгалтер/.test(tIp) && /Индивидуальный предприниматель, Иванов/.test(tIp), 'Р19: у ИП бухгалтера нет, подписывает как предприниматель');
+
+    // Р7: реестр — только продажные документы, одна сделка один раз, у платёжки и акта сверки нет оплаты.
+    const cpS = bdbR.createCp(uid, { name: 'ООО «Реестровый»', kind: 'customer', opening_date: '2026-01-01' });
+    const mk = (type, items, more = {}) => dsR.issueDocument(uid, { type, cpId: cpS, skipQuota: true, date: '2026-09-10', items, ...more });
+    const dSch = await mk('sch', [{ name: 'Обед', qty: 1, price: 1000 }]);
+    const dTn = await mk('torg12', [{ name: 'Обед', qty: 1, price: 1000 }], { date: '2026-09-12' });
+    const dUsl = await mk('usl', [{ name: 'Консультация', qty: 1, price: 2500 }], { date: '2026-09-15' });
+    const dPp = await dsR.issuePlain(uid, { type: 'pp', cpId: cpS, date: '2026-09-16', fields: { amount: 1000, purpose: 'Оплата по счёту' }, skipQuota: true });
+    ok(dSch.ok && dTn.ok && dUsl.ok && dPp.ok, 'Р7: документы для реестра выписаны', JSON.stringify([dSch.message, dTn.message, dUsl.message, dPp.message]));
+    const reg = bdbR.registryDocs(uid, bdbR.docsBetween(uid, '2026-09-01', '2026-09-30').filter((d) => d.cp_id === cpS));
+    ok(reg.docs.length === 2 && reg.twins === 1 && reg.other === 1 && !reg.docs.some((d) => d.type === 'pp'),
+      'Р7: из четырёх документов остались две сделки; парный и платёжка не в счёт', JSON.stringify([reg.docs.map((d) => d.type), reg.twins, reg.other]));
+    const wbReg = new ExcelJS3.Workbook();
+    await wbReg.xlsx.load(await require('./lib/xlsx-registry').buildRegistry({ org: orgFull, docs: reg.docs, from: '2026-09-01', to: '2026-09-30', twins: reg.twins }));
+    const shReg = wbReg.getWorksheet('Реестр');
+    const regSum = [6, 7].reduce((a, r) => a + Number(shReg.getRow(r).getCell(7).value), 0);
+    ok(regSum === 3500 && String(shReg.getCell('A3').value).includes('2'), 'Р7: итог реестра 3 500 = выручка, а не 5 500', String(regSum));
+    ok(/парных документов не показано — 1/.test(String(shReg.getCell('A4').value)), 'Р7: под заголовком сказано про парный документ');
+    const pureFilter = await require('./lib/xlsx-registry').buildRegistry({ org: orgFull, from: '2026-09-01', to: '2026-09-30',
+      docs: [{ type: 'pp', date: '2026-09-16', number: '1', total: 1000, payload: {} }, { type: 'akt', date: '2026-09-30', number: '1', total: 5000, payload: {} }] });
+    const wbPure = new ExcelJS3.Workbook();
+    await wbPure.xlsx.load(pureFilter);
+    ok(/Всего документов: 0/.test(String(wbPure.getWorksheet('Реестр').getCell('A3').value)), 'Р7: платёжка и акт сверки в реестр не попадают даже напрямую');
+  }
+
   console.log('\n── общий браузер для PDF ──');
   const pdf = require('./lib/pdf');
   if (pdf.pdfAvailable()) {

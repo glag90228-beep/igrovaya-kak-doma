@@ -1998,6 +1998,43 @@ function docsBetween(userId, from, to, cpId = null, orgId = null) {
   });
 }
 
+/*
+ * Типы документов, которые попадают в реестр: то, чем что-то продано.
+ *
+ * Раньше в реестр шло всё подряд, и «ИТОГО» оказывался в шесть с лишним раз
+ * больше продажи: счёт, накладная и акт одной сделки складывались втроём, к
+ * ним добавлялись платёжка (деньги, а не продажа) и акт сверки (сумма долга,
+ * а не выручка), а у двух последних ещё и горела красная «не оплачен» — у
+ * платёжки и акта сверки оплаты быть не может.
+ */
+const REGISTRY_TYPES = ['sch', 'schdog', 'usl', 'upd', 'torg12', 'avans', 'ksf'];
+const DEAL_TYPES = ['sch', 'schdog', 'usl', 'upd', 'torg12'];
+
+/**
+ * Документы для реестра: только продажные и без второго документа сделки.
+ *
+ * Парных ищем тем же правилом, что «Ждут оплаты» (dealTotals): счёт и
+ * закрывающий его акт на одну сумму — одна сделка, в реестре остаётся тот,
+ * что создаёт долг при выбранном основании. Акт за месяц повторяет накладные
+ * месяца и тоже не считается второй раз.
+ *
+ * @returns {{docs: object[], twins: number, other: number}} twins — сколько
+ *   парных документов не показано, other — сколько непродажных (платёжки,
+ *   акты сверки, договоры) пропущено
+ */
+function registryDocs(userId, docs) {
+  const sale = (docs || []).filter((d) => REGISTRY_TYPES.includes(d.type));
+  const deal = sale.filter((d) => DEAL_TYPES.includes(d.type)).map((d) => ({ ...d }));
+  const org = (deal[0] && orgOfDoc(userId, deal[0])) || currentOrg(userId) || {};
+  dealTotals(userId, deal, basisOf(org));
+  const twin = new Set(deal.filter((d) => d.pair).map((d) => d.id));
+  return {
+    docs: sale.filter((d) => !twin.has(d.id)),
+    twins: twin.size,
+    other: (docs || []).length - sale.length,
+  };
+}
+
 /**
  * Неоплаченные документы с суммой — то, за чем следят каждый день.
  *
@@ -3251,7 +3288,7 @@ module.exports = {
   DEBT_DOCS, basisOf, makesDebt, basisMismatch, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
   debtByDoc, rebuildDebt, restoreDebt,
   markPaid, unmarkPaid, matchPaymentsToDocs, closeDocsFromBank, docNumbersIn, linkedPaid, dealOf, settleMonthActs,
-  unpaidDocs, unpaidSummary, dealTotals, docsBetween,
+  unpaidDocs, unpaidSummary, dealTotals, docsBetween, registryDocs,
   freePaymentsFor, freePaymentQuestion, freePaymentLabel, linkFreePayment,
   docShort, unpaidLinesFor, debtListText,
   askBizOnce,

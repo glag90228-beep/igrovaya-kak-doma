@@ -27,6 +27,20 @@ function ru(iso) {
   return m ? `${m[3]}.${m[2]}.${m[1]}` : String(iso);
 }
 
+/*
+ * Период акта сверки словами. У клиента без даты начала расчётов (акт «за всё
+ * время») раньше выходило «за период: – 18.10.2026» и «Сальдо начальное на »
+ * с пустым местом: контрагент подписывает бумагу, где не сказано, с какого
+ * дня считать. Теперь прямо пишем «с начала расчётов».
+ */
+function periodLabel(from, to) {
+  return from ? `${ru(from)} — ${ru(to)}` : `с начала расчётов по ${ru(to)}`;
+}
+/** «Сальдо начальное» + «на 01.01.2026» или «(на начало расчётов)». */
+function openingLabel(date) {
+  return date ? `Сальдо начальное на ${ru(date)}` : 'Сальдо начальное (на начало расчётов)';
+}
+
 const CSS = `
   * { box-sizing: border-box; }
   body { margin: 0; font-family: Arial, "DejaVu Sans", sans-serif; color: #14171f; font-size: 12px; line-height: 1.4; }
@@ -325,6 +339,6 @@ function page(title, body) {
 }
 
 module.exports = {
-  esc, ru, page, fxHtml, stampsHtml, withStamps, isIp, isSelfEmployed, npdNote, courtOf, signRows, usnNote, cityOf, placeDate,
+  esc, ru, periodLabel, openingLabel, page, fxHtml, stampsHtml, withStamps, isIp, isSelfEmployed, npdNote, courtOf, signRows, usnNote, cityOf, placeDate,
   formatMoney, formatPrice, formatRub, amountInWords,
 };

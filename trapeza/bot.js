@@ -7,7 +7,7 @@
 
 const { Telegram, keyboard } = require('./lib/tg');
 const bdb = require('./lib/bot-db');
-const { formatRub, formatMoney, formatPrice, amountInWords, round2, vatTotals } = require('./lib/money');
+const { formatRub, formatMoney, formatPrice, lineSum, amountInWords, round2, vatTotals } = require('./lib/money');
 const { buildAkt } = require('./lib/xlsx-akt');
 const { buildRegistry } = require('./lib/xlsx-registry');
 const { buildKnigaProdazh, bookRow } = require('./lib/xlsx-kniga');
@@ -1041,7 +1041,7 @@ async function showPreview(tg, chatId, user, state) {
     Boolean(extra.priceIncludesVat));
   const total = sums.total;
   const lines = items.map((it, i) =>
-    `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatPrice(it.price)} руб. = <b>${formatRub(round2(it.qty * it.price))}</b>`);
+    `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatPrice(it.price)} руб. = <b>${formatRub(lineSum(it.qty, it.price))}</b>`);
   const head = extra.status
     ? ` · статус ${extra.status}${extra.status === 1
       ? `, НДС ${extra.vatRate == null ? 'не облагается' : `${extra.vatRate}%`}`
@@ -1609,10 +1609,10 @@ async function sendRegistry(tg, chatId, user, periodName) {
   const org = bdb.currentOrg(user.id);
   if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
   const { from, to, title } = periodOf(periodName);
-  const docs = bdb.docsBetween(user.id, from, to);
+  const { docs, twins } = bdb.registryDocs(user.id, bdb.docsBetween(user.id, from, to));
 
   await tg.sendChatAction(chatId, 'upload_document');
-  const buf = await buildRegistry({ org, docs, from, to });
+  const buf = await buildRegistry({ org, docs, from, to, twins });
   const sum = round2(docs.reduce((a2, d) => a2 + (Number(d.total) || 0), 0));
   const unpaid = docs.filter((d) => !d.paid_at);
   const unpaidSum = round2(unpaid.reduce((a2, d) => a2 + (Number(d.total) || 0), 0));

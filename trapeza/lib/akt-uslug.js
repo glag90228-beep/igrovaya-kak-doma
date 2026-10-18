@@ -108,10 +108,11 @@ function buildAktUslugHtml({ org, cp, doc }) {
        * ветки, собранной на сервере, — там это заметили раньше меня.
        */''}
     <p class="b">Всего оказано услуг на сумму: ${formatMoney(total)} руб. (${amountInWords(total)})${rate == null
-      ? ', без НДС'
+      ? ', без НДС.'
+      /* «руб.» уже с точкой: вторая давала «700,10 руб..» */
       : (gross
         ? `, в т.ч. НДС ${esc(rateLabel(rate))} — ${formatMoney(vat)} руб.`
-        : `, плюс НДС ${esc(rateLabel(rate))} — ${formatMoney(vat)} руб.`)}.</p>
+        : `, плюс НДС ${esc(rateLabel(rate))} — ${formatMoney(vat)} руб.`)}</p>
     ${rate == null ? npdNote(org) : ''}
     <p class="note">Вышеперечисленные услуги выполнены полностью и в срок. Заказчик претензий
        по объёму, качеству и срокам оказания услуг не имеет.</p>

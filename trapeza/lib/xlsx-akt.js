@@ -6,6 +6,7 @@
 
 const ExcelJS = require('exceljs');
 const { formatRub, amountInWords, round2 } = require('./money');
+const { periodLabel, openingLabel } = require('./doc-html');
 
 const BROWN = 'FF2E3A8C';
 const DARK = 'FF1F2760';
@@ -87,7 +88,7 @@ async function buildAkt({ org, cp, ops }) {
   const head = [
     ['Наша сторона:', `${orgShort} — ${orgFull}  (ИНН ${orgInn})`],
     [isSupplier ? 'Поставщик:' : 'Контрагент:', cpTitle(cp)],
-    ['Договор / период:', `${cp.contract};  период ${ru(cp.opening_date)} - ${ru(cp.period_end)}`],
+    ['Договор / период:', `${cp.contract};  период ${periodLabel(cp.opening_date, cp.period_end)}`],
   ];
   head.forEach(([label, value], i) => {
     const r = 3 + i;
@@ -116,7 +117,7 @@ async function buildAkt({ org, cp, ops }) {
 
   // Строка начального сальдо
   j.mergeCells('A9:C9');
-  j.getCell('D9').value = `Сальдо на ${ru(cp.opening_date)} `
+  j.getCell('D9').value = `Сальдо ${cp.opening_date ? `на ${ru(cp.opening_date)}` : 'на начало расчётов'} `
     + (isSupplier ? '(наш долг поставщику)' : `(в пользу ${orgShort})`);
   j.getCell('D9').font = { bold: true, size: 10 };
   const openCell = j.getCell('G9');
@@ -244,7 +245,7 @@ async function buildAkt({ org, cp, ops }) {
   };
 
   title(1, 'Акт сверки', { bold: true, size: 16, color: DARK });
-  title(2, `взаимных расчетов за период: ${ru(cp.opening_date)} - ${ru(cp.period_end)}`);
+  title(2, `взаимных расчетов за период: ${periodLabel(cp.opening_date, cp.period_end)}`);
   title(3, `между ${orgFull} (ИНН ${orgInn})`);
   title(4, `и ${cpTitle(cp)}`);
   title(5, `по договору${isSupplier ? ':' : ''} ${cp.contract}`);
@@ -278,11 +279,11 @@ async function buildAkt({ org, cp, ops }) {
   });
 
   // Начальное сальдо (правая сторона остаётся для заполнения контрагентом)
-  a.getCell('B11').value = `Сальдо начальное на ${ru(cp.opening_date)}`;
+  a.getCell('B11').value = openingLabel(cp.opening_date);
   a.getCell('B11').font = { bold: true, size: 9 };
   a.getCell('D11').value = { formula: `'Журнал операций'!G9`, result: round2(cp.opening_balance) };
   a.getCell('D11').numFmt = MONEY_FMT;
-  a.getCell('F11').value = `Сальдо начальное на ${ru(cp.opening_date)}`;
+  a.getCell('F11').value = openingLabel(cp.opening_date);
   a.getCell('F11').font = { bold: true, size: 9 };
   a.getCell('G11').value = { formula: `'Журнал операций'!G9`, result: round2(cp.opening_balance) };
   a.getCell('G11').numFmt = MONEY_FMT;

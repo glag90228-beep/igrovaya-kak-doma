@@ -1482,8 +1482,8 @@ const api = {
     const first = `${docService.todayISO().slice(0, 7)}-01`;
     const from = iso(url.searchParams.get('from'), first);
     const to = iso(url.searchParams.get('to'), docService.todayISO());
-    const docs = bdb.docsBetween(user.id, from, to);
-    const buf = await buildRegistry({ org, docs, from, to });
+    const { docs, twins } = bdb.registryDocs(user.id, bdb.docsBetween(user.id, from, to));
+    const buf = await buildRegistry({ org, docs, from, to, twins });
     const file = {
       filename: `Реестр_${from}_${to}.xlsx`,
       buffer: Buffer.from(buf),

@@ -9,7 +9,7 @@
  * Отпуск разрешил / отпустил / груз принял оформлены как в бланке.
  */
 
-const { esc, ru, page, fxHtml, usnNote, formatMoney, formatPrice, amountInWords } = require('./doc-html');
+const { esc, ru, page, fxHtml, usnNote, isIp, isSelfEmployed, signRows, formatMoney, formatPrice, amountInWords } = require('./doc-html');
 const { round2, vatSplit, vatTotals, rateLabel } = require('./money');
 
 const LAND = `
@@ -46,7 +46,15 @@ function buildTorg12Html({ org, cp, doc }) {
   const gross = Boolean(doc.priceIncludesVat);
   const sums = vatTotals(items, rate, gross);
   const total = sums.total;
-  const places = items.reduce((s, it) => s + (Number(it.qty) || 0), 0);
+  /*
+   * «Всего мест» — это число грузовых мест (коробок, ящиков), а не сумма
+   * количеств. Раньше складывали qty всех позиций: «3 шт. + 1 услуга» давало
+   * «4 места», а 0,125 кг — «0.125 мест». Мест мы не знаем, поэтому печатаем
+   * строку только если число передали явно (doc.places).
+   */
+  const places = Number.isInteger(Number(doc.places)) && Number(doc.places) > 0 ? Number(doc.places) : 0;
+  const accountant = !isIp(org) && !isSelfEmployed(org);
+  const position = signRows(org)[0].title;
 
   const rows = items.map((it, i) => {
     const s1 = vatSplit(it, rate, gross);
@@ -107,8 +115,7 @@ function buildTorg12Html({ org, cp, doc }) {
     <p class="b">Всего наименований ${items.length},
        на сумму ${formatMoney(total)} руб.</p>
     <p class="b">${amountInWords(total)}.</p>
-    <p class="small">Всего мест: ${places} ${plural(places, 'место', 'места', 'мест')}.
-       Отпущено ${items.length} ${plural(items.length, 'наименование', 'наименования', 'наименований')}.</p>
+    <p class="small">${places ? `Всего мест: ${places} ${plural(places, 'место', 'места', 'мест')}. ` : ''}Отпущено ${items.length} ${plural(items.length, 'наименование', 'наименования', 'наименований')}.</p>
     ${rate == null ? usnNote(org)
       : `<p class="note">Сумма НДС по ставке ${esc(rateLabel(rate))} —
          ${formatMoney(sums.vat)} руб.${gross ? ' Цены пересчитаны из цен с налогом.' : ''}</p>`}
@@ -117,7 +124,9 @@ function buildTorg12Html({ org, cp, doc }) {
     <div class="foot">
       <div>
         <div class="row"><b>Отпуск груза разрешил</b>
-          <div class="line">${fxHtml(org.fx, { stamp: true, tight: true })}${esc(org.signer || '')}</div></div>
+          <div class="line">${fxHtml(org.fx, { stamp: true, tight: true })}${esc(position)}${org.signer ? `, ${esc(org.signer)}` : ''}</div></div>
+        ${accountant ? `<div class="row"><b>Главный (старший) бухгалтер</b>
+          <div class="line">подпись, расшифровка</div></div>` : ''}
         <div class="row"><b>Отпуск груза произвёл</b>
           <div class="line">должность, подпись, расшифровка</div></div>
         <div class="small">Дата отпуска: <b>${ru(doc.date)}</b></div>

@@ -23,6 +23,7 @@ const BROWN = 'FF2E3A8C';
 const CREAM = 'FFF4F6FC';
 const SAND = 'FFE3E8F8';
 const MONEY = '#,##0.00';
+const NOT_SALE = ['pp', 'akt', 'dog'];
 
 const ru = (iso) => {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
@@ -86,9 +87,12 @@ function splitOf(d) {
  * @param {Array}  p.docs документы (как отдаёт listDocs) с полем cpName
  * @param {string} p.from начало периода, ISO
  * @param {string} p.to   конец периода, ISO
+ * @param {number} [p.twins] сколько парных документов сделки не показано (для пометки)
  * @returns {Promise<Buffer>}
  */
-async function buildRegistry({ org, docs, from, to }) {
+async function buildRegistry({ org, docs: all, from, to, twins = 0 }) {
+  // Платёжка, договор и акт сверки — не продажа: их сумма не выручка, а оплаты у них нет.
+  const docs = (all || []).filter((d) => !NOT_SALE.includes(d.type));
   const wb = new ExcelJS.Workbook();
   wb.creator = 'Первичка';
   const s = wb.addWorksheet('Реестр', {
@@ -120,6 +124,13 @@ async function buildRegistry({ org, docs, from, to }) {
   s.mergeCells('A3:I3');
   s.getCell('A3').value = `Всего документов: ${docs.length}`;
   s.getCell('A3').font = { size: 10, color: { argb: 'FF5A6172' } };
+
+  if (twins > 0) {
+    s.mergeCells('A4:I4');
+    s.getCell('A4').value = `Счёт и акт (накладная) на одну сумму — одна сделка, учтена один раз: `
+      + `парных документов не показано — ${twins}.`;
+    s.getCell('A4').font = { size: 9, italic: true, color: { argb: 'FF5A6172' } };
+  }
 
   const HEAD = ['Дата', 'Документ', 'Номер', 'Контрагент',
     'Без НДС', 'НДС', 'Всего', 'Оплата', 'Дата оплаты'];
