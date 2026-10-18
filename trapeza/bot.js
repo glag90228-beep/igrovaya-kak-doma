@@ -2441,9 +2441,11 @@ async function mailDoc(tg, chatId, user, docId, emailOverride = null) {
 
   bdb.clearState(user.id);
   if (!res.ok) {
+    // Настоящая причина (адрес сервера, порт, код) — в журнал; человеку — одна понятная фраза.
     await tg.sendMessage(chatId,
-      `Не отправилось: ${esc(res.error)}\n\nПопробуйте ещё раз или пришлите файл вручную.`,
-      keyboard([[{ text: '↩️ К документу', data: `doc:${docId}` }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+      `${esc(mailer.failText(res))}\n\nПопробуйте ещё раз или пришлите файл вручную.`,
+      keyboard([[{ text: '⚙️ Настройки почты', data: 'mb' }],
+        [{ text: '↩️ К документу', data: `doc:${docId}` }], [{ text: '⬅️ Меню', data: 'menu' }]]));
     return;
   }
 
@@ -2543,7 +2545,7 @@ async function testMailbox(tg, chatId, user) {
   }, box.options);
   if (!res.ok) {
     await tg.sendMessage(chatId,
-      `Не получилось: ${esc(res.error)}\n\n`
+      `${esc(mailer.failText(res))}\n\n`
       + '<i>Чаще всего дело в пароле: у Яндекса и Mail.ru нужен не обычный '
       + 'пароль от почты, а отдельный «пароль приложения».</i>',
       keyboard([[{ text: '🔁 Ввести заново', data: 'mb.new' }], [{ text: '⬅️ Назад', data: 'mb' }]]));
@@ -4732,7 +4734,8 @@ async function sendReminderMail(tg, chatId, user, cpId, email, tone = 'biz') {
     attachments,
   }, box.options);
   if (!res.ok) {
-    await tg.sendMessage(chatId, `Не отправилось: ${esc(res.error)}`, mainMenu());
+    await tg.sendMessage(chatId, esc(mailer.failText(res)),
+      keyboard([[{ text: '⚙️ Настройки почты', data: 'mb' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
     return;
   }
   digest.logReminder(user.id, cp.id, { tone, via: 'mail' });

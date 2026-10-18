@@ -9155,6 +9155,33 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'снятие отметки возвращает оплату в свободные — деньги не пропадают', bal(cpY));
   }
 
+  console.log('\n── письмо не ушло: человеческим языком и кнопка «Настройки почты» (Д14) ──');
+  {
+    const bdbR = require('./lib/bot-db');
+    const dsR = require('./lib/doc-service');
+    const mailboxLib = require('./lib/mailbox');
+    const net = require('node:net');
+    const uid = fxUserId();
+    // Свободный порт, на котором никто не слушает: соединение будет отвергнуто.
+    const deadPort = await new Promise((res) => {
+      const srv = net.createServer().listen(0, '127.0.0.1', () => { const p = srv.address().port; srv.close(() => res(p)); });
+    });
+    const saved = await mailboxLib.save(uid, {
+      preset: 'custom', host: '127.0.0.1', port: deadPort, secure: false, pass: 'x', from: 'sender@mycompany.ru',
+    });
+    ok(saved.ok, 'ящик с недоступным сервером заведён для проверки', JSON.stringify(saved));
+    const cpM = bdbR.createCp(uid, { name: 'ООО «Почтовый»', kind: 'customer', email: 'buh@client.ru', opening_date: '2026-01-01' });
+    const made = await dsR.issueDocument(uid, { type: 'sch', cpId: cpM, skipQuota: true, items: [{ name: 'Обед', qty: 1, price: 1000 }] });
+    sent.length = 0;
+    await tap(`doc.mail:${made.doc.id}`);
+    const said = norm(sent.map((m) => m.text || '').join(' '));
+    ok(said.includes('Письмо не ушло: не удалось связаться с почтовым сервером'),
+      'Д14: «Письмо не ушло: не удалось связаться с почтовым сервером»', said.slice(0, 160));
+    ok(!/ECONN|127\.0\.0\.1|getaddrinfo|ENOTFOUND/.test(said), 'Д14: сырые коды и адреса человеку не показаны', said.slice(0, 200));
+    ok(Boolean(button('Настройки почты')), 'Д14: рядом кнопка «Настройки почты»');
+    mailboxLib.remove(uid);
+  }
+
   console.log('\n── общий браузер для PDF ──');
   const pdf = require('./lib/pdf');
   if (pdf.pdfAvailable()) {

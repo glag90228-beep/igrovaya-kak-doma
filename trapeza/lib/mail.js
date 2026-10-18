@@ -435,7 +435,49 @@ async function sendMail(letter, options = {}) {
   }
 }
 
+/**
+ * Что сказать человеку, когда письмо не ушло.
+ *
+ * Сырой текст ошибки — «Не соединиться с smtp.yandex.ru:465 — connect
+ * ECONNREFUSED 77.88.21.158:465» — человеку ничего не говорит, а адреса и
+ * порты сервера ему показывать незачем. Поэтому в сообщение идёт одна
+ * понятная причина, а подробности уходят в журнал сервера (там их ищет тот,
+ * кто чинит).
+ *
+ * @param {string} raw текст ошибки из sendMail
+ * @returns {{kind: string, text: string}} kind — connect | auth | tls | rcpt | address | config | other;
+ *   text — причина строчными буквами, без точки: «не удалось связаться с почтовым сервером»
+ */
+function humanError(raw) {
+  const t = String(raw || '');
+  if (/^Неправильный адрес/.test(t)) return { kind: 'address', text: t.charAt(0).toLowerCase() + t.slice(1) };
+  if (/не настроена|Не задан адрес отправителя/.test(t)) return { kind: 'config', text: 'почта не настроена' };
+  if (/Не соединиться|ECONN|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EPIPE|EPRIVATE|не отвечает|превышено время|закрыл соединение|внутренн/i.test(t)) {
+    return { kind: 'connect', text: 'не удалось связаться с почтовым сервером' };
+  }
+  if (/STARTTLS|TLS|SSL|certificate|сертификат/i.test(t)) {
+    return { kind: 'tls', text: 'не удалось установить защищённое соединение с почтовым сервером' };
+  }
+  if (/SMTP 5(34|35|30)|AUTH|парол|password|credentials|логин|не поддерживает вход/i.test(t)) {
+    return { kind: 'auth', text: 'почтовый сервер не принял логин или пароль' };
+  }
+  if (/SMTP 55\d|RCPT|recipient|mailbox/i.test(t)) {
+    return { kind: 'rcpt', text: 'почтовый сервер не принял адрес получателя' };
+  }
+  return { kind: 'other', text: 'почтовый сервер отклонил письмо' };
+}
+
+/**
+ * Готовая фраза для человека — и запись настоящей причины в журнал сервера.
+ * `Письмо не ушло: не удалось связаться с почтовым сервером.`
+ */
+function failText(res, what = 'Письмо не ушло') {
+  console.error('отправка почты:', res && res.error);
+  return `${what}: ${humanError(res && res.error).text}.`;
+}
+
 module.exports = {
+  humanError, failText,
   sendMail, buildMessage, mailAvailable, mailHint, validEmail,
   encodeHeader, encodeFilename, dotStuff, cfg, isPrivateIp, guardedTarget,
 };

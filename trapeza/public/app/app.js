@@ -93,17 +93,44 @@ function haptic(kind = 'light') {
 }
 
 let toastTimer = 0;
-function toast(text, isError = false, ms = 0) {
+/**
+ * Всплывающая подсказка. Необязательное действие — кнопка под текстом
+ * («Настройки почты»): по одному тексту ошибки человек не знает, куда идти.
+ * С кнопкой подсказка висит дольше — её надо успеть нажать.
+ */
+function toast(text, isError = false, ms = 0, action = null) {
   const box = document.getElementById('toast');
   box.textContent = text;
-  box.className = `toast${isError ? ' err' : ''}`;
+  box.className = `toast${isError ? ' err' : ''}${action ? ' has-act' : ''}`;
+  if (action) {
+    box.append(h('button', {
+      class: 'toast-act', type: 'button',
+      onclick: () => { box.classList.remove('show'); box.hidden = true; action.onclick(); },
+    }, action.label));
+  }
   box.hidden = false;
   requestAnimationFrame(() => box.classList.add('show'));
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
     box.classList.remove('show');
     setTimeout(() => { box.hidden = true; }, 200);
-  }, ms || (isError ? 5000 : 3000));
+  }, ms || (action ? 9000 : (isError ? 5000 : 3000)));
+}
+
+/** Ошибка запроса — подсказкой; у письма, которое не ушло, рядом кнопка в настройки почты. */
+function toastError(e) {
+  // Нет реквизитов своей организации (любая выписка без них) — ведём их заполнять, а не оставляем с красной строкой.
+  if (e && e.payload && e.payload.reason === 'org' && current().name !== 'org') {
+    toast('Сначала заполните реквизиты своей организации', true);
+    go('org');
+    return;
+  }
+  // На самом экране настроек почты кнопка «Настройки почты» была бы ссылкой на себя.
+  if (e && e.payload && e.payload.reason === 'mail' && current().name !== 'mail') {
+    toast(e.message, true, 0, { label: 'Настройки почты', onclick: () => go('mail') });
+  } else {
+    toast(e.message, true);
+  }
 }
 
 // ---------- обращения к серверу ----------
@@ -157,7 +184,7 @@ async function withBusy(btn, fn) {
   try {
     return await fn();
   } catch (e) {
-    toast(e.message, true);
+    toastError(e);
     return undefined;
   } finally {
     btn.disabled = false;

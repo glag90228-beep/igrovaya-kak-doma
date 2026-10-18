@@ -971,6 +971,14 @@ body.drawer-open { overflow: hidden; }
 .toast[hidden] { display: none; }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .toast.err { background: #8c2b23; }
+/* Подсказка с кнопкой: её надо нажимать, поэтому она принимает касания. */
+.toast.has-act { pointer-events: auto; }
+.toast-act {
+  display: block; width: 100%; margin-top: 8px; min-height: var(--tap);
+  border: 0; border-radius: var(--r-field);
+  background: rgba(255, 255, 255, .18); color: #fff;
+  font: 600 15px/1 var(--font); cursor: pointer;
+}
 
 /* Цена в строке тарифа: крупнее обычного текста, но не как сальдо —
    выбирают между двумя числами, и их надо сравнить одним взглядом. */

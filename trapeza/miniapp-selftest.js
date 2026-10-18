@@ -2167,12 +2167,30 @@ async function main() {
       'проверочное письмо уходит по кнопке', r.status === 200 ? r.json.sent : (r.json || {}).error);
     ok(got.rcpt.includes('buh@mycompany.ru'), 'и приходит на свой же адрес', got.rcpt.join());
 
+    /*
+     * Д14: почтовый сервер перестал отвечать. Человек должен прочитать
+     * «Письмо не ушло: не удалось связаться с почтовым сервером», а не
+     * «Не соединиться с 127.0.0.1:… — connect ECONNREFUSED …».
+     */
+    smtp.close();
+    const rawErr = /ECONN|ENOTFOUND|127\.0\.0\.1|getaddrinfo|Не соединиться/;
+    r = await call('POST', '/api/reminder/mail', {
+      user: masha, body: { cpId: debt.cpId, email: 'buh@dolzhnik.ru', text: debt.text },
+    });
+    ok(r.status === 400 && r.json.error === 'Письмо не ушло: не удалось связаться с почтовым сервером.' && r.json.reason === 'mail',
+      'Д14: напоминание — понятная причина и признак reason=mail', JSON.stringify(r.json));
+    ok(!rawErr.test(JSON.stringify(r.json)), 'Д14: сырых кодов и адресов сервера в ответе нет');
+    r = await call('POST', '/api/doc/mail', { user: masha, body: { id: someDoc.id, email: 'buh@zarya.ru' } });
+    ok(r.status === 400 && /^Письмо не ушло: не удалось связаться/.test(r.json.error) && r.json.reason === 'mail',
+      'Д14: документ на почту — то же', (r.json || {}).error);
+    r = await call('POST', '/api/mailbox/test', { user: masha });
+    ok(r.status === 400 && /^Письмо не ушло: не удалось связаться/.test(r.json.error) && !rawErr.test(r.json.error),
+      'Д14: проверочное письмо — то же', (r.json || {}).error);
+
     r = await call('POST', '/api/mailbox/delete', { user: masha });
     ok(r.status === 200, 'ящик можно отключить');
     r = await call('GET', '/api/state', { user: masha });
     ok(r.json.mailbox === null, 'после отключения ящика нет');
-
-    smtp.close();
   }
 
   section('подпись и печать');

@@ -1000,6 +1000,33 @@ const ok = (c, m, extra) => {
     return { page: pg, close: () => c.close() };
   };
 
+  console.log('\n── письмо не ушло: понятная причина и «Настройки почты» (Д14) ──');
+  {
+    forgetRate();
+    const mailboxLib = require(path.join(APP, 'lib/mailbox'));
+    const net = require('node:net');
+    process.env.MAIL_KEY = process.env.MAIL_KEY || 'app-selftest-key';
+    process.env.MAIL_ALLOW_LOCAL = '1';
+    const deadPort = await new Promise((res) => {
+      const srv = net.createServer().listen(0, '127.0.0.1', () => { const pt = srv.address().port; srv.close(() => res(pt)); });
+    });
+    const saved = await mailboxLib.save(user.id, { preset: 'custom', host: '127.0.0.1', port: deadPort, secure: false, pass: 'x', from: 'me@mycompany.ru' });
+    ok(saved.ok, 'ящик с недоступным сервером заведён', JSON.stringify(saved));
+    await page.evaluate(() => window.__go('reminders', {}));
+    await page.waitForSelector('textarea.remind-text', { timeout: 5000 });
+    await page.fill('input[type=email]', 'buh@dolzhnik.ru');
+    await page.getByRole('button', { name: 'Отправить с моей почты' }).first().tap();
+    await page.waitForSelector('.toast-act', { timeout: 8000 });
+    const tt = (await page.locator('#toast').innerText()).replace(/\s/g, ' ');
+    ok(tt.includes('Письмо не ушло: не удалось связаться с почтовым сервером'), 'Д14: «Письмо не ушло: не удалось связаться с почтовым сервером»', tt);
+    ok(!/ECONN|127\.0\.0\.1|ENOTFOUND/.test(tt), 'Д14: сырых кодов и адресов в сообщении нет', tt);
+    ok(await page.evaluate(() => document.querySelector('.toast-act').getBoundingClientRect().height >= 44), 'кнопка в сообщении ≥ 44 px');
+    await page.locator('.toast-act').tap();
+    await page.waitForSelector('#app .screen', { timeout: 5000 });
+    ok((await page.locator('#topbar').innerText()).includes('Почта'), '«Настройки почты» ведёт на экран почты');
+    mailboxLib.remove(user.id);
+  }
+
   console.log('\n── вход с обычного сайта, без Telegram ──');
   {
     const webAuth = require(path.join(APP, 'lib/web-auth'));

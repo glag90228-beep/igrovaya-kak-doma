@@ -1035,7 +1035,7 @@ const api = {
         filename: built.file.filename, content: built.file.buffer, contentType: built.file.mime,
       }],
     }, box.options);
-    if (!res.ok) return { error: `Не отправилось: ${res.error}` };
+    if (!res.ok) return { error: mailer.failText(res), reason: 'mail' };
 
     if (to !== cp.email) bdb.updateCp(user.id, cp.id, { email: to });
     return { sent: to, remembered: to !== cp.email };
@@ -1202,7 +1202,7 @@ const api = {
       text: 'Это проверочное письмо от «Первички». Если вы его видите, '
         + 'отправка документов клиентам настроена верно.',
     }, box.options);
-    if (!res.ok) return { error: res.error };
+    if (!res.ok) return { error: mailer.failText(res), reason: 'mail' };
     mailbox.markChecked(user.id);
     return { sent: box.options.from, mailbox: mailbox.info(user.id) };
   },
@@ -1674,7 +1674,7 @@ const api = {
       text,
       attachments,
     }, box.options);
-    if (!res.ok) return { error: `Не отправилось: ${res.error}` };
+    if (!res.ok) return { error: mailer.failText(res), reason: 'mail' };
 
     if (to !== cp.email) bdb.updateCp(user.id, cp.id, { email: to });
     return {
@@ -2029,9 +2029,15 @@ const api = {
       text: 'Это проверочное письмо. Если вы его видите, отправка документов настроена верно.',
     }, box.options);
     if (!res.ok) {
+      // Подробности — в журнал; человеку — причина без адресов и портов.
+      const why = mailer.humanError(res.error);
+      console.error('проверка почты при подключении:', res.error);
       return {
-        error: `Пароль не принят: ${res.error}. У Яндекса и Mail.ru нужен «пароль приложения», а не обычный.`,
+        error: why.kind === 'auth'
+          ? 'Пароль не принят. У Яндекса и Mail.ru нужен «пароль приложения», а не обычный.'
+          : `Письмо не ушло: ${why.text}. Ящик сохранён: проверьте сервер и пароль, потом отправьте проверочное письмо ещё раз.`,
         saved: true,
+        reason: 'mail',
       };
     }
     mailbox.markChecked(user.id);
