@@ -12,6 +12,8 @@
  *   node ai-eval.js --holdout [1|2]  только «отложенные» фразы (написаны после правил, на них честно)
  *   node ai-eval.js --tuned          только фразы, на которых правила настраивались
  *   node ai-eval.js --json           итог одним JSON — для сравнения «до/после»
+ *   node ai-eval.js --check          быстрая проверка порогов FLOOR без ИИ: тихо, если всё в порядке,
+ *                                    иначе полный отчёт и код 1 (это и гоняет `npm test`)
  *
  * Зачем он нужен. Разбор фразы — единственное место, где ошибка превращается
  * не в «не понял», а в неверный документ: сумма, клиент, вид бумаги. Пока
@@ -360,7 +362,7 @@ function print(res, { misses = 40, ai } = {}) {
     const p = res.predicted[k] || { n: 0, ok: 0 };
     console.log(`  ${pad(k + (b.wired ? '' : '*'), 11)} ${lpad(b.n, 4)} ${lpad(b.ok, 4)} ${fmtPct(pct(b.ok, b.n))}   выдано ${lpad(p.n, 3)}, верно ${lpad(p.ok, 3)} ${fmtPct(pct(p.ok, p.n))}`);
   }
-  console.log('  * экрана в боте пока нет: в «намерение верно» не входят');
+  if (order.some((k) => !res.byIntent[k].wired)) console.log('  * экрана в боте пока нет: в «намерение верно» не входят');
 
   console.log('\nПо полям (сколько раз поле ожидалось / сколько раз верно)');
   for (const k of Object.keys(res.fields).sort()) {
@@ -386,6 +388,16 @@ function print(res, { misses = 40, ai } = {}) {
     console.log(`    вышло:  ${fmtGot(ai, cps, r)}${r.source === 'model' ? '   [ответила модель]' : ''}`);
   }
   console.log('');
+}
+
+/** Что из порогов FLOOR не выполнено: пусто — всё в порядке. */
+function belowFloor(res) {
+  const out = [];
+  for (const [name, label] of [['intent', 'намерение'], ['full', 'безупречно'], ['sum', 'сумма'], ['client', 'клиент']]) {
+    if (res[name] < FLOOR[name]) out.push(`${label} ${res[name]}% < ${FLOOR[name]}%`);
+  }
+  if (res.dangerPhrases > FLOOR.dangerMax) out.push(`опасных ошибок ${res.dangerPhrases} (допустимо ${FLOOR.dangerMax})`);
+  return out;
 }
 
 // ---------- запуск из командной строки ----------
@@ -422,7 +434,19 @@ async function main(argv) {
   const hi = argv.indexOf('--holdout');
   const holdout = hi >= 0 ? (/^\d$/.test(argv[hi + 1] || '') ? Number(argv[hi + 1]) : true) : (argv.includes('--tuned') ? false : undefined);
   const res = await evaluate({ mode, ai, intent: arg('--intent'), tag: arg('--tag'), holdout });
-  if (argv.includes('--json')) {
+  if (argv.includes('--check')) {
+    // Пороги FLOOR заданы для правил; у модели свои цифры и своё место — `--ai`.
+    if (mode !== 'rules') { console.error('--check проверяет только правила, без модели.'); process.exit(2); }
+    const fails = belowFloor(res);
+    if (!fails.length) {
+      console.log(`Разбор фраз (правила, без ИИ): ${res.n} фраз, намерение ${res.intent}%, `
+        + `безупречно ${res.full}%, сумма ${res.sum}%, клиент ${res.client}%, опасных ошибок ${res.dangerPhrases} ✅`);
+    } else {
+      print(res, { misses: 40, ai });
+      console.log(`❌ Ниже порога: ${fails.join('; ')}`);
+      process.exitCode = 1;
+    }
+  } else if (argv.includes('--json')) {
     const { rows, ...rest } = res;
     console.log(JSON.stringify(rest, null, 1));
   } else {
@@ -433,7 +457,7 @@ async function main(argv) {
   }
 }
 
-module.exports = { evaluate, scorePhrase, sameName, FLOOR, loadPhrases };
+module.exports = { evaluate, scorePhrase, sameName, belowFloor, FLOOR, loadPhrases };
 
 if (require.main === module) {
   main(process.argv.slice(2)).catch((e) => { console.error(e); process.exit(1); });
