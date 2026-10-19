@@ -67,6 +67,37 @@ const money = (n) => `${rub.format(Number(n) || 0)} ₽`;
 /* В сводке копейки только мешают: там важен порядок суммы, а точность
    до копейки нужна в документе, и там она есть. */
 const rub0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
+/*
+ * Деньги в целых копейках — так же, как на сервере (lib/money.js).
+ *
+ * Подпись «Выписать на …» обязана совпасть с суммой документа до копейки.
+ * Умножение дробных в двойной точности и округление «на глаз» расходились с
+ * сервером: 1,5 × 99,99 здесь было 149,98, а в документе 149,99. Поэтому число
+ * раскладываем по его десятичной записи и считаем целыми (BigInt).
+ */
+function decimalOf(x) {
+  const v = Number(x);
+  if (!Number.isFinite(v)) return { m: 0n, s: 0 };
+  const [mant, exp] = String(v).toLowerCase().split('e');
+  const neg = mant.startsWith('-');
+  const [i, f = ''] = mant.replace('-', '').split('.');
+  let m = BigInt(i + f);
+  let sc = f.length - (exp ? Number(exp) : 0);
+  if (sc < 0) { m *= 10n ** BigInt(-sc); sc = 0; }
+  return { m: neg ? -m : m, s: sc };
+}
+/** Деление целых с округлением «половина от нуля»; d > 0. */
+function divRound(n, d) {
+  const a = n < 0n ? -n : n;
+  const q = (2n * a + d) / (2n * d);
+  return n < 0n ? -q : q;
+}
+/** Количество × цена в целых копейках. */
+function lineCents(qty, price) {
+  const a = decimalOf(qty); const b = decimalOf(price);
+  return divRound(a.m * b.m * 100n, 10n ** BigInt(a.s + b.s));
+}
+
 const money0 = (n) => `${rub0.format(Math.round(Number(n) || 0))} ₽`;
 const ru = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(iso || '')
   ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : (iso || ''));
@@ -118,6 +149,15 @@ function toast(text, isError = false, ms = 0, action = null) {
 }
 
 /** Ошибка запроса — подсказкой; у письма, которое не ушло, рядом кнопка в настройки почты. */
+/**
+ * Переспросить перед необратимым. В Telegram — родное окно мессенджера,
+ * в браузере — обычный confirm. Возвращает true, если человек согласился.
+ */
+function askSure(text) {
+  if (tg && tg.showConfirm) return new Promise((done) => tg.showConfirm(text, (ok) => done(Boolean(ok))));
+  return Promise.resolve(window.confirm(text));
+}
+
 function toastError(e) {
   // Нет реквизитов своей организации (любая выписка без них) — ведём их заполнять, а не оставляем с красной строкой.
   if (e && e.payload && e.payload.reason === 'org' && current().name !== 'org') {
@@ -206,7 +246,7 @@ const TABS = [
    * искал и не находил — они жили в карточке клиента. Долги не пропали: они
    * первой строкой на вкладке «Ещё» и под суммой на главной.
    */
-  { name: 'crm', label: 'CRM', icon: 'bell' },
+  { name: 'crm', label: 'Дела', icon: 'bell' },
   { name: 'more', label: 'Ещё', icon: 'more' },
 ];
 
@@ -337,7 +377,7 @@ function paintCrmBadge() {
   const btn = tabsBox.querySelector('[data-name="crm"]');
   if (btn) {
     btn.setAttribute('aria-label', crmDue
-      ? `CRM, ${crmDue} ${plural(crmDue, 'напоминание', 'напоминания', 'напоминаний')} на сегодня и раньше` : 'CRM');
+      ? `Дела, ${crmDue} ${plural(crmDue, 'напоминание', 'напоминания', 'напоминаний')} на сегодня и раньше` : 'Дела');
   }
 }
 
@@ -354,12 +394,15 @@ async function refreshCrmBadge(force) {
   try { noteFollowups((await api('GET', '/api/crm/followups')).followups); } catch (_) { /* счётчик не критичен */ }
 }
 
+// Значок строки ленты клиента: сервер отдаёт эмодзи (их же читает бот), приложению нужен значок из набора.
+const TL_ICON = { '✅': 'check', '📄': 'doc', '💰': 'wallet', '✉️': 'mail', '📝': 'pen' };
+
 // Заголовок шапки для экранов, которых нет во вкладках.
 const TITLES = {
   cp: 'Клиент', op: 'Операция', doc: 'Документ', new: 'Новый документ',
-  inbox: 'Почта', letter: 'Письмо', mail: 'Почта', bank: 'Банк', org: 'Организация',
-  billing: 'Тариф', support: 'Поддержка', help: 'Помощь', ask: 'Помощник',
-  recurring: 'По расписанию', reminders: 'Напомнить о долге', unpaid: 'Не оплачено',
+  inbox: 'Почта', letter: 'Письмо', mail: 'Почта', bank: 'Банк', org: 'Моя организация',
+  billing: 'Подписка', support: 'Поддержка', help: 'Помощь', ask: 'Помощник',
+  recurring: 'По расписанию', reminders: 'Напомнить о долге', unpaid: 'Ждут оплаты',
   debts: 'Долги', monthact: 'Акт за месяц', cheques: 'Чеки «Мой налог»',
 };
 
@@ -577,7 +620,7 @@ const balanceTone = (cp) => (!cp.balance ? '' : (owesUs(cp) ? 'in' : 'out'));
 function deletedText(d, r) {
   const head = `${d.title} № ${d.number} удалён`;
   if (r && Number(r.delta)) return `${head}. Долг изменился на ${money(Math.abs(r.delta))}`;
-  return `${head}. Сальдо клиента не изменилось — проводки у него не было`;
+  return `${head}. Баланс клиента не изменился — записи в журнале у него не было`;
 }
 
 function navRow(opts) {
@@ -591,6 +634,9 @@ function navRow(opts) {
     opts.right && h('span', { class: `money nowrap ${opts.rightTone || ''}`, text: opts.right }),
     icon('chev', 'chev'));
 }
+
+/** «№ 2» без разрыва: номер не должен оторваться от знака и уехать на другую строку. */
+const nb = (t) => String(t == null ? '' : t).replace(/№ /g, '№\u00A0');
 
 /** «02.09» — день и месяц. Год в строке списка лишний: он и так понятен. */
 const dm = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(iso || '') ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}` : (iso || ''));
@@ -613,7 +659,7 @@ function docRow(d, opts = {}) {
     h('span', { class: `icon-box ${opts.tone || ''}` }, icon(opts.icon || 'doc')),
     h('span', { class: 'grow' },
       h('div', { class: 'ellipsis', text: who || `${d.title} № ${d.number}` }),
-      h('div', { class: 'small muted doc-sub', text: sub || ru(d.date) }),
+      h('div', { class: 'small muted doc-sub', text: nb(sub || ru(d.date)) }),
       opts.badge && h('div', { class: 'sub-line' }, h('span', { class: `badge ${opts.badgeTone || ''}`, text: opts.badge }))),
     icon('chev', 'chev'));
 }
@@ -733,9 +779,10 @@ screens.home = async function home() {
     // Янтарный, а не зелёный: зелёный в этом приложении значит «деньги
     // получены». Ожидание оплаты — не получение.
     lead
-      ? h('div', { class: 'sub wait' }, unpaid.count
-        ? `⏱ ждут оплаты · ${unpaid.count} ${plural(unpaid.count, 'счёт', 'счёта', 'счетов')} →`
-        : `⏱ должны вам · ${s.counts.debtors} ${plural(s.counts.debtors, 'контрагент', 'контрагента', 'контрагентов')} →`)
+      ? h('div', { class: 'sub wait' }, icon('clock', 'icon inline'), unpaid.count
+        ? `ждут оплаты · ${unpaid.count} ${plural(unpaid.count, 'счёт', 'счёта', 'счетов')}`
+        : `должны вам · ${s.counts.debtors} ${plural(s.counts.debtors, 'клиент', 'клиента', 'клиентов')}`,
+      icon('chev', 'icon inline'))
       : h('div', { class: 'sub', text: 'все рассчитались' }),
     /*
      * Отдельной ссылки «Из чего эта сумма» здесь больше нет.
@@ -772,7 +819,7 @@ screens.home = async function home() {
   const greetRow = h('div', { class: 'greet-row' },
     h('span', { class: 'greet ellipsis', text: greetName(s.user.name) }),
     h('span', { class: `badge ${q0.paid ? 'ok' : ''}`,
-      text: q0.paid ? 'подписка' : `${q0.left ?? 0}/${q0.limit ?? 0} бесплатно` }));
+      text: q0.paid ? 'подписка' : `осталось ${q0.left ?? 0} из ${q0.limit ?? 0}` }));
 
   /*
    * Неполные реквизиты — сверху, до суммы: это единственное, что мешает
@@ -859,7 +906,7 @@ screens.home = async function home() {
   const askRow = h('button', { class: 'prompt' },
     h('span', { class: 'icon-box' }, icon('mic')),
     h('span', { class: 'grow' },
-      h('div', { text: 'Голос или текст' }),
+      h('div', { text: 'Помощник: голос или текст' }),
       h('div', { class: 'small muted ellipsis', text: '«Счёт Заре на 51 000 за банкет»' })),
     h('span', { class: 'prompt-go' }, icon('chev')));
   askRow.onclick = () => { haptic(); go('ask'); };
@@ -923,7 +970,7 @@ screens.home = async function home() {
       h('div', { class: 'card' }, followupRows(fuNow.slice(0, 5), () => render(), true)));
   }
   box.append(h('div', { class: 'card' }, navRow({
-    icon: 'bell', title: 'CRM: напоминания и заметки',
+    icon: 'bell', title: 'Дела: напоминания и заметки',
     sub: fuAll.followups.length
       ? `${fuAll.followups.length} ${plural(fuAll.followups.length, 'напоминание', 'напоминания', 'напоминаний')} · заметки по клиентам`
       : 'заметки по клиентам, «напомнить мне»',
@@ -935,11 +982,11 @@ screens.home = async function home() {
   // Счёт уехал в главное действие наверху — в плитках он был бы вторым
   // приглашением к тому же и размывал бы выбор.
   const types = [
-    ['usl', 'doc-check', 'Акт услуг', 'закрывающий документ'],
+    ['usl', 'doc-check', 'Акт услуг', 'подтверждает, что работа сделана'],
     ['schdog', 'pen', 'Счёт-договор', 'заменяет договор'],
-    ['upd', 'docs2', 'УПД', 'счёт-фактура и акт'],
+    ['upd', 'docs2', 'УПД', 'счёт-фактура и накладная в одном'],
     ['torg12', 'box', 'ТОРГ-12', 'накладная на товар'],
-    ['pp', 'wallet', 'Платёжка', 'форма 0401060 для банка'],
+    ['pp', 'wallet', 'Платёжка', 'платёжное поручение для банка'],
     ['dog', 'pen', 'Договор', 'условия на бумаге'],
   // Самозанятому УПД не предлагаем: счёт-фактуру он выставлять не вправе (422-ФЗ).
   ].filter(([type]) => !(type === 'upd' && Number((s.org || {}).npd)));
@@ -959,10 +1006,11 @@ screens.home = async function home() {
     navRow({
       icon: q.paid ? 'star' : 'clock',
       tone: q.paid ? 'ok' : '',
-      title: q.paid ? 'Подписка активна' : `Осталось ${q.left} ${plural(q.left, 'документ', 'документа', 'документов')}`,
+      // Везде одна формула: «Осталось N из M» — остаток, а не то, сколько уже потрачено.
+      title: q.paid ? 'Подписка активна' : `Осталось ${q.left} из ${q.limit}`,
       sub: q.paid
         ? (s.access.until ? `действует до ${ru(s.access.until)}` : 'без ограничений')
-        : `${q.used} из ${q.limit} в этом месяце`,
+        : 'бесплатных документов в этом месяце',
       onclick: () => go('billing'),
     })));
 
@@ -1060,7 +1108,7 @@ screens.why = async function why() {
   }
 
   const parts = [
-    ['Начальное сальдо', b.opening, 'долг, который был до бота — из карточек контрагентов', 'cps'],
+    ['Долг на начало', b.opening, 'долг, который был до Первички — из карточек клиентов', 'cps'],
     ['Документы', b.docs, 'акты, УПД, накладные и счета — уходит вместе с документом', 'docs'],
     ['Внесено руками', b.manual, 'операции из журнала и банковской выписки', 'debts'],
   ].filter(([, v]) => v);
@@ -1078,8 +1126,8 @@ screens.why = async function why() {
 
     // Слово «удалил» звучит в каждой жалобе, поэтому объясняем именно его.
     box.append(h('div', { class: 'card' }, h('div', { class: 'row muted small' },
-      'Удаление документа снимает только его строку. Начальное сальдо правится '
-      + 'в карточке контрагента, ручные операции — в журнале.')));
+      'Удаление документа снимает только его строку. Долг на начало правится '
+      + 'в карточке клиента, ручные операции — в журнале.')));
   }
 
   if (lost) {
@@ -1532,8 +1580,10 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
     // «Оплачено» предлагаем только тогда, когда оплата отмечена в журнале.
     // Штамп — это утверждение о деньгах, и придумывать его нельзя.
     if (d.paidAt) chips.unshift(chip('paid', `Оплачено ${ru(d.paidAt)}`));
-    box.append(h('div', { class: 'section-title', text: 'Штамп на копии' }));
+    box.append(h('div', { class: 'section-title', text: 'Надпись на файле' }));
     box.append(h('div', { class: 'chips' }, chips));
+    box.append(h('p', { class: 'small muted', style: 'margin:-4px 18px 8px',
+      text: 'Отметьте — и надпись («Копия», «Оплачено») появится на файле, который вы пришлёте или отправите клиенту.' }));
     if (!d.paidAt && ['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) && d.total) {
       box.append(h('p', {
         class: 'small muted',
@@ -1635,7 +1685,7 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
         haptic('medium');
         download(r.file);
       }),
-    }, 'Прислать файл заново')));
+    }, 'Прислать файл заново в чат с ботом')));
 
   /*
    * Исправление — только у счёта-фактуры (УПД со статусом 1).
@@ -1675,7 +1725,7 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
     const cp = cpOf || {};
     const mailField = field('email', 'Почта получателя', cp.email, {
       type: 'email', placeholder: 'buh@company.ru',
-      hint: cp.email ? 'Сохранена у контрагента' : 'Запомню её для этого контрагента',
+      hint: cp.email ? 'Сохранена у клиента' : 'Запомню её для этого клиента',
     });
     box.append(h('div', { class: 'section-title', text: 'Отправить клиенту' }));
     if (d.type === 'akt') {
@@ -1821,7 +1871,7 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
           + '«Всё верно», «Поправить» или «Пропустить сегодня».' }),
       weekPanel, monthPanel);
 
-    const repeat = h('button', { class: 'btn ghost', id: 'rec-open' }, 'Повторять по расписанию');
+    const repeat = h('button', { class: 'btn secondary', id: 'rec-open' }, icon('repeat', 'icon inline'), 'Повторять по расписанию');
     repeat.onclick = () => {
       outer.hidden = !outer.hidden;
       haptic();
@@ -1845,8 +1895,8 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
     });
     del.replaceWith(h('div', {},
       h('p', { class: 'small muted', style: 'margin:0 6px 10px', text: d.debt
-        ? `Документ исчезнет из журнала вместе со своей проводкой: долг клиента изменится на ${money(Math.abs(d.debt))}.`
-        : 'Документ исчезнет из журнала. Проводки у него нет — сальдо клиента не изменится.' }),
+        ? `Документ исчезнет из журнала вместе со своей записью в журнале: долг клиента изменится на ${money(Math.abs(d.debt))}.`
+        : 'Документ исчезнет из журнала. Записи в журнале у него нет — баланс клиента не изменится.' }),
       sure));
   };
   box.append(h('div', { class: 'btn-wrap' }, del));
@@ -1874,7 +1924,7 @@ function followupRows(list, after, withCp) {
     return h('div', { class: 'row fu-row' },
       h('span', { class: `icon-box ${late ? 'warn' : ''}` }, icon('clock')),
       h('span', { class: 'grow' },
-        h('div', { text: f.text }),
+        h('div', { text: nb(f.text) }),
         h('div', { class: `small ${late ? 'fu-late' : 'muted'}`,
           text: `${late ? 'просрочено · ' : (f.today ? 'сегодня · ' : '')}${ru(f.due)}${withCp && f.cpName ? ` · ${f.cpName}` : ''}` }),
         h('div', { class: 'fu-btns' },
@@ -1905,17 +1955,17 @@ function crmBlock(cpId) {
     }, label)));
     const feed = items.length
       ? items.map((it) => h('div', { class: 'row tl-row' },
-        h('span', { class: 'tl-ico', text: it.icon }),
+        h('span', { class: 'tl-ico' }, icon(TL_ICON[it.icon] || 'doc', 'icon inline')),
         h('span', { class: 'grow' },
-          h('div', { text: it.text }),
+          h('div', { text: nb(it.text) }),
           h('div', { class: 'small muted', text: ru(String(it.at).slice(0, 10)) }))))
       : [h('div', { class: 'row muted', text: 'Пока пусто: документы, оплаты и заметки появятся здесь' })];
     wrap.replaceChildren(
       h('div', { class: 'section-title', text: 'История клиента' }),
       h('div', { class: 'card crm-form' },
-        h('div', { class: 'field' }, h('label', { for: 'crm-note', text: '📝 Заметка' }), note,
+        h('div', { class: 'field' }, h('label', { for: 'crm-note' }, icon('pen', 'icon inline'), 'Заметка'), note,
           h('button', { class: 'btn secondary', onclick: saveNote }, 'Сохранить заметку')),
-        h('div', { class: 'field' }, h('label', { for: 'crm-fu-text', text: '⏰ Напомнить мне' }), fuText, fuBtns)),
+        h('div', { class: 'field' }, h('label', { for: 'crm-fu-text' }, icon('bell', 'icon inline'), 'Напомнить мне'), fuText, fuBtns)),
       followups.length ? h('div', { class: 'card' }, followupRows(followups, draw, false)) : null,
       h('div', { class: 'card' }, feed));
   };
@@ -1941,7 +1991,7 @@ screens.crm = async function crmScreen() {
     api('GET', '/api/cps').catch(() => ({ cps: [] })),
   ]);
   noteFollowups(fu.followups);
-  const box = h('div', {}, h('h1', { text: 'CRM' }));
+  const box = h('div', {}, h('h1', { text: 'Дела' }));
   const list = cpsRes.cps;
   const redraw = () => render();
 
@@ -1986,7 +2036,7 @@ screens.crm = async function crmScreen() {
         ? 'Нажмите «+ Напоминание», выберите клиента, напишите, о чём напомнить, и укажите срок. В этот день бот напишет вам сам.'
         : 'Сначала добавьте клиента — потом к нему можно привязать напоминание и заметки.',
       list.length ? null : h('div', { class: 'btn-wrap' },
-        h('button', { class: 'btn', onclick: () => go('cp', {}) }, 'Добавить контрагента'))));
+        h('button', { class: 'btn', onclick: () => go('cp', {}) }, 'Добавить клиента'))));
   }
   for (const [title, rows] of groups) {
     if (!rows.length) continue;
@@ -2020,8 +2070,8 @@ screens.monthact = async function monthActScreen({ cpId, ym }) {
   const r = await api('GET', `/api/month-act?cpId=${cpId}`);
   const box = h('div', {}, h('h1', { text: 'Акт за месяц' }));
   box.append(h('p', { class: 'small muted', style: 'margin:0 18px 8px',
-    text: `${r.cp.name}. Один акт услуг на накладные и УПД за месяц, которые ещё не вошли в акт. `
-      + 'Акт закрывающий: новый долг он не создаёт — сумма уже учтена накладными.' }));
+    text: `${String(r.cp.name).replace(/\.$/, '')}. Один акт услуг на все накладные и УПД за месяц, по которым акта ещё не было. `
+      + 'Он подтверждает месяц целиком, поэтому нового долга не создаёт: сумма уже учтена по накладным.' }));
 
   // Открываем тот месяц, что просили; иначе — первый, где есть что оформлять.
   let cur = r.months.find((m) => m.ym === ym) || r.months.find((m) => m.docs.length) || r.months[0];
@@ -2086,7 +2136,7 @@ screens.monthact = async function monthActScreen({ cpId, ym }) {
 
 screens.cps = async function cps() {
   const { cps: list } = await api('GET', '/api/cps');
-  const box = h('div', {}, h('h1', { text: 'Контрагенты' }));
+  const box = h('div', {}, h('h1', { text: 'Клиенты' }));
   // Сами напоминания переехали на вкладку CRM; здесь остаётся короткая
   // дорожка к ним — в список заходят, в том числе, чтобы вспомнить, кому позвонить.
   const fu = await api('GET', '/api/crm/followups').catch(() => ({ followups: [] }));
@@ -2096,7 +2146,7 @@ screens.cps = async function cps() {
     box.append(h('div', { class: 'card' }, navRow({
       icon: 'bell', tone: hot ? 'warn' : '',
       title: `${fu.followups.length} ${plural(fu.followups.length, 'напоминание', 'напоминания', 'напоминаний')}`,
-      sub: hot ? `${hot} — срок сегодня или уже прошёл` : 'ближайшие — на вкладке CRM',
+      sub: hot ? `${hot} — срок сегодня или уже прошёл` : 'ближайшие — на вкладке «Дела»',
       onclick: () => reset('crm'),
     })));
   }
@@ -2104,7 +2154,7 @@ screens.cps = async function cps() {
   if (!list.length) {
     box.append(empty('users', 'Пока никого нет',
       'Добавьте заказчика или поставщика — реквизиты подставятся в документы автоматически.',
-      h('div', { class: 'btn-wrap' }, h('button', { class: 'btn', onclick: () => go('cp', {}) }, 'Добавить контрагента'))));
+      h('div', { class: 'btn-wrap' }, h('button', { class: 'btn', onclick: () => go('cp', {}) }, 'Добавить клиента'))));
     return box;
   }
   /*
@@ -2132,7 +2182,7 @@ screens.cps = async function cps() {
     onclick: () => go('cp', { id: cp.id }),
   }))));
   box.append(h('div', { class: 'btn-wrap' },
-    h('button', { class: 'btn secondary', onclick: () => go('cp', {}) }, 'Добавить контрагента')));
+    h('button', { class: 'btn secondary', onclick: () => go('cp', {}) }, 'Добавить клиента')));
   return box;
 };
 
@@ -2165,6 +2215,22 @@ function showError(f, message) {
   f.append(h('div', { class: 'err' }, icon('warn', 'icon'), h('span', { text: message })));
   f.input.focus();
 }
+/**
+ * Ошибка сервера про конкретное поле (неверный ИНН, БИК, счёт) — под самим полем.
+ *
+ * Раньше она приходила тостом внизу, а поле с опечаткой оставалось где-то за
+ * экраном и ничем не отмечалось: человек читал «ИНН не сходится», не видя, где
+ * его править. Сервер называет поле в `field` — подсвечиваем его и увозим экран туда.
+ *
+ * @returns {boolean} true, если ошибку показали у поля
+ */
+function fieldFail(e, fields) {
+  const key = e && e.payload && e.payload.field;
+  if (!key || !fields[key] || !fields[key].input) return false;
+  showError(fields[key], e.message);
+  fields[key].scrollIntoView({ behavior: 'smooth', block: 'center' });
+  return true;
+}
 function clearErrors(fields) {
   for (const f of Object.values(fields)) {
     f.classList.remove('invalid');
@@ -2191,6 +2257,7 @@ async function schedulesBlock(cpId) {
     h('button', {
       class: 'row-act', 'aria-label': `Остановить: ${r.title}`,
       onclick: (e) => withBusy(e.currentTarget, async () => {
+        if (!(await askSure(`Остановить расписание «${r.title}»? Предложения по нему перестанут приходить.`))) return;
         await api('POST', '/api/recurring/off', { id: r.id });
         haptic('medium');
         toast('Расписание остановлено');
@@ -2216,7 +2283,7 @@ screens.cp = async function cpScreen({ id, name }) {
     inn: field('inn', 'ИНН', cp.inn, { inputmode: 'numeric', hint: 'Заполним остальное из реестра' }),
     kpp: field('kpp', 'КПП', cp.kpp, { inputmode: 'numeric' }),
     address: field('address', 'Адрес', cp.address),
-    opening_balance: field('opening_balance', 'Начальное сальдо, ₽', cp.opening_balance || '', {
+    opening_balance: field('opening_balance', 'Долг на начало, ₽', cp.opening_balance || '', {
       inputmode: 'decimal',
       hint: 'Сколько числилось за клиентом, когда начали вести расчёты. 0 — если с нуля',
     }),
@@ -2291,10 +2358,13 @@ screens.cp = async function cpScreen({ id, name }) {
    */
   const openingHint = () => {
     const v = Number(cp.opening_balance) || 0;
-    if (!v) return 'Задать начальное сальдо';
+    if (!v) return 'Указать долг на начало';
     return `Начали с ${money(Math.abs(v))}${cp.opening_date ? ` на ${ru(cp.opening_date)}` : ''}`;
   };
+  // Долг на начало спрятан в «Дополнительно»: новичку, у которого долгов не было, он только мешает.
+  const openingBox = h('details', { class: 'more-fields', id: 'opening-box' });
   const gotoOpening = () => {
+    openingBox.open = true;
     const el = f.opening_balance.input;
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     // preventScroll — иначе браузер дёрнет экран второй раз, поверх плавного.
@@ -2313,9 +2383,9 @@ screens.cp = async function cpScreen({ id, name }) {
     const balanceRow = h('button', { class: 'row balance' },
       h('span', { class: 'grow' },
         h('div', { class: 'ellipsis muted small',
-          text: cp.balance ? (owesUs(cp) ? 'Должен нам' : 'Должны мы') : 'Сальдо' }),
+          text: cp.balance ? (owesUs(cp) ? 'Должен нам' : 'Должны мы') : 'Баланс' }),
         h('div', { class: `v money ${balanceTone(cp)}`, text: money(Math.abs(cp.balance || 0)) }),
-        cp.prepay ? h('div', { class: 'small', text: `💰 ${cp.prepay.text}` }) : '',
+        cp.prepay ? h('div', { class: 'small' }, icon('wallet', 'icon inline'), cp.prepay.text) : '',
         h('div', { class: 'hint', text: openingHint() })),
       icon('chev', 'chev'));
     balanceRow.onclick = () => { haptic(); gotoOpening(); };
@@ -2349,15 +2419,18 @@ screens.cp = async function cpScreen({ id, name }) {
     h('div', { class: 'field' }, h('label', { for: 'f-kind', text: 'Кто это' }), kindSel)));
   if (!id) box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
   box.append(h('div', { class: 'card' }, f.inn, f.kpp, f.address, f.email));
+  // Автозаполнение — сразу под ИНН, а не после поля про долг, куда его раньше загоняло.
+  box.append(h('div', { class: 'btn-wrap' }, lookup));
 
   /*
    * Начальное сальдо. Без него акт сверки открывается нулём, и клиент,
    * у которого долг тянется с прошлого года, такой акт не подпишет.
    * В боте это спрашивали при заведении, в приложении задать было негде.
    */
-  box.append(h('div', { class: 'section-title', text: 'С чего начинаем расчёты' }));
-  box.append(h('div', { class: 'card' }, f.opening_balance, f.opening_date));
-  box.append(h('div', { class: 'btn-wrap' }, lookup));
+  openingBox.open = Boolean(Number(cp.opening_balance) || cp.opening_date);
+  openingBox.append(h('summary', {}, 'Дополнительно: с чего начинаем расчёты'),
+    h('div', { class: 'card' }, f.opening_balance, f.opening_date));
+  box.append(openingBox);
   box.append(h('div', { class: 'section-title', text: 'Банк' }));
   box.append(h('div', { class: 'card' }, f.bank_name, f.bik, f.acc, f.corr_acc));
 
@@ -2365,12 +2438,17 @@ screens.cp = async function cpScreen({ id, name }) {
     clearErrors(f);
     const v = values(f);
     if (!v.name) { showError(f.name, 'Без названия документ не подписать'); return; }
-    await api('POST', '/api/cp', {
-      id: id || 0, ...v, kind: kindSel.value,
-      opening_balance: f.opening_balance.input.value.trim(),
-      opening_date: f.opening_date.input.value,
-    });
-    toast(id ? 'Сохранил' : 'Контрагент добавлен');
+    try {
+      await api('POST', '/api/cp', {
+        id: id || 0, ...v, kind: kindSel.value,
+        opening_balance: f.opening_balance.input.value.trim(),
+        opening_date: f.opening_date.input.value,
+      });
+    } catch (e) {
+      if (fieldFail(e, f)) return;
+      throw e;
+    }
+    toast(id ? 'Сохранил' : 'Клиент добавлен');
     haptic('medium');
     back();
   };
@@ -2423,7 +2501,7 @@ screens.org = async function orgScreen() {
       h('label', { for: 'f-active-org', text: 'Работаем от' }), sel,
       h('div', {
         class: 'hint',
-        text: 'У каждой фирмы свой ряд номеров и своё сальдо с клиентами — '
+        text: 'У каждой фирмы свой ряд номеров и свой баланс с клиентами — '
           + 'смешать их нельзя, это разные юрлица.',
       })));
   }
@@ -2435,7 +2513,7 @@ screens.org = async function orgScreen() {
       toast('Заполните реквизиты новой организации');
       go('org');
     }),
-  }, '➕ Добавить организацию')));
+  }, icon('plus', 'icon inline'), 'Добавить организацию')));
 
   const paste = h('textarea', {
     id: 'f-paste', placeholder: 'Вставьте блок реквизитов из письма или договора целиком',
@@ -2499,7 +2577,7 @@ screens.org = async function orgScreen() {
     h('div', { class: 'field' }, h('label', { for: 'f-paste', text: 'Вставить блок реквизитов' }), paste)));
   box.append(h('div', { class: 'btn-wrap' }, parseBtn));
 
-  box.append(h('div', { class: 'section-title', text: 'Организация' }));
+  box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
   box.append(h('div', { class: 'card' }, f.name, f.full_name, f.inn, f.kpp, f.ogrnip, f.signer, f.address));
   box.append(h('div', { class: 'btn-wrap' }, h('button', {
     class: 'btn secondary',
@@ -2535,7 +2613,12 @@ screens.org = async function orgScreen() {
       clearErrors(f);
       const v = values(f);
       if (!v.name) { showError(f.name, 'Укажите, как называется организация'); return; }
-      await api('POST', '/api/org', v);
+      try {
+        await api('POST', '/api/org', v);
+      } catch (e) {
+        if (fieldFail(e, f)) return;
+        throw e;
+      }
       cache = {};
       toast('Реквизиты сохранены');
       haptic('medium');
@@ -2727,7 +2810,7 @@ function facsimileCard(state) {
           onclick: () => { haptic(); file.click(); },
         }, has ? 'Заменить' : 'Загрузить'),
         has && h('button', {
-          class: 'iconbtn danger', style: 'width:38px', 'aria-label': `Убрать: ${label}`,
+          class: 'iconbtn danger', style: 'width:44px', 'aria-label': `Убрать: ${label}`,
           onclick: async (e) => {
             e.stopPropagation();
             const r = await api('POST', '/api/facsimile/delete', { kind });
@@ -2755,7 +2838,7 @@ function facsimileCard(state) {
       h('div', {
         class: 'hint',
         text: 'Снимите подпись на белом листе — фон бот уберёт сам. На платёжное '
-          + 'поручение и договор факсимиле не ставится: там нужна живая подпись. '
+          + 'поручение и договор подпись-картинка не ставится: там нужна живая подпись. '
           + 'На счета-фактуры тоже — по такому документу покупателю откажут '
           + 'в вычете (п. 6 ст. 169 НК).',
       })));
@@ -2767,7 +2850,7 @@ function facsimileCard(state) {
 
 screens.debts = async function debts() {
   const { debtors } = await api('GET', '/api/debtors');
-  const box = h('div', {}, h('h1', { text: 'Кто сколько должен' }));
+  const box = h('div', {}, h('h1', { text: 'Долги' }));
   if (!debtors.length) {
     box.append(empty('wallet', 'Долгов нет',
       'Как только появятся долги по актам или счетам — зависит от вашего дела.'));
@@ -2783,7 +2866,7 @@ screens.debts = async function debts() {
       const row = navRow({
         icon: 'users',
         title: d.name,
-        sub: d.days == null ? '' : `без движения ${d.days} ${plural(d.days, 'день', 'дня', 'дней')}`,
+        sub: d.days == null ? '' : (d.days === 0 ? 'движение было сегодня' : `без движения ${d.days} ${plural(d.days, 'день', 'дня', 'дней')}`),
         right: money(d.amount),
         rightTone: tone,
         tone: d.days > 30 ? 'warn' : '',
@@ -2810,7 +2893,7 @@ screens.debts = async function debts() {
     box.append(h('div', { class: 'btn-wrap', style: 'padding-top:0' }, h('button', {
       class: 'btn secondary', onclick: () => go('reminders'),
     }, 'Напомнить всем должникам')));
-    box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
       text: 'Файлы и тексты бот присылает вам — вашим клиентам он не пишет.' }));
   }
   return box;
@@ -2825,25 +2908,18 @@ screens.more = async function more() {
       icon: 'star',
       tone: s.quota.paid ? 'ok' : '',
       title: 'Подписка',
-      sub: s.quota.paid ? `до ${ru(s.access.until)}` : `${s.quota.left} из ${s.quota.limit} бесплатных`,
+      sub: s.quota.paid ? `до ${ru(s.access.until)}` : `осталось ${s.quota.left} из ${s.quota.limit}`,
       onclick: () => go('billing'),
     })));
   box.append(h('div', { class: 'section-title', text: 'Работа' }));
   box.append(h('div', { class: 'card' },
     navRow({
       icon: 'wallet',
-      title: 'Кто сколько должен',
+      title: 'Долги',
       sub: s.counts && s.counts.debtors
-        ? `${s.counts.debtors} ${plural(s.counts.debtors, 'контрагент', 'контрагента', 'контрагентов')} · ${money0(s.debts.owedToUs)} вам`
+        ? `${s.counts.debtors} ${plural(s.counts.debtors, 'клиент', 'клиента', 'клиентов')} · ${money0(s.debts.owedToUs)} вам`
         : 'долгов нет',
       onclick: () => go('debts'),
-    }),
-    navRow({
-      icon: 'mail',
-      tone: s.mailbox ? 'ok' : '',
-      title: 'Почта',
-      sub: s.mailbox ? s.mailbox.from : 'ящик не подключён',
-      onclick: () => go('mail'),
     }),
     navRow({
       icon: 'clock',
@@ -2852,6 +2928,13 @@ screens.more = async function more() {
         ? `${s.unpaid.count} ${plural(s.unpaid.count, 'счёт', 'счёта', 'счетов')} на ${money0(s.unpaid.sum)}`
         : 'всё оплачено',
       onclick: () => go('unpaid'),
+    }),
+    navRow({
+      icon: 'mail',
+      tone: s.mailbox ? 'ok' : '',
+      title: 'Почта',
+      sub: s.mailbox ? s.mailbox.from : 'ящик не подключён',
+      onclick: () => go('mail'),
     }),
     navRow({
       icon: 'doc-check',
@@ -2873,7 +2956,7 @@ screens.more = async function more() {
     }),
     navRow({
       icon: 'repeat',
-      title: 'Каждый месяц',
+      title: 'По расписанию',
       sub: s.recurring
         ? `${s.recurring} ${plural(s.recurring, 'документ', 'документа', 'документов')} на повторе`
         : 'счета и акты по расписанию',
@@ -2895,14 +2978,14 @@ screens.more = async function more() {
       onclick: () => go('vat'),
     }),
     navRow({
-      icon: 'receipt',
+      icon: 'person',
       title: 'Самозанятость',
       sub: s.org && Number(s.org.npd)
         ? 'напомню про чек в «Моём налоге»' : 'если платите налог на профдоход',
       onclick: () => go('npd'),
     }),
     navRow({
-      icon: 'wallet',
+      icon: 'briefcase',
       title: 'Чем занимаетесь',
       sub: (() => {
         const t = (s.bizTypes || []).find((x) => x.key === s.bizType);
@@ -2917,9 +3000,9 @@ screens.more = async function more() {
     navRow({
       icon: 'bot',
       tone: s.aiEnabled !== false ? 'ok' : '',
-      title: 'ИИ-ассистент',
+      title: s.aiEnabled !== false ? 'Помощник включён' : 'Помощник выключен',
       sub: s.aiEnabled !== false
-        ? 'понимает фразы, фото счетов и голосовые'
+        ? 'понимает фразы, фото и голос'
         : 'выключен — только ручной ввод',
       onclick: async () => {
         haptic('medium');
@@ -2927,7 +3010,7 @@ screens.more = async function more() {
         try {
           await api('POST', '/api/user/ai', { enabled: next });
           s.aiEnabled = next;
-          toast(next ? 'ИИ-ассистент включён' : 'ИИ-ассистент выключен');
+          toast(next ? 'Помощник включён' : 'Помощник выключен');
           go('more');
         } catch (e) { toast(e.message, true); }
       },
@@ -3052,7 +3135,7 @@ screens.mail = async function mail() {
       h('span', { class: 'grow' },
         h('div', { text: 'Ящик не подключён' }),
         h('div', { class: 'small muted', text: 'документы придётся пересылать вручную' })))));
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
     text: 'Подключите свой ящик — и счета будут уходить клиентам с вашего адреса. '
       + 'С чужого адреса письма попадают в спам, а получатель видит незнакомого отправителя.' }));
   box.append(h('div', { class: 'btn-wrap' },
@@ -3103,7 +3186,7 @@ screens['mail.new'] = async function mailNew() {
 
   box.append(h('div', { class: 'card' }, email, pass, host, imap, fromName));
   box.append(linkBox);
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
     text: 'Пароль хранится в зашифрованном виде и нигде не показывается. '
       + 'Сразу после сохранения я отправлю проверочное письмо вам же.' }));
 
@@ -3203,7 +3286,7 @@ screens.letter = async function letter({ data }) {
       class: 'btn', onclick: () => go('op', { cpId: l.cp.id, doc: l.subject }),
     }, `Внести операцию по ${l.cp.name}`)));
   }
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
     text: 'Сам файл лежит у вас в почте — бот его не хранит. Здесь видно, что пришло, '
       + 'и можно сразу занести сумму в журнал.' }));
   return box;
@@ -3218,7 +3301,7 @@ screens.vat = async function vat() {
   const cur = org.vat_rate === '' || org.vat_rate == null ? null : String(org.vat_rate);
   const gross = Boolean(org.vat_gross);
   const box = h('div', {}, h('h1', { text: 'НДС' }));
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
     text: 'Ставка подставляется во все счета. У отдельного счёта её можно поменять.' }));
 
   /*
@@ -3230,10 +3313,11 @@ screens.vat = async function vat() {
    * а заказчик вычет всё равно не получит.
    */
   if (Number(org.npd)) {
-    box.append(h('p', { class: 'small', style: 'margin:8px 18px; color:var(--warn, #b26a00)',
-      text: '⚠️ У вас включена самозанятость. Плательщик НПД не может быть плательщиком '
+    box.append(h('p', { class: 'small', style: 'margin:8px 18px; color:var(--warn, #b26a00)' },
+      icon('warn', 'icon inline'),
+      'У вас включена самозанятость. Плательщик НПД не может быть плательщиком '
         + 'НДС — оставьте «Без НДС». Если с НПД снялись, выключите галочку в разделе '
-        + '«Самозанятость».' }));
+        + '«Самозанятость».'));
   }
 
   const pick = async (rate, isGross) => {
@@ -3282,7 +3366,7 @@ screens.npd = async function npdScreen() {
   const s = await api('GET', '/api/state');
   const on = Boolean(s.org && Number(s.org.npd));
   const box = h('div', {}, h('h1', { text: 'Налог на профессиональный доход' }));
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
     text: 'Если вы самозанятый или ИП на НПД, счёт и акт сами по себе доход не закрывают — '
       + 'его закрывает чек из «Моего налога». Включите, и после каждой отметки об оплате '
       + 'я дам данные для чека и буду помнить, пока вы не отметите его пробитым.' }));
@@ -3368,7 +3452,7 @@ screens.cheques = async function chequesScreen() {
 screens.basis = async function basis() {
   const s = await api('GET', '/api/state');
   const box = h('div', {}, h('h1', { text: s.bizType ? 'Откуда берётся долг' : 'Чем занимаетесь' }));
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
     text: 'Это про устройство вашего дела, а не про настройку. Выбор один на организацию: '
       + 'иначе долг задвоится — сначала по счёту, потом по акту на ту же сделку.' }));
 
@@ -3442,13 +3526,14 @@ screens.recurring = async function recurringScreen() {
       h('span', { class: 'icon-box' }, icon('repeat')),
       h('span', { class: 'grow' },
         h('div', { class: 'ellipsis', text: r.cpName }),
-        h('div', { class: 'small muted ellipsis', text: r.title })),
+        h('div', { class: 'small muted', text: r.title })),
       // Без копеек: сумма здесь для узнавания, а не для сверки.
       h('span', { class: 'money nowrap', text: money0(r.total) }),
       h('button', {
         class: 'row-act',
         'aria-label': `Остановить: ${r.title} для ${r.cpName}`,
         onclick: (e) => withBusy(e.currentTarget, async () => {
+          if (!(await askSure(`Остановить расписание «${r.title}» для ${r.cpName}? Предложения по нему перестанут приходить.`))) return;
           await api('POST', '/api/recurring/off', { id: r.id });
           haptic('medium');
           toast('Расписание остановлено');
@@ -3519,8 +3604,8 @@ screens.op = async function op({ cpId, doc }) {
       h('span', { class: 'ellipsis', text: cp.name }))));
   box.append(picker);
   box.append(h('div', { class: 'card' }, amount, date, docF));
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
-    text: 'Оплата уменьшает долг клиента, приход — увеличивает. Предоплата — деньги вперёд: накладные клиента дальше отмечаются оплаченными сами, пока хватает остатка.' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Оплата уменьшает долг клиента, приход — увеличивает. Предоплата — деньги вперёд: накладные клиента дальше отмечаются оплаченными сами, пока хватает остатка. После предоплаты в карточке клиента появится «Акт за месяц» — один акт на все его накладные.' }));
 
   const save = h('button', { class: 'btn' }, 'Внести в журнал');
   save.onclick = () => withBusy(save, async () => {
@@ -3553,7 +3638,7 @@ screens.ops = async function opsScreen({ cpId }) {
   box.append(h('div', { class: 'hero' },
     h('div', { class: 'greet', text: j.cp.name }),
     h('div', { class: 'sum money', text: money0(Math.abs(j.closing)) }),
-    h('div', { class: 'sub', text: j.closing ? 'текущее сальдо' : 'расчёты сошлись' })));
+    h('div', { class: 'sub', text: j.closing ? 'баланс сейчас' : 'расчёты сошлись' })));
 
   const add = h('button', { class: 'btn' }, 'Внести оплату или приход');
   add.onclick = () => { haptic('medium'); go('op', { cpId }); };
@@ -3562,7 +3647,7 @@ screens.ops = async function opsScreen({ cpId }) {
   if (j.opening) {
     box.append(h('div', { class: 'card' }, navRow({
       icon: 'clock',
-      title: 'Начальное сальдо',
+      title: 'Долг на начало',
       sub: j.openingDate ? `на ${ru(j.openingDate)}` : 'до начала расчётов',
       right: money(j.opening),
       // Строка не из журнала: правится в карточке, а не смахиванием.
@@ -3573,7 +3658,7 @@ screens.ops = async function opsScreen({ cpId }) {
   if (!j.ops.length) {
     box.append(empty('list', 'Операций нет',
       j.opening
-        ? 'Сальдо держит начальное значение из карточки клиента.'
+        ? 'Баланс держит долг на начало из карточки клиента.'
         : 'Здесь появятся оплаты и приходы — внесённые руками и из выписки.'));
     return box;
   }
@@ -3596,13 +3681,13 @@ screens.ops = async function opsScreen({ cpId }) {
       onDelete: async () => {
         const r = await api('POST', '/api/op/delete', { id: o.id, cpId });
         haptic('medium');
-        toast(`Убрано. Сальдо: ${money(Math.abs(r.balance))}`);
+        toast(`Убрано. Баланс: ${money(Math.abs(r.balance))}`);
         render();                        // перерисовать, не теряя дорогу назад
       },
     });
   });
   box.append(h('div', { class: 'card' }, rows));
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
     text: 'Смахните строку влево, чтобы убрать. Строки из документов убираются вместе с документом.' }));
   return box;
 };
@@ -3747,7 +3832,7 @@ const ASK_GO = {
   debts: ['Открыть долги', 'debts'],
   unpaid: ['Кто не заплатил', 'unpaid'],
   docs: ['Открыть документы', 'docs'],
-  cps: ['Открыть контрагентов', 'cps'],
+  cps: ['Открыть клиентов', 'cps'],
   org: ['Открыть реквизиты', 'org'],
   recurring: ['Открыть повторения', 'recurring'],
   billing: ['Открыть подписку', 'billing'],
@@ -3766,13 +3851,14 @@ screens.ask = async function ask() {
   const speakBtn = h('button', { class: 'chip' });
   const talkBtn = h('button', { class: 'chip talk' });
   const paintChips = () => {
-    speakBtn.textContent = speakOn ? '🔊 Отвечать голосом' : '🔇 Отвечать текстом';
+    speakBtn.replaceChildren(icon(speakOn ? 'speaker' : 'speaker-off', 'icon inline'),
+      speakOn ? 'Отвечать голосом' : 'Отвечать текстом');
     speakBtn.setAttribute('aria-pressed', String(speakOn));
-    talkBtn.textContent = talk ? '⏹ Закончить разговор' : '🎙 Разговор';
+    talkBtn.replaceChildren(icon(talk ? 'stop' : 'mic', 'icon inline'), talk ? 'Закончить разговор' : 'Разговор');
     talkBtn.setAttribute('aria-pressed', String(talk));
   };
   paintChips();
-  const box = h('div', {}, h('h1', { text: 'Спросить' }), h('div', { class: 'ask-modes' }, speakBtn, talkBtn));
+  const box = h('div', {}, h('h1', { text: 'Помощник' }), h('div', { class: 'ask-modes' }, speakBtn, talkBtn));
   const log = h('div', { class: 'chat' });
 
   /* Вносит проводку и показывает, что получилось, с отменой в одно нажатие. */
@@ -3780,11 +3866,11 @@ screens.ask = async function ask() {
     try {
       const res = await api('POST', '/api/pay', { cpId, amount, kind });
       haptic('heavy');
-      const undo = h('button', { class: 'btn secondary' }, 'Отменить проводку');
+      const undo = h('button', { class: 'btn secondary' }, 'Отменить запись');
       undo.onclick = async () => {
         await api('POST', '/api/op/delete', { id: res.id, cpId });
         haptic('medium');
-        say('bot', 'Проводка убрана.');
+        say('bot', 'Запись убрана.');
       };
       const left = Number(res.balance) || 0;
       say('bot', `Внёс: ${res.kind} ${money(res.sum)} по «${res.cpName}». `
@@ -3814,7 +3900,7 @@ screens.ask = async function ask() {
     if (hist && Array.isArray(hist.messages) && hist.messages.length > 0) {
       for (const m of hist.messages) {
         const who = m.role === 'user' ? 'me' : 'bot';
-        const micTag = m.type === 'voice' && m.audioSeconds ? ` 🎤 (${Math.round(m.audioSeconds)}с)` : '';
+        const micTag = m.type === 'voice' && m.audioSeconds ? ` (голосом, ${Math.round(m.audioSeconds)} с)` : '';
         say(who, (m.text || '') + (who === 'me' ? micTag : ''));
       }
     } else {
@@ -4010,7 +4096,7 @@ screens.ask = async function ask() {
     micIdle();
     const { audio, seconds } = await r0.stop();
     if (!seconds) { say('bot', 'Запись пустая — кажется, микрофон не слышит.'); talk = false; paintChips(); return; }
-    say('bot', '🎧 Слушаю…');
+    say('bot', 'Слушаю…');
     let r;
     try { r = await api('POST', '/api/ask/voice', { audio, seconds, speak: speakOn || talk }); } catch (e) {
       say('bot', e.message); talk = false; paintChips(); return;
@@ -4192,8 +4278,8 @@ screens.help = async function help() {
   box.append(h('div', { class: 'card' }, h('div', { class: 'row' },
     h('span', { class: `icon-box ${s.quota.paid ? 'ok' : ''}` }, icon(s.quota.paid ? 'check' : 'clock')),
     h('span', { class: 'grow' },
-      h('div', { text: s.quota.paid ? 'Подписка активна' : `${s.quota.left} из ${s.quota.limit} бесплатных` }),
-      h('div', { class: 'small muted', text: s.quota.paid ? `до ${ru(s.access.until)}` : 'в этом месяце' })))));
+      h('div', { text: s.quota.paid ? 'Подписка активна' : `Осталось ${s.quota.left} из ${s.quota.limit}` }),
+      h('div', { class: 'small muted', text: s.quota.paid ? `до ${ru(s.access.until)}` : 'бесплатных документов в этом месяце' })))));
 
   box.append(h('div', { class: 'btn-wrap' }, h('button', {
     class: 'btn secondary', onclick: () => go('support'),
@@ -4244,9 +4330,9 @@ screens.akt = async function aktScreen() {
     h('button', { class: 'chip', onclick: () => setRange(`${now.getFullYear()}-01-01`, iso(now)) }, 'Год'),
     h('button', { class: 'chip', onclick: () => setRange('', iso(now)) }, 'За всё время'));
 
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
-    text: 'Excel с журналом операций и сальдо придёт в чат с ботом. Пустая дата начала — '
-      + 'от начала расчётов, с начальным сальдо из карточки клиента.' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Excel с журналом операций и балансом придёт в чат с ботом. Пустая дата начала — '
+      + 'от начала расчётов, с долгом на начало из карточки клиента.' }));
   box.append(h('div', { class: 'section-title', text: 'Период' }));
   box.append(h('div', { class: 'card' }, from, to), chips);
 
@@ -4265,7 +4351,7 @@ screens.akt = async function aktScreen() {
         if (to.input.value) q.set('to', to.input.value);
         const r = await api('GET', `/api/akt?${q}`);
         haptic('medium');
-        toast(`Сальдо на конец: ${money0(Math.abs(r.closing))} · операций ${r.ops}`);
+        toast(`Баланс на конец: ${money0(Math.abs(r.closing))} · операций ${r.ops}`);
         download(r.file);
       } catch (e) { toast(e.message, true); }
     },
@@ -4277,8 +4363,8 @@ screens.registry = async function registry() {
   const now = new Date();
   const first = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
   const box = h('div', {}, h('h1', { text: 'Реестр документов' }));
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
-    text: 'Таблица всех выписанных документов за период — с суммами, контрагентами и итогом. '
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Таблица всех выписанных документов за период — с суммами, клиентами и итогом. '
       + 'Открывается в Excel, годится для сдачи бухгалтеру.' }));
   const from = field('from', 'С какого числа', first, { type: 'date' });
   const to = field('to', 'По какое', todayISO(), { type: 'date' });
@@ -4406,7 +4492,7 @@ screens.other = async function other({ type, cpId }) {
     await loadTpl();
     box.append(ownContractCard({ cpId: () => Number(who.value), cpName: () => (who.selectedOptions[0] || {}).textContent || '', reload: loadTpl }));
   }
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
     text: isPp
       ? 'Форма 0401060 — та, что принимает банк. Ваши реквизиты и реквизиты получателя подставятся сами.'
       : 'Простой договор на услуги: реквизиты обеих сторон, предмет, сумма и срок. Подпись и печать не ставятся — договор подписывают живой рукой.' }));
@@ -4470,7 +4556,7 @@ function ownContractCard({ cpId, cpName, reload }) {
   const out = h('div', {});
   const ACCEPT = '.docx,.pdf,image/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document';
   const upInput = pickFile(ACCEPT, async (file) => {
-    out.replaceChildren(h('p', { class: 'small muted', style: 'margin:12px 18px', text: '📖 Читаю договор — это до минуты…' }));
+    out.replaceChildren(h('p', { class: 'small muted', style: 'margin:12px 18px', text: 'Читаю договор — это до минуты…' }));
     try {
       const r = await api('POST', '/api/mycontract/analyze', { dataUrl: await fileToDataUrl(file), name: file.name });
       const t = r.template;
@@ -4482,7 +4568,7 @@ function ownContractCard({ cpId, cpName, reload }) {
         await reload();
       };
       out.replaceChildren(h('div', { class: 'card' },
-        h('p', { style: 'margin:12px 16px 4px', text: `📎 ${t.title} — прочитал.` }),
+        h('p', { style: 'margin:12px 16px 4px', text: `${t.title} — прочитал.` }),
         h('p', { class: 'small muted', style: 'margin:0 16px 8px', text: r.ask.length
           ? `Буду спрашивать: ${r.ask.map((f) => f.label).join(', ')}. Клиента, реквизиты, номер и дату подставлю сам.`
           : 'Меняющихся мест, кроме клиента и реквизитов, не нашёл.' }),
@@ -4492,26 +4578,26 @@ function ownContractCard({ cpId, cpName, reload }) {
     } catch (e) { out.replaceChildren(h('p', { class: 'small', style: 'margin:12px 18px', text: e.message })); }
   });
   const revInput = pickFile(ACCEPT, async (file) => {
-    out.replaceChildren(h('p', { class: 'small muted', style: 'margin:12px 18px', text: '🔎 Разбираю договор — это до минуты…' }));
+    out.replaceChildren(h('p', { class: 'small muted', style: 'margin:12px 18px', text: 'Разбираю договор — это до минуты…' }));
     try {
       const { review: rv } = await api('POST', '/api/contract/review', { dataUrl: await fileToDataUrl(file), name: file.name });
-      const ICON = { high: '🔴', medium: '🟡', low: '🟢' };
+      const LEVEL = { high: 'высокий риск', medium: 'средний риск', low: 'небольшой риск' };
       const row = (t, v) => (v ? h('p', { class: 'small', style: 'margin:4px 16px' }, h('b', { text: `${t}: ` }), v) : null);
       out.replaceChildren(h('div', { class: 'card' },
-        h('p', { style: 'margin:12px 16px 4px;font-weight:600', text: `🔎 ${rv.title}${rv.ref ? ` · ${rv.ref}` : ''}` }),
+        h('p', { style: 'margin:12px 16px 4px;font-weight:600', text: `${rv.title}${rv.ref ? ` · ${rv.ref}` : ''}` }),
         rv.summary ? h('p', { class: 'small', style: 'margin:4px 16px 8px', text: rv.summary }) : null,
         row('Предмет', rv.subject), row('Сумма', rv.amount), row('Оплата', rv.payment),
         row('Сроки', rv.dates), row('Штрафы', rv.penalties), row('Расторжение', rv.termination),
         ...(rv.risks || []).map((x) => h('p', { class: 'small', style: 'margin:6px 16px' },
-          `${ICON[x.level] || '🟡'} ${x.text}`, x.fix ? h('div', { class: 'muted', text: `Как поправить: ${x.fix}` }) : null)),
+          h('span', { class: `risk-dot ${LEVEL[x.level] ? x.level : 'medium'}`, title: LEVEL[x.level] || LEVEL.medium }), x.text, x.fix ? h('div', { class: 'muted', text: `Как поправить: ${x.fix}` }) : null)),
         h('p', { class: 'small muted', style: 'margin:10px 16px 14px',
-          text: 'Это справка, а не юридическое заключение — серьёзные риски покажите юристу. Вопросы по договору можно задать в «Спросить».' })));
+          text: 'Это справка, а не юридическое заключение — серьёзные риски покажите юристу. Вопросы по договору можно задать «Помощнику».' })));
     } catch (e) { out.replaceChildren(h('p', { class: 'small', style: 'margin:12px 18px', text: e.message })); }
   });
   return h('div', {},
     h('div', { class: 'btn-wrap' },
-      h('button', { class: 'btn secondary', onclick: () => upInput.click() }, '📤 Загрузить свой договор'),
-      h('button', { class: 'btn secondary', onclick: () => revInput.click() }, '🔎 Проверить чужой договор')),
+      h('button', { class: 'btn secondary', onclick: () => upInput.click() }, icon('upload', 'icon inline'), 'Загрузить свой договор'),
+      h('button', { class: 'btn secondary', onclick: () => revInput.click() }, icon('search', 'icon inline'), 'Проверить чужой договор')),
     upInput, revInput, out);
 }
 
@@ -4533,12 +4619,16 @@ screens.reminders = async function reminders({ cpId } = {}) {
     box.append(empty('check', 'Должников нет', 'Некому напоминать — все рассчитались.'));
     return box;
   }
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
     text: canMail
       ? 'Текст можно поправить и отправить с вашей почты — вместе с актом сверки. '
         + 'Или скопировать и отправить как удобно.'
       : 'Скопируйте текст и отправьте должнику сами. Чтобы отправлять письмом '
-        + 'прямо отсюда, подключите свою почту в разделе «Ещё».' }));
+        + 'прямо отсюда, подключите свою почту.' }));
+  if (!canMail) {
+    box.append(h('div', { class: 'btn-wrap' }, h('button', { class: 'btn secondary', id: 'rm-connect', onclick: () => go('mail') },
+      icon('mail', 'icon inline'), 'Подключить почту')));
+  }
 
   for (const r of list) {
     const card = h('div', { class: 'card' });
@@ -4561,9 +4651,17 @@ screens.reminders = async function reminders({ cpId } = {}) {
     // а перечитать его — весь смысл этого экрана.
     const grow = () => { text.style.height = 'auto'; text.style.height = `${text.scrollHeight}px`; };
     text.addEventListener('input', grow);
+    /*
+     * Письмо — в раскрывающемся блоке. Три должника подряд давали три письма
+     * по тридцать строк, а кнопка «Отправить» уезжала под них. Теперь у каждого
+     * видна строка с суммой, почта и «Отправить», а текст открывается по
+     * нажатию (у одного должника он открыт сразу — читать там больше нечего).
+     */
+    const letter = h('details', { class: 'letter', ...(list.length === 1 ? { open: '' } : {}) },
+      h('summary', {}, 'Текст письма', h('span', { class: 'small muted', text: ' — прочитать и поправить' })),
+      h('div', { class: 'field' }, h('label', { class: 'sr-only', for: `rm-${r.cpId}`, text: 'Текст письма' }), text));
+    letter.addEventListener('toggle', () => { if (letter.open) grow(); });
     requestAnimationFrame(grow);
-    card.append(h('div', { class: 'field' },
-      h('label', { for: `rm-${r.cpId}`, text: 'Текст письма' }), text));
 
     const copy = h('button', { class: 'btn secondary' }, 'Скопировать');
     copy.onclick = async () => {
@@ -4577,6 +4675,7 @@ screens.reminders = async function reminders({ cpId } = {}) {
     };
 
     if (!canMail) {
+      card.append(letter);
       box.append(card, h('div', { class: 'btn-wrap' }, copy));
       continue;
     }
@@ -4585,7 +4684,7 @@ screens.reminders = async function reminders({ cpId } = {}) {
       type: 'email', placeholder: 'buh@company.ru',
       hint: r.email ? 'Сохранена в карточке клиента' : 'Запомню её для этого клиента',
     });
-    card.append(mail);
+    card.append(mail, letter);
 
     const send = h('button', { class: 'btn' }, 'Отправить с моей почты');
     send.onclick = (e) => withBusy(e.currentTarget, async () => {
@@ -4609,7 +4708,7 @@ screens.reminders = async function reminders({ cpId } = {}) {
 
 screens.support = async function support() {
   const box = h('div', {}, h('h1', { text: 'Поддержка' }));
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
     text: 'Опишите, что случилось. Ответим в чате с ботом — там же, где приходят документы.' }));
   const text = field('text', 'Сообщение', '', {
     multiline: true, required: true,
@@ -4632,7 +4731,7 @@ screens.support = async function support() {
     + '<a href="/terms" target="_blank" style="color:var(--accent);">Пользовательское соглашение</a> · '
     + '<a href="/privacy" target="_blank" style="color:var(--accent);">Конфиденциальность</a> · '
     + '<a href="/tariffs" target="_blank" style="color:var(--accent);">Тарифы</a><br>'
-    + '<span style="font-family:monospace; font-size:11px; opacity:0.65;">plat chek</span>';
+    + '<span style="font-family:monospace; font-size:11px; opacity:0.65;">Проверочный код: plat chek</span>';
   box.append(supInfo);
 
   return box;
@@ -4656,7 +4755,7 @@ screens.support = async function support() {
  */
 screens.bank = async function bankScreen() {
   const box = h('div', {}, h('h1', { text: 'Выписка из банка' }));
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
     text: 'Выгрузите выписку в интернет-банке и пришлите файл: 1С «Клиент-Банк», Excel, '
       + 'OFX или CSV. Найду поступления, покажу, от кого они, — отметите нужные, и они '
       + 'попадут в журнал как оплаты.' }));
@@ -4890,7 +4989,7 @@ screens.bankclose = async function bankClose(params) {
 
 screens.scan = async function scan() {
   const box = h('div', {}, h('h1', { text: 'Снимок счёта' }));
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
     text: 'Сфотографируйте счёт от поставщика — вытащу сумму, дату и номер и предложу '
       + 'внести операцию. Сам файл никуда не сохраняется.' }));
 
@@ -4948,7 +5047,7 @@ screens.billing = async function billing() {
           class: 'small muted',
           text: q.paid
             ? `действует до ${ru(s.access.until)}`
-            : `выписано ${q.used} из ${q.limit} в этом месяце`,
+            : `осталось ${q.left} из ${q.limit} в этом месяце`,
         })))));
 
   if (!q.paid) {
@@ -5009,7 +5108,7 @@ screens.billing = async function billing() {
             if (tg && tg.openLink) tg.openLink(s.payUrl); else window.open(s.payUrl, '_blank');
           }
         },
-      }, '⚡ Оформить подписку')));
+      }, icon('bolt', 'icon inline'), 'Оформить подписку')));
 
       /*
        * «Я оплатил» прямо здесь. Раньше приложение отправляло человека
@@ -5073,7 +5172,7 @@ screens.billing = async function billing() {
   // Код доступа виден всегда: по нему и открывают доступ до подключения
   // оплаты, и продлевают уже действующую подписку.
   box.append(h('div', { class: 'section-title', text: 'Код доступа' }));
-  const code = field('promo', 'Код', '', { placeholder: 'PRV-A3KD-9MQX' });
+  const code = field('promo', 'Код', '', { placeholder: 'Введите код' });
   code.input.autocapitalize = 'characters';
   box.append(h('div', { class: 'card' }, code));
   const apply = h('button', { class: 'btn secondary' }, 'Активировать');
@@ -5104,7 +5203,7 @@ screens.billing = async function billing() {
   const billingLegal = h('div', { class: 'small muted', style: 'margin:20px 16px 12px; text-align:center; line-height:1.7;' });
   billingLegal.innerHTML = 'Оплата означает согласие с <a href="/terms" target="_blank" style="color:var(--accent);">офертой</a> и <a href="/privacy" target="_blank" style="color:var(--accent);">политикой конфиденциальности</a>.<br>'
     + '<a href="/tariffs" target="_blank" style="color:var(--accent);">Тарифы</a> · Поддержка: <a href="mailto:support@pervichkaru.ru" style="color:var(--accent);">support@pervichkaru.ru</a><br>'
-    + '<span style="font-family:monospace; font-size:11px; opacity:0.65;">plat chek</span>';
+    + '<span style="font-family:monospace; font-size:11px; opacity:0.65;">Проверочный код: plat chek</span>';
   box.append(billingLegal);
 
   return box;
@@ -5180,7 +5279,7 @@ screens.avans = async function avansScreen(params) {
   // Неплательщику этот документ не положен — говорим прямо, а не показываем
   // форму, которая закончится отказом.
   if (rate == null || Number(org.npd)) {
-    box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
       text: Number(org.npd)
         ? 'Самозанятый не выставляет счета-фактуры: он не плательщик НДС (422-ФЗ).'
         : 'Счёт-фактура выставляется со ставкой НДС, а у вас выбрано «без НДС».' }));
@@ -5243,7 +5342,7 @@ screens.ksf = async function ksfScreen(params) {
   const { docs } = await api('GET', `/api/doc/correctable?cpId=${Number(params.cpId) || 0}`);
 
   if (!docs.length) {
-    box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
       text: 'Корректировать нечего: по этому клиенту нет ни одного счёта-фактуры. '
         + 'Корректировочный выставляют к уже выданному, когда стороны договорились '
         + 'об изменении стоимости.' }));
@@ -5252,7 +5351,7 @@ screens.ksf = async function ksfScreen(params) {
 
   // Шаг 1 — какой документ правим.
   if (!params.baseId) {
-    box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
       text: 'К какому счёту-фактуре корректировка?' }));
     box.append(h('div', { class: 'card' }, docs.map((d) => navRow({
       icon: 'doc',
@@ -5267,7 +5366,7 @@ screens.ksf = async function ksfScreen(params) {
   const base = docs.find((d) => d.id === Number(params.baseId));
   if (!base) { box.append(h('p', { class: 'small muted', text: 'Документ не найден.' })); return box; }
 
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px',
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
     text: `К счёту-фактуре № ${base.number} от ${ru(base.date)}. Укажите, что стало — `
       + 'строки идут в том же порядке.' }));
 
@@ -5317,6 +5416,8 @@ screens.ksf = async function ksfScreen(params) {
     text: 'Увеличение попадёт в книгу продаж, уменьшение — в книгу покупок: это ваш вычет.' }));
   return box;
 };
+
+const UNITS = ['шт.', 'усл.', 'кг', 'г', 'л', 'м', 'м²', 'м³', 'час', 'сут.', 'мес.', 'упак.', 'компл.'];
 
 screens.new = async function newDoc(params) {
   const TITLES = {
@@ -5431,8 +5532,8 @@ screens.new = async function newDoc(params) {
     if (!basisInput) return;
     const contract = (known.find((c) => c.id === draft.cpId) || {}).contract || '';
     basisHint.textContent = contract
-      ? `Не заполните — напечатаем договор из карточки: «${contract}»`
-      : 'Не заполните — напечатаем «Без договора»';
+      ? `Оставите пустым — напечатаем договор из карточки: «${contract}»`
+      : 'Оставите пустым — напечатаем «Без договора»';
   }
 
   box.append(h('div', { class: 'card' }, cpField,
@@ -5618,17 +5719,17 @@ screens.new = async function newDoc(params) {
    * vatSplit в lib/money.js. Одним умножением итога вышло бы на копейку
    * иначе, и подпись снова разошлась бы с документом.
    */
-  const r2 = (v) => Math.round((v + Number.EPSILON) * 100) / 100;
   function draftTotal() {
     const rate = docRate();
     const gross = docGross();
-    let sum = 0;
+    const r = rate == null ? null : decimalOf(rate);
+    let cents = 0n;
     for (const it of draft.items) {
-      const line = r2((Number(it.qty) || 0) * (Number(it.price) || 0));
+      const line = lineCents(it.qty, it.price);
       // При ценах «с НДС» налог уже внутри строки, добавлять нечего.
-      sum += rate == null || gross ? line : r2(line + r2(line * (rate / 100)));
+      cents += r == null || gross ? line : line + divRound(line * r.m, 100n * 10n ** BigInt(r.s));
     }
-    return r2(sum);
+    return Number(cents) / 100;
   }
 
   function recalc() {
@@ -5637,9 +5738,13 @@ screens.new = async function newDoc(params) {
     if (tg) {
       // Клиент — часть готовности, а не отдельная проверка после нажатия.
       // Активная кнопка, которая в ответ говорит «выберите, кому», обманывает.
-      const ready = sum > 0 && draft.cpId > 0 && draft.items.some((it) => it.name.trim());
-      tg.MainButton.setParams({ text: `Выписать на ${money(sum)}`, is_active: ready });
-      if (ready) tg.MainButton.show(); else tg.MainButton.hide();
+      // Кнопка остаётся на месте и сама говорит, чего не хватает: раньше она
+      // пряталась, и человек не понимал, почему «Выписать» исчезло.
+      const lacks = draft.cpId <= 0 ? 'Выберите, кому выписать'
+        : (!draft.items.some((it) => it.name.trim()) ? 'Добавьте позицию'
+          : (sum > 0 ? '' : 'Укажите цену'));
+      tg.MainButton.setParams({ text: lacks || `Выписать на ${money(sum)}`, is_active: !lacks });
+      tg.MainButton.show();
     }
   }
 
@@ -5653,11 +5758,17 @@ screens.new = async function newDoc(params) {
     const qty = h('input', { value: it.qty, inputmode: 'decimal', 'aria-label': 'Количество' });
     qty.addEventListener('input', () => { it.qty = Number(qty.value.replace(',', '.')) || 0; recalc(); lineTotal(); });
 
+    // Единицу раньше выбрать было нельзя — всегда «шт.», хотя продают и по весу, и услугами.
+    const unitList = UNITS.includes(it.unit) || !it.unit ? UNITS : [it.unit, ...UNITS];
+    const unit = h('select', { class: 'unit', 'aria-label': 'Единица измерения' },
+      unitList.map((u) => h('option', { value: u, ...(u === (it.unit || 'шт.') ? { selected: '' } : {}) }, u)));
+    unit.addEventListener('change', () => { it.unit = unit.value; });
+
     const price = h('input', { value: it.price, inputmode: 'decimal', 'aria-label': 'Цена' });
     price.addEventListener('input', () => { it.price = Number(price.value.replace(',', '.')) || 0; recalc(); lineTotal(); });
 
     const sumEl = h('span', { class: 'line-total money' });
-    const lineTotal = () => { sumEl.textContent = money((Number(it.qty) || 0) * (Number(it.price) || 0)); };
+    const lineTotal = () => { sumEl.textContent = money(Number(lineCents(it.qty, it.price)) / 100); };
     lineTotal();
 
     const del = h('button', {
@@ -5670,9 +5781,12 @@ screens.new = async function newDoc(params) {
       },
     }, icon('trash'));
 
+    // Подписи видны всегда: два одинаковых поля без слов — это угадайка, где «количество», а где «цена».
+    const cap = (text, input) => h('label', { class: 'num' }, h('span', { class: 'cap', text }), input);
     return h('div', { class: 'item' },
       h('div', { class: 'top' }, name, del),
-      h('div', { class: 'nums' }, qty, h('span', { class: 'x', text: '×' }), price, sumEl));
+      h('div', { class: 'nums' }, cap('Кол-во', qty), cap('Ед.', unit), h('span', { class: 'x', text: '×' }), cap('Цена, ₽', price)),
+      h('div', { class: 'line-sum' }, h('span', { class: 'muted', text: 'Сумма' }), sumEl));
   }
 
   function drawItems() {

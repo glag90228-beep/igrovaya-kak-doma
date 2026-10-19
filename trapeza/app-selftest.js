@@ -310,7 +310,7 @@ const ok = (c, m, extra) => {
 
   const rows = await page.evaluate(() => [...document.querySelectorAll('.card .row .ellipsis')]
     .map((el) => el.textContent));
-  ok(rows.includes('Начальное сальдо'), 'и разбор называет источник — начальное сальдо', rows.join(', '));
+  ok(rows.includes('Долг на начало'), 'и разбор называет источник — долг на начало', rows.join(', '));
   ok(!rows.includes('Документы'), 'а документов в сумме нет: при «долге по отгрузке» счёт её не создаёт');
 
   /*
@@ -373,7 +373,7 @@ const ok = (c, m, extra) => {
     await page.waitForTimeout(700);
   };
   await swipeBack();
-  ok(await page.evaluate(() => (document.querySelector('h1') || {}).textContent) === 'Контрагенты',
+  ok(await page.evaluate(() => (document.querySelector('h1') || {}).textContent) === 'Клиенты',
     'жест от края увёл назад к списку, а не в никуда',
     await page.evaluate(() => (document.querySelector('h1') || {}).textContent));
 
@@ -654,6 +654,67 @@ const ok = (c, m, extra) => {
     bdb.updateOrg(user.id, bdb.getDefaultOrg(user.id).id, { vat_rate: '', vat_gross: 0, npd: 0 });
   }
 
+  console.log('\n── форма позиции, поля, контраст, цели нажатия (Д6, Д9, Д26, Д27, Р13) ──');
+  {
+    forgetRate();
+    await page.evaluate((cpId) => window.__go('new', { type: 'sch', cpId }), cp);
+    await page.waitForSelector('.item input.name');
+    await page.locator('.item input.name').first().fill('Крупа');
+    await page.locator('.item [aria-label="Количество"]').first().fill('1,5');
+    await page.locator('.item [aria-label="Цена"]').first().fill('99,99');
+    await page.waitForTimeout(400);
+    const line = await page.evaluate(() => document.querySelector('.item .line-total').textContent.replace(/[^\d,]/g, ''));
+    ok(line === '149,99', 'Р13: в форме 1,5 × 99,99 = 149,99 — как в документе, а не 149,98', line);
+    const total = await page.evaluate(() => document.querySelector('.total-row .money').textContent.replace(/[^\d,]/g, ''));
+    ok(total === '149,99', 'и итог формы тот же', total);
+    const caps = await page.evaluate(() => [...document.querySelectorAll('.item .num .cap')].map((e) => e.textContent).join('|'));
+    ok(caps === 'Кол-во|Ед.|Цена, ₽', 'Д9: у полей позиции видны подписи', caps);
+    await page.locator('.item select.unit').first().selectOption('кг');
+    const unit = await page.evaluate(() => document.querySelector('.item select.unit').value);
+    ok(unit === 'кг', 'Д9: единицу можно выбрать', unit);
+
+    // Д6: пустое поле видно — у него есть линия снизу.
+    await page.evaluate(() => window.__go('cp', {}));
+    await page.waitForSelector('#f-name');
+    const line6 = await page.evaluate(() => {
+      const st = getComputedStyle(document.getElementById('f-name'));
+      return { w: parseFloat(st.borderBottomWidth), h: document.getElementById('f-name').getBoundingClientRect().height };
+    });
+    ok(line6.w >= 1 && line6.h >= 44, 'Д6, Д27: пустое поле с линией и высотой не меньше 44 px', JSON.stringify(line6));
+
+    // Д26: подсказочный серый и текст кнопки читаются (≥ 4,5:1) на светлом фоне.
+    const ratio = await page.evaluate(() => {
+      const lum = (rgb) => {
+        const c = rgb.map((v) => { const x = v / 255; return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4; });
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+      };
+      const parse = (css) => {
+        const probe = document.createElement('i'); probe.style.color = css; document.body.append(probe);
+        const m = getComputedStyle(probe).color.match(/[\d.]+/g).map(Number); probe.remove(); return m.slice(0, 3);
+      };
+      const cr = (a, b) => { const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p); return (x + 0.05) / (y + 0.05); };
+      const root = getComputedStyle(document.documentElement);
+      return {
+        muted: cr(parse(root.getPropertyValue('--muted').trim() || 'gray'), [255, 255, 255]),
+        btn: cr(parse(root.getPropertyValue('--primary').trim() || 'blue'), [255, 255, 255]),
+      };
+    });
+    ok(ratio.muted >= 4.5, 'Д26: серый подсказочный текст ≥ 4,5:1 на белом', ratio.muted.toFixed(2));
+    ok(ratio.btn >= 4.5, 'Д26: белый на синей кнопке ≥ 4,5:1', ratio.btn.toFixed(2));
+
+    // Д27: мелкие кнопки и чипы дотягиваются до 44 px зоной нажатия, вид прежний.
+    await page.evaluate(() => window.__go('crm', {}));
+    await page.waitForSelector('.small-btn');
+    const hit = await page.evaluate(() => {
+      const b = document.querySelector('.small-btn'); const r = b.getBoundingClientRect();
+      const cx = r.left + r.width / 2; const cy = r.top + r.height / 2;
+      const up = document.elementFromPoint(cx, cy - 21); const down = document.elementFromPoint(cx, cy + 21);
+      return { h: r.height, up: up === b, down: down === b };
+    });
+    ok(hit.h < 44 && hit.up && hit.down, 'Д27: «Сделано» выглядит как прежде, а нажимается в зоне 44 px', JSON.stringify(hit));
+    forgetRate();
+  }
+
   /*
    * Нижняя панель и вкладка CRM — настоящим браузером и касаниями.
    *
@@ -679,7 +740,7 @@ const ok = (c, m, extra) => {
     await page.evaluate(() => window.__go('home'));
     await page.waitForSelector('#tabs .tab');
     const labels = await page.$$eval('#tabs .tab', (b) => b.map((x) => x.lastElementChild.textContent.trim()));
-    ok(labels.join('|') === 'Главная|Документы|Клиенты|CRM|Ещё', 'в панели пять вкладок, среди них CRM', labels.join('|'));
+    ok(labels.join('|') === 'Главная|Документы|Клиенты|Дела|Ещё', 'в панели пять вкладок, среди них «Дела»', labels.join('|'));
 
     const geo = await page.evaluate(() => {
       const t = document.getElementById('tabs').getBoundingClientRect();
@@ -782,9 +843,9 @@ const ok = (c, m, extra) => {
 
     // «Долги» ушли из панели, но не пропали: первая строка на вкладке «Ещё».
     await tap('#tabs .tab[data-name="more"]');
-    await page.getByText('Кто сколько должен', { exact: true }).first().tap();
+    await page.getByText('Долги', { exact: true }).first().tap();
     await page.waitForTimeout(700);
-    ok(await page.evaluate(() => document.getElementById('app').textContent.includes('Кто сколько должен') || document.getElementById('app').textContent.includes('Долгов нет')),
+    ok(await page.evaluate(() => (document.querySelector('h1') || {}).textContent === 'Долги' || document.getElementById('app').textContent.includes('Долгов нет')),
       'экран долгов открывается из «Ещё»');
   }
 
@@ -951,6 +1012,12 @@ const ok = (c, m, extra) => {
     await page.evaluate((id) => window.__go('cp', { id }), cpS);
     await page.waitForSelector('#cp-schedules', { timeout: 5000 });
     ok((await page.textContent('#cp-schedules')).includes('каждый день'), 'в карточке клиента — его расписание');
+    // Остановка спрашивает «точно?» (Д18): на вопрос отвечаем «да» — сначала проверяем, что отказ ничего не снимает.
+    page.once('dialog', (dlg) => dlg.dismiss());
+    await page.locator('#cp-schedules .row-act').tap();
+    await page.waitForTimeout(400);
+    ok(recLib.list(user.id).some((r) => r.cp_id === cpS), 'Д18: «Отмена» в вопросе — расписание осталось');
+    page.once('dialog', (dlg) => dlg.accept());
     await page.locator('#cp-schedules .row-act').tap();
     await page.waitForFunction(() => !document.getElementById('cp-schedules'), null, { timeout: 8000 });
     ok(!recLib.list(user.id).some((r) => r.cp_id === cpS), 'остановка из карточки клиента сняла расписание');
@@ -1148,7 +1215,8 @@ const ok = (c, m, extra) => {
     ok(await page.evaluate(() => [...document.querySelectorAll('.doc-row .ellipsis')].every((e) => e.scrollWidth <= e.clientWidth + 1)), 'Д11: заголовки строк не обрезаны многоточием');
     ok(await page.evaluate(() => [...document.querySelectorAll('.doc-row .doc-sub')].every((e) => e.scrollWidth <= e.clientWidth + 1)), 'Д11: подписи не обрезаны');
     ok(await page.locator('.pill-btn', { hasText: 'Напомнить' }).count() >= 1, 'Д12: в «Ждут оплаты» у должника есть кнопка «Напомнить»');
-    ok(await page.evaluate(() => [...document.querySelectorAll('.pill-btn')].every((b) => b.getBoundingClientRect().height >= 44)), 'кнопки «Напомнить» ≥ 44 px');
+    await page.waitForTimeout(500);   // экран въезжает анимацией: на лету высота меньше настоящей
+    ok(await page.evaluate(() => [...document.querySelectorAll('.pill-btn')].every((b) => b.getBoundingClientRect().height >= 43.9)), 'кнопки «Напомнить» ≥ 44 px');
 
     await page.evaluate(() => window.__go('docs', {}));
     await page.waitForSelector('.doc-row', { timeout: 5000 });
@@ -1228,7 +1296,13 @@ const ok = (c, m, extra) => {
     const saved = await mailboxLib.save(user.id, { preset: 'custom', host: '127.0.0.1', port: deadPort, secure: false, pass: 'x', from: 'me@mycompany.ru' });
     ok(saved.ok, 'ящик с недоступным сервером заведён', JSON.stringify(saved));
     await page.evaluate(() => window.__go('reminders', {}));
-    await page.waitForSelector('textarea.remind-text', { timeout: 5000 });
+    await page.waitForSelector('textarea.remind-text', { state: 'attached', timeout: 5000 });
+    // Д13: у нескольких должников письма свёрнуты, «Отправить» не уезжает под тридцать строк.
+    const folded = await page.evaluate(() => {
+      const ds = [...document.querySelectorAll('details.letter')];
+      return { n: ds.length, open: ds.filter((d) => d.open).length };
+    });
+    ok(folded.n > 1 && folded.open === 0, 'Д13: письма нескольких должников свёрнуты', JSON.stringify(folded));
     await page.fill('input[type=email]', 'buh@dolzhnik.ru');
     await page.getByRole('button', { name: 'Отправить с моей почты' }).first().tap();
     await page.waitForSelector('.toast-act', { timeout: 8000 });
@@ -1312,7 +1386,7 @@ const ok = (c, m, extra) => {
     await wp.evaluate(() => window.__go('docs', {}));
     await wp.waitForFunction(() => document.getElementById('tb-title').textContent === 'Документы');
     await wp.evaluate(() => window.__go('billing', {}));
-    await wp.waitForFunction(() => document.getElementById('tb-title').textContent === 'Тариф');
+    await wp.waitForFunction(() => document.getElementById('tb-title').textContent === 'Подписка');
     await wp.goBack();
     await wp.waitForFunction(() => document.getElementById('tb-title').textContent === 'Документы', null, { timeout: 5000 });
     ok((await where()) === 'Документы' && wp.url().startsWith(base), 'стрелка браузера «назад»: на предыдущий экран, а не с сайта', await where());

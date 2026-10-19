@@ -27,7 +27,7 @@ const TOKEN = process.env.BOT_TOKEN;
 
 const bdb = require('./lib/bot-db');
 const docService = require('./lib/doc-service');
-const { server, setTelegram } = require('./miniapp');
+const { server, setTelegram, forgetRate } = require('./miniapp');
 
 const USER = { id: 424242, first_name: 'Мария', last_name: 'Сарычева', username: 'masha' };
 
@@ -224,11 +224,11 @@ const SHOTS = [
   },
   { name: 'pustoy-schet', title: 'Новый счёт (пустой)', go: ['new', { type: 'sch' }] },
   { name: 'dokumenty', title: 'Документы', go: ['docs', {}] },
-  { name: 'kontragenty', title: 'Контрагенты', go: ['cps', {}] },
-  { name: 'crm', title: 'CRM', go: ['crm', {}] },
-  { name: 'crm-nizhe', title: 'CRM: лента событий', go: ['crm', {}], scroll: 'bottom' },
+  { name: 'klienty', title: 'Клиенты', go: ['cps', {}] },
+  { name: 'crm', title: 'Дела', go: ['crm', {}] },
+  { name: 'crm-nizhe', title: 'Дела: лента событий', go: ['crm', {}], scroll: 'bottom' },
   {
-    name: 'crm-forma', title: 'CRM: раскрыта форма напоминания', go: ['crm', {}],
+    name: 'crm-forma', title: 'Дела: раскрыта форма напоминания', go: ['crm', {}],
     act: async (page) => { await page.locator('#crm-new-btn').click(); await page.waitForTimeout(250); },
   },
   {
@@ -525,6 +525,8 @@ async function main() {
     // PREVIEW_ONLY=crm,glavnaya — снять только перечисленные экраны.
     const only = (process.env.PREVIEW_ONLY || '').split(',').filter(Boolean);
     for (const shot of SHOTS.filter((x) => !only.length || only.includes(x.name))) {
+      // Предел частоты рассчитан на человека, а снимки идут подряд: без сброса экран после двадцатого получал «Слишком много запросов».
+      forgetRate();
       await page.goto(base, { waitUntil: 'domcontentloaded' });
       await page.waitForSelector('#app .screen', { timeout: 15000 });
       /*
@@ -554,6 +556,27 @@ async function main() {
       await page.waitForTimeout(200);
       const file = path.join(OUT, `${shot.name}-${themeName}.png`);
       await page.screenshot({ path: file, fullPage: false });
+      // PREVIEW_TAPS=1 — перечислить цели нажатия меньше 44 px (с учётом расширенной зоны вокруг).
+      if (process.env.PREVIEW_TAPS && themeName === 'light') {
+        const small = await page.evaluate(() => {
+          const out = [];
+          const hit = (el, x, y) => {
+            if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) return true;   // за экраном не проверить
+            const t = document.elementFromPoint(x, y);
+            return Boolean(t) && (t === el || el.contains(t));
+          };
+          for (const el of document.querySelectorAll('#app button, #app a[href], #app input:not([type=hidden]), #app select, #app textarea, #topbar button, #tabs button')) {
+            const r = el.getBoundingClientRect();
+            if (!r.width || !r.height || r.bottom < 0 || r.top > innerHeight) continue;
+            const cx = r.left + r.width / 2; const cy = r.top + r.height / 2;
+            const okH = r.width >= 44 || (hit(el, cx - 21, cy) && hit(el, cx + 21, cy));
+            const okV = r.height >= 44 || (hit(el, cx, cy - 21) && hit(el, cx, cy + 21));
+            if (!okH || !okV) out.push(`${el.tagName.toLowerCase()}.${String(el.className).split(' ').join('.')} «${(el.textContent || el.value || '').trim().slice(0, 30)}» ${Math.round(r.width)}x${Math.round(r.height)}`);
+          }
+          return out;
+        });
+        for (const line of small) console.log(`  мелкая цель [${shot.name}]: ${line}`);
+      }
       made.push({ file, title: shot.title, theme: themeName });
     }
     await ctx.close();

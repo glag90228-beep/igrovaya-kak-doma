@@ -742,7 +742,7 @@ async function main() {
     ok(r.json.added === 1 && r.json.npd && r.json.npd.cheque.amount === 7000, 'Р3: платёж из выписки — чек сразу при занесении', JSON.stringify(r.json.npd && r.json.npd.cheque));
   }
 
-  section('переключатель ИИ-ассистента');
+  section('переключатель помощника');
   {
     /*
      * В приложении переключатель был нарисован, а на сервере его не было:
@@ -1385,7 +1385,7 @@ async function main() {
     ok(r.json.cps.find((c) => c.id === cpT).balance === 3000,
       'и долг накладной виден на контрагенте', r.json.cps.find((c) => c.id === cpT).balance);
 
-    // Отменить проводку можно из бота; приложение обязано это показать.
+    // Отменить запись можно из бота; приложение обязано это показать.
     bdb.deleteLastOp(bdb.getOrCreateUser(500404).id, cpK);
     r = await call('GET', '/api/docs', { user: katya });
     const undone = r.json.docs.find((x) => x.id === docK.id);
@@ -2924,6 +2924,38 @@ async function main() {
       'при этом акт по-прежнему долга не создаёт и проводок не имеет');
   }
 
+  section('единый словарь: жаргон не доходит до людей (Д23, Д24)');
+  {
+    /*
+     * Слова интерфейса проверяем по исходникам: в пользовательских строках бота,
+     * приложения и сервера не должно быть слов из чужого словаря. Комментарии
+     * вырезаем — в них объясняют «почему», и там термин уместен. Печатные формы
+     * (акт сверки, реестр) сюда не входят: у них свой язык, язык бухгалтера.
+     * Список слов и замены — в README, раздел «Слова интерфейса».
+     */
+    const fs = require('node:fs');
+    const strip = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/<!--[\s\S]*?-->/g, '')
+      .split('\n').filter((l) => !/^\s*\/\//.test(l)).map((l) => l.replace(/(^|\s)\/\/\s.*$/, '$1')).join('\n');
+    const BAD = [/онтрагент/i, /роводк/i, /ГОСТ/, /аксимиле/i, /ссистент/i, /Кто сколько должен/, /Кто должен/,
+      /альдо/i, /акрывающ/i, /CRM/, /Не оплачено(?!:)/];
+    for (const f of ['bot.js', 'miniapp.js', 'public/app/app.js', 'public/app/index.html',
+      'lib/bot-setup.js', 'lib/facsimile.js', 'lib/bot-support.js']) {
+      const hits = [];
+      strip(fs.readFileSync(f, 'utf8')).split('\n').forEach((l, i) => {
+        for (const b of BAD) if (b.test(l)) hits.push(`${i + 1}: ${l.trim().slice(0, 80)}`);
+      });
+      ok(hits.length === 0, `словарь: в ${f} нет «контрагент», «проводка», «сальдо», «CRM», «ассистент» и прочего жаргона`, hits.slice(0, 3).join(' | '));
+    }
+    const js = fs.readFileSync('./public/app/app.js', 'utf8');
+    const emoji = /[\u{1F300}-\u{1FAFF}☀-➿⏰⏱⭐✅❌]/u;
+    const noEmoji = strip(js).split('\n').filter((l) => emoji.test(l) && !/TL_ICON/.test(l) && !/^\s*return /.test(l));
+    ok(noEmoji.length === 0, 'Д25: в приложении нет эмодзи — только значки из спрайта', noEmoji.slice(0, 3).join(' | '));
+    const html = fs.readFileSync('./public/app/index.html', 'utf8');
+    const used = new Set([...js.matchAll(/icon\('([a-z0-9-]+)'/g)].map((m) => m[1]));
+    const missing = [...used].filter((n) => !html.includes(`id="i-${n}"`));
+    ok(missing.length === 0, 'все значки, которые просит приложение, есть в спрайте', missing.join(', '));
+  }
+
   section('вкладка CRM в разметке приложения');
   {
     // Файл приложения в этом прогоне не исполняется, а вкладка — это строка
@@ -2931,7 +2963,7 @@ async function main() {
     const fs = require('node:fs');
     const js = fs.readFileSync('./public/app/app.js', 'utf8');
     const html = fs.readFileSync('./public/app/index.html', 'utf8');
-    ok(/\{ name: 'crm', label: 'CRM', icon: 'bell' \}/.test(js), 'вкладка CRM есть в нижней панели');
+    ok(/\{ name: 'crm', label: 'Дела', icon: 'bell' \}/.test(js), 'вкладка «Дела» есть в нижней панели');
     ok(/screens\.crm = async function/.test(js), 'у вкладки есть экран');
     ok(html.includes('id="i-bell"'), 'значок вкладки есть в спрайте');
     ok(html.includes('<nav id="tabs"'), 'нижняя панель есть в разметке');

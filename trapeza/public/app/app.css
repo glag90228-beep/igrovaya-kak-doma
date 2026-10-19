@@ -87,12 +87,23 @@
   --surface: var(--tg-theme-section-bg-color, #ffffff);
   --group: var(--tg-theme-secondary-bg-color, #f4f4f7);
   --text: var(--tg-theme-text-color, #12171c);
-  --muted: var(--tg-theme-hint-color, #7d8b99);
-  --link: var(--tg-theme-link-color, #2b7fd4);
-  --primary: var(--tg-theme-button-color, #2b7fd4);
+  /*
+   * Серый подсказочный текст и синий кнопок — плотнее, чем отдаёт тема.
+   *
+   * Серый #7d8b99 из темы Telegram на белом даёт 3,5:1 при норме 4,5:1 для
+   * мелкого текста: подписи 12-14 px читались с трудом. Подмешиваем к нему
+   * цвет основного текста, и серый остаётся серым, но выходит на 5,7:1 в
+   * светлой теме (в тёмной он и так светлый). Тот же приём для кнопок: белый
+   * на #2b7fd4 — 4,1:1, а на чуть темнее — 5,3:1.
+   */
+  --muted: color-mix(in srgb, var(--tg-theme-hint-color, #5f6c7a) 72%, var(--text));
+  --link: color-mix(in srgb, var(--tg-theme-link-color, #2b7fd4) 86%, #000);
+  --primary: color-mix(in srgb, var(--tg-theme-button-color, #2b7fd4) 86%, #000);
   --on-primary: var(--tg-theme-button-text-color, #ffffff);
   --danger: var(--tg-theme-destructive-text-color, #d1453b);
-  --section-title: var(--tg-theme-section-header-text-color, var(--tg-theme-hint-color, #7d8b99));
+  --section-title: var(--muted);
+  /* Линия под полем ввода: без неё пустое поле не отличить от строки-подписи. */
+  --input-line: color-mix(in srgb, var(--muted) 55%, transparent);
 
   /* Деньги. Тема Telegram даёт только цвет действия и цвет опасности —
      этого мало: «нам должны» и «мы должны» человек должен различать
@@ -100,7 +111,7 @@
   --money-in: #0f9d58;
   /* Ожидание оплаты. Не зелёный (это «получено») и не красный (это «мы
      должны»): у ожидания свой смысл, и свой цвет ему нужен отдельный. */
-  --wait: #b8730a;
+  --wait: #9a5f05;
   --money-out: #e5484d;
   --success: #0f9d58;
 
@@ -155,7 +166,9 @@
     --surface: var(--tg-theme-section-bg-color, #1d2733);
     --group: var(--tg-theme-secondary-bg-color, #131c26);
     --text: var(--tg-theme-text-color, #f1f4f7);
-    --muted: var(--tg-theme-hint-color, #8fa1b3);
+    --muted: color-mix(in srgb, var(--tg-theme-hint-color, #8fa1b3) 72%, var(--text));
+    /* В тёмной теме ссылка должна быть светлой, а кнопка — тёмной под белый текст. */
+    --link: var(--tg-theme-link-color, #62a8f0);
     --money-in: #35d07f;
     /* На тёмном b8730a почти не читается — берём светлее. */
     --wait: #f5a524;
@@ -325,6 +338,16 @@ button.row:active, a.row:active, .tile:active, .btn:active {
 
 .icon { width: 22px; height: 22px; flex: none; }
 svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+/* Значок внутри строки текста — подписи, кнопки, чипы: по высоте букв, а не плитка 22 px.
+   Эмодзи тут не годятся: на каждом телефоне они свои и не берут цвет темы. */
+.icon.inline { width: 1.15em; height: 1.15em; margin-right: .4em; vertical-align: -.2em; }
+.icon.inline:last-child { margin-right: 0; margin-left: .25em; }
+.icon.inline:first-child { margin-left: 0; margin-right: .4em; }
+.btn .icon.inline, .chip .icon.inline { margin: 0 .1em 0 0; }
+/* Уровень риска договора: цветная точка вместо 🔴🟡🟢. */
+.risk-dot { display: inline-block; width: .65em; height: .65em; border-radius: 50%; margin-right: .5em; background: var(--wait); }
+.risk-dot.high { background: var(--danger); }
+.risk-dot.low { background: var(--success); }
 .icon-box {
   width: 36px; height: 36px; border-radius: 11px; flex: none;
   display: grid; place-items: center;
@@ -483,7 +506,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   box-shadow: none;
 }
 .btn.ghost { background: none; color: var(--link); box-shadow: none; min-height: var(--tap); }
-.btn.danger { background: none; color: var(--danger); box-shadow: none; }
+.btn.danger { background: none; color: var(--danger); box-shadow: none; border: 1.5px solid color-mix(in srgb, var(--danger) 45%, transparent); }
 .btn-wrap { padding: 4px 12px 12px; }
 
 /*
@@ -535,16 +558,18 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .field .req { color: var(--danger); }
 .field input, .field textarea, .field select {
   width: 100%;
-  min-height: 32px;
-  padding: 0;
+  min-height: var(--tap);
+  padding: 6px 0;
   border: 0;
-  border-radius: var(--r-field);
+  border-bottom: 1.5px solid var(--input-line);   /* поле видно и пустым, а не только заполненным */
+  border-radius: 0;
   background: none;
   color: var(--text);
   font: 500 17px/1.4 var(--font);   /* 16px и больше — иначе iOS увеличивает страницу */
 }
 .field textarea { min-height: 92px; padding: 6px 0; resize: vertical; }
-.field input:focus, .field textarea:focus { outline: none; }
+.field input:focus, .field textarea:focus, .field select:focus { outline: none; border-bottom-color: var(--primary); }
+.field.invalid input, .field.invalid textarea { border-bottom-color: var(--danger); }
 .field.invalid input { color: var(--danger); }
 .field .err {
   display: flex; gap: 6px; align-items: center;
@@ -561,7 +586,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
    и того, кого в справочнике ещё нет. */
 .cp-chip {
   display: flex; align-items: center; gap: 10px; width: 100%;
-  padding: 6px 0; border: 0; background: none; color: inherit;
+  padding: 6px 0; min-height: var(--tap); border: 0; background: none; color: inherit;
   font: 500 17px/1.4 var(--font); text-align: left; cursor: pointer;
 }
 .cp-chip:active { opacity: .6; }
@@ -602,20 +627,29 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .item { padding: 10px var(--pad); display: grid; gap: 8px; }
 .item + .item { border-top: 1px solid var(--border); }
 .item .top { display: flex; gap: 10px; align-items: start; }
-.item .name { flex: 1; border: 0; background: none; color: inherit; font: 500 16px/1.4 var(--font); min-width: 0; }
-.item .nums { display: flex; align-items: center; gap: 8px; }
+.item .name { flex: 1; border: 0; background: none; color: inherit; font: 500 16px/1.4 var(--font); min-width: 0; min-height: var(--tap); }
+.item .nums { display: flex; align-items: flex-end; gap: 8px; }
+.item .nums .num { display: grid; gap: 2px; }
+.item .nums .num .cap { font: 500 12px/1.2 var(--font); color: var(--muted); }
+.item .nums .x { padding-bottom: 12px; }
+.item .nums select.unit {
+  width: 74px; min-height: var(--tap); padding: 0 6px;
+  border: 1px solid var(--border); border-radius: var(--r-field);
+  background: var(--group); color: inherit; font: 400 16px/1 var(--font);
+}
+.item .line-sum { display: flex; justify-content: space-between; align-items: baseline; font-size: 14px; }
 .item .nums input {
-  width: 74px; text-align: right;
+  width: 84px; text-align: right;
   border: 1px solid var(--border); border-radius: var(--r-field);
   background: var(--group); color: inherit;
   font: 400 16px/1 var(--font); font-variant-numeric: tabular-nums;
-  min-height: 36px; padding: 0 8px;
+  min-height: var(--tap); padding: 0 8px;
 }
 .item .nums .x { color: var(--muted); }
 .item .line-total { margin-left: auto; font-weight: 500; font-variant-numeric: tabular-nums; }
 
 .iconbtn {
-  width: var(--tap); height: var(--tap);
+  width: var(--tap); min-width: var(--tap); height: var(--tap);
   display: grid; place-items: center;
   border: 0; background: none; color: var(--muted);
   border-radius: var(--r-btn); cursor: pointer; flex: none;
@@ -1289,10 +1323,24 @@ body.drawer-open { overflow: hidden; }
 .fu-row { align-items: flex-start; }
 .fu-late { color: var(--danger); }
 .fu-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
-.small-btn { width: auto; min-height: 36px; padding: 6px 12px; font-size: 14px; }
+.small-btn { width: auto; min-height: 36px; padding: 6px 12px; font-size: 14px; white-space: nowrap; }
+
+/*
+ * Цель нажатия не меньше 44 px (Apple HIG и WCAG 2.5.8), а вид прежний.
+ *
+ * Чипы, мелкие кнопки и плашка способа подсчёта по высоте 26–36 px: пальцем в
+ * них попадали с трудом, особенно в списках, где они стоят рядом. Увеличивать
+ * сами кнопки значило бы раздуть экран, поэтому расширяем невидимую зону
+ * нажатия — псевдоэлементом, который целиком принадлежит кнопке.
+ */
+.chip, .small-btn, .chip-basis { position: relative; }
+.chip::after, .small-btn::after, .chip-basis::after {
+  content: ''; position: absolute; left: -2px; right: -2px; top: 50%;
+  height: var(--tap); transform: translateY(-50%);
+}
 .crm-form .field + .field { margin-top: 14px; }
 .crm-form textarea { width: 100%; margin-bottom: 8px; }
-.crm-hint { margin: -4px 0 8px; }
+.crm-hint { margin: -4px var(--pad) 8px; }
 .crm-form[hidden] { display: none; }
 .feed-text { overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .crm-form select { width: 100%; }
@@ -1361,3 +1409,34 @@ body.is-login #app {
   display: block; margin-top: 2px; color: var(--primary);
   font: 800 64px/1.1 var(--font-num); letter-spacing: .04em; font-variant-numeric: tabular-nums;
 }
+
+/* Раскрывающийся блок «Текст письма»: у нескольких должников письма не заслоняют кнопки. */
+details.letter > summary {
+  list-style: none; cursor: pointer; min-height: var(--tap);
+  display: flex; align-items: center; gap: 6px; padding: 0 var(--pad);
+  color: var(--link); font: 600 15px/1.2 var(--font);
+  border-top: 1px solid var(--hairline);
+}
+details.letter > summary::-webkit-details-marker { display: none; }
+details.letter > summary::after {
+  content: ''; margin-left: auto; width: 8px; height: 8px; flex: none;
+  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  transform: rotate(45deg); transition: transform var(--fast) var(--ease);
+}
+details.letter[open] > summary::after { transform: rotate(-135deg); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* «Дополнительно»: то, что нужно не всем, сворачиваем — по виду как заголовок раздела, но нажимается. */
+details.more-fields > summary {
+  list-style: none; cursor: pointer; min-height: var(--tap);
+  display: flex; align-items: center; margin: 12px var(--pad) 0;
+  font: 600 12px/1.4 var(--font); color: var(--section-title);
+  text-transform: uppercase; letter-spacing: .06em;
+}
+details.more-fields > summary::-webkit-details-marker { display: none; }
+details.more-fields > summary::after {
+  content: ''; margin-left: auto; width: 8px; height: 8px; flex: none;
+  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  transform: rotate(45deg); transition: transform var(--fast) var(--ease);
+}
+details.more-fields[open] > summary::after { transform: rotate(-135deg); }
