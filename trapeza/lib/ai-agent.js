@@ -503,8 +503,10 @@ function withWhen(intent, ctx, asPeriod = false) {
  * получали одно и то же.
  */
 const GENERIC_WHO = /^(?:вс(?:ем|ех|е)|должник[а-яё]*|клиент[а-яё]*|контрагент[а-яё]*|покупател[а-яё]*|заказчик[а-яё]*)$/iu;
-function tidyRemind(r) {
+function tidyRemind(r, clients = []) {
   if (!r.who || !GENERIC_WHO.test(String(r.who).trim())) return r;
+  // Клиент, которого так и зовут («ООО Клиент»), — настоящее имя, а не слово вместо него.
+  if (clients.length && rules.findWho(r.who, clients)) return r;
   const { who, ...rest } = r;
   return /^(?:вс|должник)/iu.test(String(who).trim()) ? { ...rest, all: true } : rest;
 }
@@ -527,7 +529,7 @@ function parseLocal(text, opts = {}) {
   if (!t) return null;
 
   const remind = rules.remindFrom(ctx);
-  if (remind) return tidyRemind(remind);
+  if (remind) return tidyRemind(remind, ctx.clients);
   const repeat = rules.repeatFrom(ctx);
   if (repeat) return repeat;
   if (rules.RECURRING.test(t) && !rules.AKT.test(t)) {
@@ -593,6 +595,50 @@ function matchCp(cps, name) {
   const like = scored.filter((x) => x.s.fuzzy > 0);
   if (like.length) return { choices: like.map((x) => x.c).slice(0, 8) };
   return {};
+}
+
+/**
+ * Что делать с «повтори …» — решение без сообщений, одно для бота и приложения.
+ *
+ * Что считать «тем самым документом» не должно зависеть от того, откуда
+ * спросили: у бота и у приложения один порядок поиска и одни и те же случаи,
+ * когда надо переспросить, а не выбрать за человека.
+ *
+ * @param {number} userId
+ * @param {{who?:string, cpId?:number, docType?:string, date?:string}} by
+ * @returns {{kind:string}} kind:
+ *   forbidden — платёжку и договор повторить нельзя
+ *   choices   — клиент неоднозначен (choices) · missing — такого клиента нет (who)
+ *   ask       — не сказано, что именно повторять
+ *   one       — нашёлся ровно тот документ (doc)
+ *   pick      — на названное число их несколько (docs)
+ *   fallback  — на названное число нет, вот последний (doc); человек решает сам
+ *   none      — повторять нечего
+ */
+function planRepeat(userId, by = {}) {
+  const bdb = require('./bot-db');
+  const type = by.docType || '';
+  if (type && !bdb.REPEATABLE.includes(type)) return { kind: 'forbidden' };
+  const date = isoDay(by.date);
+  let cp = null;
+  if (by.cpId) {
+    cp = bdb.getCp(userId, Number(by.cpId));
+    if (!cp) return { kind: 'missing', who: String(by.who || '') };
+  } else if (by.who) {
+    const found = matchCp(bdb.listCps(userId), by.who);
+    if (found.choices) return { kind: 'choices', who: by.who, choices: found.choices, type, date };
+    if (!found.cp) return { kind: 'missing', who: by.who };
+    cp = found.cp;
+  }
+  if (!cp && !type && !date) return { kind: 'ask' };
+  const q = { cpId: cp ? cp.id : 0, type, date };
+  const docs = bdb.repeatSources(userId, q);
+  if (!docs.length) {
+    const last = date ? bdb.repeatSources(userId, { ...q, date: '', limit: 1 })[0] : null;
+    return last ? { kind: 'fallback', doc: last, cp, type, date } : { kind: 'none', cp, type, date };
+  }
+  if (docs.length > 1 && date) return { kind: 'pick', docs, cp, type, date };
+  return { kind: 'one', doc: docs[0], cp, type, date };
 }
 
 // ---------- инструкция ИИ ----------
@@ -1328,7 +1374,7 @@ async function understand(text, userId) {
 }
 
 module.exports = {
-  understand, analyze, modelParse, quickParse, parseLocal, sanitize, matchCp, budget, spend, aiLock,
+  understand, analyze, modelParse, quickParse, parseLocal, sanitize, matchCp, planRepeat, budget, spend, aiLock,
   aiAvailable, aiHint, MODEL_DEFAULT, SHOW_ACTIONS, SYSTEM, OUTOFSCOPE_REPLY,
   answerTax, taxAnswersOn,
 };

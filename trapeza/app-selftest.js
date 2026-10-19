@@ -1440,6 +1440,114 @@ const ok = (c, m, extra) => {
     ok(dbW.prepare('SELECT COUNT(*) AS n FROM web_sessions').get().n === 0, 'после выхода живых сессий нет');
   }
 
+  /*
+   * Поле «Что нужно сделать?» — те же фразы, что в боте. Клиентскую часть
+   * сервером не проверить: что нарисовать на «напомни», «повтори», «акт за
+   * сентябрь», решает app.js. Печатаем фразы настоящим пальцем и смотрим,
+   * что на экране и что осталось в базе.
+   */
+  console.log('\n── помощник в приложении: напомнить, повторить, период, дата ──');
+  {
+    const perP = require(path.join(APP, 'lib/period'));
+    const yest = perP.iso(new Date(perP.todayDate().getTime() - 86400000));
+    const pm = perP.presetRange('pm');
+    const inPm = `${pm.from.slice(0, 8)}12`;
+    const cpV = bdb.createCp(user.id, { name: 'ООО «Вектор»', kind: 'customer', opening_date: '2026-01-01' });
+    const mkDoc = (type, price, date) => docService.issueDocument(user.id, {
+      type, cpId: cpV, items: [{ name: 'Работа', qty: 1, price }], date, skipQuota: true });
+    await mkDoc('sch', 12000, inPm);
+    await mkDoc('torg12', 5000, yest);
+    bdb.setAiEnabled(user.id, true);
+
+    await page.evaluate(() => window.__go('ask', {}));
+    await page.waitForSelector('.ask-bar');
+    const say = async (text) => {
+      await page.locator('.ask-input').fill(text);
+      await page.locator('.ask-input').press('Enter');
+      await page.waitForTimeout(900);
+      return page.evaluate(() => {
+        const all = [...document.querySelectorAll('.bubble.bot')];
+        const b = all[all.length - 1];
+        return { text: b.textContent, buttons: [...b.querySelectorAll('button')].map((x) => x.textContent) };
+      });
+    };
+    const h1 = () => page.evaluate(() => (document.querySelector('h1') || {}).textContent);
+    const clickBtn = async (label) => {
+      await page.locator('.bubble.bot button', { hasText: label }).last().click();
+      await page.waitForTimeout(700);
+    };
+    const docsNow = () => bdb.listDocs(user.id, 500).length;
+
+    // напомнить: экран напоминания, письмо не ушло (почты у человека нет вовсе, а текст виден)
+    let a = await say('напомни Вектору про долг');
+    ok(/Подготовил напоминание для «ООО «Вектор»»/.test(a.text) && /только когда вы нажмёте/.test(a.text) && a.buttons.includes('Открыть напоминание'),
+      '«напомни Вектору про долг» → кнопка к напоминанию, письмо только по нажатию', a.text.slice(0, 100));
+    await clickBtn('Открыть напоминание');
+    ok(await h1() === 'Напомнить о долге' && /Вектор/.test(await page.textContent('#app')), 'кнопка открывает напоминание этому клиенту', await h1());
+    await page.evaluate(() => window.__go('ask', {}));
+    await page.waitForSelector('.ask-bar');
+    a = await say('напомни всем должникам');
+    ok(a.buttons.includes('Напомнить должникам'), '«всем должникам» — кнопка к общему экрану', a.buttons.join('|'));
+
+    // повторить: форма на проверку, документ не выписан
+    const n0 = docsNow();
+    a = await say('повтори вчерашнюю накладную');
+    ok(/Нашёл: .*ТОРГ-12/.test(a.text) && a.buttons.includes('Повторить'), '«повтори вчерашнюю накладную» → нашла и предлагает повторить', a.text.slice(0, 100));
+    await clickBtn('Повторить');
+    ok(await page.locator('#repeat-note').count() === 1 && docsNow() === n0,
+      'открылась форма повтора на проверку, новый документ не выписан', `${await h1()} · ${docsNow() - n0}`);
+    const repDate = await page.locator('#f-date').inputValue();
+    ok(repDate === perP.todayISO(), 'в форме сегодняшняя дата, а не вчерашняя', repDate);
+    await page.evaluate(() => window.__go('ask', {}));
+    await page.waitForSelector('.ask-bar');
+    a = await say('повтори вчерашний счёт Вектору');
+    ok(/Последний —/.test(a.text) && a.buttons.some((b) => b.startsWith('Повторить №')),
+      'на вчера счёта нет — последний предложен кнопкой, не подставлен молча', a.text.slice(0, 100));
+
+    // акт за период из фразы: сразу собран, а «Другой период» открывает экран с этим периодом
+    a = await say('акт сверки с вектором за прошлый месяц');
+    ok(/Собрал акт сверки за/.test(a.text) && a.buttons.includes('Другой период'), 'период назван — акт собран без вопроса', a.text.slice(0, 100));
+    ok(!/За какой период/.test(await page.textContent('#app')), 'и вопроса о периоде в переписке не было');
+    await clickBtn('Другой период');
+    ok(await h1() === 'Акт сверки' && await page.locator('#f-from').inputValue() === pm.from && await page.locator('#f-to').inputValue() === pm.to,
+      '«Другой период» открывает экран акта с уже стоящими датами', `${await page.locator('#f-from').inputValue()}…${await page.locator('#f-to').inputValue()}`);
+
+    // журнал и неоплаченные — на периоде
+    await page.evaluate(() => window.__go('ask', {}));
+    await page.waitForSelector('.ask-bar');
+    a = await say('покажи документы за прошлый месяц');
+    ok(a.buttons.some((b) => /^Открыть документы за/.test(b)), 'журнал за период предлагается одной кнопкой', a.buttons.join('|'));
+    await clickBtn('Открыть документы за');
+    await page.waitForSelector('#docs-range');
+    const inRange = bdb.docsBetween(user.id, pm.from, pm.to).length;
+    ok(await h1() === 'Документы' && inRange > 0 && (await page.locator('.swipe').count()) === inRange
+      && await page.locator('#docs-all').count() === 1 && (await page.textContent('#docs-range')).includes(`${inRange}`),
+    'открыт журнал за период: ровно документы периода и выход к полному', `${await page.locator('.swipe').count()} из ${inRange}`);
+    await page.evaluate(() => window.__go('ask', {}));
+    await page.waitForSelector('.ask-bar');
+    a = await say('покажи неоплаченные счета за прошлый месяц');
+    await clickBtn('Кто не заплатил за');
+    await page.waitForSelector('#unpaid-range');
+    ok(await h1() === 'Ждут оплаты' && (await page.locator('.card .doc-sub, .card .row').count()) >= 1, 'и «ждут оплаты» за период открыты на нём');
+
+    // оплата с датой: включённый вносит сам, вчерашним числом
+    await page.evaluate(() => window.__go('ask', {}));
+    await page.waitForSelector('.ask-bar');
+    a = await say('вчера Вектор оплатил 5000');
+    const opV = bdb.listOps(user.id, cpV).find((o) => Number(o.debit) === 5000);
+    ok(/Внёс: Оплата/.test(a.text) && opV && opV.date === yest, 'оплата внесена вчерашним числом', JSON.stringify(opV));
+    // из будущего — на подтверждение, сам не вносит
+    const opsBefore = bdb.listOps(user.id, cpV).length;
+    a = await say('Вектор оплатил три тысячи завтра');
+    ok(bdb.listOps(user.id, cpV).length === opsBefore && /ещё впереди/.test(a.text) && a.buttons.some((b) => /^Внести/.test(b)),
+      'дата из будущего: ждёт нажатия, не внесена', a.text.slice(0, 100));
+    // документ с датой: включённый выписывает вчерашним числом
+    const nDoc = docsNow();
+    a = await say('выставь счёт вектору на пять тысяч вчерашним числом');
+    const made = bdb.listDocs(user.id, 1)[0];
+    ok(docsNow() === nDoc + 1 && made.date === yest && made.total === 5000, 'документ выписан названной датой', `${made.date} ${made.total}`);
+  }
+
   await browser.close();
   await new Promise((r) => server.close(r));
   await require(path.join(APP, 'lib/pdf')).closePdf();

@@ -1178,14 +1178,30 @@ async function repeatDoc(docId) {
   } catch (e) { toast(e.message, true); }
 }
 
-screens.docs = async function docs({ cp } = {}) {
+screens.docs = async function docs({ cp, from, to } = {}) {
   // Сервер умеет отдавать журнал по одному клиенту — в приложении этим
   // никто не пользовался, хотя из его карточки это первое, что нужно.
-  const { docs: list } = await api('GET', `/api/docs${cp ? `?cp=${cp}` : ''}`);
+  // И за период: так открывает помощник на «покажи документы за август».
+  const q = new URLSearchParams();
+  if (cp) q.set('cp', String(cp));
+  if (to) { if (from) q.set('from', from); q.set('to', to); }
+  const { docs: list } = await api('GET', `/api/docs${q.toString() ? `?${q}` : ''}`);
   // Режим НДС нужен, чтобы решить, показывать ли счета-фактуры. Кэш может
   // быть пуст, если на этот экран пришли сразу по ссылке.
   const st = cache.org ? cache : await api('GET', '/api/state');
   const box = h('div', {}, h('h1', { text: 'Документы' }));
+  // Период назван — говорим, какой, и даём выйти к полному журналу.
+  const scoped = Boolean(to);
+  if (scoped) {
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px', id: 'docs-range',
+      text: `За период ${from ? `${ru(from)} — ` : 'по '}${ru(to)}: ${list.length} ${plural(list.length, 'документ', 'документа', 'документов')}.` }));
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn secondary', id: 'docs-all', onclick: () => { haptic(); go('docs', cp ? { cp } : {}); } }, 'Все документы')));
+  }
+  if (!list.length && scoped) {
+    box.append(empty('doc', 'За этот период ничего нет', 'Выберите другой период или откройте все документы.'));
+    return box;
+  }
   if (!list.length) {
     /*
      * Пустой журнал — не значит «денег нет». Оплаты и приходы вносят руками,
@@ -3862,9 +3878,9 @@ screens.ask = async function ask() {
   const log = h('div', { class: 'chat' });
 
   /* Вносит проводку и показывает, что получилось, с отменой в одно нажатие. */
-  const doPay = async (cpId, cpName, amount, kind) => {
+  const doPay = async (cpId, cpName, amount, kind, date) => {
     try {
-      const res = await api('POST', '/api/pay', { cpId, amount, kind });
+      const res = await api('POST', '/api/pay', { cpId, amount, kind, ...(date ? { date } : {}) });
       haptic('heavy');
       const undo = h('button', { class: 'btn secondary' }, 'Отменить запись');
       undo.onclick = async () => {
@@ -3921,6 +3937,58 @@ screens.ask = async function ask() {
   const field = h('input', { class: 'ask-input', type: 'text', placeholder: 'Что нужно сделать?',
     enterkeyhint: 'send', autocomplete: 'off' });
 
+  /*
+   * «Повтори …»: сервер решил (ai.planRepeat — то же, что в боте), здесь только
+   * кнопки. Повтор всегда открывает форму на проверку: копия чужого решения
+   * не выписывается сама, даже у включённого ассистента.
+   */
+  const showRepeat = (rep, text) => {
+    const again = (d, label) => h('button', { class: 'btn', onclick: () => { haptic('medium'); repeatDoc(d.id); } }, label);
+    if (rep.kind === 'choices') {
+      say('bot', text, h('div', { class: 'btn-wrap' }, rep.choices.map((c) => h('button', {
+        class: 'btn secondary',
+        onclick: async () => {
+          try {
+            const q = new URLSearchParams({ cp: String(c.id), type: rep.type || '', date: rep.date || '' });
+            const x = await api('GET', `/api/repeat/find?${q}`);
+            showRepeat(x.repeat, x.text);
+          } catch (e) { say('bot', e.message); }
+        },
+      }, c.name))));
+      return;
+    }
+    if (rep.kind === 'pick') {
+      say('bot', text, h('div', { class: 'btn-wrap' }, rep.docs.map((d) => h('button', {
+        class: 'btn secondary', onclick: () => { haptic('medium'); repeatDoc(d.id); },
+      }, `${d.cpName || '—'} · ${d.short} № ${d.number} · ${money(d.total)}`))));
+      return;
+    }
+    if (rep.kind === 'one' || rep.kind === 'fallback') {
+      say('bot', text, again(rep.doc, rep.kind === 'one' ? 'Повторить' : `Повторить № ${rep.doc.number}`));
+      return;
+    }
+    if (rep.kind === 'ask') {
+      say('bot', text, h('button', { class: 'btn', onclick: () => { haptic('medium'); go('docs'); } }, 'Открыть документы'));
+      return;
+    }
+    say('bot', text);
+  };
+
+  // Акт сверки за период из фразы — тот же запрос, что на экране «Акт сверки».
+  const makeAkt = async (cpId, range, periodText) => {
+    try {
+      const q = new URLSearchParams({ cp: String(cpId) });
+      if (range.from) q.set('from', range.from);
+      q.set('to', range.to);
+      const x = await api('GET', `/api/akt?${q}`);
+      haptic('medium');
+      const other = h('button', { class: 'btn secondary' }, 'Другой период');
+      other.onclick = () => { haptic(); go('akt', { from: range.from, to: range.to }); };
+      say('bot', `Собрал акт сверки за ${periodText}. Баланс на конец: ${money(Math.abs(x.closing))}, операций ${x.ops}.`, other);
+      download(x.file);
+    } catch (e) { say('bot', e.message); }
+  };
+
   // Асинхронный: оплату ассистент вносит сам, а это обращение к серверу.
   const answer = async (r) => {
     if (r.heard) say('me', r.heard);
@@ -3936,6 +4004,8 @@ screens.ask = async function ask() {
           items: r.items || [],
           vatRate: r.vatRate,
           priceIncludesVat: r.priceIncludesVat,
+          // Дата, названная во фразе («вчерашним числом»), в форме уже стоит.
+          date: r.date,
           ...extra,
         });
       };
@@ -3965,10 +4035,11 @@ screens.ask = async function ask() {
        * форму с кнопкой. В этом и весь смысл тумблера; текст поэтому зависит
        * от режима, а не прибит гвоздями.
        */
-      if (r.auto && r.cpId && (r.items || []).length) {
+      // Дата из будущего выписывается только после взгляда на форму, даже у включённого ассистента.
+      if (r.auto && !r.dateFuture && r.cpId && (r.items || []).length) {
         try {
           const payload = {
-            type: r.docType, cpId: r.cpId, date: todayISO(),
+            type: r.docType, cpId: r.cpId, date: r.date || todayISO(),
             items: r.items,
           };
           if (r.vatRate !== undefined) {
@@ -4004,7 +4075,7 @@ screens.ask = async function ask() {
       if (r.cpChoices && r.cpChoices.length) {
         const pick = h('div', { class: 'btn-wrap' }, r.cpChoices.map((c) => h('button', {
           class: 'btn secondary',
-          onclick: () => doPay(c.id, c.name, r.amount, r.kind),
+          onclick: () => doPay(c.id, c.name, r.amount, r.kind, r.date),
         }, c.name)));
         say('bot', `По кому вносим — «${r.who}»?`, pick);
         return;
@@ -4022,18 +4093,20 @@ screens.ask = async function ask() {
           return;
         }
         const yes = h('button', { class: 'btn' }, `Внести ${money(owed)}`);
-        yes.onclick = () => doPay(r.cpId, r.cpName, owed, r.kind);
+        yes.onclick = () => doPay(r.cpId, r.cpName, owed, r.kind, r.date);
         say('bot', `За «${r.cpName}» числится ${money(owed)}. Внести эту сумму?`, yes);
         return;
       }
-      if (!r.auto) {
+      // Дата из будущего — всегда на подтверждение: в прошедшем времени так не говорят, вероятно, ошиблось распознавание.
+      if (!r.auto || r.dateFuture) {
         const go2 = h('button', { class: 'btn' }, `Внести ${money(r.amount)}`);
-        go2.onclick = () => doPay(r.cpId, r.cpName, r.amount, r.kind);
-        say('bot', `Подготовил: ${r.kind} ${money(r.amount)} по «${r.cpName}». `
+        go2.onclick = () => doPay(r.cpId, r.cpName, r.amount, r.kind, r.date);
+        say('bot', `Подготовил: ${r.kind} ${money(r.amount)} по «${r.cpName}»${r.dateText ? ` от ${r.dateText}` : ''}. `
+          + (r.dateFuture ? 'Эта дата ещё впереди — проверьте, что она верная. ' : '')
           + 'Сам я ничего не провожу — нажмите, и внесу.', go2);
         return;
       }
-      await doPay(r.cpId, r.cpName, r.amount, r.kind);
+      await doPay(r.cpId, r.cpName, r.amount, r.kind, r.date);
       return;
     }
     if (r.action === 'outofscope') {
@@ -4051,11 +4124,52 @@ screens.ask = async function ask() {
     }
     // Книга учёта: текст с сервера — куда прислать выписку.
     if (r.action === 'kudir') { say('bot', r.replyText); return; }
+    // Напомнить должнику: экран «Напомнить о долге» с текстом; письмо уходит только кнопкой на нём.
+    if (r.action === 'remind') {
+      if (r.cpChoices && r.cpChoices.length) {
+        say('bot', r.replyText, h('div', { class: 'btn-wrap' }, r.cpChoices.map((c) => h('button', {
+          class: 'btn secondary', onclick: () => { haptic('medium'); go('reminders', { cpId: c.id }); },
+        }, c.name))));
+        return;
+      }
+      if (r.cpMissing || (r.cpId && !r.owes)) { say('bot', r.replyText); return; }
+      const open = h('button', { class: 'btn' }, r.cpId ? 'Открыть напоминание' : r.all ? 'Напомнить должникам' : 'Выбрать должника');
+      open.onclick = () => { haptic('medium'); go('reminders', r.cpId ? { cpId: r.cpId } : {}); };
+      say('bot', r.replyText, open);
+      return;
+    }
+    if (r.action === 'repeat') { showRepeat(r.repeat, r.replyText); return; }
+    if (r.action === 'akt') {
+      const range = r.period && r.period.to ? { from: r.period.from, to: r.period.to } : null;
+      if (r.cpMissing) { say('bot', r.replyText); return; }
+      if (r.cpChoices && r.cpChoices.length) {
+        say('bot', r.replyText, h('div', { class: 'btn-wrap' }, r.cpChoices.map((c) => h('button', {
+          class: 'btn secondary',
+          onclick: () => (range ? makeAkt(c.id, range, r.periodText) : go('akt')),
+        }, c.name))));
+        return;
+      }
+      if (r.cpId && range) {
+        // Период назван — не переспрашиваем: включённый ассистент собирает сразу, выключенный даёт кнопку.
+        if (r.auto) { await makeAkt(r.cpId, range, r.periodText); return; }
+        const make = h('button', { class: 'btn' }, 'Собрать акт');
+        make.onclick = () => makeAkt(r.cpId, range, r.periodText);
+        say('bot', r.replyText, make);
+        return;
+      }
+      const pick = h('button', { class: 'btn' }, range ? 'Выбрать клиента' : 'Выбрать период');
+      pick.onclick = () => { haptic('medium'); go('akt', range || {}); };
+      say('bot', r.replyText, pick);
+      return;
+    }
     const known = ASK_GO[r.action];
     if (known) {
-      const btn = h('button', { class: 'btn' }, known[0]);
-      btn.onclick = () => { haptic('medium'); go(known[1]); };
-      say('bot', 'Понял.', btn);
+      // Журнал и «Ждут оплаты» за названный период открываются сразу на нём; поменять можно на самом экране.
+      const range = (r.action === 'docs' || r.action === 'unpaid') && r.period && r.period.to
+        ? { from: r.period.from, to: r.period.to } : null;
+      const btn = h('button', { class: 'btn' }, range ? `${known[0]} за ${r.periodText}` : known[0]);
+      btn.onclick = () => { haptic('medium'); go(known[1], range || {}); };
+      say('bot', range ? r.replyText : 'Понял.', btn);
       return;
     }
     if (r.source === 'limit') {
@@ -4179,14 +4293,22 @@ screens.ask = async function ask() {
 };
 
 /** Счета, по которым не отметили оплату. */
-screens.unpaid = async function unpaid() {
+screens.unpaid = async function unpaid({ from, to } = {}) {
   const [{ docs: list, count, sum }, { debtors }] = await Promise.all([
-    api('GET', '/api/unpaid'),
+    api('GET', `/api/unpaid${to ? `?${new URLSearchParams({ from: from || '', to })}` : ''}`),
     api('GET', '/api/debtors'),
   ]);
   const box = h('div', {}, h('h1', { text: 'Ждут оплаты' }));
+  // За период — так открывает помощник на «неоплаченные за сентябрь»; полный список — кнопкой.
+  if (to) {
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px', id: 'unpaid-range',
+      text: `За период ${from ? `${ru(from)} — ` : 'по '}${ru(to)}.` }));
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn secondary', id: 'unpaid-all', onclick: () => { haptic(); go('unpaid'); } }, 'Все неоплаченные')));
+  }
   if (!list.length) {
-    box.append(empty('check', 'Всё оплачено', 'Здесь появятся счета, по которым не отмечена оплата.'));
+    box.append(empty('check', to ? 'За этот период всё оплачено' : 'Всё оплачено',
+      'Здесь появятся счета, по которым не отмечена оплата.'));
     return box;
   }
   /*
@@ -4294,7 +4416,7 @@ screens.help = async function help() {
  * нельзя — приходилось знать, что он там. Документ, которым закрывают
  * квартал, не должен требовать знания, где он спрятан.
  */
-screens.akt = async function aktScreen() {
+screens.akt = async function aktScreen(params = {}) {
   const { cps: list } = await api('GET', '/api/cps');
   const box = h('div', {}, h('h1', { text: 'Акт сверки' }));
   if (!list.length) {
@@ -4310,8 +4432,9 @@ screens.akt = async function aktScreen() {
    */
   const now = new Date();
   const iso = isoDate;
-  const from = field('from', 'С какой даты', '', { type: 'date' });
-  const to = field('to', 'По какую', iso(now), { type: 'date' });
+  // Период мог прийти из фразы помощника («акт сверки за сентябрь») — тогда он уже стоит в полях.
+  const from = field('from', 'С какой даты', params.from || '', { type: 'date' });
+  const to = field('to', 'По какую', params.to || iso(now), { type: 'date' });
 
   const setRange = (a, b) => {
     from.input.value = a;

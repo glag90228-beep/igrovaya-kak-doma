@@ -67,7 +67,7 @@ const webAuth = require('./lib/web-auth');
 const { encodeQr, qrSvg } = require('./lib/qr');
 const { payLink, priceText, yearSaving, planTitle, plans: lavaPlans } = require('./lib/lava');
 const platega = require('./lib/platega');
-const { currentYear, isoDay } = require('./lib/period');
+const { currentYear, isoDay, periodTitle } = require('./lib/period');
 const { Telegram } = require('./lib/tg');
 
 const PORT = Number(process.env.MINIAPP_PORT || 8790);
@@ -287,21 +287,57 @@ const ruDate = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(iso || '')
 
 /** Всё, что нужно главному экрану, одним запросом — меньше походов по сети. */
 function withCp(user, intent) {
-  if (!intent || (intent.action !== 'draft' && intent.action !== 'pay')) return intent;
+  if (!intent) return intent;
+  if (intent.action === 'repeat') return withRepeat(user, intent);
+  if (!['draft', 'pay', 'akt', 'remind'].includes(intent.action)) return intent;
   const cps = bdb.listCps(user.id);
-  if (!intent.who) return { ...intent, cpChoices: cps.length === 1 ? undefined : [] };
+  if (!intent.who) {
+    // Для сверки и напоминания «кого» без имени — не вопрос приложения: оно откроет свой выбор клиента.
+    if (intent.action === 'akt' || intent.action === 'remind') return intent;
+    return { ...intent, cpChoices: cps.length === 1 ? undefined : [] };
+  }
   const found = ai.matchCp(cps, intent.who);
   if (found.cp) {
     const out = { ...intent, cpId: found.cp.id, cpName: found.cp.name };
     // Для оплаты сразу отдаём долг из журнала: если сумму не назвали, именно
     // её приложение и предложит внести — гадать не придётся.
     if (intent.action === 'pay') out.balance = round2(bdb.balanceOf(user.id, found.cp.id).closing);
+    // Напомнить можно тому, кто сейчас должен; без долга приложение так и скажет.
+    if (intent.action === 'remind') {
+      const row = bdb.debtors(user.id).find((d) => d.theyOwe && d.cp.id === found.cp.id);
+      out.owes = Boolean(row);
+      if (row) out.owed = row.amount;
+    }
     return out;
   }
   if (found.choices) {
     return { ...intent, cpChoices: found.choices.map((c) => ({ id: c.id, name: c.name })) };
   }
   return { ...intent, cpMissing: true };
+}
+
+/**
+ * «Повтори …» для приложения: решение принимает ai.planRepeat — то же, что в
+ * боте, — а здесь оно только переводится в поля для экрана.
+ */
+function repeatBrief(user, plan) {
+  const names = new Map(bdb.listCps(user.id).map((c) => [c.id, c.name]));
+  const brief = (d) => ({
+    id: d.id, title: d.title, short: bdb.docShort(d.type), number: d.number, date: d.date,
+    total: d.total, cpId: d.cp_id, cpName: names.get(d.cp_id) || '',
+  });
+  const out = { kind: plan.kind, type: plan.type || '', date: plan.date || '' };
+  if (plan.cp) { out.cpId = plan.cp.id; out.cpName = plan.cp.name; }
+  if (plan.who) out.who = plan.who;
+  if (plan.choices) out.choices = plan.choices.map((c) => ({ id: c.id, name: c.name }));
+  if (plan.doc) out.doc = brief(plan.doc);
+  if (plan.docs) out.docs = plan.docs.map(brief);
+  return out;
+}
+
+function withRepeat(user, intent) {
+  const plan = ai.planRepeat(user.id, { who: intent.who, docType: intent.docType, date: intent.date });
+  return { ...intent, repeat: repeatBrief(user, plan) };
 }
 
 /*
@@ -342,6 +378,18 @@ async function askFlow(user, text, { heard, speak }) {
   }
   const enriched = withCp(user, intent);
   const auto = bdb.isAiEnabled(user.id);
+  /*
+   * Период и дата из фразы — готовыми подписями: приложению не нужно знать,
+   * как называть «сентябрь 2026», и оно не расходится с ботом (lib/period.js).
+   * Дата из будущего приложению подозрительна так же, как боту: внесение или
+   * выписка по такой — только по нажатию, даже у включённого ассистента.
+   */
+  if (enriched.period && enriched.period.to) enriched.periodText = periodTitle(enriched.period.from, enriched.period.to);
+  const named = isoDay(enriched.date);
+  if (named) {
+    enriched.dateText = ruDate(named);
+    enriched.dateFuture = named > docService.todayISO();
+  }
   const replyText = consulted || formatAiReply(intent, enriched, auto);
   bdb.saveAiMessage({
     userId: user.id, source: 'miniapp', role: 'assistant', type: 'text',
@@ -376,14 +424,58 @@ function contractFile(body) {
   return { buffer, mime: m[1], name: str(body.name, 120) || 'договор' };
 }
 
+/** Что сказать на «повтори …»: те же случаи, что в боте (ai.planRepeat). */
+function repeatReply(rep, intent) {
+  if (!rep) return 'Какой документ повторить? Откройте журнал и нажмите «Повторить».';
+  const d = rep.doc;
+  const on = rep.date ? ruDate(rep.date) : '';
+  switch (rep.kind) {
+    case 'forbidden': return 'Платёжку и договор повторить не получится — они собираются из своих полей. Выпишите заново.';
+    case 'choices': return `Кого именно вы имели в виду — «${rep.who}»?`;
+    case 'missing': return `Клиента «${rep.who}» у вас нет — повторять нечего.`;
+    case 'ask': return 'Какой документ повторить? Откройте журнал и нажмите «Повторить» у нужного.';
+    case 'pick': return `За ${on} нашёл несколько. Какой повторить?`;
+    case 'fallback':
+      return `За ${on} такого документа не нашёл. Последний — ${d.title} № ${d.number} от ${ruDate(d.date)}. Повторить его?`;
+    case 'none': return 'Подходящих документов не нашёл — повторять нечего.';
+    default: return `Нашёл: ${d.title} № ${d.number} от ${ruDate(d.date)}${d.cpName ? ` для «${d.cpName}»` : ''}. `
+      + 'Открою форму с теми же позициями — проверьте и выпишите.';
+  }
+}
+
 function formatAiReply(intent, withCpRes, auto) {
   if (!intent) return 'Не понял. Попробуйте сказать иначе.';
   if (intent.source === 'limit') return 'Разбор фраз на этот месяц исчерпан. Кнопки и команды работают как обычно.';
   if (intent.source === 'off') return 'Свободный ввод сейчас выключен — пользуйтесь кнопками.';
   if (intent.source === 'error') return 'Разбор фраз сейчас не отвечает — попробуйте позже.';
   if (intent.action === 'debts') return 'Открываю список долгов.';
-  if (intent.action === 'unpaid') return 'Открываю неоплаченные счета.';
-  if (intent.action === 'docs') return 'Открываю раздел документов.';
+  if (intent.action === 'unpaid') {
+    return withCpRes && withCpRes.periodText ? `Открываю неоплаченные счета за ${withCpRes.periodText}.` : 'Открываю неоплаченные счета.';
+  }
+  if (intent.action === 'docs') {
+    return withCpRes && withCpRes.periodText ? `Открываю документы за ${withCpRes.periodText}.` : 'Открываю раздел документов.';
+  }
+  if (intent.action === 'akt') {
+    const when = withCpRes && withCpRes.periodText ? ` за ${withCpRes.periodText}` : '';
+    if (withCpRes && withCpRes.cpChoices && withCpRes.cpChoices.length) return `Уточните клиента: «${intent.who}»?`;
+    if (withCpRes && withCpRes.cpMissing) return `Клиента «${intent.who}» пока нет в базе.`;
+    if (withCpRes && withCpRes.cpName) {
+      if (!when) return `Акт сверки с «${withCpRes.cpName}»: выберите период.`;
+      return auto ? `Собираю акт сверки с «${withCpRes.cpName}»${when}.`
+        : `Подготовил акт сверки с «${withCpRes.cpName}»${when}. Нажмите, и соберу.`;
+    }
+    return `С кем сверяемся${when}?`;
+  }
+  if (intent.action === 'remind') {
+    if (withCpRes && withCpRes.cpChoices && withCpRes.cpChoices.length) return `Кому именно напомнить: «${intent.who}»?`;
+    if (withCpRes && withCpRes.cpMissing) return `Клиента «${intent.who}» нет в базе.`;
+    if (withCpRes && withCpRes.cpName) {
+      return withCpRes.owes ? `Подготовил напоминание для «${withCpRes.cpName}». Письмо уйдёт, только когда вы нажмёте.`
+        : `За «${withCpRes.cpName}» долга нет — напоминать не о чем.`;
+    }
+    return intent.all ? 'Открываю напоминания всем должникам.' : 'Кому напомнить о долге?';
+  }
+  if (intent.action === 'repeat') return repeatReply(withCpRes && withCpRes.repeat, intent);
   if (intent.action === 'cps') return 'Открываю список клиентов.';
   if (intent.action === 'org') return 'Открываю реквизиты организации.';
   if (intent.action === 'vat') return 'Открываю настройки НДС.';
@@ -407,7 +499,11 @@ function formatAiReply(intent, withCpRes, auto) {
   if (intent.action === 'pay') {
     if (withCpRes && withCpRes.cpChoices && withCpRes.cpChoices.length) return `По кому вносим оплату: «${intent.who}»?`;
     if (withCpRes && withCpRes.cpMissing) return `Клиента «${intent.who}» нет в базе.`;
-    if (withCpRes && withCpRes.cpName) return `Вношу оплату по «${withCpRes.cpName}».`;
+    if (withCpRes && withCpRes.cpName) {
+      const on = withCpRes.dateText ? ` от ${withCpRes.dateText}` : '';
+      if (withCpRes.dateFuture) return `Оплата по «${withCpRes.cpName}»${on}: дата ещё впереди, проверьте и нажмите.`;
+      return `Вношу оплату по «${withCpRes.cpName}»${on}.`;
+    }
     return 'По кому вносим оплату? Назовите клиента.';
   }
   return 'Не понял. Скажите иначе — например: «кто мне должен» или «выставь счёт Заре на 30 тысяч».';
@@ -984,7 +1080,15 @@ const api = {
 
   async 'GET /api/docs'({ user, url }) {
     const cpId = Number(url.searchParams.get('cp')) || null;
-    const rows = bdb.listDocs(user.id, 30, cpId);
+    /*
+     * За период («покажи документы за август» в помощнике) — тем же отбором,
+     * что в боте: bdb.docsBetween. Новые сверху, как в обычном журнале.
+     */
+    const to = isoDay(url.searchParams.get('to'));
+    const from = isoDay(url.searchParams.get('from'));
+    const rows = to
+      ? bdb.docsBetween(user.id, from, to, cpId).reverse().slice(0, 100)
+      : bdb.listDocs(user.id, 30, cpId);
     // Долг по документу — чтобы карточка могла честно сказать, изменится
     // ли сальдо при удалении. Одним запросом на весь список, не по одному.
     const debt = bdb.debtByDoc(user.id, rows.map((d) => d.id));
@@ -2076,8 +2180,10 @@ const api = {
    * Пока экран складывал список сам, он показывал вдвое больше плитки на
    * главной: счёт и закрывающий его акт на одну сделку шли как два долга.
    */
-  async 'GET /api/unpaid'({ user }) {
-    const s = bdb.unpaidSummary(user.id);
+  async 'GET /api/unpaid'({ user, url }) {
+    // С периодом — тот же отбор и те же сделки, что в боте (bdb.unpaidBetween).
+    const to = isoDay(url.searchParams.get('to'));
+    const s = to ? bdb.unpaidBetween(user.id, isoDay(url.searchParams.get('from')), to) : bdb.unpaidSummary(user.id);
     const names = new Map(bdb.listCps(user.id).map((c) => [c.id, c.name]));
     return {
       // paid/left: сколько по документу уже привязано оплатами и сколько осталось (частичная оплата из выписки).
@@ -2396,6 +2502,20 @@ const api = {
    * сегодняшняя. Оплата у копии своя: paid_at не переносится, потому что
    * сюда не попадает вовсе.
    */
+  /**
+   * Найти, что повторять, после выбора клиента в помощнике. Решение то же, что
+   * в боте (ai.planRepeat); сам повтор — по-прежнему GET /api/doc/repeat и
+   * форма на проверку.
+   */
+  async 'GET /api/repeat/find'({ user, url }) {
+    const cpId = Number(url.searchParams.get('cp')) || 0;
+    const plan = ai.planRepeat(user.id, {
+      cpId, docType: str(url.searchParams.get('type'), 10), date: isoDay(url.searchParams.get('date')),
+    });
+    const repeat = repeatBrief(user, plan);
+    return { repeat, text: repeatReply(repeat) };
+  },
+
   async 'GET /api/doc/repeat'({ user, url }) {
     const src = bdb.getDoc(user.id, Number(url.searchParams.get('id')));
     if (!src || !docService.ITEM_DOCS[src.type]) return { error: 'Такой документ повторить нельзя.' };

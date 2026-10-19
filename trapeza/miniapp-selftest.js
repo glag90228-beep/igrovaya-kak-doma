@@ -111,6 +111,7 @@ setTelegram({
 });
 
 let base = '';
+const ruD = (iso) => iso.split('-').reverse().join('.');
 
 async function call(method, path, { user, body, raw, headers = {} } = {}) {
   const init = { method, headers: { ...headers } };
@@ -3632,6 +3633,125 @@ async function main() {
     ok(r.status === 200 && r.json.id && !r.json.warn, 'Д19: после подтверждения расписание создано', JSON.stringify(r.json));
     r = await call('POST', '/api/recurring', { user: ud, body: { docId: src.id, day: 10 } });
     ok(r.status === 200 && r.json.id && !r.json.warn, 'раз в месяц предупреждения нет');
+  }
+
+  section('помощник: напомнить, повторить, период и дата — тем же кодом, что в боте');
+  {
+    /*
+     * Поле «Что нужно сделать?» зовёт тот же ai.understand, что и бот. Новые
+     * намерения не должны там оборваться на «Понял» без дела: сервер решает
+     * (клиент, документ для повтора, подписи периода и даты), экран только
+     * рисует кнопки. Письмо должнику тут уходит лишь с экрана напоминаний.
+     */
+    const U = { id: 501313, first_name: 'Ася', username: 'asya' };
+    const ua = initDataFor(U);
+    const bdbA = require('./lib/bot-db');
+    const perA = require('./lib/period');
+    const uid = bdbA.getOrCreateUser(U.id).id;
+    // Подписка оплачена: бесплатный лимит прогона (2 документа) к проверке периодов отношения не имеет.
+    require('./db').db.prepare("UPDATE bot_users SET access_until = '2099-01-01' WHERE id = ?").run(uid);
+    bdbA.saveMyOrg(uid, { name: 'ИП Асин', inn: '183209316100', signer: 'А. А.',
+      bank_name: 'ПАО Сбербанк', bik: '044525225', corr_acc: '30101810400000000225', acc: '40802810900000000009' });
+    bdbA.updateOrg(uid, bdbA.getDefaultOrg(uid).id, { debt_basis: 'invoice' });
+    const cpZ = bdbA.createCp(uid, { name: 'ООО «Заря»', kind: 'customer', opening_date: '2026-01-01' });
+    const cpV = bdbA.createCp(uid, { name: 'ООО «Вектор»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbA.createCp(uid, { name: 'ООО «Лотос»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbA.createCp(uid, { name: 'ООО «Лотос-Опт»', kind: 'customer', opening_date: '2026-01-01' });
+    const yest = perA.iso(new Date(perA.todayDate().getTime() - 86400000));
+    const pm = perA.presetRange('pm');
+    const inPm = `${pm.from.slice(0, 8)}10`;
+    const mk = (type, cpId, price, date) => docService.issueDocument(uid, {
+      type, cpId, items: [{ name: 'Работа', qty: 1, price }], date, skipQuota: true });
+    const schZ = (await mk('sch', cpZ, 30000, yest)).doc;
+    bdbA.markPaid(uid, schZ.id);
+    const schV = (await mk('sch', cpV, 12000, inPm)).doc;
+    const tnV = (await mk('torg12', cpV, 5000, yest)).doc;
+    const ask = async (text) => (await call('POST', '/api/ask', { user: ua, body: { text } })).json;
+
+    // напомнить
+    let a = await ask('напомни Вектору про долг');
+    ok(a.action === 'remind' && a.cpId === cpV && a.owes === true && a.owed >= 12000,
+      '«напомни Вектору про долг» → клиент найден, долг назван', JSON.stringify(a).slice(0, 140));
+    ok(/Письмо уйдёт, только когда вы нажмёте/.test(a.replyText), 'и сказано, что письмо — только по нажатию', a.replyText);
+    a = await ask('напомни Заре про долг');
+    ok(a.action === 'remind' && a.owes === false && /долга нет/.test(a.replyText), 'без долга напоминать не о чем', a.replyText);
+    a = await ask('напомни лотосу про долг');
+    ok((a.cpChoices || []).length === 2, 'два похожих клиента — выбор из двух', JSON.stringify(a.cpChoices));
+    a = await ask('напомни ромашке про долг');
+    ok(a.cpMissing === true && !a.cpId, 'незнакомый клиент помечен', a.replyText);
+    a = await ask('напомни всем должникам');
+    ok(a.action === 'remind' && a.all === true && !a.cpId, '«всем должникам» — без клиента, all', JSON.stringify(a).slice(0, 100));
+
+    // повторить
+    a = await ask('повтори вчерашнюю накладную');
+    ok(a.action === 'repeat' && a.repeat.kind === 'one' && a.repeat.doc.id === tnV.id && a.repeat.doc.cpName === 'ООО «Вектор»',
+      '«повтори вчерашнюю накладную» → единственная накладная за вчера', JSON.stringify(a.repeat).slice(0, 160));
+    r = await call('GET', `/api/doc/repeat?id=${a.repeat.doc.id}`, { user: ua });
+    ok(r.status === 200 && r.json.draft.cpId === cpV && r.json.draft.items.length === 1, 'и форма повтора открывается по этому id');
+    a = await ask('повтори последний счёт Заре');
+    ok(a.repeat.kind === 'one' && a.repeat.doc.id === schZ.id && a.repeat.cpId === cpZ, '«повтори последний счёт Заре» → её счёт', JSON.stringify(a.repeat).slice(0, 120));
+    a = await ask('повтори вчерашний счёт Вектору');
+    ok(a.repeat.kind === 'fallback' && a.repeat.doc.id === schV.id, 'на вчера у Вектора счёта нет — последний предложен, не подставлен', JSON.stringify(a.repeat).slice(0, 120));
+    await mk('torg12', cpZ, 7000, yest);
+    a = await ask('повтори вчерашнюю накладную');
+    ok(a.repeat.kind === 'pick' && a.repeat.docs.length === 2, 'две накладные за вчера — человек выбирает', a.repeat.kind);
+    a = await ask('повтори последний счёт лотосу');
+    ok(a.repeat.kind === 'choices' && a.repeat.choices.length === 2, 'неоднозначный клиент — переспрос', a.repeat.kind);
+    r = await call('GET', `/api/repeat/find?cp=${a.repeat.choices[0].id}&type=sch`, { user: ua });
+    ok(r.status === 200 && ['none', 'one'].includes(r.json.repeat.kind) && Boolean(r.json.text), 'после выбора клиента поиск идёт тем же кодом', JSON.stringify(r.json).slice(0, 100));
+    r = await call('GET', `/api/repeat/find?cp=${cpV}&type=torg12`, { user: ua });
+    ok(r.json.repeat.kind === 'one' && r.json.repeat.doc.id === tnV.id, 'и находит документ выбранного клиента');
+    r = await call('GET', `/api/repeat/find?cp=${cpV}`, { user: initDataFor(PETYA) });
+    ok(r.json.repeat.kind === 'missing', 'чужого клиента по id не найти', r.json.repeat.kind);
+    a = await ask('повтори платёжку заре');
+    ok(a.repeat.kind === 'forbidden', 'платёжку повторить нельзя', a.repeat.kind);
+    a = await ask('повтори счёт ромашке');
+    ok(a.repeat.kind === 'missing', 'незнакомый клиент — повторять нечего', a.repeat.kind);
+    const nDocs = bdbA.listDocs(uid, 500).length;
+    await ask('повтори последний счёт Заре');
+    ok(bdbA.listDocs(uid, 500).length === nDocs, 'сам повтор ничего не выписывает — только открывает форму');
+
+    // период
+    a = await ask('акт сверки с зарёй за прошлый месяц');
+    ok(a.action === 'akt' && a.cpId === cpZ && a.period.from === pm.from && a.period.to === pm.to
+      && a.periodText === perA.periodTitle(pm.from, pm.to), 'акт сверки: клиент и период названы готовыми полями', JSON.stringify(a).slice(0, 170));
+    a = await ask('акт сверки за прошлый месяц');
+    ok(a.action === 'akt' && !a.cpId && a.periodText && /С кем сверяемся/.test(a.replyText), 'клиент не назван — период помним, спрашиваем клиента', a.replyText);
+    a = await ask('акт сверки с лотосом за прошлый месяц');
+    ok((a.cpChoices || []).length === 2 && a.period.to === pm.to, 'неоднозначный клиент — выбор, период не потерян');
+    r = await call('GET', `/api/akt?cp=${cpZ}&from=${pm.from}&to=${pm.to}`, { user: ua });
+    ok(r.status === 200 && r.json.from === pm.from && r.json.to === pm.to, 'сам акт за этот период собирается тем же запросом, что на экране');
+    a = await ask('акт сверки с зарёй');
+    ok(a.action === 'akt' && a.cpId === cpZ && !a.period, 'период не назван — приложение предложит выбрать, как раньше', JSON.stringify(a).slice(0, 100));
+
+    a = await ask('покажи документы за прошлый месяц');
+    ok(a.action === 'docs' && a.periodText === perA.periodTitle(pm.from, pm.to), 'документы за период: подпись готова', a.replyText);
+    r = await call('GET', `/api/docs?from=${pm.from}&to=${pm.to}`, { user: ua });
+    ok(r.json.docs.length === 1 && r.json.docs[0].id === schV.id, 'журнал за период содержит только документы периода', r.json.docs.length);
+    r = await call('GET', '/api/docs', { user: ua });
+    ok(r.json.docs.length > 1, 'а без периода — как раньше, все');
+    a = await ask('покажи неоплаченные счета за прошлый месяц');
+    ok(a.action === 'unpaid' && a.period.to === pm.to, 'неоплаченные за период: период передан', JSON.stringify(a.period));
+    r = await call('GET', `/api/unpaid?from=${pm.from}&to=${pm.to}`, { user: ua });
+    ok(r.json.docs.length === 1 && r.json.docs[0].id === schV.id && r.json.sum === 12000,
+      '«ждут оплаты» за период — только счёт этого месяца, сумма сделками', JSON.stringify([r.json.docs.length, r.json.sum]));
+    r = await call('GET', '/api/unpaid', { user: ua });
+    ok(r.json.docs.length >= 2, 'без периода — все, как раньше');
+
+    // дата
+    a = await ask('вчера Заря оплатила 5000');
+    ok(a.action === 'pay' && a.date === yest && a.dateText === ruD(yest) && a.dateFuture === false,
+      'оплата с датой: «вчера» разобрано, подпись готова', JSON.stringify(a).slice(0, 150));
+    a = await ask('Заря оплатила пять тысяч завтра');
+    ok(a.dateFuture === true && /ещё впереди/.test(a.replyText), 'дата из будущего помечена — приложение попросит нажать', a.replyText);
+    r = await call('POST', '/api/pay', { user: ua, body: { cpId: cpZ, amount: 5000, date: yest } });
+    ok(r.status === 200 && bdbA.listOps(uid, cpZ).some((o) => Number(o.debit) === 5000 && o.date === yest), 'оплата вносится названным числом');
+    a = await ask('выставь счёт заре на пять тысяч вчерашним числом');
+    ok(a.action === 'draft' && a.date === yest && a.dateText === ruD(yest), 'документ с датой: дата доходит до экрана', JSON.stringify(a).slice(0, 140));
+
+    // клиентская часть знает все новые действия (в браузере это проверяет app-selftest)
+    const appJs = require('node:fs').readFileSync('./public/app/app.js', 'utf8');
+    ok(['remind', 'repeat', 'akt'].every((x) => appJs.includes(`r.action === '${x}'`)), 'экран помощника обрабатывает remind, repeat и akt');
   }
 
   // Сервер держим до конца: проверки выше ходят к нему по HTTP, и закрытый

@@ -3211,73 +3211,65 @@ async function aiRemind(tg, chatId, user, intent) {
  * суммой, и показать её перед выпуском дешевле, чем исправлять.
  */
 async function aiRepeat(tg, chatId, user, intent) {
-  if (intent.docType && !bdb.REPEATABLE.includes(intent.docType)) {
-    await tg.sendMessage(chatId,
-      'Платёжку и договор повторить не получится — они собираются из своих полей. '
-      + 'Откройте клиента и выпишите заново.', mainMenu());
-    return;
-  }
-  let cpId = 0;
-  if (intent.who) {
-    const found = ai.matchCp(bdb.listCps(user.id), intent.who);
-    if (found.choices) {
-      const dash = (v) => v || '-';
-      await tg.sendMessage(chatId, `Кого именно вы имели в виду — «${esc(intent.who)}»?`,
-        whichClientKb(found.choices, (c) => `rp.cp:${c.id}:${dash(intent.docType)}:${packDay(intent.date) || '0'}`));
-      return;
-    }
-    if (!found.cp) {
-      await tg.sendMessage(chatId,
-        `Клиента «${esc(intent.who)}» у вас нет — повторять нечего. `
-        + 'Нажмите 🔁 рядом с документом в журнале, если нужен другой.', mainMenu());
-      return;
-    }
-    cpId = found.cp.id;
-  }
-  await repeatBy(tg, chatId, user, { cpId, type: intent.docType || '', date: intent.date || '' });
+  // Решение — в ai.planRepeat: оно общее с приложением. Здесь только слова и кнопки.
+  const plan = ai.planRepeat(user.id, { who: intent.who, docType: intent.docType, date: intent.date });
+  await sayRepeat(tg, chatId, user, plan);
 }
 
 const REPEAT_WHAT = { sch: 'счетов', schdog: 'счетов-договоров', usl: 'актов', upd: 'УПД', torg12: 'накладных' };
 
-/** Найти, что повторять, по клиенту, виду бумаги и числу; если неясно — спросить. */
-async function repeatBy(tg, chatId, user, by) {
-  if (!by.cpId && !by.type && !by.date) {
-    // «Повтори» без слов о том, что именно: гадать нельзя, но журнал с кнопкой «🔁» под рукой.
-    await tg.sendMessage(chatId, 'Какой документ повторить? Нажмите 🔁 рядом с нужным.');
-    await showDocs(tg, chatId, user);
-    return;
-  }
-  const found = bdb.repeatSources(user.id, by);
-  const what = REPEAT_WHAT[by.type] || 'документов';
-  const cp = by.cpId ? bdb.getCp(user.id, by.cpId) : null;
+async function sayRepeat(tg, chatId, user, plan) {
+  const cp = plan.cp || null;
   const whose = cp ? ` у ${quoted(cp.name)}` : '';
-  if (!found.length) {
-    // На названное число ничего нет — не подсовываем молча другой документ, а показываем кнопкой.
-    const last = by.date ? bdb.repeatSources(user.id, { cpId: by.cpId, type: by.type, limit: 1 })[0] : null;
-    if (last) {
+  const what = REPEAT_WHAT[plan.type] || 'документов';
+  switch (plan.kind) {
+    case 'forbidden':
       await tg.sendMessage(chatId,
-        `За ${ru(by.date)}${whose} ${what} не нашёл. Последний — ${esc(bdb.docShort(last.type))} № ${esc(last.number)} `
-        + `от ${ru(last.date)}, ${formatRub(last.total)}. Повторить его?`,
-        keyboard([[{ text: `🔁 Повторить № ${last.number}`.slice(0, 60), data: `d.rep:${last.id}` }],
+        'Платёжку и договор повторить не получится — они собираются из своих полей. '
+        + 'Откройте клиента и выпишите заново.', mainMenu());
+      return;
+    case 'choices':
+      await tg.sendMessage(chatId, `Кого именно вы имели в виду — «${esc(plan.who)}»?`,
+        whichClientKb(plan.choices, (c) => `rp.cp:${c.id}:${plan.type || '-'}:${packDay(plan.date) || '0'}`));
+      return;
+    case 'missing':
+      await tg.sendMessage(chatId,
+        `Клиента «${esc(plan.who)}» у вас нет — повторять нечего. `
+        + 'Нажмите 🔁 рядом с документом в журнале, если нужен другой.', mainMenu());
+      return;
+    case 'ask':
+      // «Повтори» без слов о том, что именно: гадать нельзя, но журнал с кнопкой «🔁» под рукой.
+      await tg.sendMessage(chatId, 'Какой документ повторить? Нажмите 🔁 рядом с нужным.');
+      await showDocs(tg, chatId, user);
+      return;
+    case 'fallback': {
+      // На названное число ничего нет — не подсовываем молча другой документ, а показываем кнопкой.
+      const d = plan.doc;
+      await tg.sendMessage(chatId,
+        `За ${ru(plan.date)}${whose} ${what} не нашёл. Последний — ${esc(bdb.docShort(d.type))} № ${esc(d.number)} `
+        + `от ${ru(d.date)}, ${formatRub(d.total)}. Повторить его?`,
+        keyboard([[{ text: `🔁 Повторить № ${d.number}`.slice(0, 60), data: `d.rep:${d.id}` }],
           [{ text: '⬅️ Меню', data: 'menu' }]]));
       return;
     }
-    await tg.sendMessage(chatId,
-      `Подходящих документов${whose} не нашёл — повторять нечего. Выпишите первый, а дальше повтор в одно нажатие.`,
-      mainMenu());
-    return;
+    case 'none':
+      await tg.sendMessage(chatId,
+        `Подходящих документов${whose} не нашёл — повторять нечего. Выпишите первый, а дальше повтор в одно нажатие.`,
+        mainMenu());
+      return;
+    case 'pick': {
+      // Названо число и под него подходит несколько — выбирает человек.
+      const rows = plan.docs.map((d) => {
+        const c = d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
+        return [{ text: `${c ? c.name : '—'} · ${bdb.docShort(d.type)} № ${d.number} · ${formatRub(d.total)}`.slice(0, 60), data: `d.rep:${d.id}` }];
+      });
+      rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+      await tg.sendMessage(chatId, `За ${ru(plan.date)} нашёл несколько. Какой повторить?`, keyboard(rows));
+      return;
+    }
+    default:
+      await repeatDoc(tg, chatId, user, plan.doc.id);
   }
-  // Названо число и под него подходит несколько — выбирает человек.
-  if (found.length > 1 && by.date) {
-    const rows = found.map((d) => {
-      const c = d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
-      return [{ text: `${c ? c.name : '—'} · ${bdb.docShort(d.type)} № ${d.number} · ${formatRub(d.total)}`.slice(0, 60), data: `d.rep:${d.id}` }];
-    });
-    rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
-    await tg.sendMessage(chatId, `За ${ru(by.date)} нашёл несколько. Какой повторить?`, keyboard(rows));
-    return;
-  }
-  await repeatDoc(tg, chatId, user, found[0].id);
 }
 
 /**
@@ -6678,7 +6670,8 @@ async function handleCallback(tg, cq) {
     // Повтор по фразе, когда клиент оказался неоднозначным: после выбора ищем документ заново.
     if (data.startsWith('rp.cp:')) {
       const [cpId, type, day] = data.slice(6).split(':');
-      await repeatBy(tg, chatId, user, { cpId: Number(cpId), type: type === '-' ? '' : type, date: unpackDay(day) });
+      await sayRepeat(tg, chatId, user,
+        ai.planRepeat(user.id, { cpId: Number(cpId), docType: type === '-' ? '' : type, date: unpackDay(day) }));
       return;
     }
     if (data.startsWith('kniga.p:')) { await sendKniga(tg, chatId, user, data.slice(8)); return; }
