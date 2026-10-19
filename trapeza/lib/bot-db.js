@@ -2588,6 +2588,9 @@ function debtors(userId) {
       amount: Math.abs(closing),
       // нам должны или мы должны
       theyOwe: cp.kind === 'supplier' ? closing < 0 : closing > 0,
+      // Кредитовое сальдо заказчика на предоплате — это не «мы должны», а его аванс,
+      // который мы отработаем отгрузками. Показ обязан называть его так, а не долгом.
+      prepaid: cp.kind !== 'supplier' && closing < 0 && Boolean(prepayState(userId, cp.id)),
       lastOp,
       days,
       ops: b.ops.length,
@@ -2930,16 +2933,31 @@ function setPrepayMode(userId, cpId, orgId, on, baseDoc) {
  * в минус, и каждая накладная съедает её своим «Реализация». Вторая проводка
  * поверх задвоила бы оплату.
  */
-function addPrepay(userId, cpId, sum, date, orgId = null) {
+function addPrepay(userId, cpId, sum, date, orgId = null, comment = '') {
   const amount = round2(Math.abs(Number(sum) || 0));
   if (!amount || !getCp(userId, cpId)) return null;
   const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  // Договор или допсоглашение, по которому внесли, — в основание строки; note остаётся
+  // ровно «Предоплата»: по нему свободную оплату отличают от предоплаты (см. привязку оплат к документам).
+  const why = String(comment || '').replace(/\s+/g, ' ').trim().slice(0, 100);
   const opId = addOp(userId, cpId, {
     date: /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? date : todayISO(),
-    kind: 'Оплата', doc: 'Предоплата', note: 'Предоплата', debit: amount,
+    kind: 'Оплата', doc: why && !/^предоплата$/i.test(why) ? `Предоплата · ${why}` : 'Предоплата',
+    note: 'Предоплата', debit: amount,
   }, org);
   setPrepayMode(userId, cpId, org, true);
   db.prepare('UPDATE cp_prepay SET last_sum = ? WHERE org_id = ? AND cp_id = ?').run(amount, org, cpId);
+  /*
+   * Накладные, выписанные ДО предоплаты (или до пополнения), сами отметку «оплачено»
+   * не получат: settleFromPrepay вызывается только при выписке. Деньги при этом уже
+   * в сальдо, и документ висел в «Ждут оплаты», хотя его покрыли. Закрываем их тем же
+   * правилом: сальдо не выше нуля — значит, всё выписанное покрыто. Не хватило — не
+   * дробим и ничего не трогаем, как и при выписке.
+   */
+  const waiting = db.prepare(`
+    SELECT id FROM documents WHERE user_id = ? AND org_id = ? AND cp_id = ? AND paid_at = ''
+       AND no_debt = 0 AND total > 0 ORDER BY date, id`).all(userId, org, cpId);
+  for (const w of waiting) settleFromPrepay(userId, w.id);
   return { opId, amount };
 }
 
@@ -2973,6 +2991,75 @@ function prepayLine(st) {
   if (st.debt > 0) return `Предоплата закончилась, долг ${fmtRub(st.debt)}`;
   if (st.left <= 0) return 'Предоплата закончилась';
   return `Предоплата: осталось ${fmtRub(st.left)}` + (st.low ? ' — скоро кончится' : '');
+}
+
+/**
+ * Что стало с предоплатой клиента: сколько внесено, что с неё списано, что
+ * не поместилось. Только показ — ничего не пишет и не пересчитывает, поэтому
+ * приложение и бот читают одни и те же цифры, а не складывают свои.
+ *
+ * «Списано» — накладные, закрытые самой предоплатой (отметка «оплачено» без
+ * собственной проводки оплаты, см. settleFromPrepay). Неоплаченные накладные,
+ * выписанные до первой предоплаты и всё ещё не закрытые, идут отдельной суммой
+ * `before`, иначе «списано» не сходилось бы с перечнем, и человек решил бы,
+ * что цифры врут. «До» определяем по номеру проводки, а не по дате:
+ * накладную легко выписать задним числом, а порядок записи не обманешь.
+ *
+ * @returns {null|{state:object, paid:number, spent:number, left:number, debt:number,
+ *   covered:object[], over:object[], before:number, partial:number}} null — клиент не на предоплате
+ */
+function prepayReport(userId, cpId, orgId = null) {
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const state = prepayState(userId, cpId, org);
+  if (!state) return null;
+  const ops = listOps(userId, cpId, org);
+  const isPre = (o) => !o.doc_id && o.kind === 'Оплата' && Number(o.debit) > 0
+    && /предоплат/i.test(`${o.doc} ${o.note}`);
+  const pre = ops.filter(isPre);
+  // Первая по времени записи, а не по дате: журнал отсортирован по дате, и предоплата,
+  // внесённая задним числом, оказалась бы «первой» по ошибке.
+  const firstId = pre.length ? Math.min(...pre.map((o) => o.id)) : 0;
+  const paid = round2(pre.reduce((a, o) => a + (Number(o.debit) || 0), 0));
+  const spent = round2(Math.min(Math.max(0, paid - state.left), paid));
+  const brief = (o) => {
+    const d = getDoc(userId, o.doc_id);
+    return d ? {
+      id: d.id, type: d.type, title: d.title, short: docShort(d.type), number: d.number,
+      date: d.date, total: Number(d.total) || 0, sum: round2(Number(o.credit) || 0), opId: o.id,
+    } : null;
+  };
+  const covered = [];
+  const unpaid = [];
+  for (const o of ops) {
+    if (!o.doc_id || o.kind !== 'Реализация') continue;
+    const d = getDoc(userId, o.doc_id);
+    if (!d) continue;
+    // Накладную закрыли отдельными деньгами («Оплатил») — это не списание с предоплаты.
+    const ownPay = ops.some((x) => x.doc_id === o.doc_id && x.kind === 'Оплата');
+    const b = brief(o);
+    if (d.paid_at && !ownPay) covered.push(b);
+    else if (!d.paid_at) unpaid.push(b);
+  }
+  /*
+   * Что не поместилось: предоплата гасит накладные по порядку, поэтому долг
+   * образуют самые новые из неоплаченных — берём их, пока сумма не дотянет до долга.
+   * Старые неоплаченные (выписаны до предоплаты) в этот список не попадают.
+   */
+  const over = [];
+  if (state.debt > 0) {
+    let acc = 0;
+    for (let i = unpaid.length - 1; i >= 0 && acc < state.debt - 0.004; i -= 1) {
+      over.unshift(unpaid[i]);
+      acc += unpaid[i].sum;
+    }
+  }
+  const overIds = new Set(over.map((d) => d.id));
+  const before = round2(unpaid.filter((d) => !overIds.has(d.id) && d.opId < firstId)
+    .reduce((a, d) => a + d.sum, 0));
+  // Часть остатка, ушедшая на накладную, которая целиком не поместилась: сама она остаётся
+  // неоплаченной, но деньги из предоплаты уже взяла. Без этой строки «списано» не сходилось бы со списком.
+  const partial = round2(Math.max(0, spent - round2(covered.reduce((a, d) => a + d.sum, 0)) - before));
+  return { state, paid, spent, left: state.left, debt: state.debt, covered, over, before, partial };
 }
 
 const hasOpOfDoc = (docId, kind) => db.prepare(
@@ -3338,7 +3425,7 @@ module.exports = {
   isSeqTaken, guardSeq, numberTakenInOrg, currentOrgId, currentOrg, setActiveOrg,
   orgQuota, grantOrgSlots,
   openingFor, setOpeningFor, cpOrgs,
-  prepayFor, setPrepayMode, addPrepay, prepayState, prepayLine, settleFromPrepay,
+  prepayFor, setPrepayMode, addPrepay, prepayState, prepayReport, prepayLine, settleFromPrepay,
   setNoDebt, shipmentsOfMonth, monthActOf, monthActsOf, openShipmentsOfMonth,
   nextSeqForOrg, saveDoc, listDocs, repeatSources, REPEATABLE, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, seedItems, listTemplates, getTemplate, forgetTemplate,

@@ -280,15 +280,22 @@ function cpMenu(userId, cp) {
   const b = bdb.balanceOf(userId, cp.id);
   const pre = bdb.prepayState(userId, cp.id);
   const closing = b ? round2(b.closing) : 0;
+  // Кредитовое сальдо заказчика на предоплате — его аванс, а не «мы должны ему»: так и называем,
+  // одной строкой, без повтора суммы.
+  const advance = pre && cp.kind !== 'supplier' && pre.left > 0 && !pre.debt;
   const info = `<b>${esc(cp.name)}</b>${cp.inn ? ` · ИНН ${esc(cp.inn)}` : ''}\n`
     + `Тип: ${cp.kind === 'supplier' ? 'поставщик' : 'заказчик'} · операций: ${b ? b.ops.length : 0}\n`
-    + balanceLine(cp, closing)
-    + (pre ? `\n💰 <b>${bdb.prepayLine(pre)}</b>` : '');
+    + (advance
+      ? `💰 Осталось из предоплаты: <b>${formatRub(pre.left)}</b>${pre.low ? ' — скоро кончится' : ''}\n`
+        + '<i>Столько ещё можно отгрузить в счёт аванса.</i>'
+      : balanceLine(cp, closing) + (pre ? `\n💰 <b>${bdb.prepayLine(pre)}</b>` : ''));
   const rows = [
     [{ text: '➕ Внести операцию', data: `op:${cp.id}` }],
     // Предоплата — отдельная кнопка: это не «оплата по счёту», а режим работы с клиентом.
-    pre ? [{ text: '💰 Предоплата', data: `pp.in:${cp.id}` }, { text: '📄 Акт за месяц', data: `pp.act:${cp.id}` }]
-      : [{ text: '💰 Предоплата', data: `pp.in:${cp.id}` }],
+    // Нет предоплаты — кнопка сразу про внесение, названная тем, что человек ищет;
+    // есть — «Предоплата» открывает остаток и список списанного, а внести ещё — оттуда.
+    pre ? [{ text: '💰 Предоплата', data: `pp.view:${cp.id}` }, { text: '📄 Акт за месяц', data: `pp.act:${cp.id}` }]
+      : [{ text: '💰 Внести предоплату', data: `pp.in:${cp.id}` }],
     [{ text: '📄 Акт сверки', data: `d.akt:${cp.id}` }, { text: '🧾 Акт услуг', data: `d.usl:${cp.id}` }],
     [{ text: '💰 Счёт на оплату', data: `d.sch:${cp.id}` }, { text: '🏦 Платёжка', data: `d.pp:${cp.id}` }],
     [{ text: '🤝 Счёт-договор', data: `d.schdog:${cp.id}` }],
@@ -2991,6 +2998,47 @@ async function doPrepay(tg, chatId, user, cpId, amount, when = '') {
   await remindFresh(tg, chatId, user);
 }
 
+/**
+ * Предоплата клиента: сколько внесено, списано, осталось и какие накладные
+ * ушли из неё. Показ — цифры берём у bdb.prepayReport, те же, что в приложении.
+ * Клиент не на предоплате — сразу спрашиваем сумму, смотреть не на что.
+ */
+async function showPrepay(tg, chatId, user, cpId) {
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
+  const rep = bdb.prepayReport(user.id, cpId);
+  if (!rep) {
+    bdb.setState(user.id, `ppay:${cpId}`, {});
+    await tg.sendMessage(chatId, `Сколько внёс ${quoted(cp.name)} предоплатой? Напишите сумму, например <code>140000</code>.`);
+    return;
+  }
+  const docLine = (d) => `${esc(d.short || d.title)} № ${esc(d.number)} · ${ru(d.date)} · ${formatRub(d.sum || d.total)}`;
+  const lines = [
+    `💰 <b>Предоплата · ${esc(cp.name)}</b>`,
+    rep.paid > 0 ? `Внесено ${formatRub(rep.paid)} · списано ${formatRub(rep.spent)}` : '',
+    rep.debt > 0 ? '<b>Предоплата кончилась.</b>' : `<b>Осталось ${formatRub(rep.left)}</b>${rep.state.low ? ' — скоро кончится' : ''}`,
+  ];
+  if (rep.before > 0) lines.push(`<i>Накладные на ${formatRub(rep.before)} выписаны до предоплаты — они уже вычтены из остатка.</i>`);
+  if (rep.covered.length) {
+    const last = rep.covered.slice(-8);
+    lines.push('', `<b>Списано накладными (${rep.covered.length}):</b>`,
+      ...(rep.covered.length > last.length ? [`… и ещё ${rep.covered.length - last.length}`] : []),
+      ...last.map(docLine));
+  }
+  if (rep.debt > 0) {
+    lines.push('', `🔴 <b>Сверх предоплаты: ${formatRub(rep.debt)} — это долг.</b>`);
+    if (rep.over.length) {
+      lines.push(`Эти накладные в остаток целиком не поместились${rep.partial > 0 ? ` (${formatRub(rep.partial)} предоплаты ушло на них, остальное — долг)` : ''}:`,
+        ...rep.over.slice(0, 5).map(docLine));
+    }
+  }
+  await tg.sendMessage(chatId, lines.filter((x, i) => x !== '' || lines[i - 1] !== '').join('\n'),
+    keyboard([
+      [{ text: '➕ Пополнить', data: `pp.in:${cpId}` }, { text: '📄 Акт за месяц', data: `pp.act:${cpId}` }],
+      [{ text: `📂 Карточка «${cp.name}»`.slice(0, 60), data: `cp:${cpId}` }],
+    ]));
+}
+
 const monthAct = require('./lib/month-act');
 
 /** Выбор месяца для акта: три последних, с суммой не вошедших в акт отгрузок на кнопке. */
@@ -4833,6 +4881,10 @@ async function showDebts(tg, chatId, user) {
     // Когда напоминали — чтобы не написать второй раз за день и не забыть на месяц.
     const ago = r.theyOwe ? digest.lastReminded(user.id, r.cp.id) : null;
     const rem = ago == null ? '' : ago === 0 ? ' · напомнили сегодня' : ` · напоминали ${ago} ${plural(ago, 'день', 'дня', 'дней')} назад`;
+    if (isPre(r)) {
+      const st = bdb.prepayState(user.id, r.cp.id);
+      return `• <b>${esc(r.cp.name)}</b> — осталось ${formatRub(r.amount)}${st.low ? ' · скоро кончится' : ''}${quiet}`;
+    }
     const pl = bdb.prepayLine(bdb.prepayState(user.id, r.cp.id));
     return `• <b>${esc(r.cp.name)}</b> — ${formatRub(r.amount)}${quiet}${rem}${flag}`
       + (pl ? `\n   💰 ${pl}` : '');
@@ -4846,7 +4898,7 @@ async function showDebts(tg, chatId, user) {
     text += `<b>Мы должны — ${formatRub(sum(weOwe))}</b>\n${weOwe.map(line).join('\n')}\n\n`;
   }
   if (prepaid.length) {
-    text += `<b>На предоплате</b>\n${prepaid.map(line).join('\n')}\n\n`;
+    text += `<b>На предоплате — аванс клиентов, не долг</b>\n${prepaid.map(line).join('\n')}\n\n`;
   }
   text += `⚠️ — больше двух месяцев без единой операции.${basisNote}`;
 
@@ -6981,6 +7033,10 @@ async function handleCallback(tg, cq) {
       if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
       bdb.setState(user.id, `ppay:${cpId}`, {});
       await tg.sendMessage(chatId, `Сколько внёс ${quoted(cp.name)} предоплатой? Напишите сумму, например <code>140000</code>.`);
+      return;
+    }
+    if (data.startsWith('pp.view:')) {
+      await showPrepay(tg, chatId, user, Number(data.slice(8)));
       return;
     }
     if (data.startsWith('pp.do:')) {

@@ -1376,7 +1376,7 @@ const api = {
     // Предоплата — свободная строка «Оплата» плюс режим у клиента; накладные
     // дальше закрываются сами (см. bdb.settleFromPrepay).
     if (body.kind === 'prepay') {
-      bdb.addPrepay(user.id, cp.id, amount, date);
+      bdb.addPrepay(user.id, cp.id, amount, date, null, str(body.doc, 100));
       return { cp: cpBrief(user.id, bdb.getCp(user.id, cp.id)), npd: npdNoteFor(user.id) };
     }
     bdb.addOp(user.id, cp.id, {
@@ -2200,7 +2200,7 @@ const api = {
     return {
       debtors: bdb.debtors(user.id).map((d) => ({
         cpId: d.cp.id, name: d.cp.name, amount: d.amount,
-        theyOwe: d.theyOwe, days: d.days, lastOp: d.lastOp,
+        theyOwe: d.theyOwe, prepaid: d.prepaid, days: d.days, lastOp: d.lastOp,
       })),
     };
   },
@@ -2313,12 +2313,27 @@ const api = {
         date: o.date,
         kind: o.kind || '',
         doc: o.doc || '',
+        note: o.note || '',
+        // Документ, из которого пришла проводка: по нему строка журнала открывает карточку документа.
+        docId: o.doc_id || 0,
         // Знак с точки зрения долга: плюс — долг вырос, минус — закрыт.
         delta: round2((Number(o.credit) || 0) - (Number(o.debit) || 0)),
         balance: round2(o.balance),
         fromDoc: Boolean(o.doc_id),
       })),
     };
+  },
+
+  /**
+   * Предоплата клиента для карточки: внесено, списано, остаток, накладные.
+   * null — клиент на обычных условиях. Цифры считает bdb.prepayReport — те же,
+   * что видит бот; здесь только дверь с проверкой, что клиент свой.
+   */
+  async 'GET /api/prepay'({ user, url }) {
+    const cpId = Number(url.searchParams.get('cp'));
+    if (!bdb.getCp(user.id, cpId)) return { error: 'Клиент не найден.' };
+    const r = bdb.prepayReport(user.id, cpId);
+    return { prepay: r ? { ...r, text: bdb.prepayLine(r.state) } : null };
   },
 
   /** Убрать одну строку журнала. */

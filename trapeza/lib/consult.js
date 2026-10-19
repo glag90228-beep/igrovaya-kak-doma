@@ -91,7 +91,8 @@ function userContext(userId) {
   }
   const rows = bdb.debtors(userId);
   const theyOwe = rows.filter((r) => r.theyOwe).sort((a, b) => b.amount - a.amount);
-  const weOwe = rows.filter((r) => !r.theyOwe);
+  const weOwe = rows.filter((r) => !r.theyOwe && !r.prepaid);
+  const prepaid = rows.filter((r) => r.prepaid);
   if (theyOwe.length) {
     const total = theyOwe.reduce((s, r) => s + r.amount, 0);
     lines.push(`Клиенты должны всего ${rub(total)}: ${theyOwe.slice(0, 6).map((r) => `${r.cp.name} — ${rub(r.amount)}`
@@ -101,6 +102,9 @@ function userContext(userId) {
   }
   if (weOwe.length) {
     lines.push(`Мы должны: ${weOwe.slice(0, 4).map((r) => `${r.cp.name} — ${rub(r.amount)}`).join('; ')}.`);
+  }
+  if (prepaid.length) {
+    lines.push(`На предоплате (это аванс клиентов, а не наш долг): ${prepaid.slice(0, 4).map((r) => `${r.cp.name} — осталось ${rub(r.amount)}`).join('; ')}.`);
   }
   const unpaid = bdb.unpaidDocs(userId, 5);
   if (unpaid.length) {

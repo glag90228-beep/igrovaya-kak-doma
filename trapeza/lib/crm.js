@@ -108,7 +108,8 @@ function timeline(userId, cpId, limit = 25) {
   const bdb = require('./bot-db');
   const items = [];
   for (const d of bdb.listDocs(userId, 200, cpId)) {
-    items.push({ at: d.date, icon: d.paid_at ? '✅' : '📄',
+    // docId — чтобы строку ленты можно было открыть: без него она выглядела нажимаемой и молчала.
+    items.push({ at: d.date, icon: d.paid_at ? '✅' : '📄', kind: 'doc', docId: d.id,
       text: `${d.title} № ${d.number}${d.total ? ` — ${Math.round(d.total).toLocaleString('ru-RU')} ₽` : ''}${d.paid_at ? ' · оплачен' : ''}` });
   }
   const b = bdb.balanceOf(userId, cpId);
@@ -116,14 +117,14 @@ function timeline(userId, cpId, limit = 25) {
     if (op.doc_id || op.docId) continue;   // проводка документа уже есть в ленте самим документом
     const sum = Number(op.debit || op.credit || 0);
     if (!sum) continue;
-    items.push({ at: op.date, icon: '💰', text: `${op.kind || 'Операция'} — ${Math.round(sum).toLocaleString('ru-RU')} ₽` });
+    items.push({ at: op.date, icon: '💰', kind: 'op', opId: op.id, text: `${op.kind || 'Операция'} — ${Math.round(sum).toLocaleString('ru-RU')} ₽` });
   }
   require('./digest');   // таблица напоминаний должникам заводится там
   for (const r of db.prepare('SELECT * FROM debt_reminders WHERE user_id = ? AND cp_id = ?').all(userId, cpId)) {
-    items.push({ at: String(r.at).slice(0, 10), icon: '✉️', text: `Напоминание об оплате${r.via === 'mail' ? ' письмом' : ''}` });
+    items.push({ at: String(r.at).slice(0, 10), icon: '✉️', kind: 'reminder', text: `Напоминание об оплате${r.via === 'mail' ? ' письмом' : ''}` });
   }
   for (const n of db.prepare('SELECT * FROM cp_notes WHERE user_id = ? AND cp_id = ?').all(userId, cpId)) {
-    items.push({ at: String(n.at).slice(0, 10), icon: '📝', text: n.text });
+    items.push({ at: String(n.at).slice(0, 10), icon: '📝', kind: 'note', text: n.text });
   }
   items.sort((a, b2) => String(b2.at).localeCompare(String(a.at)));
   return items.slice(0, limit);

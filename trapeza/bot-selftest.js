@@ -9240,6 +9240,55 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'фраза «предоплата 140000 от Обычный» разбирается', JSON.stringify(q));
     const q2 = ai.quickParse('договор с предоплатой 30%');
     ok(!q2 || !q2.prepay, 'слово «предоплатой» внутри фразы режим не включает');
+
+    /*
+     * Где в боте предоплата. Владелец не нашёл «внести предоплату» на клиенте:
+     * кнопка называлась «Предоплата» и у обычного клиента, и у того, кто уже
+     * на предоплате. Теперь у обычного она зовёт внести, а у клиента на
+     * предоплате открывает остаток, списанные накладные и «Пополнить».
+     */
+    const kbData = () => ((sent[sent.length - 1] || {}).kb || []).flat();
+    await tapP(`cp:${cpPlain}`);
+    ok(kbData().some((b) => b.text === '💰 Внести предоплату' && b.callback_data === `pp.in:${cpPlain}`),
+      'карточка обычного клиента: кнопка «💰 Внести предоплату»', kbData().map((b) => b.text).join('|'));
+    await tapP(`cp:${cpP}`);
+    ok(kbData().some((b) => b.text === '💰 Предоплата' && b.callback_data === `pp.view:${cpP}`)
+      && kbData().some((b) => b.callback_data === `pp.act:${cpP}`),
+    'карточка клиента на предоплате: «💰 Предоплата» (остаток) и «Акт за месяц»', kbData().map((b) => b.text).join('|'));
+    await tapP(`pp.view:${cpP}`);
+    ok(/Внесено 240 000/.test(norm(last())) && /Списано накладными/.test(last()) && /Сверх предоплаты: 20 000/.test(norm(last())),
+      '«Предоплата»: внесено, списанные накладные и красная строка «сверх предоплаты»', norm(last()).slice(0, 700));
+    ok(kbData().some((b) => b.text === '➕ Пополнить' && b.callback_data === `pp.in:${cpP}`), 'и кнопка «Пополнить»');
+    await tapP(`pp.view:${cpPlain}`);
+    ok(norm(last()).includes('предоплатой') && bdbP.prepayState(uP.id, cpPlain) === null,
+      'у обычного клиента «посмотреть» сразу спрашивает сумму, ничего не включая');
+    bdbP.clearState(uP.id);
+
+    // Остаток аванса — не «мы должны ему»: карточка и «Кто должен» называют его авансом.
+    const cpAv = bdbP.createCp(uP.id, { name: 'ООО «Аванс»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbP.addPrepay(uP.id, cpAv, 150000, '2026-10-01');
+    for (const d of ['01', '02', '03', '04']) await torg(cpAv, d, 24200);
+    await tapP(`cp:${cpAv}`);
+    ok(/Осталось из предоплаты: 53 200/.test(norm(last()).replace(/<[^>]+>/g, '')) && /ещё можно отгрузить/.test(last())
+      && !/мы должны ему/.test(last()) && !/Баланс:/.test(last()),
+    'карточка в боте: «Осталось из предоплаты: 53 200», без «мы должны ему»', norm(last()).slice(0, 200));
+    await tapP('debts');
+    const dbt = sent.slice(-3).map((m) => norm(m.text)).join(' ');
+    ok(/На предоплате — аванс клиентов, не долг/.test(dbt) && /Аванс[^•]*осталось 53 200/.test(dbt),
+      '«Кто должен»: клиент в разделе «На предоплате», строка «осталось 53 200»', dbt.slice(0, 300));
+    ok(!/Мы должны[^•]*Аванс/.test(dbt.replace(/На предоплате[\s\S]*/, '')), 'и не в разделе «Мы должны»');
+
+    // «Заря внесла предоплату 150000» — разбор приводит к тому же doPrepay, что и кнопка.
+    const cpZar = bdbP.createCp(uP.id, { name: 'ООО «Заря»', kind: 'customer', opening_date: '2026-01-01' });
+    await sayP('Заря внесла предоплату 150000');
+    const confirmBtn = kbData().find((b) => /^pp\.do:/.test(b.callback_data || ''));
+    if (confirmBtn) await tapP(confirmBtn.callback_data);
+    const zarOps = bdbP.listOps(uP.id, cpZar).filter((o) => o.note === 'Предоплата');
+    ok(zarOps.length === 1 && zarOps[0].debit === 150000 && !zarOps[0].doc_id && bdbP.prepayFor(cpZar, orgA).prepay
+      && bdbP.prepayState(uP.id, cpZar).left === 150000,
+    '«Заря внесла предоплату 150000»: та же запись «Предоплата», режим включён, остаток 150 000',
+    `${last().slice(0, 80)} | ${JSON.stringify(zarOps)}`);
+    ok(/Предоплата.*150 000/.test(norm(last())) || /внесена/.test(last()), 'бот ответил, что предоплата внесена', last().slice(0, 100));
   }
 
   console.log('\n── «Повторить»: под выданным документом, в журнале, у оплаченного ──');
@@ -9602,8 +9651,11 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     bdbR.addPrepay(uid, pre, 15000, '2026-10-01');
     sent.length = 0;
     await tap(`cp:${pre}`);
-    ok(norm(sent.map((m) => m.text || '').join(' ')).includes('мы должны ему 15 000'),
-      'Д30: при предоплате — «мы должны ему 15 000», а не «в нашу пользу»', norm(last()).slice(0, 160));
+    // Аванс клиента на предоплате не называем «мы должны ему»: владелец пугался красного долга. Слово — «осталось из предоплаты».
+    const plain = (t) => norm(t).replace(/<[^>]+>/g, '');
+    ok(plain(sent.map((m) => m.text || '').join(' ')).includes('Осталось из предоплаты: 15 000')
+      && !/мы должны ему/.test(sent.map((m) => m.text || '').join(' ')),
+    'Д30: при предоплате — «осталось из предоплаты 15 000», не «мы должны ему» и не «в нашу пользу»', norm(last()).slice(0, 160));
     ok(!sent.map((m) => m.text || '').join(' ').includes('в нашу пользу'), 'старой подписи нет');
     const dbtr = mkC('ООО «Должник-знак»', 'customer');
     bdbR.addOp(uid, dbtr, { date: '2026-10-01', kind: 'Приход', doc: 'Счёт', credit: 54250 });

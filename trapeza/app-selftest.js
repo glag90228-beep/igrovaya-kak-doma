@@ -391,8 +391,13 @@ const ok = (c, m, extra) => {
     'внесённая оплата видна строкой',
     await page.evaluate(() => document.querySelectorAll('.swipe').length));
 
+  // Нажатие по записи открывает её карточку (раньше строка молчала); смахивание работает по-прежнему.
   const opRow = await page.locator('.swipe-face').first().boundingBox();
   await page.touchscreen.tap(opRow.x + opRow.width / 2, opRow.y + opRow.height / 2);
+  await page.waitForSelector('#opcard-cancel', { timeout: 5000 });
+  ok(await page.locator('#opcard-cancel').count() === 1, 'нажатие по записи журнала открывает её карточку');
+  await page.evaluate((cpId) => window.__go('ops', { cpId }), cp);
+  await page.waitForSelector('.swipe-face');
   await swipe(-120, 0);
   const delBtn = await page.locator('.swipe-del').first().boundingBox();
   await page.touchscreen.tap(delBtn.x + delBtn.width / 2, delBtn.y + delBtn.height / 2);
@@ -1546,6 +1551,243 @@ const ok = (c, m, extra) => {
     a = await say('выставь счёт вектору на пять тысяч вчерашним числом');
     const made = bdb.listDocs(user.id, 1)[0];
     ok(docsNow() === nDoc + 1 && made.date === yest && made.total === 5000, 'документ выписан названной датой', `${made.date} ${made.total}`);
+  }
+
+  /*
+   * Карточка клиента, как её видит владелец с телефона: журнал нажимается,
+   * над историей нет слова «null», а предоплату можно найти и внести.
+   *
+   * Все три жалобы пришли разом со скриншотами iPhone: строки журнала со
+   * стрелкой «›» не открывались; над историей клиента стояло «null»; а
+   * «внести предоплату» на клиенте не было — режим жил за переключателем
+   * внутри «Внести оплату». Проверяем настоящими касаниями на ширине 390.
+   */
+  console.log('\n── клиент: журнал нажимается, «null» нет, предоплата на виду ──');
+  {
+    const crm = require(path.join(APP, 'lib/crm'));
+    const shotsDir = process.env.TRAPEZA_SHOTS || '';
+    const shot = async (name) => {
+      if (!shotsDir) return;
+      require('node:fs').mkdirSync(shotsDir, { recursive: true });
+      for (const scheme of ['light', 'dark']) {
+        // eslint-disable-next-line no-await-in-loop
+        await page.emulateMedia({ colorScheme: scheme });
+        // eslint-disable-next-line no-await-in-loop
+        await page.waitForTimeout(250);
+        // eslint-disable-next-line no-await-in-loop
+        // Экран телефона, а не вся страница: плавающие панель и подсказка на длинном снимке
+        // оказываются посреди листа и портят картину. Подсказку прячем — она висит три секунды.
+        // eslint-disable-next-line no-await-in-loop
+        await page.evaluate(() => { window.scrollTo(0, 0); const t = document.getElementById('toast'); if (t) t.hidden = true; });
+        // eslint-disable-next-line no-await-in-loop
+        await page.screenshot({ path: path.join(shotsDir, `${name}-${scheme}.png`) });
+      }
+      await page.emulateMedia({ colorScheme: 'light' });
+    };
+    const text = () => page.evaluate(() => document.body.innerText);
+    const flat = async () => (await text()).replace(/\s/g, ' ');
+    const h1z = () => page.evaluate(() => (document.querySelector('h1') || {}).textContent);
+    /** Настоящее касание в середину элемента: прокручиваем к нему и жмём пальцем. */
+    const tapEl = async (loc) => {
+      await loc.scrollIntoViewIfNeeded();
+      const b = await loc.boundingBox();
+      await page.touchscreen.tap(b.x + b.width / 2, b.y + b.height / 2);
+      await page.waitForTimeout(400);
+    };
+    const openCp = async (id) => {
+      await page.evaluate((x) => window.__go('cp', { id: x }), id);
+      await page.waitForSelector('#crm-note', { timeout: 8000 });
+      await page.getByText('История клиента').waitFor({ timeout: 8000 });
+      // Лента рисуется отдельным запросом — ждём, пока в ней появится хоть одна строка.
+      await page.waitForSelector('.tl-row, .card .row.muted', { timeout: 8000 });
+    };
+    const org = bdb.currentOrgId(user.id);
+    const issue = (cpId, day, price) => docService.issueDocument(user.id, {
+      type: 'torg12', cpId, date: `2026-10-${day}`, skipQuota: true,
+      items: [{ name: 'Обеды', unit: 'шт.', qty: 1, price }],
+    });
+
+    // ── 1. Журнал: строка с документом открывает документ, строка без него — запись.
+    const cpJ = bdb.createCp(user.id, { name: 'ООО «Журнальный»', kind: 'customer', opening_date: '2026-01-01' });
+    const rJ = await issue(cpJ, '05', 7600);
+    const opFree = bdb.addOp(user.id, cpJ, { date: '2026-10-06', kind: 'Оплата', doc: 'Оплата по счёту № 4', note: 'Оплата', debit: 2500, credit: 0 });
+    await page.evaluate((cpId) => window.__go('ops', { cpId }), cpJ);
+    await page.waitForSelector('.card .row', { timeout: 8000 });
+    // Строка документа — первая по дате: «Реализация · 05.10.2026 · Товарная накладная…».
+    const docRow = page.locator('.card .row', { hasText: 'Реализация' }).first();
+    await tapEl(docRow);
+    await page.waitForSelector('#app h1', { timeout: 5000 });
+    ok(/Товарная накладная/.test(await flat()) && /№ 1/.test(await flat()) && await page.locator('#opcard-cancel').count() === 0,
+      'тап по «Реализация» в журнале открывает карточку документа', (await h1z()) || (await flat()).slice(0, 80));
+
+    await page.evaluate((cpId) => window.__go('ops', { cpId }), cpJ);
+    await page.waitForSelector('.swipe-face', { timeout: 8000 });
+    await tapEl(page.locator('.swipe-face').first());
+    await page.waitForSelector('#opcard-cancel', { timeout: 5000 });
+    const card = await flat();
+    ok(/Запись журнала/.test(await h1z()) && /2 500/.test(card) && /06\.10\.2026/.test(card) && /Оплата по счёту № 4/.test(card),
+      'тап по ручной оплате открывает запись: сумма, дата, основание', card.slice(0, 160));
+    page.once('dialog', (dlg) => dlg.dismiss());
+    await tapEl(page.locator('#opcard-cancel'));
+    await page.waitForTimeout(500);
+    ok(bdb.listOps(user.id, cpJ).some((o) => o.id === opFree), 'отказ в подтверждении запись не трогает');
+    page.once('dialog', (dlg) => dlg.accept());
+    await tapEl(page.locator('#opcard-cancel'));
+    await page.waitForFunction(() => !document.querySelector('#opcard-cancel'), null, { timeout: 5000 });
+    ok(!bdb.listOps(user.id, cpJ).some((o) => o.id === opFree), '«Отменить запись» с подтверждением убирает проводку');
+    ok(bdb.balanceOf(user.id, cpJ).closing === 7600, 'баланс клиента вернулся к долгу по накладной', bdb.balanceOf(user.id, cpJ).closing);
+    ok(await page.locator('.swipe-face').count() === 0 && /Реализация/.test(await flat()),
+      'после отмены вернулись в журнал: записи нет, строка документа на месте');
+
+    // ── 2. История: «null» нигде, документы нажимаются, заметка — просто текст.
+    for (const withFollowup of [false, true]) {
+      if (withFollowup) crm.addFollowup(user.id, cpJ, { today: docService.todayISO(), days: 3, text: 'позвонить по счёту' });
+      // eslint-disable-next-line no-await-in-loop
+      await openCp(cpJ);
+      // eslint-disable-next-line no-await-in-loop
+      const t = await text();
+      ok(!/(^|\W)(null|undefined|NaN)(\W|$)/.test(t),
+        `в тексте карточки клиента нет «null»/«undefined»/«NaN»${withFollowup ? ' (с напоминанием)' : ''}`,
+        (t.match(/.{0,30}(null|undefined|NaN).{0,30}/) || [''])[0]);
+    }
+    crm.addNote(user.id, cpJ, 'договорились на пятницу');
+    await openCp(cpJ);
+    const tlDoc = page.locator('button.tl-row', { hasText: 'Товарная накладная' }).first();
+    ok(await tlDoc.count() === 1, 'документ в истории — нажимаемая строка');
+    const tlNote = page.locator('.tl-row', { hasText: 'договорились на пятницу' }).first();
+    ok(await tlNote.evaluate((el) => el.tagName) === 'DIV', 'заметка в истории — не кнопка и без стрелки');
+    await tapEl(tlDoc);
+    await page.waitForFunction(() => !document.querySelector('#crm-note'), null, { timeout: 5000 });
+    ok(/Товарная накладная/.test(await flat()), 'тап по документу в истории открывает документ');
+
+    // ── 3. Предоплата: блок виден, внесение меняет остаток, накладная списывается, избыток — долг.
+    const cpP = bdb.createCp(user.id, { name: 'ООО «Заря»', kind: 'customer', opening_date: '2026-01-01' });
+    await openCp(cpP);
+    ok(await page.locator('#prepay-block').count() === 1 && /Внести предоплату/.test(await page.locator('#prepay-block').innerText()),
+      'у клиента без предоплаты в карточке есть блок с кнопкой «Внести предоплату»');
+    ok(await page.locator('#pp-line').count() === 0 && !/Акт за месяц/.test(await flat()),
+      'остатка и «Акт за месяц» без предоплаты нет');
+    await shot('cp-bez-predoplaty');
+    const addBtn = page.locator('#prepay-add');
+    ok((await addBtn.boundingBox()).height >= 40, 'кнопка нажимается пальцем: не ниже 40 px');
+    await tapEl(addBtn);
+    await page.waitForSelector('#prepay-save', { timeout: 5000 });
+    ok(await h1z() === 'Предоплата' && await page.locator('#f-date').count() === 1 && await page.locator('#f-doc').count() === 1,
+      'форма предоплаты: сумма, дата, договор или допсоглашение');
+    await page.locator('#prepay-save').tap();
+    await page.waitForTimeout(300);
+    ok(bdb.prepayState(user.id, cpP) === null && /Укажите сумму/.test(await flat()), 'без суммы предоплата не вносится');
+    await page.locator('#f-amount').fill('150000');
+    await page.locator('#f-doc').fill('допсоглашение № 3');
+    await tapEl(page.locator('#prepay-save'));
+    await page.waitForSelector('#pp-line', { timeout: 8000 });
+    let st = bdb.prepayState(user.id, cpP);
+    ok(st && st.left === 150000 && bdb.prepayFor(cpP, org).prepay, 'внесли 150 000: режим включён, остаток 150 000', JSON.stringify(st));
+    const prepOp = bdb.listOps(user.id, cpP).find((o) => o.note === 'Предоплата');
+    ok(prepOp && prepOp.debit === 150000 && prepOp.doc === 'Предоплата · допсоглашение № 3' && !prepOp.doc_id,
+      'в журнал легла одна свободная запись «Предоплата · допсоглашение № 3»', JSON.stringify(prepOp));
+    let t = await flat();
+    ok(/Предоплата 150 000 ₽ · списано 0 ₽/.test(t) && /осталось 150 000 ₽/.test(t), 'блок показывает внесено 150 000, списано 0, осталось 150 000', t.slice(0, 200));
+    ok(await page.locator('#prepay-act').count() === 1 && await page.locator('#prepay-add').innerText() === 'Пополнить',
+      'в блоке есть «Пополнить» и «Акт за месяц»');
+    await shot('cp-s-predoplatoy');
+
+    const rA = await issue(cpP, '10', 10000);
+    const rB = await issue(cpP, '11', 30000);
+    ok(rA.prepaid && rB.prepaid, 'две накладные (10 000 и 30 000) списались с предоплаты');
+    await openCp(cpP);
+    t = await flat();
+    ok(/списано 40 000 ₽/.test(t) && /осталось 110 000 ₽/.test(t), 'теперь «списано 40 000 · осталось 110 000»', t.slice(t.indexOf('Предоплата'), t.indexOf('Предоплата') + 120));
+    const covered = await page.locator('#pp-covered .row').count();
+    const coveredText = (await page.locator('#pp-covered').innerText()).replace(/\s/g, ' ');
+    ok(covered === 2 && coveredText.includes(`№ ${rA.doc.number}`) && coveredText.includes(`№ ${rB.doc.number}`),
+      'в блоке перечислены две списанные накладные', covered);
+    ok(await page.locator('#pp-over').count() === 0, 'пока денег хватает, красной строки про долг нет');
+    await shot('cp-predoplata-spisano');
+    // Накладная из списка открывается.
+    await tapEl(page.locator('#pp-covered .row').first());
+    await page.waitForFunction(() => !document.querySelector('#prepay-block'), null, { timeout: 5000 });
+    ok(/Товарная накладная/.test(await flat()), 'нажатие на списанную накладную открывает её');
+
+    // Пополнение.
+    await openCp(cpP);
+    await tapEl(page.locator('#prepay-add'));
+    await page.waitForSelector('#prepay-save', { timeout: 5000 });
+    ok(await h1z() === 'Пополнить предоплату', 'у клиента на предоплате кнопка называется «Пополнить»');
+    await page.locator('#f-amount').fill('20000');
+    await tapEl(page.locator('#prepay-save'));
+    await page.waitForSelector('#pp-line', { timeout: 8000 });
+    st = bdb.prepayState(user.id, cpP);
+    ok(st.left === 130000, 'пополнили на 20 000: осталось 130 000', JSON.stringify(st));
+    t = await flat();
+    ok(/Предоплата 170 000 ₽ · списано 40 000 ₽/.test(t) && /осталось 130 000 ₽/.test(t), 'блок: внесено 170 000, списано 40 000, осталось 130 000');
+
+    // Превышение: накладная на 150 000 при остатке 130 000 — остаётся неоплаченной, 20 000 сверху — долг.
+    const rC = await issue(cpP, '12', 150000);
+    ok(!rC.prepaid, 'накладная, не помещающаяся в остаток, не закрывается');
+    await openCp(cpP);
+    t = await flat();
+    ok(await page.locator('#pp-over').count() === 1 && /Сверх предоплаты: 20 000,00 ₽ — это долг/.test(t),
+      'сверх предоплаты показан красным долгом: 20 000', (t.match(/Сверх.{0,60}/) || [''])[0]);
+    const blockText = await page.locator('#prepay-block').innerText();
+    ok(/Предоплата кончилась/.test(blockText) && !/осталось/i.test(blockText), 'и остаток не врёт: «Предоплата кончилась»');
+    const redColor = await page.locator('#pp-over b').evaluate((el) => getComputedStyle(el).color);
+    ok(/^rgb\(2\d\d, \d+, \d+\)$/.test(redColor) || /^rgb\(209, 69, 59\)$/.test(redColor), 'строка про долг красная', redColor);
+    ok(!/(^|\W)(null|undefined|NaN)(\W|$)/.test(await text()), 'и в карточке клиента с предоплатой тоже нет «null»');
+    await shot('cp-predoplata-sverh');
+    ok(/130 000 ₽ предоплаты ушло на них/.test((await page.locator('#pp-over').innerText()).replace(/\s/g, ' ')),
+      'красная плашка объясняет, куда ушли 130 000: накладная целиком не поместилась');
+    ok(bdb.balanceOf(user.id, cpP).closing === 20000, 'учёт: сальдо клиента +20 000 (долг), как и показано', bdb.balanceOf(user.id, cpP).closing);
+
+    // «Акт за месяц» из блока открывает экран акта.
+    await tapEl(page.locator('#prepay-act'));
+    await page.waitForSelector('#monthact-list, .empty, .chips, #app h1', { timeout: 5000 });
+    ok(/Акт за месяц/.test(await h1z()), 'кнопка «Акт за месяц» в блоке открывает экран акта', await h1z());
+
+    // «Должны мы» с красной суммой над предоплатой пугало: клиент внёс 150 000, отгрузили на 96 800.
+    const cpF = bdb.createCp(user.id, { name: 'ООО «Испуганный»', kind: 'customer', opening_date: '2026-01-01' });
+    bdb.addPrepay(user.id, cpF, 150000, '2026-10-01');
+    for (const day of ['01', '02', '03', '04']) await issue(cpF, day, 24200);
+    ok(bdb.prepayState(user.id, cpF).left === 53200, 'учёт: 150 000 − 4 × 24 200 = осталось 53 200');
+    await openCp(cpF);
+    const top = (await page.locator('.balance').innerText()).replace(/\s/g, ' ');
+    const whole = await flat();
+    ok(!/Должны мы/.test(whole) && !/Должен нам/.test(whole), 'в карточке клиента на предоплате нет слов «Должны мы»', top);
+    ok(/Осталось из предоплаты/.test(top) && /53 200,00 ₽/.test(top) && /Столько ещё можно отгрузить в счёт аванса/.test(top),
+      'вместо них: «Осталось из предоплаты 53 200 ₽» и пояснение про отгрузку', top);
+    ok(/осталось 53 200 ₽/.test(whole) && /списано 96 800 ₽/.test(whole), 'в блоке: внесено 150 000, списано 96 800, осталось 53 200');
+    const reds = await page.evaluate(() => {
+      const bad = [];
+      for (const el of document.querySelectorAll('#app .money, #app .v')) {
+        const c = getComputedStyle(el).color;
+        const m = /rgb\((\d+), (\d+), (\d+)\)/.exec(c);
+        if (m && Number(m[1]) > 200 && Number(m[2]) < 110 && Number(m[3]) < 110) bad.push(`${el.textContent} ${c}`);
+      }
+      return bad;
+    });
+    ok(reds.length === 0, 'красных сумм на экране нет', reds.join('; '));
+    ok(await page.locator('#pp-left').count() === 0 && (await page.locator('#prepay-block').innerText()).replace(/\s/g, ' ').split('53 200').length === 2,
+      'сумма остатка в блоке не задваивается второй крупной строкой');
+    ok(await page.locator('.balance .hint').evaluate((el) => parseFloat(getComputedStyle(el).fontSize)) <= 13,
+      '«Указать долг на начало» остаётся, ниже и мелко');
+    await shot('cp-ostatok-predoplaty');
+    // Список клиентов и «Долги» тоже не называют аванс долгом.
+    await page.evaluate(() => window.__go('debts', {}));
+    await page.waitForSelector('.section-title', { timeout: 8000 });
+    const sections = await page.evaluate(() => [...document.querySelectorAll('.section-title')].map((t) => ({
+      title: t.textContent, body: (t.nextElementSibling || {}).textContent || '' })));
+    const mine = sections.find((x) => /Испуганный/.test(x.body));
+    ok(mine && /На предоплате/.test(mine.title) && !/Должны мы/.test(mine.title),
+      'в «Долгах» клиент на предоплате — в разделе «На предоплате», не «Должны мы»', mine && mine.title);
+    await page.evaluate(() => window.__go('cps', {}));
+    await page.waitForSelector('.card .row', { timeout: 8000 });
+    ok(/на предоплате/.test((await page.locator('.row', { hasText: 'Испуганный' }).first().innerText())),
+      'и в списке клиентов подпись «на предоплате»');
+
+    // Поставщику блока нет: предоплату вносит заказчик.
+    const cpS = bdb.createCp(user.id, { name: 'ООО «Поставщик»', kind: 'supplier', opening_date: '2026-01-01' });
+    await openCp(cpS);
+    ok(await page.locator('#prepay-block').count() === 0, 'у поставщика блока «Предоплата» нет');
   }
 
   await browser.close();

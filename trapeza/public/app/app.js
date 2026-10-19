@@ -290,7 +290,7 @@ const PARENT = {
   letter: 'inbox', inbox: 'more', mail: 'more', bank: 'more', org: 'more',
   billing: 'more', support: 'more', help: 'more', vat: 'more', basis: 'more',
   recurring: 'more', reminders: 'more', registry: 'docs', akt: 'docs',
-  unpaid: 'home', scan: 'docs', ops: 'cps', ask: 'home', bankclose: 'debts',
+  unpaid: 'home', scan: 'docs', ops: 'cps', opcard: 'cps', prepay: 'cps', ask: 'home', bankclose: 'debts',
   debts: 'more', monthact: 'cps', cheques: 'home',
 };
 
@@ -606,7 +606,13 @@ function empty(iconName, title, text, action) {
  * должен сам.
  */
 const owesUs = (cp) => (cp.kind === 'supplier' ? cp.balance < 0 : cp.balance > 0);
-const balanceTone = (cp) => (!cp.balance ? '' : (owesUs(cp) ? 'in' : 'out'));
+/*
+ * Заказчик на предоплате с остатком: кредитовое сальдо — это его аванс, а не «мы должны».
+ * По учёту знак тот же, но человек читал красное «Должны мы 53 200 ₽» и пугался: он ничего
+ * не должен, а должен отгрузить. Красный остаётся для настоящего долга: переплаты и возврата.
+ */
+const onPrepay = (cp) => cp.kind !== 'supplier' && Boolean(cp.prepay) && cp.prepay.left > 0 && !(cp.prepay.debt > 0);
+const balanceTone = (cp) => (!cp.balance || onPrepay(cp) ? '' : (owesUs(cp) ? 'in' : 'out'));
 
 /** Строка-ссылка в карточке: иконка, заголовок, пояснение, шеврон. */
 /*
@@ -1969,21 +1975,40 @@ function crmBlock(cpId) {
         toast(`Напомню: ${label.toLowerCase()}`); haptic('medium'); refreshCrmBadge(true); await draw();
       }),
     }, label)));
-    const feed = items.length
-      ? items.map((it) => h('div', { class: 'row tl-row' },
+    /*
+     * Нажимаются только строки, за которыми есть что открыть: документ и
+     * запись журнала. Заметка и напоминание целиком уже на экране, и рисовать
+     * их кнопкой со стрелкой значило бы обещать переход, которого нет.
+     */
+    const tlRow = (it) => {
+      const target = it.docId ? () => go('doc', { id: it.docId })
+        : (it.opId ? () => go('opcard', { cpId, opId: it.opId }) : null);
+      const kids = [
         h('span', { class: 'tl-ico' }, icon(TL_ICON[it.icon] || 'doc', 'icon inline')),
         h('span', { class: 'grow' },
           h('div', { text: nb(it.text) }),
-          h('div', { class: 'small muted', text: ru(String(it.at).slice(0, 10)) }))))
+          h('div', { class: 'small muted', text: ru(String(it.at).slice(0, 10)) })),
+      ];
+      if (!target) return h('div', { class: 'row tl-row' }, kids);
+      return h('button', { class: 'row tl-row', onclick: () => { haptic(); target(); } }, kids, icon('chev', 'chev'));
+    };
+    const feed = items.length
+      ? items.map(tlRow)
       : [h('div', { class: 'row muted', text: 'Пока пусто: документы, оплаты и заметки появятся здесь' })];
-    wrap.replaceChildren(
+    /*
+     * Пустые блоки отсеиваем здесь, а не передаём null: replaceChildren, в
+     * отличие от h(), превращает null в текст «null». Он и висел над историей
+     * у каждого клиента без открытых напоминаний.
+     */
+    wrap.replaceChildren(...[
       h('div', { class: 'section-title', text: 'История клиента' }),
       h('div', { class: 'card crm-form' },
         h('div', { class: 'field' }, h('label', { for: 'crm-note' }, icon('pen', 'icon inline'), 'Заметка'), note,
           h('button', { class: 'btn secondary', onclick: saveNote }, 'Сохранить заметку')),
         h('div', { class: 'field' }, h('label', { for: 'crm-fu-text' }, icon('bell', 'icon inline'), 'Напомнить мне'), fuText, fuBtns)),
       followups.length ? h('div', { class: 'card' }, followupRows(followups, draw, false)) : null,
-      h('div', { class: 'card' }, feed));
+      h('div', { class: 'card' }, feed),
+    ].filter(Boolean));
   };
   draw().catch((e) => wrap.replaceChildren(h('div', { class: 'row muted', text: e.message })));
   return wrap;
@@ -2189,7 +2214,7 @@ screens.cps = async function cps() {
     icon: 'users',
     title: cp.name,
     sub: (multiOrg && !cp.mine ? 'другая ваша фирма · ' : '')
-      + (cp.prepay ? `${cp.prepay.text} · ` : '')
+      + (onPrepay(cp) ? 'на предоплате · ' : (cp.prepay ? `${cp.prepay.text} · ` : ''))
       + (cp.inn ? `ИНН ${cp.inn}` : (cp.kind === 'supplier' ? 'поставщик' : 'заказчик')),
     right: cp.balance ? money(Math.abs(cp.balance)) : '',
     // Сумма без знака непонятна: в списке рядом стоят и должники, и те,
@@ -2282,6 +2307,106 @@ async function schedulesBlock(cpId) {
     }, icon('trash'))))));
   return wrap;
 }
+
+/*
+ * Блок «Предоплата» в карточке клиента.
+ *
+ * rep — отчёт сервера (bdb.prepayReport) или null, если клиент на обычных
+ * условиях. Здесь только показ: ни остаток, ни список накладных не
+ * пересчитываются в браузере, иначе цифры разошлись бы с ботом.
+ * «Акт за месяц» живёт в этом же блоке: он есть только у клиента на
+ * предоплате (иначе акт сразу «оплачен», а накладные висят долгом).
+ */
+function prepayBlock(cp, rep) {
+  const id = cp.id;
+  const wrap = h('div', { id: 'prepay-block' });
+  if (!rep) {
+    wrap.append(h('div', { class: 'card prepay' },
+      h('div', { class: 'row' },
+        h('span', { class: 'icon-box' }, icon('wallet')),
+        h('span', { class: 'grow' },
+          h('div', { text: 'Предоплата' }),
+          h('div', { class: 'small muted', text: 'Клиент заплатил вперёд? Его накладные будут отмечаться оплаченными сами, пока хватает денег.' }))),
+      h('div', { class: 'btn-wrap' },
+        h('button', { class: 'btn', id: 'prepay-add', onclick: () => { haptic(); go('prepay', { cpId: id }); } }, 'Внести предоплату'))));
+    return wrap;
+  }
+
+  const ended = rep.left <= 0;
+  const low = Boolean(rep.state && rep.state.low);
+  const pct = rep.paid > 0 ? Math.max(0, Math.min(100, Math.round((rep.left / rep.paid) * 100))) : 0;
+  const docRowOf = (d) => navRow({
+    icon: 'doc', title: `${d.short || d.title} № ${d.number}`, sub: ru(d.date), right: money0(d.sum || d.total),
+    onclick: () => go('doc', { id: d.id }),
+  });
+  const card = h('div', { class: 'card prepay' },
+    h('div', { class: 'pp-top' },
+      /*
+       * Крупная сумма остатка стоит в строке баланса выше («Осталось из предоплаты»);
+       * здесь она одной строкой вместе с внесённым и списанным, а не вторым большим числом.
+       * Крупно — только слова «Предоплата кончилась»: у них сумм нет.
+       */
+      h('div', { class: `small ${ended ? 'muted' : 'pp-sum'}`, id: 'pp-line',
+        text: (rep.paid > 0 ? `Предоплата ${money0(rep.paid)} · списано ${money0(rep.spent)}` : 'Клиент на предоплате')
+          + (ended ? '' : ` · осталось ${money0(rep.left)}`) }),
+      ended && h('div', { class: `pp-left money${rep.debt > 0 ? ' out' : ''}`, id: 'pp-left', text: 'Предоплата кончилась' }),
+      rep.paid > 0 && h('div', { class: `pp-bar${low || rep.debt > 0 ? ' low' : ''}`, role: 'progressbar', 'aria-label': 'Остаток предоплаты',
+        'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': String(pct) }, h('i', { style: `width:${pct}%` })),
+      low && h('div', { class: 'small pp-warn', text: 'Скоро кончится — пора выставить счёт на новую предоплату.' }),
+      rep.before > 0 && h('div', { class: 'small muted', id: 'pp-before',
+        text: `Накладные на ${money0(rep.before)} были выписаны до предоплаты — они уже вычтены из остатка.` })),
+    rep.covered.length > 0 && h('details', { class: 'pp-list', id: 'pp-covered', open: rep.covered.length <= 5 },
+      h('summary', { text: `Списано накладными · ${rep.covered.length}` }),
+      rep.covered.map(docRowOf)),
+    h('div', { class: 'btn-wrap pp-actions' },
+      h('button', { class: 'btn', id: 'prepay-add', onclick: () => { haptic(); go('prepay', { cpId: id }); } }, 'Пополнить'),
+      h('button', { class: 'btn secondary', id: 'prepay-act', onclick: () => { haptic(); go('monthact', { cpId: id }); } }, 'Акт за месяц')));
+  wrap.append(card);
+
+  if (rep.debt > 0) {
+    wrap.append(h('div', { class: 'banner', id: 'pp-over' }, icon('warn'),
+      h('div', {},
+        h('b', { text: `Сверх предоплаты: ${money(rep.debt)} — это долг` }),
+        h('div', { class: 'small', style: 'margin-top:4px',
+          text: rep.over.length
+            ? `Эти накладные не поместились целиком${rep.partial > 0 ? `: ${money0(rep.partial)} предоплаты ушло на них, остальное — долг` : ''}:`
+            : 'Остатка не хватило, клиент должен разницу.' }),
+        rep.over.slice(0, 5).map((d) => h('div', { class: 'small', style: 'margin-top:2px', text: nb(`${d.short || d.title} № ${d.number} · ${ru(d.date)} · ${money0(d.sum || d.total)}`) })))));
+  }
+  return wrap;
+}
+
+/** Внести или пополнить предоплату: сумма, дата и договор, по которому внесли. */
+screens.prepay = async function prepayScreen({ cpId }) {
+  const { cps } = await api('GET', '/api/cps');
+  const cp = cps.find((c) => c.id === Number(cpId));
+  if (!cp) return empty('warn', 'Клиент не найден');
+  const box = h('div', {}, h('h1', { text: cp.prepay ? 'Пополнить предоплату' : 'Предоплата' }));
+  const amount = field('amount', 'Сумма, ₽', '', { inputmode: 'decimal', required: true });
+  const date = field('date', 'Дата', todayISO(), { type: 'date' });
+  const doc = field('doc', 'Договор или допсоглашение', '', { placeholder: 'Например: договор № 7 или допсоглашение № 2' });
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Клиент' }), h('span', { class: 'ellipsis', text: cp.name })),
+    cp.prepay && h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Сейчас' }), h('span', { text: cp.prepay.text }))));
+  box.append(h('div', { class: 'card' }, amount, date, doc));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Деньги лягут в журнал одной записью «Предоплата». Дальше накладные, акты и УПД этого клиента отмечаются оплаченными сами, пока хватает остатка. Ошиблись — запись можно отменить в журнале.' }));
+  const save = h('button', { class: 'btn', id: 'prepay-save' }, cp.prepay ? 'Пополнить' : 'Внести предоплату');
+  save.onclick = () => withBusy(save, async () => {
+    clearErrors({ amount });
+    const sum = Number(String(amount.input.value).replace(/\s/g, '').replace(',', '.'));
+    if (!(sum > 0)) { showError(amount, 'Укажите сумму'); return; }
+    const saved = await api('POST', '/api/op', {
+      cpId: cp.id, amount: sum, kind: 'prepay', date: date.input.value, doc: doc.input.value.trim(),
+    });
+    haptic('medium');
+    const left = saved && saved.cp && saved.cp.prepay ? saved.cp.prepay.left : 0;
+    toast(`Предоплата внесена. Осталось ${money(left)}`);
+    reset(saved && saved.npd ? 'cheques' : 'cp', saved && saved.npd ? {} : { id: cp.id });
+  });
+  box.append(h('div', { class: 'btn-wrap' }, save));
+  return box;
+};
 
 screens.cp = async function cpScreen({ id, name }) {
   let cp = {};
@@ -2399,15 +2524,28 @@ screens.cp = async function cpScreen({ id, name }) {
     const balanceRow = h('button', { class: 'row balance' },
       h('span', { class: 'grow' },
         h('div', { class: 'ellipsis muted small',
-          text: cp.balance ? (owesUs(cp) ? 'Должен нам' : 'Должны мы') : 'Баланс' }),
+          text: onPrepay(cp) ? 'Осталось из предоплаты'
+            : (cp.balance ? (owesUs(cp) ? 'Должен нам' : 'Должны мы') : 'Баланс') }),
         h('div', { class: `v money ${balanceTone(cp)}`, text: money(Math.abs(cp.balance || 0)) }),
-        cp.prepay ? h('div', { class: 'small' }, icon('wallet', 'icon inline'), cp.prepay.text) : '',
+        onPrepay(cp) && h('div', { class: 'small muted', id: 'balance-advance', text: 'Столько ещё можно отгрузить в счёт аванса' }),
         h('div', { class: 'hint', text: openingHint() })),
       icon('chev', 'chev'));
     balanceRow.onclick = () => { haptic(); gotoOpening(); };
 
+    box.append(h('div', { class: 'card' }, balanceRow));
+    /*
+     * Предоплата — своим блоком сразу под суммой, а не строкой среди остальных.
+     * Режим был, но его включало «Внести оплату» с переключателем «Предоплата»
+     * внутри: владелец искал «внести предоплату» на клиенте и не находил.
+     * Поставщику блок не нужен: предоплату вносит заказчик, а не мы.
+     */
+    if (cp.kind !== 'supplier') {
+      const rep = cp.prepay
+        ? await api('GET', `/api/prepay?cp=${id}`).then((r) => r.prepay).catch(() => null)
+        : null;
+      box.append(prepayBlock(cp, rep));
+    }
     box.append(h('div', { class: 'card' },
-      balanceRow,
       navRow({ icon: 'list', title: 'Журнал операций', sub: 'внесённое руками и из выписки',
         onclick: () => go('ops', { cpId: id }) }),
       navRow({ icon: 'receipt', title: 'Выписать счёт', onclick: () => go('new', { type: 'sch', cpId: id }) }),
@@ -2420,11 +2558,7 @@ screens.cp = async function cpScreen({ id, name }) {
             download(r.file);
           } catch (e) { toast(e.message, true); }
         } }),
-      navRow({ icon: 'docs2', title: 'Документы клиента', onclick: () => go('docs', { cp: id }) }),
-      // Только клиенту на предоплате: акт сразу «оплачен», а это верно, лишь когда
-      // отгрузки покрыты авансом. У поставщика отгружаем не мы.
-      cp.kind === 'supplier' || !cp.prepay ? null : navRow({ icon: 'doc-check', title: 'Акт за месяц',
-        sub: 'накладные и УПД — одним актом', onclick: () => go('monthact', { cpId: id }) })));
+      navRow({ icon: 'docs2', title: 'Документы клиента', onclick: () => go('docs', { cp: id }) })));
     const schedules = await schedulesBlock(id);
     if (schedules) box.append(schedules);
     box.append(crmBlock(id));
@@ -2873,7 +3007,8 @@ screens.debts = async function debts() {
     return box;
   }
   const them = debtors.filter((d) => d.theyOwe);
-  const us = debtors.filter((d) => !d.theyOwe);
+  const pre = debtors.filter((d) => d.prepaid);
+  const us = debtors.filter((d) => !d.theyOwe && !d.prepaid);
   // Цвет суммы тот же, что на главной: зелёная — нам, красная — мы.
   // Одинаково окрашенные столбцы цифр заставляют читать заголовок раздела.
   const block = (title, list, tone) => (list.length ? [
@@ -2894,7 +3029,9 @@ screens.debts = async function debts() {
     })),
   ] : []);
   // append массив не разворачивает — он бы превратился в строку.
-  box.append(...block('Должны нам', them, 'in'), ...block('Должны мы', us, 'out'));
+  box.append(...block('Должны нам', them, 'in'), ...block('Должны мы', us, 'out'),
+    // Аванс клиентов — отдельно и без цвета долга: это не наш долг, а будущие отгрузки.
+    ...block('На предоплате: сколько ещё отгрузить', pre, ''));
   if (them.length) {
     // Акты сверки всем сразу: в боте это одна кнопка, а в приложении
     // приходилось заходить в каждого клиента по очереди.
@@ -3686,9 +3823,15 @@ screens.ops = async function opsScreen({ cpId }) {
       sub: [ru(o.date), o.doc, o.fromDoc ? 'из документа' : ''].filter(Boolean).join(' · '),
       right: money(Math.abs(o.delta)),
       rightTone: o.delta > 0 ? 'in' : 'out',
-      onclick: () => {},
+      /*
+       * Стрелка справа обещает переход, поэтому он есть у каждой строки.
+       * Здесь стоял пустой обработчик: строка выглядела нажимаемой, нажималась
+       * и молчала. Из документа — карточка документа; свободная запись
+       * (оплата руками, предоплата) — карточка записи с «Отменить».
+       */
+      onclick: () => (o.docId ? go('doc', { id: o.docId }) : go('opcard', { cpId, opId: o.id })),
     });
-    // Строки, пришедшие из документа, отсюда не трогаем: их снимает сам
+    // Строки, пришедшие из документа, смахиванием не убираем: их снимает сам
     // документ, а убрать проводку в обход него — значит развести журнал с
     // тем, что напечатано на бумаге.
     if (o.fromDoc) return row;
@@ -3704,7 +3847,58 @@ screens.ops = async function opsScreen({ cpId }) {
   });
   box.append(h('div', { class: 'card' }, rows));
   box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
-    text: 'Смахните строку влево, чтобы убрать. Строки из документов убираются вместе с документом.' }));
+    text: 'Нажмите на строку, чтобы открыть. Убрать внесённую руками запись можно смахиванием влево или в её карточке. Строки из документов убираются вместе с документом.' }));
+  return box;
+};
+
+/*
+ * Карточка записи журнала: то, что внесено руками (оплата, предоплата, приход).
+ *
+ * Строка в журнале показывает сумму и две подписи, а комментарий, вид и дату
+ * целиком не покажет. Отмену здесь спрашиваем отдельно: смахивание можно
+ * сделать случайно, а запись уходит из баланса.
+ */
+screens.opcard = async function opCardScreen({ cpId, opId }) {
+  const j = await api('GET', `/api/ops?cp=${cpId}`);
+  const o = j.ops.find((x) => x.id === Number(opId));
+  if (!o) {
+    return empty('list', 'Этой записи уже нет', 'Её убрали — баланс клиента посчитан без неё.',
+      h('div', { class: 'btn-wrap' }, h('button', { class: 'btn', onclick: () => back() }, 'Назад')));
+  }
+  const kind = o.kind || (o.delta > 0 ? 'Приход' : 'Оплата');
+  const sum = Math.abs(o.delta);
+  const row = (label, value) => h('div', { class: 'row' },
+    h('span', { class: 'muted', text: label }), h('span', { class: 'grow', style: 'text-align:right;overflow-wrap:anywhere', text: value }));
+  const note = o.note && o.note !== o.doc && !String(o.doc).startsWith(o.note) ? o.note : '';
+
+  const box = h('div', {}, h('h1', { text: 'Запись журнала' }));
+  box.append(h('div', { class: 'hero' },
+    h('div', { class: 'greet', text: j.cp.name }),
+    h('div', { class: 'sum money', text: money(sum) }),
+    h('div', { class: 'sub', text: `${kind} · ${ru(o.date)}` })));
+  box.append(h('div', { class: 'card', id: 'opcard-info' },
+    row('Вид', kind),
+    row('Дата', ru(o.date)),
+    row('Сумма', `${o.delta > 0 ? '+' : '−'}${money(sum)}`),
+    o.doc && row('Основание', o.doc),
+    note && row('Комментарий', note)));
+
+  const cancel = h('button', { class: 'btn danger', id: 'opcard-cancel' }, 'Отменить запись');
+  cancel.onclick = async () => {
+    // Спрашиваем до «Секунду…»: иначе кнопка зависает в ожидании окна подтверждения.
+    if (!await askSure(`Отменить запись «${kind}» на ${money(sum)} от ${ru(o.date)}? Баланс клиента изменится.`)) return;
+    await withBusy(cancel, async () => {
+      const r = await api('POST', '/api/op/delete', { id: o.id, cpId });
+      haptic('medium');
+      toast(`Запись отменена. Баланс: ${money(Math.abs(r.balance))}`);
+      back();
+    });
+  };
+  box.append(h('div', { class: 'btn-wrap' }, cancel));
+  if (/предоплат/i.test(`${o.doc} ${o.note}`)) {
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+      text: 'Это предоплата: после отмены деньги уйдут из остатка. Клиент при этом останется на предоплате.' }));
+  }
   return box;
 };
 
@@ -4464,7 +4658,7 @@ screens.akt = async function aktScreen(params = {}) {
   box.append(h('div', { class: 'card' }, sorted.map((c) => navRow({
     icon: 'users',
     title: c.name,
-    sub: c.balance ? (owesUs(c) ? 'должен нам' : 'должны мы') : 'расчёты закрыты',
+    sub: c.balance ? (onPrepay(c) ? 'на предоплате' : (owesUs(c) ? 'должен нам' : 'должны мы')) : 'расчёты закрыты',
     right: c.balance ? money0(Math.abs(c.balance)) : '',
     rightTone: balanceTone(c),
     onclick: async () => {
