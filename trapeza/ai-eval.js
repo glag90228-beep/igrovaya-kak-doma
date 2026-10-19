@@ -50,11 +50,11 @@ const PHRASES_FILE = path.join(__dirname, 'ai-phrases.json');
  * перестанут что-либо охранять.
  */
 const FLOOR = {
-  intent: 0,      // доля верных намерений среди ожидаемых «wired»
-  full: 0,        // доля фраз, разобранных безупречно
-  sum: 0,         // сумма документа/оплаты верна, когда она ожидалась
-  client: 0,      // клиент определён верно (или честно переспрошен)
-  dangerMax: 999, // сколько опасных ошибок допустимо
+  intent: 98,     // % верных намерений среди фраз, у которых в боте есть экран
+  full: 96,       // % фраз, разобранных безупречно
+  sum: 98,        // % верных сумм там, где сумма ожидалась
+  client: 98,     // % верно найденных клиентов (вопрос «кого вы имели в виду» тоже верный ответ)
+  dangerMax: 0,   // опасных ошибок — неверная сумма, клиент или документ без переспроса — быть не должно
 };
 
 // ---------- сравнение полей ----------
@@ -273,7 +273,8 @@ function summarize(rows, mode, model) {
   }
   // Покрытие: сколько осмысленных фраз правила взяли сами, не отдав модели.
   const meaningful = rows.filter((r) => r.exp.i !== 'unknown');
-  const answered = meaningful.filter((r) => r.got && r.got.action && r.got.action !== 'unknown');
+  const answered = meaningful.filter((r) => (r.source === 'правила' || r.source === 'local')
+    && r.got && r.got.action && r.got.action !== 'unknown');
   const sumField = fields.sum || { n: 0, ok: 0 };
   const clField = fields.client || { n: 0, ok: 0 };
   return {
@@ -382,7 +383,7 @@ function print(res, { misses = 40, ai } = {}) {
     const mark = r.danger.length ? `ОПАСНО(${r.danger.join(',')}) ` : '';
     console.log(`\n  ${mark}«${r.exp.t}»`);
     console.log(`    ждали:  ${fmtExp(r.exp)}`);
-    console.log(`    вышло:  ${fmtGot(ai, cps, r)}`);
+    console.log(`    вышло:  ${fmtGot(ai, cps, r)}${r.source === 'model' ? '   [ответила модель]' : ''}`);
   }
   console.log('');
 }

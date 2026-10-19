@@ -200,16 +200,20 @@ function extractWhen(text, today) {
 
     // Месяц словами: «за сентябрь», «в августе», «за декабрь прошлого года», «за март 2025»
     if (!per) {
-      const mm = new RegExp(`(?:за|в|на)\\s+(${MONTH_ANY})(?:\\s+(прошл[а-яё]+\\s+года|20\\d{2}))?(?:\\s+года)?`, 'iu').exec(t);
+      const mm = new RegExp(`(?:за|в|на|с)\\s+(${MONTH_ANY})(?:\\s+(?:и|по|-|–)\\s+(${MONTH_ANY}))?(?:\\s+(прошл[а-яё]+\\s+года|20\\d{2}))?(?:\\s+года)?`, 'iu').exec(t);
       if (mm) {
         const m = monthIndex(mm[1]);
+        const m2 = mm[2] ? monthIndex(mm[2]) : -1;
         let yy = null;
-        if (mm[2]) yy = /прошл/i.test(mm[2]) ? y - 1 : Number(mm[2]);
+        if (mm[3]) yy = /прошл/i.test(mm[3]) ? y - 1 : Number(mm[3]);
+        const lastM = m2 >= 0 ? m2 : m;
         if (yy == null) {
           // год не назван: будущий месяц — это прошлогодний (так и в period.js)
-          yy = new Date(y, m, 1) > today ? y - 1 : y;
+          yy = new Date(y, lastM, 1) > today ? y - 1 : y;
         }
-        per = { from: period.iso(new Date(yy, m, 1)), to: period.iso(new Date(yy, m + 1, 0)) };
+        // «август и сентябрь», «с ноября по февраль»: от первого до последнего
+        const endYear = m2 >= 0 && m2 < m ? yy + 1 : yy;
+        per = { from: period.iso(new Date(yy, m, 1)), to: period.iso(new Date(endYear, lastM + 1, 0)) };
         t = t.replace(mm[0], ' ');
       }
     }

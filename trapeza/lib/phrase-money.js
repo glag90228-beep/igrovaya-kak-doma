@@ -37,6 +37,7 @@ function amountFrom(text) {
     const before = s.slice(0, m.index);
     const after = s.slice(m.index + m[0].length);
     if (NOT_MONEY.test(before)) continue;             // реквизит или период
+    if (/^\s*(?:%|процент)/i.test(after)) continue;   // «пятьдесят процентов» — доля, а не рубли
     const n = Number(m[1].replace(/[\s  ]/g, '').replace(',', '.'));
     if (!Number.isFinite(n) || n <= 0) continue;
     const unit = (MONEY_AFTER.exec(after) || [''])[0].trim();

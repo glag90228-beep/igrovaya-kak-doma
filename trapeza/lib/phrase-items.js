@@ -53,6 +53,8 @@ function lex(s) {
   while ((m = re.exec(String(s))) !== null) {
     const w = m[0];
     const lw = w.toLowerCase().replace(/ё/g, 'е');
+    // «50 процентов» — доля, а не деньги и не количество: число с процентом выбрасываем целиком
+    if (/^процент/.test(lw) && out.length && out[out.length - 1].t === 'NUM') { out.pop(); continue; }
     let tok;
     if (w === '‖') tok = { t: 'AMB', s: w };
     else if (/^\d/.test(w)) tok = { t: 'NUM', s: w, v: Number(w.replace(',', '.')) };
@@ -106,8 +108,16 @@ function splitSegments(toks) {
   // сегмент без чисел — название для следующего («кисти и краски по 150»); хвост без чисел — мусор
   const merged = [];
   let carry = [];
-  for (const seg of out) {
+  const lastNum = out.reduce((acc, seg, i) => (seg.some((t) => t.t === 'NUM' || t.t === 'AMB') ? i : acc), -1);
+  for (let si = 0; si < out.length; si += 1) {
+    const seg = out[si];
     if (!seg.length) continue;
+    // «15000 за настройку и монтаж оборудования»: хвост после «и» — продолжение названия
+    const prev = merged[merged.length - 1];
+    if (si > lastNum && prev && prev.some((t) => t.t === 'ZA') && !seg.some((t) => t.t === 'NUM') && seg.length <= 4) {
+      prev.push({ t: 'WORD', s: 'и', lw: 'и' }, ...seg);
+      continue;
+    }
     if (seg.some((t) => t.t === 'NUM' || t.t === 'AMB')) { merged.push([...carry, ...seg]); carry = []; } else carry = [...carry, ...seg, { t: 'WORD', s: 'и', lw: 'и' }];
   }
   return merged;
