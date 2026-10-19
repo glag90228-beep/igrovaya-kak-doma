@@ -384,7 +384,7 @@ function formatAiReply(intent, withCpRes, auto) {
   if (intent.action === 'debts') return 'Открываю список долгов.';
   if (intent.action === 'unpaid') return 'Открываю неоплаченные счета.';
   if (intent.action === 'docs') return 'Открываю раздел документов.';
-  if (intent.action === 'cps') return 'Открываю список контрагентов.';
+  if (intent.action === 'cps') return 'Открываю список клиентов.';
   if (intent.action === 'org') return 'Открываю реквизиты организации.';
   if (intent.action === 'vat') return 'Открываю настройки НДС.';
   // Книга собирается в боте: ей нужен файл выписки, а файлы приходят в чат.
@@ -676,7 +676,7 @@ const api = {
   async 'POST /api/pay'({ user, body }) {
     const cpId = Number(body.cpId);
     const cp = bdb.getCp(user.id, cpId);
-    if (!cp) return { error: 'Контрагент не найден.' };
+    if (!cp) return { error: 'Клиент не найден.' };
     const sum = round2(Number(body.amount) || 0);
     if (sum <= 0) return { error: 'Сумма должна быть больше нуля.' };
     // Дату проверяем, а не принимаем любой строкой: «вчера» или «31.02»
@@ -709,13 +709,13 @@ const api = {
    */
   async 'GET /api/crm/timeline'({ user, url }) {
     const cpId = Number(url.searchParams.get('cpId'));
-    if (!bdb.getCp(user.id, cpId)) return { error: 'Контрагент не найден.' };
+    if (!bdb.getCp(user.id, cpId)) return { error: 'Клиент не найден.' };
     return { items: crm.timeline(user.id, cpId, 40), followups: crm.openFollowups(user.id, cpId).map(fuBrief) };
   },
 
   async 'POST /api/crm/note'({ user, body }) {
     const cpId = Number(body.cpId);
-    if (!bdb.getCp(user.id, cpId)) return { error: 'Контрагент не найден.' };
+    if (!bdb.getCp(user.id, cpId)) return { error: 'Клиент не найден.' };
     const id = crm.addNote(user.id, cpId, str(body.text, 1000));
     if (!id) return { error: 'Заметка пустая.' };
     return { id };
@@ -723,7 +723,7 @@ const api = {
 
   async 'POST /api/crm/followup'({ user, body }) {
     const cpId = Number(body.cpId);
-    if (!bdb.getCp(user.id, cpId)) return { error: 'Контрагент не найден.' };
+    if (!bdb.getCp(user.id, cpId)) return { error: 'Клиент не найден.' };
     const f = crm.addFollowup(user.id, cpId, { today: docService.todayISO(), days: Number(body.days), text: str(body.text, 300) });
     return { followup: f };
   },
@@ -757,7 +757,7 @@ const api = {
 
   async 'POST /api/cp'({ user, body }) {
     const name = str(body.name, 200);
-    if (!name) return { error: 'Без названия контрагента не обойтись.' };
+    if (!name) return { error: 'Без названия клиента не обойтись.' };
     const fields = {
       name,
       full_name: str(body.full_name, 400),
@@ -800,7 +800,7 @@ const api = {
     if (wrong.length) return { error: wrong[0].error, field: wrong[0].field };
     const id = Number(body.id) || 0;
     if (id) {
-      if (!bdb.getCp(user.id, id)) return { error: 'Контрагент не найден.' };
+      if (!bdb.getCp(user.id, id)) return { error: 'Клиент не найден.' };
       bdb.updateCp(user.id, id, fields);
       return { cp: cpBrief(user.id, bdb.getCp(user.id, id)) };
     }
@@ -922,7 +922,9 @@ const api = {
     if (bik) await ask(dadata.bankByBik, bik, 'bank');
 
     if (!out.party && !out.bank) {
-      return { error: `${problems.join('; ')} — заполните вручную.` };
+      // Один и тот же отказ по ИНН и по БИК называем один раз, с заглавной буквы.
+      const why = [...new Set(problems)].join('; ');
+      return { error: `${why.charAt(0).toUpperCase()}${why.slice(1)} — заполните вручную.` };
     }
     return out;
   },
@@ -1009,7 +1011,7 @@ const api = {
     const doc = bdb.getDoc(user.id, Number(body.id));
     if (!doc) return { error: 'Документ не найден.' };
     const cp = bdb.getCp(user.id, doc.cp_id);
-    if (!cp) return { error: 'Контрагент не найден.' };
+    if (!cp) return { error: 'Клиент не найден.' };
 
     const to = str(body.email, 254) || cp.email;
     if (!mailer.validEmail(to)) return { error: 'Укажите правильный адрес почты.' };
@@ -1259,7 +1261,7 @@ const api = {
   /** Операция в журнал контрагента: приход или оплата. */
   async 'POST /api/op'({ user, body }) {
     const cp = bdb.getCp(user.id, Number(body.cpId));
-    if (!cp) return { error: 'Контрагент не найден.' };
+    if (!cp) return { error: 'Клиент не найден.' };
     // До копейки на самой границе: полукопейки внутри базы разводят
     // колонку сальдо и её разбор — считают-то они по-разному.
     const amount = round2(Math.abs(Number(body.amount) || 0));
@@ -1290,7 +1292,7 @@ const api = {
     if (!org) return { error: 'Сначала заполните реквизиты организации.' };
     const p = bdb.cpForPeriod(user.id, Number(url.searchParams.get('cp')),
       isoDay(url.searchParams.get('from')), isoDay(url.searchParams.get('to')));
-    if (!p) return { error: 'Контрагент не найден.' };
+    if (!p) return { error: 'Клиент не найден.' };
     const cp = p.cp;
     // Лимит бесплатных: в боте акт его тратил, здесь — нет, и лимит
     // обходился простым переходом в приложение.
@@ -1532,7 +1534,7 @@ const api = {
     const t = body.template || {};
     if (typeof t.body !== 'string' || !t.body.trim()) return { error: 'Нет текста договора — прочитайте файл заново.' };
     const cpId = Number(body.cpId) || 0;
-    if (cpId && !bdb.getCp(user.id, cpId)) return { error: 'Контрагент не найден.' };
+    if (cpId && !bdb.getCp(user.id, cpId)) return { error: 'Клиент не найден.' };
     const fields = (Array.isArray(t.fields) ? t.fields : []).slice(0, 25).map((f) => ({
       key: str(f && f.key, 31), label: str(f && f.label, 80), type: str(f && f.type, 10) || 'text', example: str(f && f.example, 80),
     })).filter((f) => /^[a-z][a-z0-9_]{0,30}$/.test(f.key));
@@ -1648,7 +1650,7 @@ const api = {
     if (!box.ok) return { error: box.reason };
 
     const cp = bdb.getCp(user.id, Number(body.cpId));
-    if (!cp) return { error: 'Контрагент не найден.' };
+    if (!cp) return { error: 'Клиент не найден.' };
     const to = str(body.email, 254) || cp.email;
     if (!mailer.validEmail(to)) return { error: 'Укажите почту клиента — куда отправлять.' };
 
@@ -2194,7 +2196,7 @@ const api = {
   async 'GET /api/ops'({ user, url }) {
     const cpId = Number(url.searchParams.get('cp'));
     const b = bdb.balanceOf(user.id, cpId);
-    if (!b) return { error: 'Контрагент не найден.' };
+    if (!b) return { error: 'Клиент не найден.' };
     return {
       cp: { id: b.cp.id, name: b.cp.name, kind: b.cp.kind },
       opening: round2(Number(b.cp.opening_balance) || 0),

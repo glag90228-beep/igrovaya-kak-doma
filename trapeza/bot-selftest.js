@@ -896,7 +896,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   // вставка блока прямо в бота на шаге ИНН — поля должны разложиться, QR появиться
   await tap('cp.new');
   await say(blob);
-  ok(last().includes('Тип контрагента'), 'после вставки блока бот пропустил название/адрес/счета');
+  ok(last().includes('Кто это'), 'после вставки блока бот пропустил название/адрес/счета');
   const notedBlock = sent.slice(-3).some((m) => m.text.includes('Разобрал реквизиты'));
   ok(notedBlock, 'бот отчитался, что разобрал реквизиты');
   await tap('fb:supplier');
@@ -929,7 +929,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   await say('7707083893');   // ИНН — дальше название/адрес/КПП должны подставиться
   ok(last().includes('Ромашка') || sent[sent.length - 2].text.includes('Ромашка'),
     'бот показал найденную организацию');
-  ok(last().includes('Тип контрагента'), 'название, адрес и КПП пропущены — сразу спросил тип');
+  ok(last().includes('Кто это'), 'название, адрес и КПП пропущены — сразу спросил тип');
   await tap('fb:customer');
   await say('-');            // договор
   await say('0');            // сальдо
@@ -3472,7 +3472,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'повторная отметка оплаты не задваивает проводку', bdb3.balanceOf(uid, rentId).closing);
 
     await tap('unpaid');
-    ok(last().includes('Не оплачено') || last().includes('Неоплаченных'),
+    ok(last().includes('Ждут оплаты') || last().includes('Неоплаченных'),
       'экран неоплаченных открывается', last().slice(0, 40));
 
     /*
@@ -3580,12 +3580,12 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       await tap(owesBtn.callback_data);
       ok(bdb3.balanceOf(uid, owesCp).closing === 0, 'нажатие вносит оплату и закрывает долг',
         bdb3.balanceOf(uid, owesCp).closing);
-      ok(Boolean(button('Отменить проводку')), 'и оплату можно тут же отменить');
+      ok(Boolean(button('Отменить запись')), 'и оплату можно тут же отменить');
       // Долг закрыт — значит, и сам документ больше не «ждёт оплаты».
       ok(!bdb3.unpaidDocs(uid).some((d) => d.cp_id === owesCp),
         'после «Оплатил» акт пропадает из списка «Не оплачено»',
         JSON.stringify(bdb3.unpaidDocs(uid).filter((d) => d.cp_id === owesCp).map((d) => d.number)));
-      const undoBtn = button('Отменить проводку');
+      const undoBtn = button('Отменить запись');
       await tap(owesBtn.callback_data);
       ok(/уже внесена/.test(last()) && bdb3.balanceOf(uid, owesCp).closing === 0,
         'второе нажатие той же кнопки деньги не проводит', last());
@@ -3758,7 +3758,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     await say('/menu');
     ok(button('Ещё') === 'more', 'в главном меню есть «Ещё»', button('Ещё'));
     ok(button('Выписать счёт') === 'go.sch', 'и главное действие на месте');
-    ok(button('Кто должен') === 'debts' && button('Не оплачено') === 'unpaid',
+    ok(button('Долги') === 'debts' && button('Ждут оплаты') === 'unpaid',
       'долги остались на первом уровне — это ежедневная работа');
     await tap('more');
     for (const [label, data] of [['Почта', 'mb'], ['Моя организация', 'org'],
@@ -7484,7 +7484,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
   const OTHER = { id: 777002, first_name: 'Чужой', username: 'other' };
   await handleUpdate(tg, { message: { chat: { id: 777002 }, from: OTHER, text: '/start' } });
   await handleUpdate(tg, { callback_query: { id: 'c2', from: OTHER, data: 'cps', message: { chat: { id: 777002 } } } });
-  ok(last().includes('Контрагентов пока нет'), 'чужой пользователь не видит наших контрагентов', last().slice(0, 50));
+  ok(last().includes('Клиентов пока нет'), 'чужой пользователь не видит наших контрагентов', last().slice(0, 50));
   await handleUpdate(tg, { callback_query: { id: 'c3', from: OTHER, data: `cp:${cpId}`, message: { chat: { id: 777002 } } } });
   ok(last().includes('Такого клиента нет в вашем списке'), 'по прямой ссылке чужого контрагента тоже не отдаёт');
 
@@ -7795,7 +7795,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
 
     // Отмена одним нажатием — раз проводку сделал бот, убрать её должно быть
     // так же просто, как она появилась.
-    const undo = button('Отменить проводку');
+    const undo = button('Отменить запись');
     ok(Boolean(undo), 'есть кнопка отмены', undo);
     await tap(undo);
     ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 80000,

@@ -772,7 +772,7 @@ async function rebuildDocument(userId, docId, opts = {}) {
 
   const org0 = bdb.getOrg(userId, saved.org_id) || bdb.currentOrg(userId);
   const cp0 = bdb.getCp(userId, saved.cp_id);
-  if (!org0 || !cp0) return fail('data', 'Не хватает данных для сборки: проверьте организацию и контрагента.');
+  if (!org0 || !cp0) return fail('data', 'Не хватает данных для сборки: проверьте организацию и клиента.');
 
   /*
    * Акт сверки собирается иначе всех остальных: не из позиций документа, а
@@ -787,7 +787,7 @@ async function rebuildDocument(userId, docId, opts = {}) {
   if (saved.type === 'akt') {
     // Журнал — той фирмы, что в шапке акта (org0), а не текущей.
     const p = bdb.cpForPeriod(userId, saved.cp_id, saved.payload.from || '', saved.payload.to || '', org0.id);
-    if (!p) return fail('data', 'Не удалось собрать акт: проверьте контрагента.');
+    if (!p) return fail('data', 'Не удалось собрать акт: проверьте клиента.');
     const forAkt = {
       org: {
         brand: org0.name, org_short: org0.name, org_full: org0.full_name || org0.name,
