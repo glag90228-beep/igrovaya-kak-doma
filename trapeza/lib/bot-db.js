@@ -2197,6 +2197,19 @@ function unpaidSummary(userId, limit = 200) {
 }
 
 /**
+ * То же за период: «покажи неоплаченные за сентябрь». Отбор по дате документа.
+ *
+ * Сделки считаем внутри отобранного: счёт августа и закрывающий его акт
+ * сентября в «сентябре» — не пара, и обе суммы нужно видеть. Общая для бота и
+ * приложения, чтобы цифра за период не расходилась между ними.
+ */
+function unpaidBetween(userId, from, to, limit = 500) {
+  const list = unpaidDocs(userId, limit)
+    .filter((d) => (!from || d.date >= from) && (!to || d.date <= to));
+  return dealTotals(userId, list);
+}
+
+/**
  * Номера документов, названные в назначении платежа: «по накладной № 3»,
  * «счёт 12 от 03.10», «акт №5».
  *
@@ -3096,6 +3109,35 @@ function listDocs(userId, limit = 10, cpId = null, orgId = null) {
   return rows.map(withPayload);
 }
 
+/** Типы, которые «Повторить» умеет: набираются позициями (то же, что ITEM_DOCS в doc-service). */
+const REPEATABLE = ['sch', 'schdog', 'usl', 'upd', 'torg12'];
+
+/**
+ * Что можно повторить по фразе «повтори вчерашнюю накладную Заре».
+ *
+ * Общая для бота и приложения: что считать «тем самым документом» не должно
+ * зависеть от того, откуда спросили. Берём документы текущей фирмы (как в
+ * журнале), с позициями — без них повторять нечего. Новые сверху.
+ *
+ * @param {number} userId
+ * @param {{cpId?:number, type?:string, date?:string, limit?:number}} [by]
+ *   cpId — клиент, type — вид бумаги, date — число исходного документа
+ * @returns {object[]} пусто — ничего подходящего, или вид бумаги не повторяется
+ */
+function repeatSources(userId, { cpId = 0, type = '', date = '', limit = 6 } = {}) {
+  const types = type ? REPEATABLE.filter((t) => t === type) : REPEATABLE;
+  if (!types.length) return [];
+  const where = ['user_id = ?', 'org_id = ?', `type IN (${types.map(() => '?').join(',')})`];
+  const args = [userId, currentOrgId(userId), ...types];
+  if (cpId) { where.push('cp_id = ?'); args.push(Number(cpId)); }
+  if (date) { where.push('date = ?'); args.push(date); }
+  const rows = db.prepare(`SELECT * FROM documents WHERE ${where.join(' AND ')}
+                            ORDER BY date DESC, id DESC LIMIT 60`).all(...args);
+  return rows.map(withPayload)
+    .filter((d) => Array.isArray(d.payload.items) && d.payload.items.length > 0)
+    .slice(0, limit);
+}
+
 function getDoc(userId, id) {
   const row = db.prepare('SELECT * FROM documents WHERE id = ? AND user_id = ?').get(id, userId);
   return row ? withPayload(row) : null;
@@ -3288,7 +3330,7 @@ module.exports = {
   DEBT_DOCS, basisOf, makesDebt, basisMismatch, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
   debtByDoc, rebuildDebt, restoreDebt,
   markPaid, unmarkPaid, matchPaymentsToDocs, closeDocsFromBank, docNumbersIn, linkedPaid, dealOf, settleMonthActs,
-  unpaidDocs, unpaidSummary, dealTotals, docsBetween, registryDocs,
+  unpaidDocs, unpaidSummary, unpaidBetween, dealTotals, docsBetween, registryDocs,
   freePaymentsFor, freePaymentQuestion, freePaymentLabel, linkFreePayment,
   docShort, unpaidLinesFor, debtListText,
   askBizOnce,
@@ -3298,7 +3340,7 @@ module.exports = {
   openingFor, setOpeningFor, cpOrgs,
   prepayFor, setPrepayMode, addPrepay, prepayState, prepayLine, settleFromPrepay,
   setNoDebt, shipmentsOfMonth, monthActOf, monthActsOf, openShipmentsOfMonth,
-  nextSeqForOrg, saveDoc, listDocs, getDoc, deleteDoc, DOC_TITLES,
+  nextSeqForOrg, saveDoc, listDocs, repeatSources, REPEATABLE, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, seedItems, listTemplates, getTemplate, forgetTemplate,
   quota, docsThisMonth, freePerMonth,
 };

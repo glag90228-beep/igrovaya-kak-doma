@@ -251,9 +251,39 @@ function parsePeriodIn(text, today, defaultYear) {
   return null;
 }
 
+const MONTH_NAMES = ['январь', 'февраль', 'март', 'апрель', 'май', 'июнь', 'июль', 'август',
+  'сентябрь', 'октябрь', 'ноябрь', 'декабрь'];
+
+const ruDay = (d) => `${d.slice(8, 10)}.${d.slice(5, 7)}.${d.slice(0, 4)}`;
+
+/**
+ * Период словами для подписи: «сентябрь 2026», «3-й квартал 2026», «2026 год»,
+ * «18.10.2026», «период 01.09.2026—15.10.2026».
+ *
+ * Читается после «за»: «Акт сверки за сентябрь 2026». Целый месяц, квартал и
+ * год называем по имени, остальное — датами: «за период» с двумя числами
+ * человек проверит глазами, а «за последние три недели» — нет.
+ */
+function periodTitle(from, to) {
+  if (!from) return 'всё время';
+  const a = isoDay(from);
+  const b = isoDay(to) || a;
+  if (!a) return '';
+  if (a === b) return ruDay(a);
+  const [y1, m1] = a.split('-').map(Number);
+  const [y2, m2] = b.split('-').map(Number);
+  if (a === first(y1, m1 - 1) && b === last(y1, m1 - 1)) return `${MONTH_NAMES[m1 - 1]} ${y1}`;
+  if (y1 === y2 && m1 % 3 === 1 && m2 === m1 + 2 && a === first(y1, m1 - 1) && b === last(y2, m2 - 1)) {
+    return `${(m1 - 1) / 3 + 1}-й квартал ${y1}`;
+  }
+  if (a === `${y1}-01-01` && b === `${y1}-12-31`) return `${y1} год`;
+  return `период ${ruDay(a)}—${ruDay(b)}`;
+}
+
 // parseDay наружу: он единственный разбор даты, который проверяет, что
 // такая дата существует. bot.js держал свою копию без проверки — и «31.02»
 // попадало в журнал.
 module.exports = {
   PRESETS, presetRange, parsePeriodText, parseDay, isoDay, iso, todayISO, todayDate, currentYear,
+  periodTitle,
 };

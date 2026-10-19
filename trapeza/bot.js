@@ -851,7 +851,7 @@ async function requireQuota(tg, chatId, user) {
  * в ней opening_date значит начало отношений, а не начало выбранного
  * периода, и подменять одно другим нельзя.
  */
-async function genAktSverki(tg, chatId, user, cpId, from, to) {
+async function genAktSverki(tg, chatId, user, cpId, from, to, opts = {}) {
   if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
   const p = bdb.cpForPeriod(user.id, cpId, from, to);
@@ -886,6 +886,8 @@ async function genAktSverki(tg, chatId, user, cpId, from, to) {
   } else {
     rows.push([{ text: '✉️ Подключить почту и отправить', data: 'mb' }]);
   }
+  // Период взят из фразы — значит, его не спрашивали; поменять надо уметь.
+  if (opts.changePeriod) rows.push([{ text: '📅 Другой период', data: `d.akt:${cpId}` }]);
   rows.push([{ text: `👤 ${cp ? cp.name : 'Клиент'}`.slice(0, 60), data: `cp:${cpId}` }]);
   rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
   await tg.sendMessage(chatId,
@@ -963,7 +965,7 @@ function itemsKb(user, data) {
   return keyboard(rows);
 }
 
-async function startItems(tg, chatId, user, type, cpId, extra = {}) {
+async function startItems(tg, chatId, user, type, cpId, extra = {}, when = '') {
   /*
    * Платёжка и договор собираются из своих полей, а не из позиций, и у них
    * свои сценарии. Ассистент законно называет оба вида (они есть в его
@@ -980,7 +982,13 @@ async function startItems(tg, chatId, user, type, cpId, extra = {}) {
     return undefined;
   }
   if (!(await requireQuota(tg, chatId, user))) return;
-  const year = currentYear();
+  /*
+   * Дату называют во фразе («счёт на пять тысяч вчерашним числом»). Номер при
+   * этом считаем по году ЭТОЙ даты: ряд номеров идёт по годам, и счёт,
+   * датированный прошлым декабрём, не должен получить номер из нового года.
+   */
+  const docDate = period.isoDay(when) || todayISO();
+  const year = Number(docDate.slice(0, 4));
   /*
    * Номер здесь — только показать человеку в сводке; настоящий берёт
    * doc-service при выписке. Но показанный обязан совпадать с будущим, иначе
@@ -1014,7 +1022,7 @@ async function startItems(tg, chatId, user, type, cpId, extra = {}) {
     if (v.rate != null) { doc.vatRate = v.rate; doc.priceIncludesVat = v.gross; }
   }
 
-  const data = { seq, number: String(seq), date: todayISO(), items: [], ask: '', doc };
+  const data = { seq, number: String(seq), date: docDate, items: [], ask: '', doc };
   bdb.setState(user.id, `items:${type}:${cpId}`, data);
   const tpl = bdb.listTemplates(user.id, 6).length
     ? '\n\nЧастые позиции — кнопками ниже, количество спрошу.' : '';
@@ -1615,10 +1623,13 @@ async function sendKudir(tg, chatId, user) {
   }
 }
 
-async function sendRegistry(tg, chatId, user, periodName) {
+async function sendRegistry(tg, chatId, user, periodName, range = null) {
   const org = bdb.currentOrg(user.id);
   if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
-  const { from, to, title } = periodOf(periodName);
+  // Свой период — из фразы или со списка «за сентябрь»; готовые названия — из меню.
+  const { from, to, title } = range
+    ? { from: range.from, to: range.to, title: period.periodTitle(range.from, range.to) }
+    : periodOf(periodName);
   const { docs, twins } = bdb.registryDocs(user.id, bdb.docsBetween(user.id, from, to));
 
   await tg.sendChatAction(chatId, 'upload_document');
@@ -1637,11 +1648,20 @@ async function sendRegistry(tg, chatId, user, periodName) {
 }
 
 /** Что ещё не оплачено — то, за чем следят каждый день. */
-async function showUnpaid(tg, chatId, user) {
-  const list = bdb.unpaidDocs(user.id);
+async function showUnpaid(tg, chatId, user, range = null) {
+  /*
+   * Период назван во фразе («неоплаченные за сентябрь») — сразу показываем
+   * его, не переспрашивая; поменять можно кнопкой под списком.
+   */
+  const per = range && range.to ? range : null;
+  const when = per ? period.periodTitle(per.from, per.to) : '';
+  const scoped = per ? bdb.unpaidBetween(user.id, per.from, per.to) : null;
+  const list = scoped ? scoped.docs : bdb.unpaidDocs(user.id);
   if (!list.length) {
-    await tg.sendMessage(chatId, 'Неоплаченных документов нет — все закрыты.',
-      keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
+    await tg.sendMessage(chatId,
+      per ? `За ${when} неоплаченных документов нет.` : 'Неоплаченных документов нет — все закрыты.',
+      keyboard([...(per ? [[{ text: '📅 Другой период', data: 'lp.pick:unpaid' }, { text: 'Все неоплаченные', data: 'unpaid' }]] : []),
+        [{ text: '⬅️ Меню', data: 'menu' }]]));
     return;
   }
   /*
@@ -1653,7 +1673,7 @@ async function showUnpaid(tg, chatId, user) {
    * без пометки «та же сделка» это выглядело ошибкой в расчётах. Приложение
    * такую пометку рисует давно, бот — теперь тоже.
    */
-  const { count, sum } = bdb.dealTotals(user.id, list);
+  const { count, sum } = scoped || bdb.dealTotals(user.id, list);
   /*
    * Строка кнопки — «Заря · ТОРГ-12 № 2 · 02.09 · 14 000 ₽»: клиент первым,
    * потому что по нему ищут. Раньше первым шло полное название документа, и на
@@ -1680,19 +1700,30 @@ async function showUnpaid(tg, chatId, user) {
     askedAbout.add(d.cp_id);
     rows.push([{ text: `🔔 Напомнить: ${owing.get(d.cp_id)}`.slice(0, 60), data: `rm.one:${d.cp_id}` }]);
   }
+  if (per) rows.push([{ text: '📅 Другой период', data: 'lp.pick:unpaid' }, { text: 'Все неоплаченные', data: 'unpaid' }]);
   rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
   const twins = list.length - count;
   await tg.sendMessage(chatId,
-    `<b>Ждут оплаты: ${formatRub(sum)}</b> — ${count} ${plural(count, 'сделка', 'сделки', 'сделок')}.`
+    `<b>Ждут оплаты${per ? ` за ${esc(when)}` : ''}: ${formatRub(sum)}</b> — ${count} ${plural(count, 'сделка', 'сделки', 'сделок')}.`
     + (twins ? `\n<i>Ниже ${list.length} документов: ${twins} из них закрывают те же сделки `
       + 'и в сумму не идут.</i>' : ''),
     keyboard(rows));
 }
 
 /** Журнал выписанного. */
-async function showDocs(tg, chatId, user, cpId = null) {
-  const docs = bdb.listDocs(user.id, 10, cpId);
+async function showDocs(tg, chatId, user, cpId = null, range = null) {
+  // Период назван во фразе («документы за август») — показываем его сразу, без вопроса.
+  const per = range && range.to ? range : null;
+  const when = per ? period.periodTitle(per.from, per.to) : '';
+  const inRange = per ? bdb.docsBetween(user.id, per.from, per.to, cpId).reverse() : null;
+  const docs = inRange ? inRange.slice(0, 12) : bdb.listDocs(user.id, 10, cpId);
   if (!docs.length) {
+    if (per) {
+      await tg.sendMessage(chatId, `За ${esc(when)} документов нет.`,
+        keyboard([[{ text: '📅 Другой период', data: 'lp.pick:docs' }, { text: 'Все документы', data: 'docs' }],
+          [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
     await tg.sendMessage(chatId, 'Пока ничего не выписано.', mainMenu());
     return;
   }
@@ -1711,6 +1742,16 @@ async function showDocs(tg, chatId, user, cpId = null) {
       ? [{ text: label.slice(0, 44), data: `doc:${d.id}` }, { text: '🔁', data: `d.rep:${d.id}` }]
       : [{ text: label.slice(0, 60), data: `doc:${d.id}` }];
   });
+  if (per) {
+    rows.push([{ text: '📊 Реестр за эти даты (Excel)', data: `reg.r:${packDay(per.from) || '0'}:${packDay(per.to)}` }]);
+    rows.push([{ text: '📅 Другой период', data: 'lp.pick:docs' }, { text: 'Все документы', data: 'docs' }]);
+    rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+    await tg.sendMessage(chatId,
+      `<b>Документы за ${esc(when)}</b>: ${inRange.length}`
+      + (inRange.length > docs.length ? ` (показываю последние ${docs.length}; полный список — в реестре)` : '') + '.',
+      keyboard(rows));
+    return;
+  }
   rows.push([{ text: '📊 Реестр за период (Excel)', data: 'reg' }]);
   const repeats = recurring.list(user.id).length;
   rows.push([{ text: `🔁 Регулярные документы${repeats ? ` (${repeats})` : ''}`, data: 'rec' }]);
@@ -2914,18 +2955,29 @@ async function showBasis(tg, chatId, user) {
 const oneShot = () => require('node:crypto').randomBytes(4).toString('hex');
 
 /*
+ * Кнопка «внести оплату». Дата, названная во фразе, едет в самой кнопке:
+ * между фразой и нажатием состояния у бота нет, а «оплатил вчера» без даты
+ * превратилось бы в оплату сегодняшним числом. 8 цифр вместо ISO — кнопка
+ * ограничена 64 байтами.
+ */
+const packDay = (iso) => String(iso || '').replace(/-/g, '');
+const unpackDay = (v) => (/^\d{8}$/.test(v || '') ? period.isoDay(`${v.slice(0, 4)}-${v.slice(4, 6)}-${v.slice(6)}`) : '');
+const payData = (cpId, sum, flag, when = '', tok = oneShot()) => `pay.cp:${cpId}:${sum}:${flag}:${tok}${when ? `:${packDay(when)}` : ''}`;
+const prepayData = (cpId, sum, when = '', tok = oneShot()) => `pp.do:${cpId}:${sum}:${tok}${when ? `:${packDay(when)}` : ''}`;
+
+/*
  * Предоплата клиента.
  *
  * Деньги ложатся обычной строкой «Оплата» (bdb.addPrepay) — не документом и не
  * второй проводкой, иначе каждая накладная оплачивалась бы дважды. Дальше всё
  * делает выписка: пока остаток покрывает накладную, она сразу «оплачена».
  */
-async function doPrepay(tg, chatId, user, cpId, amount) {
+async function doPrepay(tg, chatId, user, cpId, amount, when = '') {
   const cp = bdb.getCp(user.id, cpId);
   if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
   const sum = round2(Math.abs(Number(amount) || 0));
   if (!sum || sum >= 1e10) { await tg.sendMessage(chatId, 'Не разобрал сумму. Напишите число, например <code>140000</code>.'); return; }
-  const r = bdb.addPrepay(user.id, cpId, sum, todayISO());
+  const r = bdb.addPrepay(user.id, cpId, sum, period.isoDay(when) || todayISO());
   const st = bdb.prepayState(user.id, cpId);
   await tg.sendMessage(chatId,
     `✅ Предоплата <b>${formatRub(sum)}</b> от ${quoted(cp.name)} внесена.\n\n`
@@ -3001,7 +3053,7 @@ async function issueMonthAct(tg, chatId, user, cpId, ym) {
     ]));
 }
 
-async function recordPay(tg, chatId, user, cpId, amount, kind) {
+async function recordPay(tg, chatId, user, cpId, amount, kind, when = '') {
   const cp = bdb.getCp(user.id, cpId);
   if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
   const isIncome = kind === 'Приход';
@@ -3020,13 +3072,14 @@ async function recordPay(tg, chatId, user, cpId, amount, kind) {
     await tg.sendMessage(chatId,
       `За ${quoted(cp.name)} числится <b>${formatRub(owed)}</b>. Внести эту сумму как оплату?`,
       keyboard([
-        [{ text: `✅ Да, ${formatMoney(owed)}`, data: `pay.cp:${cpId}:${owed}:o:${oneShot()}` }],
+        [{ text: `✅ Да, ${formatMoney(owed)}`, data: payData(cpId, owed, 'o', when) }],
         [{ text: '⬅️ Меню', data: 'menu' }],
       ]));
     return;
   }
 
-  const op = { date: todayISO(), kind: isIncome ? 'Приход' : 'Оплата' };
+  // Дата — если назвали («оплатил вчера»); иначе сегодня. Будущую без нажатия сюда не присылают (см. handleFreeText).
+  const op = { date: period.isoDay(when) || todayISO(), kind: isIncome ? 'Приход' : 'Оплата' };
   if (isIncome) op.credit = sum; else op.debit = sum;
   const opId = bdb.addOp(user.id, cpId, op);
   /*
@@ -3107,6 +3160,195 @@ async function replyVoice(tg, chatId, user, text) {
   }
 }
 
+
+// ---------- что ассистент умеет по фразе: напомнить, повторить, сверить, показать за период ----------
+
+/** Кнопки выбора клиента: «Кого именно вы имели в виду — „зоре“?» */
+function whichClientKb(list, dataOf) {
+  return keyboard([...list.slice(0, 8).map((c) => ([{ text: c.name.slice(0, 60), data: dataOf(c) }])),
+    [{ text: '⬅️ Меню', data: 'menu' }]]);
+}
+
+/**
+ * «Напомни Вектору про долг» — тот же экран, что у кнопки «🔔 Напомнить»:
+ * текст в трёх тонах и кнопка отправки. Письмо уходит только по нажатию —
+ * ни при включённом ассистенте, ни при выключенном фраза сама ничего не шлёт:
+ * отправленное письмо должнику не вернуть.
+ */
+async function aiRemind(tg, chatId, user, intent) {
+  const debtors = bdb.debtors(user.id).filter((r) => r.theyOwe);
+  const debtorsKb = () => keyboard([
+    ...debtors.slice(0, 8).map((r) => ([{ text: `${r.cp.name} · ${formatRub(r.amount)}`.slice(0, 60), data: `rm.one:${r.cp.id}` }])),
+    [{ text: '⬅️ Меню', data: 'menu' }]]);
+  // «Всем должникам» — тексты на каждого, каждый со своей кнопкой отправки.
+  if (intent.all) { await debtReminder(tg, chatId, user); return; }
+  if (!intent.who) {
+    if (!debtors.length) { await tg.sendMessage(chatId, 'Должников нет — напоминать некому.', mainMenu()); return; }
+    await tg.sendMessage(chatId, 'Кому напомнить о долге?', debtorsKb());
+    return;
+  }
+  const found = ai.matchCp(bdb.listCps(user.id), intent.who);
+  if (found.cp) { await remindOne(tg, chatId, user, found.cp.id); return; }
+  if (found.choices) {
+    await tg.sendMessage(chatId, `Кого именно вы имели в виду — «${esc(intent.who)}»?`,
+      whichClientKb(found.choices, (c) => `rm.one:${c.id}`));
+    return;
+  }
+  // Такого клиента нет. Заводить его ради напоминания незачем — предлагаем должников.
+  if (!debtors.length) {
+    await tg.sendMessage(chatId, `Клиента «${esc(intent.who)}» у вас нет, да и должников сейчас нет.`, mainMenu());
+    return;
+  }
+  await tg.sendMessage(chatId,
+    `Клиента «${esc(intent.who)}» у вас нет. Напомнить кому-то из должников?`, debtorsKb());
+}
+
+/**
+ * «Повтори вчерашнюю накладную Заре» — находим документ и открываем тот же
+ * «Повторить», что и по кнопке: новый номер, сегодняшняя дата, сводка на
+ * проверку, оплата не копируется. Выписывает человек кнопкой, и при включённом
+ * ассистенте тоже: повтор — это копия чужого решения, а не просьба с готовой
+ * суммой, и показать её перед выпуском дешевле, чем исправлять.
+ */
+async function aiRepeat(tg, chatId, user, intent) {
+  if (intent.docType && !bdb.REPEATABLE.includes(intent.docType)) {
+    await tg.sendMessage(chatId,
+      'Платёжку и договор повторить не получится — они собираются из своих полей. '
+      + 'Откройте клиента и выпишите заново.', mainMenu());
+    return;
+  }
+  let cpId = 0;
+  if (intent.who) {
+    const found = ai.matchCp(bdb.listCps(user.id), intent.who);
+    if (found.choices) {
+      const dash = (v) => v || '-';
+      await tg.sendMessage(chatId, `Кого именно вы имели в виду — «${esc(intent.who)}»?`,
+        whichClientKb(found.choices, (c) => `rp.cp:${c.id}:${dash(intent.docType)}:${packDay(intent.date) || '0'}`));
+      return;
+    }
+    if (!found.cp) {
+      await tg.sendMessage(chatId,
+        `Клиента «${esc(intent.who)}» у вас нет — повторять нечего. `
+        + 'Нажмите 🔁 рядом с документом в журнале, если нужен другой.', mainMenu());
+      return;
+    }
+    cpId = found.cp.id;
+  }
+  await repeatBy(tg, chatId, user, { cpId, type: intent.docType || '', date: intent.date || '' });
+}
+
+const REPEAT_WHAT = { sch: 'счетов', schdog: 'счетов-договоров', usl: 'актов', upd: 'УПД', torg12: 'накладных' };
+
+/** Найти, что повторять, по клиенту, виду бумаги и числу; если неясно — спросить. */
+async function repeatBy(tg, chatId, user, by) {
+  if (!by.cpId && !by.type && !by.date) {
+    // «Повтори» без слов о том, что именно: гадать нельзя, но журнал с кнопкой «🔁» под рукой.
+    await tg.sendMessage(chatId, 'Какой документ повторить? Нажмите 🔁 рядом с нужным.');
+    await showDocs(tg, chatId, user);
+    return;
+  }
+  const found = bdb.repeatSources(user.id, by);
+  const what = REPEAT_WHAT[by.type] || 'документов';
+  const cp = by.cpId ? bdb.getCp(user.id, by.cpId) : null;
+  const whose = cp ? ` у ${quoted(cp.name)}` : '';
+  if (!found.length) {
+    // На названное число ничего нет — не подсовываем молча другой документ, а показываем кнопкой.
+    const last = by.date ? bdb.repeatSources(user.id, { cpId: by.cpId, type: by.type, limit: 1 })[0] : null;
+    if (last) {
+      await tg.sendMessage(chatId,
+        `За ${ru(by.date)}${whose} ${what} не нашёл. Последний — ${esc(bdb.docShort(last.type))} № ${esc(last.number)} `
+        + `от ${ru(last.date)}, ${formatRub(last.total)}. Повторить его?`,
+        keyboard([[{ text: `🔁 Повторить № ${last.number}`.slice(0, 60), data: `d.rep:${last.id}` }],
+          [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
+    await tg.sendMessage(chatId,
+      `Подходящих документов${whose} не нашёл — повторять нечего. Выпишите первый, а дальше повтор в одно нажатие.`,
+      mainMenu());
+    return;
+  }
+  // Названо число и под него подходит несколько — выбирает человек.
+  if (found.length > 1 && by.date) {
+    const rows = found.map((d) => {
+      const c = d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
+      return [{ text: `${c ? c.name : '—'} · ${bdb.docShort(d.type)} № ${d.number} · ${formatRub(d.total)}`.slice(0, 60), data: `d.rep:${d.id}` }];
+    });
+    rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+    await tg.sendMessage(chatId, `За ${ru(by.date)} нашёл несколько. Какой повторить?`, keyboard(rows));
+    return;
+  }
+  await repeatDoc(tg, chatId, user, found[0].id);
+}
+
+/**
+ * Акт сверки по фразе.
+ *
+ * Период назван («за сентябрь») — не спрашиваем его снова. Ассистент включён —
+ * собираем сразу, с кнопкой «Другой период» под файлом; выключен — показываем,
+ * что соберём, одной кнопкой. Период не назван — спрашиваем, как раньше.
+ */
+async function aiAkt(tg, chatId, user, intent, auto) {
+  const cps = bdb.listCps(user.id);
+  if (!cps.length) {
+    await tg.sendMessage(chatId, 'Сверяться пока не с кем — сначала добавьте клиента.',
+      addClientKb(user, intent.who, 'akt'));
+    return;
+  }
+  const range = intent.period && intent.period.to ? intent.period : null;
+  const pick = (c) => (range ? `akt.r:${c.id}:${packDay(range.from) || '0'}:${packDay(range.to)}` : `d.akt:${c.id}`);
+  const found = intent.who ? ai.matchCp(cps, intent.who) : {};
+  if (found.cp) {
+    if (!range) { await askAktPeriod(tg, chatId, user, found.cp.id); return; }
+    if (auto) { await genAktSverki(tg, chatId, user, found.cp.id, range.from, range.to, { changePeriod: true }); return; }
+    await tg.sendMessage(chatId,
+      `Подготовил: акт сверки с <b>${esc(found.cp.name)}</b> за ${esc(period.periodTitle(range.from, range.to))}.\n\n`
+      + '<i>Сам я акт не собираю — нажмите, и соберу.</i>',
+      keyboard([[{ text: '✅ Собрать акт', data: pick(found.cp) }],
+        [{ text: '📅 Другой период', data: `d.akt:${found.cp.id}` }],
+        [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+  if (found.choices) {
+    await tg.sendMessage(chatId, `Кого именно вы имели в виду — «${esc(intent.who)}»?`,
+      whichClientKb(found.choices, pick));
+    return;
+  }
+  await tg.sendMessage(chatId,
+    `${intent.who ? `Клиента «${esc(intent.who)}» у вас нет. ` : ''}С кем сверяемся`
+    + `${range ? ` за ${esc(period.periodTitle(range.from, range.to))}` : ''}?`,
+    whichClientKb(cps, pick));
+}
+
+/** Свой период для списка («документы», «неоплаченные») — те же кнопки, что у акта сверки. */
+async function askListPeriod(tg, chatId, kind) {
+  const rows = [];
+  for (let i = 0; i < period.PRESETS.length; i += 2) {
+    rows.push(period.PRESETS.slice(i, i + 2).map((p) => ({ text: p.text, data: `lp.p:${kind}:${p.code}` })));
+  }
+  rows.push([{ text: '📅 Свой период', data: `lp.own:${kind}` }]);
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId, 'За какой период показать?', keyboard(rows));
+}
+
+async function showListFor(tg, chatId, user, kind, range) {
+  if (kind === 'unpaid') await showUnpaid(tg, chatId, user, range);
+  else await showDocs(tg, chatId, user, null, range);
+}
+
+async function handleListPeriodText(tg, chatId, user, kind, text) {
+  const r = period.parsePeriodText(text);
+  if (!r) {
+    await tg.sendMessage(chatId,
+      'Не понял период. Напишите одним из способов:\n'
+      + '<code>01.09.2026 - 30.09.2026</code>\n'
+      + '<code>сентябрь</code>  ·  <code>апрель 2025</code>\n'
+      + '<code>2 квартал</code>  ·  <code>2025</code>');
+    return;
+  }
+  bdb.clearState(user.id);
+  await showListFor(tg, chatId, user, kind, r);
+}
+
 const VOICE_OFF = /^(?:отвечай|отвечать|пиши|ответь)\s+(?:мне\s+)?(?:текстом|буквами|письменно)|^(?:не\s+отвечай|хватит\s+отвечать)\s+голосом/i;
 const VOICE_ON = /^(?:отвечай|отвечать|ответь|говори)\s+(?:мне\s+)?(?:голосом|вслух)/i;
 
@@ -3148,8 +3390,19 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
     if (opts.isVoice) await replyVoice(tg, chatId, user, consult.spokenDebts(user.id));
     return true;
   }
-  if (intent.action === 'unpaid') { logAiReply('Показываю неоплаченные счета'); await showUnpaid(tg, chatId, user); return true; }
-  if (intent.action === 'docs') { logAiReply('Показываю документы'); await showDocs(tg, chatId, user); return true; }
+  if (intent.action === 'unpaid') {
+    logAiReply(intent.period ? 'Показываю неоплаченные счета за период' : 'Показываю неоплаченные счета');
+    await showUnpaid(tg, chatId, user, intent.period);
+    return true;
+  }
+  if (intent.action === 'docs') {
+    logAiReply(intent.period ? 'Показываю документы за период' : 'Показываю документы');
+    await showDocs(tg, chatId, user, null, intent.period);
+    return true;
+  }
+  // Оба только готовят: письмо уходит по нажатию, повтор выходит после сводки на проверку.
+  if (intent.action === 'remind') { logAiReply('Напоминание должнику'); await aiRemind(tg, chatId, user, intent); return true; }
+  if (intent.action === 'repeat') { logAiReply('Повтор документа'); await aiRepeat(tg, chatId, user, intent); return true; }
   if (intent.action === 'cps') { logAiReply('Показываю клиентов'); await showCps(tg, chatId, user); return true; }
   if (intent.action === 'org') { logAiReply('Показываю организацию'); await showOrg(tg, chatId, user); return true; }
   if (intent.action === 'vat') { logAiReply('Показываю НДС'); await showVat(tg, chatId, user); return true; }
@@ -3177,6 +3430,17 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
     }
     const found = intent.who ? ai.matchCp(cps, intent.who) : {};
     /*
+     * Дата оплаты, если её назвали («оплатил вчера»). Названная дата в будущем
+     * («оплатил двадцатого», а сегодня девятнадцатое) — повод остановиться:
+     * в прошедшем времени так не говорят, скорее всего ошиблось распознавание.
+     * Тогда внесение — только по кнопке, даже при включённом ассистенте, и дата
+     * в тексте на виду.
+     */
+    const payDate = period.isoDay(intent.date);
+    const future = Boolean(payDate) && payDate > todayISO();
+    const onDate = payDate ? ` от ${ru(payDate)}` : '';
+    const autoPay = auto && !future;
+    /*
      * Единственному клиенту оплату приписываем, только если плательщика не
      * назвали вовсе. Раньше «Ромашка заплатила 50 000» при одном клиенте
      * «Заря» вносило оплату Заре — имя не совпало, а запасной вариант
@@ -3184,11 +3448,12 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
      */
     const cp = found.cp || (!intent.who && cps.length === 1 ? cps[0] : null);
     if (!cp) {
+      // Один токен на все кнопки списка: выбрав одного клиента, остальных нажать уже нельзя.
       const tok = oneShot();
       const rows = (found.choices || cps).slice(0, 8)
         .map((c) => ([{ text: c.name.slice(0, 60), data: intent.prepay
-          ? (intent.amount ? `pp.do:${c.id}:${round2(intent.amount)}:${tok}` : `pp.in:${c.id}`)
-          : `pay.cp:${c.id}:${intent.amount || 0}:${intent.kind === 'Приход' ? 'p' : 'o'}:${tok}` }]));
+          ? (intent.amount ? prepayData(c.id, round2(intent.amount), payDate, tok) : `pp.in:${c.id}`)
+          : payData(c.id, intent.amount || 0, intent.kind === 'Приход' ? 'p' : 'o', payDate, tok) }]));
       await tg.sendMessage(chatId,
         intent.who ? `Кого именно вы имели в виду — «${esc(intent.who)}»?` : 'По кому вносим?',
         keyboard([...rows, [{ text: '⬅️ Меню', data: 'menu' }]]));
@@ -3201,17 +3466,19 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
         await tg.sendMessage(chatId, `Сколько внёс ${quoted(cp.name)}? Напишите сумму предоплаты.`);
         return true;
       }
-      if (!auto) {
+      if (!autoPay) {
         await tg.sendMessage(chatId,
-          `Подготовил: <b>предоплата ${formatRub(pSum)}</b> от ${quoted(cp.name)}.\n\n<i>Сам я ничего не провожу — нажмите, и внесу.</i>`,
-          keyboard([[{ text: `✅ Внести ${formatMoney(pSum)}`, data: `pp.do:${cp.id}:${pSum}:${oneShot()}` }],
+          `Подготовил: <b>предоплата ${formatRub(pSum)}</b> от ${quoted(cp.name)}${onDate}.\n\n`
+          + (future ? '⚠️ Эта дата ещё впереди — проверьте, что она верная.\n\n' : '')
+          + '<i>Сам я ничего не провожу — нажмите, и внесу.</i>',
+          keyboard([[{ text: `✅ Внести ${formatMoney(pSum)}`, data: prepayData(cp.id, pSum, payDate) }],
             [{ text: '⬅️ Меню', data: 'menu' }]]));
         return true;
       }
-      await doPrepay(tg, chatId, user, cp.id, pSum);
+      await doPrepay(tg, chatId, user, cp.id, pSum, payDate);
       return true;
     }
-    if (!auto) {
+    if (!autoPay) {
       const sum = round2(Number(intent.amount) || 0);
       // Только долг, не переплата: с Math.abs переплата 30 000 предлагалась
       // к внесению как оплата — и удваивалась.
@@ -3222,15 +3489,16 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
         return true;
       }
       await tg.sendMessage(chatId,
-        `Подготовил: <b>${intent.kind} ${formatRub(use)}</b> по ${quoted(cp.name)}.\n\n`
+        `Подготовил: <b>${intent.kind} ${formatRub(use)}</b> по ${quoted(cp.name)}${onDate}.\n\n`
+        + (future ? '⚠️ Эта дата ещё впереди — проверьте, что она верная.\n\n' : '')
         + '<i>Сам я ничего не провожу — нажмите, и внесу.</i>',
         keyboard([
-          [{ text: `✅ Внести ${formatMoney(use)}`, data: `pay.cp:${cp.id}:${use}:${intent.kind === 'Приход' ? 'p' : 'o'}:${oneShot()}` }],
+          [{ text: `✅ Внести ${formatMoney(use)}`, data: payData(cp.id, use, intent.kind === 'Приход' ? 'p' : 'o', payDate) }],
           [{ text: '⬅️ Меню', data: 'menu' }],
         ]));
       return true;
     }
-    await recordPay(tg, chatId, user, cp.id, intent.amount, intent.kind);
+    await recordPay(tg, chatId, user, cp.id, intent.amount, intent.kind, payDate);
     return true;
   }
   if (intent.action === 'recurring') { logAiReply('Показываю регулярные счета'); await showRecurring(tg, chatId, user); return true; }
@@ -3244,20 +3512,10 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
     return true;
   }
 
-  // Акт сверки собирается по конкретному контрагенту — спрашиваем, по кому.
+  // Акт сверки собирается по конкретному контрагенту — спрашиваем, по кому; период, если назван, не переспрашиваем.
   if (intent.action === 'akt') {
-    logAiReply('Сверка расчётов');
-    const cps = bdb.listCps(user.id);
-    if (!cps.length) {
-      await tg.sendMessage(chatId, 'Сверяться пока не с кем — сначала добавьте клиента.',
-        addClientKb(user, intent.who, 'akt'));
-      return true;
-    }
-    const found = ai.matchCp(cps, intent.who || '');
-    if (found.cp) { await askAktPeriod(tg, chatId, user, found.cp.id); return true; }
-    await tg.sendMessage(chatId, 'С кем сверяемся?',
-      keyboard([...cps.slice(0, 8).map((c) => ([{ text: c.name.slice(0, 60), data: `d.akt:${c.id}` }])),
-        [{ text: '⬅️ Меню', data: 'menu' }]]));
+    logAiReply(intent.period ? 'Сверка расчётов за период' : 'Сверка расчётов');
+    await aiAkt(tg, chatId, user, intent, auto);
     return true;
   }
 
@@ -3365,7 +3623,10 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
           + 'поменять можно в разделе «НДС».');
       }
     }
-    await startItems(tg, chatId, user, intent.docType, found.cp.id, extra);
+    // Дата документа, если её назвали («вчерашним числом»). Будущая — повод показать сводку, а не выписывать сразу.
+    const docDate = period.isoDay(intent.date);
+    const futureDoc = Boolean(docDate) && docDate > todayISO();
+    await startItems(tg, chatId, user, intent.docType, found.cp.id, extra, docDate);
     const items = docService.cleanItems(intent.items || []);
     if (items.length) {
       const st = bdb.getState(user.id);
@@ -3382,7 +3643,7 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
          * бесследно: документ виден в журнале и удаляется оттуда, а бот
          * сразу говорит, что именно выписал.
          */
-        if (auto) {
+        if (auto && !futureDoc) {
           await finishItems(tg, chatId, user, bdb.getState(user.id));
           return true;
         }
@@ -5687,6 +5948,10 @@ async function handleMessage(tg, msg) {
     await handleAktPeriodText(tg, chatId, user, Number(state.state.slice(5)), text);
     return;
   }
+  if (state.state === 'lp:docs' || state.state === 'lp:unpaid') {
+    await handleListPeriodText(tg, chatId, user, state.state.slice(3), text);
+    return;
+  }
   if (state.state === 'claim') { await claimByEmail(tg, chatId, user, text); return; }
   if (state.state === 'claim-code') { await claimByCode(tg, chatId, user, text); return; }
   if (state.state === 'promo') { await redeemPromo(tg, chatId, user, text); return; }
@@ -6383,6 +6648,39 @@ async function handleCallback(tg, cq) {
       return;
     }
     if (data.startsWith('reg.p:')) { await sendRegistry(tg, chatId, user, data.slice(6)); return; }
+    if (data.startsWith('reg.r:')) {
+      const [a, b] = data.slice(6).split(':');
+      const from = a === '0' ? '' : unpackDay(a);
+      const to = unpackDay(b);
+      if (!to || (a !== '0' && !from)) { await tg.sendMessage(chatId, 'Не понял период.', mainMenu()); return; }
+      await sendRegistry(tg, chatId, user, '', { from, to });
+      return;
+    }
+    // Другой период для списка «документы» / «неоплаченные».
+    if (data.startsWith('lp.pick:')) { await askListPeriod(tg, chatId, data.slice(8)); return; }
+    if (data.startsWith('lp.p:')) {
+      const [kind, code] = data.slice(5).split(':');
+      const r = period.presetRange(code);
+      await showListFor(tg, chatId, user, kind, { from: r.from, to: r.to });
+      return;
+    }
+    if (data.startsWith('lp.own:')) {
+      const kind = data.slice(7) === 'unpaid' ? 'unpaid' : 'docs';
+      bdb.setState(user.id, `lp:${kind}`, {});
+      await tg.sendMessage(chatId,
+        'Напишите период — как удобно:\n'
+        + '<code>01.09.2026 - 30.09.2026</code>\n'
+        + '<code>сентябрь</code>  ·  <code>апрель 2025</code>\n'
+        + '<code>2 квартал</code>  ·  <code>2025</code>',
+        keyboard([[{ text: '✖️ Отмена', data: 'menu' }]]));
+      return;
+    }
+    // Повтор по фразе, когда клиент оказался неоднозначным: после выбора ищем документ заново.
+    if (data.startsWith('rp.cp:')) {
+      const [cpId, type, day] = data.slice(6).split(':');
+      await repeatBy(tg, chatId, user, { cpId: Number(cpId), type: type === '-' ? '' : type, date: unpackDay(day) });
+      return;
+    }
     if (data.startsWith('kniga.p:')) { await sendKniga(tg, chatId, user, data.slice(8)); return; }
     if (data === 'taxmode') { await showTaxMode(tg, chatId, user); return; }
     if (data.startsWith('tax.set:')) {
@@ -6674,12 +6972,14 @@ async function handleCallback(tg, cq) {
     if (data === 'cp.new') { await startForm(tg, chatId, user, 'cp'); return; }
     // Выбор клиента и суммы для проводки, начатой фразой.
     if (data.startsWith('pay.cp:')) {
-      const [cpIdStr, sumStr, kindFlag, tok] = data.slice(7).split(':');
+      const [cpIdStr, sumStr, kindFlag, tok, day] = data.slice(7).split(':');
       if (!bdb.claimButton(user.id, tok)) {
         await tg.sendMessage(chatId, 'Эта оплата уже внесена — повторно не провожу.', mainMenu());
         return;
       }
-      await recordPay(tg, chatId, user, Number(cpIdStr), Number(sumStr), kindFlag === 'p' ? 'Приход' : 'Оплата');
+      // Дату нажатие подтверждает: даже будущая, названная во фразе, внесётся — человек её видел.
+      await recordPay(tg, chatId, user, Number(cpIdStr), Number(sumStr), kindFlag === 'p' ? 'Приход' : 'Оплата',
+        unpackDay(day));
       return;
     }
     if (data.startsWith('pp.in:')) {
@@ -6691,12 +6991,12 @@ async function handleCallback(tg, cq) {
       return;
     }
     if (data.startsWith('pp.do:')) {
-      const [cpIdStr, sumStr, tok] = data.slice(6).split(':');
+      const [cpIdStr, sumStr, tok, day] = data.slice(6).split(':');
       if (!bdb.claimButton(user.id, tok)) {
         await tg.sendMessage(chatId, 'Эта предоплата уже внесена — повторно не провожу.', mainMenu());
         return;
       }
-      await doPrepay(tg, chatId, user, Number(cpIdStr), Number(sumStr));
+      await doPrepay(tg, chatId, user, Number(cpIdStr), Number(sumStr), unpackDay(day));
       return;
     }
     if (data.startsWith('pp.act:')) {
@@ -6796,6 +7096,15 @@ async function handleCallback(tg, cq) {
       return;
     }
     if (data.startsWith('d.akt:')) { await askAktPeriod(tg, chatId, user, Number(data.slice(6))); return; }
+    // Акт за период, названный во фразе: даты едут в кнопке (0 в начале — «от начала расчётов»).
+    if (data.startsWith('akt.r:')) {
+      const [cpId, a, b] = data.slice(6).split(':');
+      const from = a === '0' ? '' : unpackDay(a);
+      const to = unpackDay(b);
+      if (!to || (a !== '0' && !from)) { await askAktPeriod(tg, chatId, user, Number(cpId)); return; }
+      await genAktSverki(tg, chatId, user, Number(cpId), from, to, { changePeriod: true });
+      return;
+    }
     if (data.startsWith('akt.p:')) {
       const [cpId, code] = data.slice(6).split(':');
       const r = period.presetRange(code);

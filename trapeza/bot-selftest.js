@@ -3141,6 +3141,244 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     recX.off(uX.id, rid);
   }
 
+  console.log('\n── ассистент: напомнить, повторить, период и дата из фразы ──');
+  {
+    /*
+     * Фраза превращается в действие бота: «напомни Вектору» — текст и кнопка
+     * (письмо только по нажатию), «повтори» — сводка на проверку, период и
+     * дата из фразы не переспрашиваются. Время — настоящее: «вчера» и
+     * «прошлый месяц» считаем теми же функциями, что и разбор.
+     */
+    const bdbW = require('./lib/bot-db');
+    const dsW = require('./lib/doc-service');
+    const perW = require('./lib/period');
+    const mailerW = require('./lib/mail');
+    const mailboxW = require('./lib/mailbox');
+    const whoW = { id: 779150, first_name: 'Ассистент', username: 'asst' };
+    const sayW = (t) => handleUpdate(tg, { message: { chat: { id: whoW.id }, from: whoW, text: t } });
+    const tapW = (d) => handleUpdate(tg,
+      { callback_query: { id: 'cb', from: whoW, data: d, message: { chat: { id: whoW.id } } } });
+    const uW = bdbW.getOrCreateUser(whoW.id, 'Ассистент');
+    bdbW.saveMyOrg(uW.id, { name: 'ИП Помощников', inn: '183112345678', acc: '40802810900000000009',
+      bank_name: 'ПАО Сбербанк', bik: '044525225', corr_acc: '30101810400000000225' });
+    bdbW.updateOrg(uW.id, bdbW.getDefaultOrg(uW.id).id, { debt_basis: 'invoice' });
+    const cpZ = bdbW.createCp(uW.id, { name: 'ООО «Заря»', kind: 'customer', opening_date: '2026-01-01' });
+    const cpV = bdbW.createCp(uW.id, { name: 'ООО «Вектор»', kind: 'customer', opening_date: '2026-01-01', email: 'buh@vektor.ru' });
+    const cpL = bdbW.createCp(uW.id, { name: 'ООО «Лотос»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbW.createCp(uW.id, { name: 'ООО «Лотос-Опт»', kind: 'customer', opening_date: '2026-01-01' });
+    const yest = perW.iso(new Date(perW.todayDate().getTime() - 86400000));
+    const today = perW.todayISO();
+    const pm = perW.presetRange('pm');
+    const inPm = `${pm.from.slice(0, 8)}10`;                    // 10-е число прошлого месяца
+    const issue = (type, cpId, price, date) => dsW.issueDocument(uW.id, {
+      type, cpId, items: [{ name: 'Работа', qty: 1, price }], date, skipQuota: true });
+
+    // Письма не уходят нигде, кроме нажатой кнопки: считаем обращения к почте.
+    let mails = 0;
+    const realSend = mailerW.sendMail;
+    mailerW.sendMail = async () => { mails += 1; return { ok: true }; };
+    await mailboxW.save(uW.id, { preset: 'custom', login: 'ip@pomoshnikov.ru', pass: 'пароль',
+      host: '127.0.0.1', port: 2525 });
+
+    const schZ = await issue('sch', cpZ, 30000, yest);
+    bdbW.markPaid(uW.id, schZ.doc.id);                          // счёт Заре вчера, уже оплачен
+    const schV = await issue('sch', cpV, 12000, inPm);          // Вектор должен с прошлого месяца
+    const tnV = await issue('torg12', cpV, 5000, yest);         // единственная накладная «вчера»
+
+    // ---------- напомнить ----------
+    let mark = sent.length;
+    await sayW('напомни Вектору про долг');
+    const remText = sent.slice(mark).map((m) => m.text).join('\n');
+    ok(/Напоминание: ООО «Вектор»/.test(remText), '«напомни Вектору про долг» → напоминание именно ему', remText.slice(0, 80));
+    ok(/числится задолженность|не отмечена оплата|не погашена/.test(remText), 'текст письма показан');
+    const sendBtnW = buttonSince(mark, 'Отправить на buh@vektor.ru');
+    ok(Boolean(sendBtnW) && /^rm\.mail:/.test(sendBtnW), 'и кнопка отправки на почту клиента', sendBtnW);
+    ok(mails === 0, 'сама фраза письмо не отправила', mails);
+    bdbW.setAiEnabled(uW.id, false);
+    await sayW('пни вектора по оплате');
+    ok(mails === 0, 'и при выключенном ассистенте тоже', mails);
+    bdbW.setAiEnabled(uW.id, true);
+    await sayW('напомни Вектору про долг');
+    ok(mails === 0, 'и при включённом — письмо только по кнопке', mails);
+    await tapW(sendBtnW);
+    ok(mails === 1 && last().includes('Отправлено на'), 'нажатие отправило ровно одно письмо', `${mails} · ${last().slice(0, 40)}`);
+
+    mark = sent.length;
+    await sayW('напомни заре об оплате');
+    ok(/долга нет/.test(last()), 'клиенту без долга напоминать не о чем — так и сказано', last().slice(0, 60));
+    mark = sent.length;
+    await sayW('напомни лотосу про долг');
+    ok(last().includes('Кого именно') && Boolean(button('Лотос-Опт')) && Boolean(button('ООО «Лотос»')),
+      'два похожих клиента — переспрос с обоими', last().slice(0, 60));
+    ok(/^rm\.one:/.test(button('Лотос-Опт')) && mails === 1, 'кнопки ведут к напоминанию, письмо не ушло', mails);
+    await sayW('напомни ромашке про долг');
+    ok(last().includes('у вас нет') && Boolean(button('Вектор')), 'незнакомый клиент — сказано, и предложены должники', last().slice(0, 60));
+    await sayW('отправь напоминание');
+    ok(last().includes('Кому напомнить') && Boolean(button('Вектор')), 'кому — не названо: бот спрашивает', last().slice(0, 60));
+    mark = sent.length;
+    await sayW('напомни всем должникам');
+    ok(sent.slice(mark).some((m) => /числится задолженность|не отмечена оплата|не погашена/.test(m.text || '')) && mails === 1,
+      '«всем должникам» — тексты на каждого, писем нет', mails);
+    await sayW('напомни мне завтра позвонить');
+    ok(!/Напоминание:/.test(last()), '«напомни мне» — не про клиентов, должнику не пишем', last().slice(0, 50));
+
+    // ---------- повторить ----------
+    const docsBefore = () => bdbW.listDocs(uW.id, 200).length;
+    const n0 = docsBefore();
+    await sayW('повтори последний счёт Заре');
+    let stR = bdbW.getState(uW.id);
+    ok(/Повторяю/.test(sent.slice(-2).map((m) => m.text).join(' ')) && stR.state === `items:sch:${cpZ}`,
+      '«повтори последний счёт Заре» → сводка повтора счёта Заре', stR.state);
+    ok(stR.data.date === today && Number(stR.data.number) > Number(schZ.doc.number),
+      'дата сегодняшняя, номер новый', `${stR.data.date} № ${stR.data.number}`);
+    ok(docsBefore() === n0, 'документ показан на проверку, а не выписан', docsBefore() - n0);
+    ok(Boolean(button('Сформировать')), 'выпускает кнопка «Сформировать»', sent[sent.length - 1].kb.flat().map((b) => b.text).join('|'));
+    await tapW('doc.make');
+    const fresh = bdbW.listDocs(uW.id, 1)[0];
+    ok(docsBefore() === n0 + 1 && fresh.type === 'sch' && fresh.cp_id === cpZ && fresh.id !== schZ.doc.id,
+      'после нажатия выписан новый счёт тому же клиенту', JSON.stringify([fresh.type, fresh.cp_id]));
+    ok(fresh.date === today && !fresh.paid_at, 'с сегодняшней датой и без отметки об оплате (у исходного она есть)',
+      `${fresh.date} paid=${fresh.paid_at}`);
+    ok(Boolean(bdbW.getDoc(uW.id, schZ.doc.id).paid_at), 'исходный счёт остался оплаченным');
+    ok(bdbW.listOps(uW.id, cpZ).filter((o) => o.kind === 'Оплата').length === 1,
+      'оплата не скопировалась: проводка «Оплата» по-прежнему одна');
+    bdbW.clearState(uW.id);
+
+    await sayW('повтори вчерашнюю накладную');
+    stR = bdbW.getState(uW.id);
+    ok(stR.state === `items:torg12:${cpV}` && stR.data.items.length === 1 && stR.data.items[0].price === 5000,
+      '«повтори вчерашнюю накладную» → накладная Вектору с теми же позициями', stR.state);
+    bdbW.clearState(uW.id);
+
+    mark = sent.length;
+    await sayW('повтори вчерашний счёт Вектору');
+    ok(!bdbW.getState(uW.id).state && /Последний — /.test(last()) && Boolean(button('Повторить №')),
+      'вчера у Вектора счёта не было — выбранный другой не подсовывается, он предложен кнопкой', last().slice(0, 90));
+    ok(button('Повторить №') === `d.rep:${schV.doc.id}`, 'и это его последний счёт', button('Повторить №'));
+
+    await issue('torg12', cpZ, 7000, yest);                     // теперь накладных «вчера» две
+    await sayW('повтори вчерашнюю накладную');
+    ok(last().includes('несколько') && Boolean(button('Вектор')) && Boolean(button('Заря')) && !bdbW.getState(uW.id).state,
+      'две накладные за вчера — человек выбирает, какую', last().slice(0, 60));
+    await tapW(button('Заря'));
+    ok(bdbW.getState(uW.id).state === `items:torg12:${cpZ}`, 'выбор открывает сводку этой накладной');
+    bdbW.clearState(uW.id);
+
+    await sayW('повтори последний счёт лотосу');
+    ok(last().includes('Кого именно') && Boolean(button('Лотос-Опт')), 'неоднозначный клиент — переспрос', last().slice(0, 50));
+    await sayW('повтори счёт Ромашке');
+    ok(last().includes('у вас нет') && !bdbW.getState(uW.id).state, 'незнакомый клиент — повторять нечего', last().slice(0, 50));
+    await sayW('повтори платёжку заре');
+    ok(/не получится/.test(last()), 'платёжку и договор повторить нельзя — сказано словами', last().slice(0, 50));
+    mark = sent.length;
+    await sayW('повтори');
+    ok(last().includes('Последние документы') && sent.slice(mark).some((m) => /Какой документ повторить/.test(m.text)),
+      '«повтори» без слов о том, что — журнал с кнопками 🔁', last().slice(0, 50));
+    bdbW.clearState(uW.id);
+
+    // ---------- период ----------
+    bdbW.setAiEnabled(uW.id, true);
+    const fCount = () => files.filter((f) => /Акт_сверки/.test(f.filename)).length;
+    const f0 = fCount();
+    mark = sent.length;
+    await sayW('акт сверки с зарёй за прошлый месяц');
+    ok(fCount() === f0 + 1, 'период назван — акт собран сразу, без вопроса «за какой период»', fCount() - f0);
+    ok(!sent.slice(mark).some((m) => /За какой период/.test(m.text || '')), 'вопроса о периоде не было');
+    const akt = files[files.length - 1];
+    ok((akt.caption || '').includes(`${pm.from.slice(8)}.${pm.from.slice(5, 7)}.${pm.from.slice(0, 4)}`)
+      && (akt.caption || '').includes(`${pm.to.slice(8)}.${pm.to.slice(5, 7)}.${pm.to.slice(0, 4)}`),
+    'в акте период из фразы — прошлый месяц', akt.caption);
+    ok(button('Другой период') === `d.akt:${cpZ}`, 'под актом есть «Другой период»', button('Другой период'));
+    await tapW(button('Другой период'));
+    ok(last().includes('За какой период') && Boolean(button('Этот квартал')), '«Другой период» открывает выбор периодов');
+
+    bdbW.setAiEnabled(uW.id, false);
+    const f1 = fCount();
+    await sayW('акт сверки с вектором за прошлый месяц');
+    ok(fCount() === f1 && Boolean(button('Собрать акт')), 'ассистент выключен: акт предложен кнопкой, не собран', fCount() - f1);
+    await tapW(button('Собрать акт'));
+    ok(fCount() === f1 + 1 && /Вектор/.test((files[files.length - 1].caption || '')), 'нажатие собирает акт за названный период');
+    bdbW.setAiEnabled(uW.id, true);
+
+    await sayW('акт сверки за прошлый месяц');
+    ok(last().includes('С кем сверяемся') && last().includes('за прошлый месяц'.replace('прошлый месяц', perW.periodTitle(pm.from, pm.to))),
+      'клиент не назван — спрашиваем только его, период помним', last().slice(0, 70));
+    const f2 = fCount();
+    await tapW(button('Вектор'));
+    ok(fCount() === f2 + 1 && !/За какой период/.test(last()), 'выбор клиента сразу собирает акт за этот период');
+    await sayW('акт сверки с лотосом за прошлый месяц');
+    ok(last().includes('Кого именно') && /^akt\.r:/.test(button('Лотос-Опт')), 'похожие клиенты — переспрос, кнопки несут период', button('Лотос-Опт'));
+    await sayW('акт сверки с зарёй');
+    ok(last().includes('За какой период'), 'период не назван — спрашиваем, как и раньше');
+
+    // журнал и неоплаченные за период
+    await sayW('покажи документы за прошлый месяц');
+    ok(last().includes('Документы за') && last().includes(perW.periodTitle(pm.from, pm.to)) && Boolean(button(`№ ${schV.doc.number}`)),
+      '«документы за прошлый месяц» → журнал за этот месяц, без вопросов', last().slice(0, 60));
+    ok(!sent[sent.length - 1].kb.flat().some((b) => b.callback_data === `doc:${schZ.doc.id}`),
+      'документ другого месяца в нём не показан');
+    ok(Boolean(button('Другой период')) && /^reg\.r:/.test(button('Реестр за эти даты')), 'есть «Другой период» и реестр за эти даты');
+    mark = sent.length;
+    await tapW(button('Реестр за эти даты'));
+    ok(files[files.length - 1].filename.startsWith('Реестр_') && files[files.length - 1].filename.includes(pm.from),
+      'реестр собран за те же даты', files[files.length - 1].filename);
+    await sayW('покажи неоплаченные счета за прошлый месяц');
+    ok(last().includes('Ждут оплаты за') && /12\s?000/.test(last()), '«неоплаченные за прошлый месяц» → только его счёт на 12 000', last().slice(0, 80));
+    ok(Boolean(button(`№ ${schV.doc.number}`)) && !sent[sent.length - 1].kb.flat().some((b) => b.callback_data === `doc:${tnV.doc.id}`),
+      'накладная этого месяца в списке за прошлый не показана');
+    await sayW('документы за 2020 год');
+    ok(last().includes('документов нет'), 'за пустой период честно сказано, что пусто', last().slice(0, 50));
+    await tapW('lp.pick:docs');
+    ok(Boolean(button('Свой период')) && Boolean(button('Этот год')), '«Другой период» для списка — те же кнопки');
+    await tapW(button('Этот год'));
+    ok(last().includes('Документы за') && Boolean(button(`№ ${tnV.doc.number}`)), 'и год показывает документы этого года');
+    await tapW('lp.own:docs');
+    await sayW('не период');
+    ok(last().includes('Не понял период') && bdbW.getState(uW.id).state === 'lp:docs', 'свой период: мусор отклонён, состояние ждёт');
+    await sayW('сентябрь 2025');
+    ok(/За сентябрь 2025/.test(last()) && !bdbW.getState(uW.id).state, 'свой период текстом принят и показан', last().slice(0, 50));
+
+    // ---------- дата ----------
+    const opsOfZ = () => bdbW.listOps(uW.id, cpZ);
+    await issue('sch', cpZ, 9000, yest);
+    await sayW('вчера Заря оплатила 5000');
+    const opZ = opsOfZ().find((o) => o.kind === 'Оплата' && Number(o.debit) === 5000);
+    ok(opZ && opZ.date === yest, '«вчера Заря оплатила 5000» → оплата внесена вчерашним числом',
+      JSON.stringify(opZ));
+    ok(last().includes(yest.split('-').reverse().join('.')), 'и в ответе стоит эта дата', last().slice(0, 70));
+    bdbW.setAiEnabled(uW.id, false);
+    const opsN = opsOfZ().length;
+    await sayW('вчера Заря оплатила 1000');
+    ok(opsOfZ().length === opsN && last().includes(yest.split('-').reverse().join('.')),
+      'ассистент выключен: оплата с датой готовится, но не вносится', last().slice(0, 70));
+    const payB = button('Внести');
+    ok(/:\d{8}$/.test(payB), 'дата едет в кнопке', payB);
+    await tapW(payB);
+    const opZ2 = opsOfZ().find((o) => o.kind === 'Оплата' && Number(o.debit) === 1000);
+    ok(opsOfZ().length === opsN + 1 && opZ2 && opZ2.date === yest, 'нажатие вносит оплату вчерашним числом', JSON.stringify(opZ2));
+    bdbW.setAiEnabled(uW.id, true);
+    const opsF = opsOfZ().length;
+    await sayW('Заря оплатила пять тысяч завтра');
+    ok(opsOfZ().length === opsF && last().includes('ещё впереди'),
+      'дата из будущего: даже включённый ассистент не вносит сам, а просит проверить', last().slice(0, 80));
+    ok(/:\d{8}$/.test(button('Внести')), 'кнопка с датой на месте');
+
+    const nD = docsBefore();
+    await sayW('выставь счёт заре на пять тысяч вчерашним числом');
+    const dd = bdbW.listDocs(uW.id, 1)[0];
+    ok(docsBefore() === nD + 1 && dd.date === yest && dd.total === 5000,
+      'дата документа из фразы: счёт выписан вчерашним числом', `${dd.date} ${dd.total}`);
+    await sayW('выставь счёт заре на пять тысяч завтрашним числом');
+    ok(docsBefore() === nD + 1 && bdbW.getState(uW.id).state === `items:sch:${cpZ}`
+      && bdbW.getState(uW.id).data.date > today,
+    'дата документа из будущего: показан на проверку, сам не выписан');
+    bdbW.clearState(uW.id);
+
+    mailerW.sendMail = realSend;
+    mailboxW.remove(uW.id);
+    ok(mails === 1, 'за весь блок ушло ровно одно письмо — то, что подтвердили кнопкой', mails);
+  }
+
   console.log('\n── обрыв ответа Telegram не вешает бота ──');
   {
     /*
@@ -4330,9 +4568,22 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
         'хочу чтобы заря оплатила 5000']) {
         ok(P(s) === null, `не принимается за поручение: «${s}»`, JSON.stringify(P(s)));
       }
-      // «напомни» и «повтори» разбор узнаёт, но бот пока выполнить не может — наружу не отдаём.
-      ok(P('напомни вектору про долг').action === 'remind' && ai.quickParse('напомни вектору про долг') === null,
-        '«напомни» узнаётся, но без экрана в бота не уходит');
+      // «напомни» и «повтори» теперь выполняются (aiRemind, aiRepeat) — разбор отдаёт их наружу.
+      ok(P('напомни вектору про долг').action === 'remind' && ai.quickParse('напомни вектору про долг').action === 'remind',
+        '«напомни» узнаётся и уходит в бота');
+      ok(ai.quickParse('повтори вчерашнюю накладную').action === 'repeat', '«повтори» — тоже');
+      ok(ai.quickParse('напомни всем должникам').all === true && !ai.quickParse('напомни всем должникам').who,
+        '«напомни всем должникам» — всем, а не клиенту по имени «Должникам»');
+      ok(!ai.quickParse('напомни клиенту про долг').who, '«напомни клиенту» — имени нет, бот спросит кому');
+      // Ответ модели проходит ту же проверку: лишнего не пропускаем, нужное оставляем.
+      const sRem = ai.sanitize({ action: 'remind', who: 'Заря', docType: 'выдумка', amount: 5 });
+      ok(sRem.action === 'remind' && sRem.who === 'Заря' && sRem.docType === undefined && sRem.amount === undefined,
+        'sanitize: «напомни» — клиент остаётся, выдуманный вид документа и сумма — нет', JSON.stringify(sRem));
+      const sRep = ai.sanitize({ action: 'repeat', who: 'Заря', docType: 'torg12', date: '2026-10-18' });
+      ok(sRep.docType === 'torg12' && sRep.date === '2026-10-18', 'sanitize: «повтори» держит вид бумаги и число');
+      ok(ai.sanitize({ action: 'repeat', date: '2026-02-31' }).date === undefined, 'и несуществующее число отбрасывает');
+      const sUn = ai.sanitize({ action: 'unpaid', period: { from: '2026-09-01', to: '2026-09-30' } });
+      ok(sUn.period && sUn.period.to === '2026-09-30', 'sanitize: у «неоплаченных» период сохраняется', JSON.stringify(sUn));
 
       // Клиент: уверенное совпадение только по корню слова, остальное — вопрос.
       const cpsM = nm.map((n, i) => ({ id: i + 1, name: n }));
