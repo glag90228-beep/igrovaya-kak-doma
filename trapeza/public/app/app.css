@@ -1440,3 +1440,6 @@ details.more-fields > summary::after {
   transform: rotate(45deg); transition: transform var(--fast) var(--ease);
 }
 details.more-fields[open] > summary::after { transform: rotate(-135deg); }
+
+/* Ссылки внизу экранов (оферта, поддержка) — мелкий шрифт, но палец должен попадать. */
+.legal-links a { display: inline-block; padding: 13px 6px; }

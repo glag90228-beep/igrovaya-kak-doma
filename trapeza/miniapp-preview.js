@@ -225,6 +225,9 @@ const SHOTS = [
   { name: 'pustoy-schet', title: 'Новый счёт (пустой)', go: ['new', { type: 'sch' }] },
   { name: 'dokumenty', title: 'Документы', go: ['docs', {}] },
   { name: 'klienty', title: 'Клиенты', go: ['cps', {}] },
+  { name: 'klient-novyj', title: 'Новый клиент: «Дополнительно» свёрнуто', go: ['cp', {}] },
+  { name: 'klient-novyj-dolg', title: 'Новый клиент: «Дополнительно» раскрыто', go: ['cp', {}], scroll: 'bottom',
+    act: async (page) => { await page.locator('#opening-box summary').click(); await page.waitForTimeout(250); } },
   { name: 'crm', title: 'Дела', go: ['crm', {}] },
   { name: 'crm-nizhe', title: 'Дела: лента событий', go: ['crm', {}], scroll: 'bottom' },
   {

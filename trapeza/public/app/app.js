@@ -4726,7 +4726,7 @@ screens.support = async function support() {
   });
   box.append(h('div', { class: 'btn-wrap' }, send));
 
-  const supInfo = h('div', { class: 'small muted', style: 'margin:24px 18px 12px; line-height:1.7; text-align:center;' });
+  const supInfo = h('div', { class: 'small muted legal-links', style: 'margin:24px 18px 12px; line-height:1.7; text-align:center;' });
   supInfo.innerHTML = 'Telegram: <a href="https://t.me/flowcraft_agent" target="_blank" style="color:var(--accent);">@flowcraft_agent</a> · Email: <a href="mailto:support@pervichkaru.ru" style="color:var(--accent);">support@pervichkaru.ru</a><br>'
     + '<a href="/terms" target="_blank" style="color:var(--accent);">Пользовательское соглашение</a> · '
     + '<a href="/privacy" target="_blank" style="color:var(--accent);">Конфиденциальность</a> · '
@@ -5200,7 +5200,7 @@ screens.billing = async function billing() {
       : 'Код выдаёт поддержка — например, на время знакомства с сервисом.',
   }));
 
-  const billingLegal = h('div', { class: 'small muted', style: 'margin:20px 16px 12px; text-align:center; line-height:1.7;' });
+  const billingLegal = h('div', { class: 'small muted legal-links', style: 'margin:20px 16px 12px; text-align:center; line-height:1.7;' });
   billingLegal.innerHTML = 'Оплата означает согласие с <a href="/terms" target="_blank" style="color:var(--accent);">офертой</a> и <a href="/privacy" target="_blank" style="color:var(--accent);">политикой конфиденциальности</a>.<br>'
     + '<a href="/tariffs" target="_blank" style="color:var(--accent);">Тарифы</a> · Поддержка: <a href="mailto:support@pervichkaru.ru" style="color:var(--accent);">support@pervichkaru.ru</a><br>'
     + '<span style="font-family:monospace; font-size:11px; opacity:0.65;">Проверочный код: plat chek</span>';
