@@ -3996,6 +3996,14 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const bdbA = require('./lib/bot-db');
     const uid = fxUserId();
 
+    /*
+     * Фраза, которую правила разбора НЕ берут сами, — чтобы проверки ниже шли
+     * через модель. Раньше для этого годилось «надо бы выставить Заре за аренду
+     * тридцать тысяч», но правила научились и ей (числа словами, разговорные
+     * обороты), и проверка защиты от выдуманного НДС стала бы проверкой правил.
+     */
+    const MODEL_PHRASE = 'Заре за аренду тридцать тысяч, как обычно';
+
     // По умолчанию модуль выключен: ключ в .env лежит ради распознавания
     // счетов и сам по себе не должен запускать расходы.
     delete process.env.AI_ENABLED;
@@ -4146,7 +4154,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       action: 'draft', docType: 'sch', who: 'Заря',
       items: [{ name: 'Аренда', qty: 1, price: 30000 }],
     });
-    intent = await ai.understand('надо бы выставить Заре за аренду тридцать тысяч', uid);
+    intent = await ai.understand(MODEL_PHRASE, uid);
     ok(intent.action === 'draft' && intent.items[0].price === 30000, 'ответ модели разобран',
       JSON.stringify(intent).slice(0, 80));
 
@@ -4198,7 +4206,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       vatRate: null, priceIncludesVat: false,
     });
     process.env.AI_MOCK = vatMock;
-    const silent = await ai.understand('надо бы выставить Заре за аренду тридцать тысяч', uid);
+    const silent = await ai.understand(MODEL_PHRASE, uid);
     ok(silent.action === 'draft', 'документ всё равно разобран', silent.action);
     ok(silent.vatRate === undefined && silent.priceIncludesVat === undefined,
       'про НДС не говорили — выдуманная ставка отброшена', JSON.stringify(silent.vatRate));
@@ -4206,13 +4214,14 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     /*
      * А когда сказали — уважаем сказанное. Фразы здесь нарочно такие, что
      * местный разбор их не берёт: иначе проверялся бы он, а не защита.
-     * Первая версия этой проверки на том и обожглась.
+     * Первая версия этой проверки на том и обожглась. Клиента «Лилия» у
+     * человека нет, и без названного клиента, суммы и глагола правила молчат.
      */
     process.env.AI_MOCK = JSON.stringify({
       action: 'draft', docType: 'sch', who: 'Заря', items: [],
       vatRate: 22, priceIncludesVat: true,
     });
-    const rate = await ai.understand('счёт Заре, в т.ч. НДС 22', uid);
+    const rate = await ai.understand('счёт Лилии, в т.ч. НДС 22', uid);
     ok(rate.source === 'model', 'фраза дошла до модели, а не осела в regex', rate.source);
     ok(rate.vatRate === 22 && rate.priceIncludesVat === true,
       'названную ставку не трогаем', JSON.stringify(rate.vatRate));
@@ -4459,7 +4468,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
 
     bdbA.setAiEnabled(uid, false);
     const docsBefore = bdbA.listDocs(uid, 99).length;
-    await say('надо выписать Тюльпану за обслуживание');
+    await say('Тюльпану за обслуживание двенадцать тысяч');
     ok(bdbA.listDocs(uid, 99).length === docsBefore, 'с выключенным тумблером документ сам не выписался',
       bdbA.listDocs(uid, 99).length - docsBefore);
     const st = bdbA.getState(uid);
@@ -4472,7 +4481,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
 
     bdbA.setAiEnabled(uid, true);
     const docsOn = bdbA.listDocs(uid, 99).length;
-    await say('надо выписать Тюльпану за обслуживание');
+    await say('Тюльпану за обслуживание двенадцать тысяч');
     ok(bdbA.listDocs(uid, 99).length === docsOn + 1,
       'с включённым — выписал сам, без второго нажатия',
       `${docsOn} → ${bdbA.listDocs(uid, 99).length}`);
@@ -7254,7 +7263,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     global.fetch = (u, o) => realFetch(
       String(u).replace('https://api.x.ai', `http://127.0.0.1:${srv.address().port}`), o,
     );
-    const intent = await aiG.understand('надо бы выставить Заре за аренду тридцать тысяч', 4343);
+    const intent = await aiG.understand('Заре за аренду тридцать тысяч, как обычно', 4343);
     ok(intent.action === 'draft' && intent.who === 'Заря', 'фраза разобрана', JSON.stringify(intent));
     ok(got.model === 'grok-проверочный', 'модель взята из AI_MODEL', got.model);
     ok(hdr.authorization === 'Bearer xai-test', 'ключ ушёл в Bearer', hdr.authorization);
@@ -7369,7 +7378,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'без каталога честно говорим, чего не хватает', aiY.aiHint());
     process.env.YANDEX_FOLDER_ID = 'b1gtest';
 
-    const intent = await aiY.understand('надо бы выставить Заре за аренду тридцать тысяч', 4242);
+    const intent = await aiY.understand('Заре за аренду тридцать тысяч, как обычно', 4242);
     ok(intent.action === 'draft' && intent.who === 'Заря', 'фраза разобрана моделью',
       JSON.stringify(intent));
     ok(got.modelUri === 'gpt://b1gtest/yandexgpt-lite/latest',

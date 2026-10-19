@@ -9,6 +9,8 @@
  *   node ai-eval.js --misses 80      показать больше промахов (по умолчанию 40; --all — все)
  *   node ai-eval.js --intent pay     только фразы с таким ожидаемым намерением
  *   node ai-eval.js --tag числа-словами   только фразы с такой меткой
+ *   node ai-eval.js --holdout [1|2]  только «отложенные» фразы (написаны после правил, на них честно)
+ *   node ai-eval.js --tuned          только фразы, на которых правила настраивались
  *   node ai-eval.js --json           итог одним JSON — для сравнения «до/после»
  *
  * Зачем он нужен. Разбор фразы — единственное место, где ошибка превращается
@@ -208,6 +210,9 @@ async function evaluate(opts = {}) {
   for (const exp of data.phrases) {
     if (opts.intent && exp.i !== opts.intent) continue;
     if (opts.tag && !(exp.tags || []).includes(opts.tag)) continue;
+    if (opts.holdout === true && !exp.holdout) continue;
+    if (typeof opts.holdout === 'number' && Number(exp.holdout === true ? 1 : exp.holdout) !== opts.holdout) continue;
+    if (opts.holdout === false && exp.holdout) continue;
     if (mode !== 'rules' && inPrompt(ai, exp.t)) { model.skippedShots += 1; continue; }
     let got = null;
     let source = 'правила';
@@ -413,7 +418,9 @@ async function main(argv) {
     console.error(`Модель недоступна: ${ai.aiHint()}\nКлюч берётся из .env рядом со скриптом или из окружения; в чат его не присылайте.`);
     process.exit(2);
   }
-  const res = await evaluate({ mode, ai, intent: arg('--intent'), tag: arg('--tag') });
+  const hi = argv.indexOf('--holdout');
+  const holdout = hi >= 0 ? (/^\d$/.test(argv[hi + 1] || '') ? Number(argv[hi + 1]) : true) : (argv.includes('--tuned') ? false : undefined);
+  const res = await evaluate({ mode, ai, intent: arg('--intent'), tag: arg('--tag'), holdout });
   if (argv.includes('--json')) {
     const { rows, ...rest } = res;
     console.log(JSON.stringify(rest, null, 1));
