@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="UTF-8" /><meta name="viewport" content="width=1080, height=1920" />
+<title>Память Claude</title>
+<script src="gsap.min.js"></script><script src="three.global.js"></script><script src="mascot3d.js"></script>
+<style>@font-face{font-family:Manrope;font-weight:200 800;src:url(manrope-cyrillic-wght-normal.woff2) format('woff2');unicode-range:U+0400-045F,U+2116,U+00AB,U+00BB}
+@font-face{font-family:Manrope;font-weight:200 800;src:url(manrope-latin-wght-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+2212,U+20BD}
+@font-face{font-family:Manrope;font-weight:200 800;src:url(manrope-latin-ext-wght-normal.woff2) format('woff2');unicode-range:U+0100-024F,U+20A0-20CF}
+@font-face{font-family:JBM;font-weight:400;src:url(jetbrains-mono-cyrillic-400-normal.woff2) format('woff2');unicode-range:U+0400-045F}
+@font-face{font-family:JBM;font-weight:400;src:url(jetbrains-mono-latin-400-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F}
+@font-face{font-family:JBM;font-weight:700;src:url(jetbrains-mono-latin-700-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F}
+@font-face{font-family:JBM;font-weight:700;src:url(jetbrains-mono-cyrillic-700-normal.woff2) format('woff2');unicode-range:U+0400-045F}
+html,body{margin:0;background:#0F0E0C}
+#root{position:relative;width:1080px;height:1920px;overflow:hidden;font-family:Manrope,sans-serif;background:#0F0E0C;color:#F5F2EA}
+.clip{position:absolute;inset:0}
+#bg{background:radial-gradient(ellipse 90% 60% at 50% 42%,#26201A,#0F0E0C 72%)}
+#bg::after{content:'';position:absolute;inset:0;background-image:radial-gradient(rgba(245,242,234,.07) 2px,transparent 2px);background-size:44px 44px}
+#flash{background:#fff;opacity:0;z-index:90}
+#wipe{z-index:85;background:#0F0E0C;clip-path:circle(0px at 540px 900px)}
+.scn{position:absolute;inset:0;opacity:0}
+.tt{position:absolute;left:50px;right:50px;top:160px;text-align:center;font:800 84px/1.06 Manrope;letter-spacing:-.01em;opacity:0;z-index:20}
+.tt b{color:#D97757}.tt .r{color:#FF5A4E;display:inline-block}.tt small{display:block;font:700 40px Manrope;color:#B8AE9F;margin-top:12px}
+.cp{position:absolute;left:60px;right:60px;top:1430px;text-align:center;font:800 68px/1.1 Manrope;text-transform:uppercase;opacity:0;z-index:60;
+  text-shadow:0 6px 0 rgba(0,0,0,.55),0 0 30px rgba(0,0,0,.6)}
+.kw{display:inline-block;color:#fff;margin:0 .1em}
+.kw.nc{text-transform:none;font-family:JBM;font-weight:700;font-size:58px}
+.card{position:absolute;border-radius:36px;background:#1C1916;border:3px solid #3A332B;box-shadow:0 40px 80px rgba(0,0,0,.5);overflow:hidden}
+.card .hd{height:84px;display:flex;align-items:center;gap:16px;padding:0 30px;border-bottom:3px solid #2C2721;font:700 28px JBM;color:#8C8273}
+.card .hd i{width:20px;height:20px;border-radius:50%;background:#3A332B}
+.card .hd i:nth-child(1){background:#FF5F57}.card .hd i:nth-child(2){background:#FEBC2E}.card .hd i:nth-child(3){background:#28C840}
+.card .hd span{margin-left:12px}
+/* 0: чат, где Claude «забыл» */
+#chat{left:84px;top:470px;width:640px;height:600px}
+.b{position:absolute;padding:20px 24px;border-radius:26px;font:600 32px/1.3 Manrope;opacity:0;max-width:520px}
+.b.out{right:24px;background:#D97757;color:#fff;border-bottom-right-radius:8px}
+.b.in{left:24px;background:#2C2721;color:#F5F2EA;border-bottom-left-radius:8px}
+#u1{top:120px}#c1{top:300px}
+.qm{position:absolute;font:800 90px Manrope;color:#FFD45C;opacity:0;z-index:57;text-shadow:0 0 24px rgba(255,212,92,.6)}
+.orb{position:absolute;left:0;top:0;width:44px;height:44px;margin:-22px 0 0 -22px;font:800 44px/44px Manrope;color:#FFD45C;text-align:center;opacity:0;z-index:57;text-shadow:0 0 16px #FFB000}
+#mem{position:absolute;left:110px;top:560px;width:560px;padding:40px 0;border-radius:34px;border:6px dashed #5C5246;text-align:center;opacity:0}
+#mem b{display:block;font:800 52px Manrope}#mem span{display:block;font:700 40px JBM;color:#FF5A4E;margin-top:10px}
+/* 1: тизер */
+#tease{left:110px;top:560px;width:620px;height:330px}
+#tease .ln{position:absolute;left:36px;top:130px;font:700 64px JBM;color:#F5F2EA}
+#tease .ln em{font-style:normal;color:#D97757}
+#tease .ln u{text-decoration:none;filter:blur(10px)}
+#lockq{position:absolute;right:40px;top:120px;width:110px;height:110px;border-radius:50%;background:#FFD45C;color:#0F0E0C;font:800 80px/110px Manrope;text-align:center}
+/* 2: папка проекта и файл */
+#tree{left:60px;top:470px;width:600px;height:640px}
+.tr{position:absolute;left:34px;font:700 40px JBM;color:#CFC6B8;white-space:nowrap}
+#mdrow{color:#FFD45C;padding:6px 14px;margin-left:-14px;border-radius:12px}
+#md{left:60px;top:470px;width:600px;height:760px;opacity:0}
+#md .fh{position:absolute;left:30px;top:24px;font:800 46px JBM;color:#D97757}
+.mdl{position:absolute;left:34px;right:30px;font:700 34px JBM;color:#F5F2EA;white-space:nowrap;opacity:0}
+.mdl em{font-style:normal;color:#8C8273}
+.sk{position:absolute;left:34px;width:400px;height:20px;border-radius:10px;background:#2C2721}
+/* 3: сессии */
+.tab{position:absolute;left:700px;width:320px;padding:18px 0;border-radius:22px;background:#2C2721;border:3px solid #3A332B;text-align:center;font:800 34px Manrope;opacity:0}
+.tab i{font-style:normal;color:#3DDC84}
+.fly{position:absolute;left:0;top:0;width:70px;height:86px;margin:-43px 0 0 -35px;border-radius:12px;background:#F5F2EA;color:#D97757;font:800 20px/86px JBM;text-align:center;opacity:0;z-index:58;box-shadow:0 10px 24px rgba(0,0,0,.4)}
+/* 4: ответ без напоминаний */
+#c2{position:absolute;left:60px;top:1250px;padding:22px 26px;border-radius:26px;background:#2C2721;border:3px solid #3DDC84;font:700 34px/1.3 Manrope;opacity:0;max-width:600px;z-index:6}
+#c2 b{color:#3DDC84}
+/* 5: наш файл */
+#ours{left:60px;right:60px;top:470px;height:700px}
+#ours .ln{position:absolute;left:34px;right:30px;font:700 34px/1.35 JBM;color:#CFC6B8;opacity:0}
+#ours .h{color:#D97757}
+#ours .hot{color:#FF5A4E}
+#hl{position:absolute;left:20px;right:20px;top:254px;height:64px;border-radius:14px;background:rgba(255,90,78,.16);border:3px solid #FF5A4E;opacity:0}
+#lock{position:absolute;right:40px;top:380px;width:160px;height:160px;border-radius:40px;background:#FF5A4E;color:#fff;font:800 92px/160px Manrope;text-align:center;opacity:0;transform:rotate(-8deg)}
+/* 6: /init */
+#term{left:60px;right:60px;top:460px;height:330px}
+#cmd{position:absolute;left:36px;top:120px;font:700 64px JBM}
+#cmd .p{color:#D97757}
+#cur{display:inline-block;width:30px;height:62px;background:#D97757;vertical-align:-10px;margin-left:8px}
+#scanl{position:absolute;left:36px;top:226px;font:700 34px JBM;color:#8C8273}
+#bar{position:absolute;left:36px;right:36px;bottom:30px;height:14px;border-radius:7px;background:#2C2721;overflow:hidden}
+#bar i{display:block;height:100%;width:100%;background:linear-gradient(90deg,#D97757,#F2A07F);transform-origin:0 50%;transform:scaleX(0)}
+#md2{left:60px;right:60px;top:830px;height:440px;opacity:0}
+#md2 .fh{position:absolute;left:30px;top:20px;font:800 40px JBM;color:#D97757}
+#md2 .mdl{font-size:32px}
+#ok{position:absolute;right:30px;top:20px;padding:8px 20px;border-radius:12px;background:#3DDC84;color:#0F0E0C;font:800 30px Manrope;opacity:0}
+.mg{position:absolute;left:0;top:0;width:44px;height:44px;margin:-22px 0 0 -22px;font:800 44px/44px Manrope;text-align:center;color:#FFE066;text-shadow:0 0 18px #FFB000,0 0 6px #fff;opacity:0;z-index:58}
+/* 7: призыв */
+#cmt{position:absolute;left:90px;right:90px;top:540px;border-radius:40px;background:#F5F2EA;color:#0F0E0C;padding:36px 40px;display:flex;gap:28px;align-items:center;box-shadow:0 30px 70px rgba(0,0,0,.45)}
+#cmt .av{width:110px;height:110px;border-radius:50%;background:linear-gradient(135deg,#D97757,#FEBC2E);flex:none}
+#cmt .nm{font:700 32px Manrope;color:#8C8273}#cmt .tx{font:800 90px/1.05 Manrope;margin-top:4px}
+#gift{position:absolute;left:330px;top:820px;width:420px;height:300px;border-radius:30px;background:#1C1916;border:3px solid #D97757;opacity:0;text-align:center}
+#gift b{display:block;margin-top:70px;font:800 52px JBM;color:#D97757}#gift span{display:block;margin-top:10px;font:700 34px Manrope;color:#CFC6B8}
+#dmb{position:absolute;right:110px;top:770px;padding:14px 30px;border-radius:999px;background:#D97757;color:#fff;font:800 40px Manrope;opacity:0}
+#hcv{position:absolute;left:0;top:0;width:1080px;height:1920px}
+#hb{position:absolute;left:0;top:0;margin:-40px 0 0 -40px;min-width:80px;height:80px;padding:0 18px;box-sizing:border-box;border-radius:40px;background:#3DDC84;color:#0F0E0C;font:800 48px/80px Manrope;text-align:center;opacity:0;box-shadow:0 10px 24px rgba(0,0,0,.4);z-index:56}
+</style></head><body>
+<div id="root" data-composition-id="pamyat" data-width="1080" data-height="1920" data-duration="__T__">
+  <section id="bg" class="clip" data-start="0" data-duration="__T__" data-track-index="0"></section>
+  <section id="main" class="clip" data-start="0" data-duration="__T__" data-track-index="1">
+    <div class="scn" id="sc0">
+      <div class="card" id="chat"><div class="hd"><i></i><i></i><i></i><span>claude</span></div>
+        <div class="b out" id="u1">Мы же договорились: коммиты по-русски!</div>
+        <div class="b in" id="c1">Простите… а о чём мы договаривались? 🤔</div></div>
+      <div id="mem"><b>Память Claude</b><span>пусто</span></div>
+    </div>
+    <div class="scn" id="sc1"><div class="card" id="tease"><div class="hd"><i></i><i></i><i></i><span>claude</span></div>
+      <div class="ln"><em>&gt;</em> /<u>init</u></div><div id="lockq">?</div></div></div>
+    <div class="scn" id="sc2">
+      <div class="card" id="tree"><div class="hd"><i></i><i></i><i></i><span>my-project</span></div>
+        <div class="tr" style="top:120px">📁 src</div><div class="tr" style="top:200px">📁 tests</div>
+        <div class="tr" style="top:280px">📄 package.json</div><div class="tr" style="top:360px">📄 README.md</div>
+        <div class="tr" id="mdrow" style="top:440px">✨ CLAUDE.md</div></div>
+    </div>
+    <div class="card" id="md"><div class="fh">CLAUDE.md</div>
+      <div class="sk" style="top:110px;width:300px"></div><div class="sk" style="top:150px;width:420px"></div>
+      <div class="mdl" id="ml1" style="top:210px">## Стиль <em>— коротко, по делу</em></div>
+      <div class="mdl" id="ml2" style="top:280px">## Запреты <em>— прод не трогать</em></div>
+      <div class="mdl" id="ml3" style="top:350px">## Команды <em>— npm test</em></div>
+      <div class="mdl" id="ml4" style="top:460px">- Коммиты — по-русски</div>
+      <div class="mdl" id="ml5" style="top:530px">- Тесты перед коммитом</div></div>
+    <div class="scn" id="sc3">
+      <div class="tab" id="tb0" style="top:470px">Сессия 1 <i>✓</i></div>
+      <div class="tab" id="tb1" style="top:560px">Сессия 2 <i>✓</i></div>
+      <div class="tab" id="tb2" style="top:650px">Сессия 3 <i>✓</i></div>
+      <b class="fly" id="fl0">.md</b><b class="fly" id="fl1">.md</b><b class="fly" id="fl2">.md</b>
+    </div>
+    <div class="scn" id="sc4"><div id="c2"><b>Claude:</b> Готово. Коммит по-русски, тесты зелёные ✓</div></div>
+    <div class="scn" id="sc5"><div class="card" id="ours"><div class="hd"><i></i><i></i><i></i><span>CLAUDE.md · наш, настоящий</span></div>
+      <div class="ln h" id="o1" style="top:120px">### Чего нельзя</div>
+      <div class="ln" id="o2" style="top:190px">- Не пушить в чужие ветки.</div>
+      <div class="ln hot" id="o3" style="top:260px">- Не коммитить .env, токены и базы.</div>
+      <div class="ln" id="o4" style="top:330px">- Письма — только по нажатию человека.</div>
+      <div id="hl"></div><div id="lock">🔒</div></div></div>
+    <div class="scn" id="sc6">
+      <div class="card" id="term"><div class="hd"><i></i><i></i><i></i><span>claude</span></div>
+        <div id="cmd"><span class="p">&gt;</span> <span id="cmdt"></span><i id="cur"></i></div>
+        <div id="scanl"></div><div id="bar"><i></i></div></div>
+      <div class="card" id="md2"><div class="fh">CLAUDE.md</div><b id="ok">создан ✓</b>
+        <div class="mdl" id="w0" style="top:100px">## Проект <em>— бот для документов</em></div>
+        <div class="mdl" id="w1" style="top:160px">## Сборка <em>— npm test</em></div>
+        <div class="mdl" id="w2" style="top:220px">## Структура <em>— lib/, public/</em></div>
+        <div class="mdl" id="w3" style="top:280px">## Правила <em>— тесты перед коммитом</em></div>
+        <div class="mdl" id="w4" style="top:340px">## Стиль <em>— как в остальном коде</em></div></div>
+      <b class="mg" id="mg0">✦</b><b class="mg" id="mg1">✦</b><b class="mg" id="mg2">✦</b><b class="mg" id="mg3">✦</b><b class="mg" id="mg4">✦</b>
+    </div>
+    <div class="scn" id="sc7">
+      <div id="cmt"><i class="av"></i><div><div class="nm">твой комментарий</div><div class="tx">ПАМЯТЬ</div></div></div>
+      <div id="gift"><b>CLAUDE.md</b><span>наш шаблон</span></div>
+      <div id="dmb">→ в личку</div>
+    </div>
+    <b class="qm" id="q0" style="left:720px;top:820px">?</b><b class="qm" id="q1" style="left:900px;top:760px">?</b><b class="qm" id="q2" style="left:980px;top:900px">?</b>
+  </section>
+  <section id="ttl" class="clip" data-start="0" data-duration="__T__" data-track-index="2" style="z-index:50">
+    <div class="tt" id="tt0">Claude опять<br><span class="r">всё забыл?</span></div>
+    <div class="tt" id="tt0b">Это не баг —<br>нет <b>памяти</b></div>
+    <div class="tt" id="ttT">А в конце —<br><b>команда-волшебник</b></div>
+    <div class="tt" id="tt2">Память —<br><b>CLAUDE.md</b></div>
+    <div class="tt" id="tt3">Читает<br><b>каждую сессию</b></div>
+    <div class="tt" id="tt4">Один раз —<br><b>навсегда</b></div>
+    <div class="tt" id="tt5">Наш <b>CLAUDE.md</b><small>кусок настоящего файла</small></div>
+    <div class="tt" id="tt6">Команда <b>/init</b><small>пишет файл за тебя</small></div>
+    <div class="tt" id="tt7">Пиши <b>«ПАМЯТЬ»</b><br>— скину шаблон</div>
+  </section>
+  <section id="hostc" class="clip" data-start="0" data-duration="__T__" data-track-index="3" style="z-index:55"><canvas id="hcv" width="1080" height="1920"></canvas><b id="hb">✓</b>
+    <b class="orb" id="or0">★</b><b class="orb" id="or1">★</b><b class="orb" id="or2">★</b></section>
+  <section id="caps" class="clip" data-start="0" data-duration="__T__" data-track-index="4" style="z-index:60">
+__CAPS__
+  </section>
+  <section id="wipe" class="clip" data-start="0" data-duration="__T__" data-track-index="30"></section>
+  <section id="flash" class="clip" data-start="0" data-duration="__T__" data-track-index="31"></section>
+  <audio id="sfx" src="audio.wav" data-start="0" data-duration="__T__" data-track-index="32"></audio>
+</div>
+<script>
+const tl = gsap.timeline({ paused: true, onUpdate: () => ST.render() });
+window.__timelines = window.__timelines || {};
+window.__timelines['pamyat'] = tl;
+const ST = makeStage(document.getElementById('hcv'), { flat: true, dist: 15 }), P = ST.add();
+const T = __T__, EV = __EV__, CAPT = __CAPT__, KW = __KW__, S = EV.s, $$ = (s) => [...document.querySelectorAll(s)];
+const popIn = (s, t, d = 0.4, from = {}) => tl.fromTo(s, Object.assign({ autoAlpha: 0, scale: 0.7, y: 24 }, from), { autoAlpha: 1, scale: 1, x: 0, y: 0, rotation: 0, duration: d, ease: 'back.out(2)', immediateRender: false }, t);
+const blurIn = (s, t, d = 0.35) => tl.fromTo(s, { autoAlpha: 0, scale: 1.1, filter: 'blur(16px)' }, { autoAlpha: 1, scale: 1, filter: 'blur(0px)', duration: d, ease: 'expo.out', immediateRender: false }, t);
+const blurOut = (s, t, d = 0.2) => tl.to(s, { autoAlpha: 0, scale: 0.92, filter: 'blur(16px)', duration: d, ease: 'power2.in' }, t);
+const flash = (t, a = 0.4) => tl.fromTo('#flash', { opacity: a }, { opacity: 0, duration: 0.18, ease: 'none', immediateRender: false }, t);
+const punch = (s, t, k = 1.12) => tl.fromTo(s, { scale: k }, { scale: 1, duration: 0.3, ease: 'back.out(3)', immediateRender: false }, t);
+const shake = (s, t, n = 6, a = 14) => { for (let k = 0; k < n; k++) tl.to(s, { x: (k % 2 ? -1 : 1) * a * (1 - k / n), duration: 0.04, ease: 'none' }, t + k * 0.04); tl.to(s, { x: 0, duration: 0.04 }, t + n * 0.04); };
+const scene = (k, a, b) => { tl.set('#sc' + k, { autoAlpha: 1 }, a); if (b !== undefined) tl.set('#sc' + k, { autoAlpha: 0 }, b); };
+const title = (k, a, b) => { if (a === 0) tl.set('#tt' + k, { autoAlpha: 1 }, 0); else blurIn('#tt' + k, a); if (b !== undefined) blurOut('#tt' + k, b - 0.2); };
+const typeIn = (s, t, d) => tl.fromTo(s, { autoAlpha: 1, clipPath: 'inset(0 100% 0 0)' }, { clipPath: 'inset(0 0% 0 0)', duration: d, ease: 'steps(16)', immediateRender: false }, t);
+
+// ---------- субтитры-караоке ----------
+CAPT.forEach(([a, b], k) => {
+  if (a === 0) tl.set('#cp' + k, { autoAlpha: 1 }, 0);
+  else tl.fromTo('#cp' + k, { autoAlpha: 0, scale: 0.85, y: 20 }, { autoAlpha: 1, scale: 1, y: 0, duration: 0.14, ease: 'back.out(2.5)', immediateRender: false }, a);
+  tl.set('#cp' + k, { autoAlpha: 0 }, b);
+});
+KW.forEach(([id, t]) => {
+  const el = document.getElementById(id);
+  const base = el.classList.contains('r') ? '#FF5A4E' : el.classList.contains('g') ? '#3DDC84' : el.classList.contains('a') ? '#D97757' : '#fff';
+  tl.set(el, { color: base }, 0);
+  tl.set(el, { color: base === '#fff' ? '#FFC94D' : base, scale: 1.05 }, Math.max(0, t));
+  tl.to(el, { scale: 1, duration: 0.2 }, Math.max(0, t) + 0.05);
+});
+
+// ---------- персонаж ----------
+const H1 = 4.4 * ST.ppu;
+const place = (px, py, h) => Object.assign(ST.at(px, py), { s: h / H1 });
+const HOME = Object.assign(place(870, 1340, 540), { rotY: -0.4, rotX: 0.04, rotZ: 0, yaw: 0, spin: 0, armL: 0.35, armR: 0.35, armLx: 0, armRx: 0, handR: 0,
+  eyeS: 1, happy: 0, mouth: 1, jump: 0, sq: 0, look: -0.6, blink: 0, beret: 1, pencil: 1, bulb: 0, lit: 0, shield: 0 });
+Object.assign(P, HOME);
+const pose = (t, o, d = 0.25, ease = 'back.out(2)') => tl.to(P, Object.assign({ duration: d, ease }, o), t);
+const rest = (t, d = 0.3) => pose(t, { armL: 0.35, armR: 0.35, armLx: 0, armRx: 0, handR: 0, eyeS: 1, happy: 0, rotZ: 0, sq: 0 }, d, 'power2.out');
+const hopP = (t, h = 0.6) => { pose(t, { sq: 0.12 }, 0.08, 'power2.in'); pose(t + 0.08, { jump: h, sq: -0.06 }, 0.2, 'power2.out'); pose(t + 0.28, { jump: 0, sq: 0 }, 0.3, 'bounce.out'); };
+const moveTo = (t, px, py, h, extra = {}, d = 0.45) => {
+  tl.to(P, Object.assign({ duration: d, ease: 'power2.inOut' }, place(px, py, h), extra), t);
+  pose(t, { jump: 0.8, sq: -0.05 }, d / 2, 'power2.out'); pose(t + d / 2, { jump: 0, sq: 0 }, d / 2, 'power2.in');
+};
+const spinP = (t, d = 0.55) => { tl.fromTo(P, { spin: 0 }, { spin: Math.PI * 2, duration: d, ease: 'power2.inOut', immediateRender: false }, t); tl.set(P, { spin: 0 }, t + d + 0.01); };
+const bubble = (txt, t, d, xy, bg = '#3DDC84') => {
+  tl.set('#hb', { textContent: txt, backgroundColor: bg, left: xy[0], top: xy[1] }, t);
+  tl.fromTo('#hb', { autoAlpha: 0, scale: 0.3, y: 20 }, { autoAlpha: 1, scale: 1, y: 0, duration: 0.25, ease: 'back.out(3)', immediateRender: false }, t);
+  tl.to('#hb', { autoAlpha: 0, scale: 0.6, duration: 0.15 }, t + d);
+};
+for (let t = 0, k = 0; t < T - 0.6; t += 1.1, k++) tl.to(P, { yaw: k % 2 ? -0.12 : 0.12, duration: 1.1, ease: 'sine.inOut' }, t);
+for (let t = 2.2; t < T - 0.8; t += 2.9) tl.to(P, { blink: 1, duration: 0.06, yoyo: true, repeat: 1 }, t);
+KW.forEach(([, t]) => { if (t > 0.05) { tl.to(P, { mouth: 1.55, duration: 0.07 }, t); tl.to(P, { mouth: 1, duration: 0.12 }, t + 0.09); } });
+
+// ---------- 0. хук: Claude «забыл», звёздочки вокруг головы ----------
+title(0, 0, EV.notbug); title('0b', EV.notbug, S[1]);
+scene(0, 0, S[1]);
+tl.set(['#u1', '#c1'], { autoAlpha: 1 }, 0);
+punch('#c1', 0.15, 1.08);
+tl.to(['#u1', '#c1'], { autoAlpha: 0, filter: 'blur(14px)', scale: 0.9, y: -30, duration: 0.35, stagger: 0.08, ease: 'power2.in' }, EV.notbug - 0.25);
+shake('#chat', EV.forgot, 8, 16); flash(EV.forgot, 0.25);
+pose(0.3, { armL: 1.0, armR: 1.0, armLx: -0.5, armRx: -0.5 }, 0.3);                     // разводит руками
+pose(EV.forgot, { eyeS: 0.75, rotZ: 0.12, armL: 0.35, armR: 0.35, armLx: 0, armRx: 0 }, 0.2);
+const head0 = ST.pointOf(P, Object.assign({}, HOME, { eyeS: 0.75, rotZ: 0.12 }), 'head');
+$$('.orb').forEach((o, k) => {
+  for (let t = EV.forgot, j = 0; t < EV.mem + 0.4; t += 0.05, j++) {
+    const a = (j * 0.32) + k * 2.094;
+    tl.set(o, { x: head0.x + Math.cos(a) * 120, y: head0.y - 40 + Math.sin(a) * 34, autoAlpha: 1, scale: 0.8 + 0.3 * Math.sin(a) }, t);
+  }
+  tl.set(o, { autoAlpha: 0 }, EV.mem + 0.45);
+});
+$$('.qm').forEach((q, k) => { popIn(q, EV.forgot + 0.15 + k * 0.12, 0.3, { scale: 2, rotation: (k - 1) * 25 }); tl.to(q, { autoAlpha: 0, duration: 0.2 }, EV.mem + 0.3); });
+tl.to('#chat', { autoAlpha: 0, duration: 0.25 }, EV.notbug);
+popIn('#mem', EV.notbug + 0.05, 0.4, { scale: 0.8 });
+tl.to('#mem span', { opacity: 0.25, duration: 0.15, yoyo: true, repeat: 5 }, EV.mem);
+pose(EV.mem, { eyeS: 1, rotZ: 0, armL: 1.4, armLx: -0.3, rotY: -0.5 }, 0.25);           // показывает на пустую память
+
+// ---------- 1. тизер: скрытая команда ----------
+title('T', S[1], S[2]); scene(1, S[1], S[2]);
+popIn('#tease', S[1], 0.4, { y: 80, scale: 0.9 });
+tl.to('#lockq', { y: -12, duration: 0.25, yoyo: true, repeat: 5, ease: 'sine.inOut' }, S[1] + 0.3);
+rest(S[1]);
+pose(EV.foryou - 0.2, { armR: 2.4, armRx: -0.3, happy: 1 }, 0.25);                      // поднимает волшебный карандаш
+pose(S[2] - 0.15, { happy: 0, armR: 0.35, armRx: 0 }, 0.2);
+
+// ---------- 2. папка проекта → CLAUDE.md ----------
+title(2, S[2], S[3]); scene(2, S[2], S[3]);
+popIn('#tree', S[2], 0.4, { x: -80, scale: 0.9 });
+moveTo(S[2] + 0.05, 860, 1360, 520, { rotY: -0.45 });
+tl.to('#mdrow', { backgroundColor: 'rgba(255,212,92,.18)', duration: 0.15 }, EV.fname - 0.1);
+punch('#mdrow', EV.fname - 0.1, 1.25);
+pose(EV.fname, { armL: 1.5, armLx: -0.3, rotY: -0.55 }, 0.25);
+tl.to('#tree', { autoAlpha: 0, x: -200, duration: 0.3, ease: 'power2.in' }, EV.folder + 0.25);
+tl.fromTo('#md', { autoAlpha: 0, scale: 0.3, x: -40, y: 300 }, { autoAlpha: 1, scale: 1, x: 0, y: 0, duration: 0.45, ease: 'back.out(1.6)', immediateRender: false }, EV.folder + 0.35);
+flash(EV.folder + 0.4, 0.2);
+
+// ---------- 3. каждую сессию: файл летит в голову, лампочка горит ----------
+title(3, S[3], S[4]); scene(3, S[3], S[4]);
+rest(S[3]);
+pose(S[3], { bulb: 1 }, 0.3);
+const bulbXY = ST.pointOf(P, Object.assign({}, HOME, place(860, 1360, 520), { rotY: -0.45, bulb: 1 }), 'bulb');
+const tabT = [EV.each - 0.15, EV.each + 0.45, EV.each + 1.05];
+tabT.forEach((t, k) => {
+  popIn('#tb' + k, t, 0.3, { x: 60 });
+  tl.fromTo('#fl' + k, { autoAlpha: 1, x: 360, y: 640, scale: 0.6, rotation: -20 }, { x: bulbXY.x, y: bulbXY.y, scale: 0.4, rotation: 20, duration: 0.35, ease: 'power2.in', immediateRender: false }, t + 0.05);
+  tl.set('#fl' + k, { autoAlpha: 0 }, t + 0.4);
+  tl.fromTo(P, { lit: 1 }, { lit: 0.25, duration: 0.45, ease: 'power2.out', immediateRender: false }, t + 0.4);
+  hopP(t + 0.4, 0.25);
+});
+typeIn('#ml1', EV.style - 0.05, 0.4); typeIn('#ml2', EV.ban - 0.05, 0.4); typeIn('#ml3', EV.cmds - 0.05, 0.4);
+tl.set(['#ml1', '#ml2', '#ml3', '#ml4', '#ml5'], { autoAlpha: 0 }, 0);
+
+// ---------- 4. написал один раз — больше не повторяешь ----------
+title(4, S[4], S[5]); scene(4, S[4], S[5]);
+typeIn('#ml4', EV.r1 - 0.1, 0.45); typeIn('#ml5', EV.r2 - 0.05, 0.45);
+punch('#ml4', EV.r1 + 0.35, 1.08); punch('#ml5', EV.r2 + 0.4, 1.08);
+popIn('#c2', EV.norep, 0.4, { x: 60 });
+pose(EV.norep, { lit: 1, happy: 1, armR: 2.4, armRx: -0.2 }, 0.25); hopP(EV.norep, 0.5);
+bubble('✓', EV.norep + 0.1, 0.8, [bulbXY.x - 120, bulbXY.y]);
+tl.to('#md', { autoAlpha: 0, x: -200, duration: 0.3, ease: 'power2.in' }, S[5] - 0.1);
+
+// ---------- 5. наш настоящий файл: ключи и базы не коммитить ----------
+title(5, S[5], S[6]); scene(5, S[5], S[6]);
+popIn('#ours', S[5], 0.4, { y: 80, scale: 0.9 });
+pose(S[5], { lit: 0, bulb: 0, happy: 0, armR: 0.35, armRx: 0 }, 0.25);
+moveTo(S[5] + 0.05, 870, 1420, 470, { rotY: -0.4 });
+['#o1', '#o2', '#o3', '#o4'].forEach((o, k) => typeIn(o, S[5] + 0.3 + k * 0.18, 0.3));
+tl.set(['#o1', '#o2', '#o3', '#o4'], { autoAlpha: 0 }, 0);
+popIn('#hl', EV.keys - 0.05, 0.3, { scale: 1.06 });
+tl.fromTo('#lock', { autoAlpha: 0, scale: 2.4 }, { autoAlpha: 1, scale: 1, duration: 0.22, ease: 'power4.in', immediateRender: false }, EV.no);
+shake('#ours', EV.no + 0.22, 6, 10);
+pose(EV.no, { shield: 1, armR: 2.3, armRx: -0.2 }, 0.25);
+
+// ---------- 6. раскрытие: /init пишет файл сам ----------
+title(6, S[6], S[7]); scene(6, S[6], S[7]);
+spinP(S[6] - 0.05);
+pose(S[6] + 0.2, { shield: 0, armR: 0.35, armRx: 0 }, 0.2);
+moveTo(S[6] + 0.25, 170, 1720, 400, { rotY: 0.5 });
+popIn('#term', S[6], 0.4, { y: 80, scale: 0.9 });
+const CMD = '/init';
+for (let k = 0; k <= CMD.length; k++) tl.set('#cmdt', { textContent: CMD.slice(0, k) }, EV.slash - 0.15 + k * 0.06);
+tl.set('#cmdt', { textContent: '' }, 0);
+tl.to('#cur', { opacity: 0, duration: 0.01, yoyo: true, repeat: 11, repeatDelay: 0.25 }, S[6]);
+const FILES = ['bot.js', 'miniapp.js', 'lib/', 'public/', 'package.json', 'README.md', 'tests…'];
+FILES.forEach((f, k) => tl.set('#scanl', { textContent: 'читаю ' + f }, EV.study - 0.1 + k * 0.12));
+tl.set('#scanl', { textContent: '' }, 0);
+tl.fromTo('#bar i', { scaleX: 0 }, { scaleX: 1, duration: FILES.length * 0.12 + 0.2, ease: 'power1.inOut', immediateRender: false }, EV.study - 0.1);
+const w0 = EV.study + FILES.length * 0.12 + 0.05;
+popIn('#md2', w0 - 0.25, 0.35, { y: 60, scale: 0.92 });
+pose(w0 - 0.2, { armR: 2.2, armRx: -0.25, rotY: 0.6 }, 0.2);
+const tipXY = ST.pointOf(P, Object.assign({}, HOME, place(170, 1720, 400), { rotY: 0.6, armR: 2.2, armRx: -0.25 }), 'tip');
+$$('#md2 .mdl').forEach((l, k) => {
+  const t = w0 + k * 0.17, r = l.getBoundingClientRect();
+  tl.to(P, { handR: k % 2 ? 0.35 : -0.35, duration: 0.06 }, t);
+  tl.fromTo('#mg' + k, { autoAlpha: 1, x: tipXY.x, y: tipXY.y, scale: 0.6 }, { x: r.left + 40, y: r.top + r.height / 2, scale: 1, duration: 0.15, ease: 'power2.in', immediateRender: false }, t);
+  tl.to('#mg' + k, { autoAlpha: 0, scale: 2, duration: 0.2 }, t + 0.15);
+  typeIn(l, t + 0.12, 0.3);
+});
+tl.set('#md2 .mdl', { autoAlpha: 0 }, 0); tl.set('.mg', { autoAlpha: 0 }, 0);
+popIn('#ok', EV.self, 0.3, { scale: 1.8 });
+pose(EV.self, { happy: 1, handR: 0, armL: 2.5 }, 0.2); hopP(EV.self, 0.5);
+flash(EV.self, 0.2);
+
+// ---------- 7. призыв ----------
+title(7, S[7]); scene(7, S[7]);
+rest(S[7]);
+moveTo(S[7], 880, 1700, 460, { rotY: -0.35 });
+popIn('#cmt', S[7], 0.45, { y: 160, scale: 0.8 });
+punch('#cmt .tx', EV.word, 1.25);
+popIn('#gift', EV.tmpl - 0.1, 0.4, { y: 60, rotation: -6 });
+popIn('#dmb', EV.tmpl + 0.3, 0.3, { x: 60 });
+tl.to('#gift', { x: 360, y: -560, scale: 0.15, rotation: 25, autoAlpha: 0, duration: 0.35, ease: 'power3.in' }, T - 1.0);
+tl.to('#dmb', { x: 300, y: -300, autoAlpha: 0, duration: 0.25, ease: 'power3.in' }, T - 0.95);
+pose(EV.word, { armR: 2.75, armRx: -0.2 }, 0.25);
+for (let k = 0; k < 8; k++) tl.to(P, { handR: k % 2 ? -0.5 : 0.5, duration: 0.12, ease: 'sine.inOut' }, EV.word + 0.25 + k * 0.12);
+
+// ---------- камера ----------
+const CAM = ['#bg', '#main', '#hostc'];
+tl.set(CAM, { transformOrigin: '540px 960px', scale: 1, x: 0, y: 0 }, 0);
+const cam = (t, sc, ox, oy, d = 0.4, ease = 'power2.inOut') => tl.to(CAM, { scale: sc, x: (1 - sc) * (ox - 540), y: (1 - sc) * (oy - 960), duration: d, ease }, t);
+cam(0, 1.06, 400, 800, EV.forgot, 'power1.inOut');
+cam(EV.forgot, 1.16, 760, 960, 0.12, 'expo.out'); cam(EV.forgot + 0.35, 1.0, 540, 960, 0.35);
+cam(S[2] + 0.1, 1.05, 330, 900, EV.fname - S[2], 'power1.inOut');
+cam(EV.fname - 0.1, 1.12, 300, 1010, 0.15, 'expo.out'); cam(EV.folder + 0.3, 1.0, 540, 960, 0.3);
+cam(EV.keys - 0.1, 1.1, 540, 760, 0.2, 'expo.out'); cam(EV.no + 0.6, 1.0, 540, 960, 0.35);
+cam(EV.slash - 0.2, 1.1, 300, 620, 0.35); cam(w0 - 0.3, 1.0, 540, 960, 0.35);
+cam(EV.self, 1.06, 540, 1000, 0.12, 'expo.out'); cam(EV.self + 0.3, 1.0, 540, 960, 0.3);
+tl.set(CAM, { scale: 1, x: 0, y: 0 }, T - 0.5);
+
+// ---------- кольцо ----------
+tl.fromTo('#wipe', { clipPath: 'circle(0px at 540px 900px)' }, { clipPath: 'circle(2300px at 540px 900px)', duration: 0.3, ease: 'power3.in', immediateRender: false }, T - 0.8);
+tl.set(['#sc7', '#tt7'], { autoAlpha: 0 }, T - 0.5);
+tl.set(['#sc0', '#tt0', '#cp0', '#chat', '#u1', '#c1'], { autoAlpha: 1, filter: 'blur(0px)', scale: 1, y: 0 }, T - 0.5);
+tl.set('#mem', { autoAlpha: 0 }, T - 0.5);
+tl.set(P, HOME, T - 0.5);
+tl.fromTo('#wipe', { clipPath: 'circle(2300px at 540px 900px)' }, { clipPath: 'circle(0px at 540px 900px)', duration: 0.35, ease: 'power3.out', immediateRender: false }, T - 0.45);
+tl.set({}, {}, T);
+</script>
+</body></html>

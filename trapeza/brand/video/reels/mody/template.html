@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="UTF-8" /><meta name="viewport" content="width=1080, height=1920" />
+<title>Память Claude</title>
+<script src="gsap.min.js"></script><script src="three.global.js"></script><script src="mascot3d.js"></script>
+<style>@font-face{font-family:Manrope;font-weight:200 800;src:url(manrope-cyrillic-wght-normal.woff2) format('woff2');unicode-range:U+0400-045F,U+2116,U+00AB,U+00BB}
+@font-face{font-family:Manrope;font-weight:200 800;src:url(manrope-latin-wght-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+2212,U+20BD}
+@font-face{font-family:Manrope;font-weight:200 800;src:url(manrope-latin-ext-wght-normal.woff2) format('woff2');unicode-range:U+0100-024F,U+20A0-20CF}
+@font-face{font-family:JBM;font-weight:400;src:url(jetbrains-mono-cyrillic-400-normal.woff2) format('woff2');unicode-range:U+0400-045F}
+@font-face{font-family:JBM;font-weight:400;src:url(jetbrains-mono-latin-400-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F}
+@font-face{font-family:JBM;font-weight:700;src:url(jetbrains-mono-latin-700-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F}
+@font-face{font-family:JBM;font-weight:700;src:url(jetbrains-mono-cyrillic-700-normal.woff2) format('woff2');unicode-range:U+0400-045F}
+html,body{margin:0;background:#0F0E0C}
+#root{position:relative;width:1080px;height:1920px;overflow:hidden;font-family:Manrope,sans-serif;background:#0F0E0C;color:#F5F2EA}
+.clip{position:absolute;inset:0}
+#bg{background:radial-gradient(ellipse 90% 60% at 50% 42%,#26201A,#0F0E0C 72%)}
+#bg::after{content:'';position:absolute;inset:0;background-image:radial-gradient(rgba(245,242,234,.07) 2px,transparent 2px);background-size:44px 44px}
+#flash{background:#fff;opacity:0;z-index:90}
+#wipe{z-index:85;background:#0F0E0C;clip-path:circle(0px at 540px 900px)}
+.scn{position:absolute;inset:0;opacity:0}
+.tt{position:absolute;left:50px;right:50px;top:150px;text-align:center;font:800 84px/1.06 Manrope;letter-spacing:-.01em;opacity:0;z-index:20}
+.tt b{color:#D97757}.tt .r{color:#FF5A4E;display:inline-block}.tt .g{color:#3DDC84}.tt small{display:block;font:700 40px Manrope;color:#B8AE9F;margin-top:12px}
+.cp{position:absolute;left:60px;right:60px;top:1450px;text-align:center;font:800 68px/1.1 Manrope;text-transform:uppercase;opacity:0;z-index:60;
+  text-shadow:0 6px 0 rgba(0,0,0,.55),0 0 30px rgba(0,0,0,.6)}
+.kw{display:inline-block;color:#fff;margin:0 .1em}
+.kw.nc{text-transform:none;font-family:JBM;font-weight:700;font-size:58px}
+.card{position:absolute;border-radius:36px;background:#1C1916;border:3px solid #3A332B;box-shadow:0 40px 80px rgba(0,0,0,.5);overflow:hidden}
+.card .hd{height:84px;display:flex;align-items:center;gap:16px;padding:0 30px;border-bottom:3px solid #2C2721;font:700 28px JBM;color:#8C8273}
+.card .hd i{width:20px;height:20px;border-radius:50%;background:#3A332B}
+.card .hd i:nth-child(1){background:#FF5F57}.card .hd i:nth-child(2){background:#FEBC2E}.card .hd i:nth-child(3){background:#28C840}
+.card .hd span{margin-left:12px}
+.st{position:absolute;display:block;filter:drop-shadow(0 14px 18px rgba(0,0,0,.45))}
+.spr{position:absolute;background-repeat:no-repeat;filter:drop-shadow(0 14px 18px rgba(0,0,0,.45))}
+/* 0: хук — сетка модов, три из них — глаза */
+#inp{left:60px;right:60px;top:420px;height:210px}
+#inp .ln{position:absolute;left:34px;top:112px;font:700 44px JBM;color:#F5F2EA;white-space:nowrap}
+#inp .ln em{font-style:normal;color:#D97757}
+#inpt{display:inline-block;overflow:hidden;vertical-align:bottom}
+.cell{position:absolute;width:180px;height:180px}
+.cell .st{left:0;top:0;width:180px}
+.cell .spr{left:-6px;top:-6px;width:192px;height:192px;opacity:0}
+.cell .ring{position:absolute;inset:-14px;border-radius:40px;border:6px solid #FF5A4E;opacity:0}
+.lk{position:absolute;left:0;top:0;font:800 46px JBM;color:#FFC94D;opacity:0;z-index:7;text-shadow:0 0 14px rgba(255,201,77,.7)}
+#rays{position:absolute;left:0;top:0;width:1080px;height:1920px;z-index:6;overflow:visible}
+#rays line{stroke:#FF5A4E;stroke-width:7;stroke-linecap:round;stroke-dasharray:16 14;opacity:0}
+/* 1: тизер и рубильник */
+#tease{left:60px;right:60px;top:430px;height:250px}
+#tease .ln{position:absolute;left:34px;top:120px;font:700 58px JBM;color:#F5F2EA;white-space:nowrap}
+#tease .ln em{font-style:normal;color:#D97757}#tease .ln u{text-decoration:none;filter:blur(11px)}
+#sw{position:absolute;left:150px;top:760px;width:260px;height:420px;border-radius:40px;background:#26221D;border:4px solid #3A332B;box-shadow:0 30px 60px rgba(0,0,0,.5);opacity:0}
+#sw .lb{position:absolute;left:0;right:0;top:26px;text-align:center;font:800 40px Manrope;color:#CFC6B8}
+#sw .slot{position:absolute;left:105px;top:110px;width:50px;height:230px;border-radius:25px;background:#0F0E0C}
+#lev{position:absolute;left:100px;top:110px;width:60px;height:115px;transform-origin:30px 115px}
+#lev i{position:absolute;left:18px;top:20px;width:24px;height:95px;border-radius:12px;background:#B8AE9F}
+#lev b{position:absolute;left:0;top:-10px;width:60px;height:60px;border-radius:50%;background:#3DDC84;box-shadow:0 0 24px #3DDC84}
+#lamp{position:absolute;left:0;right:0;bottom:22px;text-align:center;font:800 36px Manrope;color:#3DDC84}
+#swq{position:absolute;right:-50px;top:-40px;width:110px;height:110px;border-radius:50%;background:#FFD45C;color:#0F0E0C;font:800 80px/110px Manrope;text-align:center;opacity:0}
+/* 2: что такое мод */
+#cal{position:absolute;left:70px;top:430px;width:220px;height:230px;border-radius:30px;background:#F5F2EA;overflow:hidden;opacity:0;box-shadow:0 30px 60px rgba(0,0,0,.45)}
+#cal .m{height:70px;background:#FF5A4E;color:#fff;font:800 40px/70px Manrope;text-align:center}
+#cal .d{font:800 130px/160px Manrope;color:#0F0E0C;text-align:center}
+#bigpz{left:390px;top:400px;width:290px;opacity:0}
+.feat{position:absolute;left:70px;width:600px;height:140px;border-radius:30px;background:#1C1916;border:3px solid #3A332B;opacity:0;box-shadow:0 24px 50px rgba(0,0,0,.45)}
+.feat .st{left:22px;top:15px;width:110px}
+.feat b{position:absolute;left:160px;top:0;line-height:134px;font:800 54px Manrope}
+/* 3: тысячи */
+.rain{left:0;top:0;width:120px;opacity:0}
+#cnt{position:absolute;left:60px;right:60px;top:470px;text-align:center;font:800 200px/1 Manrope;color:#F5F2EA;opacity:0;letter-spacing:-.02em}
+#cnts{position:absolute;left:60px;right:60px;top:690px;text-align:center;font:700 44px Manrope;color:#B8AE9F;opacity:0}
+#fire{left:790px;top:420px;width:180px;height:180px;opacity:0}
+#quote{position:absolute;left:70px;top:820px;width:640px;padding:34px 40px;border-radius:34px;background:#F5F2EA;color:#0F0E0C;opacity:0;box-shadow:0 30px 60px rgba(0,0,0,.45)}
+#quote span{display:block;font:700 34px Manrope;color:#6B6257}#quote b{display:block;font:800 76px/1.1 Manrope;margin-top:8px;color:#D97757}
+/* 4: аудит */
+#audit{left:50px;top:430px;width:720px;height:750px}
+.dot{position:absolute;width:24px;height:24px;border-radius:50%;background:#4A4238}
+.cnt{position:absolute;left:790px;width:250px;text-align:center;opacity:0}
+.cnt .spr,.cnt .st{position:relative;display:block;margin:0 auto;width:110px;height:110px}
+.cnt b{display:block;font:800 84px/1 Manrope;margin-top:2px}.cnt span{display:block;font:700 28px/1.15 Manrope;color:#CFC6B8}
+#c111{top:420px}#c111 b{color:#FF5A4E}
+#c75{top:690px}#c75 b{color:#4EA8FF}
+/* 5: без песочницы */
+#okc{position:absolute;left:70px;top:430px;padding:16px 30px;border-radius:999px;background:#163B26;border:3px solid #3DDC84;color:#3DDC84;font:800 40px Manrope;opacity:0}
+#sbox{position:absolute;left:80px;top:560px;width:440px;height:360px;border-radius:40px;border:7px dashed #8C8273;opacity:0}
+#sbox .lb{position:absolute;left:0;right:0;top:-34px;text-align:center}
+#sbox .lb span{background:#1C1916;padding:6px 20px;border-radius:14px;font:800 38px Manrope;color:#CFC6B8}
+#sbox .x{position:absolute;left:30px;right:30px;top:-12px;height:7px;background:#FF5A4E;transform:scaleX(0);transform-origin:0 50%}
+#pzm{left:200px;top:640px;width:200px;opacity:0;z-index:4}
+.tg{position:absolute;top:1070px;width:190px;text-align:center;opacity:0}
+.tg .st{position:relative;display:block;margin:0 auto;width:150px}
+.tg b{display:block;font:800 40px Manrope;margin-top:6px}
+#links{position:absolute;left:0;top:0;width:1080px;height:1920px;overflow:visible;z-index:3}
+#links line{stroke:#FF5A4E;stroke-width:8;stroke-linecap:round;stroke-dasharray:18 14}
+/* 6: правило */
+#chk{left:60px;top:430px;width:690px;height:330px}
+.ck{position:absolute;left:36px;font:800 48px Manrope;color:#F5F2EA;opacity:0}
+.ck i{display:inline-block;width:58px;height:58px;border-radius:14px;border:5px solid #8C8273;vertical-align:-10px;margin-right:22px;box-sizing:border-box;text-align:center;font:800 44px/48px Manrope;font-style:normal;color:#0F0E0C}
+#codec{left:60px;top:800px;width:690px;height:420px}
+.cl{position:absolute;left:30px;font:700 32px JBM;color:#CFC6B8;white-space:nowrap}
+.cl em{font-style:normal;color:#D97757}
+#badl{position:absolute;left:14px;right:14px;top:232px;height:58px;border-radius:12px;background:rgba(255,90,78,.16);border:3px solid #FF5A4E;opacity:0}
+#mag{left:0;top:0;width:160px;opacity:0;z-index:5}
+/* 7: раскрытие */
+#term{left:60px;right:60px;top:420px;height:250px}
+#cmd{position:absolute;left:34px;top:116px;font:700 56px JBM;white-space:nowrap}
+#cmd .p{color:#D97757}
+#cur{display:inline-block;width:28px;height:58px;background:#D97757;vertical-align:-10px;margin-left:8px}
+.g2{position:absolute;width:130px}
+#bolt{left:250px;top:560px;width:220px;height:220px;opacity:0;z-index:8}
+#offb{position:absolute;left:80px;top:1240px;padding:18px 34px;border-radius:999px;background:#3DDC84;color:#0F0E0C;font:800 48px Manrope;opacity:0}
+/* 8: призыв */
+#cmt{position:absolute;left:90px;right:90px;top:520px;border-radius:40px;background:#F5F2EA;color:#0F0E0C;padding:36px 40px;display:flex;gap:28px;align-items:center;box-shadow:0 30px 70px rgba(0,0,0,.45)}
+#cmt .av{width:110px;height:110px;border-radius:50%;background:linear-gradient(135deg,#D97757,#FEBC2E);flex:none}
+#cmt .nm{font:700 32px Manrope;color:#8C8273}#cmt .tx{font:800 90px/1.05 Manrope;margin-top:4px}
+#gift{position:absolute;left:90px;top:820px;width:560px;height:330px;border-radius:30px;background:#1C1916;border:3px solid #D97757;opacity:0}
+#gift .st{left:30px;top:90px;width:150px}
+#gift b{position:absolute;left:200px;top:90px;font:800 52px Manrope;color:#D97757}#gift span{position:absolute;left:200px;top:160px;width:330px;font:700 34px/1.2 Manrope;color:#CFC6B8}
+#dmb{position:absolute;left:420px;top:1180px;padding:14px 30px;border-radius:999px;background:#D97757;color:#fff;font:800 40px Manrope;opacity:0}
+#hcv{position:absolute;left:0;top:0;width:1080px;height:1920px}
+#hb{position:absolute;left:0;top:0;margin:-40px 0 0 -40px;min-width:80px;height:80px;padding:0 18px;box-sizing:border-box;border-radius:40px;background:#3DDC84;color:#0F0E0C;font:800 48px/80px Manrope;text-align:center;opacity:0;box-shadow:0 10px 24px rgba(0,0,0,.4);z-index:56}
+</style></head><body>
+<div id="root" data-composition-id="mody" data-width="1080" data-height="1920" data-duration="__T__">
+  <section id="bg" class="clip" data-start="0" data-duration="__T__" data-track-index="0"></section>
+  <section id="main" class="clip" data-start="0" data-duration="__T__" data-track-index="1">
+    <div class="scn" id="sc0">
+      <div class="card" id="inp"><div class="hd"><i></i><i></i><i></i><span>claude</span></div>
+        <div class="ln"><em>&gt;</em> <span id="inpt">вот мой ключ: sk-ant-…</span></div></div>
+      <svg id="rays"><line id="ry0"/><line id="ry1"/><line id="ry2"/></svg>
+      <div id="grid"></div>
+      <b class="lk" id="lk0">s</b><b class="lk" id="lk1">k</b><b class="lk" id="lk2">-</b><b class="lk" id="lk3">a</b><b class="lk" id="lk4">n</b><b class="lk" id="lk5">t</b>
+    </div>
+    <div class="scn" id="sc1"><div class="card" id="tease"><div class="hd"><i></i><i></i><i></i><span>claude</span></div>
+      <div class="ln"><em>&gt;</em> claude --s<u>afe-mode</u></div></div></div>
+    <div id="sw"><div class="lb">МОДЫ</div><div class="slot"></div><div id="lev"><i></i><b></b></div><div id="lamp">ВКЛ</div><div id="swq">?</div></div>
+    <div class="scn" id="sc2">
+      <div id="cal"><div class="m">ОКТ</div><div class="d">1</div></div>
+      <img class="st" id="bigpz" src="st-puzzle.webp">
+      <div class="feat" id="f0" style="top:760px"><img class="st" src="st-laptop.webp"><b>интерфейс</b></div>
+      <div class="feat" id="f1" style="top:920px"><img class="st" src="st-file.webp"><b>промпты</b></div>
+      <div class="feat" id="f2" style="top:1080px"><img class="st" src="st-gear.webp"><b>команды</b></div>
+    </div>
+    <div class="scn" id="sc3">
+      <div id="rainbox"></div>
+      <div id="cnt">0</div><div id="cnts">модов за пару недель</div>
+      <div class="spr" id="fire" data-a="fire"></div>
+      <div id="quote"><span>Создатель Claude Code:</span><b>«новые скиллы»</b></div>
+    </div>
+    <div class="scn" id="sc4">
+      <div class="card" id="audit"><div class="hd"><i></i><i></i><i></i><span>проверка · 359 модов</span></div><div id="dots"></div></div>
+      <div class="cnt" id="c111"><div class="spr" id="eyes" data-a="eyes"></div><b id="n111">0</b><span>видят каждый запрос</span></div>
+      <div class="cnt" id="c75"><img class="st" src="st-globe.webp"><b id="n75">0</b><span>выходят в интернет</span></div>
+    </div>
+    <div class="scn" id="sc5">
+      <div id="okc">✓ не все вредные</div>
+      <div id="sbox"><div class="lb"><span>песочница</span></div><div class="x"></div></div>
+      <svg id="links"><line id="lnk0"/><line id="lnk1"/><line id="lnk2"/></svg>
+      <img class="st" id="pzm" src="st-puzzle.webp">
+      <div class="tg" id="tg0" style="left:70px"><img class="st" src="st-unlock.webp"><b>права</b></div>
+      <div class="tg" id="tg1" style="left:290px"><img class="st" src="st-folder.webp"><b>файлы</b></div>
+      <div class="tg" id="tg2" style="left:510px"><img class="st" src="st-key.webp"><b>ключи</b></div>
+    </div>
+    <div class="scn" id="sc6">
+      <div class="card" id="chk"><div class="hd"><i></i><i></i><i></i><span>перед установкой</span></div>
+        <div class="ck" id="ck0" style="top:120px"><i id="cb0"></i>проверенный автор</div>
+        <div class="ck" id="ck1" style="top:220px"><i id="cb1"></i>посмотрел код</div></div>
+      <div class="card" id="codec"><div class="hd"><i></i><i></i><i></i><span>мод.js · пример</span></div>
+        <div class="cl" style="top:110px"><em>export default</em> {</div>
+        <div class="cl" style="top:170px">  onPrompt(text) {</div>
+        <div class="cl" style="top:240px">    fetch(<em>'https://…'</em>, text)</div>
+        <div class="cl" style="top:310px">  }</div>
+        <div class="cl" style="top:360px">}</div>
+        <div id="badl"></div></div>
+      <img class="st" id="mag" src="st-mag.webp">
+    </div>
+    <div class="scn" id="sc7">
+      <div class="card" id="term"><div class="hd"><i></i><i></i><i></i><span>терминал</span></div>
+        <div id="cmd"><span class="p">$</span> <span id="cmdt"></span><i id="cur"></i></div></div>
+      <div id="g2box"></div>
+      <div class="spr" id="bolt" data-a="bolt"></div>
+      <div id="offb">моды выключены ✓</div>
+    </div>
+    <div class="scn" id="sc8">
+      <div id="cmt"><i class="av"></i><div><div class="nm">твой комментарий</div><div class="tx">МОДЫ</div></div></div>
+      <div id="gift"><img class="st" src="st-check.webp"><b>Чек-лист</b><span>как проверить мод за минуту</span></div>
+      <div id="dmb">→ в личку</div>
+    </div>
+  </section>
+  <section id="ttl" class="clip" data-start="0" data-duration="__T__" data-track-index="2" style="z-index:50">
+    <div class="tt" id="tt0">В Claude Code<br>появились <b>моды</b></div>
+    <div class="tt" id="tt0b">Каждый третий<br><span class="r">видит всё</span></div>
+    <div class="tt" id="ttT">А в конце —<br><b>выключатель</b></div>
+    <div class="tt" id="tt2">Мод — программа,<br>которая <b>меняет Claude</b></div>
+    <div class="tt" id="tt3">За пару недель —<br><b>тысячи</b></div>
+    <div class="tt" id="tt4">Проверили<br><b>359 модов</b></div>
+    <div class="tt" id="tt5">Это не значит,<br>что они <span class="g">вредные</span></div>
+    <div class="tt" id="tt5b">Но они<br><span class="r">без песочницы</span></div>
+    <div class="tt" id="tt6">Правило:<br><b>автор и код</b></div>
+    <div class="tt" id="tt7">Флаг <b>--safe-mode</b><small>выключает все моды</small></div>
+    <div class="tt" id="tt8">Пиши <b>«МОДЫ»</b><br>— скину чек-лист</div>
+  </section>
+  <section id="hostc" class="clip" data-start="0" data-duration="__T__" data-track-index="3" style="z-index:55"><canvas id="hcv" width="1080" height="1920"></canvas><b id="hb">!</b></section>
+  <section id="caps" class="clip" data-start="0" data-duration="__T__" data-track-index="4" style="z-index:60">
+__CAPS__
+  </section>
+  <section id="wipe" class="clip" data-start="0" data-duration="__T__" data-track-index="30"></section>
+  <section id="flash" class="clip" data-start="0" data-duration="__T__" data-track-index="31"></section>
+  <audio id="sfx" src="audio.wav" data-start="0" data-duration="__T__" data-track-index="32"></audio>
+</div>
+<script>
+// Ячейки, точки и дождь строятся до таймлайна: разметка одна и та же при каждом рендере
+const mk = (tag, cls, parent, css = {}, attrs = {}) => { const e = document.createElement(tag); if (cls) e.className = cls; Object.assign(e.style, css); Object.entries(attrs).forEach(([k, v]) => e.setAttribute(k, v)); document.getElementById(parent).appendChild(e); return e; };
+const EYES = [1, 5, 6];                                                   // «почти каждый третий»: 3 из 9
+const CELL = (k) => [90 + (k % 3) * 210, 690 + Math.floor(k / 3) * 210];
+for (let k = 0; k < 9; k++) {
+  const [x, y] = CELL(k), c = mk('div', 'cell', 'grid', { left: x + 'px', top: y + 'px' }, { id: 'ce' + k });
+  const im = document.createElement('img'); im.className = 'st'; im.src = 'st-puzzle.webp'; im.id = 'pz' + k; c.appendChild(im);
+  if (EYES.includes(k)) {
+    const r = document.createElement('div'); r.className = 'ring'; r.id = 'rg' + k; c.appendChild(r);
+    const s = document.createElement('div'); s.className = 'spr'; s.id = 'ey' + k; s.dataset.a = 'eye'; c.appendChild(s);
+  }
+}
+for (let k = 0; k < 16; k++) mk('img', 'st rain', 'rainbox', {}, { src: 'st-puzzle.webp', id: 'rn' + k });
+// 359 точек; какие загорятся — по фиксированной перестановке, чтобы «111» и «75» были рассыпаны по сетке
+const ORDER = [...Array(359).keys()].sort((a, b) => ((a * 7919) % 359) - ((b * 7919) % 359) || a - b);
+for (let i = 0; i < 359; i++) mk('div', 'dot', 'dots', { left: 30 + (i % 20) * 33 + 'px', top: 110 + Math.floor(i / 20) * 33 + 'px' }, { id: 'd' + i });
+for (let k = 0; k < 9; k++) mk('img', 'st g2', 'g2box', { left: 70 + (k % 3) * 150 + 'px', top: 740 + Math.floor(k / 3) * 150 + 'px' }, { src: 'st-puzzle.webp', id: 'gp' + k });
+
+// анимированные стикеры: кадр считается от времени таймлайна, а не от часов браузера — рендер повторяем
+const ANIM = { eye: [72, 3.024], eyes: [49, 2.058], bolt: [72, 3.024], fire: [48, 2.016] };
+const SPR = [...document.querySelectorAll('.spr')].map((el) => {
+  const w = parseFloat(getComputedStyle(el).width); el.style.backgroundImage = `url(an-${el.dataset.a}.webp)`; el.style.backgroundSize = `${8 * w}px auto`;
+  return { el, w, n: ANIM[el.dataset.a][0], d: ANIM[el.dataset.a][1] };
+});
+const frames = (t) => SPR.forEach((s) => { const f = Math.floor(((t / s.d) % 1) * s.n); s.el.style.backgroundPosition = `${-(f % 8) * s.w}px ${-Math.floor(f / 8) * s.w}px`; });
+
+const tl = gsap.timeline({ paused: true, onUpdate: () => { frames(tl.time()); ST.render(); } });
+window.__timelines = window.__timelines || {};
+window.__timelines['mody'] = tl;
+const ST = makeStage(document.getElementById('hcv'), { flat: true, dist: 15 }), P = ST.add();
+const T = __T__, EV = __EV__, CAPT = __CAPT__, KW = __KW__, S = EV.s, $$ = (s) => [...document.querySelectorAll(s)];
+const popIn = (s, t, d = 0.4, from = {}) => tl.fromTo(s, Object.assign({ autoAlpha: 0, scale: 0.7, y: 24 }, from), { autoAlpha: 1, scale: 1, x: 0, y: 0, rotation: 0, duration: d, ease: 'back.out(2)', immediateRender: false }, t);
+const blurIn = (s, t, d = 0.35) => tl.fromTo(s, { autoAlpha: 0, scale: 1.1, filter: 'blur(16px)' }, { autoAlpha: 1, scale: 1, filter: 'blur(0px)', duration: d, ease: 'expo.out', immediateRender: false }, t);
+const blurOut = (s, t, d = 0.2) => tl.to(s, { autoAlpha: 0, scale: 0.92, filter: 'blur(16px)', duration: d, ease: 'power2.in' }, t);
+const flash = (t, a = 0.4) => tl.fromTo('#flash', { opacity: a }, { opacity: 0, duration: 0.18, ease: 'none', immediateRender: false }, t);
+const punch = (s, t, k = 1.12) => tl.fromTo(s, { scale: k }, { scale: 1, duration: 0.3, ease: 'back.out(3)', immediateRender: false }, t);
+const shake = (s, t, n = 6, a = 14) => { for (let k = 0; k < n; k++) tl.to(s, { x: (k % 2 ? -1 : 1) * a * (1 - k / n), duration: 0.04, ease: 'none' }, t + k * 0.04); tl.to(s, { x: 0, duration: 0.04 }, t + n * 0.04); };
+const scene = (k, a, b) => { tl.set('#sc' + k, { autoAlpha: 1 }, a); if (b !== undefined) tl.set('#sc' + k, { autoAlpha: 0 }, b); };
+const title = (k, a, b) => { if (a === 0) tl.set('#tt' + k, { autoAlpha: 1 }, 0); else blurIn('#tt' + k, a); if (b !== undefined) blurOut('#tt' + k, b - 0.2); };
+const count = (s, t, to, d, fmt = (v) => String(Math.round(v))) => { const o = { v: 0 }; tl.set(s, { textContent: fmt(0) }, 0); tl.to(o, { v: to, duration: d, ease: 'power2.out', onUpdate: () => { document.querySelector(s).textContent = fmt(o.v); } }, t); };
+const line = (id, a, b) => { const l = document.getElementById(id); l.setAttribute('x1', a[0]); l.setAttribute('y1', a[1]); l.setAttribute('x2', b[0]); l.setAttribute('y2', b[1]); return Math.hypot(b[0] - a[0], b[1] - a[1]); };
+
+// ---------- субтитры-караоке ----------
+CAPT.forEach(([a, b], k) => {
+  if (a === 0) tl.set('#cp' + k, { autoAlpha: 1 }, 0);
+  else tl.fromTo('#cp' + k, { autoAlpha: 0, scale: 0.85, y: 20 }, { autoAlpha: 1, scale: 1, y: 0, duration: 0.14, ease: 'back.out(2.5)', immediateRender: false }, a);
+  tl.set('#cp' + k, { autoAlpha: 0 }, b);
+});
+KW.forEach(([id, t]) => {
+  const el = document.getElementById(id);
+  const base = el.classList.contains('r') ? '#FF5A4E' : el.classList.contains('g') ? '#3DDC84' : el.classList.contains('a') ? '#D97757' : '#fff';
+  tl.set(el, { color: base }, 0);
+  tl.set(el, { color: base === '#fff' ? '#FFC94D' : base, scale: 1.05 }, Math.max(0, t));
+  tl.to(el, { scale: 1, duration: 0.2 }, Math.max(0, t) + 0.05);
+});
+
+// ---------- персонаж ----------
+const H1 = 4.4 * ST.ppu;
+const place = (px, py, h) => Object.assign(ST.at(px, py), { s: h / H1 });
+const HOME = Object.assign(place(900, 1390, 470), { rotY: -0.4, rotX: 0.04, rotZ: 0, yaw: 0, spin: 0, armL: 0.35, armR: 0.35, armLx: 0, armRx: 0, handR: 0,
+  eyeS: 1, happy: 0, mouth: 1, jump: 0, sq: 0, look: -0.6, blink: 0, beret: 1, pencil: 1, hood: 0, glasses: 0, laptop: 0, doc: 0, shield: 0,
+  det: 0, mag: 0, guard: 0, flash: 0, beam: 0, bulb: 0, lit: 0 });
+Object.assign(P, HOME);
+const pose = (t, o, d = 0.25, ease = 'back.out(2)') => tl.to(P, Object.assign({ duration: d, ease }, o), t);
+const outfit = (t, o) => tl.to(P, Object.assign({ duration: 0.3, ease: 'back.out(2.5)' }, o), t);
+const rest = (t, d = 0.3) => pose(t, { armL: 0.35, armR: 0.35, armLx: 0, armRx: 0, handR: 0, eyeS: 1, happy: 0, rotZ: 0, sq: 0 }, d, 'power2.out');
+const hopP = (t, h = 0.6) => { pose(t, { sq: 0.12 }, 0.08, 'power2.in'); pose(t + 0.08, { jump: h, sq: -0.06 }, 0.2, 'power2.out'); pose(t + 0.28, { jump: 0, sq: 0 }, 0.3, 'bounce.out'); };
+const spinP = (t, d = 0.55) => { tl.fromTo(P, { spin: 0 }, { spin: Math.PI * 2, duration: d, ease: 'power2.inOut', immediateRender: false }, t); tl.set(P, { spin: 0 }, t + d + 0.01); };
+const bubble = (txt, t, d, xy, bg = '#3DDC84', color = '#0F0E0C') => {
+  tl.set('#hb', { textContent: txt, backgroundColor: bg, color, left: xy[0], top: xy[1] }, t);
+  tl.fromTo('#hb', { autoAlpha: 0, scale: 0.3, y: 20 }, { autoAlpha: 1, scale: 1, y: 0, duration: 0.25, ease: 'back.out(3)', immediateRender: false }, t);
+  tl.to('#hb', { autoAlpha: 0, scale: 0.6, duration: 0.15 }, t + d);
+};
+const HEAD = [900 - 130, 1390 - 520];
+for (let t = 0, k = 0; t < T - 0.6; t += 1.1, k++) tl.to(P, { yaw: k % 2 ? -0.12 : 0.12, duration: 1.1, ease: 'sine.inOut' }, t);
+for (let t = 2.2; t < T - 0.8; t += 2.9) tl.to(P, { blink: 1, duration: 0.06, yoyo: true, repeat: 1 }, t);
+KW.forEach(([, t]) => { if (t > 0.05) { tl.to(P, { mouth: 1.55, duration: 0.07 }, t); tl.to(P, { mouth: 1, duration: 0.12 }, t + 0.09); } });
+
+// ---------- 0. хук: моды-пазлы, три превращаются в глаза, ключ утекает к ним ----------
+title(0, 0, EV.sees); title('0b', EV.sees, S[1]);
+scene(0, 0, S[1]);
+for (let k = 0; k < 9; k++) tl.to('#pz' + k, { y: -10, duration: 0.6, yoyo: true, repeat: Math.ceil(S[1] / 1.2), ease: 'sine.inOut' }, k * 0.11);
+tl.fromTo('#inpt', { width: 0 }, { width: 600, duration: Math.max(0.6, EV.third - 0.2), ease: 'steps(22)', immediateRender: false }, 0);
+tl.set('#inpt', { width: 0 }, 0);
+for (let k = 0; k < 9; k++) punch('#ce' + k, EV.mods + k * 0.03, 1.15);
+EYES.forEach((k, j) => {
+  tl.fromTo('#rg' + k, { autoAlpha: 0, scale: 1.3 }, { autoAlpha: 1, scale: 1, duration: 0.25, ease: 'back.out(3)', immediateRender: false }, EV.third + j * 0.12);
+  tl.to('#pz' + k, { scaleX: 0, duration: 0.12, ease: 'power2.in' }, EV.sees - 0.1 + j * 0.06);
+  tl.fromTo('#ey' + k, { autoAlpha: 1, scaleX: 0 }, { scaleX: 1, duration: 0.18, ease: 'back.out(2)', immediateRender: false }, EV.sees + 0.02 + j * 0.06);
+  const [x, y] = CELL(k), L = line('ry' + j, [300 + j * 160, 600], [x + 90, y + 20]);
+  tl.fromTo('#ry' + j, { opacity: 0, strokeDashoffset: L }, { opacity: 0.9, strokeDashoffset: 0, duration: 0.3, ease: 'power2.out', immediateRender: false }, EV.sees + 0.1 + j * 0.06);
+  tl.to('#ry' + j, { strokeDashoffset: -120, duration: 1.6, ease: 'none' }, EV.sees + 0.4);
+});
+tl.to('#grid .cell:not(#ce1):not(#ce5):not(#ce6)', { opacity: 0.35, duration: 0.3 }, EV.sees);
+flash(EV.sees, 0.35); shake('#grid', EV.sees, 8, 14);
+$$('.lk').forEach((l, k) => {
+  const [x, y] = CELL(EYES[k % 3]), t = EV.write - 0.25 + k * 0.1;
+  tl.fromTo(l, { autoAlpha: 1, x: 470 + k * 30, y: 520, scale: 1 }, { x: x + 70, y: y + 60, scale: 0.4, duration: 0.4, ease: 'power2.in', immediateRender: false }, t);
+  tl.set(l, { autoAlpha: 0 }, t + 0.4);
+});
+tl.to('#inpt', { opacity: 0.3, duration: 0.3 }, EV.write + 0.3);
+pose(EV.sees, { eyeS: 1.35, armL: 2.5, armR: 2.5, armLx: -0.4, armRx: -0.4, rotZ: -0.05, look: -0.9 }, 0.2);   // испугался: руки вверх
+hopP(EV.sees, 0.4);
+bubble('!', EV.sees + 0.1, 0.9, HEAD, '#FF5A4E', '#fff');
+
+// ---------- 1. тизер: размытый флаг и рубильник ----------
+title('T', S[1], S[2]); scene(1, S[1], S[2]);
+popIn('#tease', S[1], 0.4, { y: 80, scale: 0.9 });
+popIn('#sw', S[1] + 0.2, 0.4, { y: 120, scale: 0.8 });
+tl.set('#lev', { rotation: -28 }, 0);
+popIn('#swq', EV.flag, 0.3, { scale: 2 });
+tl.to('#swq', { y: -12, duration: 0.25, yoyo: true, repeat: 5, ease: 'sine.inOut' }, EV.flag + 0.3);
+for (let k = 0; k < 4; k++) tl.to('#lev', { rotation: k % 2 ? -28 : -8, duration: 0.1, ease: 'sine.inOut' }, EV.off1 + k * 0.1);
+rest(S[1]);
+pose(S[1] + 0.2, { armL: 1.45, armLx: -0.3, rotY: -0.55, look: -0.8 }, 0.25);            // показывает на рубильник
+tl.to('#sw', { autoAlpha: 0, y: 120, duration: 0.25, ease: 'power2.in' }, S[2] - 0.1);
+tl.set('#swq', { autoAlpha: 0 }, S[2]);
+
+// ---------- 2. что такое мод: дата, пазл, три карточки ----------
+title(2, S[2], S[3]); scene(2, S[2], S[3]);
+rest(S[2]);
+popIn('#bigpz', S[2], 0.45, { scale: 0.3, rotation: -30 });
+tl.to('#bigpz', { rotation: 6, duration: 0.5, yoyo: true, repeat: Math.max(1, Math.floor((S[3] - S[2] - 1) / 0.5)), ease: 'sine.inOut' }, S[2] + 0.5);
+popIn('#cal', EV.oct - 0.05, 0.4, { rotation: -12, y: -60 });
+['ui', 'pr', 'cmd'].forEach((e, k) => {
+  // карточки вылетают из пазла заранее, тусклыми, и вспыхивают каждая на своём слове
+  const t0 = Math.min(EV.prog + 0.3 + k * 0.35, EV[e] - 0.1);
+  tl.fromTo('#f' + k, { autoAlpha: 0, x: 380, y: 520 - 160 * k, scale: 0.3 }, { autoAlpha: 0.35, x: 0, y: 0, scale: 0.94, duration: 0.4, ease: 'back.out(1.6)', immediateRender: false }, t0);
+  punch('#bigpz', t0, 1.12);
+  tl.to('#f' + k, { autoAlpha: 1, scale: 1, borderColor: '#D97757', duration: 0.2, ease: 'back.out(3)' }, EV[e] - 0.05);
+});
+pose(EV.ui, { armL: 1.4, armLx: -0.3, rotY: -0.55 }, 0.25);
+pose(EV.cmd + 0.3, { happy: 1 }, 0.2);
+
+// ---------- 3. тысячи модов за пару недель ----------
+title(3, S[3], S[4]); scene(3, S[3], S[4]);
+rest(S[3]);
+$$('.rain').forEach((r, k) => {
+  const x = 40 + ((k * 397) % 920), t = EV.weeks - 0.2 + (k % 8) * 0.12 + Math.floor(k / 8) * 0.55;
+  tl.fromTo(r, { autoAlpha: 1, x, y: -160, rotation: (k % 2 ? -1 : 1) * 40 }, { y: 2050 + (k % 3) * 120, rotation: (k % 2 ? 1 : -1) * 160, duration: 1.4 + (k % 4) * 0.15, ease: 'power1.in', immediateRender: false }, t);
+});
+tl.set('.rain', { autoAlpha: 0 }, 0);
+tl.set('#cnt', { autoAlpha: 1 }, S[3]); tl.set('#cnts', { autoAlpha: 1 }, S[3] + 0.2);
+count('#cnt', S[3] + 0.1, 1000, EV.k - S[3] + 0.1, (v) => v >= 999.5 ? '1 000+' : Math.round(v).toLocaleString('ru-RU'));
+punch('#cnt', EV.k + 0.2, 1.2);
+popIn('#fire', EV.k, 0.35, { scale: 0.2 });
+popIn('#quote', EV.author - 0.05, 0.45, { y: 90, rotation: -4 });
+punch('#quote b', EV.skills, 1.15);
+pose(EV.k, { happy: 1, armR: 2.4, armRx: -0.2 }, 0.25); hopP(EV.k, 0.5);
+pose(EV.author, { happy: 0, armR: 0.35, armRx: 0, armL: 1.4, armLx: -0.3 }, 0.25);
+
+// ---------- 4. аудит: 359 точек, 111 — видят запросы, 75 — ходят в сеть ----------
+title(4, S[4], S[5]); scene(4, S[4], S[5]);
+rest(S[4]);
+outfit(S[4], { beret: 0, det: 1, mag: 1, look: -0.7 });
+tl.to(P, Object.assign({ duration: 0.4, ease: 'power2.inOut' }, place(925, 1440, 400)), S[4]);
+tl.to(P, Object.assign({ duration: 0.4, ease: 'power2.inOut' }, place(900, 1390, 470)), S[5]);
+popIn('#audit', S[4], 0.4, { y: 80, scale: 0.92 });
+tl.fromTo('.dot', { scale: 0 }, { scale: 1, duration: 0.25, ease: 'back.out(3)', stagger: { each: 0.0018, from: 'start' }, immediateRender: false }, EV.n359 - 0.1);
+tl.set('.dot', { scale: 0 }, 0);
+const RED = ORDER.slice(0, 111).map((i) => '#d' + i), BLUE = ORDER.slice(111, 186).map((i) => '#d' + i);
+tl.to(RED, { backgroundColor: '#FF5A4E', boxShadow: '0 0 12px #FF5A4E', duration: 0.12, stagger: 0.007 }, EV.n111 - 0.05);
+tl.to(BLUE, { backgroundColor: '#4EA8FF', boxShadow: '0 0 12px #4EA8FF', duration: 0.12, stagger: 0.008 }, EV.n75 - 0.05);
+popIn('#c111', EV.n111 - 0.1, 0.4, { x: 60 }); count('#n111', EV.n111, 111, 0.9);
+popIn('#c75', EV.n75 - 0.1, 0.4, { x: 60 }); count('#n75', EV.n75, 75, 0.7);
+punch('#c111', EV.req, 1.12); punch('#c75', EV.net, 1.12);
+pose(EV.n111, { armR: 1.9, armRx: -0.5, rotY: -0.6 }, 0.25);                               // наводит лупу
+pose(EV.n75, { eyeS: 1.2 }, 0.2);
+
+// ---------- 5. не вредные, но без песочницы ----------
+title(5, S[5], EV.nosb - 0.05); title('5b', EV.nosb - 0.05, S[6]); scene(5, S[5], S[6]);
+rest(S[5]);
+outfit(S[5], { det: 0, mag: 0, guard: 1, flash: 1 });
+popIn('#okc', EV.harm - 0.1, 0.35, { x: -60 });
+popIn('#sbox', S[5] + 0.1, 0.4, { scale: 0.85 });
+popIn('#pzm', S[5] + 0.25, 0.4, { scale: 0.4 });
+tl.to('#pzm', { y: -14, duration: 0.4, yoyo: true, repeat: Math.max(1, Math.floor((EV.nosb - S[5] - 0.9) / 0.4)), ease: 'sine.inOut' }, S[5] + 0.7);
+tl.to('#okc', { autoAlpha: 0, duration: 0.2 }, EV.nosb);
+tl.to('#sbox .x', { scaleX: 1, duration: 0.25, ease: 'power2.out' }, EV.nosb + 0.05);
+tl.to('#sbox', { borderColor: '#FF5A4E', duration: 0.15 }, EV.nosb);
+tl.to('#sbox', { opacity: 0.25, duration: 0.3 }, EV.nosb + 0.35);
+tl.to('#pzm', { x: 60, y: 170, scale: 0.85, duration: 0.4, ease: 'power2.inOut' }, EV.nosb + 0.25);
+shake('#sbox', EV.nosb, 6, 10);
+const PZ = [300 + 60, 740 + 170];
+['rights', 'files', 'keys'].forEach((e, k) => {
+  const tx = 70 + k * 220 + 95, L = line('lnk' + k, PZ, [tx, 1110]);
+  popIn('#tg' + k, EV[e] - 0.05, 0.35, { scale: 0.4 });
+  tl.fromTo('#lnk' + k, { opacity: 0, strokeDashoffset: L }, { opacity: 0.9, strokeDashoffset: 0, duration: 0.25, immediateRender: false }, EV[e] - 0.05);
+  tl.to('#lnk' + k, { strokeDashoffset: -96, duration: 1.2, ease: 'none' }, EV[e] + 0.2);
+});
+tl.set('#links line', { opacity: 0 }, 0);
+pose(EV.nosb, { armR: 2.15, armRx: -0.25, beam: 1, rotY: -0.6, look: -0.8 }, 0.2);          // светит фонарём на мод
+pose(S[6] - 0.3, { beam: 0, armR: 0.35, armRx: 0 }, 0.2);
+
+// ---------- 6. правило: автор и код ----------
+title(6, S[6], S[7]); scene(6, S[6], S[7]);
+outfit(S[6] - 0.05, { guard: 0, flash: 0, beam: 0, beret: 1, glasses: 1 });
+popIn('#chk', S[6], 0.4, { y: 80, scale: 0.92 });
+popIn('#codec', S[6] + 0.15, 0.4, { y: 80, scale: 0.92 });
+tl.set(['#ck0', '#ck1'], { autoAlpha: 1 }, S[6] + 0.3);
+['auth', 'code'].forEach((e, k) => {
+  tl.to('#cb' + k, { backgroundColor: '#3DDC84', borderColor: '#3DDC84', duration: 0.1 }, EV[e]); tl.set('#cb' + k, { textContent: '✓' }, EV[e]);
+  punch('#ck' + k, EV[e], 1.1);
+});
+tl.set(['#cb0', '#cb1'], { textContent: '' }, 0);
+tl.fromTo('#mag', { autoAlpha: 1, x: 120, y: 880 }, { x: 420, y: 960, duration: 0.6, ease: 'power1.inOut', immediateRender: false }, EV.code - 0.4);
+tl.to('#mag', { x: 470, y: 1000, scale: 1.15, duration: 0.25, ease: 'back.out(2)' }, EV.code + 0.2);
+popIn('#badl', EV.code + 0.25, 0.25, { scale: 1.05 });
+tl.set('#mag', { autoAlpha: 0 }, 0);
+pose(EV.auth, { armL: 1.5, armLx: -0.3, rotY: -0.55 }, 0.25);
+pose(EV.code + 0.3, { eyeS: 1.25 }, 0.2);
+bubble('?!', EV.code + 0.35, 0.8, HEAD, '#FF5A4E', '#fff');
+
+// ---------- 7. раскрытие: --safe-mode гасит все моды ----------
+title(7, S[7], S[8]); scene(7, S[7], S[8]);
+spinP(S[7] - 0.05);
+outfit(S[7] + 0.2, { glasses: 0, eyeS: 1, armL: 0.35, armLx: 0 });
+popIn('#term', S[7], 0.4, { y: 80, scale: 0.9 });
+tl.fromTo('.g2', { autoAlpha: 0, scale: 0.4 }, { autoAlpha: 1, scale: 1, duration: 0.3, ease: 'back.out(2)', stagger: 0.04, immediateRender: false }, S[7] + 0.15);
+tl.set('#sw', { left: 520, top: 740, y: 0 }, S[7]);
+popIn('#sw', S[7] + 0.3, 0.4, { y: 120, scale: 0.8 });
+const CMD = 'claude --safe-mode';
+for (let k = 0; k <= CMD.length; k++) tl.set('#cmdt', { textContent: CMD.slice(0, k) }, EV.safe - 0.5 + k * 0.045);
+tl.set('#cmdt', { textContent: '' }, 0);
+tl.to('#cur', { opacity: 0, duration: 0.01, yoyo: true, repeat: Math.floor((S[8] - S[7]) / 0.26), repeatDelay: 0.25 }, S[7]);
+popIn('#bolt', EV.off - 0.35, 0.25, { scale: 0.3 }); tl.to('#bolt', { autoAlpha: 0, duration: 0.2 }, EV.off + 0.4);
+tl.to('#lev', { rotation: 28, duration: 0.18, ease: 'back.out(3)' }, EV.off - 0.15);
+tl.to('#lev b', { backgroundColor: '#FF5A4E', boxShadow: '0 0 24px #FF5A4E', duration: 0.1 }, EV.off - 0.1);
+tl.set('#lamp', { textContent: 'ВЫКЛ', color: '#FF5A4E' }, EV.off - 0.1);
+tl.set('#lamp', { textContent: 'ВКЛ', color: '#3DDC84' }, 0); tl.set('#lev b', { backgroundColor: '#3DDC84', boxShadow: '0 0 24px #3DDC84' }, 0);
+tl.to('.g2', { filter: 'grayscale(1) brightness(.45)', scale: 0.85, duration: 0.15, stagger: 0.05 }, EV.off - 0.05);
+tl.set('.g2', { filter: 'grayscale(0) brightness(1)' }, 0);
+flash(EV.off - 0.1, 0.3);
+popIn('#offb', EV.off + 0.3, 0.35, { scale: 1.6 });
+pose(EV.off + 0.2, { happy: 1, armR: 2.5, armRx: -0.2, armL: 2.5, armLx: -0.2 }, 0.25); hopP(EV.off + 0.2, 0.55);
+tl.to('#sw', { autoAlpha: 0, duration: 0.2 }, S[8] - 0.05);
+
+// ---------- 8. призыв ----------
+title(8, S[8]); scene(8, S[8]);
+rest(S[8]);
+popIn('#cmt', S[8], 0.45, { y: 160, scale: 0.8 });
+punch('#cmt .tx', EV.word, 1.25);
+popIn('#gift', EV.list - 0.1, 0.4, { y: 60, rotation: -6 });
+popIn('#dmb', EV.list + 0.3, 0.3, { x: 60 });
+tl.to('#gift', { x: 360, y: -560, scale: 0.15, rotation: 25, autoAlpha: 0, duration: 0.35, ease: 'power3.in' }, T - 1.0);
+tl.to('#dmb', { x: 300, y: -300, autoAlpha: 0, duration: 0.25, ease: 'power3.in' }, T - 0.95);
+pose(EV.word, { armR: 2.75, armRx: -0.2 }, 0.25);
+tl.to('#cmt', { y: -10, duration: 0.6, yoyo: true, repeat: Math.floor((T - 1.2 - S[8]) / 0.6), ease: 'sine.inOut' }, S[8] + 0.5);
+tl.to('#gift', { rotation: 2, duration: 0.7, yoyo: true, repeat: Math.max(1, Math.floor((T - 1.2 - EV.list) / 0.7)), ease: 'sine.inOut' }, EV.list + 0.4);
+for (let k = 0; k < Math.floor((T - 1.4 - EV.word) / 0.12); k++) tl.to(P, { handR: k % 2 ? -0.5 : 0.5, duration: 0.12, ease: 'sine.inOut' }, EV.word + 0.25 + k * 0.12);
+tl.to(P, { handR: 0, duration: 0.1 }, T - 1.1);
+
+// ---------- камера ----------
+const CAM = ['#bg', '#main', '#hostc'];
+tl.set(CAM, { transformOrigin: '540px 960px', scale: 1, x: 0, y: 0 }, 0);
+const cam = (t, sc, ox, oy, d = 0.4, ease = 'power2.inOut') => tl.to(CAM, { scale: sc, x: (1 - sc) * (ox - 540), y: (1 - sc) * (oy - 960), duration: d, ease }, t);
+cam(0, 1.05, 400, 900, EV.sees, 'power1.inOut');
+cam(EV.sees, 1.14, 400, 920, 0.12, 'expo.out'); cam(EV.write + 0.4, 1.0, 540, 960, 0.35);
+cam(EV.n111 - 0.1, 1.08, 420, 760, 0.3); cam(S[5] - 0.2, 1.0, 540, 960, 0.3);
+cam(EV.nosb, 1.1, 320, 900, 0.15, 'expo.out'); cam(EV.keys + 0.4, 1.0, 540, 960, 0.3);
+cam(EV.code + 0.2, 1.1, 400, 1040, 0.2, 'expo.out'); cam(S[7] - 0.1, 1.0, 540, 960, 0.3);
+cam(EV.off - 0.1, 1.08, 400, 900, 0.12, 'expo.out'); cam(EV.off + 0.4, 1.0, 540, 960, 0.3);
+tl.set(CAM, { scale: 1, x: 0, y: 0 }, T - 0.5);
+
+// ---------- кольцо ----------
+tl.fromTo('#wipe', { clipPath: 'circle(0px at 540px 900px)' }, { clipPath: 'circle(2300px at 540px 900px)', duration: 0.3, ease: 'power3.in', immediateRender: false }, T - 0.8);
+tl.set(['#sc8', '#tt8'], { autoAlpha: 0 }, T - 0.5);
+tl.set(['#sc0', '#tt0', '#cp0'], { autoAlpha: 1, filter: 'blur(0px)', scale: 1, y: 0 }, T - 0.5);
+tl.set(['#ey1', '#ey5', '#ey6', '.ring', '.lk'], { autoAlpha: 0 }, T - 0.5);
+tl.set('#rays line', { opacity: 0 }, T - 0.5);
+tl.set('#grid .st', { scaleX: 1, y: 0 }, T - 0.5); tl.set('#grid .cell', { opacity: 1 }, T - 0.5);
+tl.set('#inpt', { width: 0, opacity: 1 }, T - 0.5);
+tl.set(P, HOME, T - 0.5);
+tl.fromTo('#wipe', { clipPath: 'circle(2300px at 540px 900px)' }, { clipPath: 'circle(0px at 540px 900px)', duration: 0.35, ease: 'power3.out', immediateRender: false }, T - 0.45);
+tl.set({}, {}, T);
+</script>
+</body></html>
