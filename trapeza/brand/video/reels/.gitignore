@@ -3,3 +3,7 @@ out/
 events.json
 *.wav
 *.mp4
+work-*/
+.*hf-transaction*/
+.hyperframes/
+render.log

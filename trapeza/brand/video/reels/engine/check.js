@@ -13,7 +13,8 @@ const { chromium } = require('playwright');
   const errs = [];
   page.on('pageerror', (e) => errs.push('pageerror: ' + e.message));
   page.on('console', (m) => { if (m.type() === 'error') errs.push('console: ' + m.text()); });
-  page.on('requestfailed', (r) => errs.push('нет файла: ' + r.url()));
+  // ERR_ABORTED — браузер сам обрывает загрузку звука после метаданных, файл при этом на месте
+  page.on('requestfailed', (r) => { if (!/ERR_ABORTED/.test(r.failure()?.errorText || '')) errs.push('нет файла: ' + r.url()); });
   await page.goto('file://' + file);
   await page.waitForTimeout(800);
   const res = await page.evaluate(() => {

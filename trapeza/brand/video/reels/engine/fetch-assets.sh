@@ -37,6 +37,8 @@ declare -A ST=(
   [puzzle]=1f9e9 [lock]=1f512 [unlock]=1f513 [key]=1f511 [cam]=1f4f9 [shield]=1f6e1-fe0f [mag]=1f50d
   [siren]=1f6a8 [box]=1f4e6 [laptop]=1f4bb [globe]=1f310 [folder]=1f4c1 [warn]=26a0-fe0f [check]=2705
   [gear]=2699-fe0f [file]=1f4c4 [stop]=1f6d1 [plug]=1f50c [robot]=1f916 [toolbox]=1f9f0
+  [broom]=1f9f9 [alarm]=23f0 [nobell]=1f515 [rocket]=1f680 [coffee]=2615 [shawarma]=1f959 [money]=1f4b8
+  [receipt]=1f9fe [phone]=1f4f1 [memo]=1f4dd [mic]=1f399-fe0f [bell]=1f514 [party]=1f389
 )
 npm pack -q @lobehub/fluent-emoji-3d@1.1.0 >/dev/null
 for n in "${!ST[@]}"; do tar xzf lobehub-fluent-emoji-3d-1.1.0.tgz "package/assets/${ST[$n]}.webp" && cp "package/assets/${ST[$n]}.webp" "$DEST/st-$n.webp"; done
