@@ -1036,6 +1036,13 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(bdbQ.quota(uq.id).used === wasUsed + 1,
       'документ прошлым числом всё равно съедает бесплатный лимит',
       `${wasUsed} → ${bdbQ.quota(uq.id).used}`);
+    // Удаление лимит не возвращает: файл остался у человека, документ выписан.
+    const gone = bdbQ.saveDoc(uq.id, { orgId: orgQ.id, cpId: limCp, type: 'sch',
+      number: 'УД-1', seq: 90002, date: '2025-03-10', total: 100, payload: {} });
+    const before = bdbQ.quota(uq.id).used;
+    bdbQ.deleteDoc(uq.id, gone);
+    ok(bdbQ.quota(uq.id).used === before,
+      'удалённый документ из бесплатного лимита не выпадает', `${before} → ${bdbQ.quota(uq.id).used}`);
   }
 
   require('./lib/billing').grantDays(require('./lib/bot-db').getOrCreateUser(LIM.id).id, 30);

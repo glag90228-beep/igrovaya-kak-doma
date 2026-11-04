@@ -187,6 +187,13 @@ function migrate() {
       used_at TEXT    NOT NULL,
       PRIMARY KEY (user_id, token)
     );
+    -- Выписанные и потом удалённые документы: только когда выписаны. Нужны
+    -- бесплатному лимиту — см. docsThisMonth.
+    CREATE TABLE IF NOT EXISTS docs_removed (
+      user_id    INTEGER NOT NULL,
+      created_at TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS docs_removed_user ON docs_removed(user_id, created_at);
   `);
 
   /*
@@ -3268,7 +3275,8 @@ function debtByDoc(userId, ids) {
 function deleteDoc(userId, id) {
   // Проводки убираем первыми: deleteOpsOfDoc сверяется с документом, и после
   // его удаления она уже ничего не найдёт.
-  if (!getDoc(userId, id)) return false;
+  const doc = getDoc(userId, id);
+  if (!doc) return false;
   deleteOpsOfDoc(userId, id);
   dropChequeWait(userId, { docId: id });
   /*
@@ -3279,7 +3287,9 @@ function deleteDoc(userId, id) {
    */
   db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0, paid_with = 0 WHERE paid_with = ? AND user_id = ?")
     .run(id, userId);
-  return db.prepare('DELETE FROM documents WHERE id = ? AND user_id = ?').run(id, userId).changes > 0;
+  const gone = db.prepare('DELETE FROM documents WHERE id = ? AND user_id = ?').run(id, userId).changes > 0;
+  if (gone && doc.created_at) db.prepare('INSERT INTO docs_removed(user_id, created_at) VALUES (?, ?)').run(userId, doc.created_at);
+  return gone;
 }
 
 // ---------- шаблоны позиций ----------
@@ -3386,11 +3396,15 @@ function docsThisMonth(userId) {
    * первого числа в час ночи, попадал бы в квоту прошлого месяца — с этого
    * когда-то и начался уход на поле date.
    */
+  /*
+   * Удалённые тоже в счёт. Файл документа остаётся у человека в переписке,
+   * и считай мы только живые строки, лимит снимался бы так: выписал пять,
+   * убрал их из журнала — и снова пять бесплатных.
+   */
   const month = todayISO().slice(0, 7);
-  return db.prepare(
-    "SELECT COUNT(*) AS n FROM documents WHERE user_id = ?"
-    + " AND substr(datetime(created_at, '+3 hours'),1,7) = ?",
-  ).get(userId, month).n;
+  const inMonth = " AND substr(datetime(created_at, '+3 hours'),1,7) = ?";
+  return db.prepare(`SELECT COUNT(*) AS n FROM documents WHERE user_id = ?${inMonth}`).get(userId, month).n
+    + db.prepare(`SELECT COUNT(*) AS n FROM docs_removed WHERE user_id = ?${inMonth}`).get(userId, month).n;
 }
 
 /** @returns {{allowed:boolean, used:number, left:number, limit:number, paid:boolean}} */
