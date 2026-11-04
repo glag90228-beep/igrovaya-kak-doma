@@ -616,6 +616,17 @@ async function startSmeta(env = {}) {
     await new Promise((r) => srvW.close(r));
   }
 
+  {
+    // Внутренний адрес в любой записи IPv6: раньше «::ffff:7f00:1» (это 127.0.0.1)
+    // проходил как почтовый сервер, ловилась только запись с точками.
+    const { isPrivateIp } = require('./lib/mail');
+    for (const a of ['::ffff:7f00:1', '::ffff:a9fe:a9fe', '0:0:0:0:0:ffff:7f00:1', '::127.0.0.1',
+      '64:ff9b::7f00:1', 'fec0::1', '2002:7f00:1::', 'fe80::1%eth0', '192.0.0.8', '198.18.0.1']) {
+      ok(isPrivateIp(a), `адрес ${a} считается внутренним`);
+    }
+    ok(!isPrivateIp('2a00:1450:4010:c05::6d') && !isPrivateIp('77.88.21.158'), 'внешние адреса почтовых серверов проходят');
+  }
+
   console.log(bad ? `\nне прошло: ${bad}` : '\nвсе атаки отражены ✅');
   process.exit(bad ? 1 : 0);
 })().catch((e) => {

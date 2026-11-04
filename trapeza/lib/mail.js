@@ -31,6 +31,18 @@ const tls = require('node:tls');
 const dns = require('node:dns');
 const crypto = require('node:crypto');
 
+/*
+ * IPv6 проверяем от обратного: наружу ведёт только глобальный unicast
+ * 2000::/3, и из него вычитаем диапазоны со вшитым IPv4 (6to4, Teredo) и
+ * документационный. Список «плохих» префиксов обходился записью: v4 в обёртке
+ * ловился только с точками, а «::ffff:7f00:1» — тот же 127.0.0.1 — проходил.
+ * BlockList понимает любую запись адреса, поэтому сравнивать строки не нужно.
+ */
+const GLOBAL6 = new net.BlockList();
+GLOBAL6.addSubnet('2000::', 3, 'ipv6');
+const SPECIAL6 = new net.BlockList();
+for (const [p, l] of [['2002::', 16], ['2001::', 32], ['2001:db8::', 32]]) SPECIAL6.addSubnet(p, l, 'ipv6');
+
 /** Внутренний ли адрес: петля, частные сети, link-local, свои IPv6. */
 function isPrivateIp(ip) {
   const v = String(ip || '');
@@ -41,13 +53,17 @@ function isPrivateIp(ip) {
       || (a === 192 && b === 168)
       || (a === 169 && b === 254)
       || (a === 100 && b >= 64 && b <= 127)   // CGNAT
+      || (a === 192 && b === 0)               // 192.0.0.0/24, служебные
+      || (a === 198 && (b === 18 || b === 19)) // 198.18.0.0/15, стенды
       || a >= 224;                            // multicast и выше
   }
   const low = v.toLowerCase().replace(/^\[|\]$/g, '');
-  if (low === '::1' || low === '::' || low.startsWith('fe80:')) return true;
-  if (/^f[cd][0-9a-f]{2}:/.test(low)) return true;          // уникальные локальные
-  const m = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(low);      // IPv4 в обёртке IPv6
-  return m ? isPrivateIp(m[1]) : false;
+  if (!net.isIPv6(low)) return true;          // не адрес — пускать некуда
+  try {
+    return !GLOBAL6.check(low, 'ipv6') || SPECIAL6.check(low, 'ipv6');
+  } catch {
+    return true;                              // зона «%eth0» и прочее непонятное — внутрь
+  }
 }
 
 /**

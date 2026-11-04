@@ -410,14 +410,26 @@ function splitParty(text) {
  * над «Дебет» и «Кредит». Эти две колонки раскладываем на счёт, ИНН и
  * название плательщика и получателя.
  */
+const XLSX_MAX_COLS = 60;
+const XLSX_MAX_ROWS = 20000;
+
 async function parseXlsx(buf, own = new Set()) {
+  /*
+   * Потолки до разбора, а не после. ExcelJS распаковывает архив целиком и
+   * без предела, а размер листа берёт из самой дальней ячейки: файл на 6 КБ
+   * с одной ячейкой в колонке XFD раздувался в гигабайты и ронял процесс —
+   * бот и приложение у всех. readZip проверяет архив со своими пределами
+   * распаковки; у выписки колонок десятки и строк тысячи, не больше.
+   */
+  require('./zip').readZip(buf);
   const ExcelJS = require('exceljs');
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buf);
   for (const ws of wb.worksheets) {
-    const width = Math.max(ws.columnCount || 0, 1);
+    const width = Math.min(Math.max(ws.columnCount || 0, 1), XLSX_MAX_COLS);
     const grid = [];
-    ws.eachRow({ includeEmpty: true }, (row, n) => {
+    ws.eachRow((row, n) => {
+      if (n > XLSX_MAX_ROWS) return;
       const cells = [];
       for (let i = 1; i <= width; i += 1) cells.push(cellText(row.getCell(i).value).trim());
       grid[n - 1] = cells;
@@ -488,10 +500,31 @@ const ofxTag = (block, tag) => {
   return m ? m[1].trim() : '';
 };
 
+/**
+ * Блоки <STMTTRN>…</STMTTRN> — проходом по indexOf, а не ленивой регуляркой.
+ * Та на каждом открытом теге без закрывающего сканировала файл до конца:
+ * файл из одних «<STMTTRN>» на 700 КБ держал процесс 20 секунд, на 10 МБ — часы.
+ */
+function ofxBlocks(text) {
+  const low = text.toLowerCase();
+  const out = [];
+  let at = low.indexOf('<stmttrn>');
+  while (at >= 0 && out.length < 50000) {
+    const end = low.indexOf('</stmttrn>', at);
+    if (end < 0) break;                     // закрывающих дальше нет — и блоков нет
+    const next = low.indexOf('<stmttrn>', at + 9);
+    // Открытие без закрытия перед следующим открытием — битый блок, пропускаем.
+    if (next >= 0 && next < end) { at = next; continue; }
+    out.push(text.slice(at, end + 10));
+    at = low.indexOf('<stmttrn>', end);
+  }
+  return out;
+}
+
 /** @returns {Array<object>} операции из OFX/QFX */
 function parseOfx(text) {
   const out = [];
-  for (const block of String(text).match(/<STMTTRN>[\s\S]*?<\/STMTTRN>/gi) || []) {
+  for (const block of ofxBlocks(String(text))) {
     const date = parseDate(ofxTag(block, 'DTPOSTED'));
     const amount = parseMoney(ofxTag(block, 'TRNAMT'));
     if (!date || !amount) continue;

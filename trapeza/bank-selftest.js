@@ -684,6 +684,24 @@ console.log('\n── книга учёта: форма ФНС ──');
       ok(pdf.unsupported === 'pdf' && !pdf.rows.length, 'PDF честно не разбирается, и видно почему');
       const xls = await bank.parseStatementFile(Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]));
       ok(xls.unsupported === 'xls', 'старый .xls тоже назван, а не выдан за пустую выписку');
+
+      /*
+       * Бомбы от проверки безопасности. Одна ячейка в колонке XFD — файл на
+       * 6 КБ разворачивался в 8 ГБ памяти и ронял процесс у всех. Файл из
+       * одних «<STMTTRN>» без закрытия держал ленивую регулярку десятки секунд.
+       */
+      const xb2 = new (require('exceljs').Workbook)();
+      xb2.addWorksheet('a').getCell('XFD8000').value = 'x';
+      const bomb = Buffer.from(await xb2.xlsx.writeBuffer());
+      const m0 = process.memoryUsage().rss; let t0 = Date.now();
+      const gotB = await bank.parseStatementFile(bomb).catch((e) => ({ rows: [], err: e.message }));
+      ok(Date.now() - t0 < 3000 && process.memoryUsage().rss - m0 < 200e6 && !gotB.rows.length,
+        'xlsx с ячейкой в колонке XFD не раздувает память', `${Date.now() - t0} мс`);
+      t0 = Date.now();
+      const ofx = bank.parseOfx('<STMTTRN>'.repeat(100000));
+      ok(Date.now() - t0 < 1000 && ofx.length === 0, 'OFX из одних открывающих тегов разбирается мгновенно', `${Date.now() - t0} мс`);
+      ok(bank.parseOfx('<STMTTRN><DTPOSTED>20261102<TRNAMT>154000<NAME>Вектор</STMTTRN>').length === 1,
+        'а настоящий блок OFX по-прежнему читается');
     }
 
     console.log(bad === 0 ? '\n✅ Разбор выписок: все проверки прошли\n' : `\n❌ Ошибок: ${bad}\n`);

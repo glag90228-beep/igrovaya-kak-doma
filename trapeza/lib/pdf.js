@@ -92,6 +92,10 @@ async function renderOnce(html, opts) {
   const b = await getBrowser();
   const page = await b.newPage();
   try {
+    // Документу из сети ничего не нужно: картинки подписи и печати — data:.
+    // Любой другой запрос из пользовательского текста (file://, внутренний
+    // адрес) обрываем, чтобы рендер не стал окном в сервер.
+    await page.route('**/*', (r) => (/^(data|about):/.test(r.request().url()) ? r.continue() : r.abort()));
     await page.setContent(html, { waitUntil: 'load' });
     return await page.pdf({
       format: 'A4',
