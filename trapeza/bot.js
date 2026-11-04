@@ -4656,6 +4656,9 @@ async function handleVoice(tg, chatId, user, msg) {
   const seconds = Number(src.duration) || 0;
   const got = await speech.transcribe(buf, seconds);
   if (!got.ok) {
+    // Как в приложении: подробность ответа провайдера — в журнал владельцу,
+    // иначе 404 от неверной модели не отличить от кончившейся квоты.
+    if (got.detail) office.record({ kind: 'speech', where: 'бот', error: got.detail, userId: user.id });
     await tg.sendMessage(chatId, `Не разобрал запись: ${esc(got.error)}`, mainMenu());
     return;
   }

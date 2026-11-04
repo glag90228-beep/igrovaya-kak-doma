@@ -4932,6 +4932,28 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
         if (v === undefined) delete process.env[name]; else process.env[name] = v;
       }
     }
+    {
+      /*
+       * Модель для голоса. AI_MODEL — модель основного ИИ, и на сервере там
+       * стоит Claude. Голос брал её же и слал в Gemini чужое имя — Gemini
+       * отвечал 404, а человек видел «не разобрал запись» на любой фразе.
+       */
+      const keep = { m: process.env.AI_MODEL, s: process.env.SPEECH_MODEL, k: process.env.GEMINI_API_KEY, f: global.fetch };
+      const urls = [];
+      global.fetch = async (url) => { urls.push(String(url)); return { ok: false, status: 404, headers: new Map(), text: async () => '', json: async () => ({}) }; };
+      process.env.GEMINI_API_KEY = 'AIza-test'; delete process.env.SPEECH_MODEL;
+      process.env.AI_MODEL = 'claude-haiku-4-5-20251001';
+      await sp.viaGemini(Buffer.from('OggS'), 'oggopus').catch(() => {});
+      ok(urls.length && !/claude/.test(urls[0]) && /models\/gemini/.test(urls[0]),
+        'основной ИИ — Claude, а голос всё равно идёт в модель Gemini', urls[0]);
+      urls.length = 0; process.env.AI_MODEL = 'gemini-3.6-pro';
+      await sp.viaGemini(Buffer.from('OggS'), 'oggopus').catch(() => {});
+      ok(/models\/gemini-3\.6-pro:/.test(urls[0] || ''), 'основной ИИ — Gemini: голос берёт ту же модель', urls[0]);
+      global.fetch = keep.f;
+      for (const [name, v] of [['AI_MODEL', keep.m], ['SPEECH_MODEL', keep.s], ['GEMINI_API_KEY', keep.k]]) {
+        if (v === undefined) delete process.env[name]; else process.env[name] = v;
+      }
+    }
 
     /*
      * Ответ асинхронного распознавания — склеенные подряд объекты, а не

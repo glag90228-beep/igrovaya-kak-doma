@@ -305,7 +305,11 @@ async function viaGemini(buffer, kind) {
   if (!apiKey) throw new Error('GEMINI_API_KEY не задан');
   const baseUrl = (process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com')
     .replace(/\/+$/, '');
-  const model = process.env.SPEECH_MODEL || process.env.AI_MODEL || 'gemini-3.6-flash';
+  // AI_MODEL — модель основного ИИ, а он бывает Claude, Grok или YandexGPT.
+  // Чужое имя Gemini не примет и ответит 404, поэтому берём его, только если
+  // это и правда модель Gemini.
+  const main = String(process.env.AI_MODEL || '').trim();
+  const model = process.env.SPEECH_MODEL || (/^gemini/i.test(main) ? main : 'gemini-3.6-flash');
 
   // Тип берём по сигнатуре файла, а не по словам отправителя: mime_type в
   // Telegram задаёт он сам, а у видеокружка его нет вовсе.
