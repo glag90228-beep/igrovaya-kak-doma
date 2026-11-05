@@ -4,7 +4,7 @@
 // контрагенты и операции. Всё строго изолировано по user_id — пользователь
 // никогда не видит чужие данные. Надстройка над существующей базой (db.js).
 
-const { db, computeBalance } = require('../db');
+const { db, computeBalance, priorOps } = require('../db');
 const { round2, formatRub } = require('./money');
 
 // «Сегодня» — по Москве, а не по поясу сервера (пояснение в lib/period.js).
@@ -1026,7 +1026,13 @@ function periodBalance(userId, cpId, from, to, orgId = null) {
   // Начальное сальдо — пары, по тем же соображениям, что и в balanceOf.
   const cp = { ...cp0, ...openingFor(cpId, org) };
 
-  let opening = Number(cp.opening_balance) || 0;
+  /*
+   * Операции до даты сальдо уже внутри него (см. priorOps в db.js). Чтобы
+   * акт за любой период сходился с карточкой, отсчёт ведём от остатка ДО
+   * них: сальдо минус то, что в него вошло. Дальше всё как раньше.
+   */
+  const prior = priorOps(cp, all).reduce((s, o) => round2(s + round2(o.credit) - round2(o.debit)), 0);
+  let opening = round2((Number(cp.opening_balance) || 0) - prior);
   const inside = [];
   for (const op of all) {
     const d = String(op.date || '');
@@ -2519,6 +2525,19 @@ function closeDocsFromBank(userId, deals) {
   return { docs, deals: done, leads, partial };
 }
 
+/**
+ * Что из журнала вошло в долг на начало: столько операций до даты сальдо
+ * больше не прибавляются к долгу. Показываем это человеку при сохранении —
+ * иначе пропавший из итога октябрь выглядел бы потерей денег.
+ * @returns {null|{count:number, date:string}}
+ */
+function openingCovers(userId, cpId, orgId = null) {
+  const b = balanceOf(userId, cpId, orgId);
+  if (!b) return null;
+  const n = priorOps(b.cp, b.ops).length;
+  return n ? { count: n, date: b.cp.opening_date } : null;
+}
+
 /** Сальдо по контрагенту (переиспользует computeBalance из db.js) */
 function balanceOf(userId, cpId, orgId = null) {
   const cp = getCp(userId, cpId);
@@ -3426,7 +3445,7 @@ module.exports = {
   saveAiMessage, listAiMessages, getAiDataset,
   createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, orgOfDoc, claimButton, getDefaultOrg, setDefaultOrg,
   createCp, updateCp, listCps, getCp, openAdvances, updateDocPayload,
-  addOp, listOps, deleteLastOp, deleteOp, balanceOf, debtors, debtBreakdown, periodBalance, cpForPeriod,
+  addOp, listOps, deleteLastOp, deleteOp, balanceOf, openingCovers, debtors, debtBreakdown, periodBalance, cpForPeriod,
   knownBankKeys, importBankRows,
   DEBT_DOCS, basisOf, makesDebt, basisMismatch, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
   debtByDoc, rebuildDebt, restoreDebt,

@@ -898,7 +898,11 @@ const api = {
     if (id) {
       if (!bdb.getCp(user.id, id)) return { error: 'Клиент не найден.' };
       bdb.updateCp(user.id, id, fields);
-      return { cp: cpBrief(user.id, bdb.getCp(user.id, id)) };
+      const cov = 'opening_balance' in fields || 'opening_date' in fields ? bdb.openingCovers(user.id, id) : null;
+      return {
+        cp: cpBrief(user.id, bdb.getCp(user.id, id)),
+        note: cov ? `Операции журнала до ${cov.date.split('-').reverse().join('.')} (${cov.count}) уже входят в долг на начало — второй раз они не считаются.` : '',
+      };
     }
     // Дата начала расчётов — сегодня только если её не назвали. Раньше она
     // ставилась всегда, поверх присланной: клиент с долгом с прошлого года

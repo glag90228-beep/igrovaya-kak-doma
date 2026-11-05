@@ -169,8 +169,31 @@ function listMenu(onlyActive = true) {
  */
 const kop = (v) => Math.round((Number(v) || 0) * 100) / 100;
 
+/**
+ * Операции, которые уже сидят внутри начального сальдо.
+ *
+ * «Долг на начало 34 600 на 01.11» — это итог всего, что было до 1 ноября.
+ * Если октябрьские накладные и оплаты уже в журнале, прибавлять их к этим
+ * 34 600 ещё раз нельзя: долг удваивался. Так и случилось у владельца —
+ * в ноябре он вписал долг на начало, а октябрь в журнале уже был.
+ *
+ * Только при ненулевом сальдо: дата начала у нового клиента ставится
+ * сегодняшняя сама, и счёт, выписанный задним числом, иначе выпал бы из долга.
+ */
+function priorOps(cp, ops) {
+  const od = String(cp.opening_date || '');
+  if (!od || !kop(cp.opening_balance)) return [];
+  return ops.filter((o) => String(o.date || '') < od);
+}
+
 function computeBalance(cp, ops) {
-  let running = kop(cp.opening_balance);
+  /*
+   * Бегущий остаток стартует не с сальдо, а с того, что было до операций,
+   * вошедших в него: тогда строки до даты сальдо показывают свой настоящий
+   * остаток, а итог равен сальдо плюс всё, что после его даты.
+   */
+  const prior = priorOps(cp, ops).reduce((s, o) => kop(s + kop(o.credit) - kop(o.debit)), 0);
+  let running = kop(kop(cp.opening_balance) - prior);
   const rows = ops.map((op) => {
     running = kop(running + kop(op.credit) - kop(op.debit));
     return { ...op, balance: running };
@@ -181,6 +204,6 @@ function computeBalance(cp, ops) {
 }
 
 module.exports = {
-  db, getSetting, setSetting, allSettings, listMenu, computeBalance,
+  db, getSetting, setSetting, allSettings, listMenu, computeBalance, priorOps,
   DB_FILE, DATA_DIR: path.dirname(DB_FILE),
 };

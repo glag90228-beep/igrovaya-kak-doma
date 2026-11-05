@@ -1043,6 +1043,32 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     bdbQ.deleteDoc(uq.id, gone);
     ok(bdbQ.quota(uq.id).used === before,
       'удалённый документ из бесплатного лимита не выпадает', `${before} → ${bdbQ.quota(uq.id).used}`);
+
+    /*
+     * Пример владельца. Октябрь: предоплата 148 000, отгрузили на 182 600 —
+     * на конец месяца долг 34 600. В ноябре вписал «Долг на начало 34 600 на
+     * 01.11», а октябрь уже в журнале — долг считался дважды. Ноябрь:
+     * предоплата 154 000, две отгрузки на 110 000 → аванс 9 400.
+     */
+    const dc = bdbQ.createCp(uq.id, { name: 'ООО Пример долга', kind: 'customer' });
+    bdbQ.addOp(uq.id, dc, { date: '2026-10-05', kind: 'Оплата', debit: 148000 });
+    bdbQ.addOp(uq.id, dc, { date: '2026-10-20', kind: 'Реализация', credit: 182600 });
+    ok(bdbQ.balanceOf(uq.id, dc).closing === 34600, 'конец октября: долг 34 600', bdbQ.balanceOf(uq.id, dc).closing);
+    bdbQ.updateCp(uq.id, dc, { opening_balance: 34600, opening_date: '2026-11-01' });
+    ok(bdbQ.balanceOf(uq.id, dc).closing === 34600, 'долг на начало ноября не удвоил октябрь', bdbQ.balanceOf(uq.id, dc).closing);
+    ok((bdbQ.openingCovers(uq.id, dc) || {}).count === 2, 'и человеку сказано, что две октябрьские записи вошли в сальдо');
+    bdbQ.addOp(uq.id, dc, { date: '2026-11-02', kind: 'Оплата', debit: 154000 });
+    bdbQ.addOp(uq.id, dc, { date: '2026-11-03', kind: 'Реализация', credit: 60000 });
+    bdbQ.addOp(uq.id, dc, { date: '2026-11-04', kind: 'Реализация', credit: 50000 });
+    ok(bdbQ.balanceOf(uq.id, dc).closing === -9400, 'ноябрь: аванс клиента 9 400', bdbQ.balanceOf(uq.id, dc).closing);
+    const nov = bdbQ.periodBalance(uq.id, dc, '2026-11-01', '2026-11-30');
+    ok(nov.opening === 34600 && nov.closing === -9400, 'акт сверки за ноябрь: на начало 34 600, на конец −9 400', `${nov.opening} → ${nov.closing}`);
+    const oct = bdbQ.periodBalance(uq.id, dc, '2026-10-01', '2026-10-31');
+    ok(oct.opening === 0 && oct.closing === 34600, 'и за октябрь акт по-прежнему сходится: 0 → 34 600', `${oct.opening} → ${oct.closing}`);
+    // Новый клиент с нулём «с сегодня»: счёт задним числом в долг попадает.
+    const nc = bdbQ.createCp(uq.id, { name: 'ООО Задним числом', kind: 'customer', opening_date: '2026-11-05' });
+    bdbQ.addOp(uq.id, nc, { date: '2026-10-28', kind: 'Реализация', credit: 5000 });
+    ok(bdbQ.balanceOf(uq.id, nc).closing === 5000, 'нулевое сальдо не прячет документы задним числом', bdbQ.balanceOf(uq.id, nc).closing);
   }
 
   require('./lib/billing').grantDays(require('./lib/bot-db').getOrCreateUser(LIM.id).id, 30);

@@ -2426,7 +2426,7 @@ screens.cp = async function cpScreen({ id, name }) {
     address: field('address', 'Адрес', cp.address),
     opening_balance: field('opening_balance', 'Долг на начало, ₽', cp.opening_balance || '', {
       inputmode: 'decimal',
-      hint: 'Сколько числилось за клиентом, когда начали вести расчёты. 0 — если с нуля',
+      hint: 'Сколько числилось за клиентом на эту дату. Всё, что в журнале раньше неё, считается уже вошедшим в эту сумму',
     }),
     opening_date: field('opening_date', 'На какую дату', cp.opening_date || '', {
       type: 'date', hint: 'С неё начинается акт сверки',
@@ -2588,8 +2588,9 @@ screens.cp = async function cpScreen({ id, name }) {
     clearErrors(f);
     const v = values(f);
     if (!v.name) { showError(f.name, 'Без названия документ не подписать'); return; }
+    let saved;
     try {
-      await api('POST', '/api/cp', {
+      saved = await api('POST', '/api/cp', {
         id: id || 0, ...v, kind: kindSel.value,
         opening_balance: f.opening_balance.input.value.trim(),
         opening_date: f.opening_date.input.value,
@@ -2598,7 +2599,7 @@ screens.cp = async function cpScreen({ id, name }) {
       if (fieldFail(e, f)) return;
       throw e;
     }
-    toast(id ? 'Сохранил' : 'Клиент добавлен');
+    toast(saved && saved.note ? saved.note : (id ? 'Сохранил' : 'Клиент добавлен'));
     haptic('medium');
     back();
   };
