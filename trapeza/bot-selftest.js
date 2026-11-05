@@ -705,6 +705,15 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(madeP && vP.price === 180000 && vP.venue === 'банкетный зал «Север»',
       'договор выписан после двух ответов, сумма — из фразы', JSON.stringify(vP));
 
+    // Договор на середине вопросов, а человек просит счёт: счёт и выходит, а не договор.
+    await say(`договор ${cpC.name.replace(/[«»"]/g, '')} на 90000`);
+    ok(/Дата мероприятия/.test(last()), 'договор начат и ждёт дату', last());
+    const dogsMid = bdbC.listDocs(uidC, 500).filter((d) => d.type === 'dog').length;
+    await say(`счёт ${cpC.name.replace(/[«»"]/g, '')} на 45000`);
+    const stMid = bdbC.getState(uidC);
+    ok(bdbC.listDocs(uidC, 500).filter((d) => d.type === 'dog').length === dogsMid && !(stMid && /^dogx:/.test(stMid.state)),
+      'просьба о счёте бросает недоделанный договор, а не уходит в него ответом', stMid && stMid.state);
+
     // Заменили шаблон — старый договор остаётся прежним.
     mcM.saveTemplate(uidC, 0, { title: 'Совсем другой', body: 'ДРУГОЙ ТЕКСТ {{them}}', fields: [] });
     ok(bdbC.getDoc(uidC, newDog.id).payload.body.includes('{{venue}}'), 'замена шаблона не трогает выписанные договоры');

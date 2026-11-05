@@ -6012,6 +6012,21 @@ async function handleMessage(tg, msg) {
   if (state.state.startsWith('pp:')) { await handlePpText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('av:')) { await handleAvansText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('ksf:')) { await handleKsfText(tg, chatId, user, state, text); return; }
+  /*
+   * Договор на середине вопросов — а человек уже просит счёт.
+   *
+   * «Счёт Вектору на 45 000» уходило ответом на «Дата мероприятия», и вместо
+   * счёта выходил ещё один договор; выбраться было нельзя, пока не ответишь
+   * на все поля. Как у позиций документа (см. items: выше): новая просьба
+   * бросает недоделанный договор и выполняется сама.
+   */
+  if (/^dogx?:/.test(state.state) && looksLikeRequest(text, bdb.listCps(user.id))) {
+    bdb.clearState(user.id);
+    if (!(await handleFreeText(tg, chatId, user, text))) {
+      await tg.sendMessage(chatId, 'Договор отложил. Не разобрал просьбу — выберите документ в меню.', mainMenu());
+    }
+    return;
+  }
   if (await contractFlow().onText(tg, chatId, user, state, text)) return;
   if (state.state.startsWith('note:')) {
     const cpId = Number(state.state.slice(5));
