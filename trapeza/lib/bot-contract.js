@@ -208,17 +208,28 @@ module.exports = function contractFlow(h) {
 
   // ── выписка договора по шаблону ──
 
-  async function startTpl(tg, chatId, user, cp, tpl) {
+  /**
+   * Сумму, названную во фразе («договор Вектору на 150 000»), ставим сразу и
+   * больше её не спрашиваем: человек уже сказал её. Если денежное поле в
+   * шаблоне одно — оно и есть сумма договора; если их несколько, гадать,
+   * какое из них, нельзя, и спрашиваем все как раньше.
+   */
+  async function startTpl(tg, chatId, user, cp, tpl, { amount = 0 } = {}) {
     if (!(await requireQuota(tg, chatId, user))) return;
     const org = await requireOrg(tg, chatId, user); if (!org) return;
-    const ask = mc.askFields(tpl);
-    bdb.setState(user.id, `dogx:${cp.id}`, { tplId: tpl.id, i: 0, values: {} });
+    const all = mc.askFields(tpl);
+    const values = {};
+    const money = all.filter((f) => f.type === 'money');
+    if (Number(amount) > 0 && money.length === 1) values[money[0].key] = Number(amount);
+    const ask = all.filter((f) => !(f.key in values));
+    bdb.setState(user.id, `dogx:${cp.id}`, { tplId: tpl.id, i: 0, values, done: Object.keys(values) });
     await tg.sendMessage(chatId,
       `Договор с <b>${esc(cp.name)}</b> по вашему шаблону «${esc(tpl.title)}». `
+      + (Object.keys(values).length ? `Сумма — ${esc(Number(amount).toLocaleString('ru-RU'))} ₽. ` : '')
       + (ask.length ? `Реквизиты подставлю сам — ${ask.length === 1 ? 'нужен один ответ' : `нужно ответов: ${ask.length}`}.`
-        : 'Спрашивать нечего — выписываю.'),
+        : 'Спрашивать больше нечего — выписываю.'),
       keyboard([[{ text: '📄 Лучше типовой', data: `d.dogstd:${cp.id}` }]]));
-    if (!ask.length) { await finishTpl(tg, chatId, user, cp.id, tpl.id, {}); return; }
+    if (!ask.length) { await finishTpl(tg, chatId, user, cp.id, tpl.id, values); return; }
     await askField(tg, chatId, ask[0]);
   }
 
@@ -247,7 +258,9 @@ module.exports = function contractFlow(h) {
     const d = state.data || {};
     const tpl = mc.getTemplateById(user.id, d.tplId);
     if (!tpl) { bdb.clearState(user.id); await tg.sendMessage(chatId, 'Шаблон пропал — загрузите его заново.', mainMenu()); return; }
-    const ask = mc.askFields(tpl);
+    // Поля, уже заполненные из фразы, в очередь вопросов не входят.
+    const done = new Set(d.done || []);
+    const ask = mc.askFields(tpl).filter((f) => !done.has(f.key));
     const f = ask[d.i];
     const t = String(text).trim();
     if (f && t !== '-') {

@@ -90,7 +90,11 @@ const REVIEW_PROMPT = (owner) => `Разбери договор для влад�
 
 async function callGemini(parts, maxTokens) {
   const baseUrl = (process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
-  const model = process.env.MYCON_MODEL || process.env.VISION_MODEL || process.env.AI_MODEL || ai.MODEL_DEFAULT;
+  // VISION_MODEL и AI_MODEL бывают чужими (Claude через OpenRouter, YandexGPT):
+  // их имя Gemini не примет и ответит 404 — договор тогда не разбирался вовсе.
+  // Берём из них только модель Gemini; MYCON_MODEL задают ровно под это.
+  const gem = [process.env.VISION_MODEL, process.env.AI_MODEL].map((v) => String(v || '').trim()).find((v) => /^gemini/i.test(v));
+  const model = process.env.MYCON_MODEL || gem || ai.MODEL_DEFAULT;
   const res = await fetchRetry(`${baseUrl}/v1beta/models/${model}:generateContent`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },

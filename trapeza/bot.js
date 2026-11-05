@@ -984,7 +984,7 @@ async function startItems(tg, chatId, user, type, cpId, extra = {}, when = '') {
    */
   if (!ITEM_DOCS[type]) {
     if (type === 'pp') return startPp(tg, chatId, user, cpId);
-    if (type === 'dog') return startDogovor(tg, chatId, user, cpId);
+    if (type === 'dog') return startDogovor(tg, chatId, user, cpId, { amount: extra.amount });
     await tg.sendMessage(chatId, 'Такой документ из позиций не собирается — выберите его в меню.', mainMenu());
     return undefined;
   }
@@ -3666,6 +3666,11 @@ async function handleFreeText(tg, chatId, user, text, opts = {}) {
     // Дата документа, если её назвали («вчерашним числом»). Будущая — повод показать сводку, а не выписывать сразу.
     const docDate = period.isoDay(intent.date);
     const futureDoc = Boolean(docDate) && docDate > todayISO();
+    // У договора нет позиций: сумма из фразы — это сумма договора, её шаблон и подставит.
+    if (intent.docType === 'dog') {
+      extra.amount = docService.cleanItems(intent.items || [])
+        .reduce((a, it) => a + (Number(it.qty) || 1) * (Number(it.price) || 0), 0);
+    }
     await startItems(tg, chatId, user, intent.docType, found.cp.id, extra, docDate);
     const items = docService.cleanItems(intent.items || []);
     if (items.length) {
@@ -5164,11 +5169,11 @@ const DOG_STEPS = [
   { key: 'term', q: 'До какой даты действует? Напр. «31.12.2026» или «-» = до конца года:', opt: true },
 ];
 
-async function startDogovor(tg, chatId, user, cpId, { typical = false } = {}) {
+async function startDogovor(tg, chatId, user, cpId, { typical = false, amount = 0 } = {}) {
   // Есть свой договор (для этого клиента или для всех) — выписываем по нему.
   const tpl = typical ? null : require('./lib/my-contract').getTemplate(user.id, cpId);
   const cpT = tpl ? bdb.getCp(user.id, cpId) : null;
-  if (tpl && cpT) { await contractFlow().startTpl(tg, chatId, user, cpT, tpl); return; }
+  if (tpl && cpT) { await contractFlow().startTpl(tg, chatId, user, cpT, tpl, { amount }); return; }
   if (!(await requireQuota(tg, chatId, user))) return;
   const org = await requireOrg(tg, chatId, user); if (!org) return;
   const cp = bdb.getCp(user.id, cpId); if (!cp) return;

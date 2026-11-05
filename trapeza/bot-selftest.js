@@ -688,6 +688,23 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const reb = await docSvc.rebuildDocument(uidC, newDog.id);
     ok(reb.ok && /^Договор/.test(reb.file.filename), 'копия пересобирается своим договором, а не типовым');
 
+    /*
+     * Сумма из фразы. «Договор Ромашке на 180 000» — сумму человек уже назвал,
+     * и спрашивать её второй раз незачем: подставляется в своё денежное поле,
+     * спрашиваются только дата и место.
+     */
+    const dogsBeforeP = bdbC.listDocs(uidC, 500).filter((d) => d.type === 'dog');
+    await say(`договор ${cpC.name.replace(/[«»"]/g, '')} на 180000`);
+    ok(/180[\s ]000/.test(norm(sent.slice(-3).map((m) => m.text).join(' '))) && /Дата мероприятия/.test(last()),
+      'сумма из фразы подставлена, первый вопрос — дата, а не сумма', last());
+    await say('1 июля 2026 г.');
+    await say('банкетный зал «Север»');
+    const dogsAfterP = bdbC.listDocs(uidC, 500).filter((d) => d.type === 'dog');
+    const madeP = dogsAfterP.find((d) => !dogsBeforeP.some((x) => x.id === d.id));
+    const vP = madeP ? bdbC.getDoc(uidC, madeP.id).payload.values : {};
+    ok(madeP && vP.price === 180000 && vP.venue === 'банкетный зал «Север»',
+      'договор выписан после двух ответов, сумма — из фразы', JSON.stringify(vP));
+
     // Заменили шаблон — старый договор остаётся прежним.
     mcM.saveTemplate(uidC, 0, { title: 'Совсем другой', body: 'ДРУГОЙ ТЕКСТ {{them}}', fields: [] });
     ok(bdbC.getDoc(uidC, newDog.id).payload.body.includes('{{venue}}'), 'замена шаблона не трогает выписанные договоры');
