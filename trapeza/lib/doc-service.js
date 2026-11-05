@@ -324,7 +324,7 @@ function plannedTotal(userId, { type, items, extra = {} }) {
  *          |{ok:false, reason:string, message:string, quota?:object}}
  */
 async function issueDocument(userId, {
-  type, cpId, items, date, number, extra = {}, skipQuota = false, noDebt = false,
+  type, cpId, items, date, number, extra = {}, skipQuota = false, noDebt = false, replaceId = 0,
 }) {
   const kind = ITEM_DOCS[type];
   if (!kind) return fail('type', 'Такой документ выписать нельзя.');
@@ -462,7 +462,7 @@ async function issueDocument(userId, {
    * в журнале.
    */
   const wanted = number == null || number === '' ? '' : String(number).slice(0, 40);
-  if (wanted && bdb.numberTakenInOrg(org.id, type, year, wanted)) {
+  if (wanted && bdb.numberTakenInOrg(org.id, type, year, wanted, replaceId)) {
     return fail('number', `${kind.title} № ${wanted} за ${year} год уже выписан. Укажите другой номер.`);
   }
 
@@ -882,8 +882,43 @@ function reusablePayload(payload) {
   return { items, extra };
 }
 
+/**
+ * Исправить выписанный документ, не меняя его номера.
+ *
+ * Ошибся в накладной (не то число обедов) — раньше выход был один: удалить и
+ * выписать заново, и новая выходила следующим номером, 22 вместо 7. Здесь
+ * новый документ выписывается с номером прежнего, и только когда он
+ * получился, прежний убирается — сорвись сборка, старый останется на месте.
+ * Лимит не тратится, порядковый номер и время выписки — прежние.
+ */
+async function replaceDocument(userId, oldId, { items, date, number, extra = {} }) {
+  const old = bdb.getDoc(userId, Number(oldId));
+  if (!old) return fail('notfound', 'Документ не найден.');
+  if (!ITEM_DOCS[old.type]) return fail('type', 'Этот документ так не исправить.');
+  const cur = bdb.currentOrgId(userId);
+  if (Number(old.org_id) && Number(old.org_id) !== Number(cur)) {
+    return fail('org', 'Документ выписан от другой вашей организации — переключитесь на неё и исправьте там.');
+  }
+  const res = await issueDocument(userId, {
+    type: old.type, cpId: old.cp_id, items, date: date || old.date,
+    number: number || old.number, extra, skipQuota: true, replaceId: old.id,
+  });
+  if (!res.ok) return res;
+  bdb.deleteDoc(userId, old.id, { keepQuota: true });
+  bdb.takePlaceOf(userId, res.doc.id, old);
+  return { ...res, replaced: { id: old.id, number: old.number, wasPaid: Boolean(old.paid_at) } };
+}
+
+/** Сменить номер выписанного документа и собрать файл заново — уже с новым номером. */
+async function renumberDocument(userId, id, number) {
+  const r = bdb.renumberDoc(userId, Number(id), number);
+  if (!r.ok) return fail('number', r.error);
+  const res = await rebuildDocument(userId, Number(id));
+  return res.ok ? { ...res, old: r.old } : res;
+}
+
 module.exports = {
   ITEM_DOCS, OTHER_DOCS, ALL_DOCS,
-  issueDocument, issueFlat, issuePlain, rebuildDocument, renderFile, stampFor,
+  issueDocument, issueFlat, issuePlain, rebuildDocument, renderFile, stampFor, replaceDocument, renumberDocument,
   totalOf, plannedTotal, vatFieldsFor, cleanItems, itemsProblem, pickDate, safeName, todayISO, reusablePayload,
 };

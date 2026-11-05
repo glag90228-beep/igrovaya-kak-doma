@@ -1031,7 +1031,14 @@ function periodBalance(userId, cpId, from, to, orgId = null) {
    * акт за любой период сходился с карточкой, отсчёт ведём от остатка ДО
    * них: сальдо минус то, что в него вошло. Дальше всё как раньше.
    */
-  const prior = priorOps(cp, all).reduce((s, o) => round2(s + round2(o.credit) - round2(o.debit)), 0);
+  const priors = priorOps(cp, all);
+  const prior = priors.reduce((s, o) => round2(s + round2(o.credit) - round2(o.debit)), 0);
+  /*
+   * Акт без периода начинается с даты сальдо, если до неё есть вошедшие в
+   * него операции: иначе он открывался нулём и показывал их строками под
+   * датой сальдо, хотя в карточке на эту дату стоит долг на начало.
+   */
+  if (!from && priors.length) from = cp.opening_date;
   let opening = round2((Number(cp.opening_balance) || 0) - prior);
   const inside = [];
   for (const op of all) {
@@ -3182,10 +3189,51 @@ function openShipmentsOfMonth(userId, cpId, ym, orgId = null) {
  * ряды. Переименована по той же причине: перепутать id организации с id
  * человека молча нельзя.
  */
-function numberTakenInOrg(orgId, type, year, number) {
+function numberTakenInOrg(orgId, type, year, number, exceptId = 0) {
+  // exceptId — сам документ, которому номер меняют или которого исправляют:
+  // свой же номер ему не помеха.
   return Boolean(db.prepare(
-    'SELECT id FROM documents WHERE org_id = ? AND type = ? AND year = ? AND number = ? LIMIT 1',
-  ).get(Number(orgId) || 0, type, Number(year), String(number)));
+    'SELECT id FROM documents WHERE org_id = ? AND type = ? AND year = ? AND number = ? AND id <> ? LIMIT 1',
+  ).get(Number(orgId) || 0, type, Number(year), String(number), Number(exceptId) || 0));
+}
+
+/**
+ * Сменить номер выписанного документа.
+ *
+ * Номер ставит человек, а ошибается он так: удалил накладную № 7, выписал
+ * заново — и она вышла № 22, потому что следующий номер — «самый большой
+ * плюс один». Порядковый номер (seq) тоже переносим, если новый номер —
+ * число и такой порядковый свободен: иначе следующая выписка перескочила бы
+ * через дыру. В строках журнала номер записан текстом — меняем и там.
+ * @returns {{ok:boolean, error?:string, old?:string}}
+ */
+function renumberDoc(userId, id, number) {
+  const d = getDoc(userId, id);
+  if (!d) return { ok: false, error: 'Документ не найден.' };
+  const num = String(number || '').trim().slice(0, 40);
+  if (!num) return { ok: false, error: 'Нужен номер.' };
+  if (num === String(d.number)) return { ok: true, old: d.number };
+  if (numberTakenInOrg(d.org_id, d.type, d.year, num, d.id)) {
+    return { ok: false, error: `№ ${num} за ${d.year} год уже есть у другого документа этого вида.` };
+  }
+  const seq = /^\d{1,9}$/.test(num) && !db.prepare(
+    'SELECT id FROM documents WHERE org_id = ? AND type = ? AND year = ? AND seq = ? AND id <> ?',
+  ).get(d.org_id, d.type, d.year, Number(num), d.id) ? Number(num) : d.seq;
+  db.prepare('UPDATE documents SET number = ?, seq = ? WHERE id = ? AND user_id = ?').run(num, seq, d.id, userId);
+  db.prepare('UPDATE operations SET doc = replace(doc, ?, ?) WHERE doc_id = ?').run(`№ ${d.number}`, `№ ${num}`, d.id);
+  return { ok: true, old: d.number };
+}
+
+/**
+ * Исправленный документ встаёт на место прежнего: тот же порядковый номер и
+ * то же время выписки — исправление не новая выписка, и бесплатный лимит
+ * оно не тратит. Вызывается после того, как прежний удалён.
+ */
+function takePlaceOf(userId, newId, old) {
+  const busy = db.prepare('SELECT id FROM documents WHERE org_id = ? AND type = ? AND year = ? AND seq = ? AND id <> ?')
+    .get(old.org_id, old.type, old.year, old.seq, newId);
+  db.prepare(`UPDATE documents SET created_at = ?${busy ? '' : ', seq = ?'} WHERE id = ? AND user_id = ?`)
+    .run(...(busy ? [old.created_at, newId, userId] : [old.created_at, old.seq, newId, userId]));
 }
 
 /** Не прошла ли запись именно из-за занятого номера. */
@@ -3291,7 +3339,7 @@ function debtByDoc(userId, ids) {
   return new Map(rows.map((r) => [r.id, { ops: r.n, delta: Number(r.delta) || 0 }]));
 }
 
-function deleteDoc(userId, id) {
+function deleteDoc(userId, id, { keepQuota = false } = {}) {
   // Проводки убираем первыми: deleteOpsOfDoc сверяется с документом, и после
   // его удаления она уже ничего не найдёт.
   const doc = getDoc(userId, id);
@@ -3307,7 +3355,9 @@ function deleteDoc(userId, id) {
   db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0, paid_with = 0 WHERE paid_with = ? AND user_id = ?")
     .run(id, userId);
   const gone = db.prepare('DELETE FROM documents WHERE id = ? AND user_id = ?').run(id, userId).changes > 0;
-  if (gone && doc.created_at) db.prepare('INSERT INTO docs_removed(user_id, created_at) VALUES (?, ?)').run(userId, doc.created_at);
+  // keepQuota — документ не исчезает, а заменяется исправленным: его выписку
+  // унаследует замена (takePlaceOf), и считать её второй раз нельзя.
+  if (gone && doc.created_at && !keepQuota) db.prepare('INSERT INTO docs_removed(user_id, created_at) VALUES (?, ?)').run(userId, doc.created_at);
   return gone;
 }
 
@@ -3455,7 +3505,7 @@ module.exports = {
   docShort, unpaidLinesFor, debtListText,
   askBizOnce,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
-  isSeqTaken, guardSeq, numberTakenInOrg, currentOrgId, currentOrg, setActiveOrg,
+  isSeqTaken, guardSeq, numberTakenInOrg, renumberDoc, takePlaceOf, currentOrgId, currentOrg, setActiveOrg,
   orgQuota, grantOrgSlots,
   openingFor, setOpeningFor, cpOrgs,
   prepayFor, setPrepayMode, addPrepay, prepayState, prepayReport, prepayLine, settleFromPrepay,

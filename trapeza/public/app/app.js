@@ -1176,11 +1176,12 @@ function lowerTitle(t) {
  * в списке одни позиции, и копия теряла бы налог и основание накладной.
  * Выписывает по-прежнему человек — кнопкой в форме, после проверки.
  */
-async function repeatDoc(docId) {
+async function repeatDoc(docId, fix = null) {
   try {
     const r = await api('GET', `/api/doc/repeat?id=${docId}`);
     haptic('medium');
-    go('new', { ...r.draft, repeat: { ...r.from, otherOrg: r.otherOrg, orgName: r.orgName } });
+    if (fix) go('new', { ...r.draft, ...fix, fix: { ...r.from } });
+    else go('new', { ...r.draft, repeat: { ...r.from, otherOrg: r.otherOrg, orgName: r.orgName } });
   } catch (e) { toast(e.message, true); }
 }
 
@@ -1772,10 +1773,35 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
   if (d.items && d.items.length) {
     box.append(h('div', { class: 'btn-wrap' },
       h('button', {
+        class: 'btn secondary', id: 'doc-fix',
+        // Ошибся в позициях — исправляем этот же документ, номер и дата остаются.
+        onclick: (e) => withBusy(e.currentTarget, () => repeatDoc(d.id, { replaceId: d.id, number: d.number, date: d.date })),
+      }, 'Исправить — номер тот же'),
+      h('button', {
         class: 'btn secondary',
         onclick: (e) => withBusy(e.currentTarget, () => repeatDoc(d.id)),
       }, 'Повторить')));
-
+  }
+  if (d.type !== 'akt') {
+    // Номер ставит человек, и ошибается: удалил № 7, выписал заново — вышел № 22.
+    const numIn = h('input', { class: 'input', id: 'renum-input', value: d.number, inputmode: 'numeric', style: 'display:none' });
+    const numSave = h('button', {
+      class: 'btn', id: 'renum-save', style: 'display:none',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        const r = await api('POST', '/api/doc/renumber', { id: d.id, number: numIn.value.trim() });
+        toast(`Номер изменён на ${r.number}`);
+        haptic('medium');
+        download(r.file);
+        render();
+      }),
+    }, 'Сохранить номер');
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', {
+        class: 'btn secondary', id: 'renum-open',
+        onclick: (e) => { e.currentTarget.style.display = 'none'; numIn.style.display = ''; numSave.style.display = ''; numIn.focus(); },
+      }, 'Изменить номер'), numIn, numSave));
+  }
+  if (d.items && d.items.length) {
     /*
      * Повторение заводится отсюда: позиции уже проверены человеком, остаётся
      * назвать число. 29–31 в списке нет — таких чисел нет в каждом месяце.
@@ -5777,6 +5803,12 @@ screens.new = async function newDoc(params) {
    * Повтор: говорим, чей это документ и что будет с номером и датой. Форма
    * ниже обычная — поправить можно всё, а выпишется он только по кнопке.
    */
+  if (params.fix) {
+    box.append(h('div', { class: 'banner info', id: 'fix-note' }, icon('repeat'),
+      h('div', {},
+        h('div', { text: `Исправление: ${lowerTitle(params.fix.title)} № ${params.number} от ${ru(params.date)}` }),
+        h('div', { class: 'small muted', text: 'Номер и дата остаются прежними. Прежний документ заменится, когда выпишете исправленный.' }))));
+  }
   if (params.repeat) {
     const rp = params.repeat;
     box.append(h('div', { class: 'banner info', id: 'repeat-note' }, icon('repeat'),
@@ -6152,6 +6184,7 @@ screens.new = async function newDoc(params) {
     try {
       if (tg) tg.MainButton.showProgress();
       const payload = { type, cpId: draft.cpId, date: dateInput.value, items };
+      if (params.replaceId) { payload.replaceId = params.replaceId; payload.number = params.number; }
       if (basisInput && basisInput.value.trim()) payload.basis = basisInput.value.trim();
       if (draft.vatRate !== undefined) {
         payload.vatRate = draft.vatRate;

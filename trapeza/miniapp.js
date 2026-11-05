@@ -2412,14 +2412,19 @@ const api = {
      */
     const basis = str(body.basis, 200);
     if (basis && ['torg12', 'upd'].includes(String(body.type))) extra.basis = basis;
-    const res = await docService.issueDocument(user.id, {
-      type: str(body.type, 10),
-      cpId: Number(body.cpId),
-      items: body.items,
-      date: str(body.date, 10),
-      number: str(body.number, 40),
-      extra,
-    });
+    // replaceId — исправление выписанного под тем же номером (docService.replaceDocument).
+    const res = Number(body.replaceId)
+      ? await docService.replaceDocument(user.id, Number(body.replaceId), {
+        items: body.items, date: str(body.date, 10), number: str(body.number, 40), extra,
+      })
+      : await docService.issueDocument(user.id, {
+        type: str(body.type, 10),
+        cpId: Number(body.cpId),
+        items: body.items,
+        date: str(body.date, 10),
+        number: str(body.number, 40),
+        extra,
+      });
     if (!res.ok) return { error: res.message, reason: res.reason, quota: res.quota };
 
     const token = keepFile(user.id, res.file);
@@ -2689,6 +2694,21 @@ const api = {
       }).catch(() => {});
     }
     return { no, file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf } };
+  },
+
+  /** Сменить номер выписанного документа; файл с новым номером — в чат и на скачивание. */
+  async 'POST /api/doc/renumber'({ user, body }) {
+    const res = await docService.renumberDocument(user.id, Number(body.id), str(body.number, 40));
+    if (!res.ok) return { error: res.message };
+    const d = bdb.getDoc(user.id, Number(body.id));
+    const token = keepFile(user.id, res.file);
+    if (tg) {
+      await tg.sendDocument(user.tg_id, {
+        filename: res.file.filename, buffer: res.file.buffer,
+        caption: `Номер изменён: было № ${escTg(res.old)}, стало № ${escTg(d.number)}.`,
+      }).catch(() => {});
+    }
+    return { number: d.number, file: { url: `/api/file/${token}`, name: res.file.filename, pdf: res.file.pdf } };
   },
 
   /** Прислать копию ранее выписанного. */

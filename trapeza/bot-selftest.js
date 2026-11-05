@@ -1089,6 +1089,9 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(bdbQ.balanceOf(uq.id, dc).closing === -9400, 'ноябрь: аванс клиента 9 400', bdbQ.balanceOf(uq.id, dc).closing);
     const nov = bdbQ.periodBalance(uq.id, dc, '2026-11-01', '2026-11-30');
     ok(nov.opening === 34600 && nov.closing === -9400, 'акт сверки за ноябрь: на начало 34 600, на конец −9 400', `${nov.opening} → ${nov.closing}`);
+    const all = bdbQ.periodBalance(uq.id, dc, '', '');
+    ok(all.opening === 34600 && all.closing === -9400 && all.from === '2026-11-01',
+      'акт сверки без периода начинается с долга на начало, а не с нуля', `${all.from} ${all.opening} → ${all.closing}`);
     const oct = bdbQ.periodBalance(uq.id, dc, '2026-10-01', '2026-10-31');
     ok(oct.opening === 0 && oct.closing === 34600, 'и за октябрь акт по-прежнему сходится: 0 → 34 600', `${oct.opening} → ${oct.closing}`);
     // Новый клиент с нулём «с сегодня»: счёт задним числом в долг попадает.
@@ -1915,12 +1918,50 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     const beforeArch = files.length;
     const quotaArch = require('./lib/bot-db').quota(fxUserId()).used;
     await tap('arch.k:quarter:all');
+    // Архив собирается без ожидания (не держит бота) — даём ему дособраться.
+    for (let i = 0; i < 100 && files.length === beforeArch; i += 1) await new Promise((r) => setTimeout(r, 100));
     const arch = files[files.length - 1] || {};
     const inZip = arch.filename && arch.filename.endsWith('.zip')
       ? [...require('./lib/zip').readZip(fs.readFileSync(path.join(OUT, arch.filename))).keys()] : [];
     ok(files.length === beforeArch + 1 && inZip.length > 1 && inZip.every((n) => /\.(pdf|html|xlsx)$/.test(n)),
       'архив пришёл, в нём файлы документов', `${arch.filename} ${inZip.length}: ${inZip.slice(0, 3).join(', ')}`);
     ok(require('./lib/bot-db').quota(fxUserId()).used === quotaArch, 'архив не тратит бесплатный лимит');
+
+    /*
+     * Исправить под тем же номером и сменить номер. Случай владельца: в накладной
+     * ошибка — удалил, выписал заново, а она вышла № 22 вместо 7.
+     */
+    {
+      const bdbF = require('./lib/bot-db');
+      const uidF = fxUserId();
+      const src = bdbF.listDocs(uidF, 500).find((d) => d.type === 'sch' && !d.paid_at);
+      const srcNum = src.number;
+      const qF = bdbF.quota(uidF).used;
+      await tap(`doc:${src.id}`);
+      ok(Boolean(button('номер тот же')) && Boolean(button('Изменить номер')), 'у документа есть «Исправить» и «Изменить номер»');
+      await tap(`d.fix:${src.id}`);
+      const stF = bdbF.getState(uidF);
+      ok(stF && stF.data.replaceId === src.id && stF.data.number === String(srcNum), 'исправление открыто с прежним номером', stF && stF.state);
+      stF.data.items = [{ name: 'Исправленная позиция', unit: 'шт.', qty: 2, price: 1500 }];
+      bdbF.setState(uidF, stF.state, stF.data);
+      await tap('doc.make');
+      const same = bdbF.listDocs(uidF, 500).filter((d) => d.type === 'sch' && String(d.number) === String(srcNum));
+      ok(!bdbF.getDoc(uidF, src.id) && same.length === 1 && Number(same[0].total) === 3000,
+        'исправленный встал на место прежнего с тем же номером', `${same.length} ${same[0] && same[0].total}`);
+      ok(bdbF.quota(uidF).used === qF, 'исправление не тратит бесплатный лимит', `${qF} → ${bdbF.quota(uidF).used}`);
+      ok(/Исправлен прежний/.test((files[files.length - 1] || {}).caption || ''), 'в подписи сказано, что прежний заменён');
+
+      const fixed = same[0];
+      const other = bdbF.listDocs(uidF, 500).find((d) => d.type === 'sch' && d.id !== fixed.id);
+      await tap(`d.num:${fixed.id}`);
+      await say(String(other.number));
+      ok(/уже есть/.test(last()) && bdbF.getDoc(uidF, fixed.id).number === String(srcNum), 'занятый номер не даётся', last());
+      await say('7777');
+      ok(bdbF.getDoc(uidF, fixed.id).number === '7777' && /стало/.test((files[files.length - 1] || {}).caption || ''),
+        'номер изменён, файл пришёл с новым номером', bdbF.getDoc(uidF, fixed.id).number);
+      const opF = bdbF.opsOfDoc ? bdbF.opsOfDoc(uidF, fixed.id) : [];
+      ok(!opF.length || opF.every((o) => !o.doc || o.doc.includes('7777')), 'и в журнале операций номер новый', JSON.stringify(opF.map((o) => o.doc)));
+    }
 
     // Читаем файл обратно: важно, что суммы — числа, а не текст,
     // иначе реестр не складывается и им нельзя пользоваться.

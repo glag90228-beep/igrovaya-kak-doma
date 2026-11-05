@@ -156,6 +156,8 @@ const FLOW_BUTTONS = {
   'fu:': [],
   // Ждём ссылку на чек; кнопки внутри нет, любая нажатая — «передумал».
   'chq:': [],
+  // Ждём новый номер документа; кнопка внутри одна — «Отмена».
+  'renum:': [],
 };
 
 // ---------- меню ----------
@@ -1238,13 +1240,15 @@ function parseItemLine(text) {
  * Выпускает счёт или акт услуг: собирает файл, запоминает позиции
  * как шаблоны и кладёт документ в журнал — чтобы потом «повторить».
  */
-async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
+async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {}, replaceId = 0 }) {
   // Сборка, факсимиле, нумерация и запись в журнал — в общем сервисе:
   // мини-приложение делает ровно то же самое, и расходиться им нельзя.
   await tg.sendChatAction(chatId, 'upload_document');
-  const res = await docService.issueDocument(user.id, {
-    type, cpId, items: doc.items, date: doc.date, number: doc.number, extra,
-  });
+  const res = replaceId
+    ? await docService.replaceDocument(user.id, replaceId, { items: doc.items, date: doc.date, number: doc.number, extra })
+    : await docService.issueDocument(user.id, {
+      type, cpId, items: doc.items, date: doc.date, number: doc.number, extra,
+    });
   if (!res.ok) {
     const kb = res.reason === 'quota'
       ? keyboard([[{ text: '⭐ Оформить подписку', data: 'billing' }], [{ text: '⬅️ Меню', data: 'menu' }]])
@@ -1255,8 +1259,11 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {} }) {
 
   const cp = bdb.getCp(user.id, cpId);
   const org = bdb.currentOrg(user.id);
-  const q = res.quota;
-  const tail = q.paid ? '' : `\n<i>Выписано в этом месяце: ${q.used} из ${q.limit} бесплатных.</i>`;
+  const q = replaceId ? bdb.quota(user.id) : res.quota;
+  const tail = (res.replaced
+    ? `\n\n<i>Исправлен прежний № ${esc(res.replaced.number)}: старый убран из журнала, лимит не потрачен.`
+      + `${res.replaced.wasPaid ? ' Он был отмечен оплаченным — отметьте оплату у исправленного заново.' : ''}</i>` : '')
+    + (q.paid ? '' : `\n<i>Выписано в этом месяце: ${q.used} из ${q.limit} бесплатных.</i>`);
   // Проводка в журнал — вещь неочевидная, о ней надо сказать прямо,
   // иначе человек не поймёт, откуда взялся долг в разделе «Кто должен».
   /*
@@ -1372,9 +1379,30 @@ async function finishItems(tg, chatId, user, state) {
   const d = state.data;
   const doc = { number: d.number, date: d.date, items: d.items, ...(d.doc || {}) };
   bdb.clearState(user.id);
-  const done = await issueDoc(tg, chatId, user, { type, cpId, doc, seq: d.seq, extra: d.doc || {} });
+  const done = await issueDoc(tg, chatId, user, { type, cpId, doc, seq: d.seq, extra: d.doc || {}, replaceId: d.replaceId || 0 });
   if (!done) return;
   await afterDoc(tg, chatId, user, cpId);
+}
+
+/**
+ * Исправить выписанный документ под тем же номером: те же клиент, позиции,
+ * дата и номер в обычной сводке — правите и выпускаете. Прежний заменяется
+ * только после удачного выпуска (docService.replaceDocument).
+ */
+async function fixDoc(tg, chatId, user, docId) {
+  const src = bdb.getDoc(user.id, docId);
+  if (!src || !ITEM_DOCS[src.type]) {
+    await tg.sendMessage(chatId, 'Этот документ так не исправить.', mainMenu());
+    return;
+  }
+  // Это тот же документ: его отметки (статус УПД, основание, ставка) остаются, меняются позиции.
+  const { items = [], ...extra } = src.payload || {};
+  const data = { seq: src.seq, number: String(src.number), date: src.date, items, ask: '', doc: extra, replaceId: src.id };
+  bdb.setState(user.id, `items:${src.type}:${src.cp_id}`, data);
+  await tg.sendMessage(chatId,
+    `Исправляем <b>${esc(bdb.docShort(src.type))} № ${esc(src.number)}</b> от ${ru(src.date)}. `
+    + 'Поправьте позиции — номер и дата останутся прежними. Прежний документ заменится, когда выпустите исправленный.');
+  await showPreview(tg, chatId, user, bdb.getState(user.id));
 }
 
 /** Повтор ранее выписанного документа: те же позиции, новый номер и дата. */
@@ -1932,6 +1960,8 @@ async function showDoc(tg, chatId, user, docId) {
       data: `doc.mail:${d.id}`,
     }]);
   }
+  if (ITEM_DOCS[d.type]) rows.push([{ text: '✏️ Исправить — номер тот же', data: `d.fix:${d.id}` }]);
+  if (d.type !== 'akt') rows.push([{ text: '🔢 Изменить номер', data: `d.num:${d.id}` }]);
   if (ITEM_DOCS[d.type]) rows.push([{ text: '🔁 Повторить новым номером', data: `d.rep:${d.id}` }]);
   if (cp) rows.push([{ text: `👤 ${cp.name}`, data: `cp:${cp.id}` }]);
   rows.push([{ text: '🗑 Убрать из журнала', data: `doc.del:${d.id}` }]);
@@ -2890,6 +2920,17 @@ function addClientKb(user, who, type) {
  * «Акт приёмки 1 3000» — честная позиция, клиента в ней нет.
  */
 const REQUEST_START = /^\s*(выстав|выпиш|сдела|сформир|подготов|составь|оформи|создай|нужен|нужна|нужно|счёт|счет|акт|упд|накладн|торг)/i;
+/*
+ * Строже, чем looksLikeRequest: ответы на вопросы шаблона договора сами
+ * начинаются со слов вроде «Торговая площадка», «Актовый зал», «Нужно
+ * поставить…» — по корню они похожи на просьбу, а это ответ. Здесь — только
+ * глагол выписки или название документа целым словом.
+ */
+const DOC_REQUEST = /^\s*(?:(?:выстав|выпиш|сформир|оформи|создай|сделай)[\p{L}]*\s+|(?:счёт|счет|акт|упд|торг-?12|накладн[\p{L}]*)(?![\p{L}\d-]))/iu;
+function looksLikeDocRequest(text, cps) {
+  return DOC_REQUEST.test(text) && looksLikeRequest(text, cps);
+}
+
 function looksLikeRequest(text, cps) {
   if (!REQUEST_START.test(text)) return false;
   if (/(?:^|\s)(?:ооо|оао|зао|пао|ип|ао)\s+[«"„]?[\p{L}\p{N}]/iu.test(text)) return true;
@@ -6012,6 +6053,18 @@ async function handleMessage(tg, msg) {
   if (state.state.startsWith('pp:')) { await handlePpText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('av:')) { await handleAvansText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('ksf:')) { await handleKsfText(tg, chatId, user, state, text); return; }
+  if (state.state.startsWith('renum:')) {
+    const id = Number(state.state.slice(6));
+    const res = await docService.renumberDocument(user.id, id, text);
+    if (!res.ok) { await tg.sendMessage(chatId, `${esc(res.message)} Напишите другой номер:`); return; }
+    bdb.clearState(user.id);
+    const d = bdb.getDoc(user.id, id);
+    await tg.sendDocument(chatId, {
+      filename: res.file.filename, buffer: res.file.buffer,
+      caption: `Номер изменён: было № ${esc(res.old)}, стало <b>№ ${esc(d.number)}</b>. Файл — с новым номером.`,
+    });
+    return;
+  }
   /*
    * Договор на середине вопросов — а человек уже просит счёт.
    *
@@ -6020,12 +6073,14 @@ async function handleMessage(tg, msg) {
    * на все поля. Как у позиций документа (см. items: выше): новая просьба
    * бросает недоделанный договор и выполняется сама.
    */
-  if (/^dogx?:/.test(state.state) && looksLikeRequest(text, bdb.listCps(user.id))) {
-    bdb.clearState(user.id);
-    if (!(await handleFreeText(tg, chatId, user, text))) {
-      await tg.sendMessage(chatId, 'Договор отложил. Не разобрал просьбу — выберите документ в меню.', mainMenu());
+  if (/^dogx?:/.test(state.state) && looksLikeDocRequest(text, bdb.listCps(user.id))) {
+    // Состояние договора не трогаем до разбора: не вышла просьба — текст
+    // остаётся ответом на вопрос, как и раньше, и введённое не пропадает.
+    if (await handleFreeText(tg, chatId, user, text)) {
+      const now = bdb.getState(user.id);
+      if (now && now.state === state.state) bdb.clearState(user.id);
+      return;
     }
-    return;
   }
   if (await contractFlow().onText(tg, chatId, user, state, text)) return;
   if (state.state.startsWith('note:')) {
@@ -6791,7 +6846,14 @@ async function handleCallback(tg, cq) {
     }
     if (/^arch\.k:\w+:\w+$/.test(data)) {
       const [, per, kind] = data.split(':');
-      await sendArchive(tg, chatId, user, per, kind);
+      /*
+       * Не ждём: обновления бот разбирает по одному, и архив на десятки PDF
+       * держал бы минуту всех остальных. Файл придёт сам, когда соберётся.
+       */
+      sendArchive(tg, chatId, user, per, kind).catch((e) => {
+        office.record({ kind: 'crash', where: 'архив документов', error: e.message, userId: user.id }).catch(() => {});
+        tg.sendMessage(chatId, 'Архив собрать не получилось. Попробуйте позже.').catch(() => {});
+      });
       return;
     }
     if (data.startsWith('reg.p:')) { await sendRegistry(tg, chatId, user, data.slice(6)); return; }
@@ -7606,6 +7668,15 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('doc:')) { await showDoc(tg, chatId, user, Number(data.slice(4))); return; }
     if (data.startsWith('d.rep:')) { await repeatDoc(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('d.fix:')) { await fixDoc(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('d.num:')) {
+      const d = bdb.getDoc(user.id, Number(data.slice(6)));
+      if (!d) return;
+      bdb.setState(user.id, `renum:${d.id}`, {});
+      await tg.sendMessage(chatId, `Новый номер для «${esc(bdb.docShort(d.type))} № ${esc(d.number)}»:`,
+        keyboard([[{ text: '✖️ Отмена', data: `doc:${d.id}` }]]));
+      return;
+    }
   } catch (e) {
     if (e && e.blocked) throw e; // разберётся handleUpdate
     console.error('Ошибка обработки:', e.message);
