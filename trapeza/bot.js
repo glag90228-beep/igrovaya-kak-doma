@@ -1630,6 +1630,64 @@ async function sendKudir(tg, chatId, user) {
   }
 }
 
+/** Какие документы можно забрать архивом и как их назвать в кнопке. */
+const ARCHIVE_KINDS = {
+  all: { title: 'Все документы', types: null },
+  torg12: { title: 'ТОРГ-12', types: ['torg12'] },
+  upd: { title: 'УПД', types: ['upd'] },
+  sch: { title: 'Счета', types: ['sch', 'schdog'] },
+  usl: { title: 'Акты', types: ['usl'] },
+  dog: { title: 'Договоры', types: ['dog'] },
+};
+const ARCHIVE_MAX = 80;
+
+/**
+ * Файлы документов за период — одним архивом.
+ *
+ * Файл каждого документа ушёл в чат в момент выписки, но двадцать ТОРГ-12 за
+ * месяц выискивать в переписке по одной — полдня. Собираем заново из журнала
+ * (тем же rebuildDocument, что и «Копия»), квоту это не трогает: новых
+ * документов не появляется. Потолок — чтобы архив за год не держал бота
+ * минутами; больше — по месяцам.
+ */
+async function sendArchive(tg, chatId, user, periodName, kind) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
+  const k = ARCHIVE_KINDS[kind] || ARCHIVE_KINDS.all;
+  const { from, to, title } = periodOf(periodName);
+  const docs = bdb.docsBetween(user.id, from, to).filter((d) => (k.types ? k.types.includes(d.type) : d.type !== 'akt'));
+  if (!docs.length) {
+    await tg.sendMessage(chatId, `${esc(k.title)} за ${esc(title)} (${ru(from)}—${ru(to)}) не найдено.`,
+      keyboard([[{ text: '⬅️ К документам', data: 'docs' }]]));
+    return;
+  }
+  const take = docs.slice(0, ARCHIVE_MAX);
+  await tg.sendMessage(chatId, `Собираю ${take.length} ${plural(take.length, 'файл', 'файла', 'файлов')} — это займёт до минуты…`);
+  await tg.sendChatAction(chatId, 'upload_document');
+  const files = {};
+  const failed = [];
+  for (const d of take) {
+    const res = await docService.rebuildDocument(user.id, d.id).catch(() => null);
+    if (!res || !res.ok || !res.file) { failed.push(`№ ${d.number}`); continue; }
+    // Одинаковые имена у двух документов одному клиенту — архив не должен их склеить.
+    let name = res.file.filename;
+    for (let i = 2; files[name]; i += 1) name = res.file.filename.replace(/(\.\w+)$/, `_${i}$1`);
+    files[name] = res.file.buffer;
+  }
+  if (!Object.keys(files).length) {
+    await tg.sendMessage(chatId, 'Не получилось собрать ни одного файла. Попробуйте позже.', mainMenu());
+    return;
+  }
+  const sum = round2(take.reduce((a2, d) => a2 + (Number(d.total) || 0), 0));
+  await tg.sendDocument(chatId, {
+    filename: `${k.title.replace(/\s+/g, '_')}_${from}_${to}.zip`,
+    buffer: require('./lib/zip').makeZip(files),
+    caption: `${esc(k.title)} за ${esc(title)} (${ru(from)}—${ru(to)}): <b>${Object.keys(files).length}</b> на <b>${formatRub(sum)}</b>.`
+      + (docs.length > take.length ? `\nВ архиве первые ${take.length} — остальные выберите по месяцам.` : '')
+      + (failed.length ? `\nНе собрались: ${esc(failed.join(', '))}.` : ''),
+  });
+}
+
 async function sendRegistry(tg, chatId, user, periodName, range = null) {
   const org = bdb.currentOrg(user.id);
   if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
@@ -6695,8 +6753,30 @@ async function handleCallback(tg, cq) {
         [{ text: 'Текущий месяц', data: 'reg.p:month' }, { text: 'Прошлый месяц', data: 'reg.p:prev' }],
         [{ text: 'Квартал', data: 'reg.p:quarter' }, { text: 'Год', data: 'reg.p:year' }],
         [{ text: '📕 Книга продаж за квартал', data: 'kniga.p:quarter' }],
+        [{ text: '📦 Файлы документов архивом', data: 'arch' }],
         [{ text: '⬅️ К документам', data: 'docs' }],
       ]));
+      return;
+    }
+    if (data === 'arch' || /^arch\.p:\w+$/.test(data)) {
+      // Сначала период, потом вид: чаще всего нужен прошлый месяц целиком.
+      if (data === 'arch') {
+        await tg.sendMessage(chatId, 'Файлы за какой период?', keyboard([
+          [{ text: 'Прошлый месяц', data: 'arch.p:prev' }, { text: 'Текущий месяц', data: 'arch.p:month' }],
+          [{ text: 'Квартал', data: 'arch.p:quarter' }],
+          [{ text: '⬅️ К документам', data: 'docs' }],
+        ]));
+        return;
+      }
+      const per = data.slice(7);
+      const kinds = Object.entries(ARCHIVE_KINDS).map(([key, v]) => ({ text: v.title, data: `arch.k:${per}:${key}` }));
+      await tg.sendMessage(chatId, 'Какие документы?', keyboard([kinds.slice(0, 2), kinds.slice(2, 4), kinds.slice(4),
+        [{ text: '⬅️ К документам', data: 'docs' }]]));
+      return;
+    }
+    if (/^arch\.k:\w+:\w+$/.test(data)) {
+      const [, per, kind] = data.split(':');
+      await sendArchive(tg, chatId, user, per, kind);
       return;
     }
     if (data.startsWith('reg.p:')) { await sendRegistry(tg, chatId, user, data.slice(6)); return; }

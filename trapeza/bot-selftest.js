@@ -1897,6 +1897,22 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(regFile.caption.includes('Документов:'), 'в подписи есть количество и сумма',
       regFile.caption.slice(0, 60));
 
+    // Файлы за период архивом: те же документы, что в реестре, — одним ZIP.
+    await tap('reg');
+    ok(Boolean(button('архивом')), 'рядом с реестром — «Файлы документов архивом»');
+    await tap('arch');
+    await tap('arch.p:quarter');
+    ok(Boolean(button('ТОРГ-12')), 'бот спрашивает, какие документы');
+    const beforeArch = files.length;
+    const quotaArch = require('./lib/bot-db').quota(fxUserId()).used;
+    await tap('arch.k:quarter:all');
+    const arch = files[files.length - 1] || {};
+    const inZip = arch.filename && arch.filename.endsWith('.zip')
+      ? [...require('./lib/zip').readZip(fs.readFileSync(path.join(OUT, arch.filename))).keys()] : [];
+    ok(files.length === beforeArch + 1 && inZip.length > 1 && inZip.every((n) => /\.(pdf|html|xlsx)$/.test(n)),
+      'архив пришёл, в нём файлы документов', `${arch.filename} ${inZip.length}: ${inZip.slice(0, 3).join(', ')}`);
+    ok(require('./lib/bot-db').quota(fxUserId()).used === quotaArch, 'архив не тратит бесплатный лимит');
+
     // Читаем файл обратно: важно, что суммы — числа, а не текст,
     // иначе реестр не складывается и им нельзя пользоваться.
     const wb = new ExcelJS.Workbook();
