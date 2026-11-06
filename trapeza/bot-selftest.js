@@ -3951,6 +3951,19 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'и бот говорит об этом в подписи к накладной', (shipFile.caption || '').slice(-200));
     ok(fileBtn(shipFile, 'basis.set:closing'), 'а под файлом — кнопка «считать по актам и накладным»');
 
+    // Жалоба: «выписал ТОРГ-12, а выписался ещё и счёт». Накладная — один документ,
+    // а кнопка «ещё» после неё ведёт в накладную, не в счёт.
+    {
+      const docsOfCp = bdb3.listDocs(uid, 5000).filter((d) => d.cp_id === shipId);
+      ok(docsOfCp.length === 1 && docsOfCp[0].type === 'torg12',
+        'после ТОРГ-12 в журнале ровно один документ — накладная, счёта нет',
+        docsOfCp.map((d) => d.type).join(','));
+      const after = [...sent].reverse().find((m) => (m.text || '').includes('Что дальше'));
+      const flat = JSON.stringify((after && (after.keyboard || after.reply_markup || after.markup)) || after || {});
+      ok(flat.includes('go.torg12') && !flat.includes('go.sch'),
+        'под накладной «ещё» ведёт в накладную, а не в счёт', flat.slice(0, 200));
+    }
+
     // Режим «вручную» — бот в журнал не лезет.
     await tap('basis.set:manual');
     const manId = bdb3.createCp(uid, { name: 'ООО «Ручной учёт»', kind: 'customer', opening_date: '2026-01-01' });

@@ -1388,7 +1388,14 @@ async function afterDoc(tg, chatId, user, cpId) {
     rows.push([{ text: '🔁 Повторить', data: `d.rep:${last.id}` }]);
     rows.push([{ text: '🔁 Повторять по расписанию', data: `rec.new:${last.id}` }]);
   }
-  rows.push([{ text: '🧾 Выписать ещё', data: 'go.sch' },
+  /*
+   * «Ещё» — того же вида, что только что выписан. Раньше кнопка всегда вела
+   * в счёт: после ТОРГ-12 нажатие открывало выписку счёта, и казалось, что
+   * вместе с накладной выписывается второй документ.
+   */
+  const sameKind = last && docService.ITEM_DOCS[last.type] ? last.type : 'sch';
+  const sameTitle = (docService.ITEM_DOCS[sameKind] || {}).title || 'счёт';
+  rows.push([{ text: `➕ Ещё: ${sameTitle}`.slice(0, 40), data: `go.${sameKind}` },
     { text: '📄 Другой документ', data: 'go.any' }]);
   rows.push([{ text: '👤 Карточка клиента', data: `cp:${cpId}` }]);
   rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
