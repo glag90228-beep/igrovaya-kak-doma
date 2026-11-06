@@ -1265,6 +1265,40 @@ function spokenNumbers(text, opts) {
   return set;
 }
 
+/**
+ * Числа каждой позиции стоят во фразе по порядку: позиции не перепутаны местами.
+ * Модель называла каждое число верно, но отдавала цену кабеля розеткам — а
+ * проверка «число во фразе есть» такого не замечает.
+ */
+function itemsInSpokenOrder(items, phrase) {
+  const nums = [...String(phrase).matchAll(/\d+(?:[.,]\d+)?/g)].map((m) => round2(Number(m[0].replace(',', '.'))));
+  let floor = -1;
+  for (const it of items) {
+    const need = [];
+    if (it.qty !== 1) need.push([round2(it.qty)]);
+    need.push([round2(it.price), round2(it.price * it.qty)]);     // цена за штуку или сумма позиции
+    const at = [];
+    for (const variants of need) {
+      let found = -1;
+      for (let i = floor + 1; i < nums.length; i += 1) {
+        if (!at.includes(i) && variants.includes(nums[i])) { found = i; break; }
+      }
+      if (found < 0) return false;
+      at.push(found);
+    }
+    floor = Math.max(...at);
+  }
+  return true;
+}
+
+/** «…итого 4500» во фразе должно совпасть с суммой позиций. */
+function totalMatches(items, phrase) {
+  const m = /(?:итого|всего|общая\s+сумма|в\s+сумме)\s+(\d+(?:[.,]\d+)?)/iu.exec(String(phrase));
+  if (!m) return true;
+  const sum = round2(items.reduce((a, it) => a + it.qty * it.price, 0));
+  return sum === round2(Number(m[1].replace(',', '.')));
+}
+
 function groundIntent(intent, text, opts = {}) {
   if (!intent) return intent;
   const out = { ...intent };
@@ -1282,6 +1316,13 @@ function groundIntent(intent, text, opts = {}) {
       && (nums.has(round2(it.price)) || nums.has(round2(it.price * it.qty)))
     ));
     if (!ok) { out.items = []; out.weak = true; }
+    else if (out.items && out.items.length && !itemsInSpokenOrder(out.items, phrase)) {
+      // Каждое число названо, но не в том порядке: цены двух позиций поменялись местами
+      // или количество одной попало в другую. Документ на такую сумму не выписываем — спрашиваем.
+      out.items = []; out.weak = true;
+    } else if (out.items && out.items.length > 1 && !totalMatches(out.items, phrase)) {
+      out.items = []; out.weak = true;
+    }
   }
   if (out.action === 'pay' && out.amount) {
     if (!spokenNumbers(text, opts).has(round2(out.amount))) { out.amount = 0; out.weak = true; }

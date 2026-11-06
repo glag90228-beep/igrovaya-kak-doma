@@ -222,8 +222,55 @@ function readSegment(seg, defName) {
  * @returns {{items:Object[], weak:boolean, numbers:number}}
  */
 function parseItems(text, defName = 'Оказание услуг') {
+  const src = String(text);
+  /*
+   * Итог в конце фразы — это проверка, а не позиция: «…кабель 2 по 1500 и
+   * розетки 5 по 300, итого 4500». Раньше такая фраза считалась неоднозначной
+   * и документ не выписывался, а если итог расходился с позициями —
+   * проходила как есть. Теперь сошлось — берём, не сошлось — спрашиваем.
+   */
+  const tot = /[\s,;:]+(?:итого|всего|общая\s+сумма|в\s+сумме)\s+(\d+(?:[.,]\d+)?)\s*(?:руб\p{L}*\.?|₽|р\.?)?[\s.]*$/iu.exec(src);
+  if (tot) {
+    const rest = parseItems(src.slice(0, tot.index), defName);
+    if (rest.items.length || rest.weak) {
+      const want = round2(Number(tot[1].replace(',', '.')));
+      const got = round2(rest.items.reduce((a, it) => a + it.qty * it.price, 0));
+      if (rest.weak || rest.items.length < 2 || got !== want) {
+        // одна позиция с «итого» — это обычная сумма («аренда итого 4500»), разбираем целиком
+        if (!rest.weak && rest.items.length < 2) return parseItemsPlain(src, defName);
+        return { items: [], weak: true, numbers: rest.numbers + 1 };
+      }
+      return rest;
+    }
+  }
+  return parseItemsPlain(src, defName);
+}
+
+/**
+ * Перечисление — не позиция. «Два наименования: …», «первая позиция …»,
+ * «1) … 2) …»: числа и слова здесь только нумеруют строки. Раньше «на два
+ * наименования» становилось позицией «Наименования» за 2 ₽, а в названиях
+ * оставалось «Первая позиция кабель» — и сумма документа была не той.
+ */
+function stripEnumeration(text) {
+  let t = String(text);
+  // «на два наименования», «3 позиции:», но не «5 позиций по 100» — там это количество
+  t = t.replace(/(?:^|[\s,;:])(?:на\s+)?\d+\s+(?:наименовани|позици|пункт|строк)[а-яё]*(?!\s+по\s)[\s,;:—-]*/giu, ', ');
+  // «1) кабель … 2) розетки …»
+  t = t.replace(/(?:^|[\s,;])\d{1,2}\)\s*/gu, ', ');
+  // «первая позиция …», «второе наименование …»
+  t = t.replace(/(?<![\p{L}])(?:перв|втор|трет|четв[её]рт|пят)(?:ая|ое|ый|ой|ую)\s+(?:позици|наименовани|пункт|строк|товар)[а-яё]*[\s,:;—-]*/giu, ', ');
+  // «первое кабель, второе розетки» — порядковые без «позиции», только когда их несколько
+  const ords = t.match(/(?<![\p{L}])(?:перв|втор|трет|четв[её]рт|пят)(?:ая|ое|ый|ой)(?![\p{L}])/giu) || [];
+  if (new Set(ords.map((w) => w.toLowerCase().slice(0, 4))).size >= 2) {
+    t = t.replace(/(?<![\p{L}])(?:перв|втор|трет|четв[её]рт|пят)(?:ая|ое|ый|ой)(?![\p{L}])[\s,:;—-]*/giu, ', ');
+  }
+  return t.replace(/\s{2,}/g, ' ').replace(/^[\s,;:]+/, '');
+}
+
+function parseItemsPlain(text, defName) {
   // «50000 в месяц» — срок, за который назван платёж, а не название позиции
-  const toks = lex(String(text).replace(/\s+в\s+(?:месяц|год|день|неделю|квартал|сутки)(?![\p{L}])/giu, ' '));
+  const toks = lex(stripEnumeration(text).replace(/\s+в\s+(?:месяц|год|день|неделю|квартал|сутки)(?![\p{L}])/giu, ' '));
   const numbers = toks.filter((t) => t.t === 'NUM' || t.t === 'AMB').length;
   if (!numbers) return { items: [], weak: false, numbers };
   const segs = splitSegments(toks);
@@ -240,4 +287,4 @@ function parseItems(text, defName = 'Оказание услуг') {
   return { items, weak: false, numbers };
 }
 
-module.exports = { parseItems, lex, UNIT_WORDS };
+module.exports = { parseItems, stripEnumeration, lex, UNIT_WORDS };

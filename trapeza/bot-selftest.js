@@ -3338,6 +3338,60 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       'переплату внести «как оплату» бот не предлагает', last().slice(0, 60));
     for (const [k, v] of keepEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
 
+    // 4а. Ассистент и накладная на два наименования: жалоба «сказал два наименования,
+    // а сумма совсем другая». Включённый ассистент, фраза с перечислением.
+    {
+      bdbX.setAiEnabled(uX.id, true);
+      process.env.AI_ENABLED = '1';
+      process.env.AI_PROVIDER = process.env.AI_PROVIDER || 'gemini';
+      const nowDocs = () => bdbX.listDocs(uX.id, 5000).filter((d) => d.type === 'torg12');
+      const take = () => nowDocs().map((d) => d.id);
+      // правила разбирают сами: «два наименования» — не позиция за 2 ₽
+      process.env.AI_MOCK = JSON.stringify({ action: 'unknown' });
+      const b0 = take();
+      await sayX('выпиши накладную Заре на два наименования: кабель два по полторы тысячи и розетки пять по триста');
+      const made = nowDocs().filter((d) => !b0.includes(d.id));
+      ok(made.length === 1 && Math.round(made[0].total) === 4500,
+        'А1: «два наименования» — накладная на две позиции, 4 500 ₽, а не 4 502', made.map((d) => d.total).join(','));
+      ok(made[0] && (made[0].payload.items || []).length === 2 && !(made[0].payload.items || []).some((i) => /наименован/i.test(i.name)),
+        'А1: слово «наименования» в позиции не попало', JSON.stringify((made[0] || {}).payload));
+
+      // фраза, которую правила не берут: отвечает модель. Верный ответ — только со сводкой.
+      const phrase = 'выпиши торг 12 Заре кабель 2 штуки 1500 розетка 5 штук 300';
+      process.env.AI_MOCK = JSON.stringify({ action: 'draft', docType: 'torg12', who: 'Заря', items: [
+        { name: 'Кабель', qty: 2, price: 1500 }, { name: 'Розетка', qty: 5, price: 300 }] });
+      const b1 = take();
+      await sayX(phrase);
+      ok(take().length === b1.length, 'А2: позиции от модели сразу не выписываются — сначала сводка',
+        take().length - b1.length);
+      ok(String(bdbX.getState(uX.id).state || '').startsWith('items:torg12'),
+        'А2: и человек видит сводку «Всё верно?»', bdbX.getState(uX.id).state);
+      await tapX('menu');
+
+      // модель перепутала цены местами: числа все названы, но не в том порядке
+      process.env.AI_MOCK = JSON.stringify({ action: 'draft', docType: 'torg12', who: 'Заря', items: [
+        { name: 'Кабель', qty: 2, price: 300 }, { name: 'Розетка', qty: 5, price: 1500 }] });
+      const b2 = take();
+      await sayX(phrase);
+      const st2 = bdbX.getState(uX.id);
+      ok(take().length === b2.length && !((st2.data || {}).items || []).length,
+        'А3: перепутанные цены модели не принимаются — ни документа, ни позиций',
+        JSON.stringify((st2.data || {}).items));
+      await tapX('menu');
+
+      // итог во фразе не сходится с позициями
+      process.env.AI_MOCK = JSON.stringify({ action: 'draft', docType: 'torg12', who: 'Заря', items: [
+        { name: 'Кабель', qty: 2, price: 1500 }, { name: 'Розетка', qty: 5, price: 300 }] });
+      const b3 = take();
+      await sayX('выпиши торг 12 Заре кабель 2 штуки 1500 розетка 5 штук 300 итого 5000');
+      const st3 = bdbX.getState(uX.id);
+      ok(take().length === b3.length && !((st3.data || {}).items || []).length,
+        'А4: «итого 5000» при позициях на 4 500 — не выписываем, спрашиваем', JSON.stringify((st3.data || {}).items));
+      await tapX('menu');
+      bdbX.setAiEnabled(uX.id, false);
+      for (const [k, v] of keepEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    }
+
     // 5. «✅ Выписать» по напоминанию дважды — один документ.
     const rid = recX.add(uX.id, { cpId: cpX, type: 'sch', day: 1, items: [{ name: 'Аренда', qty: 1, price: 1000 }] });
     const docs0 = bdbX.listDocs(uX.id, 100).length;
