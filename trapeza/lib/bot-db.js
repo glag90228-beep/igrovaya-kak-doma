@@ -196,10 +196,12 @@ function migrate() {
     CREATE INDEX IF NOT EXISTS docs_removed_user ON docs_removed(user_id, created_at);
     -- Основание накладных и УПД, которое запомнено за клиентом (см. basisFor).
     CREATE TABLE IF NOT EXISTS cp_basis (
-      user_id INTEGER NOT NULL,
-      cp_id   INTEGER NOT NULL,
-      basis   TEXT    NOT NULL,
-      PRIMARY KEY (user_id, cp_id)
+      user_id  INTEGER NOT NULL,
+      cp_id    INTEGER NOT NULL,
+      org_id   INTEGER NOT NULL,            -- основание договора одной фирмы с клиентом не годится другой
+      basis    TEXT    NOT NULL DEFAULT '', -- пусто — сброшено, но отметка since_id нужна
+      since_id INTEGER NOT NULL DEFAULT 0,  -- «три раза» считаются только по документам новее этого
+      PRIMARY KEY (user_id, cp_id, org_id)
     );
     -- Подсказки позиций, которые человек убрал: cp_id = 0 — для всех клиентов.
     CREATE TABLE IF NOT EXISTS item_hidden (
@@ -3496,21 +3498,35 @@ const cleanBasis = (v) => String(v || '').replace(/\s+/g, ' ').trim().slice(0, 2
 // Сколько раз подряд одно и то же основание должно встретиться, чтобы его запомнили.
 const BASIS_LEARN_AFTER = 3;
 
-/** Запомненное за клиентом основание накладных и УПД; пусто — не запомнено. */
-function basisFor(userId, cpId) {
-  const row = db.prepare('SELECT basis FROM cp_basis WHERE user_id = ? AND cp_id = ?').get(userId, Number(cpId));
+const orgIdOf = (userId, orgId) => (orgId == null ? currentOrgId(userId) : Number(orgId) || 0);
+
+/** Самый свежий документ клиента, у которого есть графа «основание». */
+function lastBasisDocId(userId, cpId, orgId) {
+  return db.prepare("SELECT COALESCE(MAX(id), 0) AS n FROM documents WHERE user_id = ? AND cp_id = ? AND org_id = ? AND type IN ('torg12', 'upd')")
+    .get(userId, Number(cpId), orgId).n;
+}
+
+/** Запомненное основание накладных и УПД клиента у этой фирмы; пусто — не запомнено. */
+function basisFor(userId, cpId, orgId = null) {
+  const row = db.prepare('SELECT basis FROM cp_basis WHERE user_id = ? AND cp_id = ? AND org_id = ?')
+    .get(userId, Number(cpId), orgIdOf(userId, orgId));
   return row ? row.basis : '';
 }
 
-/** Задать или сбросить (пустая строка) основание клиента. */
-function setBasisFor(userId, cpId, basis) {
+/**
+ * Задать или сбросить (пустая строка) основание клиента.
+ *
+ * С отметкой «с этого документа»: «три раза подряд» после явного выбора
+ * человека считаются заново. Иначе сброшенное тут же запоминалось бы снова —
+ * старых накладных с прежним основанием уже три и больше.
+ */
+function setBasisFor(userId, cpId, basis, orgId = null) {
   if (!getCp(userId, Number(cpId))) return '';
+  const org = orgIdOf(userId, orgId);
   const b = cleanBasis(basis);
-  if (!b) db.prepare('DELETE FROM cp_basis WHERE user_id = ? AND cp_id = ?').run(userId, Number(cpId));
-  else {
-    db.prepare(`INSERT INTO cp_basis(user_id, cp_id, basis) VALUES (?, ?, ?)
-                ON CONFLICT(user_id, cp_id) DO UPDATE SET basis = excluded.basis`).run(userId, Number(cpId), b);
-  }
+  db.prepare(`INSERT INTO cp_basis(user_id, cp_id, org_id, basis, since_id) VALUES (?, ?, ?, ?, ?)
+              ON CONFLICT(user_id, cp_id, org_id) DO UPDATE SET basis = excluded.basis, since_id = excluded.since_id`)
+    .run(userId, Number(cpId), org, b, lastBasisDocId(userId, cpId, org));
   return b;
 }
 
@@ -3518,21 +3534,39 @@ function setBasisFor(userId, cpId, basis) {
  * Основание, которое человек вписывает руками раз за разом, запоминаем.
  * Вызывается после выписки документа с основанием, которое он ввёл сам:
  * в третий раз за клиента — и дальше оно подставляется само.
- * exceptDocId — документ, который этим заменяется: его считать дважды нельзя.
+ * exceptDocId — заменённый документ, его считать нельзя.
  * @returns {boolean} запомнено только что
  */
-function learnBasis(userId, cpId, basis, exceptDocId = 0) {
+function learnBasis(userId, cpId, basis, exceptDocId = 0, orgId = null) {
   const b = cleanBasis(basis);
-  if (!b || normBasis(basisFor(userId, cpId)) === normBasis(b)) return false;
-  const rows = db.prepare("SELECT payload FROM documents WHERE user_id = ? AND cp_id = ? AND type IN ('torg12', 'upd') AND id <> ?")
-    .all(userId, Number(cpId), Number(exceptDocId) || 0);
+  const org = orgIdOf(userId, orgId);
+  if (!b || normBasis(basisFor(userId, cpId, org)) === normBasis(b)) return false;
+  const row = db.prepare('SELECT since_id FROM cp_basis WHERE user_id = ? AND cp_id = ? AND org_id = ?').get(userId, Number(cpId), org);
+  const rows = db.prepare("SELECT payload FROM documents WHERE user_id = ? AND cp_id = ? AND org_id = ? AND type IN ('torg12', 'upd') AND id > ? AND id <> ?")
+    .all(userId, Number(cpId), org, row ? row.since_id : 0, Number(exceptDocId) || 0);
   let n = 0;
   for (const r of rows) {
     try { if (normBasis(JSON.parse(r.payload || '{}').basis) === normBasis(b)) n += 1; } catch (_) { /* битый payload — не считаем */ }
   }
   if (n < BASIS_LEARN_AFTER) return false;
-  setBasisFor(userId, cpId, b);
+  setBasisFor(userId, cpId, b, org);
   return true;
+}
+
+/**
+ * Расписания клиента с накладными и УПД хранят свои копии полей, в том числе
+ * основание. Без этого после смены основания расписание выписывало бы
+ * следующие накладные по-старому.
+ */
+function applyBasisToRules(userId, cpId, basis) {
+  const b = cleanBasis(basis);
+  for (const r of db.prepare("SELECT id, extra FROM recurring WHERE user_id = ? AND cp_id = ? AND type IN ('torg12', 'upd')")
+    .all(userId, Number(cpId))) {
+    let e = {};
+    try { e = JSON.parse(r.extra || '{}'); } catch (_) { e = {}; }
+    if (b) e.basis = b; else delete e.basis;
+    db.prepare('UPDATE recurring SET extra = ? WHERE id = ?').run(JSON.stringify(e), r.id);
+  }
 }
 
 /** Накладные и УПД клиента у текущей фирмы: {id, number, date, type, basis}. */
@@ -3683,6 +3717,6 @@ module.exports = {
   setNoDebt, shipmentsOfMonth, monthActOf, monthActsOf, openShipmentsOfMonth,
   nextSeqForOrg, saveDoc, listDocs, repeatSources, REPEATABLE, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, seedItems, listTemplates, getTemplate, forgetTemplate,
-  suggestItems, clientItems, hideItem, unhideItems, basisFor, setBasisFor, learnBasis, basisDocs, applyBasis,
+  suggestItems, clientItems, hideItem, unhideItems, basisFor, setBasisFor, learnBasis, basisDocs, applyBasis, applyBasisToRules,
   quota, docsThisMonth, freePerMonth,
 };

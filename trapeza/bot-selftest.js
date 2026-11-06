@@ -2010,14 +2010,42 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       // Кнопки в боте: подсказка по клиенту, а не общий список.
       await tap(`d.torg12:${cpB}`);
       ok(Boolean(button('Обед')) && !button('Канапе') , 'в боте на ТОРГ-12 клиента кнопка «Обед» без канапе', last());
-      await tap('ci:0');
+      await tap(button('Обед'));
       ok(/Сколько\?/.test(last()) && /450/.test(last()), 'нажатие подсказки спрашивает количество, цена — клиентская', last());
       await say('7');
       const stB = bdbB.getState(uidB);
       ok(stB && stB.data.items.length === 1 && stB.data.items[0].qty === 7 && stB.data.items[0].price === 450, 'позиция добавлена: 7 × 450');
       await tap('ci.hide');
       ok(Boolean(button('Обед')) && /Какую позицию убрать/.test(last()), 'можно убрать лишнюю подсказку кнопкой');
+      // Нажатие по метке, а не по номеру: порядок подсказок меняется, позиция та же.
+      const hideTag = button('Обед');
+      ok(/^ci\.x:[0-9a-f]{6}$/.test(hideTag), 'кнопка «убрать» несёт метку позиции, а не номер', hideTag);
       await tap('menu');
+
+      // Связи основания: сброс не отменяется повтором, замена не «вводит» основание,
+      // основание принадлежит паре «фирма — клиент», расписание берёт новое.
+      {
+        const cpR = bdbB.createCp(uidB, { name: 'ООО Связи', kind: 'customer', opening_date: '2026-01-01' });
+        const X = 'Договор № 1 от 01.01.2026';
+        for (let i = 0; i < 3; i += 1) await mkT(cpR, { basis: X });
+        ok(bdbB.basisFor(uidB, cpR) === X, 'связи: основание запомнено');
+        bdbB.setBasisFor(uidB, cpR, '');
+        const rep1 = await mkT(cpR, { basis: X });   // повтор старой накладной несёт прежнее основание
+        ok(bdbB.basisFor(uidB, cpR) === '' && !rep1.basisLearned, 'после сброса повтор старой накладной основание не возвращает');
+        for (let i = 0; i < 2; i += 1) await mkT(cpR, { basis: X });
+        ok(bdbB.basisFor(uidB, cpR) === X, 'а три новых с тем же — запоминают заново');
+        const old = bdbB.basisDocs(uidB, cpR).slice(-1)[0];
+        const replaced = await docSvc.replaceDocument(uidB, old.id, { items: [{ name: 'Обед', unit: 'чел.', qty: 1, price: 100 }], extra: { basis: 'Другое' } });
+        ok(replaced.ok && !replaced.basisLearned, 'исправление документа основание не запоминает');
+        bdbB.setBasisFor(uidB, cpR, 'Фирма А', 901);
+        ok(bdbB.basisFor(uidB, cpR, 901) === 'Фирма А' && bdbB.basisFor(uidB, cpR, 902) === '', 'основание принадлежит паре «фирма — клиент»');
+        const rec = require('./lib/recurring');
+        const ruleId = rec.add(uidB, { cpId: cpR, type: 'torg12', items: [{ name: 'Обед', unit: 'чел.', qty: 1, price: 100 }], extra: { basis: X }, day: 5 });
+        bdbB.applyBasisToRules(uidB, cpR, 'Новое для расписания');
+        ok((rec.get(uidB, ruleId) || {}).extra.basis === 'Новое для расписания', 'расписание накладных получило новое основание');
+        bdbB.applyBasisToRules(uidB, cpR, '');
+        ok(!(rec.get(uidB, ruleId) || {}).extra.basis, 'а при сбросе — потеряло его');
+      }
 
       // Основание всем накладным клиента: только надпись, суммы и долг не меняются.
       const before = bdbB.basisDocs(uidB, cpB);

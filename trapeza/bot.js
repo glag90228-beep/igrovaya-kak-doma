@@ -959,6 +959,10 @@ const { ITEM_DOCS } = docService;
  * Подсказки позиций для текущего набора: что выписывали ЭТОМУ клиенту в
  * таком же документе (см. bdb.suggestItems). Клиент и вид — из состояния.
  */
+// Короткая метка позиции для кнопки: порядок подсказок меняется (убрали одну,
+// выписали документ), и номер в списке указал бы на другую позицию.
+const itemTag = (name) => require('node:crypto').createHash('md5').update(String(name).trim().toLowerCase()).digest('hex').slice(0, 6);
+
 function suggestionsOf(user) {
   const st = bdb.getState(user.id);
   const [, type, cpId] = String((st && st.state) || '').split(':');
@@ -967,8 +971,8 @@ function suggestionsOf(user) {
 
 /** Клавиатура набора позиций: частые позиции кнопками + управление. */
 function itemsKb(user, data) {
-  const rows = suggestionsOf(user).map((t, i) => ([{
-    text: `➕ ${t.name} · ${formatRub(t.price)}`.slice(0, 60), data: t.tplId ? `tpl:${t.tplId}` : `ci:${i}`,
+  const rows = suggestionsOf(user).map((t) => ([{
+    text: `➕ ${t.name} · ${formatRub(t.price)}`.slice(0, 60), data: t.tplId ? `tpl:${t.tplId}` : `ci:${itemTag(t.name)}`,
   }]));
   if (rows.length) rows.push([{ text: '🧹 Убрать лишнее из подсказок', data: 'ci.hide' }]);
   if (data.items.length) {
@@ -7494,15 +7498,16 @@ async function handleCallback(tg, cq) {
       bdb.setState(user.id, state.state, state.data);
       await tg.sendMessage(chatId, 'Напишите основание — например, '
         + '<code>Договор поставки № 7 от 01.09.2026</code> или <code>Заказ № 45</code>.\n'
-        + '<i>Отправьте «-», чтобы печатать договор из карточки клиента, а без него — «Без договора».</i>');
+        + '<i>Отправьте «-» — подставлю запомненное для клиента основание, а если его нет, '
+        + 'договор из карточки (без него — «Без договора»).</i>');
       return;
     }
     // Позиция из подсказок по клиенту (то, что выписывали ему раньше).
     if (data.startsWith('ci:')) {
       const state = bdb.getState(user.id);
       if (!state.state.startsWith('items:')) return;
-      const t = suggestionsOf(user)[Number(data.slice(3))];
-      if (!t || t.tplId) { await tg.sendMessage(chatId, 'Подсказка устарела — нажмите позицию заново.', itemsKb(user, state.data)); return; }
+      const t = suggestionsOf(user).find((x) => !x.tplId && itemTag(x.name) === data.slice(3));
+      if (!t) { await tg.sendMessage(chatId, 'Подсказка устарела — нажмите позицию заново.', itemsKb(user, state.data)); return; }
       if (!(t.price > 0)) {
         state.data.ask = 'np'; state.data.pending = { name: t.name, unit: t.unit };
         bdb.setState(user.id, state.state, state.data);
@@ -7521,7 +7526,7 @@ async function handleCallback(tg, cq) {
       const cpId = Number(state.state.split(':')[2]) || 0;
       const list = suggestionsOf(user);
       if (data.startsWith('ci.x:')) {
-        const t = list[Number(data.slice(5))];
+        const t = list.find((x) => itemTag(x.name) === data.slice(5));
         if (t) {
           bdb.hideItem(user.id, cpId, t.name, { global: !t.own });
           await tg.sendMessage(chatId, `Убрал «${esc(t.name)}» из подсказок.`, itemsKb(user, state.data));
@@ -7530,7 +7535,7 @@ async function handleCallback(tg, cq) {
       }
       if (!list.length) { await tg.sendMessage(chatId, 'Подсказок нет.', itemsKb(user, state.data)); return; }
       await tg.sendMessage(chatId, 'Какую позицию убрать из подсказок? Сами документы это не меняет.',
-        keyboard([...list.map((t, i) => ([{ text: `🗑 ${t.name}`.slice(0, 60), data: `ci.x:${i}` }])),
+        keyboard([...list.map((t) => ([{ text: `🗑 ${t.name}`.slice(0, 60), data: `ci.x:${itemTag(t.name)}` }])),
           [{ text: '⬅️ Назад к позициям', data: 'ci.back' }]]));
       return;
     }
@@ -7793,6 +7798,7 @@ async function handleCallback(tg, cq) {
     if (/^cb\.reset:\d+$/.test(data)) {
       const cpId = Number(data.slice(9));
       bdb.setBasisFor(user.id, cpId, '');
+      bdb.applyBasisToRules(user.id, cpId, '');
       await tg.sendMessage(chatId, 'Сбросил: дальше печатаю договор из карточки клиента.');
       await showCpBasis(tg, chatId, user, cpId);
       return;
@@ -7806,6 +7812,7 @@ async function handleCallback(tg, cq) {
       if (!basis || !bdb.getCp(user.id, cpId)) { await tg.sendMessage(chatId, 'Основание потерялось — задайте заново.', mainMenu()); return; }
       bdb.clearState(user.id);
       bdb.setBasisFor(user.id, cpId, basis);
+      bdb.applyBasisToRules(user.id, cpId, basis);   // расписание тоже выписывает с новым
       if (scope === 'new') {
         await tg.sendMessage(chatId, `Готово: новые накладные и УПД этого клиента — с основанием «${esc(basis)}».`);
         return;

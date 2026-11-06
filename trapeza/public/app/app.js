@@ -6165,12 +6165,16 @@ screens.new = async function newDoc(params) {
    * «×» убирает подсказку.
    */
   const chipsBox = h('div', {});
+  let chipsAsk = 0;
   async function drawChips() {
+    // Ответы на частую смену клиента могут прийти не по порядку: рисуем только последний.
+    const mine = ++chipsAsk;
     let list = [];
     try {
       const r = await api('GET', `/api/templates?cpId=${draft.cpId || 0}&type=${encodeURIComponent(type)}`);
       list = r.templates || [];
     } catch (_) { list = []; }
+    if (mine !== chipsAsk) return;
     chipsBox.textContent = '';
     if (!list.length) return;
     chipsBox.append(h('div', { class: 'section-title', text: draft.cpId && !list[0].global ? 'Выписывали этому клиенту' : 'Частые позиции' }));

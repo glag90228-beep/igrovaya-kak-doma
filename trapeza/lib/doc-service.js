@@ -415,7 +415,7 @@ async function issueDocument(userId, {
    */
   const typedBasis = ['torg12', 'upd'].includes(type) ? String(fields.basis || '').trim() : '';
   if (['torg12', 'upd'].includes(type) && !typedBasis) {
-    const known = bdb.basisFor(userId, cp.id);
+    const known = bdb.basisFor(userId, cp.id, org.id);
     if (known) fields = { ...fields, basis: known };
   }
 
@@ -520,7 +520,10 @@ async function issueDocument(userId, {
 
   bdb.rememberItems(userId, clean);
   bdb.unhideItems(userId, cp.id, clean);
-  const basisLearned = typedBasis && bdb.learnBasis(userId, cp.id, typedBasis, replaceId) ? typedBasis : '';
+  // Исправление документа основание не «вводит»: оно уже было в прежнем. Повтор и
+  // расписание несут его из старого документа, а «три раза» они не должны ни копить,
+  // ни перебивать выбор человека, поэтому учёт идёт только по документам новее его выбора.
+  const basisLearned = typedBasis && !replaceId && bdb.learnBasis(userId, cp.id, typedBasis, 0, org.id) ? typedBasis : '';
 
   // Долг в журнал — если этот тип документа его создаёт при выбранном
   // основании. Проводка привязана к документу: её видно, можно отменить,
