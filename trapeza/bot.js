@@ -1725,30 +1725,20 @@ async function sendArchive(tg, chatId, user, periodName, kind) {
  * Новых документов не появляется, поэтому лимит не тратится.
  */
 async function sendDocsZip(tg, chatId, user, docs, { name, what }) {
-  const take = docs.slice(0, ARCHIVE_MAX);
-  await tg.sendMessage(chatId, `Собираю ${take.length} ${plural(take.length, 'файл', 'файла', 'файлов')} — это займёт до минуты…`);
+  const take = Math.min(docs.length, docService.ZIP_MAX);
+  await tg.sendMessage(chatId, `Собираю ${take} ${plural(take, 'файл', 'файла', 'файлов')} — это займёт до минуты…`);
   await tg.sendChatAction(chatId, 'upload_document');
-  const files = {};
-  const failed = [];
-  for (const d of take) {
-    const res = await docService.rebuildDocument(user.id, d.id).catch(() => null);
-    if (!res || !res.ok || !res.file) { failed.push(`№ ${d.number}`); continue; }
-    // Одинаковые имена у двух документов одному клиенту — архив не должен их склеить.
-    let fname = res.file.filename;
-    for (let i = 2; files[fname]; i += 1) fname = res.file.filename.replace(/(\.\w+)$/, `_${i}$1`);
-    files[fname] = res.file.buffer;
-  }
-  if (!Object.keys(files).length) {
+  const z = await docService.zipDocs(user.id, docs);
+  if (!z) {
     await tg.sendMessage(chatId, 'Не получилось собрать ни одного файла. Попробуйте позже.', mainMenu());
     return;
   }
-  const sum = round2(take.reduce((a2, d) => a2 + (Number(d.total) || 0), 0));
   await tg.sendDocument(chatId, {
     filename: name,
-    buffer: require('./lib/zip').makeZip(files),
-    caption: `${what}: <b>${Object.keys(files).length}</b> на <b>${formatRub(sum)}</b>.`
-      + (docs.length > take.length ? `\nВ архиве первые ${take.length} — остальные выберите по месяцам.` : '')
-      + (failed.length ? `\nНе собрались: ${esc(failed.join(', '))}.` : ''),
+    buffer: z.buffer,
+    caption: `${what}: <b>${z.count}</b> на <b>${formatRub(z.sum)}</b>.`
+      + (z.cut ? `\nВ архиве первые ${take} — остальные выберите по месяцам.` : '')
+      + (z.failed.length ? `\nНе собрались: ${esc(z.failed.join(', '))}.` : ''),
   });
 }
 

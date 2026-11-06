@@ -3425,19 +3425,21 @@ const normName = (v) => String(v || '').replace(/\s+/g, ' ').trim().toLowerCase(
  * ЭТОМУ клиенту именно в таком документе — первым, цена — последняя, какую
  * ему ставили.
  */
-function clientItems(userId, cpId, type, limit = 6) {
-  const hidden = new Set(db.prepare('SELECT name FROM item_hidden WHERE user_id = ? AND cp_id IN (?, 0)')
+function clientItems(userId, cpId, type, limit = 6, { ignoreHidden = false } = {}) {
+  const hidden = new Set(ignoreHidden ? [] : db.prepare('SELECT name FROM item_hidden WHERE user_id = ? AND cp_id IN (?, 0)')
     .all(userId, Number(cpId)).map((r) => normName(r.name)));
   const rows = db.prepare('SELECT type, payload FROM documents WHERE user_id = ? AND cp_id = ? ORDER BY id DESC LIMIT 60')
     .all(userId, Number(cpId));
   const seen = new Map();
+  let hadSame = false;   // в таких документах позиции были, но все убраны
   for (const r of rows) {
     let items = [];
     try { items = (JSON.parse(r.payload || '{}').items) || []; } catch (_) { items = []; }
     for (const it of items) {
       const name = String((it && it.name) || '').trim();
       const key = normName(name);
-      if (!key || hidden.has(key)) continue;
+      if (!key) continue;
+      if (hidden.has(key)) { if (r.type === type) hadSame = true; continue; }
       let e = seen.get(key);
       if (!e) {
         // Строки идут от новых к старым, поэтому первая встреча — самая свежая цена.
@@ -3452,7 +3454,8 @@ function clientItems(userId, cpId, type, limit = 6) {
   // Есть позиции именно из такого документа — остальные не предлагаем:
   // обеды из накладных не должны делить кнопки с канапе из чужих счетов.
   const same = list.filter((e) => e.same > 0);
-  if (same.length) list = same;
+  // Убрали всё, что было в таких документах, — пусто, а не позиции из других документов клиента.
+  if (same.length || hadSame) list = same;
   list.sort((a, b) => b.same - a.same || b.count - a.count || a.order - b.order);
   return list.slice(0, limit);
 }
@@ -3466,6 +3469,9 @@ function suggestItems(userId, cpId, type, limit = 6) {
   if (Number(cpId)) {
     const own = clientItems(userId, cpId, type, limit);
     if (own.length) return own.map((e) => ({ name: e.name, unit: e.unit, price: e.price, own: true }));
+    // История у клиента есть, но всё из неё убрано, — пусто и остаётся. Общий список
+    // вернул бы ровно то лишнее, от чего человек избавлялся; он только для клиента без истории.
+    if (clientItems(userId, cpId, type, 1, { ignoreHidden: true }).length) return [];
   }
   const hidden = new Set(db.prepare('SELECT name FROM item_hidden WHERE user_id = ? AND cp_id = 0')
     .all(userId).map((r) => normName(r.name)));
@@ -3573,12 +3579,12 @@ function applyBasisToRules(userId, cpId, basis) {
 function basisDocs(userId, cpId, from = '', to = '') {
   const org = currentOrgId(userId);
   const out = [];
-  for (const r of db.prepare("SELECT id, type, number, date, payload FROM documents WHERE user_id = ? AND cp_id = ? AND org_id = ? AND type IN ('torg12', 'upd') ORDER BY date, id")
+  for (const r of db.prepare("SELECT id, type, number, date, total, payload FROM documents WHERE user_id = ? AND cp_id = ? AND org_id = ? AND type IN ('torg12', 'upd') ORDER BY date, id")
     .all(userId, Number(cpId), org)) {
     if ((from && r.date < from) || (to && r.date > to)) continue;
     let p = {};
     try { p = JSON.parse(r.payload || '{}'); } catch (_) { p = {}; }
-    out.push({ id: r.id, type: r.type, number: r.number, date: r.date, basis: p.basis || '' });
+    out.push({ id: r.id, type: r.type, number: r.number, date: r.date, total: r.total, basis: p.basis || '' });
   }
   return out;
 }

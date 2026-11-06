@@ -926,6 +926,38 @@ async function replaceDocument(userId, oldId, { items, date, number, extra = {} 
   return { ...res, replaced: { id: old.id, number: old.number, wasPaid: Boolean(old.paid_at) } };
 }
 
+/** Потолок файлов в одном архиве: каждый — это отрисованный PDF. */
+const ZIP_MAX = 80;
+
+/**
+ * Файлы выписанных документов — одним ZIP, собранные заново из журнала.
+ * Общая для бота и приложения: новых документов не появляется, лимит не тратится.
+ * @returns {Promise<{buffer:Buffer, count:number, sum:number, failed:string[], cut:boolean}|null>}
+ *   null — ни один файл не собрался
+ */
+async function zipDocs(userId, docs, max = ZIP_MAX) {
+  const take = docs.slice(0, max);
+  const files = {};
+  const failed = [];
+  for (const d of take) {
+    const res = await rebuildDocument(userId, d.id).catch(() => null);
+    if (!res || !res.ok || !res.file) { failed.push(`№ ${d.number}`); continue; }
+    // Одинаковые имена у двух документов одному клиенту — архив не должен их склеить.
+    let name = res.file.filename;
+    for (let i = 2; files[name]; i += 1) name = res.file.filename.replace(/(\.\w+)$/, `_${i}$1`);
+    files[name] = res.file.buffer;
+  }
+  const count = Object.keys(files).length;
+  if (!count) return null;
+  return {
+    buffer: require('./zip').makeZip(files),
+    count,
+    sum: Math.round(take.reduce((a, d) => a + (Number(d.total) || 0), 0) * 100) / 100,
+    failed,
+    cut: docs.length > take.length,
+  };
+}
+
 /** Сменить номер выписанного документа и собрать файл заново — уже с новым номером. */
 async function renumberDocument(userId, id, number) {
   const r = bdb.renumberDoc(userId, Number(id), number);
@@ -936,6 +968,6 @@ async function renumberDocument(userId, id, number) {
 
 module.exports = {
   ITEM_DOCS, OTHER_DOCS, ALL_DOCS,
-  issueDocument, issueFlat, issuePlain, rebuildDocument, renderFile, stampFor, replaceDocument, renumberDocument,
+  issueDocument, issueFlat, issuePlain, rebuildDocument, renderFile, stampFor, replaceDocument, renumberDocument, zipDocs, ZIP_MAX,
   totalOf, plannedTotal, vatFieldsFor, cleanItems, itemsProblem, pickDate, safeName, todayISO, reusablePayload,
 };

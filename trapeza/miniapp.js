@@ -2373,6 +2373,63 @@ const api = {
     };
   },
 
+  /**
+   * Основание накладных и УПД клиента: что запомнено и сколько документов затронет.
+   * «Прошлый месяц» — те же границы, что у архива в боте (lib/period.js).
+   */
+  async 'GET /api/cp/basis'({ user, url }) {
+    const cpId = Number(url.searchParams.get('cpId')) || 0;
+    const cp = bdb.getCp(user.id, cpId);
+    if (!cp) return { error: 'Клиент не найден.' };
+    const prev = require('./lib/period').presetRange('pm', require('./lib/period').todayDate(), { whole: true });
+    return {
+      basis: bdb.basisFor(user.id, cpId),
+      contract: cp.contract || '',
+      total: bdb.basisDocs(user.id, cpId).length,
+      prev: bdb.basisDocs(user.id, cpId, prev.from, prev.to).length,
+      prevTitle: periodTitle(prev.from, prev.to),
+    };
+  },
+
+  /**
+   * Задать основание клиента и, если просили, поставить его уже выписанным.
+   * scope: all — всем накладным и УПД клиента, prev — только за прошлый месяц,
+   * new — только на будущее, reset — сбросить запомненное. Это надпись в бланке:
+   * суммы, номера и долг не меняются. Исправленные файлы уходят в чат архивом
+   * (в фоне: сборка PDF дольше минуты, а прокси ждёт ответа не больше шестидесяти секунд).
+   */
+  async 'POST /api/cp/basis'({ user, body }) {
+    const cpId = Number(body.cpId) || 0;
+    if (!bdb.getCp(user.id, cpId)) return { error: 'Клиент не найден.' };
+    const scope = ['all', 'prev', 'new', 'reset'].includes(body.scope) ? body.scope : 'new';
+    const basis = scope === 'reset' ? '' : str(body.basis, 200).replace(/\s+/g, ' ').trim();
+    if (scope !== 'reset' && (!basis || /^[-—–]$/.test(basis))) return { error: 'Напишите основание текстом, например «Договор № 12 от 01.03.2026».', field: 'basis' };
+    bdb.setBasisFor(user.id, cpId, basis);
+    bdb.applyBasisToRules(user.id, cpId, basis);   // расписание тоже выписывает с новым
+    if (scope === 'new' || scope === 'reset') return { basis, changed: 0, files: false };
+    const p = require('./lib/period');
+    const r = scope === 'prev' ? p.presetRange('pm', p.todayDate(), { whole: true }) : { from: '', to: '' };
+    const ids = bdb.applyBasis(user.id, cpId, basis, r.from, r.to);
+    let files = false;
+    if (ids.length && tg && !basisZipBusy.has(user.id)) {
+      files = true;
+      basisZipBusy.add(user.id);
+      const docs = bdb.basisDocs(user.id, cpId, r.from, r.to);
+      docService.zipDocs(user.id, docs).then(async (z) => {
+        if (!z) return;
+        await tg.sendDocument(user.tg_id, {
+          filename: 'Накладные_с_новым_основанием.zip', buffer: z.buffer,
+          caption: `Накладные и УПД с новым основанием: ${z.count} на ${round2(z.sum)} ₽.`
+            + (z.cut ? ` В архиве первые ${docService.ZIP_MAX}.` : '')
+            + (z.failed.length ? ` Не собрались: ${escTg(z.failed.join(', '))}.` : ''),
+        });
+      }).catch((e) => {
+        office.record({ kind: 'crash', where: 'основание накладных (приложение)', error: e.message, userId: user.id }).catch(() => {});
+      }).finally(() => basisZipBusy.delete(user.id));
+    }
+    return { basis, changed: ids.length, files };
+  },
+
   /** Убрать подсказку позиции: у клиента, а у общих (без его истории) — совсем. */
   async 'POST /api/templates/hide'({ user, body }) {
     const cpId = Number(body.cpId) || 0;
@@ -2759,6 +2816,10 @@ const api = {
  */
 const files = new Map();
 const crypto = require('node:crypto');
+// Кто сейчас ждёт архив с новым основанием: второй такой запрос не запускаем,
+// иначе повторные нажатия поставят в очередь десятки сборок PDF.
+const basisZipBusy = new Set();
+
 function keepFile(userId, file) {
   const token = crypto.randomBytes(18).toString('base64url');
   files.set(token, { userId, file, until: Date.now() + 5 * 60 * 1000 });

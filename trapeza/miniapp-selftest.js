@@ -2355,6 +2355,57 @@ async function main() {
   r = await call('POST', '/api/cp', { body: { name: 'Без подписи' } });
   ok(r.status === 401, 'POST без подписи тоже не проходит', r.status);
 
+  section('основание накладных: запоминание и массовое изменение (приложение)');
+  {
+    const bdbX = require('./lib/bot-db');
+    const uidX = bdbX.getOrCreateUser(MASHA.id).id;
+    const day = new Date().toISOString().slice(0, 10);
+    let rX = await call('POST', '/api/cp', { user: masha, body: { name: 'ООО Основание Апп' } });
+    const cpX = (rX.json.cp || rX.json).id;
+    const X = 'Договор № 5 от 01.02.2026';
+    for (let i = 0; i < 3; i += 1) {
+      rX = await call('POST', '/api/doc', { user: masha, body: { type: 'torg12', cpId: cpX, date: day, basis: X, items: [{ name: 'Обед', unit: 'чел.', qty: 5, price: 450 }] } });
+    }
+    ok(rX.json && rX.json.doc, 'накладные выписаны из приложения', JSON.stringify(rX.json).slice(0, 120));
+    rX = await call('GET', '/api/cps', { user: masha });
+    ok((rX.json.cps.find((c) => c.id === cpX) || {}).basis === X, 'в третий раз основание запомнено и приходит в списке клиентов');
+    // Подсказки позиций: по клиенту и виду документа; убрать — только у себя.
+    rX = await call('GET', `/api/templates?cpId=${cpX}&type=torg12`, { user: masha });
+    ok(rX.json.templates.length === 1 && rX.json.templates[0].name === 'Обед' && rX.json.templates[0].price === 450 && rX.json.templates[0].global === false,
+      'подсказки клиента: его позиция и последняя цена', JSON.stringify(rX.json));
+    rX = await call('POST', '/api/templates/hide', { user: masha, body: { cpId: cpX, name: 'Обед', global: false } });
+    ok(rX.status === 200 && rX.json.ok === true, 'убрать подсказку принимается', `${rX.status} ${rX.text.slice(0, 100)}`);
+    rX = await call('GET', `/api/templates?cpId=${cpX}&type=torg12`, { user: masha });
+    ok(rX.json.templates.length === 0, 'и она больше не предлагается', JSON.stringify(rX.json));
+    rX = await call('POST', '/api/templates/hide', { user: petya, body: { cpId: cpX, name: 'Обед' } });
+    ok(Boolean(rX.json.error), 'чужому клиенту подсказки не убрать');
+    await bdbX.unhideItems(uidX, cpX, [{ name: 'Обед' }]);
+    rX = await call('GET', `/api/cp/basis?cpId=${cpX}`, { user: masha });
+    ok(rX.json.basis === X && rX.json.total === 3 && typeof rX.json.prevTitle === 'string', 'экран основания: что запомнено и сколько документов', JSON.stringify(rX.json));
+    rX = await call('GET', `/api/cp/basis?cpId=${cpX}`, { user: petya });
+    ok(Boolean(rX.json.error), 'чужого клиента не показывает');
+    rX = await call('POST', '/api/cp/basis', { user: petya, body: { cpId: cpX, basis: 'Взлом', scope: 'all' } });
+    ok(Boolean(rX.json.error) && bdbX.basisFor(uidX, cpX) === X, 'чужой клиент: изменить основание нельзя, у владельца оно прежнее');
+    rX = await call('POST', '/api/cp/basis', { user: masha, body: { cpId: cpX, basis: '  ', scope: 'all' } });
+    ok(Boolean(rX.json.error) && rX.json.field === 'basis', 'пустое основание не принимается');
+
+    const balX = bdbX.balanceOf(uidX, cpX).closing;
+    const chatBefore = sentToChat.length;
+    rX = await call('POST', '/api/cp/basis', { user: masha, body: { cpId: cpX, basis: 'Договор № 9 от 15.10.2026', scope: 'all' } });
+    ok(rX.json.changed === 3 && rX.json.files === true, 'основание поставлено у трёх накладных, файлы пойдут в чат', JSON.stringify(rX.json));
+    ok(bdbX.basisDocs(uidX, cpX).every((d) => d.basis === 'Договор № 9 от 15.10.2026') && bdbX.basisFor(uidX, cpX) === 'Договор № 9 от 15.10.2026',
+      'у всех накладных клиента новое основание, и оно запомнено');
+    ok(bdbX.balanceOf(uidX, cpX).closing === balX, 'долг не изменился');
+    for (let i = 0; i < 150 && sentToChat.length === chatBefore; i += 1) await new Promise((r) => setTimeout(r, 100));
+    const zipX = sentToChat[sentToChat.length - 1] || {};
+    ok(/\.zip$/.test(zipX.filename || '') && /3 на/.test(zipX.caption || ''), 'архив с исправленными файлами пришёл в чат', `${zipX.filename} ${zipX.caption}`);
+    rX = await call('POST', '/api/cp/basis', { user: masha, body: { cpId: cpX, basis: 'Заказ № 1', scope: 'new' } });
+    ok(rX.json.changed === 0 && bdbX.basisFor(uidX, cpX) === 'Заказ № 1' && bdbX.basisDocs(uidX, cpX)[0].basis === 'Договор № 9 от 15.10.2026',
+      '«только на будущее»: выписанные не тронуты, новое запомнено');
+    rX = await call('POST', '/api/cp/basis', { user: masha, body: { cpId: cpX, scope: 'reset' } });
+    ok(rX.json.changed === 0 && bdbX.basisFor(uidX, cpX) === '', 'сброс убирает запомненное');
+  }
+
   section('ограничение частоты');
   const flood = [];
   for (let i = 0; i < 130; i += 1) flood.push(call('GET', '/api/templates', { user: petya }));

@@ -659,6 +659,43 @@ const ok = (c, m, extra) => {
     bdb.updateOrg(user.id, bdb.getDefaultOrg(user.id).id, { vat_rate: '', vat_gross: 0, npd: 0 });
   }
 
+  /*
+   * Подсказки позиций по клиенту и экран «Основание накладных» — в настоящем
+   * браузере. Подсказки раньше брались по всему аккаунту: на накладную лезло
+   * канапе из чужих счетов. Экран основания — отдельный путь «применить ко
+   * всем выписанным», которого в приложении не было.
+   */
+  console.log('\n── подсказки позиций по клиенту, экран основания накладных ──');
+  {
+    forgetRate();
+    const cpS = bdb.createCp(user.id, { name: 'ООО Подсказки', kind: 'customer', opening_date: '2026-01-01' });
+    await docService.issueDocument(user.id, { type: 'torg12', cpId: cpS, items: [{ name: 'Обед деловой', unit: 'чел.', qty: 5, price: 450 }], skipQuota: true, extra: { basis: 'Договор № 3' } });
+    await docService.issueDocument(user.id, { type: 'sch', cpId: cpS, items: [{ name: 'Канапе ассорти', unit: 'шт.', qty: 20, price: 650 }], skipQuota: true });
+    await page.evaluate((cpId) => window.__go('new', { type: 'torg12', cpId }), cpS);
+    await page.waitForSelector('.chips .chip');
+    const chips = await page.locator('.chips .chip:not(.chip-x)').allInnerTexts();
+    ok(chips.length === 1 && /Обед деловой/.test(chips[0]) && !/Канапе/.test(chips.join('|')),
+      'на накладную клиента — его позиция из накладных, без канапе из счетов', chips.join(' | '));
+    await page.locator('.chips .chip:not(.chip-x)').first().click();
+    const row = await page.locator('.item input.name').first().inputValue();
+    ok(row === 'Обед деловой', 'нажатие подсказки ставит позицию в форму', row);
+    await page.locator('.chip-x').first().click();
+    await page.waitForTimeout(600);
+    const left = await page.locator('.chips .chip:not(.chip-x)').allInnerTexts();
+    ok(left.length === 0, '«×» убирает подсказку', left.join(' | '));
+
+    await page.evaluate((cpId) => window.__go('cbasis', { cpId }), cpS);
+    await page.waitForSelector('#cb-now');
+    ok(Boolean(await page.locator('#cb-all').count()) && Boolean(await page.locator('#cb-new').count()),
+      'экран основания: «Всем выписанным» и «Только на будущее»');
+    await page.locator('#f-basis').fill('Договор № 77 от 01.11.2026');
+    await page.locator('#cb-all').click();
+    await page.waitForTimeout(800);
+    ok(bdb.basisDocs(user.id, cpS).every((d) => d.basis === 'Договор № 77 от 01.11.2026')
+      && bdb.basisFor(user.id, cpS) === 'Договор № 77 от 01.11.2026',
+    'нажатие «Всем выписанным» ставит основание и запоминает его', JSON.stringify(bdb.basisDocs(user.id, cpS).map((d) => d.basis)));
+  }
+
   console.log('\n── форма позиции, поля, контраст, цели нажатия (Д6, Д9, Д26, Д27, Р13) ──');
   {
     forgetRate();

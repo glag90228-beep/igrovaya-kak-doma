@@ -291,7 +291,7 @@ const PARENT = {
   billing: 'more', support: 'more', help: 'more', vat: 'more', basis: 'more',
   recurring: 'more', reminders: 'more', registry: 'docs', akt: 'docs',
   unpaid: 'home', scan: 'docs', ops: 'cps', opcard: 'cps', prepay: 'cps', ask: 'home', bankclose: 'debts',
-  debts: 'more', monthact: 'cps', cheques: 'home',
+  debts: 'more', monthact: 'cps', cheques: 'home', cbasis: 'cps',
 };
 
 /*
@@ -2403,6 +2403,41 @@ function prepayBlock(cp, rep) {
 }
 
 /** Внести или пополнить предоплату: сумма, дата и договор, по которому внесли. */
+screens.cbasis = async function cbasisScreen({ cpId }) {
+  const [{ cps }, info] = await Promise.all([api('GET', '/api/cps'), api('GET', `/api/cp/basis?cpId=${Number(cpId) || 0}`)]);
+  const cp = cps.find((c) => c.id === Number(cpId));
+  if (!cp) return empty('warn', 'Клиент не найден');
+  const box = h('div', {}, h('h1', { text: 'Основание накладных' }));
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Клиент' }), h('span', { class: 'ellipsis', text: cp.name })),
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Сейчас' }),
+      h('span', { class: 'ellipsis', id: 'cb-now', text: info.basis || (info.contract ? `договор из карточки: ${info.contract}` : 'без договора') })),
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Накладных и УПД выписано' }), h('span', { text: String(info.total) }))));
+  const basis = field('basis', 'Основание', info.basis || '', { placeholder: 'Договор № 12 от 01.03.2026' });
+  box.append(h('div', { class: 'card' }, basis));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Это надпись в бланке: суммы, номера и долг не меняются. Само запоминается, если вписать одно и то же основание в три накладные подряд.' }));
+
+  const run = (scope, btn) => withBusy(btn, async () => {
+    clearErrors({ basis });
+    const value = basis.input.value.trim();
+    if (scope !== 'reset' && !value) { showError(basis, 'Напишите основание'); return; }
+    const r = await api('POST', '/api/cp/basis', { cpId: cp.id, basis: value, scope });
+    haptic('medium');
+    if (scope === 'reset') toast('Сбросил: дальше печатаю договор из карточки');
+    else if (!r.changed) toast('Готово: новые накладные и УПД — с этим основанием');
+    else toast(r.files ? `Основание поставлено у ${r.changed}. Исправленные файлы придут в чат архивом` : `Основание поставлено у ${r.changed}`, false, 6000);
+    reset('cp', { id: cp.id });
+  });
+  const mk = (id, cls, text, scope) => { const b = h('button', { class: cls, id }, text); b.onclick = () => run(scope, b); return b; };
+  box.append(h('div', { class: 'btn-col' },
+    info.total ? mk('cb-all', 'btn', `Всем выписанным (${info.total}) и на будущее`, 'all') : null,
+    info.prev && info.prev !== info.total ? mk('cb-prev', 'btn secondary', `Только за ${info.prevTitle} (${info.prev}) и на будущее`, 'prev') : null,
+    mk('cb-new', 'btn secondary', 'Только на будущее', 'new'),
+    info.basis ? mk('cb-reset', 'btn secondary', 'Сбросить запомненное', 'reset') : null));
+  return box;
+};
+
 screens.prepay = async function prepayScreen({ cpId }) {
   const { cps } = await api('GET', '/api/cps');
   const cp = cps.find((c) => c.id === Number(cpId));
@@ -2584,7 +2619,9 @@ screens.cp = async function cpScreen({ id, name }) {
             download(r.file);
           } catch (e) { toast(e.message, true); }
         } }),
-      navRow({ icon: 'docs2', title: 'Документы клиента', onclick: () => go('docs', { cp: id }) })));
+      navRow({ icon: 'docs2', title: 'Документы клиента', onclick: () => go('docs', { cp: id }) }),
+      navRow({ icon: 'pen', title: 'Основание накладных', sub: 'что печатать в графе «Основание» у ТОРГ-12 и УПД',
+        onclick: () => go('cbasis', { cpId: id }) })));
     const schedules = await schedulesBlock(id);
     if (schedules) box.append(schedules);
     box.append(crmBlock(id));
@@ -6178,23 +6215,26 @@ screens.new = async function newDoc(params) {
     chipsBox.textContent = '';
     if (!list.length) return;
     chipsBox.append(h('div', { class: 'section-title', text: draft.cpId && !list[0].global ? 'Выписывали этому клиенту' : 'Частые позиции' }));
-    chipsBox.append(h('div', { class: 'chips' }, list.map((t) => h('button', {
-      class: 'chip',
-      onclick: () => {
-        const blank = draft.items.findIndex((it) => !it.name.trim());
-        const row = { name: t.name, unit: t.unit || 'шт.', qty: 1, price: t.price };
-        if (blank >= 0) draft.items[blank] = row; else draft.items.push(row);
-        drawItems();
-        haptic();
-      },
-    }, icon('plus'), t.name, h('span', {
-      class: 'chip-x', title: 'Убрать из подсказок', style: 'margin-left:8px;opacity:.6',
-      onclick: async (e) => {
-        e.stopPropagation();
-        await api('POST', '/api/templates/hide', { cpId: draft.cpId || 0, name: t.name, global: t.global }).catch(() => {});
-        drawChips();
-      },
-    }, '×')))));
+    // «×» — отдельная кнопка рядом, а не внутри кнопки подсказки: нажатие внутри
+    // кнопки браузер отдаёт ей самой, и убрать подсказку было невозможно.
+    chipsBox.append(h('div', { class: 'chips' }, list.map((t) => h('span', { class: 'chip-wrap', style: 'display:inline-flex;gap:2px;align-items:center' },
+      h('button', {
+        class: 'chip',
+        onclick: () => {
+          const blank = draft.items.findIndex((it) => !it.name.trim());
+          const row = { name: t.name, unit: t.unit || 'шт.', qty: 1, price: t.price };
+          if (blank >= 0) draft.items[blank] = row; else draft.items.push(row);
+          drawItems();
+          haptic();
+        },
+      }, icon('plus'), t.name),
+      h('button', {
+        class: 'chip chip-x', title: 'Убрать из подсказок', 'aria-label': `Убрать «${t.name}» из подсказок`, style: 'opacity:.75',
+        onclick: async () => {
+          await api('POST', '/api/templates/hide', { cpId: draft.cpId || 0, name: t.name, global: t.global }).catch(() => {});
+          drawChips();
+        },
+      }, '×')))));
   }
   box.append(chipsBox);
   drawChips();

@@ -2004,6 +2004,7 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       ok(sugNew.length >= 1 && sugNew.every((x) => x.tplId), 'у клиента без истории — общие частые, как раньше');
       bdbB.hideItem(uidB, cpB, 'Обед');
       ok(!bdbB.suggestItems(uidB, cpB, 'torg12', 6).some((x) => x.name === 'Обед'), 'убранная подсказка не предлагается');
+      ok(bdbB.suggestItems(uidB, cpB, 'torg12', 6).length === 0, 'убрали последнюю — пусто, а не общий список с лишним');
       await mkT(cpB, {});
       ok(bdbB.suggestItems(uidB, cpB, 'torg12', 6).some((x) => x.name === 'Обед'), 'а выписал снова — подсказка вернулась');
 
