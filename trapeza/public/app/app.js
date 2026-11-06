@@ -5769,9 +5769,8 @@ screens.new = async function newDoc(params) {
     upd: 'УПД', torg12: 'Товарная накладная ТОРГ-12',
   };
   const type = TITLES[params.type] ? params.type : 'sch';
-  const [{ cps }, { templates }, st] = await Promise.all([
+  const [{ cps }, st] = await Promise.all([
     api('GET', '/api/cps'),
-    api('GET', '/api/templates').catch(() => ({ templates: [] })),
     api('GET', '/api/state').catch(() => ({})),
   ]);
   const myOrg = (st && st.org) || {};
@@ -5880,10 +5879,12 @@ screens.new = async function newDoc(params) {
   const basisHint = h('div', { class: 'small muted', style: 'margin-top:4px' });
   function drawBasisHint() {
     if (!basisInput) return;
-    const contract = (known.find((c) => c.id === draft.cpId) || {}).contract || '';
-    basisHint.textContent = contract
-      ? `Оставите пустым — напечатаем договор из карточки: «${contract}»`
-      : 'Оставите пустым — напечатаем «Без договора»';
+    const c = known.find((x) => x.id === draft.cpId) || {};
+    basisHint.textContent = c.basis
+      ? `Оставите пустым — напечатаем запомненное для клиента: «${c.basis}»`
+      : (c.contract
+        ? `Оставите пустым — напечатаем договор из карточки: «${c.contract}»`
+        : 'Оставите пустым — напечатаем «Без договора»');
   }
 
   box.append(h('div', { class: 'card' }, cpField,
@@ -5931,6 +5932,7 @@ screens.new = async function newDoc(params) {
     haptic();
     drawCp();
     recalc();
+    drawChips();
   }
 
   let lookupTimer = 0;
@@ -6156,9 +6158,23 @@ screens.new = async function newDoc(params) {
     onclick: () => { draft.items.push({ name: '', unit: 'шт.', qty: 1, price: 0 }); drawItems(); haptic(); },
   }, 'Добавить позицию')));
 
-  if (templates.length) {
-    box.append(h('div', { class: 'section-title', text: 'Частые позиции' }));
-    box.append(h('div', { class: 'chips' }, templates.slice(0, 8).map((t) => h('button', {
+  /*
+   * Подсказки позиций — по клиенту и виду документа: что выписывали ЭТОМУ клиенту
+   * именно в таком документе. Общий список по всему аккаунту подсовывал на
+   * накладную позиции из чужих счетов. Перерисовывается при выборе клиента;
+   * «×» убирает подсказку.
+   */
+  const chipsBox = h('div', {});
+  async function drawChips() {
+    let list = [];
+    try {
+      const r = await api('GET', `/api/templates?cpId=${draft.cpId || 0}&type=${encodeURIComponent(type)}`);
+      list = r.templates || [];
+    } catch (_) { list = []; }
+    chipsBox.textContent = '';
+    if (!list.length) return;
+    chipsBox.append(h('div', { class: 'section-title', text: draft.cpId && !list[0].global ? 'Выписывали этому клиенту' : 'Частые позиции' }));
+    chipsBox.append(h('div', { class: 'chips' }, list.map((t) => h('button', {
       class: 'chip',
       onclick: () => {
         const blank = draft.items.findIndex((it) => !it.name.trim());
@@ -6167,8 +6183,17 @@ screens.new = async function newDoc(params) {
         drawItems();
         haptic();
       },
-    }, icon('plus'), t.name))));
+    }, icon('plus'), t.name, h('span', {
+      class: 'chip-x', title: 'Убрать из подсказок', style: 'margin-left:8px;opacity:.6',
+      onclick: async (e) => {
+        e.stopPropagation();
+        await api('POST', '/api/templates/hide', { cpId: draft.cpId || 0, name: t.name, global: t.global }).catch(() => {});
+        drawChips();
+      },
+    }, '×')))));
   }
+  box.append(chipsBox);
+  drawChips();
 
   // Что набрано в форме — в виде параметров экрана, чтобы вернуться к ней без потерь.
   const saveDraft = () => ({

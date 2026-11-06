@@ -194,6 +194,20 @@ function migrate() {
       created_at TEXT    NOT NULL
     );
     CREATE INDEX IF NOT EXISTS docs_removed_user ON docs_removed(user_id, created_at);
+    -- Основание накладных и УПД, которое запомнено за клиентом (см. basisFor).
+    CREATE TABLE IF NOT EXISTS cp_basis (
+      user_id INTEGER NOT NULL,
+      cp_id   INTEGER NOT NULL,
+      basis   TEXT    NOT NULL,
+      PRIMARY KEY (user_id, cp_id)
+    );
+    -- Подсказки позиций, которые человек убрал: cp_id = 0 — для всех клиентов.
+    CREATE TABLE IF NOT EXISTS item_hidden (
+      user_id INTEGER NOT NULL,
+      cp_id   INTEGER NOT NULL,
+      name    TEXT    NOT NULL,
+      PRIMARY KEY (user_id, cp_id, name)
+    );
   `);
 
   /*
@@ -3397,6 +3411,163 @@ function seedItems(userId, items) {
   return added;
 }
 
+const normName = (v) => String(v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+/**
+ * Позиции, которые этот клиент уже получал, — по его же документам.
+ *
+ * Общий список частых позиций считается по всему аккаунту, и у того, кто
+ * выписывает и канапе по счетам, и обеды по накладным, в кнопки лезло чужое:
+ * на ТОРГ-12 клиенту предлагались позиции из счетов другим людям, а нужных
+ * не было. Здесь ранжирование по клиенту и по виду документа: что выписывали
+ * ЭТОМУ клиенту именно в таком документе — первым, цена — последняя, какую
+ * ему ставили.
+ */
+function clientItems(userId, cpId, type, limit = 6) {
+  const hidden = new Set(db.prepare('SELECT name FROM item_hidden WHERE user_id = ? AND cp_id IN (?, 0)')
+    .all(userId, Number(cpId)).map((r) => normName(r.name)));
+  const rows = db.prepare('SELECT type, payload FROM documents WHERE user_id = ? AND cp_id = ? ORDER BY id DESC LIMIT 60')
+    .all(userId, Number(cpId));
+  const seen = new Map();
+  for (const r of rows) {
+    let items = [];
+    try { items = (JSON.parse(r.payload || '{}').items) || []; } catch (_) { items = []; }
+    for (const it of items) {
+      const name = String((it && it.name) || '').trim();
+      const key = normName(name);
+      if (!key || hidden.has(key)) continue;
+      let e = seen.get(key);
+      if (!e) {
+        // Строки идут от новых к старым, поэтому первая встреча — самая свежая цена.
+        e = { name, unit: it.unit || 'шт.', price: Number(it.price) || 0, count: 0, same: 0, order: seen.size };
+        seen.set(key, e);
+      }
+      e.count += 1;
+      if (r.type === type) e.same += 1;
+    }
+  }
+  let list = [...seen.values()];
+  // Есть позиции именно из такого документа — остальные не предлагаем:
+  // обеды из накладных не должны делить кнопки с канапе из чужих счетов.
+  const same = list.filter((e) => e.same > 0);
+  if (same.length) list = same;
+  list.sort((a, b) => b.same - a.same || b.count - a.count || a.order - b.order);
+  return list.slice(0, limit);
+}
+
+/**
+ * Что предложить кнопками при выписке: сначала то, что выписывали этому
+ * клиенту; у нового клиента — общие частые, кроме убранных.
+ * @returns {Array<{name:string, unit:string, price:number, tplId?:number, own?:boolean}>}
+ */
+function suggestItems(userId, cpId, type, limit = 6) {
+  if (Number(cpId)) {
+    const own = clientItems(userId, cpId, type, limit);
+    if (own.length) return own.map((e) => ({ name: e.name, unit: e.unit, price: e.price, own: true }));
+  }
+  const hidden = new Set(db.prepare('SELECT name FROM item_hidden WHERE user_id = ? AND cp_id = 0')
+    .all(userId).map((r) => normName(r.name)));
+  return listTemplates(userId, limit + 20)
+    .filter((t) => !hidden.has(normName(t.name)))
+    .slice(0, limit)
+    .map((t) => ({ name: t.name, unit: t.unit || 'шт.', price: Number(t.price) || 0, tplId: t.id }));
+}
+
+/** Убрать подсказку: у этого клиента; у общих (без собственной истории) — совсем. */
+function hideItem(userId, cpId, name, { global = false } = {}) {
+  const n = String(name || '').trim().slice(0, 200);
+  if (!n) return;
+  db.prepare('INSERT OR IGNORE INTO item_hidden(user_id, cp_id, name) VALUES (?, ?, ?)').run(userId, global ? 0 : Number(cpId) || 0, n);
+  if (global) db.prepare('DELETE FROM item_templates WHERE user_id = ? AND name = ?').run(userId, n);
+}
+
+/** Выписал позицию снова — значит она нужна: подсказка возвращается. */
+function unhideItems(userId, cpId, items) {
+  for (const it of items || []) {
+    db.prepare('DELETE FROM item_hidden WHERE user_id = ? AND cp_id IN (?, 0) AND name = ?')
+      .run(userId, Number(cpId) || 0, String(it.name || '').trim());
+  }
+}
+
+// ---------- основание накладных и УПД ----------
+
+const normBasis = (v) => String(v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+const cleanBasis = (v) => String(v || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+// Сколько раз подряд одно и то же основание должно встретиться, чтобы его запомнили.
+const BASIS_LEARN_AFTER = 3;
+
+/** Запомненное за клиентом основание накладных и УПД; пусто — не запомнено. */
+function basisFor(userId, cpId) {
+  const row = db.prepare('SELECT basis FROM cp_basis WHERE user_id = ? AND cp_id = ?').get(userId, Number(cpId));
+  return row ? row.basis : '';
+}
+
+/** Задать или сбросить (пустая строка) основание клиента. */
+function setBasisFor(userId, cpId, basis) {
+  if (!getCp(userId, Number(cpId))) return '';
+  const b = cleanBasis(basis);
+  if (!b) db.prepare('DELETE FROM cp_basis WHERE user_id = ? AND cp_id = ?').run(userId, Number(cpId));
+  else {
+    db.prepare(`INSERT INTO cp_basis(user_id, cp_id, basis) VALUES (?, ?, ?)
+                ON CONFLICT(user_id, cp_id) DO UPDATE SET basis = excluded.basis`).run(userId, Number(cpId), b);
+  }
+  return b;
+}
+
+/**
+ * Основание, которое человек вписывает руками раз за разом, запоминаем.
+ * Вызывается после выписки документа с основанием, которое он ввёл сам:
+ * в третий раз за клиента — и дальше оно подставляется само.
+ * exceptDocId — документ, который этим заменяется: его считать дважды нельзя.
+ * @returns {boolean} запомнено только что
+ */
+function learnBasis(userId, cpId, basis, exceptDocId = 0) {
+  const b = cleanBasis(basis);
+  if (!b || normBasis(basisFor(userId, cpId)) === normBasis(b)) return false;
+  const rows = db.prepare("SELECT payload FROM documents WHERE user_id = ? AND cp_id = ? AND type IN ('torg12', 'upd') AND id <> ?")
+    .all(userId, Number(cpId), Number(exceptDocId) || 0);
+  let n = 0;
+  for (const r of rows) {
+    try { if (normBasis(JSON.parse(r.payload || '{}').basis) === normBasis(b)) n += 1; } catch (_) { /* битый payload — не считаем */ }
+  }
+  if (n < BASIS_LEARN_AFTER) return false;
+  setBasisFor(userId, cpId, b);
+  return true;
+}
+
+/** Накладные и УПД клиента у текущей фирмы: {id, number, date, type, basis}. */
+function basisDocs(userId, cpId, from = '', to = '') {
+  const org = currentOrgId(userId);
+  const out = [];
+  for (const r of db.prepare("SELECT id, type, number, date, payload FROM documents WHERE user_id = ? AND cp_id = ? AND org_id = ? AND type IN ('torg12', 'upd') ORDER BY date, id")
+    .all(userId, Number(cpId), org)) {
+    if ((from && r.date < from) || (to && r.date > to)) continue;
+    let p = {};
+    try { p = JSON.parse(r.payload || '{}'); } catch (_) { p = {}; }
+    out.push({ id: r.id, type: r.type, number: r.number, date: r.date, basis: p.basis || '' });
+  }
+  return out;
+}
+
+/**
+ * Поставить основание выписанным накладным и УПД клиента (весь период или
+ * только from–to). Это только надпись в бланке: суммы, номера, долг и оплата
+ * не меняются. Файлы после этого пересобираются из журнала.
+ * @returns {number[]} id изменённых документов
+ */
+function applyBasis(userId, cpId, basis, from = '', to = '') {
+  const b = cleanBasis(basis);
+  const ids = [];
+  for (const d of basisDocs(userId, cpId, from, to)) {
+    const doc = getDoc(userId, d.id);
+    if (!doc) continue;
+    const payload = { ...(doc.payload || {}) };
+    if (b) payload.basis = b; else delete payload.basis;
+    if (updateDocPayload(userId, d.id, payload)) ids.push(d.id);
+  }
+  return ids;
+}
+
 function listTemplates(userId, limit = 8) {
   return db.prepare(
     'SELECT * FROM item_templates WHERE user_id = ? ORDER BY uses DESC, used_at DESC LIMIT ?',
@@ -3512,5 +3683,6 @@ module.exports = {
   setNoDebt, shipmentsOfMonth, monthActOf, monthActsOf, openShipmentsOfMonth,
   nextSeqForOrg, saveDoc, listDocs, repeatSources, REPEATABLE, getDoc, deleteDoc, DOC_TITLES,
   rememberItems, seedItems, listTemplates, getTemplate, forgetTemplate,
+  suggestItems, clientItems, hideItem, unhideItems, basisFor, setBasisFor, learnBasis, basisDocs, applyBasis,
   quota, docsThisMonth, freePerMonth,
 };

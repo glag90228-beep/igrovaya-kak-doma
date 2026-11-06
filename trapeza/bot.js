@@ -131,7 +131,10 @@ const clean = (s) => (String(s).trim() === '-' ? '' : String(s).trim());
  * ждут только текста, и любая кнопка для них — выход.
  */
 const FLOW_BUTTONS = {
-  'items:': ['items.', 'tpl:', 'doc.make', 'doc.num', 'doc.date', 'doc.basis', 'doc.vat'],
+  'items:': ['items.', 'tpl:', 'ci:', 'ci.', 'doc.make', 'doc.num', 'doc.date', 'doc.basis', 'doc.vat'],
+  // Основание накладных клиента: сначала ждём текст, потом выбор «кому применить».
+  'cbasis:': [],
+  'cbasis.ok:': ['cb.'],
   'form:': ['fb:', 'form.skip'],
   photo: ['ph.'],
   // Книга учёта и выбор режима — часть работы с выпиской: раньше их нажатие
@@ -307,6 +310,7 @@ function cpMenu(userId, cp) {
       ? [{ text: '🚚 ТОРГ-12', data: `d.torg12:${cp.id}` }]
       : [{ text: '📦 УПД', data: `d.upd:${cp.id}` }, { text: '🚚 ТОРГ-12', data: `d.torg12:${cp.id}` }],
     [{ text: '📝 Договор', data: `d.dog:${cp.id}` }, { text: '📎 Свой договор', data: `mc.menu:${cp.id}` }],
+    [{ text: '📎 Основание накладных', data: `cb:${cp.id}` }],
     [{ text: '🕑 История', data: `crm.h:${cp.id}` }, { text: '📝 Заметка', data: `crm.n:${cp.id}` },
       { text: '⏰ Напомнить мне', data: `crm.f:${cp.id}` }],
   ];
@@ -951,11 +955,22 @@ async function handleAktPeriodText(tg, chatId, user, cpId, text) {
 // документа правилась в одном месте, а не в двух расходящихся копиях.
 const { ITEM_DOCS } = docService;
 
+/**
+ * Подсказки позиций для текущего набора: что выписывали ЭТОМУ клиенту в
+ * таком же документе (см. bdb.suggestItems). Клиент и вид — из состояния.
+ */
+function suggestionsOf(user) {
+  const st = bdb.getState(user.id);
+  const [, type, cpId] = String((st && st.state) || '').split(':');
+  return bdb.suggestItems(user.id, Number(cpId) || 0, type || '', 6);
+}
+
 /** Клавиатура набора позиций: частые позиции кнопками + управление. */
 function itemsKb(user, data) {
-  const rows = bdb.listTemplates(user.id, 6).map((t) => ([{
-    text: `➕ ${t.name} · ${formatRub(t.price)}`.slice(0, 60), data: `tpl:${t.id}`,
+  const rows = suggestionsOf(user).map((t, i) => ([{
+    text: `➕ ${t.name} · ${formatRub(t.price)}`.slice(0, 60), data: t.tplId ? `tpl:${t.tplId}` : `ci:${i}`,
   }]));
+  if (rows.length) rows.push([{ text: '🧹 Убрать лишнее из подсказок', data: 'ci.hide' }]);
   if (data.items.length) {
     /*
      * Выпуск одним нажатием: раньше было «Готово», потом «Сформировать» —
@@ -1033,14 +1048,16 @@ async function startItems(tg, chatId, user, type, cpId, extra = {}, when = '') {
 
   const data = { seq, number: String(seq), date: docDate, items: [], ask: '', doc };
   bdb.setState(user.id, `items:${type}:${cpId}`, data);
-  const tpl = bdb.listTemplates(user.id, 6).length
-    ? '\n\nЧастые позиции — кнопками ниже, количество спрошу.' : '';
+  const sug = bdb.suggestItems(user.id, cpId, type, 6);
+  const tpl = sug.length
+    ? `\n\n${sug[0].own ? 'Что выписывали этому клиенту' : 'Частые позиции'} — кнопками ниже, количество спрошу.` : '';
+  // Пример — позиция самого человека, а не выдуманная: чужой пример только путает.
+  const sample = sug[0] && sug[0].price > 0
+    ? `${sug[0].name} 10 ${Math.round(sug[0].price)}` : 'Название 10 500';
   await tg.sendMessage(chatId,
     `Составляем <b>${esc(ITEM_DOCS[type].title)} № ${esc(data.number)}</b> от ${ru(data.date)}.\n`
-    + 'Отправляйте позиции по одной — как удобно:\n'
-    + '<code>Аренда помещения 1 30000</code>\n'
-    + '<code>Канапе ассорти 20 650</code>\n'
-    + '<code>Бумага 10 пачек по 300</code>\n\n'
+    + 'Отправляйте позиции по одной — название, количество, цена:\n'
+    + `<code>${esc(sample)}</code>\n\n`
     + '<i>Если чего-то не хватит — спрошу.</i>' + tpl,
     itemsKb(user, data));
 }
@@ -1057,7 +1074,8 @@ async function showPreview(tg, chatId, user, state) {
    */
   const hasBasis = ['torg12', 'upd'].includes(type);
   const basisLine = hasBasis
-    ? `Основание: <b>${esc(extra.basis || (bdb.getCp(user.id, Number(cpIdStr)) || {}).contract || 'Без договора')}</b>\n`
+    ? `Основание: <b>${esc(extra.basis || bdb.basisFor(user.id, Number(cpIdStr))
+      || (bdb.getCp(user.id, Number(cpIdStr)) || {}).contract || 'Без договора')}</b>\n`
     : '';
   // Итог считаем тем же кодом, что и сам документ: иначе сводка покажет
   // одно, а в PDF попадёт другое — на НДС «сверху» разница заметная.
@@ -1260,7 +1278,10 @@ async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {}, replace
   const cp = bdb.getCp(user.id, cpId);
   const org = bdb.currentOrg(user.id);
   const q = replaceId ? bdb.quota(user.id) : res.quota;
-  const tail = (res.replaced
+  const learned = res.basisLearned
+    ? `\n\n<i>Запомнил основание «${esc(res.basisLearned)}» для ${esc(cp.name)} — дальше подставлю само. `
+      + 'Сменить: карточка клиента → «Основание накладных».</i>' : '';
+  const tail = learned + (res.replaced
     ? `\n\n<i>Исправлен прежний № ${esc(res.replaced.number)}: старый убран из журнала, лимит не потрачен.`
       + `${res.replaced.wasPaid ? ' Он был отмечен оплаченным — отметьте оплату у исправленного заново.' : ''}</i>` : '')
     + (q.paid ? '' : `\n<i>Выписано в этом месяце: ${q.used} из ${q.limit} бесплатных.</i>`);
@@ -1689,6 +1710,17 @@ async function sendArchive(tg, chatId, user, periodName, kind) {
       keyboard([[{ text: '⬅️ К документам', data: 'docs' }]]));
     return;
   }
+  await sendDocsZip(tg, chatId, user, docs, {
+    name: `${k.title.replace(/\s+/g, '_')}_${from}_${to}.zip`,
+    what: `${esc(k.title)} за ${esc(title)} (${ru(from)}—${ru(to)})`,
+  });
+}
+
+/**
+ * Собрать файлы переданных документов из журнала и прислать одним ZIP.
+ * Новых документов не появляется, поэтому лимит не тратится.
+ */
+async function sendDocsZip(tg, chatId, user, docs, { name, what }) {
   const take = docs.slice(0, ARCHIVE_MAX);
   await tg.sendMessage(chatId, `Собираю ${take.length} ${plural(take.length, 'файл', 'файла', 'файлов')} — это займёт до минуты…`);
   await tg.sendChatAction(chatId, 'upload_document');
@@ -1698,9 +1730,9 @@ async function sendArchive(tg, chatId, user, periodName, kind) {
     const res = await docService.rebuildDocument(user.id, d.id).catch(() => null);
     if (!res || !res.ok || !res.file) { failed.push(`№ ${d.number}`); continue; }
     // Одинаковые имена у двух документов одному клиенту — архив не должен их склеить.
-    let name = res.file.filename;
-    for (let i = 2; files[name]; i += 1) name = res.file.filename.replace(/(\.\w+)$/, `_${i}$1`);
-    files[name] = res.file.buffer;
+    let fname = res.file.filename;
+    for (let i = 2; files[fname]; i += 1) fname = res.file.filename.replace(/(\.\w+)$/, `_${i}$1`);
+    files[fname] = res.file.buffer;
   }
   if (!Object.keys(files).length) {
     await tg.sendMessage(chatId, 'Не получилось собрать ни одного файла. Попробуйте позже.', mainMenu());
@@ -1708,12 +1740,32 @@ async function sendArchive(tg, chatId, user, periodName, kind) {
   }
   const sum = round2(take.reduce((a2, d) => a2 + (Number(d.total) || 0), 0));
   await tg.sendDocument(chatId, {
-    filename: `${k.title.replace(/\s+/g, '_')}_${from}_${to}.zip`,
+    filename: name,
     buffer: require('./lib/zip').makeZip(files),
-    caption: `${esc(k.title)} за ${esc(title)} (${ru(from)}—${ru(to)}): <b>${Object.keys(files).length}</b> на <b>${formatRub(sum)}</b>.`
+    caption: `${what}: <b>${Object.keys(files).length}</b> на <b>${formatRub(sum)}</b>.`
       + (docs.length > take.length ? `\nВ архиве первые ${take.length} — остальные выберите по месяцам.` : '')
       + (failed.length ? `\nНе собрались: ${esc(failed.join(', '))}.` : ''),
   });
+}
+
+/**
+ * Основание накладных и УПД клиента — экран карточки.
+ * Показывает, что запомнено, сколько накладных выписано, и даёт задать новое.
+ */
+async function showCpBasis(tg, chatId, user, cpId) {
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) return;
+  const known = bdb.basisFor(user.id, cpId);
+  const docs = bdb.basisDocs(user.id, cpId);
+  const rows = [[{ text: '✏️ Задать основание', data: `cb.set:${cpId}` }]];
+  if (known) rows.push([{ text: '🗑 Сбросить запомненное', data: `cb.reset:${cpId}` }]);
+  rows.push([{ text: '⬅️ К клиенту', data: `cp:${cpId}` }]);
+  await tg.sendMessage(chatId,
+    `<b>Основание накладных и УПД — ${esc(cp.name)}</b>\n\n`
+    + (known ? `Подставляю: <b>${esc(known)}</b>` : `Не задано: печатаю договор из карточки (${esc(cp.contract || 'Без договора')}).`)
+    + `\nНакладных и УПД выписано: <b>${docs.length}</b>.\n\n`
+    + '<i>Само запоминается, если вписать одно и то же основание в три накладные подряд.</i>',
+    keyboard(rows));
 }
 
 async function sendRegistry(tg, chatId, user, periodName, range = null) {
@@ -5975,8 +6027,8 @@ async function handleMessage(tg, msg) {
     if (d.ask === 'qty') {
       const qty = parseAmount(text);
       if (qty == null || qty <= 0) { await tg.sendMessage(chatId, 'Нужно количество числом, напр. 20:'); return; }
-      const t = bdb.getTemplate(user.id, d.tplId);
-      d.ask = ''; d.tplId = 0;
+      const t = d.tplItem || bdb.getTemplate(user.id, d.tplId);
+      d.ask = ''; d.tplId = 0; d.tplItem = null;
       if (t) d.items.push({ name: t.name, qty, unit: t.unit || 'шт.', price: t.price });
       bdb.setState(user.id, state.state, d);
       await tg.sendMessage(chatId,
@@ -6053,6 +6105,24 @@ async function handleMessage(tg, msg) {
   if (state.state.startsWith('pp:')) { await handlePpText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('av:')) { await handleAvansText(tg, chatId, user, state, text); return; }
   if (state.state.startsWith('ksf:')) { await handleKsfText(tg, chatId, user, state, text); return; }
+  if (state.state.startsWith('cbasis:')) {
+    const cpId = Number(state.state.slice(7));
+    const basis = text.replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (!basis || /^[-—–]$/.test(basis)) { await tg.sendMessage(chatId, 'Напишите основание текстом, например «Договор № 12 от 01.03.2026».'); return; }
+    const all = bdb.basisDocs(user.id, cpId);
+    const prev = periodOf('prev');
+    const last = bdb.basisDocs(user.id, cpId, prev.from, prev.to);
+    bdb.setState(user.id, `cbasis.ok:${cpId}`, { basis });
+    const rows = [];
+    if (all.length) rows.push([{ text: `Всем выписанным (${all.length}) и на будущее`.slice(0, 60), data: `cb.all:${cpId}` }]);
+    if (last.length && last.length !== all.length) rows.push([{ text: `Только за прошлый месяц (${last.length}) и на будущее`.slice(0, 60), data: `cb.prev:${cpId}` }]);
+    rows.push([{ text: 'Только на будущее', data: `cb.new:${cpId}` }]);
+    rows.push([{ text: '✖️ Отмена', data: `cb:${cpId}` }]);
+    await tg.sendMessage(chatId, `Основание: <b>${esc(basis)}</b>\n\nК каким накладным и УПД этого клиента применить?`
+      + (all.length ? '\n<i>Это надпись в бланке: суммы, номера и долг не меняются. Исправленные файлы пришлю архивом.</i>' : ''),
+    keyboard(rows));
+    return;
+  }
   if (state.state.startsWith('renum:')) {
     const id = Number(state.state.slice(6));
     const res = await docService.renumberDocument(user.id, id, text);
@@ -7427,6 +7497,48 @@ async function handleCallback(tg, cq) {
         + '<i>Отправьте «-», чтобы печатать договор из карточки клиента, а без него — «Без договора».</i>');
       return;
     }
+    // Позиция из подсказок по клиенту (то, что выписывали ему раньше).
+    if (data.startsWith('ci:')) {
+      const state = bdb.getState(user.id);
+      if (!state.state.startsWith('items:')) return;
+      const t = suggestionsOf(user)[Number(data.slice(3))];
+      if (!t || t.tplId) { await tg.sendMessage(chatId, 'Подсказка устарела — нажмите позицию заново.', itemsKb(user, state.data)); return; }
+      if (!(t.price > 0)) {
+        state.data.ask = 'np'; state.data.pending = { name: t.name, unit: t.unit };
+        bdb.setState(user.id, state.state, state.data);
+        await tg.sendMessage(chatId, `<b>${esc(t.name)}</b>\nСколько и по какой цене?`);
+        return;
+      }
+      state.data.ask = 'qty'; state.data.tplId = 0; state.data.tplItem = { name: t.name, unit: t.unit, price: t.price };
+      bdb.setState(user.id, state.state, state.data);
+      await tg.sendMessage(chatId, `<b>${esc(t.name)}</b> по ${formatRub(t.price)} за ${esc(t.unit)}\nСколько?`);
+      return;
+    }
+    // «Убрать лишнее»: список подсказок с корзиной, нажатое пропадает из кнопок.
+    if (data === 'ci.hide' || data.startsWith('ci.x:')) {
+      const state = bdb.getState(user.id);
+      if (!state.state.startsWith('items:')) return;
+      const cpId = Number(state.state.split(':')[2]) || 0;
+      const list = suggestionsOf(user);
+      if (data.startsWith('ci.x:')) {
+        const t = list[Number(data.slice(5))];
+        if (t) {
+          bdb.hideItem(user.id, cpId, t.name, { global: !t.own });
+          await tg.sendMessage(chatId, `Убрал «${esc(t.name)}» из подсказок.`, itemsKb(user, state.data));
+        }
+        return;
+      }
+      if (!list.length) { await tg.sendMessage(chatId, 'Подсказок нет.', itemsKb(user, state.data)); return; }
+      await tg.sendMessage(chatId, 'Какую позицию убрать из подсказок? Сами документы это не меняет.',
+        keyboard([...list.map((t, i) => ([{ text: `🗑 ${t.name}`.slice(0, 60), data: `ci.x:${i}` }])),
+          [{ text: '⬅️ Назад к позициям', data: 'ci.back' }]]));
+      return;
+    }
+    if (data === 'ci.back') {
+      const state = bdb.getState(user.id);
+      if (state.state.startsWith('items:')) await tg.sendMessage(chatId, 'Продолжаем.', itemsKb(user, state.data));
+      return;
+    }
     if (data.startsWith('tpl:')) {
       const state = bdb.getState(user.id);
       if (!state.state.startsWith('items:')) return;
@@ -7668,6 +7780,52 @@ async function handleCallback(tg, cq) {
     }
     if (data.startsWith('doc:')) { await showDoc(tg, chatId, user, Number(data.slice(4))); return; }
     if (data.startsWith('d.rep:')) { await repeatDoc(tg, chatId, user, Number(data.slice(6))); return; }
+    if (/^cb:\d+$/.test(data)) { await showCpBasis(tg, chatId, user, Number(data.slice(3))); return; }
+    if (/^cb\.set:\d+$/.test(data)) {
+      const cpId = Number(data.slice(7));
+      if (!bdb.getCp(user.id, cpId)) return;
+      bdb.setState(user.id, `cbasis:${cpId}`, {});
+      await tg.sendMessage(chatId,
+        'Напишите основание так, как оно должно стоять в накладной:\n<code>Договор № 12 от 01.03.2026</code>',
+        keyboard([[{ text: '✖️ Отмена', data: `cb:${cpId}` }]]));
+      return;
+    }
+    if (/^cb\.reset:\d+$/.test(data)) {
+      const cpId = Number(data.slice(9));
+      bdb.setBasisFor(user.id, cpId, '');
+      await tg.sendMessage(chatId, 'Сбросил: дальше печатаю договор из карточки клиента.');
+      await showCpBasis(tg, chatId, user, cpId);
+      return;
+    }
+    // Применить основание: ко всем выпущенным, к прошлому месяцу или только на будущее.
+    if (/^cb\.(all|prev|new):\d+$/.test(data)) {
+      const [scope, id] = data.slice(3).split(':');
+      const cpId = Number(id);
+      const st = bdb.getState(user.id);
+      const basis = st && st.state === `cbasis.ok:${cpId}` ? String((st.data || {}).basis || '') : '';
+      if (!basis || !bdb.getCp(user.id, cpId)) { await tg.sendMessage(chatId, 'Основание потерялось — задайте заново.', mainMenu()); return; }
+      bdb.clearState(user.id);
+      bdb.setBasisFor(user.id, cpId, basis);
+      if (scope === 'new') {
+        await tg.sendMessage(chatId, `Готово: новые накладные и УПД этого клиента — с основанием «${esc(basis)}».`);
+        return;
+      }
+      const r = scope === 'prev' ? periodOf('prev') : { from: '', to: '' };
+      const ids = bdb.applyBasis(user.id, cpId, basis, r.from, r.to);
+      await tg.sendMessage(chatId, `Основание «${esc(basis)}» поставлено у ${ids.length} ${plural(ids.length, 'документ', 'документа', 'документов')}. `
+        + 'Суммы, номера и долг не менялись.');
+      const docs = bdb.basisDocs(user.id, cpId, r.from, r.to);
+      if (docs.length) {
+        // Файлы с новым основанием — архивом, не заставляя бот ждать (как у обычного архива).
+        sendDocsZip(tg, chatId, user, docs, {
+          name: `Накладные_с_новым_основанием.zip`, what: 'Накладные и УПД с новым основанием',
+        }).catch((e) => {
+          office.record({ kind: 'crash', where: 'основание накладных', error: e.message, userId: user.id }).catch(() => {});
+          tg.sendMessage(chatId, 'Архив собрать не получилось. Файлы можно получить в Документы → Файлы архивом.').catch(() => {});
+        });
+      }
+      return;
+    }
     if (data.startsWith('d.fix:')) { await fixDoc(tg, chatId, user, Number(data.slice(6))); return; }
     if (data.startsWith('d.num:')) {
       const d = bdb.getDoc(user.id, Number(data.slice(6)));

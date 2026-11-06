@@ -408,6 +408,17 @@ async function issueDocument(userId, {
    * УПД самозанятому теперь не выписывается вовсе (см. выше), и это правило
    * осталось только страховкой.
    */
+  /*
+   * Основание накладной и УПД: что вписал человек — его; не вписал — то, что
+   * запомнено за этим клиентом (после трёх одинаковых вводов подряд, см.
+   * bdb.learnBasis), а дальше, как раньше, договор из карточки.
+   */
+  const typedBasis = ['torg12', 'upd'].includes(type) ? String(fields.basis || '').trim() : '';
+  if (['torg12', 'upd'].includes(type) && !typedBasis) {
+    const known = bdb.basisFor(userId, cp.id);
+    if (known) fields = { ...fields, basis: known };
+  }
+
   if (type === 'upd' && !Object.prototype.hasOwnProperty.call(fields, 'status')) {
     const payer = bdb.vatOf(org).rate != null && !isNpd(org);
     fields = { ...fields, status: payer ? 1 : 2 };
@@ -508,6 +519,8 @@ async function issueDocument(userId, {
   });
 
   bdb.rememberItems(userId, clean);
+  bdb.unhideItems(userId, cp.id, clean);
+  const basisLearned = typedBasis && bdb.learnBasis(userId, cp.id, typedBasis, replaceId) ? typedBasis : '';
 
   // Долг в журнал — если этот тип документа его создаёт при выбранном
   // основании. Проводка привязана к документу: её видно, можно отменить,
@@ -534,6 +547,7 @@ async function issueDocument(userId, {
     basis: bdb.basisOf(org),
     title: kind.title,
     file,
+    basisLearned,
     doc: {
       id, type, number: num, date: when, total, title: kind.title,
       cp: { id: cp.id, name: cp.name },

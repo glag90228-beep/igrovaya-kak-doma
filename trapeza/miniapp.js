@@ -693,6 +693,8 @@ function cpBrief(userId, cp) {
     id: cp.id, name: cp.name, full_name: cp.full_name, inn: cp.inn, kpp: cp.kpp,
     kind: cp.kind, address: cp.address, bank_name: cp.bank_name, bik: cp.bik,
     acc: cp.acc, corr_acc: cp.corr_acc, contract: cp.contract, email: cp.email,
+    // Основание накладных и УПД, запомненное за клиентом: форма подставляет его сама.
+    basis: bdb.basisFor(userId, cp.id),
     /*
      * Начальное сальдо показываем ТЕКУЩЕЙ фирмы, а не то, что записано на
      * карточке. Считается оно уже по паре «организация — клиент», и если
@@ -2357,8 +2359,28 @@ const api = {
     return bdb.debtBreakdown(user.id);
   },
 
-  async 'GET /api/templates'({ user }) {
-    return { templates: bdb.listTemplates(user.id, 20) };
+  /**
+   * Частые позиции для формы документа. С cpId и type — то, что выписывали ЭТОМУ
+   * клиенту в таком же документе (bdb.suggestItems); без них — общие.
+   */
+  async 'GET /api/templates'({ user, url }) {
+    const cpId = Number(url.searchParams.get('cpId')) || 0;
+    const type = String(url.searchParams.get('type') || '').slice(0, 10);
+    if (cpId && !bdb.getCp(user.id, cpId)) return { templates: [] };
+    return {
+      templates: bdb.suggestItems(user.id, cpId, type, 8)
+        .map((t) => ({ name: t.name, unit: t.unit, price: t.price, global: !t.own })),
+    };
+  },
+
+  /** Убрать подсказку позиции: у клиента, а у общих (без его истории) — совсем. */
+  async 'POST /api/templates/hide'({ user, body }) {
+    const cpId = Number(body.cpId) || 0;
+    if (cpId && !bdb.getCp(user.id, cpId)) return { error: 'Клиент не найден.' };
+    const name = str(body.name, 200);
+    if (!name) return { error: 'Не понял, какую позицию убрать.' };
+    bdb.hideItem(user.id, cpId, name, { global: Boolean(body.global) || !cpId });
+    return { ok: true };
   },
 
   /** Выпуск документа: файл в чат + ссылка на скачивание в приложении. */

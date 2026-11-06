@@ -1963,6 +1963,82 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
       ok(!opF.length || opF.every((o) => !o.doc || o.doc.includes('7777')), 'и в журнале операций номер новый', JSON.stringify(opF.map((o) => o.doc)));
     }
 
+    /*
+     * Основание накладных и подсказки позиций — по клиенту.
+     * Владелец: одно и то же основание в накладную вписывается раз за разом;
+     * на ТОРГ-12 предлагались позиции из чужих счетов (канапе, брускетта), а
+     * свои — нет.
+     */
+    {
+      const bdbB = require('./lib/bot-db');
+      const uidB = fxUserId();
+      const cpB = bdbB.createCp(uidB, { name: 'ООО Основание', kind: 'customer', opening_date: '2026-01-01' });
+      const cpOther = bdbB.createCp(uidB, { name: 'ООО Соседи', kind: 'customer', opening_date: '2026-01-01' });
+      const BASIS = 'Договор № 12 от 01.03.2026';
+      const docSvc = require('./lib/doc-service');
+      const mkT = (cp, extra, items = [{ name: 'Обед', unit: 'чел.', qty: 5, price: 450 }], type = 'torg12') =>
+        docSvc.issueDocument(uidB, { type, cpId: cp, items, date: '2026-10-05', skipQuota: true, extra });
+      let r1 = await mkT(cpB, { basis: BASIS });
+      let r2 = await mkT(cpB, { basis: '  договор №  12 от 01.03.2026 ' });
+      ok(!r1.basisLearned && !r2.basisLearned && bdbB.basisFor(uidB, cpB) === '', 'после двух вводов основание ещё не запоминается');
+      const r3 = await mkT(cpB, { basis: BASIS });
+      ok(r3.basisLearned === BASIS && bdbB.basisFor(uidB, cpB) === BASIS, 'в третий раз запоминается за клиентом', r3.basisLearned);
+      ok(bdbB.basisFor(uidB, cpOther) === '', 'другому клиенту оно не достаётся');
+      const r4 = await mkT(cpB, {});
+      ok(bdbB.getDoc(uidB, r4.doc.id).payload.basis === BASIS, 'не вписали основание — подставилось запомненное');
+      const r5 = await mkT(cpB, { basis: 'Заказ-наряд № 5' });
+      ok(bdbB.getDoc(uidB, r5.doc.id).payload.basis === 'Заказ-наряд № 5' && bdbB.basisFor(uidB, cpB) === BASIS,
+        'вписали другое — печатается оно, запомненное не сбито');
+      const r6 = await mkT(cpOther, {});
+      ok(!bdbB.getDoc(uidB, r6.doc.id).payload.basis, 'у клиента без запомненного основания поле пустое, как раньше');
+
+      // Подсказки позиций: накладная клиента видит свои позиции из накладных, не из счетов.
+      await mkT(cpB, {}, [{ name: 'Канапе ассорти', unit: 'шт.', qty: 20, price: 650 }, { name: 'Брускетта', unit: 'шт.', qty: 15, price: 780 }], 'sch');
+      const sugT = bdbB.suggestItems(uidB, cpB, 'torg12', 6);
+      ok(sugT.length === 1 && sugT[0].name === 'Обед' && sugT[0].price === 450,
+        'на накладную — только то, что выписывали этому клиенту в накладных', JSON.stringify(sugT.map((x) => x.name)));
+      const sugS = bdbB.suggestItems(uidB, cpB, 'sch', 6);
+      ok(sugS.length === 2 && sugS[0].name === 'Канапе ассорти', 'на счёт — позиции из его счетов', JSON.stringify(sugS.map((x) => x.name)));
+      const cpFresh = bdbB.createCp(uidB, { name: 'ООО Новичок', kind: 'customer', opening_date: '2026-01-01' });
+      const sugNew = bdbB.suggestItems(uidB, cpFresh, 'torg12', 6);
+      ok(sugNew.length >= 1 && sugNew.every((x) => x.tplId), 'у клиента без истории — общие частые, как раньше');
+      bdbB.hideItem(uidB, cpB, 'Обед');
+      ok(!bdbB.suggestItems(uidB, cpB, 'torg12', 6).some((x) => x.name === 'Обед'), 'убранная подсказка не предлагается');
+      await mkT(cpB, {});
+      ok(bdbB.suggestItems(uidB, cpB, 'torg12', 6).some((x) => x.name === 'Обед'), 'а выписал снова — подсказка вернулась');
+
+      // Кнопки в боте: подсказка по клиенту, а не общий список.
+      await tap(`d.torg12:${cpB}`);
+      ok(Boolean(button('Обед')) && !button('Канапе') , 'в боте на ТОРГ-12 клиента кнопка «Обед» без канапе', last());
+      await tap('ci:0');
+      ok(/Сколько\?/.test(last()) && /450/.test(last()), 'нажатие подсказки спрашивает количество, цена — клиентская', last());
+      await say('7');
+      const stB = bdbB.getState(uidB);
+      ok(stB && stB.data.items.length === 1 && stB.data.items[0].qty === 7 && stB.data.items[0].price === 450, 'позиция добавлена: 7 × 450');
+      await tap('ci.hide');
+      ok(Boolean(button('Обед')) && /Какую позицию убрать/.test(last()), 'можно убрать лишнюю подсказку кнопкой');
+      await tap('menu');
+
+      // Основание всем накладным клиента: только надпись, суммы и долг не меняются.
+      const before = bdbB.basisDocs(uidB, cpB);
+      const balB = bdbB.balanceOf(uidB, cpB).closing;
+      await tap(`cb:${cpB}`);
+      ok(/Подставляю/.test(last()) && Boolean(button('Задать основание')), 'карточка основания: что подставляется и как задать', last());
+      await tap(`cb.set:${cpB}`);
+      await say('Договор № 99 от 15.10.2026');
+      ok(Boolean(button('Всем выписанным')), 'бот спрашивает, к каким накладным применить', last());
+      const filesBeforeZ = files.length;
+      await tap(`cb.all:${cpB}`);
+      for (let i = 0; i < 100 && files.length === filesBeforeZ; i += 1) await new Promise((r) => setTimeout(r, 100));
+      const after = bdbB.basisDocs(uidB, cpB);
+      ok(after.length === before.length && after.every((d) => d.basis === 'Договор № 99 от 15.10.2026'),
+        'основание стоит у всех накладных и УПД клиента', JSON.stringify(after.map((d) => d.basis)));
+      ok(bdbB.basisFor(uidB, cpB) === 'Договор № 99 от 15.10.2026', 'и запомнено для новых');
+      ok(bdbB.balanceOf(uidB, cpB).closing === balB, 'долг не изменился');
+      const zB = files[files.length - 1] || {};
+      ok(/\.zip$/.test(zB.filename || ''), 'исправленные файлы пришли архивом', zB.filename);
+    }
+
     // Читаем файл обратно: важно, что суммы — числа, а не текст,
     // иначе реестр не складывается и им нельзя пользоваться.
     const wb = new ExcelJS.Workbook();
@@ -6192,9 +6268,10 @@ const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
     ok(rec.isDue(one, nextMonth) === true, 'в следующем месяце предложение положено');
 
     // Предложение и выписка по кнопке.
-    const before = bdbR.listDocs(uid, 50).length;
+    // Предел с запасом: журнал успел вырасти, и «последние 50» уже не растут на одну запись.
+    const before = bdbR.listDocs(uid, 5000).length;
     await tap(`rec.go:${one.id}`);
-    ok(bdbR.listDocs(uid, 50).length === before + 1, 'по кнопке документ выписан',
+    ok(bdbR.listDocs(uid, 5000).length === before + 1, 'по кнопке документ выписан',
       bdbR.listDocs(uid, 50).length - before);
     const madeDoc = bdbR.listDocs(uid, 1)[0];
     ok(madeDoc.total === 45000 && madeDoc.cp_id === cpR, 'тот же клиент и та же сумма',
