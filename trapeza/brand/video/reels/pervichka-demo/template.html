@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="UTF-8" /><meta name="viewport" content="width=1080, height=1920" />
+<title>Первичка — демо</title>
+<script src="gsap.min.js"></script>
+<style>
+@font-face{font-family:Unb;font-weight:200 900;src:url(unbounded-cyrillic-wght-normal.woff2) format('woff2');unicode-range:U+0400-045F,U+2116,U+00AB,U+00BB,U+2014}
+@font-face{font-family:Unb;font-weight:200 900;src:url(unbounded-latin-wght-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+20BD,U+2212}
+@font-face{font-family:Man;font-weight:200 800;src:url(manrope-cyrillic-wght-normal.woff2) format('woff2');unicode-range:U+0400-045F,U+2116,U+00AB,U+00BB}
+@font-face{font-family:Man;font-weight:200 800;src:url(manrope-latin-wght-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+20BD,U+2212}
+html,body{margin:0;background:#04060F}
+#root{position:relative;width:1080px;height:1920px;overflow:hidden;font-family:Unb,Man,sans-serif;color:#fff;background:#04060F}
+.clip{position:absolute;inset:0}
+#bg{background:radial-gradient(ellipse 90% 40% at 50% 100%,rgba(61,98,255,.5),rgba(30,45,140,.2) 55%,transparent 75%),radial-gradient(ellipse 120% 60% at 50% 0%,#0B1230,#04060F 70%)}
+#floor{position:absolute;left:-120px;right:-120px;bottom:-80px;height:330px;border-radius:50%;background:radial-gradient(ellipse at 50% 30%,rgba(120,150,255,.9),rgba(70,100,255,.5) 35%,rgba(40,60,200,.12) 65%,transparent 72%);filter:blur(10px)}
+.sp{position:absolute;border-radius:50%}
+.scn{position:absolute;inset:0;opacity:0;overflow:hidden}
+.hl{position:absolute;left:0;right:0;text-align:center;font-weight:800;text-transform:uppercase;line-height:1.08;letter-spacing:-.01em;text-shadow:0 6px 24px rgba(0,0,0,.45)}
+.hl span{display:inline-block;opacity:0;margin:0 .1em}
+.ac{color:#43E895}
+.chip{position:absolute;left:50%;top:150px;transform:translateX(-50%);height:84px;border-radius:42px;background:rgba(255,255,255,.1);border:2px solid rgba(255,255,255,.28);display:flex;align-items:center;gap:16px;padding:0 34px 0 12px;font:800 34px Man;white-space:nowrap;color:#fff;opacity:0}
+.chip .av{width:60px;height:60px;border-radius:50%;background:#E3E9FA url(hero2.png) no-repeat;background-size:136px auto;background-position:-32px -39px}
+.card{position:absolute;box-sizing:border-box;border-radius:36px;background:#fff;color:#0A1230;box-shadow:0 0 70px rgba(90,125,255,.45),0 30px 60px rgba(0,0,0,.45)}
+.st{position:absolute}
+.phone{position:absolute;box-sizing:border-box;border:10px solid #6F8CFF;background:#0A0F1F;overflow:hidden;box-shadow:0 0 80px rgba(80,115,255,.65),inset 0 0 30px rgba(80,115,255,.25)}
+.scr{position:absolute;inset:0;overflow:hidden;background:#EAF0F8}
+.scr>img{position:absolute;left:0;top:0;width:100%;height:100%;display:block}
+.band{position:absolute;left:0;width:100%;overflow:hidden}
+.band img{position:absolute;left:0;width:100%;display:block}
+.msg{position:absolute;opacity:0;border-radius:26px;font:600 25px/1.3 Man;padding:16px 20px;box-sizing:border-box;color:#0A1230}
+.me{right:20px;background:#EFFDDE;border-bottom-right-radius:8px;width:380px}
+.bot{left:20px;background:#fff;border-bottom-left-radius:8px;width:420px;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+.wv{display:inline-block;width:6px;border-radius:3px;background:#4FAE4E;margin-right:4px;vertical-align:middle}
+.pdf{margin-top:12px;display:flex;gap:12px;align-items:center;background:#F1F4FA;border-radius:16px;padding:10px 12px}
+.pdf i{width:52px;height:62px;border-radius:10px;background:#E5484D;color:#fff;font:800 18px/62px Unb;text-align:center;font-style:normal}
+.pdf b{font:700 22px Man;display:block}.pdf em{font:500 19px Man;color:#6B7A99;font-style:normal}
+.btn{margin-top:10px;border-radius:14px;background:#E8F0FF;text-align:center;font:700 23px Man;padding:11px 0;color:#2E5BD9}
+.ex{position:absolute;padding:6px 16px;border-radius:10px;background:#FFE9A8;color:#6B4E00;font:800 22px Man;letter-spacing:.08em;z-index:5;opacity:0}
+.ring{position:absolute;border-radius:50%;border:7px solid #43E895;opacity:0;width:110px;height:110px;margin:-55px 0 0 -55px;z-index:60}
+.hlr{position:absolute;border-radius:20px;border:5px solid #43E895;opacity:0;z-index:20;box-shadow:0 0 30px rgba(67,232,149,.7)}
+.cap{position:absolute;left:60px;right:60px;top:1700px;text-align:center;font:800 48px/1.2 Man;opacity:0;z-index:60}
+.cap i{font-style:normal;display:inline-block;margin:0 .1em;color:rgba(255,255,255,.32)}
+.pz{position:absolute;left:0;bottom:0;height:100%;opacity:0;transform:translateX(-50%)}
+.pz img{height:100%;width:auto;display:block}
+.mo{position:absolute;border-radius:50%;background:#0B1550;transform:translate(-50%,-50%) scaleY(.1);box-shadow:inset 0 -.3em 0 rgba(255,110,140,.55)}
+#hero{position:absolute;width:0;z-index:50}
+#caps{position:absolute;inset:0;z-index:70}
+</style></head><body>
+<div id="root" data-composition-id="pervichka-demo" data-width="1080" data-height="1920" data-duration="__T__">
+  <section id="bg" class="clip" data-start="0" data-duration="__T__" data-track-index="0"><div id="floor"></div><div id="sparks" class="clip"></div></section>
+  <section id="main" class="clip" data-start="0" data-duration="__T__" data-track-index="1"><div id="stage" class="clip"></div></section>
+  <section id="heroc" class="clip" data-start="0" data-duration="__T__" data-track-index="3" style="z-index:50"><div id="hero"></div></section>
+  <section id="ui" class="clip" data-start="0" data-duration="__T__" data-track-index="4" style="z-index:70"><div id="caps"></div></section>
+  <audio id="sfx" src="audio.wav" data-start="0" data-duration="__T__" data-track-index="32"></audio>
+</div>
+<script>
+const D = __DATA__, T = D.T, BEAT = 60 / D.bpm;
+const tl = gsap.timeline({ paused: true });
+window.__timelines = window.__timelines || {}; window.__timelines['pervichka-demo'] = tl;
+const _fromTo = tl.fromTo.bind(tl);
+tl.fromTo = (t, f, to, pos) => { if (typeof t !== 'string' && f && (f.autoAlpha === 0 || f.opacity === 0)) tl.set(t, f.autoAlpha === 0 ? { autoAlpha: 0 } : { opacity: 0 }, 0); return _fromTo(t, f, to, pos); };
+const $ = (s) => document.querySelector(s), stage = $('#stage');
+const mk = (tag, cls, css, html, parent) => { const e = document.createElement(tag); if (cls) e.className = cls; if (css) Object.assign(e.style, css); if (html !== undefined) e.innerHTML = html; (parent || stage).appendChild(e); return e; };
+const sc = (id) => D.scenes.find((s) => s.id === id), S = (id) => sc(id).start;
+const GREEN = '#43E895';
+// фон: искры
+{ const SP = $('#sparks'); for (let k = 0; k < 60; k++) { const sz = 4 + (k * 7) % 7, c = ['#FFD84D', '#8FB0FF', '#43E895', '#fff'][k % 4];
+  const d = mk('i', 'sp', { left: ((k * 137) % 1080) + 'px', top: (150 + (k * 251) % 1700) + 'px', width: sz + 'px', height: sz + 'px', background: c, boxShadow: `0 0 ${sz * 2}px ${c}`, opacity: .7 }, '', SP);
+  tl.to(d, { y: -(160 + (k % 5) * 70), x: k % 2 ? 36 : -36, duration: T, ease: 'none' }, 0);
+  tl.fromTo(d, { opacity: .2 }, { opacity: .95, duration: .7 + (k % 4) * .2, yoyo: true, repeat: Math.floor((T - 1) / (.7 + (k % 4) * .2)), ease: 'sine.inOut', immediateRender: false }, (k % 7) * .1); } }
+// ---------- сцены ----------
+const SCN = {}; D.scenes.forEach((s) => { const el = mk('div', 'scn', null, ''); el.id = s.id; SCN[s.id] = el; });
+const chip = (id, text, top = 150) => { const c = mk('div', 'chip', { top: top + 'px' }, `<i class="av"></i>${text}`, SCN[id]); tl.fromTo(c, { autoAlpha: 0, y: -40, scale: .9 }, { autoAlpha: 1, y: 0, scale: 1, duration: .5, ease: 'expo.out', immediateRender: false }, S(id) + .5); return c; };
+const head = (id, lines, top, size, t0, step = .2, keys = []) => lines.forEach((ln, i) => { const h = mk('div', 'hl' + (keys.includes(i) ? ' ac' : ''), { top: (top + i * size * 1.1) + 'px', fontSize: size + 'px' }, `<span>${ln}</span>`, SCN[id]);
+  tl.fromTo(h.firstChild, { autoAlpha: 0, y: 50, filter: 'blur(14px)' }, { autoAlpha: 1, y: 0, filter: 'blur(0px)', duration: .55, ease: 'expo.out', immediateRender: false }, t0 + i * step); });
+// телефон с экраном; координаты экрана: доля ширины/высоты → страница
+const PH = {};
+const phone = (id, key, x, y, w, parent) => { const hh = w * 2532 / 1170; const p = mk('div', 'phone', { left: x + 'px', top: y + 'px', width: (w + 20) + 'px', height: (hh + 20) + 'px', borderRadius: (w * .14) + 'px' }, '', parent || SCN[id]);
+  const scr = mk('div', 'scr', { borderRadius: (w * .105) + 'px' }, '', p); PH[key] = { p, scr, x, y, w, h: hh }; return PH[key]; };
+const pt = (key, fx, fy) => { const o = PH[key]; return [o.x + 10 + fx * o.w, o.y + 10 + fy * o.h]; };
+// «панель собирается»: экран режется на полосы, полосы выезжают по очереди
+const bands = (key, src, cuts, t0, step = .08) => { const o = PH[key]; for (let i = 0; i < cuts.length - 1; i++) { const a = cuts[i], b = cuts[i + 1];
+  const bd = mk('div', 'band', { top: (a * o.h) + 'px', height: ((b - a) * o.h) + 'px' }, '', o.scr); const im = mk('img', '', { top: (-a * o.h) + 'px', height: o.h + 'px' }, '', bd); im.src = src;
+  tl.fromTo(bd, { autoAlpha: 0, y: 70, scale: .96 }, { autoAlpha: 1, y: 0, scale: 1, duration: .6, ease: 'expo.out', immediateRender: false }, t0 + i * step); } };
+const shell = (key, t, from = {}) => { const o = PH[key]; tl.fromTo(o.p, Object.assign({ autoAlpha: 0, y: 160, rotationX: 24, scale: .9 }, from), { autoAlpha: 1, y: 0, rotationX: 0, scale: 1, duration: .85, ease: 'expo.out', immediateRender: false }, t); };
+const ripple = (t, x, y) => { const r = mk('i', 'ring', { left: x + 'px', top: y + 'px' }, '', stage.parentNode.querySelector('#stage')); tl.fromTo(r, { scale: .3, opacity: 1 }, { scale: 2.4, opacity: 0, duration: .65, ease: 'expo.out', immediateRender: false }, t); };
+const hlr = (key, fx, fy, fw, fh, t, d = 1.4) => { const o = PH[key]; const r = mk('i', 'hlr', { left: (fx * o.w) + 'px', top: (fy * o.h) + 'px', width: (fw * o.w) + 'px', height: (fh * o.h) + 'px' }, '', o.scr);
+  tl.fromTo(r, { opacity: 0, scale: 1.1 }, { opacity: 1, scale: 1, duration: .4, ease: 'expo.out', immediateRender: false }, t); tl.to(r, { opacity: .3, duration: BEAT / 2, yoyo: true, repeat: Math.max(1, Math.floor((d - .5) / (BEAT / 2)) - 1) }, t + .5); tl.to(r, { opacity: 0, duration: .25, overwrite: 'auto' }, t + d); tl.set(r, { opacity: 0 }, t + d + .3); };
+
+// ---------- S1 ХУК ----------
+{ const id = 's1'; chip(id, 'Для ИП, самозанятых и малого бизнеса', 120);
+  head(id, ['Счёт клиенту', 'за минуту'], 250, 92, .0, .12, [1]);
+  const cb = mk('div', '', { position: 'absolute', left: 0, top: 0, width: '1080px', height: '1650px', overflow: 'hidden' }, '', SCN[id]);
+  phone(id, 'home', 290, 640, 500, cb); shell('home', 0, { y: 120, rotationX: 18 });
+  bands('home', 'home-debt.png', [0, .075, .33, .405, .485, .565, .70, 1], .15, .09);
+  tl.to(PH.home.p, { y: -16, duration: 1.8, ease: 'sine.inOut', yoyo: true, repeat: 1 }, .9);
+  const [bx, by] = pt('home', .5, .478); hlr('home', .03, .44, .94, .075, 2.3, 1.2); ripple(3.0, bx, by); }
+// ---------- S2 ГОЛОСОМ ----------
+{ const id = 's2', t = S(id); chip(id, '1 · Скажи голосом');
+  const o = phone(id, 'chat', 290, 330, 500); o.scr.style.background = '#E7EEF6';
+  mk('div', '', { position: 'absolute', left: 0, right: 0, top: 0, height: '120px', background: '#fff', display: 'flex', alignItems: 'flex-end', padding: '0 26px 16px', boxSizing: 'border-box', gap: '14px', font: '700 28px Man', color: '#0A1230' }, '<i style="width:60px;height:60px;border-radius:50%;background:linear-gradient(135deg,#4F6BFF,#2E3A8C);color:#fff;font:800 30px/60px Unb;text-align:center;font-style:normal">П</i>Первичка<small style="font:500 20px Man;color:#8795AD;margin-left:-4px">бот</small>', o.scr);
+  mk('div', '', { position: 'absolute', left: 0, right: 0, bottom: 0, height: '96px', background: '#fff', borderTop: '1px solid #DDE5F0' }, '<span style="position:absolute;left:28px;top:30px;font:500 26px Man;color:#9AA7BD">Сообщение</span><i style="position:absolute;right:20px;top:14px;width:68px;height:68px;border-radius:50%;background:#2E7BF0"></i><svg style="position:absolute;right:38px;top:28px" width="32" height="40" viewBox="0 0 24 30"><rect x="8" y="2" width="8" height="16" rx="4" fill="#fff"/><path d="M4 14a8 8 0 0 0 16 0M12 22v5" stroke="#fff" stroke-width="2.4" fill="none" stroke-linecap="round"/></svg>', o.scr);
+  const m0 = mk('div', 'msg me', { top: '170px' }, '<span id="w4"></span> <span style="font:600 20px Man;color:#4FAE4E">0:04</span><div style="font:600 24px/1.3 Man;margin-top:6px;color:#3C5A38">«счёт Вектору на 82 000»</div>', o.scr);
+  const m1 = mk('div', 'msg bot', { top: '400px' }, 'Счёт № 1 для <b>ООО «Вектор»</b> на 82 000 ₽<div class="pdf"><i>PDF</i><div><b>Счёт_1_Вектор.pdf</b><em>с QR для оплаты</em></div></div><div class="btn">✅ Оплачено</div>', o.scr);
+  const w4 = $('#w4'); for (let k = 0; k < 20; k++) { const w = document.createElement('i'); w.className = 'wv'; w.style.height = (8 + ((k * 37) % 28)) + 'px'; w4.appendChild(w); }
+  shell('chat', t + .2, { y: 200, rotationX: 0, rotationY: -22 });
+  tl.fromTo(m0, { autoAlpha: 0, y: 24 }, { autoAlpha: 1, y: 0, duration: .45, ease: 'expo.out', immediateRender: false }, t + 1.35);
+  tl.fromTo(o.scr.querySelectorAll('.wv'), { scaleY: .3 }, { scaleY: 1, duration: .16, stagger: { each: .025, repeat: 3, yoyo: true }, ease: 'sine.inOut', immediateRender: false }, t + 1.45);
+  tl.fromTo(m1, { autoAlpha: 0, y: 24 }, { autoAlpha: 1, y: 0, duration: .5, ease: 'expo.out', immediateRender: false }, t + 3.8);
+  const mic = pt('chat', .9, .955); ripple(5.4, mic[0], mic[1]);
+  const inv = mk('div', 'card', { left: '640px', top: '420px', width: '380px', height: '500px', padding: '26px', overflow: 'hidden' }, '<div style="font:800 24px Unb;color:#2E3A8C">СЧЁТ № 1</div><div style="font:700 25px Man;margin-top:8px">ООО «Вектор»</div><div style="font:800 52px Unb;margin-top:10px;letter-spacing:-.03em">82 000 ₽</div><img src="qr.svg" style="width:220px;height:220px;margin-top:16px">', SCN[id]);
+  tl.fromTo(inv, { autoAlpha: 0, x: -260, y: 60, rotationY: 55, scale: .7 }, { autoAlpha: 1, x: 0, y: 0, rotationY: -6, scale: 1, duration: .9, ease: 'expo.out', immediateRender: false }, t + 5.2);
+  tl.to(inv, { y: -14, duration: 1.2, ease: 'sine.inOut', yoyo: true, repeat: 1 }, t + 6.1);
+  const ex = mk('span', 'ex', { left: '870px', top: '390px' }, 'ПРИМЕР', SCN[id]); tl.fromTo(ex, { autoAlpha: 0 }, { autoAlpha: 1, duration: .3 }, t + 5.8);
+  const q = mk('div', '', { position: 'absolute', left: '600px', top: '330px', width: '440px', font: '800 28px/1.2 Man', color: GREEN, textAlign: 'center' }, 'Клиент платит, наведя камеру банка', SCN[id]);
+  tl.fromTo(q, { autoAlpha: 0, y: 30 }, { autoAlpha: 1, y: 0, duration: .5, ease: 'expo.out', immediateRender: false }, t + 6.4); }
+// ---------- S3 ВСЁ В ОДНОМ МЕСТЕ ----------
+{ const id = 's3', t = S(id); chip(id, '2 · Всё в одном месте');
+  const o = phone(id, 'docs', 290, 330, 500); shell('docs', t + .3, { rotationY: 18, rotationX: 10 });
+  bands('docs', 'docs.png', [0, .075, .21, .34, .46, .58, 1], t + .75, .09);
+  const nw = mk('img', '', { position: 'absolute', left: 0, top: 0, width: '100%', height: '100%', opacity: 0 }, '', o.scr); nw.src = 'new-sch.png';
+  const [bx, by] = pt('docs', .5, .165); hlr('docs', .03, .125, .94, .075, t + 1.9, 1.0); ripple(14.9, bx, by);
+  tl.to(nw, { opacity: 1, duration: .45, ease: 'power2.inOut' }, t + 3.1);
+  const [ax, ay] = pt('docs', .5, .727); hlr('docs', .04, .69, .92, .075, t + 4.6, 1.2); ripple(17.2, ax, ay);
+  ['СЧЁТ', 'АКТ', 'УПД', 'ТОРГ-12', 'ДОГОВОР'].forEach((w, i) => { const left = i < 3, c = mk('div', 'card', { left: (left ? 40 : 830) + 'px', top: (i < 3 ? 470 + i * 190 : 560 + (i - 3) * 190) + 'px', width: '210px', height: '100px', background: ['#2E3A8C', '#0E9F58', '#7B3FE4', '#E0701F', '#1F6FEB'][i], color: '#fff', font: '800 30px/100px Unb', textAlign: 'center', borderRadius: '50px' }, w, SCN[id]);
+    tl.fromTo(c, { autoAlpha: 0, x: left ? -200 : 200, scale: .8 }, { autoAlpha: 1, x: 0, scale: 1, duration: .55, ease: 'expo.out', immediateRender: false }, t + 4.6 + i * .25); }); }
+// ---------- S4 КТО ДОЛЖЕН ----------
+{ const id = 's4', t = S(id); chip(id, '3 · Видно, кто должен');
+  const o = phone(id, 'unp', 290, 330, 500); shell('unp', t + .3, { rotationY: -18, rotationX: 10 });
+  bands('unp', 'unpaid.png', [0, .075, .26, .34, .42, .50, 1], t + .75, .09);
+  const [rx, ry] = pt('unp', .5, .288); hlr('unp', .04, .245, .92, .085, t + 1.6, 1.8); ripple(22.3, rx, ry);
+  const rem = mk('div', 'card', { left: '160px', top: '1010px', width: '760px', padding: '26px 30px', borderRadius: '30px' }, '<div style="font:800 30px Man">Напомнить: ООО «Вектор»</div><div style="font:600 26px/1.3 Man;color:#44507A;margin-top:8px">Добрый день! Напоминаем про счёт № 1 от 03.11 на 82 000 ₽. QR для оплаты — во вложении.</div><div class="btn" style="margin-top:14px;background:#2E5BD9;color:#fff;font-size:26px;padding:14px 0">✉️ Отправить клиенту</div>', SCN[id]);
+  tl.fromTo(rem, { autoAlpha: 0, y: 220, scale: .9 }, { autoAlpha: 1, y: 0, scale: 1, duration: .75, ease: 'expo.out', immediateRender: false }, t + 3.4);
+  ripple(25.6, 540, 1235);
+  const nt = mk('div', '', { position: 'absolute', left: '60px', top: '1330px', width: '960px', font: '700 30px/1.25 Man', color: '#A9B4D6', textAlign: 'center' }, 'Письмо уйдёт только по твоей кнопке', SCN[id]);
+  tl.fromTo(nt, { autoAlpha: 0 }, { autoAlpha: 1, duration: .5 }, t + 5.6); }
+// ---------- S5 ЗАКРЫТО ----------
+{ const id = 's5', t = S(id); chip(id, '4 · Заплатил — долг закрыт');
+  const o = phone(id, 'fin', 290, 520, 500); shell('fin', t + .3, { rotationX: 14 });
+  const a = mk('img', '', { position: 'absolute', left: 0, top: 0, width: '100%', height: '100%' }, '', o.scr); a.src = 'home-debt.png';
+  const b = mk('img', '', { position: 'absolute', left: 0, top: 0, width: '100%', height: '100%', opacity: 0 }, '', o.scr); b.src = 'home-paid.png';
+  [['ООО «Вектор»', '82 000'], ['ИП Заря', '40 500'], ['ООО «Луч»', '25 500']].forEach(([n, s], i) => { const x = mk('div', 'card', { left: '180px', top: '350px', width: '720px', height: '110px', background: '#0E9F58', color: '#fff', font: '800 34px/110px Man', textAlign: 'center', borderRadius: '55px' }, `✓ Оплачено · ${n} · ${s} ₽`, SCN[id]);
+    tl.fromTo(x, { autoAlpha: 0, y: 50, scale: .85 }, { autoAlpha: 1, y: 0, scale: 1, duration: .45, ease: 'back.out(2)', immediateRender: false }, t + 1.1 + i * .7); tl.to(x, { autoAlpha: 0, y: -40, duration: .25 }, t + 1.75 + i * .7); });
+  tl.to(b, { opacity: 1, duration: .5, ease: 'power2.inOut' }, t + 3.1);
+  const ok = mk('div', 'card', { left: '280px', top: '350px', width: '520px', height: '110px', background: '#43E895', color: '#04230F', font: '800 40px/110px Unb', textAlign: 'center', borderRadius: '55px' }, '✓ ДОЛГ ЗАКРЫТ', SCN[id]);
+  tl.fromTo(ok, { autoAlpha: 0, scale: .6, y: 20 }, { autoAlpha: 1, scale: 1, y: 0, duration: .55, ease: 'back.out(2.2)', immediateRender: false }, t + 3.4);
+  for (let k = 0; k < 5; k++) { const c = mk('img', 'st', { left: '0px', top: '0px', width: '110px' }, '', SCN[id]); c.src = 'st-coin.webp';
+    tl.fromTo(c, { autoAlpha: 0, x: 540, y: 1100, scale: .4, rotation: -30 }, { autoAlpha: 1, x: [110, 880, 250, 800, 520][k], y: [700, 640, 980, 960, 560][k], scale: 1, rotation: 20 * (k - 2), duration: .65, ease: 'expo.out', immediateRender: false }, t + 3.4 + k * .08);
+    tl.to(c, { y: '-=30', duration: 1.2, ease: 'sine.inOut', yoyo: true, repeat: 1 }, t + 4.05); } }
+// ---------- S6 ЦЕНА ----------
+{ const id = 's6', t = S(id);
+  head(id, ['Всё это за'], 280, 70, t + .3, 0);
+  const pr = mk('div', 'hl ac', { top: '440px', fontSize: '250px' }, '<span>390 ₽</span>', SCN[id]); tl.fromTo(pr.firstChild, { autoAlpha: 0, scale: 1.5, filter: 'blur(20px)' }, { autoAlpha: 1, scale: 1, filter: 'blur(0px)', duration: .75, ease: 'expo.out', immediateRender: false }, t + .7);
+  const m = mk('div', 'hl', { top: '720px', fontSize: '58px', fontFamily: 'Man', textTransform: 'none', color: '#A9B4D6' }, '<span>в месяц, без ограничений</span>', SCN[id]); tl.fromTo(m.firstChild, { autoAlpha: 0, y: 30 }, { autoAlpha: 1, y: 0, duration: .5, ease: 'expo.out', immediateRender: false }, t + 1.3);
+  [['5 документов в месяц — бесплатно', '#0E9F58', 900], ['Без бухгалтера и без 1С', '#2E3A8C', 1050]].forEach(([tx, c, y], i) => { const b = mk('div', 'card', { left: '90px', top: y + 'px', width: '900px', height: '110px', background: c, color: '#fff', font: '800 31px/110px Unb', textAlign: 'center', borderRadius: '55px' }, tx, SCN[id]);
+    tl.fromTo(b, { autoAlpha: 0, y: 70, scale: .9 }, { autoAlpha: 1, y: 0, scale: 1, duration: .55, ease: 'expo.out', immediateRender: false }, t + 1.9 + i * .35); }); }
+// ---------- S7 ПРИЗЫВ ----------
+{ const id = 's7', t = S(id);
+  head(id, ['Напиши'], 280, 70, t + .3, 0);
+  const w = mk('div', 'hl ac', { top: '400px', fontSize: '230px' }, '<span>СЧЁТ</span>', SCN[id]); tl.fromTo(w.firstChild, { autoAlpha: 0, scale: 1.6, filter: 'blur(20px)' }, { autoAlpha: 1, scale: 1, filter: 'blur(0px)', duration: .75, ease: 'expo.out', immediateRender: false }, t + .7);
+  const b = mk('div', 'card', { left: '150px', top: '800px', width: '780px', height: '150px', font: '800 50px/150px Unb', textAlign: 'center', borderRadius: '75px' }, 'Открыть бота →', SCN[id]);
+  tl.fromTo(b, { autoAlpha: 0, y: 70, scale: .85 }, { autoAlpha: 1, y: 0, scale: 1, duration: .55, ease: 'expo.out', immediateRender: false }, t + 1.3); tl.to(b, { scale: 1.04, duration: BEAT / 2, yoyo: true, repeat: 5, ease: 'sine.inOut' }, t + 2.0);
+  const h = mk('div', 'hl', { top: '985px', fontSize: '42px', fontFamily: 'Man', textTransform: 'none', color: '#A9B4D6' }, '<span>@pervichka_app_bot</span>', SCN[id]); tl.fromTo(h.firstChild, { autoAlpha: 0, y: 20 }, { autoAlpha: 1, y: 0, duration: .4 }, t + 1.7);
+  const f = mk('div', 'hl', { top: '1100px', fontSize: '34px', fontFamily: 'Man', textTransform: 'none', color: '#8795AD' }, '<span>Для ИП, самозанятых и малого бизнеса</span>', SCN[id]); tl.fromTo(f.firstChild, { autoAlpha: 0 }, { autoAlpha: 1, duration: .5 }, t + 2.2);
+  const ex = mk('div', 'hl', { top: '1180px', fontSize: '26px', fontFamily: 'Man', textTransform: 'none', color: '#6E7BA3' }, '<span>Суммы и клиенты в ролике — пример</span>', SCN[id]); tl.fromTo(ex.firstChild, { autoAlpha: 0 }, { autoAlpha: 1, duration: .5 }, t + 2.4); }
+// ---------- переходы: плавно, но резко ----------
+D.scenes.forEach((s, i) => { const o = SCN[s.id], t = s.start, prev = i ? SCN[D.scenes[i - 1].id] : null;
+  tl.set(o, { autoAlpha: 1 }, t);
+  if (prev) {
+    if (s.trans === 'zoom') { tl.fromTo(o, { scale: .88, opacity: 0, filter: 'blur(14px)' }, { scale: 1, opacity: 1, filter: 'blur(0px)', duration: .75, ease: 'expo.out', immediateRender: false }, t); tl.to(prev, { scale: 1.18, opacity: 0, filter: 'blur(14px)', duration: .55, ease: 'expo.in' }, t - .05); }
+    if (s.trans === 'circle') { tl.fromTo(o, { clipPath: 'circle(0px at 50% 88%)' }, { clipPath: 'circle(1800px at 50% 88%)', duration: .9, ease: 'expo.inOut', immediateRender: false }, t); tl.set(o, { clipPath: 'none' }, t + .95); tl.to(prev, { opacity: 0, duration: .5, ease: 'power2.in' }, t + .3); }
+    tl.set(prev, { autoAlpha: 0 }, t + 1.0); }
+  tl.fromTo(o, { scale: 1 }, { scale: 1.035, duration: s.end - s.start, ease: 'none', immediateRender: false }, t + .8); });
+tl.to(SCN.s7, { opacity: 0, duration: .45, ease: 'power2.inOut' }, T - .45); tl.set('#s1', { autoAlpha: 1 }, T - .45);
+// ---------- субтитры ----------
+const WORDS = [];
+D.vo.forEach(([a, b, txt]) => { const tok = txt.split(' ').map((w) => ({ w: w.replace(/\*/g, ''), key: w.includes('*') })), wts = tok.map((x) => x.w.length + 2), sum = wts.reduce((p, q) => p + q, 0); let acc = a;
+  const cap = mk('div', 'cap', null, '', $('#caps'));
+  const sp = tok.map((x, i) => { const el = mk('i', '', null, x.w, cap); const t0 = acc, t1 = acc + (b - a) * wts[i] / sum; acc = t1; WORDS.push({ t0, t1, w: x.w, key: x.key }); el._t = t0; el._k = x.key; return el; });
+  tl.set(cap, { autoAlpha: 1 }, a); tl.set(cap, { autoAlpha: 0 }, b + .3);
+  sp.forEach((el) => tl.set(el, { color: el._k ? GREEN : '#fff' }, el._t)); });
+// ---------- герой: картинки из Nano Banana, рот рисуем кодом; в сценах интерфейса герой — курсор ----------
+const POSE = { 'hero1.png': { W: 876, H: 900 }, 'hero2.png': { W: 751, H: 900, tip: [722, 168], m: { cx: 343, cy: 470, w: 84 } }, 'hero3.png': { W: 753, H: 900 }, 'hero4.png': { W: 620, H: 900 }, 'hero5.png': { W: 1112, H: 900, m: { cx: 554, cy: 780, w: 140 } } };
+const hero = $('#hero'), pz = {}, mouths = [];
+Object.entries(POSE).forEach(([f, p]) => { const z = mk('div', 'pz', { aspectRatio: p.W + '/' + p.H }, '', hero); const im = mk('img', '', null, '', z); im.src = f; pz[f] = z;
+  if (p.m) { const m = mk('i', 'mo', { left: (p.m.cx / p.W * 100) + '%', top: (p.m.cy / p.H * 100) + '%', width: (p.m.w / p.W * 100) + '%', aspectRatio: '2/1' }, '', z); mouths.push(m); } });
+tl.set(hero, { yPercent: -100, left: 900, top: 2300, height: 420 }, 0);
+const show = (t, f) => Object.entries(pz).forEach(([k, z]) => tl.set(z, { autoAlpha: k === f ? 1 : 0 }, t));
+// курсор: палец героя (tip) попадает в точку (tx, ty); герой стоит ниже и левее
+const P2 = POSE['hero2.png'];
+const at = (tx, ty, h) => { const s = h / P2.H; return { left: tx - (P2.tip[0] - P2.W / 2) * s, top: ty + (P2.H - P2.tip[1]) * s, height: h }; };
+const cur = (t, tx, ty, h = 360, d = .8) => tl.to(hero, Object.assign({ duration: d, ease: 'expo.inOut' }, at(tx, ty, h)), t);
+const away = (t, x = 900, d = .5) => tl.to(hero, { left: x, top: 2300, duration: d, ease: 'expo.in' }, t);
+const hop = (t, k = 1) => { tl.to(hero, { y: -70 * k, duration: .2, ease: 'power2.out' }, t); tl.to(hero, { y: 0, duration: .4, ease: 'bounce.out' }, t + .2); };
+const start = (t, f, x, y, h) => { show(t, f); tl.set(hero, { left: x, top: y + 700, height: h }, t - .01); tl.to(hero, { top: y, duration: .8, ease: 'expo.out' }, t); };
+// S1: появляется справа и показывает пальцем на кнопку «Выписать счёт»
+{ const [bx, by] = pt('home', .5, .478); show(1.6, 'hero2.png'); tl.set(hero, Object.assign({}, at(bx + 330, by + 520, 300), { top: 2300 }), 1.59); tl.to(hero, Object.assign({ duration: .9, ease: 'expo.out' }, at(bx + 250, by + 330, 300)), 1.6);
+  cur(2.4, bx, by, 270, .6); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 3.0); away(3.7); }
+// S2: курсор жмёт микрофон, потом показывает на QR
+{ const mic = pt('chat', .9, .955); show(S('s2') + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(mic[0] + 200, mic[1] + 400, 300), { top: 2300 }), S('s2') + .29); cur(S('s2') + .5, mic[0] + 90, mic[1] + 120, 270, .9); cur(5.0, mic[0], mic[1], 270, .5); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 5.4);
+  cur(9.0, 900, 900, 270, .9); hop(10.6, .3); away(S('s3') - .2); }
+// S3: курсор жмёт «Выписать документ», затем «Добавить позицию»
+{ const b1 = pt('docs', .5, .165), b2 = pt('docs', .5, .727); show(S('s3') + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(b1[0] + 220, b1[1] + 400, 300), { top: 2300 }), S('s3') + .29);
+  cur(13.9, b1[0], b1[1], 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 14.9); cur(16.0, b2[0], b2[1], 270, .8); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 17.2); cur(18.0, 820, 1000, 270, .9); away(S('s4') - .2); }
+// S4: курсор жмёт строку клиента, затем «Отправить клиенту»
+{ const r1 = pt('unp', .5, .288); show(S('s4') + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(r1[0] + 200, r1[1] + 450, 300), { top: 2300 }), S('s4') + .29);
+  cur(21.3, r1[0], r1[1], 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 22.3); cur(24.4, 540, 1235, 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 25.6); away(S('s5') - .2, 540); }
+// S5: радуется
+start(S('s5') + 3.2, 'hero3.png', 220, 1640, 540); hop(S('s5') + 3.9, .9); tl.to(hero, { top: 2300, duration: .5, ease: 'expo.in' }, S('s6') - .1);
+// S6, S7: с телефоном справа
+start(S('s6') + 1.6, 'hero1.png', 900, 1630, 440); hop(S('s6') + 2.4, .5); start(S('s7') + .2, 'hero1.png', 900, 1630, 440); tl.set(hero, { top: 1630 }, S('s7') + 1.0);
+tl.to(hero, { top: 2300, duration: .5, ease: 'expo.in' }, T - .8);
+// рот: по гласным в каждом слове; пока голоса нет — по оценке времени слов, с записью — по громкости
+const vow = (w) => (w.toLowerCase().match(/[аеёиоуыэюя]/g) || []).length || 1;
+WORDS.forEach((w) => { const n = vow(w.w), step = Math.max(.1, (w.t1 - w.t0) / n);
+  for (let k = 0; k < n; k++) { const t = w.t0 + k * step; mouths.forEach((m) => { tl.to(m, { scaleY: w.key ? 1 : .75, duration: .05, ease: 'power2.out' }, t); tl.to(m, { scaleY: .1, duration: .07, ease: 'power2.in' }, t + Math.min(step * .6, .12)); }); } });
+tl.set({}, {}, T);
+</script>
+</body></html>
