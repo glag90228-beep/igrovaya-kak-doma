@@ -8,7 +8,7 @@ require(APP + '/selftest-db');
 const crypto = require('node:crypto');
 process.env.BOT_TOKEN = '111:SIM'; process.env.FREE_DOCS = '1000';
 for (const k of ['GEMINI_API_KEY', 'AI_PROVIDER', 'AI_ENABLED', 'SPEECH_PROVIDER', 'VISION_PROVIDER']) delete process.env[k];
-const bdb = require(APP + '/lib/bot-db'), ds = require(APP + '/lib/doc-service');
+const bdb = require(APP + '/lib/bot-db'), ds = require(APP + '/lib/doc-service'), recurring = require(APP + '/lib/recurring');
 const { server, setTelegram } = require(APP + '/miniapp');
 const OUT = path.join(__dirname, 'shots');
 const USER = { id: 990777, first_name: 'Сергей', username: 'demo' };
@@ -27,6 +27,8 @@ const initData = () => { const f = { auth_date: String(Math.floor(Date.now() / 1
     const r = await ds.issueDocument(u.id, { type: 'sch', cpId: cp, items: [{ name: what, qty: 1, price: sum }], date: '2026-11-03', skipQuota: true });
     ids.push({ cp, doc: r.doc.id });
   }
+  // регулярный счёт: раз в месяц, за 3 дня (экран «По расписанию»)
+  recurring.add(u.id, { cpId: ids[1].cp, type: 'sch', day: 5, lead: 3, items: [{ name: 'Обслуживание за месяц', qty: 1, price: 40500 }] });
   setTelegram({ async sendDocument() { return {}; }, async sendMessage() { return {}; } });
   await new Promise((r) => server.listen(0, r));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -45,6 +47,9 @@ const initData = () => { const f = { auth_date: String(Math.floor(Date.now() / 1
   await snap('docs', 'docs');                               // журнал документов
   await snap('cp-vektor', 'cp', { id: ids[0].cp });         // карточка клиента
   await snap('new-sch', 'new', { type: 'sch', cpId: ids[0].cp });  // форма счёта
+  await snap('bank', 'bank');                               // выписка банка
+  await snap('recurring', 'recurring');                     // по расписанию
+  await snap('doc', 'doc', { id: ids[0].doc });             // карточка документа
   for (const x of ids) await bdb.markPaid(u.id, x.doc, '2026-11-06');
   await snap('home-paid', 'home');                          // «все рассчитались»
   await browser.close(); process.exit(0);

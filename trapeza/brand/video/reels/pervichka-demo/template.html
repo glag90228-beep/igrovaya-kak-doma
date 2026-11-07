@@ -88,9 +88,9 @@ const hlr = (key, fx, fy, fw, fh, t, d = 1.4) => { const o = PH[key]; const r = 
 
 // ---------- S1 ХУК ----------
 { const id = 's1'; chip(id, 'Для ИП, самозанятых и малого бизнеса', 120);
-  head(id, ['Счёт клиенту', 'за минуту'], 250, 92, .0, .12, [1]);
+  head(id, ['Счёт, акт, УПД', 'без Excel и', 'без бухгалтера'], 235, 78, .0, .12, [1, 2]);
   const cb = mk('div', '', { position: 'absolute', left: 0, top: 0, width: '1080px', height: '1650px', overflow: 'hidden' }, '', SCN[id]);
-  phone(id, 'home', 290, 640, 500, cb); shell('home', 0, { y: 120, rotationX: 18 });
+  phone(id, 'home', 290, 700, 500, cb); shell('home', 0, { y: 120, rotationX: 18 });
   bands('home', 'home-debt.png', [0, .075, .33, .405, .485, .565, .70, 1], .15, .09);
   tl.to(PH.home.p, { y: -16, duration: 1.8, ease: 'sine.inOut', yoyo: true, repeat: 1 }, .9);
   const [bx, by] = pt('home', .5, .478); hlr('home', .03, .44, .94, .075, 2.3, 1.2); ripple(3.0, bx, by); }
@@ -106,53 +106,47 @@ const hlr = (key, fx, fy, fw, fh, t, d = 1.4) => { const o = PH[key]; const r = 
   tl.fromTo(m0, { autoAlpha: 0, y: 24 }, { autoAlpha: 1, y: 0, duration: .45, ease: 'expo.out', immediateRender: false }, t + 1.35);
   tl.fromTo(o.scr.querySelectorAll('.wv'), { scaleY: .3 }, { scaleY: 1, duration: .16, stagger: { each: .025, repeat: 3, yoyo: true }, ease: 'sine.inOut', immediateRender: false }, t + 1.45);
   tl.fromTo(m1, { autoAlpha: 0, y: 24 }, { autoAlpha: 1, y: 0, duration: .5, ease: 'expo.out', immediateRender: false }, t + 3.8);
-  const mic = pt('chat', .9, .955); ripple(5.4, mic[0], mic[1]);
+  const mic = pt('chat', .9, .955); ripple(t + 1.2, mic[0], mic[1]);
   const inv = mk('div', 'card', { left: '640px', top: '420px', width: '380px', height: '500px', padding: '26px', overflow: 'hidden' }, '<div style="font:800 24px Unb;color:#2E3A8C">СЧЁТ № 1</div><div style="font:700 25px Man;margin-top:8px">ООО «Вектор»</div><div style="font:800 52px Unb;margin-top:10px;letter-spacing:-.03em">82 000 ₽</div><img src="qr.svg" style="width:220px;height:220px;margin-top:16px">', SCN[id]);
   tl.fromTo(inv, { autoAlpha: 0, x: -260, y: 60, rotationY: 55, scale: .7 }, { autoAlpha: 1, x: 0, y: 0, rotationY: -6, scale: 1, duration: .9, ease: 'expo.out', immediateRender: false }, t + 5.2);
   tl.to(inv, { y: -14, duration: 1.2, ease: 'sine.inOut', yoyo: true, repeat: 1 }, t + 6.1);
   const ex = mk('span', 'ex', { left: '870px', top: '390px' }, 'ПРИМЕР', SCN[id]); tl.fromTo(ex, { autoAlpha: 0 }, { autoAlpha: 1, duration: .3 }, t + 5.8);
-  const q = mk('div', '', { position: 'absolute', left: '600px', top: '330px', width: '440px', font: '800 28px/1.2 Man', color: GREEN, textAlign: 'center' }, 'Клиент платит, наведя камеру банка', SCN[id]);
-  tl.fromTo(q, { autoAlpha: 0, y: 30 }, { autoAlpha: 1, y: 0, duration: .5, ease: 'expo.out', immediateRender: false }, t + 6.4); }
+}
 // ---------- S3 ВСЁ В ОДНОМ МЕСТЕ ----------
 { const id = 's3', t = S(id); chip(id, '2 · Всё в одном месте');
   const o = phone(id, 'docs', 290, 330, 500); shell('docs', t + .3, { rotationY: 18, rotationX: 10 });
   bands('docs', 'docs.png', [0, .075, .21, .34, .46, .58, 1], t + .75, .09);
   const nw = mk('img', '', { position: 'absolute', left: 0, top: 0, width: '100%', height: '100%', opacity: 0 }, '', o.scr); nw.src = 'new-sch.png';
-  const [bx, by] = pt('docs', .5, .165); hlr('docs', .03, .125, .94, .075, t + 1.9, 1.0); ripple(14.9, bx, by);
+  const [bx, by] = pt('docs', .5, .165); hlr('docs', .03, .125, .94, .075, t + 1.9, 1.0); ripple(t + 2.9, bx, by);
   tl.to(nw, { opacity: 1, duration: .45, ease: 'power2.inOut' }, t + 3.1);
-  const [ax, ay] = pt('docs', .5, .727); hlr('docs', .04, .69, .92, .075, t + 4.6, 1.2); ripple(17.2, ax, ay);
-  ['СЧЁТ', 'АКТ', 'УПД', 'ТОРГ-12', 'ДОГОВОР'].forEach((w, i) => { const left = i < 3, c = mk('div', 'card', { left: (left ? 40 : 830) + 'px', top: (i < 3 ? 470 + i * 190 : 560 + (i - 3) * 190) + 'px', width: '210px', height: '100px', background: ['#2E3A8C', '#0E9F58', '#7B3FE4', '#E0701F', '#1F6FEB'][i], color: '#fff', font: '800 30px/100px Unb', textAlign: 'center', borderRadius: '50px' }, w, SCN[id]);
+  const [ax, ay] = pt('docs', .5, .727); hlr('docs', .04, .69, .92, .075, t + 4.6, 1.2); ripple(t + 5.2, ax, ay);
+  ['СЧЁТ', 'АКТ', 'УПД', 'ТОРГ-12', 'ПЛАТЁЖКА', 'ДОГОВОР'].forEach((w, i) => { const left = i < 3, c = mk('div', 'card', { left: (left ? 40 : 830) + 'px', top: (470 + (i % 3) * 190) + 'px', width: '210px', height: '100px', background: ['#2E3A8C', '#0E9F58', '#7B3FE4', '#E0701F', '#C23B6B', '#1F6FEB'][i], color: '#fff', font: (w.length > 6 ? '800 24px/100px Unb' : '800 30px/100px Unb'), textAlign: 'center', borderRadius: '50px' }, w, SCN[id]);
     tl.fromTo(c, { autoAlpha: 0, x: left ? -200 : 200, scale: .8 }, { autoAlpha: 1, x: 0, scale: 1, duration: .55, ease: 'expo.out', immediateRender: false }, t + 4.6 + i * .25); }); }
-// ---------- S4 КТО ДОЛЖЕН ----------
-{ const id = 's4', t = S(id); chip(id, '3 · Видно, кто должен');
+// ---------- S4 КТО ДОЛЖЕН + ВЫПИСКА БАНКА ----------
+{ const id = 's4', t = S(id); chip(id, 'Кто должен и кто заплатил');
   const o = phone(id, 'unp', 290, 330, 500); shell('unp', t + .3, { rotationY: -18, rotationX: 10 });
   bands('unp', 'unpaid.png', [0, .075, .26, .34, .42, .50, 1], t + .75, .09);
-  const [rx, ry] = pt('unp', .5, .288); hlr('unp', .04, .245, .92, .085, t + 1.6, 1.8); ripple(22.3, rx, ry);
-  const rem = mk('div', 'card', { left: '160px', top: '1010px', width: '760px', padding: '26px 30px', borderRadius: '30px' }, '<div style="font:800 30px Man">Напомнить: ООО «Вектор»</div><div style="font:600 26px/1.3 Man;color:#44507A;margin-top:8px">Добрый день! Напоминаем про счёт № 1 от 03.11 на 82 000 ₽. QR для оплаты — во вложении.</div><div class="btn" style="margin-top:14px;background:#2E5BD9;color:#fff;font-size:26px;padding:14px 0">✉️ Отправить клиенту</div>', SCN[id]);
-  tl.fromTo(rem, { autoAlpha: 0, y: 220, scale: .9 }, { autoAlpha: 1, y: 0, scale: 1, duration: .75, ease: 'expo.out', immediateRender: false }, t + 3.4);
-  ripple(25.6, 540, 1235);
-  const nt = mk('div', '', { position: 'absolute', left: '60px', top: '1330px', width: '960px', font: '700 30px/1.25 Man', color: '#A9B4D6', textAlign: 'center' }, 'Письмо уйдёт только по твоей кнопке', SCN[id]);
-  tl.fromTo(nt, { autoAlpha: 0 }, { autoAlpha: 1, duration: .5 }, t + 5.6); }
-// ---------- S5 ЗАКРЫТО ----------
-{ const id = 's5', t = S(id); chip(id, '4 · Заплатил — долг закрыт');
-  const o = phone(id, 'fin', 290, 520, 500); shell('fin', t + .3, { rotationX: 14 });
-  const a = mk('img', '', { position: 'absolute', left: 0, top: 0, width: '100%', height: '100%' }, '', o.scr); a.src = 'home-debt.png';
-  const b = mk('img', '', { position: 'absolute', left: 0, top: 0, width: '100%', height: '100%', opacity: 0 }, '', o.scr); b.src = 'home-paid.png';
-  [['ООО «Вектор»', '82 000'], ['ИП Заря', '40 500'], ['ООО «Луч»', '25 500']].forEach(([n, s], i) => { const x = mk('div', 'card', { left: '180px', top: '350px', width: '720px', height: '110px', background: '#0E9F58', color: '#fff', font: '800 34px/110px Man', textAlign: 'center', borderRadius: '55px' }, `✓ Оплачено · ${n} · ${s} ₽`, SCN[id]);
-    tl.fromTo(x, { autoAlpha: 0, y: 50, scale: .85 }, { autoAlpha: 1, y: 0, scale: 1, duration: .45, ease: 'back.out(2)', immediateRender: false }, t + 1.1 + i * .7); tl.to(x, { autoAlpha: 0, y: -40, duration: .25 }, t + 1.75 + i * .7); });
-  tl.to(b, { opacity: 1, duration: .5, ease: 'power2.inOut' }, t + 3.1);
-  const ok = mk('div', 'card', { left: '280px', top: '350px', width: '520px', height: '110px', background: '#43E895', color: '#04230F', font: '800 40px/110px Unb', textAlign: 'center', borderRadius: '55px' }, '✓ ДОЛГ ЗАКРЫТ', SCN[id]);
-  tl.fromTo(ok, { autoAlpha: 0, scale: .6, y: 20 }, { autoAlpha: 1, scale: 1, y: 0, duration: .55, ease: 'back.out(2.2)', immediateRender: false }, t + 3.4);
-  for (let k = 0; k < 5; k++) { const c = mk('img', 'st', { left: '0px', top: '0px', width: '110px' }, '', SCN[id]); c.src = 'st-coin.webp';
-    tl.fromTo(c, { autoAlpha: 0, x: 540, y: 1100, scale: .4, rotation: -30 }, { autoAlpha: 1, x: [110, 880, 250, 800, 520][k], y: [700, 640, 980, 960, 560][k], scale: 1, rotation: 20 * (k - 2), duration: .65, ease: 'expo.out', immediateRender: false }, t + 3.4 + k * .08);
-    tl.to(c, { y: '-=30', duration: 1.2, ease: 'sine.inOut', yoyo: true, repeat: 1 }, t + 4.05); } }
-// ---------- S6 ЦЕНА ----------
+  const bk = mk('img', '', { position: 'absolute', left: 0, top: 0, width: '100%', height: '100%', opacity: 0 }, '', o.scr); bk.src = 'bank.png';
+  const [rx, ry] = pt('unp', .5, .288); hlr('unp', .04, .245, .92, .085, t + 1.0, 1.9); ripple(t + 1.4, rx, ry);
+  tl.to(bk, { opacity: 1, duration: .5, ease: 'power2.inOut' }, t + 3.7);
+  const [fx, fy] = pt('unp', .5, .38); hlr('unp', .04, .345, .92, .075, t + 4.8, 1.4); ripple(t + 5.6, fx, fy);
+  const ok = mk('div', 'card', { left: '150px', top: '260px', width: '780px', height: '90px', background: '#0E9F58', color: '#fff', font: '800 30px/90px Man', textAlign: 'center', borderRadius: '45px', zIndex: 5 }, '✓ Оплаты сверены с долгами', SCN[id]);
+  tl.fromTo(ok, { autoAlpha: 0, y: -30, scale: .9 }, { autoAlpha: 1, y: 0, scale: 1, duration: .5, ease: 'back.out(2)', immediateRender: false }, t + 6.6); }
+// ---------- S5 ПО РАСПИСАНИЮ ----------
+{ const id = 's5', t = S(id); chip(id, 'Работает по расписанию');
+  const o = phone(id, 'rec', 290, 330, 500); shell('rec', t + .3, { rotationY: 16, rotationX: 10 });
+  bands('rec', 'recurring.png', [0, .075, .25, .34, 1], t + .75, .09);
+  const [rx, ry] = pt('rec', .5, .27); hlr('rec', .04, .235, .92, .09, t + 1.2, 1.8); ripple(t + 1.5, rx, ry);
+  const ml = mk('div', 'card', { left: '120px', top: '1010px', width: '840px', padding: '26px 30px', borderRadius: '30px' }, '<div style="font:800 30px Man">✉️ Документ уходит с твоей почты</div><div style="font:600 26px/1.3 Man;color:#44507A;margin-top:8px">Не с чужого адреса: клиент видит тебя. Бот сам смотрит входящие и показывает письма со счетами и актами.</div>', SCN[id]);
+  tl.fromTo(ml, { autoAlpha: 0, y: 200, scale: .92 }, { autoAlpha: 1, y: 0, scale: 1, duration: .75, ease: 'expo.out', immediateRender: false }, t + 3.6); }
+// ---------- S6 СКОЛЬКО ----------
 { const id = 's6', t = S(id);
-  head(id, ['Всё это за'], 280, 70, t + .3, 0);
-  const pr = mk('div', 'hl ac', { top: '440px', fontSize: '250px' }, '<span>390 ₽</span>', SCN[id]); tl.fromTo(pr.firstChild, { autoAlpha: 0, scale: 1.5, filter: 'blur(20px)' }, { autoAlpha: 1, scale: 1, filter: 'blur(0px)', duration: .75, ease: 'expo.out', immediateRender: false }, t + .7);
-  const m = mk('div', 'hl', { top: '720px', fontSize: '58px', fontFamily: 'Man', textTransform: 'none', color: '#A9B4D6' }, '<span>в месяц, без ограничений</span>', SCN[id]); tl.fromTo(m.firstChild, { autoAlpha: 0, y: 30 }, { autoAlpha: 1, y: 0, duration: .5, ease: 'expo.out', immediateRender: false }, t + 1.3);
-  [['5 документов в месяц — бесплатно', '#0E9F58', 900], ['Без бухгалтера и без 1С', '#2E3A8C', 1050]].forEach(([tx, c, y], i) => { const b = mk('div', 'card', { left: '90px', top: y + 'px', width: '900px', height: '110px', background: c, color: '#fff', font: '800 31px/110px Unb', textAlign: 'center', borderRadius: '55px' }, tx, SCN[id]);
-    tl.fromTo(b, { autoAlpha: 0, y: 70, scale: .9 }, { autoAlpha: 1, y: 0, scale: 1, duration: .55, ease: 'expo.out', immediateRender: false }, t + 1.9 + i * .35); }); }
+  head(id, ['Первые'], 240, 64, t + .3, 0);
+  const n = mk('div', 'hl ac', { top: '330px', fontSize: '400px' }, '<span>5</span>', SCN[id]); tl.fromTo(n.firstChild, { autoAlpha: 0, scale: 1.6, filter: 'blur(24px)' }, { autoAlpha: 1, scale: 1, filter: 'blur(0px)', duration: .8, ease: 'expo.out', immediateRender: false }, t + .6);
+  const m = mk('div', 'hl', { top: '800px', fontSize: '54px' }, '<span>документов в месяц</span>', SCN[id]); tl.fromTo(m.firstChild, { autoAlpha: 0, y: 30 }, { autoAlpha: 1, y: 0, duration: .5, ease: 'expo.out', immediateRender: false }, t + 1.2);
+  const f = mk('div', 'hl ac', { top: '900px', fontSize: '84px' }, '<span>бесплатно</span>', SCN[id]); tl.fromTo(f.firstChild, { autoAlpha: 0, y: 30 }, { autoAlpha: 1, y: 0, duration: .5, ease: 'expo.out', immediateRender: false }, t + 1.5);
+  [['Карта не нужна', '#2E3A8C', 1070], ['Дальше — 390 ₽ в месяц, без ограничений', '#0E9F58', 1210]].forEach(([tx, c, y], i) => { const b = mk('div', 'card', { left: '90px', top: y + 'px', width: '900px', height: '110px', background: c, color: '#fff', font: '800 30px/110px Unb', textAlign: 'center', borderRadius: '55px' }, tx, SCN[id]);
+    tl.fromTo(b, { autoAlpha: 0, y: 70, scale: .9 }, { autoAlpha: 1, y: 0, scale: 1, duration: .55, ease: 'expo.out', immediateRender: false }, t + 2.1 + i * .35); }); }
 // ---------- S7 ПРИЗЫВ ----------
 { const id = 's7', t = S(id);
   head(id, ['Напиши'], 280, 70, t + .3, 0);
@@ -161,7 +155,7 @@ const hlr = (key, fx, fy, fw, fh, t, d = 1.4) => { const o = PH[key]; const r = 
   tl.fromTo(b, { autoAlpha: 0, y: 70, scale: .85 }, { autoAlpha: 1, y: 0, scale: 1, duration: .55, ease: 'expo.out', immediateRender: false }, t + 1.3); tl.to(b, { scale: 1.04, duration: BEAT / 2, yoyo: true, repeat: 5, ease: 'sine.inOut' }, t + 2.0);
   const h = mk('div', 'hl', { top: '985px', fontSize: '42px', fontFamily: 'Man', textTransform: 'none', color: '#A9B4D6' }, '<span>@pervichka_app_bot</span>', SCN[id]); tl.fromTo(h.firstChild, { autoAlpha: 0, y: 20 }, { autoAlpha: 1, y: 0, duration: .4 }, t + 1.7);
   const f = mk('div', 'hl', { top: '1100px', fontSize: '34px', fontFamily: 'Man', textTransform: 'none', color: '#8795AD' }, '<span>Для ИП, самозанятых и малого бизнеса</span>', SCN[id]); tl.fromTo(f.firstChild, { autoAlpha: 0 }, { autoAlpha: 1, duration: .5 }, t + 2.2);
-  const ex = mk('div', 'hl', { top: '1180px', fontSize: '26px', fontFamily: 'Man', textTransform: 'none', color: '#6E7BA3' }, '<span>Суммы и клиенты в ролике — пример</span>', SCN[id]); tl.fromTo(ex.firstChild, { autoAlpha: 0 }, { autoAlpha: 1, duration: .5 }, t + 2.4); }
+  const ex = mk('div', 'hl', { top: '1180px', left: '60px', right: '60px', fontSize: '26px', fontFamily: 'Man', textTransform: 'none', color: '#6E7BA3', lineHeight: 1.3 }, '<span>Документы формируются по данным, которые вы вводите сами.<br>Бот не ведёт бухгалтерский учёт и не сдаёт отчётность. Суммы и клиенты в ролике — пример.</span>', SCN[id]); tl.fromTo(ex.firstChild, { autoAlpha: 0 }, { autoAlpha: 1, duration: .5 }, t + 2.4); }
 // ---------- переходы: плавно, но резко ----------
 D.scenes.forEach((s, i) => { const o = SCN[s.id], t = s.start, prev = i ? SCN[D.scenes[i - 1].id] : null;
   tl.set(o, { autoAlpha: 1 }, t);
@@ -169,7 +163,7 @@ D.scenes.forEach((s, i) => { const o = SCN[s.id], t = s.start, prev = i ? SCN[D.
     if (s.trans === 'zoom') { tl.fromTo(o, { scale: .88, opacity: 0, filter: 'blur(14px)' }, { scale: 1, opacity: 1, filter: 'blur(0px)', duration: .75, ease: 'expo.out', immediateRender: false }, t); tl.to(prev, { scale: 1.18, opacity: 0, filter: 'blur(14px)', duration: .55, ease: 'expo.in' }, t - .05); }
     if (s.trans === 'circle') { tl.fromTo(o, { clipPath: 'circle(0px at 50% 88%)' }, { clipPath: 'circle(1800px at 50% 88%)', duration: .9, ease: 'expo.inOut', immediateRender: false }, t); tl.set(o, { clipPath: 'none' }, t + .95); tl.to(prev, { opacity: 0, duration: .5, ease: 'power2.in' }, t + .3); }
     tl.set(prev, { autoAlpha: 0 }, t + 1.0); }
-  tl.fromTo(o, { scale: 1 }, { scale: 1.035, duration: s.end - s.start, ease: 'none', immediateRender: false }, t + .8); });
+  tl.fromTo(o, { scale: 1 }, { scale: 1.035, duration: s.end - s.start - .8, ease: 'none', immediateRender: false }, t + .8); });
 tl.to(SCN.s7, { opacity: 0, duration: .45, ease: 'power2.inOut' }, T - .45); tl.set('#s1', { autoAlpha: 1 }, T - .45);
 // ---------- субтитры ----------
 const WORDS = [];
@@ -194,20 +188,23 @@ const hop = (t, k = 1) => { tl.to(hero, { y: -70 * k, duration: .2, ease: 'power
 const start = (t, f, x, y, h) => { show(t, f); tl.set(hero, { left: x, top: y + 700, height: h }, t - .01); tl.to(hero, { top: y, duration: .8, ease: 'expo.out' }, t); };
 // S1: появляется справа и показывает пальцем на кнопку «Выписать счёт»
 { const [bx, by] = pt('home', .5, .478); show(1.6, 'hero2.png'); tl.set(hero, Object.assign({}, at(bx + 330, by + 520, 300), { top: 2300 }), 1.59); tl.to(hero, Object.assign({ duration: .9, ease: 'expo.out' }, at(bx + 250, by + 330, 300)), 1.6);
-  cur(2.4, bx, by, 270, .6); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 3.0); away(3.7); }
+  cur(2.4, bx, by, 270, .6); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 3.0); away(4.0); }
 // S2: курсор жмёт микрофон, потом показывает на QR
-{ const mic = pt('chat', .9, .955); show(S('s2') + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(mic[0] + 200, mic[1] + 400, 300), { top: 2300 }), S('s2') + .29); cur(S('s2') + .5, mic[0] + 90, mic[1] + 120, 270, .9); cur(5.0, mic[0], mic[1], 270, .5); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 5.4);
-  cur(9.0, 900, 900, 270, .9); hop(10.6, .3); away(S('s3') - .2); }
+{ const t = S('s2'), mic = pt('chat', .9, .955); show(t + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(mic[0] + 200, mic[1] + 400, 300), { top: 2300 }), t + .29); cur(t + .5, mic[0] + 90, mic[1] + 120, 270, .8); cur(t + .8, mic[0], mic[1], 270, .4); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, t + 1.2);
+  cur(t + 5.2, 900, 900, 270, .9); hop(t + 6.6, .3); away(S('s3') - .2); }
 // S3: курсор жмёт «Выписать документ», затем «Добавить позицию»
-{ const b1 = pt('docs', .5, .165), b2 = pt('docs', .5, .727); show(S('s3') + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(b1[0] + 220, b1[1] + 400, 300), { top: 2300 }), S('s3') + .29);
-  cur(13.9, b1[0], b1[1], 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 14.9); cur(16.0, b2[0], b2[1], 270, .8); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 17.2); cur(18.0, 820, 1000, 270, .9); away(S('s4') - .2); }
-// S4: курсор жмёт строку клиента, затем «Отправить клиенту»
-{ const r1 = pt('unp', .5, .288); show(S('s4') + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(r1[0] + 200, r1[1] + 450, 300), { top: 2300 }), S('s4') + .29);
-  cur(21.3, r1[0], r1[1], 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 22.3); cur(24.4, 540, 1235, 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 25.6); away(S('s5') - .2, 540); }
-// S5: радуется
-start(S('s5') + 3.2, 'hero3.png', 220, 1640, 540); hop(S('s5') + 3.9, .9); tl.to(hero, { top: 2300, duration: .5, ease: 'expo.in' }, S('s6') - .1);
-// S6, S7: с телефоном справа
-start(S('s6') + 1.6, 'hero1.png', 900, 1630, 440); hop(S('s6') + 2.4, .5); start(S('s7') + .2, 'hero1.png', 900, 1630, 440); tl.set(hero, { top: 1630 }, S('s7') + 1.0);
+{ const t = S('s3'), b1 = pt('docs', .5, .165), b2 = pt('docs', .5, .727); show(t + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(b1[0] + 220, b1[1] + 400, 300), { top: 2300 }), t + .29);
+  cur(t + 1.6, b1[0], b1[1], 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, t + 2.9); cur(t + 3.9, b2[0], b2[1], 270, .8); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, t + 5.2); cur(t + 6.0, 820, 1000, 270, .9); away(S('s4') - .2); }
+// S4: курсор жмёт строку клиента, потом «Выбрать файл выписки»
+{ const t = S('s4'), r1 = pt('unp', .5, .288), f1 = pt('unp', .5, .38); show(t + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(r1[0] + 200, r1[1] + 450, 300), { top: 2300 }), t + .29);
+  cur(t + .5, r1[0], r1[1], 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, t + 1.4); cur(t + 4.4, f1[0], f1[1], 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, t + 5.6); away(S('s5') - .2, 540); }
+// S5: курсор показывает на регулярный счёт
+{ const t = S('s5'), r1 = pt('rec', .5, .27); show(t + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(r1[0] + 200, r1[1] + 450, 300), { top: 2300 }), t + .29);
+  cur(t + .5, r1[0], r1[1], 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, t + 1.5); away(t + 3.2, 540); }
+// S6: радуется — пять бесплатных
+start(S('s6') + 1.8, 'hero3.png', 180, 1710, 380); hop(S('s6') + 2.6, .7); tl.to(hero, { top: 2300, duration: .5, ease: 'expo.in' }, S('s7') - .1);
+// S7: с телефоном справа
+start(S('s7') + .2, 'hero1.png', 900, 1710, 380); tl.set(hero, { top: 1710 }, S('s7') + 1.0);
 tl.to(hero, { top: 2300, duration: .5, ease: 'expo.in' }, T - .8);
 // рот: по гласным в каждом слове; пока голоса нет — по оценке времени слов, с записью — по громкости
 const vow = (w) => (w.toLowerCase().match(/[аеёиоуыэюя]/g) || []).length || 1;
