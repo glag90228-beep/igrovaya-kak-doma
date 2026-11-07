@@ -16,7 +16,10 @@ cd out && npx hyperframes snapshot --at 0.5,3.9,10.4,16.8     # кадры до 
 npx hyperframes render --quality high --fps 30 --output ../pervichka-geroy.mp4
 ```
 
-## Свой герой вместо 3D-документа
+## Герой
 
-Положить PNG без фона в `hero/` — `hero1.png` (основная поза), `hero2.png` … — и снова `bash build.sh`.
-Промпты для Nano Banana Pro — в документе «Первичка — ролик как у PGON: разбор, герой, промпты».
+В `hero/` лежат пять поз героя (Nano Banana Pro, фон вырезан Higgsfield, обрезаны по контуру, высота 900 px):
+`hero1` — с телефоном, `hero2` — показывает вверх, `hero3` — радуется с монетами, `hero4` — держит счёт с QR,
+`hero5` — выглядывает снизу. Позы переключаются по сценам в `template.html` (`heroSay`). Без файлов в `hero/`
+ролик собирается со старым 3D-документом из three.js. Новую позу — положить `heroN.png` (PNG без фона) и `bash build.sh`.
+Промпты — в документе «Первичка — ролик как у PGON: разбор, герой, промпты».

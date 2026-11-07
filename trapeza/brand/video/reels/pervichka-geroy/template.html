@@ -68,7 +68,8 @@ html,body{margin:0;background:#04060F}
 #cta u{display:inline-block;margin-left:20px;width:64px;height:64px;border-radius:50%;background:#2E3A8C;color:#fff;text-decoration:none;font:800 38px/64px Man;vertical-align:middle;line-height:62px}
 #handle{position:absolute;left:0;right:0;top:1350px;text-align:center;font:700 40px Man;color:#A9B4D6;opacity:0}
 #flash{background:#fff;opacity:0;z-index:90}
-#heroimg{position:absolute;display:none;z-index:55}
+#heroimg{position:absolute;width:0;display:none;z-index:55}
+#heroimg .hp{position:absolute;left:0;bottom:0;height:100%;opacity:0}
 #hcv{position:absolute;left:0;top:0;width:1080px;height:1920px}
 #hb{position:absolute;left:0;top:0;margin:-40px 0 0 -40px;min-width:80px;height:80px;padding:0 18px;box-sizing:border-box;border-radius:40px;background:#43E895;color:#04230F;font:800 40px/80px Man;text-align:center;opacity:0;z-index:56}
 </style></head><body>
@@ -128,7 +129,7 @@ html,body{margin:0;background:#04060F}
       <div id="handle">@pervichka_app_bot</div>
     </div>
   </section>
-  <section id="hostc" class="clip" data-start="0" data-duration="20.9" data-track-index="3" style="z-index:55"><canvas id="hcv" width="1080" height="1920"></canvas><img id="heroimg"><b id="hb">!</b></section>
+  <section id="hostc" class="clip" data-start="0" data-duration="20.9" data-track-index="3" style="z-index:55"><canvas id="hcv" width="1080" height="1920"></canvas><div id="heroimg"></div><b id="hb">!</b></section>
   <section id="flash" class="clip" data-start="0" data-duration="20.9" data-track-index="31"></section>
   <audio id="sfx" src="audio.wav" data-start="0" data-duration="20.9" data-track-index="32"></audio>
 </div>
@@ -181,21 +182,27 @@ if (!HERO.length) {
   heroSay = () => {};
   window.__heroHome = HOME;
 } else {
-  // свой герой: PNG без фона. Первый файл — основная поза; остальные включаются по сценам.
+  // свой герой: PNG без фона, по одному на позу. Стопка картинок в общей рамке: рамка ездит по кадру,
+  // поза меняется переключением прозрачности (смена src на лету в рендере даёт мигание).
   const box = document.getElementById('heroimg'); box.style.display = 'block'; document.getElementById('hcv').style.display = 'none';
-  box.src = HERO[0];
+  HERO.forEach((f) => { const im = new Image(); im.src = f; im.className = 'hp'; box.appendChild(im); });
+  const ims = [...box.children];
+  tl.set(ims, { xPercent: -50, autoAlpha: 0 }, 0);
+  tl.set(box, { yPercent: -100, left: 270, top: 1800, height: 540 }, 0);
   place = (px, py, h) => ({ left: px, top: py, height: h });
-  // точка (px, py) — центр низа картинки; ширина считается по пропорциям
   hero = () => {};
   heroGo = (t, px, py, h, extra = {}, d = 0.5) => tl.to(box, Object.assign({ left: px, top: py, height: h, duration: d, ease: 'power2.inOut' }, extra), t);
   heroHop = (t, h = 0.6) => { tl.to(box, { y: -90 * h, duration: 0.2, ease: 'power2.out' }, t); tl.to(box, { y: 0, duration: 0.35, ease: 'bounce.out' }, t + 0.2); };
-  heroSay = (t, i) => { if (HERO[i]) tl.set(box, { attr: { src: HERO[i] } }, t); };
-  tl.set(box, { xPercent: -50, yPercent: -100, left: 270, top: 1800, height: 540, autoAlpha: 0 }, 0);
-  for (let t = 0; t < T - 0.5; t += 1.2) tl.to(box, { rotation: ((t / 1.2) | 0) % 2 ? -2 : 2, duration: 1.2, ease: 'sine.inOut' }, t);
+  // поза i (1-based, как hero1.png…): мягкий «подпрыг» при смене
+  heroSay = (t, i) => {
+    ims.forEach((m, k) => tl.set(m, { autoAlpha: k === i - 1 ? 1 : 0 }, t));
+    tl.fromTo(box, { scale: 0.94 }, { scale: 1, duration: 0.3, ease: 'back.out(3)', immediateRender: false, transformOrigin: '50% 100%' }, t);
+  };
+  for (let k = 0; k < 17; k++) tl.to(box, { rotation: k % 2 ? -1.5 : 1.5, duration: 1.2, ease: 'sine.inOut' }, k * 1.2);
 }
-const heroIn = (t, px, py, h) => {
+const heroIn = (t, px, py, h, pose = 1) => {
   if (!HERO.length) { tl.to(P, Object.assign({ duration: 0.55, ease: 'back.out(1.6)' }, place(px, py, h)), t); heroHop(t + 0.5, 0.5); }
-  else { const b = document.getElementById('heroimg'); tl.set(b, { left: px, top: py + 500, height: h }, t - 0.01); tl.to(b, { autoAlpha: 1, top: py, duration: 0.55, ease: 'back.out(1.6)' }, t); }
+  else { const b = document.getElementById('heroimg'); tl.set(b, { left: px, top: py + 700, height: h }, t - 0.01); heroSay(t - 0.005, pose); tl.to(b, { top: py, duration: 0.6, ease: 'back.out(1.5)' }, t); }
 };
 
 // ---------- A. телефон (0–3.2) ----------
@@ -216,7 +223,7 @@ word('#hb1', 3.45); word('#hb2', 3.95); word('#hb3', 4.45); tl.fromTo('#plane', 
 flash(4.45, 0.25);
 ['#hb1', '#hb2'].forEach((s) => tl.to(s, { opacity: 0.45, duration: 0.3 }, 5.35));
 wordOut('#hb1', 5.7); wordOut('#hb2', 5.7); wordOut('#hb3', 5.7); tl.to('#plane', { autoAlpha: 0, duration: 0.2 }, 5.7);
-heroIn(2.5, 270, 1790, 540);
+if (HERO.length) { heroIn(2.5, 400, 1960, 470, 5); heroSay(3.35, 1); heroGo(3.35, 270, 1800, 540, {}, 0.35); } else heroIn(2.5, 270, 1790, 540);
 
 // ---------- C. шаги (5.9–9.0) ----------
 scene('sc', 5.9, 9.15);
@@ -224,7 +231,7 @@ rise('#s1', 6.05, 0.5, { y: 80 }); rise('#s2', 6.95, 0.5, { y: 80 }); rise('#s3'
 flash(7.85, 0.2);
 ['#s1', '#s2'].forEach((s) => tl.to(s, { opacity: 0.4, duration: 0.3 }, 8.5));
 ['#s1', '#s2', '#s3'].forEach((s) => sink(s, 8.9));
-heroGo(5.9, 540, 1800, 520, {}, 0.5); heroHop(8.1, 0.5);
+heroGo(5.9, 330, 1810, 540, {}, 0.5); heroSay(5.95, 2); heroHop(8.1, 0.5);
 
 // ---------- D. счёт с QR и оплата (9.0–12.2) ----------
 scene('sd', 9.0, 12.3);
@@ -238,14 +245,14 @@ const AMT = { v: 0 }, am = document.getElementById('amt');
 tl.fromTo('#amt', { autoAlpha: 0, y: 40 }, { autoAlpha: 1, y: 0, duration: 0.3, ease: 'power2.out', immediateRender: false }, 10.9);
 tl.fromTo(AMT, { v: 0 }, { v: 45000, duration: 0.8, ease: 'power2.out', immediateRender: false, onUpdate: () => { am.textContent = '+' + Math.round(AMT.v).toLocaleString('ru-RU').replace(/ /g, ' ') + ' ₽'; } }, 10.95);
 ['#hd1', '#hd2', '#inv', '#exD', '#paid', '#amt', '#c0', '#c1', '#c2'].forEach((s) => tl.to(s, { autoAlpha: 0, y: '-=40', duration: 0.25, ease: 'power2.in' }, 12.0));
-heroGo(9.0, 880, 1820, 400, { rotY: -0.3 }, 0.5); heroHop(10.85, 0.7);
+heroGo(9.0, 860, 1820, 420, { rotY: -0.3 }, 0.5); heroSay(9.05, 4); heroSay(10.85, 3); heroHop(10.85, 0.7); heroSay(11.9, 1);
 
 // ---------- E. что умеет (12.2–15.3) ----------
 scene('se', 12.2, 15.45);
 [0, 1, 2, 3].forEach((k) => { rise('#l' + k, 12.35 + k * 0.5, 0.45, { y: 90, scale: 0.85 }); tl.fromTo('#l' + k, { filter: 'blur(14px)' }, { filter: 'blur(0px)', duration: 0.3, immediateRender: false }, 12.35 + k * 0.5); });
 flash(13.85, 0.2);
 [0, 1, 2, 3].forEach((k) => sink('#l' + k, 15.2));
-heroGo(12.2, 840, 1800, 520, { rotY: -0.35 }, 0.5); heroHop(13.9, 0.5);
+heroGo(12.2, 300, 1810, 540, { rotY: -0.35 }, 0.5); heroSay(12.25, 2); heroHop(13.9, 0.5);
 
 // ---------- F. цена, призыв (15.4–20.9) ----------
 scene('sf', 15.4, 20.9);
@@ -256,7 +263,7 @@ tl.to('#card', { rotationY: 10, y: -14, duration: 1.8, ease: 'sine.inOut', yoyo:
 tl.fromTo('#cta', { autoAlpha: 0, y: 60, scale: 0.85 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.45, ease: 'back.out(2)', immediateRender: false }, 18.0);
 tl.to('#cta', { scale: 1.05, duration: 0.35, yoyo: true, repeat: 3, ease: 'sine.inOut' }, 18.6);
 tl.fromTo('#handle', { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.3 }, 18.4);
-heroGo(15.4, 850, 1810, 400, { rotY: -0.3 }, 0.5); heroHop(16.0, 0.7); heroHop(18.0, 0.5);
+heroGo(15.4, 850, 1810, 420, { rotY: -0.3 }, 0.5); heroSay(15.45, 1); heroSay(16.0, 3); heroHop(16.0, 0.7); heroSay(17.3, 1); heroHop(18.0, 0.5);
 tl.set({}, {}, T);
 </script>
 </body></html>
