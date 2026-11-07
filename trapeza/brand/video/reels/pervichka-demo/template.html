@@ -90,13 +90,13 @@ const hlr = (key, fx, fy, fw, fh, t, d = 1.4) => { const o = PH[key]; const r = 
 { const id = 's1'; chip(id, 'Для ИП, самозанятых и малого бизнеса', 120);
   head(id, ['Счёт, акт, УПД', 'без Excel и', 'без бухгалтера'], 235, 78, .0, .12, [1, 2]);
   const cb = mk('div', '', { position: 'absolute', left: 0, top: 0, width: '1080px', height: '1650px', overflow: 'hidden' }, '', SCN[id]);
-  phone(id, 'home', 290, 700, 500, cb); shell('home', 0, { y: 120, rotationX: 18 });
+  phone(id, 'home', 340, 700, 500, cb); shell('home', 0, { y: 120, rotationX: 18 });
   bands('home', 'home-debt.png', [0, .075, .33, .405, .485, .565, .70, 1], .15, .09);
   tl.to(PH.home.p, { y: -16, duration: 1.8, ease: 'sine.inOut', yoyo: true, repeat: 1 }, .9);
   const [bx, by] = pt('home', .5, .478); hlr('home', .03, .44, .94, .075, 2.3, 1.2); ripple(3.0, bx, by); }
 // ---------- S2 ГОЛОСОМ ----------
 { const id = 's2', t = S(id); chip(id, '1 · Скажи голосом');
-  const o = phone(id, 'chat', 290, 330, 500); o.scr.style.background = '#E7EEF6';
+  const o = phone(id, 'chat', 340, 330, 500); o.scr.style.background = '#E7EEF6';
   mk('div', '', { position: 'absolute', left: 0, right: 0, top: 0, height: '120px', background: '#fff', display: 'flex', alignItems: 'flex-end', padding: '0 26px 16px', boxSizing: 'border-box', gap: '14px', font: '700 28px Man', color: '#0A1230' }, '<i style="width:60px;height:60px;border-radius:50%;background:linear-gradient(135deg,#4F6BFF,#2E3A8C);color:#fff;font:800 30px/60px Unb;text-align:center;font-style:normal">П</i>Первичка<small style="font:500 20px Man;color:#8795AD;margin-left:-4px">бот</small>', o.scr);
   mk('div', '', { position: 'absolute', left: 0, right: 0, bottom: 0, height: '96px', background: '#fff', borderTop: '1px solid #DDE5F0' }, '<span style="position:absolute;left:28px;top:30px;font:500 26px Man;color:#9AA7BD">Сообщение</span><i style="position:absolute;right:20px;top:14px;width:68px;height:68px;border-radius:50%;background:#2E7BF0"></i><svg style="position:absolute;right:38px;top:28px" width="32" height="40" viewBox="0 0 24 30"><rect x="8" y="2" width="8" height="16" rx="4" fill="#fff"/><path d="M4 14a8 8 0 0 0 16 0M12 22v5" stroke="#fff" stroke-width="2.4" fill="none" stroke-linecap="round"/></svg>', o.scr);
   const m0 = mk('div', 'msg me', { top: '170px' }, '<span id="w4"></span> <span style="font:600 20px Man;color:#4FAE4E">0:04</span><div style="font:600 24px/1.3 Man;margin-top:6px;color:#3C5A38">«счёт Вектору на 82 000»</div>', o.scr);
@@ -114,17 +114,17 @@ const hlr = (key, fx, fy, fw, fh, t, d = 1.4) => { const o = PH[key]; const r = 
 }
 // ---------- S3 ВСЁ В ОДНОМ МЕСТЕ ----------
 { const id = 's3', t = S(id); chip(id, '2 · Всё в одном месте');
-  const o = phone(id, 'docs', 290, 330, 500); shell('docs', t + .3, { rotationY: 18, rotationX: 10 });
+  const o = phone(id, 'docs', 340, 330, 500); shell('docs', t + .3, { rotationY: 18, rotationX: 10 });
   bands('docs', 'docs.png', [0, .075, .21, .34, .46, .58, 1], t + .75, .09);
   const nw = mk('img', '', { position: 'absolute', left: 0, top: 0, width: '100%', height: '100%', opacity: 0 }, '', o.scr); nw.src = 'new-sch.png';
   const [bx, by] = pt('docs', .5, .165); hlr('docs', .03, .125, .94, .075, t + 1.9, 1.0); ripple(t + 2.9, bx, by);
   tl.to(nw, { opacity: 1, duration: .45, ease: 'power2.inOut' }, t + 3.1);
   const [ax, ay] = pt('docs', .5, .727); hlr('docs', .04, .69, .92, .075, t + 4.6, 1.2); ripple(t + 5.2, ax, ay);
-  ['СЧЁТ', 'АКТ', 'УПД', 'ТОРГ-12', 'ПЛАТЁЖКА', 'ДОГОВОР'].forEach((w, i) => { const left = i < 3, c = mk('div', 'card', { left: (left ? 40 : 830) + 'px', top: (470 + (i % 3) * 190) + 'px', width: '210px', height: '100px', background: ['#2E3A8C', '#0E9F58', '#7B3FE4', '#E0701F', '#C23B6B', '#1F6FEB'][i], color: '#fff', font: (w.length > 6 ? '800 24px/100px Unb' : '800 30px/100px Unb'), textAlign: 'center', borderRadius: '50px' }, w, SCN[id]);
+  ['СЧЁТ', 'АКТ', 'УПД', 'ТОРГ-12', 'ПЛАТЁЖКА', 'ДОГОВОР'].forEach((w, i) => { const left = i < 3, c = mk('div', 'card', { left: (left ? 30 : 885) + 'px', top: (470 + (i % 3) * 190) + 'px', width: '170px', height: '100px', background: ['#2E3A8C', '#0E9F58', '#7B3FE4', '#E0701F', '#C23B6B', '#1F6FEB'][i], color: '#fff', font: (w.length > 6 ? '800 20px/100px Unb' : '800 27px/100px Unb'), textAlign: 'center', borderRadius: '50px' }, w, SCN[id]);
     tl.fromTo(c, { autoAlpha: 0, x: left ? -200 : 200, scale: .8 }, { autoAlpha: 1, x: 0, scale: 1, duration: .55, ease: 'expo.out', immediateRender: false }, t + 4.6 + i * .25); }); }
 // ---------- S4 КТО ДОЛЖЕН + ВЫПИСКА БАНКА ----------
 { const id = 's4', t = S(id); chip(id, 'Кто должен и кто заплатил');
-  const o = phone(id, 'unp', 290, 330, 500); shell('unp', t + .3, { rotationY: -18, rotationX: 10 });
+  const o = phone(id, 'unp', 340, 330, 500); shell('unp', t + .3, { rotationY: -18, rotationX: 10 });
   bands('unp', 'unpaid.png', [0, .075, .26, .34, .42, .50, 1], t + .75, .09);
   const bk = mk('img', '', { position: 'absolute', left: 0, top: 0, width: '100%', height: '100%', opacity: 0 }, '', o.scr); bk.src = 'bank.png';
   const [rx, ry] = pt('unp', .5, .288); hlr('unp', .04, .245, .92, .085, t + 1.0, 1.9); ripple(t + 1.4, rx, ry);
@@ -134,7 +134,7 @@ const hlr = (key, fx, fy, fw, fh, t, d = 1.4) => { const o = PH[key]; const r = 
   tl.fromTo(ok, { autoAlpha: 0, y: -30, scale: .9 }, { autoAlpha: 1, y: 0, scale: 1, duration: .5, ease: 'back.out(2)', immediateRender: false }, t + 6.6); }
 // ---------- S5 ПО РАСПИСАНИЮ ----------
 { const id = 's5', t = S(id); chip(id, 'Работает по расписанию');
-  const o = phone(id, 'rec', 290, 330, 500); shell('rec', t + .3, { rotationY: 16, rotationX: 10 });
+  const o = phone(id, 'rec', 340, 330, 500); shell('rec', t + .3, { rotationY: 16, rotationX: 10 });
   bands('rec', 'recurring.png', [0, .075, .25, .34, 1], t + .75, .09);
   const [rx, ry] = pt('rec', .5, .27); hlr('rec', .04, .235, .92, .09, t + 1.2, 1.8); ripple(t + 1.5, rx, ry);
   const ml = mk('div', 'card', { left: '120px', top: '1010px', width: '840px', padding: '26px 30px', borderRadius: '30px' }, '<div style="font:800 30px Man">✉️ Документ уходит с твоей почты</div><div style="font:600 26px/1.3 Man;color:#44507A;margin-top:8px">Не с чужого адреса: клиент видит тебя. Бот сам смотрит входящие и показывает письма со счетами и актами.</div>', SCN[id]);
@@ -186,21 +186,11 @@ const cur = (t, tx, ty, h = 360, d = .8) => tl.to(hero, Object.assign({ duration
 const away = (t, x = 900, d = .5) => tl.to(hero, { left: x, top: 2300, duration: d, ease: 'expo.in' }, t);
 const hop = (t, k = 1) => { tl.to(hero, { y: -70 * k, duration: .2, ease: 'power2.out' }, t); tl.to(hero, { y: 0, duration: .4, ease: 'bounce.out' }, t + .2); };
 const start = (t, f, x, y, h) => { show(t, f); tl.set(hero, { left: x, top: y + 700, height: h }, t - .01); tl.to(hero, { top: y, duration: .8, ease: 'expo.out' }, t); };
-// S1: появляется справа и показывает пальцем на кнопку «Выписать счёт»
-{ const [bx, by] = pt('home', .5, .478); show(1.6, 'hero2.png'); tl.set(hero, Object.assign({}, at(bx + 330, by + 520, 300), { top: 2300 }), 1.59); tl.to(hero, Object.assign({ duration: .9, ease: 'expo.out' }, at(bx + 250, by + 330, 300)), 1.6);
-  cur(2.4, bx, by, 270, .6); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, 3.0); away(4.0); }
-// S2: курсор жмёт микрофон, потом показывает на QR
-{ const t = S('s2'), mic = pt('chat', .9, .955); show(t + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(mic[0] + 200, mic[1] + 400, 300), { top: 2300 }), t + .29); cur(t + .5, mic[0] + 90, mic[1] + 120, 270, .8); cur(t + .8, mic[0], mic[1], 270, .4); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, t + 1.2);
-  cur(t + 5.2, 900, 900, 270, .9); hop(t + 6.6, .3); away(S('s3') - .2); }
-// S3: курсор жмёт «Выписать документ», затем «Добавить позицию»
-{ const t = S('s3'), b1 = pt('docs', .5, .165), b2 = pt('docs', .5, .727); show(t + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(b1[0] + 220, b1[1] + 400, 300), { top: 2300 }), t + .29);
-  cur(t + 1.6, b1[0], b1[1], 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, t + 2.9); cur(t + 3.9, b2[0], b2[1], 270, .8); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, t + 5.2); cur(t + 6.0, 820, 1000, 270, .9); away(S('s4') - .2); }
-// S4: курсор жмёт строку клиента, потом «Выбрать файл выписки»
-{ const t = S('s4'), r1 = pt('unp', .5, .288), f1 = pt('unp', .5, .38); show(t + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(r1[0] + 200, r1[1] + 450, 300), { top: 2300 }), t + .29);
-  cur(t + .5, r1[0], r1[1], 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, t + 1.4); cur(t + 4.4, f1[0], f1[1], 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, t + 5.6); away(S('s5') - .2, 540); }
-// S5: курсор показывает на регулярный счёт
-{ const t = S('s5'), r1 = pt('rec', .5, .27); show(t + .3, 'hero2.png'); tl.set(hero, Object.assign({}, at(r1[0] + 200, r1[1] + 450, 300), { top: 2300 }), t + .29);
-  cur(t + .5, r1[0], r1[1], 270, .9); tl.to(hero, { scale: .94, duration: .1, yoyo: true, repeat: 1 }, t + 1.5); away(t + 3.2, 540); }
+// S1–S5: герой стоит слева у телефона и показывает на него — интерфейс и слова остаются открытыми; на каждом нажатии подпрыгивает
+const HX = 200, HY = 1640, HH = 400;
+show(1.5, 'hero2.png'); tl.set(hero, { left: HX, top: HY + 800, height: HH }, 1.49); tl.to(hero, { top: HY, duration: 1.0, ease: 'expo.out' }, 1.5);
+D.clicks.forEach((c) => { tl.to(hero, { y: -28, duration: .1, ease: 'power2.out' }, c - .1); tl.to(hero, { y: 0, duration: .35, ease: 'bounce.out' }, c); });
+tl.to(hero, { top: 2300, duration: .5, ease: 'expo.in' }, S('s6') - .1);
 // S6: радуется — пять бесплатных
 start(S('s6') + 1.8, 'hero3.png', 180, 1710, 380); hop(S('s6') + 2.6, .7); tl.to(hero, { top: 2300, duration: .5, ease: 'expo.in' }, S('s7') - .1);
 // S7: с телефоном справа
