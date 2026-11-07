@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="UTF-8" /><meta name="viewport" content="width=1080, height=1920" />
+<title>Первичка — герой</title>
+<script src="gsap.min.js"></script><script src="three.global.js"></script><script src="mascot3d.js"></script>
+<style>
+@font-face{font-family:Unb;font-weight:200 900;src:url(unbounded-cyrillic-wght-normal.woff2) format('woff2');unicode-range:U+0400-045F,U+2116,U+00AB,U+00BB,U+2014}
+@font-face{font-family:Unb;font-weight:200 900;src:url(unbounded-latin-wght-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+20BD,U+2212}
+@font-face{font-family:Man;font-weight:200 800;src:url(manrope-cyrillic-wght-normal.woff2) format('woff2');unicode-range:U+0400-045F,U+2116,U+00AB,U+00BB}
+@font-face{font-family:Man;font-weight:200 800;src:url(manrope-latin-wght-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+20BD,U+2212}
+html,body{margin:0;background:#04060F}
+#root{position:relative;width:1080px;height:1920px;overflow:hidden;font-family:Unb,Man,sans-serif;color:#fff;background:#04060F}
+.clip{position:absolute;inset:0}
+#bg{background:
+  radial-gradient(ellipse 90% 40% at 50% 100%,rgba(61,98,255,.55),rgba(30,45,140,.22) 55%,transparent 75%),
+  radial-gradient(ellipse 120% 60% at 50% 0%,#0B1230,#04060F 70%)}
+#floor{position:absolute;left:-120px;right:-120px;bottom:-60px;height:330px;border-radius:50%;
+  background:radial-gradient(ellipse at 50% 30%,rgba(120,150,255,.95),rgba(70,100,255,.55) 35%,rgba(40,60,200,.15) 65%,transparent 72%);filter:blur(10px)}
+.sp{position:absolute;border-radius:50%;opacity:.8}
+.scn{position:absolute;inset:0;opacity:0}
+.hl{position:absolute;left:0;right:0;text-align:center;font-weight:800;text-transform:uppercase;letter-spacing:-.01em;line-height:1.12;text-shadow:0 6px 24px rgba(0,0,0,.45)}
+.hl span{display:inline-block;opacity:0}
+.ac{color:#43E895}
+.sub{font-weight:700;font-size:40px;letter-spacing:.02em;text-transform:uppercase}
+/* телефон */
+#phone{position:absolute;left:270px;top:330px;width:540px;height:1080px;border-radius:78px;background:#0A0F1F;border:7px solid #6F8CFF;box-shadow:0 0 70px rgba(80,115,255,.65),inset 0 0 40px rgba(80,115,255,.25);overflow:hidden;opacity:0}
+#phone .hd{position:absolute;left:0;right:0;top:0;height:140px;background:#17212B;display:flex;align-items:flex-end;padding:0 28px 18px;box-sizing:border-box;gap:16px}
+#phone .av{width:68px;height:68px;border-radius:50%;background:linear-gradient(135deg,#4F6BFF,#2E3A8C);display:flex;align-items:center;justify-content:center;font:800 34px Unb}
+#phone .nm{font:700 30px Man;line-height:1.1}#phone .nm small{display:block;font:500 22px Man;color:#7D93A8}
+#phone .chat{position:absolute;left:0;right:0;top:140px;bottom:0;background:#0E1621}
+.msg{position:absolute;opacity:0;border-radius:26px;font:600 27px/1.28 Man;padding:18px 22px;box-sizing:border-box}
+.me{right:24px;background:#2B5278;border-bottom-right-radius:8px;width:380px}
+.bot{left:24px;background:#182533;border-bottom-left-radius:8px;width:440px}
+.wv{display:inline-block;width:6px;border-radius:3px;background:#9CC4F0;margin-right:5px;vertical-align:middle}
+.pdf{margin-top:14px;display:flex;gap:14px;align-items:center;background:#0E1621;border-radius:18px;padding:12px 14px}
+.pdf i{width:58px;height:70px;border-radius:12px;background:#E5484D;color:#fff;font:800 20px/70px Unb;text-align:center;font-style:normal}
+.pdf b{font:700 24px Man;display:block}.pdf em{font:500 20px Man;color:#7D93A8;font-style:normal}
+.btn{margin-top:12px;border-radius:16px;background:#233649;text-align:center;font:700 25px Man;padding:12px 0;color:#7CC1FF}
+.ex{position:absolute;padding:6px 16px;border-radius:10px;background:#FFE9A8;color:#6B4E00;font:800 24px Man;letter-spacing:.08em;z-index:5}
+/* шаги */
+.step{position:absolute;left:0;right:0;text-align:center;font-weight:800;font-size:66px;text-transform:uppercase;opacity:0}
+.step b{display:block;margin:0 auto 14px;width:54px;height:54px;border-radius:50%;border:4px solid #43E895;color:#43E895;font:800 30px/54px Unb;text-align:center}
+/* карточка-счёт */
+#inv{position:absolute;left:230px;top:520px;width:620px;height:800px;border-radius:44px;background:#fff;color:#0A1230;box-shadow:0 0 90px rgba(90,125,255,.55),0 40px 80px rgba(0,0,0,.5);opacity:0;overflow:hidden}
+#inv .t{position:absolute;left:44px;top:40px;font:800 30px Unb;color:#2E3A8C}
+#inv .c{position:absolute;left:44px;top:100px;font:700 32px Man}
+#inv .s{position:absolute;left:44px;top:170px;font:800 88px Unb;letter-spacing:-.03em}
+#inv .q{position:absolute;left:44px;top:340px;width:300px;height:300px}
+#inv .h{position:absolute;left:372px;top:360px;width:210px;font:800 28px/1.25 Man;color:#0E9F58}
+#amt{position:absolute;left:0;right:0;top:1345px;text-align:center;font-weight:800;font-size:88px;color:#43E895;text-shadow:0 0 40px rgba(67,232,149,.5);opacity:0}
+#paid{position:absolute;left:290px;top:1180px;padding:14px 34px;border-radius:999px;background:#43E895;color:#04230F;font:800 34px Unb;opacity:0}
+.coin{position:absolute;width:110px;opacity:0;filter:drop-shadow(0 8px 18px rgba(0,0,0,.45))}
+/* список */
+.ln{position:absolute;left:0;right:0;text-align:center;opacity:0}
+.ln b{display:block;font-weight:800;font-size:82px;text-transform:uppercase}
+.ln i{display:block;font-style:normal;font-weight:800;font-size:46px;text-transform:uppercase;margin-top:6px}
+/* финальная карта */
+#card{position:absolute;left:150px;top:560px;width:780px;height:490px;border-radius:44px;background:linear-gradient(135deg,#3F58E8,#1B2570 60%,#10184A);box-shadow:0 0 90px rgba(90,125,255,.6),0 40px 80px rgba(0,0,0,.5);opacity:0;overflow:hidden}
+#card::after{content:'';position:absolute;inset:0;background:linear-gradient(115deg,rgba(255,255,255,.28),transparent 38%)}
+#card .l{position:absolute;left:46px;top:42px;font:800 40px Unb}
+#card .m{position:absolute;left:46px;bottom:150px;font:700 34px Man;color:#C6D2FF}
+#card .n{position:absolute;left:46px;bottom:60px;font:800 64px Unb;letter-spacing:-.02em}
+#card .d{position:absolute;right:46px;top:40px;width:120px;height:150px;border-radius:16px;background:#fff;opacity:.95}
+#card .d::before{content:'';position:absolute;left:18px;right:18px;top:34px;height:8px;border-radius:4px;background:#2E3A8C;box-shadow:0 22px 0 #2E3A8C,0 44px 0 #2E3A8C,0 66px 0 #9AA8E6}
+.chips{position:absolute;left:0;right:0;top:1090px;text-align:center}
+.chip{display:inline-block;margin:0 8px;padding:14px 28px;border-radius:999px;font:800 30px Man;opacity:0}
+.chip.g{background:#43E895;color:#04230F}.chip.d{background:rgba(255,255,255,.12);color:#fff;border:2px solid rgba(255,255,255,.25)}
+#cta{position:absolute;left:210px;top:1190px;width:660px;height:132px;border-radius:66px;background:#fff;color:#0A1230;font:800 44px/132px Unb;text-align:center;opacity:0;box-shadow:0 0 60px rgba(255,255,255,.25)}
+#cta u{display:inline-block;margin-left:20px;width:64px;height:64px;border-radius:50%;background:#2E3A8C;color:#fff;text-decoration:none;font:800 38px/64px Man;vertical-align:middle;line-height:62px}
+#handle{position:absolute;left:0;right:0;top:1350px;text-align:center;font:700 40px Man;color:#A9B4D6;opacity:0}
+#flash{background:#fff;opacity:0;z-index:90}
+#heroimg{position:absolute;display:none;z-index:55}
+#hcv{position:absolute;left:0;top:0;width:1080px;height:1920px}
+#hb{position:absolute;left:0;top:0;margin:-40px 0 0 -40px;min-width:80px;height:80px;padding:0 18px;box-sizing:border-box;border-radius:40px;background:#43E895;color:#04230F;font:800 40px/80px Man;text-align:center;opacity:0;z-index:56}
+</style></head><body>
+<div id="root" data-composition-id="pervichka-geroy" data-width="1080" data-height="1920" data-duration="20.9">
+  <section id="bg" class="clip" data-start="0" data-duration="20.9" data-track-index="0"><div id="floor"></div><div id="sparks"></div></section>
+  <section id="main" class="clip" data-start="0" data-duration="20.9" data-track-index="1">
+    <!-- A. телефон -->
+    <div class="scn" id="sa">
+      <div id="phone">
+        <div class="hd"><div class="av">П</div><div class="nm">Первичка<small>бот</small></div></div>
+        <div class="chat">
+          <div class="msg me" id="m0" style="top:40px"><span id="wvs"></span> <span style="color:#9CC4F0;font:600 22px Man">0:04</span><div style="font:600 26px/1.3 Man;margin-top:6px;color:#CFE4FA">«счёт Вектору на сорок пять тысяч»</div></div>
+          <div class="msg bot" id="m1" style="top:230px">Счёт № 1 для <b>ООО «Вектор»</b> на 45 000 ₽
+            <div class="pdf"><i>PDF</i><div><b>Счёт_1_Вектор.pdf</b><em>с QR для оплаты</em></div></div>
+            <div class="btn">✅ Оплачено</div></div>
+          <div class="msg bot" id="m2" style="top:560px;width:380px">Готово. Что дальше?<div class="btn">✉️ Отправить клиенту</div></div>
+        </div>
+      </div>
+      <span class="ex" id="exA" style="left:560px;top:290px;opacity:0">ПРИМЕР</span>
+    </div>
+    <!-- B. «внутри Telegram» -->
+    <div class="scn" id="sb">
+      <div class="hl" id="hb1" style="top:380px;font-size:92px"><span>Документы</span></div>
+      <div class="hl" id="hb2" style="top:520px;font-size:92px"><span>внутри</span></div>
+      <div class="hl ac" id="hb3" style="top:670px;font-size:100px"><span>Telegram</span> <svg id="plane" width="96" height="96" viewBox="0 0 24 24" style="vertical-align:-10px;opacity:0"><circle cx="12" cy="12" r="12" fill="#43E895"/><path d="M5.5 11.7l11.8-4.6c.5-.2 1 .1.8.9l-2 9.4c-.1.7-.6.9-1.2.5l-3.3-2.4-1.6 1.5c-.2.2-.3.3-.6.3l.2-3.4 6.2-5.6c.3-.2-.1-.4-.4-.2l-7.7 4.8-3.3-1c-.7-.2-.7-.7.1-1z" fill="#04230F"/></svg></div>
+    </div>
+    <!-- C. шаги -->
+    <div class="scn" id="sc">
+      <div class="step" id="s1" style="top:330px"><b>1</b>Напиши боту</div>
+      <div class="step" id="s2" style="top:620px"><b>2</b>Скажи голосом</div>
+      <div class="step" id="s3" style="top:910px"><b>3</b>Получи PDF</div>
+    </div>
+    <!-- D. счёт с QR -->
+    <div class="scn" id="sd">
+      <div class="hl" id="hd1" style="top:170px;font-size:82px"><span>Счёт с QR</span></div>
+      <div class="hl ac sub" id="hd2" style="top:315px"><span>клиент платит камерой банка</span></div>
+      <div id="inv"><div class="t">СЧЁТ № 1</div><div class="c">ООО «Вектор»</div><div class="s">45 000 ₽</div><img class="q" src="qr.svg"><div class="h">Клиент платит, наведя камеру банка</div></div>
+      <span class="ex" id="exD" style="left:640px;top:480px;opacity:0">ПРИМЕР</span>
+      <img class="coin" id="c0" src="st-coin.webp"><img class="coin" id="c1" src="st-coin.webp"><img class="coin" id="c2" src="st-coin.webp">
+      <div id="paid">✓ ОПЛАЧЕНО</div>
+      <div id="amt">+45 000 ₽</div>
+    </div>
+    <!-- E. что умеет -->
+    <div class="scn" id="se">
+      <div class="ln" id="l0" style="top:260px"><b>Счета</b><i class="ac">и акты</i></div>
+      <div class="ln" id="l1" style="top:520px"><b class="ac">УПД</b><i>и накладные ТОРГ-12</i></div>
+      <div class="ln" id="l2" style="top:780px"><b>Договоры</b><i class="ac">и платёжки</i></div>
+      <div class="ln" id="l3" style="top:1040px"><b class="ac">Долги</b><i>и напоминания клиентам</i></div>
+    </div>
+    <!-- F. цена и призыв -->
+    <div class="scn" id="sf">
+      <div class="hl" id="hf1" style="top:190px;font-size:90px"><span>Всё это за</span></div>
+      <div class="hl ac" id="hf2" style="top:330px;font-size:150px"><span>390 ₽</span></div>
+      <div id="card"><div class="l">ПЕРВИЧКА</div><div class="d"></div><div class="m">документы без ограничений</div><div class="n">в месяц</div></div>
+      <div class="chips"><span class="chip g" id="k0">5 документов — бесплатно</span><span class="chip d" id="k1">Без 1С</span><span class="chip d" id="k2">В Telegram</span></div>
+      <div id="cta">Открыть бота <u>→</u></div>
+      <div id="handle">@pervichka_app_bot</div>
+    </div>
+  </section>
+  <section id="hostc" class="clip" data-start="0" data-duration="20.9" data-track-index="3" style="z-index:55"><canvas id="hcv" width="1080" height="1920"></canvas><img id="heroimg"><b id="hb">!</b></section>
+  <section id="flash" class="clip" data-start="0" data-duration="20.9" data-track-index="31"></section>
+  <audio id="sfx" src="audio.wav" data-start="0" data-duration="20.9" data-track-index="32"></audio>
+</div>
+<script>
+const HERO = __HERO__;           // [] — свой 3D-персонаж; иначе список файлов с героем (PNG без фона)
+const T = 20.9;
+const tl = gsap.timeline({ paused: true, onUpdate: () => { if (!HERO.length) ST.render(); } });
+window.__timelines = window.__timelines || {};
+window.__timelines['pervichka-geroy'] = tl;
+const $$ = (s) => [...document.querySelectorAll(s)];
+// искры: положение и скорость от номера, чтобы кадр был одинаковым при каждом рендере
+const SP = document.getElementById('sparks'), COL = ['#FFD84D', '#8FB0FF', '#43E895', '#FFFFFF'];
+for (let k = 0; k < 70; k++) {
+  const d = document.createElement('i'); d.className = 'sp'; const s = 4 + (k * 7) % 7;
+  Object.assign(d.style, { left: ((k * 137) % 1080) + 'px', top: (200 + (k * 251) % 1600) + 'px', width: s + 'px', height: s + 'px', background: COL[k % 4], boxShadow: `0 0 ${s * 2}px ${COL[k % 4]}` });
+  SP.appendChild(d);
+  tl.to(d, { y: -(160 + (k % 5) * 70), x: (k % 2 ? 36 : -36), duration: T, ease: 'none' }, 0);
+  tl.fromTo(d, { opacity: 0.2 }, { opacity: 0.95, duration: 0.6 + (k % 4) * 0.2, yoyo: true, repeat: Math.floor(T / (0.6 + (k % 4) * 0.2) / 2), ease: 'sine.inOut', immediateRender: false }, (k % 7) * 0.1);
+}
+const wv = document.getElementById('wvs');
+for (let k = 0; k < 22; k++) { const w = document.createElement('i'); w.className = 'wv'; w.style.height = (8 + ((k * 37) % 30)) + 'px'; wv.appendChild(w); }
+
+const flash = (t, a = 0.35) => tl.fromTo('#flash', { opacity: a }, { opacity: 0, duration: 0.2, ease: 'none', immediateRender: false }, t);
+const scene = (id, a, b) => { tl.set('#' + id, { autoAlpha: 1 }, a); tl.set('#' + id, { autoAlpha: 0 }, b); };
+// слово «выпрыгивает» с размытием, как в образце
+const word = (sel, t, d = 0.4) => tl.fromTo(sel + ' span', { autoAlpha: 0, y: 50, scale: 0.8, filter: 'blur(14px)' }, { autoAlpha: 1, y: 0, scale: 1, filter: 'blur(0px)', duration: d, ease: 'back.out(1.8)', immediateRender: false }, t);
+const wordOut = (sel, t) => tl.to(sel + ' span', { autoAlpha: 0, y: -40, filter: 'blur(10px)', duration: 0.25, ease: 'power2.in' }, t);
+const rise = (sel, t, d = 0.5, from = {}) => tl.fromTo(sel, Object.assign({ autoAlpha: 0, y: 70, scale: 0.9 }, from), { autoAlpha: 1, x: 0, y: 0, scale: 1, duration: d, ease: 'back.out(1.7)', immediateRender: false }, t);
+const sink = (sel, t) => tl.to(sel, { autoAlpha: 0, y: -50, duration: 0.25, ease: 'power2.in' }, t);
+tl.set('#root', { perspective: 1800 }, 0);
+
+// ---------- герой ----------
+let ST, P, place, hero, heroGo, heroHop, heroSay;
+if (!HERO.length) {
+  ST = makeStage(document.getElementById('hcv'), { flat: true, dist: 15 }); P = ST.add();
+  const H1 = 4.4 * ST.ppu;
+  place = (px, py, h) => Object.assign(ST.at(px, py), { s: h / H1 });
+  const HOME = Object.assign(place(270, 1800, 540), { rotY: 0.35, rotX: 0.04, rotZ: 0, yaw: 0, spin: 0, armL: 0.35, armR: 0.35, armLx: 0, armRx: 0, handR: 0,
+    eyeS: 1, happy: 0, mouth: 1, jump: 0, sq: 0, look: 0.5, blink: 0, beret: 1, pencil: 1, hood: 0, glasses: 0, laptop: 0, doc: 0, shield: 0,
+    det: 0, mag: 0, guard: 0, flash: 0, beam: 0, bulb: 0, lit: 0, s: 0.0001 });
+  Object.assign(P, HOME);
+  hero = (t, o, d = 0.3, e = 'back.out(2)') => tl.to(P, Object.assign({ duration: d, ease: e }, o), t);
+  heroGo = (t, px, py, h, extra = {}, d = 0.5) => {
+    tl.to(P, Object.assign({ duration: d, ease: 'power2.inOut' }, place(px, py, h), extra), t);
+    hero(t, { jump: 0.8, sq: -0.05 }, d / 2, 'power2.out'); hero(t + d / 2, { jump: 0, sq: 0 }, d / 2, 'power2.in');
+  };
+  heroHop = (t, h = 0.6) => { hero(t, { sq: 0.12 }, 0.08, 'power2.in'); hero(t + 0.08, { jump: h, sq: -0.06 }, 0.2, 'power2.out'); hero(t + 0.28, { jump: 0, sq: 0 }, 0.3, 'bounce.out'); };
+  for (let t = 0, k = 0; t < T - 0.6; t += 1.1, k++) tl.to(P, { yaw: k % 2 ? -0.1 : 0.1, duration: 1.1, ease: 'sine.inOut' }, t);
+  for (let t = 2.2; t < T - 0.8; t += 2.9) tl.to(P, { blink: 1, duration: 0.06, yoyo: true, repeat: 1 }, t);
+  heroSay = () => {};
+  window.__heroHome = HOME;
+} else {
+  // свой герой: PNG без фона. Первый файл — основная поза; остальные включаются по сценам.
+  const box = document.getElementById('heroimg'); box.style.display = 'block'; document.getElementById('hcv').style.display = 'none';
+  box.src = HERO[0];
+  place = (px, py, h) => ({ left: px, top: py, height: h });
+  // точка (px, py) — центр низа картинки; ширина считается по пропорциям
+  hero = () => {};
+  heroGo = (t, px, py, h, extra = {}, d = 0.5) => tl.to(box, Object.assign({ left: px, top: py, height: h, duration: d, ease: 'power2.inOut' }, extra), t);
+  heroHop = (t, h = 0.6) => { tl.to(box, { y: -90 * h, duration: 0.2, ease: 'power2.out' }, t); tl.to(box, { y: 0, duration: 0.35, ease: 'bounce.out' }, t + 0.2); };
+  heroSay = (t, i) => { if (HERO[i]) tl.set(box, { attr: { src: HERO[i] } }, t); };
+  tl.set(box, { xPercent: -50, yPercent: -100, left: 270, top: 1800, height: 540, autoAlpha: 0 }, 0);
+  for (let t = 0; t < T - 0.5; t += 1.2) tl.to(box, { rotation: ((t / 1.2) | 0) % 2 ? -2 : 2, duration: 1.2, ease: 'sine.inOut' }, t);
+}
+const heroIn = (t, px, py, h) => {
+  if (!HERO.length) { tl.to(P, Object.assign({ duration: 0.55, ease: 'back.out(1.6)' }, place(px, py, h)), t); heroHop(t + 0.5, 0.5); }
+  else { const b = document.getElementById('heroimg'); tl.set(b, { left: px, top: py + 500, height: h }, t - 0.01); tl.to(b, { autoAlpha: 1, top: py, duration: 0.55, ease: 'back.out(1.6)' }, t); }
+};
+
+// ---------- A. телефон (0–3.2) ----------
+scene('sa', 0, 3.35);
+tl.fromTo('#phone', { autoAlpha: 0, y: 900, rotationY: -38, rotationX: 22, scale: 0.8 }, { autoAlpha: 1, y: 0, rotationY: 0, rotationX: 0, scale: 1, duration: 1.1, ease: 'power3.out', immediateRender: false }, 0.05);
+tl.to('#phone', { y: -14, duration: 1.3, ease: 'sine.inOut', yoyo: true, repeat: 1 }, 1.2);
+rise('#m0', 0.8, 0.35, { y: 30, scale: 0.95 });
+tl.fromTo('.wv', { scaleY: 0.3 }, { scaleY: 1, duration: 0.18, stagger: { each: 0.03, repeat: 3, yoyo: true }, ease: 'sine.inOut', immediateRender: false }, 0.9);
+rise('#m1', 1.75, 0.4, { y: 30, scale: 0.95 }); flash(1.75, 0.18);
+rise('#m2', 2.5, 0.35, { y: 30, scale: 0.95 });
+tl.fromTo('#exA', { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.2 }, 1.2);
+tl.to('#phone', { autoAlpha: 0, y: -260, rotationY: 24, scale: 0.85, duration: 0.35, ease: 'power2.in' }, 3.0);
+tl.to('#exA', { autoAlpha: 0, duration: 0.2 }, 3.0);
+
+// ---------- B. «Документы внутри Telegram» (3.3–5.8) ----------
+scene('sb', 3.3, 5.95);
+word('#hb1', 3.45); word('#hb2', 3.95); word('#hb3', 4.45); tl.fromTo('#plane', { autoAlpha: 0, scale: 0.3, rotation: -40 }, { autoAlpha: 1, scale: 1, rotation: 0, duration: 0.4, ease: 'back.out(2.5)', immediateRender: false }, 4.85);
+flash(4.45, 0.25);
+['#hb1', '#hb2'].forEach((s) => tl.to(s, { opacity: 0.45, duration: 0.3 }, 5.35));
+wordOut('#hb1', 5.7); wordOut('#hb2', 5.7); wordOut('#hb3', 5.7); tl.to('#plane', { autoAlpha: 0, duration: 0.2 }, 5.7);
+heroIn(2.5, 270, 1790, 540);
+
+// ---------- C. шаги (5.9–9.0) ----------
+scene('sc', 5.9, 9.15);
+rise('#s1', 6.05, 0.5, { y: 80 }); rise('#s2', 6.95, 0.5, { y: 80 }); rise('#s3', 7.85, 0.5, { y: 80 });
+flash(7.85, 0.2);
+['#s1', '#s2'].forEach((s) => tl.to(s, { opacity: 0.4, duration: 0.3 }, 8.5));
+['#s1', '#s2', '#s3'].forEach((s) => sink(s, 8.9));
+heroGo(5.9, 540, 1800, 520, {}, 0.5); heroHop(8.1, 0.5);
+
+// ---------- D. счёт с QR и оплата (9.0–12.2) ----------
+scene('sd', 9.0, 12.3);
+word('#hd1', 9.15); word('#hd2', 9.7, 0.35);
+tl.fromTo('#inv', { autoAlpha: 0, y: 700, rotationY: 55, scale: 0.7 }, { autoAlpha: 1, y: 0, rotationY: -8, scale: 1, duration: 0.9, ease: 'power3.out', immediateRender: false }, 9.35);
+tl.to('#inv', { rotationY: 8, y: -16, duration: 1.4, ease: 'sine.inOut' }, 10.25);
+tl.fromTo('#exD', { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.2 }, 10.0);
+['c0', 'c1', 'c2'].forEach((c, k) => tl.fromTo('#' + c, { autoAlpha: 0, x: 440 + k * 100, y: 1500, scale: 0.4, rotation: -20 }, { autoAlpha: 1, x: [100, 850, 520][k], y: [640, 560, 1250][k], scale: 1, rotation: 20 * (k - 1), duration: 0.5, ease: 'back.out(2)', immediateRender: false }, 10.9 + k * 0.1));
+tl.fromTo('#paid', { autoAlpha: 0, scale: 0.4 }, { autoAlpha: 1, scale: 1, duration: 0.35, ease: 'back.out(3)', immediateRender: false }, 10.85); flash(10.85, 0.3);
+const AMT = { v: 0 }, am = document.getElementById('amt');
+tl.fromTo('#amt', { autoAlpha: 0, y: 40 }, { autoAlpha: 1, y: 0, duration: 0.3, ease: 'power2.out', immediateRender: false }, 10.9);
+tl.fromTo(AMT, { v: 0 }, { v: 45000, duration: 0.8, ease: 'power2.out', immediateRender: false, onUpdate: () => { am.textContent = '+' + Math.round(AMT.v).toLocaleString('ru-RU').replace(/ /g, ' ') + ' ₽'; } }, 10.95);
+['#hd1', '#hd2', '#inv', '#exD', '#paid', '#amt', '#c0', '#c1', '#c2'].forEach((s) => tl.to(s, { autoAlpha: 0, y: '-=40', duration: 0.25, ease: 'power2.in' }, 12.0));
+heroGo(9.0, 880, 1820, 400, { rotY: -0.3 }, 0.5); heroHop(10.85, 0.7);
+
+// ---------- E. что умеет (12.2–15.3) ----------
+scene('se', 12.2, 15.45);
+[0, 1, 2, 3].forEach((k) => { rise('#l' + k, 12.35 + k * 0.5, 0.45, { y: 90, scale: 0.85 }); tl.fromTo('#l' + k, { filter: 'blur(14px)' }, { filter: 'blur(0px)', duration: 0.3, immediateRender: false }, 12.35 + k * 0.5); });
+flash(13.85, 0.2);
+[0, 1, 2, 3].forEach((k) => sink('#l' + k, 15.2));
+heroGo(12.2, 840, 1800, 520, { rotY: -0.35 }, 0.5); heroHop(13.9, 0.5);
+
+// ---------- F. цена, призыв (15.4–20.9) ----------
+scene('sf', 15.4, 20.9);
+word('#hf1', 15.55); word('#hf2', 16.0, 0.5); flash(16.0, 0.3);
+tl.fromTo('#card', { autoAlpha: 0, y: 800, rotationY: 90, scale: 0.7 }, { autoAlpha: 1, y: 0, rotationY: -10, scale: 1, duration: 1.0, ease: 'power3.out', immediateRender: false }, 16.15);
+tl.to('#card', { rotationY: 10, y: -14, duration: 1.8, ease: 'sine.inOut', yoyo: true, repeat: 1 }, 17.2);
+['k0', 'k1', 'k2'].forEach((k, i) => tl.fromTo('#' + k, { autoAlpha: 0, y: 30, scale: 0.8 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.35, ease: 'back.out(2.2)', immediateRender: false }, 17.2 + i * 0.18));
+tl.fromTo('#cta', { autoAlpha: 0, y: 60, scale: 0.85 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.45, ease: 'back.out(2)', immediateRender: false }, 18.0);
+tl.to('#cta', { scale: 1.05, duration: 0.35, yoyo: true, repeat: 3, ease: 'sine.inOut' }, 18.6);
+tl.fromTo('#handle', { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.3 }, 18.4);
+heroGo(15.4, 850, 1810, 400, { rotY: -0.3 }, 0.5); heroHop(16.0, 0.7); heroHop(18.0, 0.5);
+tl.set({}, {}, T);
+</script>
+</body></html>
