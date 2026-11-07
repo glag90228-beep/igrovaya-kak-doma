@@ -11,6 +11,6 @@ npm pack -q three@0.170.0 >/dev/null; tar xzf three-0.170.0.tgz package/build/th
 for f in cyrillic latin; do take @fontsource-variable/unbounded@5.2.5 "files/unbounded-$f-wght-normal.woff2" "unbounded-$f-wght-normal.woff2"; done
 for f in cyrillic latin; do take @fontsource-variable/manrope@5.1.1 "files/manrope-$f-wght-normal.woff2" "manrope-$f-wght-normal.woff2"; done
 npm pack -q @lobehub/fluent-emoji-3d@1.1.0 >/dev/null
-for p in 1fa99:coin 1f9fe:receipt 1f4f1:phone 2705:check 1f4b8:money 1f399-fe0f:mic 1f4c4:file; do
+for p in 1fa99:coin 1f9fe:receipt 1f4f1:phone 2705:check 1f4b8:money 1f399-fe0f:mic 1f4c4:file 1f648:nosee; do
   tar xzf lobehub-fluent-emoji-3d-1.1.0.tgz "package/assets/${p%%:*}.webp" && cp "package/assets/${p%%:*}.webp" "$OUT/st-${p##*:}.webp"; done
 echo готово
