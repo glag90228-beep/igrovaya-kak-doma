@@ -2266,7 +2266,31 @@ function field(name, label, value, opts = {}) {
     input,
     opts.hint && h('div', { class: 'hint', text: opts.hint }));
   wrap.input = input;
+  if (opts.how) addHow(wrap, label, opts.how);
   return wrap;
+}
+
+/**
+ * «Где это взять» — раскрывающаяся подсказка у поля.
+ *
+ * Человек останавливается на «КПП» или «Корр. счёт» не потому, что ленится, а
+ * потому что не знает, откуда брать число. Ответ нужен прямо у поля, а не в
+ * справке, куда надо идти отдельно. Скрыт по умолчанию — тем, кто знает, он не мешает.
+ */
+function addHow(wrap, label, text) {
+  const panel = h('div', { class: 'how', id: `how-${wrap.input.name}`, role: 'region' },
+    h('div', {}, h('div', { class: 'how-in', text })));
+  const btn = h('button', {
+    type: 'button', class: 'how-btn', 'aria-expanded': 'false',
+    'aria-controls': panel.id, 'aria-label': `Где взять: ${label}`,
+    onclick: () => {
+      const open = !wrap.classList.contains('how-open');
+      wrap.classList.toggle('how-open', open);
+      btn.setAttribute('aria-expanded', String(open));
+    },
+  }, icon('help'));
+  wrap.classList.add('has-how');
+  wrap.append(btn, panel);
 }
 
 function values(fields) {
@@ -2303,6 +2327,222 @@ function clearErrors(fields) {
     f.classList.remove('invalid');
     f.querySelectorAll('.err').forEach((n) => n.remove());
   }
+}
+
+/* ---------- Помощник реквизитов ---------- */
+
+/*
+ * Проверка прямо при вводе. Алгоритмы — те же, что на сервере
+ * (lib/requisites-check.js): сервер остаётся последней инстанцией, а здесь
+ * человек узнаёт об опечатке сразу, пока цифры ещё перед глазами, а не после
+ * нажатия «Сохранить», когда надо искать, где именно ошибся.
+ * Меняя одно — меняй и другое.
+ */
+const onlyDigits = (v) => String(v == null ? '' : v).replace(/\D/g, '');
+
+function innSum(d, w) {
+  return (w.reduce((a, k, i) => a + k * Number(d[i]), 0) % 11) % 10;
+}
+function innOk(d) {
+  if (d.length === 10) return innSum(d, [2, 4, 10, 3, 5, 9, 4, 6, 8]) === Number(d[9]);
+  return innSum(d, [7, 2, 4, 10, 3, 5, 9, 4, 6, 8]) === Number(d[10])
+    && innSum(d, [3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8]) === Number(d[11]);
+}
+function accOk(acc, bik, corr) {
+  const full = (corr ? `0${bik.slice(4, 6)}` : bik.slice(6, 9)) + acc;
+  const w = [7, 1, 3];
+  return full.split('').reduce((s, c, i) => s + ((w[i % 3] * Number(c)) % 10), 0) % 10 === 0;
+}
+
+/**
+ * Что сказать про значение поля сейчас.
+ * state: empty — пусто; wait — человек ещё набирает; ok — сходится; bad — опечатка.
+ * `need` и `have` — для полоски: сколько знаков нужно и сколько есть.
+ */
+function reqState(kind, raw, bikRaw) {
+  const d = onlyDigits(raw);
+  const left = (n, one, few, many) => `Ещё ${n} ${plural(n, one, few, many)}`;
+  if (kind === 'inn') {
+    if (!d) return { state: 'empty' };
+    if (d.length < 10) return { state: 'wait', have: d.length, need: 10, msg: `${left(10 - d.length, 'цифра', 'цифры', 'цифр')} — у организации 10, у ИП 12` };
+    if (d.length === 11) return { state: 'wait', have: 11, need: 12, msg: 'Ещё одна цифра — это ИНН предпринимателя' };
+    if (d.length > 12) return { state: 'bad', have: 12, need: 12, msg: `Лишние цифры: в ИНН 10 или 12, здесь ${d.length}` };
+    if (!innOk(d)) return { state: 'bad', have: d.length, need: d.length, msg: 'Цифры не сходятся — проверьте, нет ли опечатки' };
+    return { state: 'ok', have: d.length, need: d.length, msg: d.length === 12 ? 'ИНН сходится — индивидуальный предприниматель' : 'ИНН сходится — организация' };
+  }
+  if (kind === 'kpp') {
+    const v = String(raw || '').trim().toUpperCase();
+    if (!v) return { state: 'empty' };
+    if (v.length < 9) return { state: 'wait', have: v.length, need: 9, msg: `${left(9 - v.length, 'знак', 'знака', 'знаков')} из девяти` };
+    return /^\d{4}[\dA-Z]{2}\d{3}$/.test(v)
+      ? { state: 'ok', have: 9, need: 9, msg: 'КПП на месте' }
+      : { state: 'bad', have: 9, need: 9, msg: 'КПП — девять знаков, например 771501001' };
+  }
+  if (kind === 'ogrnip') {
+    if (!d) return { state: 'empty' };
+    if (d.length < 15) return { state: 'wait', have: d.length, need: 15, msg: `${left(15 - d.length, 'цифра', 'цифры', 'цифр')} из 15` };
+    return d.length === 15
+      ? { state: 'ok', have: 15, need: 15, msg: 'ОГРНИП на месте' }
+      : { state: 'bad', have: 15, need: 15, msg: `В ОГРНИП 15 цифр, здесь ${d.length}` };
+  }
+  if (kind === 'bik') {
+    if (!d) return { state: 'empty' };
+    if (d.length < 9) return { state: 'wait', have: d.length, need: 9, msg: `${left(9 - d.length, 'цифра', 'цифры', 'цифр')} из девяти` };
+    if (d.length > 9) return { state: 'bad', have: 9, need: 9, msg: `В БИК девять цифр, здесь ${d.length}` };
+    return /^04/.test(d)
+      ? { state: 'ok', have: 9, need: 9, msg: 'БИК на месте' }
+      : { state: 'bad', have: 9, need: 9, msg: 'Российский БИК начинается с 04' };
+  }
+  if (kind === 'acc' || kind === 'corr_acc') {
+    const corr = kind === 'corr_acc';
+    if (!d) return { state: 'empty' };
+    if (d.length < 20) return { state: 'wait', have: d.length, need: 20, msg: `${left(20 - d.length, 'цифра', 'цифры', 'цифр')} из 20` };
+    if (d.length > 20) return { state: 'bad', have: 20, need: 20, msg: `В номере счёта 20 цифр, здесь ${d.length}` };
+    const b = onlyDigits(bikRaw);
+    if (b.length !== 9) return { state: 'ok', have: 20, need: 20, msg: 'Двадцать цифр. Сверю с БИК, когда он появится' };
+    return accOk(d, b, corr)
+      ? { state: 'ok', have: 20, need: 20, msg: 'Счёт сходится с БИК' }
+      : { state: 'bad', have: 20, need: 20, msg: corr ? 'Не сходится с БИК — проверьте обе строки' : 'Не сходится с БИК — обычно переставлены две цифры. Платёж по такому счёту не пройдёт' };
+  }
+  return { state: 'empty' };
+}
+
+/**
+ * Оживляет поля реквизитов: полоска набранных знаков, зелёная галочка, когда
+ * число сходится, и понятная фраза, когда нет. Не блокирует ввод и не
+ * ругается на недописанное — только подсказывает.
+ *
+ * Лишние пробелы и дефисы из вставленного номера убираются сразу: так вставка
+ * «40702 810 …» из письма работает с первого раза.
+ */
+function reqLive(f) {
+  const KINDS = ['inn', 'kpp', 'ogrnip', 'bik', 'acc', 'corr_acc'];
+  const DIGITS = new Set(['inn', 'ogrnip', 'bik', 'acc', 'corr_acc']);
+  const nodes = {};
+  const paint = (kind) => {
+    const w = f[kind]; const n = nodes[kind];
+    if (!w || !n) return;
+    const r = reqState(kind, w.input.value, f.bik && f.bik.input.value);
+    w.dataset.live = r.state;
+    n.bar.style.setProperty('--p', r.need ? Math.min(1, r.have / r.need) : 0);
+    n.msg.replaceChildren();
+    if (r.msg) {
+      n.msg.append(icon(r.state === 'bad' ? 'warn' : r.state === 'ok' ? 'check' : 'clock', 'icon'), h('span', { text: r.msg }));
+    }
+    n.msg.hidden = !r.msg;
+  };
+  const all = () => KINDS.forEach(paint);
+  for (const kind of KINDS) {
+    const w = f[kind];
+    if (!w) continue;
+    const bar = h('div', { class: 'live-bar', 'aria-hidden': 'true' }, h('i'));
+    const msg = h('div', { class: 'live-msg', role: 'status', 'aria-live': 'polite', hidden: true });
+    const anchor = w.querySelector('.hint');
+    w.input.after(bar, msg);
+    if (anchor) msg.after(anchor);               // «подсказка» остаётся ниже проверки
+    nodes[kind] = { bar, msg };
+    w.input.addEventListener('input', () => {
+      if (DIGITS.has(kind)) {
+        const clean = onlyDigits(w.input.value);
+        if (clean !== w.input.value) w.input.value = clean;
+      }
+      w.classList.remove('invalid');
+      w.querySelectorAll('.err').forEach((x) => x.remove());
+      kind === 'bik' ? all() : paint(kind);
+    });
+  }
+  all();
+  return all;
+}
+
+/**
+ * Записать в поле значение, найденное самим приложением (из реестра, из
+ * вставленного текста), и показать, что оно изменилось: короткая подсветка.
+ * Без неё автозаполнение выглядит как «что-то поменялось само» — а человек
+ * должен видеть, что именно ему подставили, и проверить.
+ */
+function fillAuto(f, key, value) {
+  const w = f[key];
+  if (!w || value == null || value === '') return false;
+  if (w.input.value === String(value)) return false;
+  w.input.value = value;
+  w.input.dispatchEvent(new Event('input', { bubbles: true }));
+  w.classList.remove('auto-filled');
+  void w.offsetWidth;                    // перезапуск анимации, если поле заполняют второй раз
+  w.classList.add('auto-filled');
+  setTimeout(() => w.classList.remove('auto-filled'), 1600);
+  return true;
+}
+
+/**
+ * Кольцо «заполнено N из M» и подсказка, что делать дальше.
+ *
+ * Реквизиты вводят один раз и бросают на середине: форма из десяти полей не
+ * говорит, сколько осталось и зачем оно нужно. Кольцо показывает прогресс, а
+ * строка под ним называет следующее поле и то, что без него не получится, — по
+ * нажатию экран сам подъезжает к нему. Когда всё заполнено, кольцо
+ * зеленеет, и это единственный «праздник» на экране.
+ *
+ * @param {object} f      поля формы
+ * @param {Array<[string,string]>} plan поле → что даст его заполнение
+ */
+function reqProgress(f, plan) {
+  const R = 20; const C = 2 * Math.PI * R;
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 48 48');
+  svg.setAttribute('class', 'rp-ring');
+  svg.setAttribute('aria-hidden', 'true');
+  const track = document.createElementNS(NS, 'circle');
+  const arc = document.createElementNS(NS, 'circle');
+  for (const c of [track, arc]) {
+    c.setAttribute('cx', '24'); c.setAttribute('cy', '24'); c.setAttribute('r', String(R));
+    c.setAttribute('fill', 'none'); c.setAttribute('stroke-width', '5');
+  }
+  track.setAttribute('class', 'rp-track');
+  arc.setAttribute('class', 'rp-arc');
+  arc.setAttribute('stroke-linecap', 'round');
+  arc.setAttribute('stroke-dasharray', String(C));
+  arc.setAttribute('stroke-dashoffset', String(C));
+  svg.append(track, arc);
+
+  const count = h('div', { class: 'rp-count' });
+  const next = h('button', { type: 'button', class: 'rp-next' });
+  const card = h('div', { class: 'rp', role: 'group', 'aria-label': 'Сколько реквизитов заполнено' },
+    h('div', { class: 'rp-ringbox' }, svg, h('span', { class: 'rp-pct' })),
+    h('div', { class: 'rp-text' }, count, next));
+  const pct = card.querySelector('.rp-pct');
+
+  const refresh = () => {
+    const live = plan.filter(([k]) => f[k] && !f[k].hidden);
+    const done = live.filter(([k]) => f[k].input.value.trim() && f[k].dataset.live !== 'bad');
+    const total = live.length || 1;
+    const share = done.length / total;
+    arc.setAttribute('stroke-dashoffset', String(C * (1 - share)));
+    pct.textContent = `${done.length}/${total}`;
+    count.textContent = done.length === total
+      ? 'Всё заполнено' : `Заполнено ${done.length} из ${total}`;
+    const left = live.find(([k]) => !done.some(([d]) => d === k));
+    card.classList.toggle('complete', done.length === total);
+    if (!left) {
+      next.textContent = 'Реквизиты подставятся во все документы';
+      next.disabled = true;
+      return;
+    }
+    next.disabled = false;
+    next.textContent = `Дальше: ${left[1]}`;
+    next.onclick = () => {
+      const w = f[left[0]];
+      w.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      w.input.focus({ preventScroll: true });
+    };
+  };
+  for (const [k] of plan) {
+    if (f[k]) f[k].input.addEventListener('input', refresh);
+  }
+  refresh();
+  card.refresh = refresh;
+  return card;
 }
 
 /**
@@ -2501,6 +2741,7 @@ screens.cp = async function cpScreen({ id, name }) {
     acc: field('acc', 'Расчётный счёт', cp.acc, { inputmode: 'numeric' }),
     corr_acc: field('corr_acc', 'Корр. счёт', cp.corr_acc, { inputmode: 'numeric' }),
   };
+  const liveAll = reqLive(f);     // проверка цифр при вводе, как в «Моей организации»
 
   const kindSel = h('select', { id: 'f-kind' },
     h('option', { value: 'customer', selected: cp.kind !== 'supplier' }, 'Заказчик — платит нам'),
@@ -2522,6 +2763,7 @@ screens.cp = async function cpScreen({ id, name }) {
         f.bank_name.input.value = r.bank.bank_name || '';
         f.corr_acc.input.value = r.bank.corr_acc || '';
       }
+      liveAll();
       toast('Заполнил из реестра');
       haptic('medium');
     }),
@@ -2541,6 +2783,7 @@ screens.cp = async function cpScreen({ id, name }) {
       f.corr_acc.input.value = r.bank.corr_acc || f.corr_acc.input.value;
       toast(`Банк: ${r.bank.bank_name}`);
     }
+    liveAll();
   });
 
   const box = h('div', {}, h('h1', { text: id ? cp.name || 'Клиент' : 'Новый клиент' }));
@@ -2678,15 +2921,37 @@ screens.org = async function orgScreen() {
   const f = {
     name: field('name', 'Краткое название', o.name, { required: true, placeholder: 'ИП Иванов И. И.' }),
     full_name: field('full_name', 'Полное наименование', o.full_name),
-    inn: field('inn', 'ИНН', o.inn, { inputmode: 'numeric' }),
-    kpp: field('kpp', 'КПП', o.kpp, { inputmode: 'numeric', hint: 'У ИП его нет — оставьте пустым' }),
-    ogrnip: field('ogrnip', 'ОГРНИП', o.ogrnip, { inputmode: 'numeric', hint: 'Подставится по ИНН; печатается в УПД' }),
+    inn: field('inn', 'ИНН', o.inn, {
+      inputmode: 'numeric',
+      how: 'Он в свидетельстве о постановке на учёт и в личном кабинете налогоплательщика на nalog.ru. '
+        + 'У организации 10 цифр, у предпринимателя 12. Введёте ИНН — остальное подставим из реестра.',
+    }),
+    kpp: field('kpp', 'КПП', o.kpp, {
+      inputmode: 'numeric', hint: 'У ИП его нет — оставьте пустым',
+      how: 'Девять знаков, указан в том же свидетельстве, что и ИНН организации. Подставится сам, когда введёте ИНН.',
+    }),
+    ogrnip: field('ogrnip', 'ОГРНИП', o.ogrnip, {
+      inputmode: 'numeric', hint: 'Подставится по ИНН; печатается в УПД',
+      how: 'Пятнадцать цифр. Указан в выписке из ЕГРИП и в свидетельстве о регистрации предпринимателя.',
+    }),
     signer: field('signer', 'Кто подписывает', o.signer, { placeholder: 'И. И. Иванов' }),
     address: field('address', 'Адрес', o.address),
     bank_name: field('bank_name', 'Банк', o.bank_name),
-    bik: field('bik', 'БИК', o.bik, { inputmode: 'numeric' }),
-    acc: field('acc', 'Расчётный счёт', o.acc, { inputmode: 'numeric', hint: 'Нужен для QR-кода в счёте' }),
-    corr_acc: field('corr_acc', 'Корр. счёт', o.corr_acc, { inputmode: 'numeric' }),
+    bik: field('bik', 'БИК', o.bik, {
+      inputmode: 'numeric',
+      how: 'Девять цифр, начинаются с 04. Есть в банковском приложении в «Реквизитах счёта». '
+        + 'Введёте БИК — название банка и корр. счёт подставим сами.',
+    }),
+    acc: field('acc', 'Расчётный счёт', o.acc, {
+      inputmode: 'numeric', hint: 'Нужен для QR-кода в счёте',
+      how: 'Двадцать цифр. Откройте счёт в банковском приложении и найдите «Реквизиты» — '
+        + 'там можно скопировать номер целиком. Номер из карты не подойдёт: он другой.',
+    }),
+    corr_acc: field('corr_acc', 'Корр. счёт', o.corr_acc, {
+      inputmode: 'numeric',
+      how: 'Двадцать цифр, принадлежит банку, а не вам. Подставится сам по БИК; '
+        + 'если банк его не отдал — возьмите в тех же «Реквизитах счёта».',
+    }),
   };
 
   /*
@@ -2740,7 +3005,7 @@ screens.org = async function orgScreen() {
       const { fields } = await api('POST', '/api/parse', { text });
       let filled = 0;
       for (const [k, v] of Object.entries(fields)) {
-        if (f[k] && v) { f[k].input.value = v; filled += 1; }
+        if (f[k] && v) { fillAuto(f, k, v); filled += 1; }
       }
       toast(filled ? `Разобрал ${filled} ${plural(filled, 'поле', 'поля', 'полей')}` : 'Ничего не нашёл', !filled);
       haptic('medium');
@@ -2752,28 +3017,44 @@ screens.org = async function orgScreen() {
    * поля всем значит просить человека решать, что из этого про него, —
    * а он впишет наугад. Определяем по длине ИНН и прячем лишнее.
    */
+  let progress = null;
   const ipFields = () => {
     const ip = String(f.inn.input.value || '').replace(/\D/g, '').length === 12;
     f.kpp.hidden = ip;
     f.ogrnip.hidden = !ip;
+    if (progress) progress.refresh();
   };
   f.inn.input.addEventListener('input', ipFields);
+
+  reqLive(f);
+  progress = reqProgress(f, [
+    ['name', 'название — оно в шапке каждого документа'],
+    ['inn', 'ИНН — печатается во всех документах'],
+    ['kpp', 'КПП — у организации печатается рядом с ИНН'],
+    ['ogrnip', 'ОГРНИП — печатается в УПД'],
+    ['signer', 'кто подписывает — подставится под документом'],
+    ['address', 'адрес — печатается в шапке документов'],
+    ['bank_name', 'банк — для платёжных реквизитов'],
+    ['bik', 'БИК — по нему подставим банк и корр. счёт'],
+    ['acc', 'расчётный счёт — нужен для QR-кода в счёте'],
+    ['corr_acc', 'корр. счёт — подставится по БИК'],
+  ]);
   ipFields();
 
   autoLookup(f, (r) => {
     if (r.party) {
-      if (!f.name.input.value) f.name.input.value = r.party.name || '';
-      f.full_name.input.value = r.party.full_name || f.full_name.input.value;
-      f.kpp.input.value = r.party.kpp || f.kpp.input.value;
-      f.address.input.value = r.party.address || f.address.input.value;
-      if (r.party.ogrnip) f.ogrnip.input.value = r.party.ogrnip;
-      if (r.party.signer && !f.signer.input.value) f.signer.input.value = r.party.signer;
+      if (!f.name.input.value) fillAuto(f, 'name', r.party.name || '');
+      fillAuto(f, 'full_name', r.party.full_name);
+      fillAuto(f, 'kpp', r.party.kpp);
+      fillAuto(f, 'address', r.party.address);
+      fillAuto(f, 'ogrnip', r.party.ogrnip);
+      if (r.party.signer && !f.signer.input.value) fillAuto(f, 'signer', r.party.signer);
       ipFields();
       toast(`Нашёл: ${r.party.name}`);
     }
     if (r.bank) {
-      f.bank_name.input.value = r.bank.bank_name || f.bank_name.input.value;
-      f.corr_acc.input.value = r.bank.corr_acc || f.corr_acc.input.value;
+      fillAuto(f, 'bank_name', r.bank.bank_name);
+      fillAuto(f, 'corr_acc', r.bank.corr_acc);
       toast(`Банк: ${r.bank.bank_name}`);
     }
   });
@@ -2781,6 +3062,7 @@ screens.org = async function orgScreen() {
   const box = h('div', {}, h('h1', { text: 'Моя организация' }));
   box.append(h('div', { class: 'banner info' }, icon('help'),
     h('div', { text: 'Эти реквизиты подставляются во все документы. Заполняются один раз.' })));
+  box.append(progress);
 
   // Выбор фирмы — выше реквизитов: сначала «чьи», потом «какие».
   if (orgs.length > 1) box.append(h('div', { class: 'section-title', text: 'Фирма' }));
@@ -2800,19 +3082,21 @@ screens.org = async function orgScreen() {
       if (!v.inn && !v.bik) { toast('Заполните ИНН или БИК', true); return; }
       const r = await api('POST', '/api/lookup', { inn: v.inn, bik: v.bik });
       if (r.party) {
-        f.name.input.value = r.party.name || f.name.input.value;
+        fillAuto(f, 'name', r.party.name);
         f.full_name.input.value = r.party.full_name || '';
         f.kpp.input.value = r.party.kpp || '';
         f.address.input.value = r.party.address || '';
         // ОГРНИП раньше не подставлялся ниоткуда: поле было, в УПД
         // печаталось, и всегда пустовало.
-        if (r.party.ogrnip) f.ogrnip.input.value = r.party.ogrnip;
-        if (r.party.signer) f.signer.input.value = r.party.signer;
+        if (r.party.ogrnip) fillAuto(f, 'ogrnip', r.party.ogrnip);
+        if (r.party.signer) fillAuto(f, 'signer', r.party.signer);
+        for (const k of ['full_name', 'kpp', 'address']) f[k].input.dispatchEvent(new Event('input', { bubbles: true }));
         ipFields();
       }
       if (r.bank) {
         f.bank_name.input.value = r.bank.bank_name || '';
-        f.corr_acc.input.value = r.bank.corr_acc || '';
+        fillAuto(f, 'corr_acc', r.bank.corr_acc);
+        f.bank_name.input.dispatchEvent(new Event('input', { bubbles: true }));
       }
       toast('Заполнил из реестра');
     }),
