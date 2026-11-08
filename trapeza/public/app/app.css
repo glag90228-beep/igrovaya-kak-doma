@@ -637,6 +637,24 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   border: 1px solid var(--border); border-radius: var(--r-field);
   background: var(--group); color: inherit; font: 400 16px/1 var(--font);
 }
+/* Подсказка у позиции: названа, а цены нет. Янтарный, не красный — это «не дошли», а не «ошиблись». */
+.item-need {
+  display: flex; gap: 6px; align-items: center;
+  font-size: 13px; line-height: 1.35; color: var(--wait);
+  animation: live-in .22s ease-out;
+}
+.item-need[hidden] { display: none; }
+.item-need .icon { width: 16px; height: 16px; flex: none; }
+/* Нет названия — строка позиции подсвечена и «вздрагивает» один раз. */
+.item.item-bad { box-shadow: inset 3px 0 0 var(--danger); }
+.item.item-bad .err { display: flex; gap: 6px; align-items: center; color: var(--danger); font-size: 13px; }
+.item.item-bad .err .icon { width: 16px; height: 16px; flex: none; animation: live-shake .34s ease-out; }
+
+/* Итог вздрагивает при смене числа: transform и opacity, вёрстку не трогает. */
+.total-row .money { display: inline-block; transform-origin: right center; }
+.total-row .money.bump { animation: bump .3s var(--ease); }
+@keyframes bump { 0% { transform: scale(1); } 35% { transform: scale(1.07); } 100% { transform: none; } }
+
 .item .line-sum { display: flex; justify-content: space-between; align-items: baseline; font-size: 14px; }
 .item .nums input {
   width: 84px; text-align: right;

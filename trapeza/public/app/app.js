@@ -6506,7 +6506,20 @@ screens.new = async function newDoc(params) {
 
   function recalc() {
     const sum = draftTotal();
-    totalEl.textContent = money(sum);
+    const text = money(sum);
+    /*
+     * Итог «вздрагивает», когда число поменялось. Сумма в форме — то, что
+     * человек сверяет глазами с тем, что имел в виду; живой отклик на каждую
+     * цифру показывает, что поле принято, а не зависло. Первая отрисовка и
+     * неизменная сумма не двигаются.
+     */
+    if (totalEl.textContent !== text && totalEl.dataset.ready) {
+      totalEl.classList.remove('bump');
+      void totalEl.offsetWidth;   // перезапуск анимации: без чтения вёрстки класс «слипается»
+      totalEl.classList.add('bump');
+    }
+    totalEl.dataset.ready = '1';
+    totalEl.textContent = text;
     if (tg) {
       // Клиент — часть готовности, а не отдельная проверка после нажатия.
       // Активная кнопка, которая в ответ говорит «выберите, кому», обманывает.
@@ -6527,8 +6540,15 @@ screens.new = async function newDoc(params) {
     });
     name.addEventListener('input', () => { it.name = name.value; recalc(); });
 
+    // Число, которое надо перебить, выделяется целиком при входе в поле: иначе
+    // «1» перед набором «12» превращается в «112», а «0» — в «0500».
+    const selectOnFocus = (input) => input.addEventListener('focus', () => setTimeout(() => {
+      try { input.select(); } catch (_) { /* не у всех типов полей */ }
+    }, 0));
+
     const qty = h('input', { value: it.qty, inputmode: 'decimal', 'aria-label': 'Количество' });
     qty.addEventListener('input', () => { it.qty = Number(qty.value.replace(',', '.')) || 0; recalc(); lineTotal(); });
+    selectOnFocus(qty);
 
     // Единицу раньше выбрать было нельзя — всегда «шт.», хотя продают и по весу, и услугами.
     const unitList = UNITS.includes(it.unit) || !it.unit ? UNITS : [it.unit, ...UNITS];
@@ -6536,12 +6556,33 @@ screens.new = async function newDoc(params) {
       unitList.map((u) => h('option', { value: u, ...(u === (it.unit || 'шт.') ? { selected: '' } : {}) }, u)));
     unit.addEventListener('change', () => { it.unit = unit.value; });
 
-    const price = h('input', { value: it.price, inputmode: 'decimal', 'aria-label': 'Цена' });
+    /*
+     * Цена 0 в пустой позиции — не ответ, а отсутствие ответа. Раньше в поле
+     * стоял настоящий «0», который приходилось стирать, и он же выглядел
+     * введённым. Теперь поле пустое, а «0» — подсказка серым. В данных ничего
+     * не меняется: пустое поле — это 0, как и было.
+     */
+    const price = h('input', { value: it.price || '', placeholder: '0', inputmode: 'decimal', 'aria-label': 'Цена' });
     price.addEventListener('input', () => { it.price = Number(price.value.replace(',', '.')) || 0; recalc(); lineTotal(); });
+    selectOnFocus(price);
 
     const sumEl = h('span', { class: 'line-total money' });
-    const lineTotal = () => { sumEl.textContent = money(Number(lineCents(it.qty, it.price)) / 100); };
+    /*
+     * Позицию назвали, а цены нет — говорим об этом тут же, у строки, а не
+     * неактивной кнопкой внизу. Не красным: это ещё не ошибка, человек просто
+     * не дошёл до поля. Подсказка исчезает, как только цена появилась.
+     */
+    const need = h('div', { class: 'item-need', hidden: true, role: 'status' }, icon('warn'), h('span', { text: 'Укажите цену — без неё сумма нулевая' }));
+    // Пока название набирают, цену не требуем — человек до неё ещё не дошёл.
+    // Позиция, пришедшая уже названной (повтор, голосовой черновик), проверяется сразу.
+    let named = Boolean(it.name.trim());
+    const lineTotal = () => {
+      sumEl.textContent = money(Number(lineCents(it.qty, it.price)) / 100);
+      need.hidden = !(named && it.name.trim() && !(it.price > 0));
+    };
     lineTotal();
+    name.addEventListener('blur', () => { named = true; lineTotal(); });
+    name.addEventListener('input', lineTotal);
 
     const del = h('button', {
       class: 'iconbtn danger', 'aria-label': `Убрать позицию ${index + 1}`,
@@ -6558,6 +6599,7 @@ screens.new = async function newDoc(params) {
     return h('div', { class: 'item' },
       h('div', { class: 'top' }, name, del),
       h('div', { class: 'nums' }, cap('Кол-во', qty), cap('Ед.', unit), h('span', { class: 'x', text: '×' }), cap('Цена, ₽', price)),
+      need,
       h('div', { class: 'line-sum' }, h('span', { class: 'muted', text: 'Сумма' }), sumEl));
   }
 
@@ -6629,10 +6671,41 @@ screens.new = async function newDoc(params) {
     basis: basisInput ? basisInput.value : params.basis,
   });
 
+  /*
+   * Чего не хватает — показываем на самом месте, а не только всплывашкой.
+   * Всплывашка пропадает через три секунды и не говорит, куда смотреть; а
+   * отметка у поля остаётся, пока его не поправят, и экран сам подъезжает к ней.
+   */
+  cpField.input = search;
+  search.addEventListener('input', () => {
+    cpField.classList.remove('invalid');
+    cpField.querySelectorAll('.err').forEach((n) => n.remove());
+  });
+  function flagNoItems() {
+    const first = itemsCard.querySelector('.item');
+    const input = first && first.querySelector('input.name');
+    if (!first || !input) return;
+    first.classList.add('item-bad');
+    first.querySelectorAll('.err').forEach((n) => n.remove());
+    first.querySelector('.top').after(h('div', { class: 'err', role: 'alert' }, icon('warn'), h('span', { text: 'Впишите, что продаёте' })));
+    const clear = () => {
+      first.classList.remove('item-bad');
+      first.querySelectorAll('.err').forEach((n) => n.remove());
+    };
+    input.addEventListener('input', clear, { once: true });
+    first.scrollIntoView({ behavior: smooth(), block: 'center' });
+    input.focus({ preventScroll: true });
+  }
+
   const issue = async () => {
     const items = draft.items.filter((it) => it.name.trim());
-    if (!items.length) { toast('Добавьте хотя бы одну позицию', true); return; }
-    if (!draft.cpId) { toast('Выберите, кому выписываем', true); search.focus(); return; }
+    if (!items.length) { toast('Добавьте хотя бы одну позицию', true); flagNoItems(); return; }
+    if (!draft.cpId) {
+      toast('Выберите, кому выписываем', true);
+      showError(cpField, 'Выберите, кому выписываем');
+      cpField.scrollIntoView({ behavior: smooth(), block: 'center' });
+      return;
+    }
     try {
       if (tg) tg.MainButton.showProgress();
       const payload = { type, cpId: draft.cpId, date: dateInput.value, items };
