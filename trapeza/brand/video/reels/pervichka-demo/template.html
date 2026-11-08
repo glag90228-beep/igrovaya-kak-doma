@@ -53,11 +53,15 @@ html,body{margin:0;background:#04060F}
   <audio id="sfx" src="audio.wav" data-start="0" data-duration="__T__" data-track-index="32"></audio>
 </div>
 <script>
-const D = __DATA__, T = D.T, BEAT = 60 / D.bpm;
+const D = __DATA__, T = D.Td, TR = D.T, BEAT = 60 / D.bpm;
 const tl = gsap.timeline({ paused: true });
 window.__timelines = window.__timelines || {}; window.__timelines['pervichka-demo'] = tl;
-const _fromTo = tl.fromTo.bind(tl);
-tl.fromTo = (t, f, to, pos) => { if (typeof t !== 'string' && f && (f.autoAlpha === 0 || f.opacity === 0)) tl.set(t, f.autoAlpha === 0 ? { autoAlpha: 0 } : { opacity: 0 }, 0); return _fromTo(t, f, to, pos); };
+const _fromTo = tl.fromTo.bind(tl), _set = tl.set.bind(tl), _to = tl.to.bind(tl), _from = tl.from.bind(tl);
+// время замысла → время записи голоса (якоря посчитал build.py); за последним якорем время идёт со скоростью 1
+const W = (t) => { const A = D.warp; if (t <= 0) return t; for (let i = 1; i < A.length; i++) if (t <= A[i][0]) return A[i - 1][1] + (t - A[i - 1][0]) * (A[i][1] - A[i - 1][1]) / (A[i][0] - A[i - 1][0]); return A[A.length - 1][1] + (t - A[A.length - 1][0]); };
+const wp = (p) => (typeof p === 'number' ? W(p) : p);
+tl.set = (t, v, pos) => _set(t, v, wp(pos)); tl.to = (t, v, pos) => _to(t, v, wp(pos)); tl.from = (t, v, pos) => _from(t, v, wp(pos));
+tl.fromTo = (t, f, to, pos) => { if (typeof t !== 'string' && f && (f.autoAlpha === 0 || f.opacity === 0)) _set(t, f.autoAlpha === 0 ? { autoAlpha: 0 } : { opacity: 0 }, 0); return _fromTo(t, f, to, wp(pos)); };
 const $ = (s) => document.querySelector(s), stage = $('#stage');
 const mk = (tag, cls, css, html, parent) => { const e = document.createElement(tag); if (cls) e.className = cls; if (css) Object.assign(e.style, css); if (html !== undefined) e.innerHTML = html; (parent || stage).appendChild(e); return e; };
 const sc = (id) => D.scenes.find((s) => s.id === id), S = (id) => sc(id).start;
@@ -65,8 +69,8 @@ const GREEN = '#43E895';
 // фон: искры
 { const SP = $('#sparks'); for (let k = 0; k < 60; k++) { const sz = 4 + (k * 7) % 7, c = ['#FFD84D', '#8FB0FF', '#43E895', '#fff'][k % 4];
   const d = mk('i', 'sp', { left: ((k * 137) % 1080) + 'px', top: (150 + (k * 251) % 1700) + 'px', width: sz + 'px', height: sz + 'px', background: c, boxShadow: `0 0 ${sz * 2}px ${c}`, opacity: .7 }, '', SP);
-  tl.to(d, { y: -(160 + (k % 5) * 70), x: k % 2 ? 36 : -36, duration: T, ease: 'none' }, 0);
-  tl.fromTo(d, { opacity: .2 }, { opacity: .95, duration: .7 + (k % 4) * .2, yoyo: true, repeat: Math.floor((T - 1) / (.7 + (k % 4) * .2)), ease: 'sine.inOut', immediateRender: false }, (k % 7) * .1); } }
+  tl.to(d, { y: -(160 + (k % 5) * 70), x: k % 2 ? 36 : -36, duration: TR, ease: 'none' }, 0);
+  tl.fromTo(d, { opacity: .2 }, { opacity: .95, duration: .7 + (k % 4) * .2, yoyo: true, repeat: Math.floor((TR - 1) / (.7 + (k % 4) * .2)), ease: 'sine.inOut', immediateRender: false }, (k % 7) * .1); } }
 // ---------- сцены ----------
 const SCN = {}; D.scenes.forEach((s) => { const el = mk('div', 'scn', null, ''); el.id = s.id; SCN[s.id] = el; });
 const chip = (id, text, top = 150) => { const c = mk('div', 'chip', { top: top + 'px' }, `<i class="av"></i>${text}`, SCN[id]); tl.fromTo(c, { autoAlpha: 0, y: -40, scale: .9 }, { autoAlpha: 1, y: 0, scale: 1, duration: .5, ease: 'expo.out', immediateRender: false }, S(id) + .5); return c; };
@@ -163,14 +167,15 @@ D.scenes.forEach((s, i) => { const o = SCN[s.id], t = s.start, prev = i ? SCN[D.
     if (s.trans === 'zoom') { tl.fromTo(o, { scale: .88, opacity: 0, filter: 'blur(14px)' }, { scale: 1, opacity: 1, filter: 'blur(0px)', duration: .75, ease: 'expo.out', immediateRender: false }, t); tl.to(prev, { scale: 1.18, opacity: 0, filter: 'blur(14px)', duration: .55, ease: 'expo.in' }, t - .05); }
     if (s.trans === 'circle') { tl.fromTo(o, { clipPath: 'circle(0px at 50% 88%)' }, { clipPath: 'circle(1800px at 50% 88%)', duration: .9, ease: 'expo.inOut', immediateRender: false }, t); tl.set(o, { clipPath: 'none' }, t + .95); tl.to(prev, { opacity: 0, duration: .5, ease: 'power2.in' }, t + .3); }
     tl.set(prev, { autoAlpha: 0 }, t + 1.0); }
-  tl.fromTo(o, { scale: 1 }, { scale: 1.035, duration: s.end - s.start - .8, ease: 'none', immediateRender: false }, t + .8); });
+  tl.fromTo(o, { scale: 1 }, { scale: 1.035, duration: W(s.end) - W(s.start) - .8, ease: 'none', immediateRender: false }, t + .8); });   // длительность — по записи, иначе медленный наплыв вылезает за конец ролика
 tl.to(SCN.s7, { opacity: 0, duration: .45, ease: 'power2.inOut' }, T - .45); tl.set('#s1', { autoAlpha: 1 }, T - .45);
 // ---------- субтитры ----------
 const WORDS = [];
-D.vo.forEach(([a, b, txt]) => { const tok = txt.split(' ').map((w) => ({ w: w.replace(/\*/g, ''), key: w.includes('*') })), wts = tok.map((x) => x.w.length + 2), sum = wts.reduce((p, q) => p + q, 0); let acc = a;
+D.vo.forEach(([a, b, txt], vi) => { const tok = txt.split(' ').map((w) => ({ w: w.replace(/\*/g, ''), key: w.includes('*') })), wts = tok.map((x) => x.w.length + 2), sum = wts.reduce((p, q) => p + q, 0); let acc = a;
   const cap = mk('div', 'cap', null, '', $('#caps'));
   const sp = tok.map((x, i) => { const el = mk('i', '', null, x.w, cap); const t0 = acc, t1 = acc + (b - a) * wts[i] / sum; acc = t1; WORDS.push({ t0, t1, w: x.w, key: x.key }); el._t = t0; el._k = x.key; return el; });
-  tl.set(cap, { autoAlpha: 1 }, a); tl.set(cap, { autoAlpha: 0 }, b + .3);
+  // гаснет через .3 с после фразы, но не позже, чем начнётся следующая: в записи паузы короче замысла, и подписи иначе налезали бы друг на друга
+  const nxt = D.vo[vi + 1]; tl.set(cap, { autoAlpha: 1 }, a); tl.set(cap, { autoAlpha: 0 }, nxt ? Math.min(b + .3, nxt[0] - .02) : b + .3);
   sp.forEach((el) => tl.set(el, { color: el._k ? GREEN : '#fff' }, el._t)); });
 // ---------- герой: картинки из Nano Banana, рот рисуем кодом; в сценах интерфейса герой — курсор ----------
 const POSE = { 'hero1.png': { W: 876, H: 900 }, 'hero2.png': { W: 751, H: 900, tip: [722, 168], m: { cx: 343, cy: 470, w: 84 } }, 'hero3.png': { W: 753, H: 900 }, 'hero4.png': { W: 620, H: 900 }, 'hero5.png': { W: 1112, H: 900, m: { cx: 554, cy: 780, w: 140 } } };
@@ -196,10 +201,8 @@ start(S('s6') + 1.8, 'hero3.png', 180, 1710, 380); hop(S('s6') + 2.6, .7); tl.to
 // S7: с телефоном справа
 start(S('s7') + .2, 'hero1.png', 900, 1710, 380); tl.set(hero, { top: 1710 }, S('s7') + 1.0);
 tl.to(hero, { top: 2300, duration: .5, ease: 'expo.in' }, T - .8);
-// рот: по гласным в каждом слове; пока голоса нет — по оценке времени слов, с записью — по громкости
-const vow = (w) => (w.toLowerCase().match(/[аеёиоуыэюя]/g) || []).length || 1;
-WORDS.forEach((w) => { const n = vow(w.w), step = Math.max(.1, (w.t1 - w.t0) / n);
-  for (let k = 0; k < n; k++) { const t = w.t0 + k * step; mouths.forEach((m) => { tl.to(m, { scaleY: w.key ? 1 : .75, duration: .05, ease: 'power2.out' }, t); tl.to(m, { scaleY: .1, duration: .07, ease: 'power2.in' }, t + Math.min(step * .6, .12)); }); } });
-tl.set({}, {}, T);
+// рот: по настоящей громкости записи (voice-env.json), в реальном времени — без якорей времени
+{ const E = D.env; let last = -1; for (let k = 0; k < E.v.length; k++) { const v = .1 + .9 * E.v[k]; if (Math.abs(v - last) < .07) continue; last = v; _set(mouths, { scaleY: v }, k / E.fps); } }
+_set({}, {}, TR);
 </script>
 </body></html>
