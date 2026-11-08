@@ -123,6 +123,23 @@ function haptic(kind = 'light') {
   try { tg.HapticFeedback.impactOccurred(kind); } catch (_) { /* не везде есть */ }
 }
 
+/*
+ * Итог действия — не «удар», а особая вибрация Telegram: «получилось» и «не
+ * вышло» телефон различает пальцем, не глядя на экран. Нет в старых клиентах —
+ * тогда молча остаётся обычный отклик.
+ */
+function hapticResult(ok) {
+  try { tg.HapticFeedback.notificationOccurred(ok ? 'success' : 'error'); } catch (_) { /* не везде есть */ }
+}
+
+/*
+ * Плавная прокрутка — только тем, кто не просил убрать движение. Системная
+ * настройка «уменьшить движение» касается и прокрутки: резкий прыжок к полю
+ * лучше, чем экран, который ползёт у человека с вестибулярным расстройством.
+ */
+const reducedMotion = () => Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+const smooth = () => (reducedMotion() ? 'auto' : 'smooth');
+
 let toastTimer = 0;
 /**
  * Всплывающая подсказка. Необязательное действие — кнопка под текстом
@@ -133,6 +150,10 @@ function toast(text, isError = false, ms = 0, action = null) {
   const box = document.getElementById('toast');
   box.textContent = text;
   box.className = `toast${isError ? ' err' : ''}${action ? ' has-act' : ''}`;
+  // Ошибку программа чтения экрана должна зачитать сразу, а не после текущей фразы.
+  box.setAttribute('role', isError ? 'alert' : 'status');
+  box.setAttribute('aria-live', isError ? 'assertive' : 'polite');
+  if (isError) hapticResult(false);
   if (action) {
     box.append(h('button', {
       class: 'toast-act', type: 'button',
@@ -187,16 +208,29 @@ const initData = (tg && tg.initData) || '';
  * «сеанс кончился».
  */
 async function api(method, path, body, opts = {}) {
-  const res = await fetch(path, {
-    method,
-    credentials: 'same-origin',
-    headers: {
-      'X-Requested-With': 'pervichka',
-      ...(initData ? { Authorization: `tma ${initData}` } : {}),
-      ...(body ? { 'Content-Type': 'application/json' } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let res;
+  try {
+    res = await fetch(path, {
+      method,
+      credentials: 'same-origin',
+      headers: {
+        'X-Requested-With': 'pervichka',
+        ...(initData ? { Authorization: `tma ${initData}` } : {}),
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (_) {
+    /*
+     * Нет сети: браузер бросает голый TypeError с английским «Failed to fetch»
+     * (в Safari — «Load failed»), и человек видел это слово в красной
+     * всплывашке. Говорим по-человечески и помечаем — экран ошибки по метке
+     * сам предложит повторить, когда связь вернётся.
+     */
+    const err = new Error('Нет связи. Проверьте интернет — и повторите.');
+    err.offline = true;
+    throw err;
+  }
   let data = {};
   try { data = await res.json(); } catch (_) { /* пусто */ }
   if (!res.ok || data.error) {
@@ -218,7 +252,12 @@ async function api(method, path, body, opts = {}) {
 async function withBusy(btn, fn) {
   if (btn.disabled) return undefined;
   const keep = btn.innerHTML;
+  // Пока идёт запрос, подпись короче прежней: без закреплённой ширины кнопка
+  // сжимается и тут же раздувается обратно — это дрожание заметно пальцем.
+  const keepMin = btn.style.minWidth;
+  btn.style.minWidth = `${btn.offsetWidth}px`;
   btn.disabled = true;
+  btn.setAttribute('aria-busy', 'true');
   btn.textContent = '';
   btn.append(h('span', { class: 'spinner' }), 'Секунду…');
   try {
@@ -228,6 +267,8 @@ async function withBusy(btn, fn) {
     return undefined;
   } finally {
     btn.disabled = false;
+    btn.removeAttribute('aria-busy');
+    btn.style.minWidth = keepMin;
     btn.innerHTML = keep;
   }
 }
@@ -582,11 +623,21 @@ function skeleton() {
 }
 
 function errorScreen(e) {
-  return h('div', { class: 'empty' },
+  const node = h('div', { class: 'empty' },
     h('div', { class: 'icon-box warn' }, icon('warn')),
-    h('h2', { text: 'Не получилось загрузить' }),
+    h('h2', { text: e.offline ? 'Нет связи' : 'Не получилось загрузить' }),
     h('p', { class: 'small', text: e.message }),
     h('div', { class: 'btn-wrap' }, h('button', { class: 'btn secondary', onclick: () => render() }, 'Повторить')));
+  /*
+   * Связь вернулась — загружаем сами. Иначе человек, въехавший в лифт и
+   * вышедший из него, смотрит на экран ошибки и не знает, что уже можно жать.
+   * Слушатель одноразовый и срабатывает, только если этот экран ещё на виду:
+   * ушёл дальше — перерисовывать нечего.
+   */
+  if (e.offline) {
+    window.addEventListener('online', () => { if (node.isConnected) render(); }, { once: true });
+  }
+  return node;
 }
 
 function empty(iconName, title, text, action) {
@@ -1379,7 +1430,7 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
             onclick: () => {
               const real = box.querySelector('#pay-main');
               if (!real) return;
-              real.scrollIntoView({ block: 'center', behavior: 'smooth' });
+              real.scrollIntoView({ block: 'center', behavior: smooth() });
               real.click();
             },
           }, 'Отметить оплату') : null,
@@ -1827,7 +1878,7 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
           }, 'Всё равно создать расписание'),
           h('button', { class: 'btn secondary', onclick: () => warnBox.replaceChildren() }, 'Выбрать другое')))));
       // Строка, которую нажали, ниже плашки: без прокрутки её можно не заметить.
-      warnBox.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      warnBox.scrollIntoView({ block: 'center', behavior: smooth() });
     };
 
     const save = (body, done) => withBusy(done, async () => {
@@ -1864,7 +1915,7 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
             h('span', { class: 'icon-box' }, icon('send')),
             h('span', { class: 'grow', text: days ? `за ${days} ${plural(days, 'день', 'дня', 'дней')}` : 'в день оплаты' })))));
           lead.hidden = false;
-          lead.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          lead.scrollIntoView({ behavior: smooth(), block: 'nearest' });
           haptic();
         }, (day) => (day ? `${day}-го числа` : 'В последний день месяца')),
         lead,
@@ -2319,7 +2370,7 @@ function fieldFail(e, fields) {
   const key = e && e.payload && e.payload.field;
   if (!key || !fields[key] || !fields[key].input) return false;
   showError(fields[key], e.message);
-  fields[key].scrollIntoView({ behavior: 'smooth', block: 'center' });
+  fields[key].scrollIntoView({ behavior: smooth(), block: 'center' });
   return true;
 }
 function clearErrors(fields) {
@@ -2533,7 +2584,7 @@ function reqProgress(f, plan) {
     next.textContent = `Дальше: ${left[1]}`;
     next.onclick = () => {
       const w = f[left[0]];
-      w.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      w.scrollIntoView({ behavior: smooth(), block: 'center' });
       w.input.focus({ preventScroll: true });
     };
   };
@@ -2811,7 +2862,7 @@ screens.cp = async function cpScreen({ id, name }) {
   const gotoOpening = () => {
     openingBox.open = true;
     const el = f.opening_balance.input;
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.scrollIntoView({ behavior: smooth(), block: 'center' });
     // preventScroll — иначе браузер дёрнет экран второй раз, поверх плавного.
     setTimeout(() => el.focus({ preventScroll: true }), 350);
   };
@@ -4449,7 +4500,7 @@ screens.ask = async function ask() {
      * на её высоту, поэтому конец страницы — это и есть нужное место.
      */
     requestAnimationFrame(() => {
-      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: smooth() });
     });
   };
 
