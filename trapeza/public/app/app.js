@@ -1444,7 +1444,7 @@ function linkedToast(r) {
     + (l.rest ? ` Ещё ${money(l.rest)} остались оплатой клиента без документа.` : '');
 }
 
-screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
+screens.doc = async function docScreen({ id, fresh = false, askBiz = false, justPaid = false }) {
   const { docs: list } = await api('GET', '/api/docs');
   const d = list.find((x) => x.id === Number(id));
   if (!d) return empty('warn', 'Документ не найден', 'Возможно, он был убран из журнала.');
@@ -1467,7 +1467,9 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
    */
   if (fresh) {
     const payable = ['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) && d.total && !d.paidAt;
-    box.append(h('div', { class: 'banner info', id: 'fresh-doc' }, icon('check'),
+    // Зелёная плашка с «вспыхивающей» галочкой: выписать документ — то, за чем пришли,
+    // и этот момент должен ощущаться как итог, а не как ещё одно сообщение.
+    box.append(h('div', { class: 'banner ok', id: 'fresh-doc' }, h('span', { class: 'ok-badge' }, icon('check')),
       h('div', {},
         h('div', { text: 'Документ выписан' }),
         h('div', { class: 'small muted', style: 'margin-top:2px', text: 'Что дальше?' }),
@@ -1581,16 +1583,28 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
   if (['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) && d.total) {
     const paid = Boolean(d.paidAt);
     box.append(h('div', { class: 'section-title', text: 'Оплата' }));
-    box.append(h('div', { class: 'card' },
+    const payCard = h('div', { class: 'card' },
       h('div', { class: 'row' },
-        h('span', { class: `icon-box ${paid ? 'ok' : ''}` }, icon(paid ? 'check' : 'clock')),
+        // justPaid — оплату только что отметили: значок «всплывает» один раз, как итог действия.
+        h('span', { class: `icon-box ${paid ? 'ok' : ''}${paid && justPaid ? ' pop' : ''}` }, icon(paid ? 'check' : 'clock')),
         h('span', { class: 'grow' },
           h('div', { text: paid ? 'Оплачен' : 'Ждёт оплаты' }),
           h('div', {
             class: 'small muted',
             text: paid ? `отмечено ${ru(d.paidAt)}`
               : (d.noDebt ? 'долг по этому документу отменён вручную' : 'долг числится за клиентом'),
-          })))));
+          }))));
+    box.append(payCard);
+    /*
+     * Оплату отметили внизу карточки, а экран перерисовался и вернулся наверх:
+     * человек нажимал на кнопку у самого низа и видел начало страницы, не
+     * понимая, сработало ли. Подводим экран к строке «Оплачен». Через таймер:
+     * сразу после сборки render() сам прокручивает наверх, и наша прокрутка
+     * должна идти за ней, а не перед ней.
+     */
+    if (paid && justPaid) {
+      setTimeout(() => payCard.scrollIntoView({ block: 'center', behavior: smooth() }), 80);
+    }
     // Отмену проводки надо уметь отменить: без этой кнопки документ навсегда
     // выпадал из долга, продолжая числиться в ожидающих оплаты.
     if (d.noDebt) {
@@ -1611,21 +1625,21 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
      * нажал «Оплатил» на накладной на те же 3 000.
      */
     const payZone = h('div', {});
-    const afterPay = (r, text) => {
-      haptic('medium');
+    const afterPay = (r, text, marked = false) => {
+      if (marked) hapticResult(true); else haptic('medium');
       toast(text);
       // Самозанятому именно сейчас надо выдать чек: счёт и акт доход не
       // закрывают. Момент единственный — деньги переводом приходят молча,
       // документ уже выписан, и всё выглядит законченным.
       if (r && r.npd) pendingCheque = r.npd;
       // Верхняя плашка «Документ выписан» своё сказала — после действия она не нужна.
-      Object.assign(current().params, { fresh: false, askBiz: false });
+      Object.assign(current().params, { fresh: false, askBiz: false, justPaid: marked });
       render();
     };
     const askFree = (ask) => {
       const answer = (free) => (e) => withBusy(e.currentTarget, async () => {
         const r = await api('POST', '/api/doc/paid', { id: d.id, free });
-        afterPay(r, free === 'new' ? 'Отмечено как оплаченный' : linkedToast(r));
+        afterPay(r, free === 'new' ? 'Отмечено как оплаченный' : linkedToast(r), true);
       });
       const several = ask.options.length > 1;
       payZone.replaceChildren(h('div', { class: 'banner info', id: 'free-pay-ask' }, icon('wallet'),
@@ -1646,7 +1660,7 @@ screens.doc = async function docScreen({ id, fresh = false, askBiz = false }) {
         if (r && r.ask) { haptic(); askFree(r.ask); return; }
         afterPay(r, !paid ? 'Отмечено как оплаченный'
           : r && r.kept ? `Отметка снята. ${money(r.kept)} из выписки остались в журнале оплатой клиента`
-            : 'Отметка снята');
+            : 'Отметка снята', !paid);
       }),
     }, paid ? 'Снять отметку об оплате' : 'Отметить оплату')));
     box.append(payZone);
@@ -6716,7 +6730,7 @@ screens.new = async function newDoc(params) {
         payload.priceIncludesVat = Boolean(draft.priceIncludesVat);
       }
       const r = await api('POST', '/api/doc', payload);
-      haptic('heavy');
+      hapticResult(true);
       const note = noDebtNote(type, r);
       if (note) toast(`Документ выписан. ${note}`, false, 8000);
       else toast(r.sentToChat ? 'Готово — файл отправлен в чат' : 'Документ выписан');
