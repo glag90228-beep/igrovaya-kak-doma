@@ -508,6 +508,8 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .btn.ghost { background: none; color: var(--link); box-shadow: none; min-height: var(--tap); }
 .btn.danger { background: none; color: var(--danger); box-shadow: none; border: 1.5px solid color-mix(in srgb, var(--danger) 45%, transparent); }
 .btn-wrap { padding: 4px 12px 12px; }
+/* Две кнопки подряд в одной обёртке не слипаются: раньше между ними не было просвета. */
+.btn-wrap > .btn + .btn { margin-top: 8px; }
 
 /*
  * Главное действие экрана.
@@ -719,6 +721,16 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .empty .icon-box { width: 56px; height: 56px; border-radius: 18px; }
 .empty .icon-box .icon { width: 30px; height: 30px; }
 .empty h2 { color: var(--text); }
+/*
+ * Пустой экран «собирается»: значок всплывает, текст и кнопки подъезжают по
+ * очереди. Пустота перестаёт выглядеть сломанным экраном: что-то произошло,
+ * и дальше есть куда идти. Один раз, 60 мс между шагами, transform и opacity.
+ */
+.empty > * { animation: rise .32s var(--ease) both; }
+.empty > :nth-child(2) { animation-delay: 60ms; }
+.empty > :nth-child(3) { animation-delay: 120ms; }
+.empty > :nth-child(n+4) { animation-delay: 180ms; }
+.empty > .icon-box { animation: ok-pop .5s cubic-bezier(.3, 1.5, .5, 1) both; }
 
 .skeleton {
   background: var(--surface);
@@ -851,6 +863,9 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 .step.now .grow > div:first-child { font-weight: 700; }
 .step:not(.now):not(.done):not(.part) .grow > div:first-child { color: var(--muted); }
 .step-sub { margin-top: 2px; }
+/* Шаги без «текущего»: все равноправны, как в инструкции, поэтому названия не приглушаем. */
+.step.plain .step-n { background: color-mix(in srgb, var(--primary) 12%, transparent); color: var(--link); }
+.step.plain:not(.now):not(.done):not(.part) .grow > div:first-child { color: var(--text); font-weight: 600; }
 
 /* Строка документа: подпись переносится, а не режется — в ней тип, номер, дата и сумма. */
 .doc-row .doc-sub { white-space: normal; overflow-wrap: anywhere; margin-top: 2px; }

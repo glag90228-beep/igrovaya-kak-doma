@@ -5533,14 +5533,21 @@ screens.support = async function support() {
  */
 screens.bank = async function bankScreen() {
   const box = h('div', {}, h('h1', { text: 'Выписка из банка' }));
-  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
-    text: 'Выгрузите выписку в интернет-банке и пришлите файл: 1С «Клиент-Банк», Excel, '
-      + 'OFX или CSV. Найду поступления, покажу, от кого они, — отметите нужные, и они '
-      + 'попадут в журнал как оплаты.' }));
-  // Книга учёта собирается в чате: сюда за ней приходили и не находили.
-  box.append(h('p', { class: 'small muted', style: 'margin:8px 18px 0',
-    text: 'Книгу учёта доходов собирает бот: пришлите этот же файл в чат с ботом — '
-      + 'под разбором будет кнопка «Собрать книгу».' }));
+  /*
+   * Три шага вместо абзаца. Сплошной текст читали до половины и не видели, что
+   * от человека нужно одно действие — выбрать файл; кнопка прижималась к
+   * последней строке. Слова прежние, только разложены по порядку, в котором
+   * всё и происходит.
+   */
+  const bankStep = (n, title, sub) => h('div', { class: 'row step plain' },
+    h('span', { class: 'step-n', 'aria-hidden': 'true', text: String(n) }),
+    h('span', { class: 'grow' },
+      h('div', { text: title }),
+      h('div', { class: 'small muted step-sub', text: sub })));
+  box.append(h('div', { class: 'card steps', id: 'bank-steps' },
+    bankStep(1, 'Выгрузите выписку', 'В интернет-банке: 1С «Клиент-Банк», Excel, OFX или CSV'),
+    bankStep(2, 'Пришлите файл сюда', 'Найду поступления и покажу, от кого они'),
+    bankStep(3, 'Отметьте нужные', 'Они попадут в журнал как оплаты')));
 
   const cps = (await api('GET', '/api/cps')).cps || [];
   const input = h('input', {
@@ -5549,7 +5556,7 @@ screens.bank = async function bankScreen() {
       + 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     style: 'display:none',
   });
-  const pick = h('button', { class: 'btn' }, 'Выбрать файл выписки');
+  const pick = h('button', { class: 'btn' }, icon('upload', 'icon inline'), 'Выбрать файл выписки');
   const result = h('div', {});
   pick.onclick = () => input.click();
 
@@ -5577,7 +5584,12 @@ screens.bank = async function bankScreen() {
     }
   });
 
-  box.append(h('div', { class: 'btn-wrap' }, pick), input, result);
+  box.append(h('div', { class: 'btn-wrap' }, pick), input);
+  // Книга учёта собирается в чате: сюда за ней приходили и не находили.
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Книгу учёта доходов собирает бот: пришлите этот же файл в чат с ботом — '
+      + 'под разбором будет кнопка «Собрать книгу».' }));
+  box.append(result);
   return box;
 };
 
