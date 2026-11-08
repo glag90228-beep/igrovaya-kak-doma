@@ -311,7 +311,16 @@ function current() { return stack[stack.length - 1]; }
  */
 let histDepth = 0;
 
+/*
+ * Откуда пришёл экран: «fwd» — вглубь (открыли карточку), «back» — назад,
+ * «swap» — со вкладки на вкладку или после действия. От этого зависит, с какой
+ * стороны он выезжает: глубже — справа, назад — слева, как во всех телефонах.
+ * Рука «видит», куда шла, и не теряет, где находится.
+ */
+let navKind = 'swap';
+
 function go(name, params = {}) {
+  navKind = 'fwd';
   stack.push({ name, params });
   if (WEB) { histDepth += 1; try { history.pushState({ d: histDepth }, ''); } catch (_) { /* песочница */ } }
   render();
@@ -353,15 +362,17 @@ function tabOf(name) {
 
 function back() {
   if (stack.length > 1) {
+    navKind = 'back';
     if (WEB && histDepth > 0) { history.back(); return; }   // дальше поработает popstate
     stack.pop(); render(); return;
   }
   const { name } = current();
   if (TABS.some((t) => t.name === name)) return;   // вкладка — возвращаться некуда
-  reset(PARENT[name] || 'home');
+  reset(PARENT[name] || 'home', {}, 'back');
 }
 
-function reset(name, params = {}) {
+function reset(name, params = {}, kind = 'swap') {
+  navKind = kind;
   stack = [{ name, params }];
   render();
 }
@@ -373,9 +384,10 @@ if (WEB) {
     const wasDeeper = d < histDepth;
     histDepth = d;
     if (!wasDeeper || !loggedIn) return;     // «вперёд» стопку не восстанавливает
+    navKind = 'back';
     if (stack.length > 1) { stack.pop(); render(); return; }
     const { name } = current();
-    if (!TABS.some((t) => t.name === name)) reset(PARENT[name] || 'home');
+    if (!TABS.some((t) => t.name === name)) reset(PARENT[name] || 'home', {}, 'back');
   });
 }
 
@@ -573,16 +585,23 @@ async function render() {
   // Экраны грузят данные по сети. Если за это время человек ушёл дальше,
   // запоздавший ответ не должен затирать новый экран старым.
   const seq = ++renderSeq;
+  // Направление читаем один раз и сбрасываем: перерисовка того же экрана после
+  // действия («Отметить оплату») не должна заново выезжать сбоку.
+  const kind = navKind;
+  navKind = 'swap';
   syncChrome();
   refreshCrmBadge();
   if (tg) tg.MainButton.hide();
   const build = screens[name] || screens.home;
-  app.replaceChildren(skeleton());
+  app.replaceChildren(skeleton(name));
   try {
     const node = await build(params);
     if (seq !== renderSeq) return;
     app.replaceChildren(node);
-    app.firstChild && app.firstChild.classList && app.firstChild.classList.add('screen');
+    if (app.firstChild && app.firstChild.classList) {
+      app.firstChild.classList.add('screen');
+      if (kind !== 'swap') app.firstChild.classList.add(`nav-${kind}`);
+    }
     window.scrollTo(0, 0);
   } catch (e) {
     if (seq !== renderSeq) return;
@@ -613,20 +632,49 @@ function dropSplash() {
   setTimeout(() => el.classList.add('gone'), left);
 }
 
-function skeleton() {
+/*
+ * Заглушка на время загрузки — по форме того экрана, который сейчас приедет.
+ *
+ * Одна и та же серая «лента» под любым экраном обманывает глаз: на главной
+ * ждёшь крупную сумму, в форме — поля, а видишь список, и экран «перестраивается»
+ * при появлении. Три формы покрывают почти все экраны: с суммой сверху, форма
+ * ввода и список. Не угадали — получился обычный список, как раньше.
+ * Показывается не сразу, а через 150 мс (см. .sk-wrap): быстрый ответ не должен
+ * мигать серыми полосами.
+ */
+const SK_HERO = new Set(['home', 'unpaid', 'debts', 'ops', 'opcard', 'bank', 'monthact']);
+const SK_FORM = new Set(['new', 'org', 'op', 'avans', 'ksf', 'other', 'akt', 'cbasis', 'prepay', 'vat', 'basis', 'mail', 'support']);
+function skeleton(name) {
   const row = (w) => h('div', { class: 'sk-row' },
     h('span', { class: 'sk-dot' }),
     h('div', { class: 'sk-col' }, h('div', { class: 'line', style: `width:${w}%` }), h('div', { class: 'line short' })));
-  return h('div', { role: 'status', 'aria-label': 'Загружаю' },
-    h('div', { class: 'skeleton' }, h('div', { class: 'line big', style: 'width:45%' }), h('div', { class: 'line', style: 'width:70%' })),
-    h('div', { class: 'skeleton' }, row(65), row(80), row(55)));
+  const field = (w) => h('div', { class: 'sk-field' },
+    h('div', { class: 'line short' }), h('div', { class: 'line', style: `width:${w}%` }));
+  let body;
+  if (SK_HERO.has(name)) {
+    body = [
+      h('div', { class: 'skeleton sk-sum' }, h('div', { class: 'line short' }), h('div', { class: 'line huge' }), h('div', { class: 'line short' })),
+      h('div', { class: 'skeleton' }, row(65), row(80)),
+    ];
+  } else if (SK_FORM.has(name)) {
+    body = [
+      h('div', { class: 'sk-title' }, h('div', { class: 'line big', style: 'width:55%' })),
+      h('div', { class: 'skeleton' }, field(70), field(45), field(85)),
+    ];
+  } else {
+    body = [
+      h('div', { class: 'skeleton' }, h('div', { class: 'line big', style: 'width:45%' }), h('div', { class: 'line', style: 'width:70%' })),
+      h('div', { class: 'skeleton' }, row(65), row(80), row(55)),
+    ];
+  }
+  return h('div', { class: 'sk-wrap', role: 'status', 'aria-label': 'Загружаю' }, body);
 }
 
 function errorScreen(e) {
   const node = h('div', { class: 'empty' },
     h('div', { class: 'icon-box warn' }, icon('warn')),
     h('h2', { text: e.offline ? 'Нет связи' : 'Не получилось загрузить' }),
-    h('p', { class: 'small', text: e.message }),
+    h('p', { class: 'small', text: e.offline ? 'Проверьте интернет. Как только он появится, страница загрузится сама.' : e.message }),
     h('div', { class: 'btn-wrap' }, h('button', { class: 'btn secondary', onclick: () => render() }, 'Повторить')));
   /*
    * Связь вернулась — загружаем сами. Иначе человек, въехавший в лифт и

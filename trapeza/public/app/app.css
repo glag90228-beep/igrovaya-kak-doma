@@ -709,7 +709,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   margin: 0 12px var(--gap);
   overflow: hidden;
 }
-.skeleton .line {
+.skeleton .line, .sk-title .line {
   height: 14px; margin: 16px;
   border-radius: 7px;
   background: linear-gradient(90deg, var(--group) 25%, color-mix(in srgb, var(--muted) 18%, var(--group)) 37%, var(--group) 63%);
@@ -717,6 +717,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   animation: shimmer 1.3s ease-in-out infinite;
 }
 @keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+
 
 .banner {
   display: flex; gap: 10px; align-items: flex-start;
@@ -992,9 +993,21 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 body.drawer-open { overflow: hidden; }
 
 /* Скелетон под настоящую вёрстку: строка с кружком вместо голых полос. */
-.skeleton .line.big { height: 26px; border-radius: 9px; }
+.skeleton .line.big, .sk-title .line.big { height: 26px; border-radius: 9px; }
 .skeleton .line.short { width: 40%; height: 11px; margin-top: 0; }
 .sk-row { display: flex; align-items: center; gap: 12px; padding: 4px 16px; }
+
+/* Заглушка появляется через 150 мс: ответ быстрее — и серые полосы не мигнут вовсе. */
+.sk-wrap { animation: sk-in 200ms 150ms var(--ease) both; }
+@keyframes sk-in { from { opacity: 0; } }
+.sk-sum { padding: 12px 0 6px; text-align: center; }
+.sk-sum .line { margin-left: auto; margin-right: auto; }
+.sk-sum .line.short { width: 38%; }
+.sk-sum .line.huge { width: 64%; height: 40px; border-radius: 12px; }
+.sk-title { padding: 6px 0 2px; }
+.sk-title .line.big { margin-top: 10px; margin-bottom: 14px; }
+.sk-field .line { margin-top: 12px; margin-bottom: 12px; }
+.sk-field .line.short { width: 28%; height: 11px; margin-bottom: 4px; }
 .sk-row .line { margin-left: 0; margin-right: 0; }
 .sk-col { flex: 1; }
 .sk-dot {
@@ -1102,6 +1115,18 @@ body.drawer-open { overflow: hidden; }
 
 .screen { animation: enter var(--slow) var(--ease); }
 @keyframes enter { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/*
+ * Вглубь — справа, назад — слева. Сдвиг небольшой (14 px): это подсказка
+ * направления, а не карусель, и ждать её окончания не приходится. Только
+ * transform и opacity — их считает видеокарта, без перерасчёта вёрстки.
+ * overflow-x: clip у #app, чтобы сдвиг не рисовал полосу прокрутки.
+ */
+#app { overflow-x: clip; }
+.screen.nav-fwd { animation-name: enter-fwd; }
+.screen.nav-back { animation-name: enter-back; }
+@keyframes enter-fwd { from { opacity: 0; transform: translateX(14px); } to { opacity: 1; transform: none; } }
+@keyframes enter-back { from { opacity: 0; transform: translateX(-14px); } to { opacity: 1; transform: none; } }
 
 /*
  * Появление по очереди.
