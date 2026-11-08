@@ -784,6 +784,8 @@ const ok = (c, m, extra) => {
     const labels = await page.$$eval('#tabs .tab', (b) => b.map((x) => x.lastElementChild.textContent.trim()));
     ok(labels.join('|') === 'Главная|Документы|Клиенты|Дела|Ещё', 'в панели пять вкладок, среди них «Дела»', labels.join('|'));
 
+    // Панель могла только что вернуться после набора текста — ждём конца её движения.
+    await page.waitForTimeout(350);
     const geo = await page.evaluate(() => {
       const t = document.getElementById('tabs').getBoundingClientRect();
       return { bottom: Math.round(t.bottom), vh: window.innerHeight, pos: getComputedStyle(document.getElementById('tabs')).position };
@@ -1826,6 +1828,59 @@ const ok = (c, m, extra) => {
     const cpS = bdb.createCp(user.id, { name: 'ООО «Поставщик»', kind: 'supplier', opening_date: '2026-01-01' });
     await openCp(cpS);
     ok(await page.locator('#prepay-block').count() === 0, 'у поставщика блока «Предоплата» нет');
+  }
+
+  /*
+   * Пока набирают текст, нижняя панель и кнопка Telegram не закрывают поле.
+   *
+   * Они стоят у края и поднимаются вместе с клавиатурой: человек вводил цену и
+   * не видел ни поля, ни суммы. Проверяем настоящим фокусом: ушли с панели,
+   * кнопка Telegram спрятана и не появляется от каждой цифры, после ввода всё вернулось.
+   */
+  {
+    console.log('\n── при вводе панель и кнопка не мешают ──');
+    await page.evaluate(() => {
+      const mb = window.Telegram.WebApp.MainButton;
+      window.__mb = { show: 0, hide: 0 };
+      const show = mb.show, hide = mb.hide;
+      mb.show = function () { window.__mb.show += 1; return show.apply(this, arguments); };
+      mb.hide = function () { window.__mb.hide += 1; return hide.apply(this, arguments); };
+    });
+    const cpT = bdb.createCp(user.id, { name: 'ООО «Набор»', kind: 'customer', opening_date: '2026-01-01' });
+    await page.evaluate((c) => window.__go('new', { type: 'sch', cpId: c }), cpT);
+    await page.waitForSelector('input[aria-label^="Наименование позиции"]', { timeout: 8000 });
+    await page.waitForTimeout(300);
+    const counts = () => page.evaluate(() => ({ ...window.__mb }));
+    const tabsOpacity = () => page.evaluate(() => Number(getComputedStyle(document.getElementById('tabs')).opacity));
+    ok(await tabsOpacity() === 1 && await page.evaluate(() => !document.body.classList.contains('typing')), 'до ввода панель на месте');
+
+    await page.locator('input[aria-label^="Наименование позиции"]').first().focus();
+    await page.waitForTimeout(400);
+    const during = await counts();
+    ok(await page.evaluate(() => document.body.classList.contains('typing')), 'фокус в поле — экран знает, что идёт набор');
+    ok(await tabsOpacity() === 0, 'нижней панели не видно, пока набирают');
+    await page.keyboard.type('Монтаж');
+    await page.waitForTimeout(200);
+    const after = await counts();
+    ok(after.show === during.show, 'кнопка Telegram не выскакивает от каждой буквы', JSON.stringify({ during, after }));
+
+    await page.evaluate(() => document.activeElement.blur());
+    await page.waitForTimeout(500);
+    ok(await page.evaluate(() => !document.body.classList.contains('typing')), 'ввод закончился — набор снят');
+    ok(await tabsOpacity() === 1, 'панель вернулась на место');
+    ok((await counts()).show > after.show, 'и кнопка Telegram снова показана');
+
+    // Переход от поля к полю не мигает панелью: она остаётся спрятанной между ними.
+    const fields = page.locator('input[aria-label^="Наименование позиции"], .num input');
+    await fields.nth(0).focus();
+    await page.waitForTimeout(250);
+    await fields.nth(1).focus();
+    await page.waitForTimeout(80);
+    ok(await page.evaluate(() => document.body.classList.contains('typing')), 'при переходе между полями набор не сбрасывается');
+    await page.evaluate(() => document.activeElement.blur());
+    await page.waitForTimeout(400);
+    await page.evaluate(() => window.__go('home', {}));
+    await page.waitForSelector('.hero', { timeout: 8000 });
   }
 
   await browser.close();

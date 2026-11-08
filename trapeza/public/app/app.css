@@ -1672,6 +1672,13 @@ body.drawer-open { overflow: hidden; }
 .qe .qa-l { font: 600 12px/1.2 var(--font); text-align: center; max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
 .qe-btns { display: grid; gap: 10px; margin-top: 22px; }
 
+/* Пока набирают текст, панель уезжает вниз, а то, что стоит над ней (строка
+   ввода помощника), опускается на её место: иначе над клавиатурой остаётся
+   пустой зазор в высоту панели. */
+.tabs { transition: transform .2s var(--ease), opacity .15s; }
+body.typing { --tabs-h: 0px; }
+body.typing .tabs { transform: translateY(160%); opacity: 0; pointer-events: none; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: .01ms !important;

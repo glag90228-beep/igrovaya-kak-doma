@@ -278,6 +278,34 @@ async function withBusy(btn, fn) {
 const app = document.getElementById('app');
 const tabsBox = document.getElementById('tabs');
 
+/*
+ * Пока человек набирает текст, всё, что висит над клавиатурой, прячем.
+ *
+ * Нижняя панель и кнопка Telegram («Выписать на…», «Укажите цену») стоят
+ * у самого края и поднимаются вместе с клавиатурой. На узком экране они
+ * закрывали поле, в которое человек как раз вводит цифры: он набирает «26» и
+ * не видит ни строки, ни суммы. Когда ввод закончен, всё возвращается на место.
+ * Задержка на уход фокуса нужна, чтобы при переходе от поля к полю панель не
+ * мигала: между «ушёл из одного» и «пришёл в другое» проходит доля секунды.
+ */
+let mainRefresh = null;     // что вернёт кнопку Telegram на экране, где она есть
+const isTextField = (el) => Boolean(el) && (el.tagName === 'TEXTAREA' || el.tagName === 'SELECT'
+  || (el.tagName === 'INPUT' && !['checkbox', 'radio', 'button', 'submit', 'file', 'range', 'color'].includes(el.type)));
+let typingTimer = 0;
+function setTyping(on) {
+  clearTimeout(typingTimer);
+  if (document.body.classList.contains('typing') === on) return;
+  document.body.classList.toggle('typing', on);
+  if (!tg || !tg.MainButton) return;
+  if (on) tg.MainButton.hide();
+  else if (mainRefresh) mainRefresh();
+}
+document.addEventListener('focusin', (e) => { if (isTextField(e.target)) setTyping(true); });
+document.addEventListener('focusout', () => {
+  clearTimeout(typingTimer);
+  typingTimer = setTimeout(() => { if (!isTextField(document.activeElement)) setTyping(false); }, 150);
+});
+
 const TABS = [
   { name: 'home', label: 'Главная', icon: 'home' },
   { name: 'docs', label: 'Документы', icon: 'doc' },
@@ -591,6 +619,8 @@ async function render() {
   navKind = 'swap';
   syncChrome();
   refreshCrmBadge();
+  mainRefresh = null;       // у нового экрана своей кнопки пока нет
+  document.body.classList.remove('typing');   // поле, где печатали, могло исчезнуть вместе со старым экраном
   if (tg) tg.MainButton.hide();
   const build = screens[name] || screens.home;
   app.replaceChildren(skeleton(name));
@@ -6731,7 +6761,9 @@ screens.new = async function newDoc(params) {
         : (!draft.items.some((it) => it.name.trim()) ? 'Добавьте позицию'
           : (sum > 0 ? '' : 'Укажите цену'));
       tg.MainButton.setParams({ text: lacks || `Выписать на ${money(sum)}`, is_active: !lacks });
-      tg.MainButton.show();
+      // Пока набирают — кнопка спрятана; покажется, когда ввод закончится (см. setTyping).
+      mainRefresh = recalc;
+      if (!document.body.classList.contains('typing')) tg.MainButton.show();
     }
   }
 
