@@ -1514,6 +1514,96 @@ body.drawer-open { overflow: hidden; }
 }
 .rp-next:disabled { color: var(--muted); cursor: default; }
 
+/* ---------- главная: тёмная карточка, круги действий, «оплачено», лента ---------- */
+
+/*
+ * Карточка суммы — тёмно-синяя, цвета фирменной заставки, а не белая.
+ * Сумма — единственное, ради чего экран открывают, и тёмный фон с белым
+ * числом выделяет её сильнее любой рамки. Цвета свои, не из темы Telegram:
+ * карточка должна выглядеть одинаково и в светлой, и в тёмной теме.
+ */
+.hero-card {
+  position: relative; overflow: hidden; isolation: isolate;
+  background: linear-gradient(150deg, #22407a 0%, #162a52 55%, #101e3c 100%);
+  color: #fff; box-shadow: 0 10px 28px -12px rgba(16, 30, 60, .55);
+  padding: 20px var(--pad) 20px;
+}
+/* Два бледных кольца в углу — глубина без картинки и без единого запроса. */
+.hero-card::before, .hero-card::after {
+  content: ''; position: absolute; z-index: -1; border-radius: 50%;
+  border: 26px solid rgba(98, 168, 240, .10); pointer-events: none;
+}
+.hero-card::before { width: 190px; height: 190px; right: -70px; top: -80px; }
+.hero-card::after { width: 130px; height: 130px; left: -50px; bottom: -70px; border-width: 18px; border-color: rgba(53, 208, 127, .08); }
+.hero-card .cap { color: rgba(255, 255, 255, .72); }
+.hero-card .sum { color: #fff; }
+.hero-card .sub { color: rgba(255, 255, 255, .72); }
+.hero-card .sub.wait { color: #ffc65c; }
+.hero-card .chip-basis { background: rgba(255, 255, 255, .13); color: rgba(255, 255, 255, .9); }
+
+/* Круги быстрых действий: форма и значок читаются раньше подписи. */
+.qa { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 16px 12px 4px; }
+.qa-i {
+  display: flex; flex-direction: column; align-items: center; gap: 7px;
+  min-width: 0; padding: 0; border: 0; background: none; cursor: pointer;
+  color: var(--text); font: inherit; -webkit-tap-highlight-color: transparent;
+}
+.qa-c {
+  position: relative; display: grid; place-items: center;
+  width: 58px; height: 58px; border-radius: 50%;
+  background: var(--surface); color: var(--primary);
+  box-shadow: var(--shadow-1), inset 0 0 0 1px var(--hairline);
+  transition: transform .12s var(--ease);
+}
+.qa-c .icon { width: 25px; height: 25px; }
+.qa-i.main .qa-c { background: var(--primary); color: var(--on-primary); box-shadow: 0 8px 18px -8px var(--primary); }
+.qa-i:active .qa-c { transform: scale(.92); }
+.qa-i:focus-visible .qa-c { outline: 2px solid var(--primary); outline-offset: 3px; }
+.qa-l { font: 600 13px/1.2 var(--font); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qa-badge {
+  position: absolute; top: -3px; right: -3px; min-width: 20px; height: 20px; padding: 0 5px;
+  border-radius: 10px; background: var(--danger); color: #fff;
+  font: 700 12px/20px var(--font-num); text-align: center; box-shadow: 0 0 0 2px var(--bg);
+}
+
+/* «Оплачено» — зелёная карточка с полосой. Тон тёмный: белый мелкий текст
+   на фирменном #0f9d58 не дотягивает до 4,5:1, на этом — дотягивает. */
+.paid-card {
+  position: relative; display: flex; align-items: center; gap: 12px;
+  width: calc(100% - 24px); margin: 14px 12px 4px; padding: 14px var(--pad) 20px;
+  border: 0; border-radius: var(--r-card); text-align: left; cursor: pointer;
+  background: linear-gradient(135deg, #0a6a3c, #0d8a4d); color: #fff; font: inherit;
+  box-shadow: 0 8px 22px -12px rgba(10, 106, 60, .7);
+}
+.paid-card:active { transform: scale(.985); transition: transform 90ms var(--ease); }
+.paid-ico { display: grid; place-items: center; width: 40px; height: 40px; flex: none; border-radius: 12px; background: rgba(255, 255, 255, .18); }
+.paid-ico .icon { width: 22px; height: 22px; }
+.paid-card .grow { flex: 1; min-width: 0; }
+.paid-t { font: 700 15px/1.3 var(--font); }
+.paid-s { font: 500 13px/1.3 var(--font-num); opacity: .88; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.paid-pct { font: 800 24px/1 var(--font-num); letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.paid-bar { position: absolute; left: var(--pad); right: var(--pad); bottom: 9px; height: 5px; border-radius: 3px; background: rgba(255, 255, 255, .25); overflow: hidden; }
+.paid-bar i { display: block; height: 100%; background: #fff; border-radius: 3px; transform-origin: left; transform: scaleX(var(--p, 0)); transition: transform .8s cubic-bezier(.2, .8, .2, 1) .15s; }
+
+/* Заголовок раздела со ссылкой справа. */
+.section-head { display: flex; align-items: flex-end; justify-content: space-between; }
+.section-head .section-title { flex: 1; }
+.link-btn { border: 0; background: none; color: var(--link); font: 600 14px/1 var(--font); padding: 0 18px 8px 8px; min-height: 44px; cursor: pointer; align-self: flex-end; margin-bottom: -12px; }
+.link-btn:active { opacity: .6; }
+
+/* Лента: кружок клиента, что и когда, сумма. */
+.act-av {
+  display: grid; place-items: center; width: 42px; height: 42px; flex: none; border-radius: 50%;
+  font: 800 14px/1 var(--font-num); letter-spacing: .02em;
+}
+.act-av .icon { width: 20px; height: 20px; }
+.act-av.blue  { background: color-mix(in srgb, var(--link) 18%, transparent); color: var(--link); }
+.act-av.green { background: color-mix(in srgb, var(--success) 16%, transparent); color: var(--success-ink); }
+.act-av.amber { background: color-mix(in srgb, var(--wait) 18%, transparent); color: var(--wait); }
+.act-t { font-weight: 600; }
+.act-sum { font: 700 15px/1.2 var(--font-num); font-variant-numeric: tabular-nums; }
+.act-sum.in { color: var(--money-in-ink); }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: .01ms !important;

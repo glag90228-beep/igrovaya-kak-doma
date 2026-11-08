@@ -816,6 +816,76 @@ const BASIS_CHIP = {
   manual: 'Долг сам не считается',
 };
 
+/*
+ * Главная: быстрые действия кругами, карточка «оплачено» и лента активности.
+ *
+ * Раньше под суммой шли четыре строки подряд (помощник, «Выписать счёт»,
+ * «Повторить», «Дела») — одинаковой ширины и почти одинакового веса, так что
+ * взгляд не находил главного. Четыре круга в ряд читаются сразу: форма и
+ * значок говорят раньше подписи, а главное действие закрашено.
+ */
+function quickActions(items) {
+  return h('div', { class: 'qa', role: 'group', 'aria-label': 'Быстрые действия' },
+    items.map((x) => h('button', {
+      class: `qa-i${x.main ? ' main' : ''}`, 'aria-label': x.aria || x.label,
+      onclick: () => { haptic(x.main ? 'medium' : undefined); x.onclick(); },
+    },
+    h('span', { class: 'qa-c' }, icon(x.icon), x.badge ? h('span', { class: 'qa-badge', text: String(x.badge) }) : null),
+    h('span', { class: 'qa-l', text: x.label }))));
+}
+
+/**
+ * Сколько из недавно выписанных счетов уже оплачено — одной полосой.
+ * Считаем только по тем счетам, что пришли на главную (последние пять
+ * документов): это не «выручка за месяц», и называть её так нельзя. Нет
+ * счетов среди них — карточки нет, а не пустая полоса с нулём.
+ */
+function paidCard(s) {
+  const sch = (s.docs || []).filter((d) => d.type === 'sch' && Number(d.total) > 0);
+  if (!sch.length) return null;
+  const all = sch.reduce((a, d) => a + Number(d.total), 0);
+  const paid = sch.filter((d) => d.paidAt).reduce((a, d) => a + Number(d.total), 0);
+  const pct = Math.round((paid / all) * 100);
+  const bar = h('i');
+  const card = h('button', { class: 'paid-card', id: 'paid-card',
+    'aria-label': `Оплачено ${pct}% из последних счетов` },
+  h('span', { class: 'paid-ico' }, icon('wallet')),
+  h('span', { class: 'grow' },
+    h('div', { class: 'paid-t', text: 'Оплачено из последних счетов' }),
+    h('div', { class: 'paid-s', text: `${money0(paid)} из ${money0(all)}` })),
+  h('span', { class: 'paid-pct', text: `${pct}%` }),
+  h('div', { class: 'paid-bar', 'aria-hidden': 'true' }, bar));
+  card.onclick = () => { haptic(); go('docs'); };
+  // Полоса «доезжает» после появления карточки: движение показывает, что число живое.
+  requestAnimationFrame(() => requestAnimationFrame(() => bar.style.setProperty('--p', String(pct / 100))));
+  return card;
+}
+
+/** Две буквы для кружка клиента: «ООО «Вектор»» → «ВЕ», «ИП Заря А. В.» → «ЗА». */
+function initials(name) {
+  const words = String(name || '').replace(/[«»"]/g, ' ').split(/\s+/)
+    .filter((w) => w && !/^(ООО|ИП|АО|ЗАО|ПАО|НКО|ОАО)$/i.test(w));
+  if (!words.length) return '';
+  const two = words.length > 1 ? words[0][0] + words[1][0] : words[0].slice(0, 2);
+  return two.toUpperCase();
+}
+
+/** Лента последних документов: кружок клиента, что и когда, сумма. Оплачено — зелёным со знаком «+». */
+function activityList(docs) {
+  const tones = ['blue', 'green', 'amber'];
+  return h('div', { class: 'card act' }, docs.map((d) => {
+    const ini = initials(d.cpName);
+    const tone = tones[[...String(d.cpName || d.title)].reduce((a, c) => a + c.charCodeAt(0), 0) % tones.length];
+    const paid = Boolean(d.paidAt) && d.total;
+    return h('button', { class: 'row act-row', onclick: () => { haptic(); go('doc', { id: d.id }); } },
+      h('span', { class: `act-av ${ini ? tone : 'blue'}`, 'aria-hidden': 'true' }, ini || icon('doc')),
+      h('span', { class: 'grow' },
+        h('div', { class: 'ellipsis act-t', text: d.cpName || `${d.title} № ${d.number}` }),
+        h('div', { class: 'small muted ellipsis', text: nb(`${d.short || d.title} № ${d.number} · ${dm(d.date)}${paid ? ' · оплачен' : ''}`) })),
+      d.total ? h('span', { class: `money nowrap act-sum${paid ? ' in' : ''}`, text: `${paid ? '+' : ''}${money0(d.total)}` }) : null);
+  }));
+}
+
 function basisChip(s) {
   const chip = h('button', { class: 'chip-basis' },
     `${BASIS_CHIP[s.debtBasis] || BASIS_CHIP.closing} ▾`);
@@ -1008,6 +1078,11 @@ screens.home = async function home() {
    * Теперь фраза — строка ввода с примером прямо в ней (человек видит, что
    * писать), а кнопка ниже — вторая дорога к тому же результату.
    */
+  // Напоминания нужны и кругу «Дела» (число на нём), и разделу ниже — спрашиваем один раз.
+  const fuAll = await api('GET', '/api/crm/followups').catch(() => ({ followups: [] }));
+  noteFollowups(fuAll.followups);
+  const lastSch = (s.docs || []).find((d) => d.type === 'sch' && d.cpId);
+
   const askRow = h('button', { class: 'prompt' },
     h('span', { class: 'icon-box' }, icon('mic')),
     h('span', { class: 'grow' },
@@ -1015,72 +1090,51 @@ screens.home = async function home() {
       h('div', { class: 'small muted ellipsis', text: '«Счёт Заре на 51 000 за банкет»' })),
     h('span', { class: 'prompt-go' }, icon('chev')));
   askRow.onclick = () => { haptic(); go('ask'); };
-  box.append(askRow);
-
-  // Одно главное действие, крупнее всего остального. У новичка его роль у
-  // кнопки шага выше — второй такой же «Выписать счёт» только путал бы.
-  const cta = newbie ? null : h('button', { class: 'cta' },
-    h('span', { class: 'cta-ico' }, icon('receipt')),
-    h('span', { class: 'grow' },
-      h('div', { class: 'cta-t', text: 'Выписать счёт' }),
-      h('div', { class: 'cta-s', text: 'с QR — клиент платит камерой банка' })),
-    icon('chev', 'chev'));
-  if (cta) {
-    cta.onclick = () => { haptic('medium'); go('new', { type: 'sch' }); };
-    box.append(cta);
-  }
+  // Новичку — строка с примером фразы, как раньше; у остальных то же самое
+  // есть кругом «Помощник» под суммой.
+  if (newbie) box.append(askRow);
 
   /*
-   * Быстрое действие — от состояния, а не сеткой плиток.
-   *
-   * Плитки «Клиенты» и «Кто должен» дублировали таб-бар: они не давали
-   * ничего сверх него, занимали первый экран и отжимали ленту операций вниз.
-   * Новичку они вредили вдвойне — он нажимал и находил пустоту.
-   *
-   * Кнопка на главной должна быть ДЕЙСТВИЕМ, место — вкладкой. Поэтому здесь
-   * стоит то, чего вкладка выразить не может: новичку — первый шаг, тому, кто
-   * уже работает, — повтор последнего счёта. Свой долг никуда не делся, он на
-   * вкладке «Долги», просто перестал занимать половину главного экрана.
+   * Быстрые действия — от состояния, а не сеткой плиток. Главное («Выписать
+   * счёт») закрашено; «Повторить» берёт позиции и клиента из прошлого счёта,
+   * дату — сегодняшнюю: это повтор регулярной работы, а не копия задним числом.
+   * Нет прошлого счёта — вместо повтора вход в клиентов. Новичку круги не нужны:
+   * у него шаги и кнопка шага выше.
    */
-  const lastSch = (s.docs || []).find((d) => d.type === 'sch' && d.cpId);
-  // Новичку — шаги наверху, второй «первый счёт» здесь был бы дублем.
-  if (newbie) {
-    // ничего: шаги и кнопка уже на экране
-  } else if (lastSch) {
-    // Сумму держим в подписи, а не отдельной колонкой справа: колонка
-    // отжимала название, и «ООО «Заря»» обрезалось до «ООО «З…».
-    const again = h('button', { class: 'row' },
-      h('span', { class: 'icon-box' }, icon('repeat')),
-      h('span', { class: 'grow' },
-        h('div', { class: 'ellipsis', text: `Повторить: ${lastSch.cpName || 'последний счёт'}` }),
-        h('div', { class: 'small muted ellipsis',
-          text: `№ ${lastSch.number} · ${money0(lastSch.total)} · сегодняшней датой` })),
-      icon('chev', 'chev'));
-    // Позиции и клиента берём из прошлого счёта, дату — сегодняшнюю: это
-    // повтор регулярной работы, а не копия документа задним числом.
-    again.onclick = () => repeatDoc(lastSch.id);
-    box.append(h('div', { class: 'card' }, again));
+  if (!newbie) {
+    box.append(quickActions([
+      { icon: 'receipt', label: 'Счёт', aria: 'Выписать счёт с QR', main: true, onclick: () => go('new', { type: 'sch' }) },
+      { icon: 'mic', label: 'Помощник', aria: 'Помощник: голос или текст', onclick: () => go('ask') },
+      lastSch
+        ? { icon: 'repeat', label: 'Повторить', aria: `Повторить счёт: ${lastSch.cpName || 'последний'}`, onclick: () => repeatDoc(lastSch.id) }
+        : { icon: 'users', label: 'Клиенты', onclick: () => reset('cps') },
+      { icon: 'bell', label: 'Дела', aria: 'Дела: напоминания и заметки', badge: fuAll.followups.length || 0, onclick: () => reset('crm') },
+    ]));
+    const pc = paidCard(s);
+    if (pc) box.append(pc);
+    box.append(h('div', { class: 'section-head' },
+      h('div', { class: 'section-title', text: 'Последние документы' }),
+      h('button', { class: 'link-btn', onclick: () => { haptic(); go('docs'); } }, 'Все')));
+    box.append(activityList(s.docs));
   }
-
 
   /*
    * Напоминания и вход в клиентов — на виду, а не в глубине карточки.
    * Владелец открыл приложение и мини-CRM не нашёл: она была только в боте.
    */
-  const fuAll = await api('GET', '/api/crm/followups').catch(() => ({ followups: [] }));
-  noteFollowups(fuAll.followups);
   const fuNow = fuAll.followups.filter((f) => f.overdue || f.today);
   if (fuNow.length) {
     box.append(h('div', { class: 'section-title', text: 'Напоминания' }),
       h('div', { class: 'card' }, followupRows(fuNow.slice(0, 5), () => render(), true)));
   }
-  box.append(h('div', { class: 'card' }, navRow({
-    icon: 'bell', title: 'Дела: напоминания и заметки',
-    sub: fuAll.followups.length
-      ? `${fuAll.followups.length} ${plural(fuAll.followups.length, 'напоминание', 'напоминания', 'напоминаний')} · заметки по клиентам`
-      : 'заметки по клиентам, «напомнить мне»',
-    onclick: () => reset('crm'),
-  })));
+  // У остальных «Дела» — круг под суммой, с числом напоминаний на нём.
+  if (newbie) {
+    box.append(h('div', { class: 'card' }, navRow({
+      icon: 'bell', title: 'Дела: напоминания и заметки',
+      sub: 'заметки по клиентам, «напомнить мне»',
+      onclick: () => reset('crm'),
+    })));
+  }
 
   // У каждого типа своя иконка: четыре одинаковых листа бумаги не помогают
   // выбрать, а взгляд цепляется за форму раньше, чем прочтёт подпись.
@@ -1119,17 +1173,9 @@ screens.home = async function home() {
       onclick: () => go('billing'),
     })));
 
-  box.append(h('div', { class: 'section-title', text: 'Последние документы' }));
-  if (!s.docs.length) {
+  if (newbie) {
+    box.append(h('div', { class: 'section-title', text: 'Последние документы' }));
     box.append(h('div', { class: 'card' }, h('div', { class: 'row muted' }, 'Пока ничего не выписано')));
-  } else {
-    box.append(h('div', { class: 'card' }, s.docs.map((d) => navRow({
-      icon: 'doc',
-      title: `${d.title} № ${d.number}`,
-      sub: ru(d.date),
-      right: d.total ? money(d.total) : '',
-      onclick: () => go('doc', { id: d.id }),
-    }))));
   }
   return box;
 };
