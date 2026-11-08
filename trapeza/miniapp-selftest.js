@@ -250,8 +250,59 @@ async function main() {
      * поменяли бы порядок списка — и уронили бы соседнюю проверку не своей
      * ошибкой, а мусором в состоянии.
      */
-    require('./db').db.prepare('DELETE FROM orgs WHERE id = ?').run(paid.json.active);
+    /*
+     * Удаление организации: только пустой, только своей, и не последней.
+     *
+     * Здесь же — прибор для прибирания: третья, оплаченная выше, удаляется
+     * настоящим вызовом, а не прямой записью в таблицу.
+     */
+    const thirdId = paid.json.active;
+    const alienDel = await call('POST', '/api/org/delete', { user: petya, body: { id: thirdId } });
+    ok(alienDel.status === 400, 'чужую организацию удалить нельзя', alienDel.status);
+    const dbx = require('./db').db;
+    ok(Boolean(dbx.prepare('SELECT 1 FROM orgs WHERE id = ?').get(thirdId)), 'и она осталась на месте');
+
+    const dropped = await call('POST', '/api/org/delete', { user: masha, body: { id: thirdId } });
+    ok(dropped.status === 200 && dropped.json.deleted, 'пустую свою организацию удалили', JSON.stringify(dropped.json));
+    ok(dropped.json.active === firstId, 'и работа вернулась на первую, а не повисла на удалённой', dropped.json.active);
+    const afterDrop = await call('GET', '/api/orgs', { user: masha });
+    ok(afterDrop.json.orgs.length === 2 && afterDrop.json.active === firstId,
+      'в списке осталось две', JSON.stringify(afterDrop.json.orgs.map((o) => o.id)));
+
+    // Организацию с документом не удалить, причина названа, а сам документ цел.
+    const secondId = afterDrop.json.orgs.find((o) => o.id !== firstId).id;
+    const mashaUid = bdbQ.getOrCreateUser(MASHA.id).id;
+    dbx.prepare("INSERT INTO documents(user_id, org_id, type, number, total, created_at) VALUES(?,?,?,?,?,?)")
+      .run(mashaUid, secondId, 'sch', 'T-1', 100, new Date().toISOString());
+    const busy = await call('POST', '/api/org/delete', { user: masha, body: { id: secondId } });
+    ok(busy.status === 400 && busy.json.reason === 'used' && /документов: 1/.test(busy.json.error || ''),
+      'организацию с документом удалить нельзя — и сказано, сколько их', JSON.stringify(busy.json));
+    const listed = await call('GET', '/api/orgs', { user: masha });
+    ok((listed.json.orgs.find((o) => o.id === secondId) || {}).docs === 1,
+      'список организаций отдаёт число документов — по нему приложение объясняет отказ');
+    ok(Boolean(dbx.prepare('SELECT 1 FROM orgs WHERE id = ?').get(secondId))
+      && dbx.prepare('SELECT COUNT(*) AS n FROM documents WHERE org_id = ?').get(secondId).n === 1,
+    'и организация, и документ целы после отказа');
+    dbx.prepare("DELETE FROM documents WHERE number = 'T-1' AND user_id = ?").run(mashaUid);
+
+    // Старый документ без организации (org_id = 0) принадлежит организации по умолчанию — её тоже не удалить.
+    dbx.prepare("INSERT INTO documents(user_id, org_id, type, number, total, created_at) VALUES(?,?,?,?,?,?)")
+      .run(mashaUid, 0, 'sch', 'T-0', 100, new Date().toISOString());
+    const legacy = await call('POST', '/api/org/delete', { user: masha, body: { id: firstId } });
+    ok(legacy.status === 400 && legacy.json.reason === 'used', 'документ старого вида держит организацию по умолчанию', JSON.stringify(legacy.json));
+    dbx.prepare("DELETE FROM documents WHERE number = 'T-0' AND user_id = ?").run(mashaUid);
+
+    // Удалили вторую — единственная оставшаяся последняя: её не удалить.
+    const dropSecond = await call('POST', '/api/org/delete', { user: masha, body: { id: secondId } });
+    ok(dropSecond.status === 200, 'пустая вторая организация удаляется', JSON.stringify(dropSecond.json));
+    const lastOne = await call('POST', '/api/org/delete', { user: masha, body: { id: firstId } });
+    ok(lastOne.status === 400 && lastOne.json.reason === 'last', 'единственную организацию удалить нельзя', JSON.stringify(lastOne.json));
+
+    // Вернули вторую организацию на место: ниже по файлу ждут две.
+    const re = await call('POST', '/api/org/add', { user: masha });
+    await call('POST', '/api/org', { user: masha, body: { name: 'ООО «Вторая»', inn: '7707083893' } });
     await call('POST', '/api/org/use', { user: masha, body: { id: firstId } });
+    ok(re.status === 200, 'вторая организация заведена заново');
   }
 
   /*

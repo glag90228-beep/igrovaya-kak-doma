@@ -788,7 +788,8 @@ const ok = (c, m, extra) => {
       const t = document.getElementById('tabs').getBoundingClientRect();
       return { bottom: Math.round(t.bottom), vh: window.innerHeight, pos: getComputedStyle(document.getElementById('tabs')).position };
     });
-    ok(geo.pos === 'fixed' && geo.bottom === geo.vh, 'панель прибита к низу экрана', JSON.stringify(geo));
+    // Панель парит над нижним краем (отступ не больше 24 px), но от прокрутки не уезжает.
+    ok(geo.pos === 'fixed' && geo.vh - geo.bottom >= 0 && geo.vh - geo.bottom <= 24, 'панель закреплена у низа экрана', JSON.stringify(geo));
     ok(await page.evaluate(() => document.querySelectorAll('#tabs .tab svg').length) === 5, 'у каждой вкладки есть значок-SVG');
 
     // Счётчик: просроченное и сегодняшнее — два; «на потом» не считается.

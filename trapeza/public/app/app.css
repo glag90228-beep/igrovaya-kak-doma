@@ -941,45 +941,57 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
 
 /* Высота вкладок нужна не только им: над ними стоит строка ввода в
    переписке, и обе должны считать её от одного числа. */
-:root { --tabs-h: calc(57px + env(safe-area-inset-bottom, 0px)); }
+:root { --tabs-h: calc(88px + env(safe-area-inset-bottom, 0px)); }
 
+/*
+ * Нижняя панель — плавающая таблетка, а не полоса во всю ширину.
+ *
+ * Полоса прилипала к краю и читалась как часть системы телефона, а не
+ * приложения. Таблетка парит над контентом, цвета те же, что у карточки суммы,
+ * так что главное и навигация собраны в одной палитре. Активный раздел —
+ * заливка под значком, а подпись остаётся у всех: пять значков без слов
+ * угадываются хуже, чем кажется (проверено на «Делах» и «Ещё»).
+ */
 .tabs {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+  position: fixed; left: 12px; right: 12px; z-index: 40;
+  bottom: calc(10px + env(safe-area-inset-bottom, 0px));
   display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
-  /* Заливка плотная, не стекло: панель стоит поверх прокручиваемых карточек,
-     и при 88% непрозрачности их текст читался сквозь подписи вкладок. Само
-     размытие оставлено — оно только смягчает край. */
-  background: var(--surface);
-  -webkit-backdrop-filter: var(--glass-blur);
-  backdrop-filter: var(--glass-blur);
-  border-top: 1px solid var(--border);
-  box-shadow: var(--glass-edge);
-  padding-bottom: env(safe-area-inset-bottom);
+  padding: 6px 6px;
+  border-radius: 30px;
+  /* background-color — запасной и честный: панель непрозрачна, текст карточек сквозь неё не читается. */
+  background-color: #14264a;
+  background-image: linear-gradient(150deg, #1d3566 0%, #14264a 60%, #101e3c 100%);
+  border: 1px solid rgba(255, 255, 255, .10);
+  box-shadow: 0 16px 34px -12px rgba(8, 16, 40, .6), inset 0 1px 0 rgba(255, 255, 255, .08);
 }
 .tab {
-  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
-  min-height: 56px; padding: 6px 4px;
-  border: 0; background: none; color: var(--muted);
-  font: 500 11px/1.2 var(--font); cursor: pointer;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  min-height: 56px; padding: 5px 2px;
+  border: 0; background: none; color: rgba(255, 255, 255, .72);
+  font: 600 11px/1.2 var(--font); letter-spacing: .01em; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
 }
-.tab[aria-current="page"] { color: var(--primary); }
-/* Активная вкладка помечена и цветом, и точкой: только цветом нельзя —
-   его не различают при дальтонизме и на выцветшем экране. */
-.tab[aria-current="page"]::after {
-  content: ''; width: 4px; height: 4px; border-radius: 50%;
-  background: currentColor; margin-top: 1px;
-}
+.tab:active .tab-ico { transform: scale(.9); }
+.tab:focus-visible { outline: 2px solid #8fc2ff; outline-offset: -2px; border-radius: 24px; }
+/* Активная вкладка: светлая подпись и синяя «капсула» под значком — и цвет,
+   и форма, чтобы не зависеть от одного цвета. */
+.tab[aria-current="page"] { color: #fff; }
 .tab .icon { width: 24px; height: 24px; }
-.tab { letter-spacing: .01em; }
+.tab-ico {
+  position: relative; display: inline-flex; align-items: center; justify-content: center;
+  width: 54px; height: 32px; border-radius: 16px;
+  transition: background-color .22s var(--ease), transform .12s var(--ease);
+}
+.tab[aria-current="page"] .tab-ico { background: #2f7fd8; animation: tab-pop .34s cubic-bezier(.3, 1.5, .5, 1); }
+@keyframes tab-pop { from { transform: scale(.78); } to { transform: none; } }
 /* Счётчик напоминаний: красный кружок на углу значка. Цифра внутри, а не
    голая точка — «есть что-то» и «горит три дела» человеку не одно и то же. */
-.tab-ico { position: relative; display: inline-flex; }
 .tab-badge {
-  position: absolute; top: -5px; left: 55%;
+  position: absolute; top: -4px; right: 0;
   min-width: 17px; height: 17px; padding: 0 4px; box-sizing: border-box;
   border-radius: 9px; background: var(--danger); color: #fff;
   font: 700 11px/17px var(--font); text-align: center;
-  box-shadow: 0 0 0 2px var(--bg);
+  box-shadow: 0 0 0 2px #14264a;
 }
 .tab-badge[hidden] { display: none; }
 .drawer-item .tab-badge { position: static; margin-left: auto; box-shadow: none; }
@@ -1486,7 +1498,7 @@ body.drawer-open { overflow: hidden; }
 /* Кольцо «заполнено N из M». */
 .rp {
   display: flex; gap: 14px; align-items: center;
-  margin: 0 0 12px; padding: 12px 14px;
+  margin: 0 12px 12px; padding: 12px 14px;
   border-radius: 14px; border: 1px solid var(--hairline);
   background: var(--surface);
 }
@@ -1603,6 +1615,62 @@ body.drawer-open { overflow: hidden; }
 .act-t { font-weight: 600; }
 .act-sum { font: 700 15px/1.2 var(--font-num); font-variant-numeric: tabular-nums; }
 .act-sum.in { color: var(--money-in-ink); }
+
+/* ---------- список организаций с корзиной ---------- */
+.org-list { display: grid; }
+.org-row { display: flex; align-items: center; }
+.org-row + .org-row { border-top: 1px solid var(--hairline); }
+.org-pick {
+  display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; min-height: 60px;
+  padding: 10px 0 10px var(--pad); border: 0; background: none; color: inherit;
+  font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.org-pick:active { opacity: .6; }
+.org-n { font-weight: 600; }
+.org-dot {
+  display: grid; place-items: center; width: 24px; height: 24px; flex: none; border-radius: 50%;
+  border: 2px solid var(--input-line); color: #fff;
+}
+.org-dot.on { background: var(--primary); border-color: var(--primary); }
+.org-dot .icon { width: 14px; height: 14px; stroke-width: 3; }
+.org-del {
+  display: grid; place-items: center; width: 52px; height: 60px; flex: none; border: 0; background: none;
+  color: var(--danger); cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.org-del.locked { color: var(--muted); opacity: .55; }
+.org-del:active { opacity: .5; }
+.org-del:focus-visible, .org-pick:focus-visible { outline: 2px solid var(--primary); outline-offset: -3px; }
+.org-hint { padding: 10px var(--pad) 8px; color: var(--muted); font-size: 13px; line-height: 1.4; }
+
+/* ---------- настройка кнопок на главной ---------- */
+.qa-edit-row { display: flex; justify-content: flex-end; margin: 0 12px; }
+.qa-edit { border: 0; background: none; color: var(--muted); font: 500 13px/1 var(--font); padding: 12px 6px; min-height: 44px; cursor: pointer; }
+.qa-edit:active { opacity: .6; }
+.qa-edit:focus-visible { outline: 2px solid var(--primary); border-radius: 8px; }
+.qe-scrim { position: fixed; inset: 0; z-index: 70; background: rgba(8, 14, 30, .55); display: flex; align-items: flex-end; justify-content: center; animation: fade .18s ease-out; }
+.qe {
+  width: 100%; max-width: 560px; max-height: 88vh; overflow-y: auto; outline: none;
+  background: var(--surface); color: var(--text);
+  border-radius: 24px 24px 0 0; padding: 10px var(--pad) calc(18px + env(safe-area-inset-bottom, 0px));
+  animation: qe-up .28s var(--ease);
+}
+@keyframes qe-up { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
+.qe-grip { width: 40px; height: 4px; border-radius: 2px; background: var(--input-line); margin: 0 auto 14px; }
+.qe-title { font: 800 20px/1.2 var(--font); }
+.qe-sub { color: var(--muted); font-size: 14px; line-height: 1.4; margin: 6px 0 16px; }
+.qe-head { font: 700 13px/1.2 var(--font); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 20px 0 10px; }
+.qe-slots { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.qe-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px 8px; }
+.qe-slot, .qe-opt { display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 0; padding: 8px 0; border: 0; border-radius: 16px; background: none; color: inherit; font: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.qe-slot.on { background: color-mix(in srgb, var(--primary) 12%, transparent); box-shadow: inset 0 0 0 2px var(--primary); }
+.qe-c { display: grid; place-items: center; width: 52px; height: 52px; border-radius: 50%; background: color-mix(in srgb, var(--muted) 12%, transparent); color: var(--link); }
+.qe-slot.main .qe-c { background: var(--primary); color: var(--on-primary); }
+.qe-c .icon { width: 24px; height: 24px; }
+.qe-opt.used { opacity: .5; }
+.qe-opt:active .qe-c, .qe-slot:active .qe-c { transform: scale(.92); }
+.qe-slot:focus-visible, .qe-opt:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.qe .qa-l { font: 600 12px/1.2 var(--font); text-align: center; max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
+.qe-btns { display: grid; gap: 10px; margin-top: 22px; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

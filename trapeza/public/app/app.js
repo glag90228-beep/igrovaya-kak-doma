@@ -824,6 +824,101 @@ const BASIS_CHIP = {
  * взгляд не находил главного. Четыре круга в ряд читаются сразу: форма и
  * значок говорят раньше подписи, а главное действие закрашено.
  */
+/*
+ * Кнопки быстрых действий на главной настраиваются.
+ *
+ * Счёт нужен не всем: кто-то выписывает только накладные, кто-то — акты и акты
+ * сверки. Четыре места остаются, а что в них стоит, решает человек. Набор
+ * хранится на самом телефоне (localStorage): это личное удобство, а не данные
+ * учёта, и на другом устройстве он начнёт с обычного. Не вышло прочитать
+ * или записать — молча остаётся стандартный набор.
+ */
+const QA_DEFAULT = ['sch', 'ask', 'repeat', 'crm'];
+
+function qaCatalog({ s, lastSch, followups }) {
+  const npd = Boolean((s.org || {}).npd);
+  const cat = {
+    sch: { icon: 'receipt', label: 'Счёт', aria: 'Выписать счёт с QR', onclick: () => go('new', { type: 'sch' }) },
+    torg12: { icon: 'box', label: 'Накладная', aria: 'Выписать накладную ТОРГ-12', onclick: () => go('new', { type: 'torg12' }) },
+    usl: { icon: 'doc-check', label: 'Акт', aria: 'Выписать акт услуг', onclick: () => go('new', { type: 'usl' }) },
+    schdog: { icon: 'pen', label: 'Счёт-договор', aria: 'Выписать счёт-договор', onclick: () => go('new', { type: 'schdog' }) },
+    pp: { icon: 'wallet', label: 'Платёжка', aria: 'Составить платёжное поручение', onclick: () => go('other', { type: 'pp' }) },
+    dog: { icon: 'pen', label: 'Договор', aria: 'Составить договор', onclick: () => go('other', { type: 'dog' }) },
+    akt: { icon: 'list', label: 'Акт сверки', aria: 'Акт сверки с клиентом', onclick: () => go('akt') },
+    ask: { icon: 'mic', label: 'Помощник', aria: 'Помощник: голос или текст', onclick: () => go('ask') },
+    repeat: {
+      icon: 'repeat', label: 'Повторить',
+      aria: lastSch ? `Повторить счёт: ${lastSch.cpName || 'последний'}` : 'Повторить последний счёт',
+      onclick: () => (lastSch ? repeatDoc(lastSch.id) : toast('Пока нечего повторять: счетов ещё нет')),
+    },
+    crm: { icon: 'bell', label: 'Дела', aria: 'Дела: напоминания и заметки', badge: followups || 0, onclick: () => reset('crm') },
+    cps: { icon: 'users', label: 'Клиенты', aria: 'Список клиентов', onclick: () => reset('cps') },
+    unpaid: { icon: 'clock', label: 'Ждут оплаты', aria: 'Счета, которые ждут оплаты', onclick: () => go('unpaid') },
+    bank: { icon: 'upload', label: 'Выписка', aria: 'Загрузить выписку банка', onclick: () => go('bank') },
+  };
+  // Самозанятому счёт-фактуру выставлять нельзя (422-ФЗ): УПД ему не предлагаем.
+  if (!npd) cat.upd = { icon: 'docs2', label: 'УПД', aria: 'Выписать УПД', onclick: () => go('new', { type: 'upd' }) };
+  return cat;
+}
+
+function qaLoad(cat) {
+  try {
+    const raw = JSON.parse(localStorage.getItem('home.qa') || 'null');
+    if (Array.isArray(raw) && raw.length === 4 && new Set(raw).size === 4 && raw.every((id) => cat[id])) return raw;
+  } catch (_) { /* нет доступа к хранилищу или битая запись — берём стандартный набор */ }
+  return QA_DEFAULT.filter((id) => cat[id]);
+}
+function qaSave(ids) {
+  try { localStorage.setItem('home.qa', JSON.stringify(ids)); } catch (_) { /* не запомним — не беда */ }
+}
+
+/**
+ * Окно выбора кнопок: четыре места сверху, все возможные кнопки ниже.
+ * Нажали на место, затем на кнопку — она встала туда; если уже стояла в другом
+ * месте, они меняются местами, чтобы ни одно место не осталось пустым.
+ */
+function qaEditor(cat, ids, onDone) {
+  let slot = 0;
+  const cur = ids.slice();
+  const scrim = h('div', { class: 'qe-scrim' });
+  const sheet = h('div', { class: 'qe', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Кнопки на главной', tabindex: '-1' });
+  const close = () => { scrim.remove(); document.removeEventListener('keydown', onKey); onDone(cur); };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  const draw = () => {
+    sheet.replaceChildren(
+      h('div', { class: 'qe-grip', 'aria-hidden': 'true' }),
+      h('div', { class: 'qe-title', text: 'Кнопки на главной' }),
+      h('div', { class: 'qe-sub', text: 'Нажмите на место, затем на кнопку, которую хотите туда поставить. Первое место — главное, оно закрашено.' }),
+      h('div', { class: 'qe-slots', role: 'group', 'aria-label': 'Четыре места' }, cur.map((id, i) => h('button', {
+        class: `qe-slot${i === slot ? ' on' : ''}${i === 0 ? ' main' : ''}`, type: 'button',
+        'aria-pressed': String(i === slot), 'aria-label': `Место ${i + 1}: ${cat[id].label}`,
+        onclick: () => { slot = i; draw(); },
+      }, h('span', { class: 'qe-c' }, icon(cat[id].icon)), h('span', { class: 'qa-l', text: cat[id].label })))),
+      h('div', { class: 'qe-head', text: 'Что можно поставить' }),
+      h('div', { class: 'qe-grid' }, Object.keys(cat).map((id) => h('button', {
+        class: `qe-opt${cur.includes(id) ? ' used' : ''}`, type: 'button',
+        'aria-label': `${cat[id].label}${cur.includes(id) ? ' — уже стоит' : ''}`,
+        onclick: () => {
+          const at = cur.indexOf(id);
+          if (at >= 0) [cur[at], cur[slot]] = [cur[slot], cur[at]]; else cur[slot] = id;
+          qaSave(cur); haptic();
+          slot = (slot + 1) % 4; draw();
+        },
+      }, h('span', { class: 'qe-c' }, icon(cat[id].icon)), h('span', { class: 'qa-l', text: cat[id].label })))),
+      h('div', { class: 'qe-btns' },
+        h('button', { class: 'btn secondary', type: 'button', onclick: () => {
+          cur.splice(0, 4, ...QA_DEFAULT.filter((id) => cat[id])); qaSave(cur); slot = 0; draw();
+        } }, 'Вернуть как было'),
+        h('button', { class: 'btn', type: 'button', onclick: close }, 'Готово')));
+  };
+  scrim.addEventListener('click', (e) => { if (e.target === scrim) close(); });
+  document.addEventListener('keydown', onKey);
+  scrim.append(sheet);
+  document.body.append(scrim);
+  draw();
+  sheet.focus();
+}
+
 function quickActions(items) {
   return h('div', { class: 'qa', role: 'group', 'aria-label': 'Быстрые действия' },
     items.map((x) => h('button', {
@@ -1102,14 +1197,13 @@ screens.home = async function home() {
    * у него шаги и кнопка шага выше.
    */
   if (!newbie) {
-    box.append(quickActions([
-      { icon: 'receipt', label: 'Счёт', aria: 'Выписать счёт с QR', main: true, onclick: () => go('new', { type: 'sch' }) },
-      { icon: 'mic', label: 'Помощник', aria: 'Помощник: голос или текст', onclick: () => go('ask') },
-      lastSch
-        ? { icon: 'repeat', label: 'Повторить', aria: `Повторить счёт: ${lastSch.cpName || 'последний'}`, onclick: () => repeatDoc(lastSch.id) }
-        : { icon: 'users', label: 'Клиенты', onclick: () => reset('cps') },
-      { icon: 'bell', label: 'Дела', aria: 'Дела: напоминания и заметки', badge: fuAll.followups.length || 0, onclick: () => reset('crm') },
-    ]));
+    const cat = qaCatalog({ s, lastSch, followups: fuAll.followups.length });
+    const ids = qaLoad(cat);
+    box.append(quickActions(ids.map((id, i) => ({ ...cat[id], main: i === 0 }))));
+    box.append(h('div', { class: 'qa-edit-row' }, h('button', {
+      class: 'qa-edit', id: 'qa-edit', type: 'button',
+      onclick: () => { haptic(); qaEditor(cat, ids, () => render()); },
+    }, icon('pen', 'icon inline'), 'Изменить кнопки')));
     const pc = paidCard(s);
     if (pc) box.append(pc);
     box.append(h('div', { class: 'section-head' },
@@ -3124,24 +3218,60 @@ screens.org = async function orgScreen() {
   const { orgs = [], active } = await api('GET', '/api/orgs').catch(() => ({ orgs: [] }));
   const orgPicker = h('div');
   if (orgs.length > 1) {
-    const sel = h('select', { id: 'f-active-org' },
-      orgs.map((x) => h('option', { value: x.id, selected: x.id === active }, x.name || 'без названия')));
-    sel.onchange = async () => {
+    /*
+     * Список, а не выпадающий выбор: у каждой строки своя корзина.
+     *
+     * Раньше фирму можно было только выбрать, а убрать — нет: заведённая по
+     * ошибке или «на пробу» оставалась навсегда и занимала место в тарифе.
+     * Строка переключает фирму, корзина её удаляет. Корзина есть всегда, а если
+     * удалить нельзя (по фирме выписаны документы), приложение объясняет почему,
+     * а не прячет кнопку: пропавшая кнопка читается как поломка.
+     */
+    const list = h('div', { class: 'org-list', id: 'org-list' });
+    const useOrg = async (x) => {
       try {
-        await api('POST', '/api/org/use', { id: Number(sel.value) });
+        await api('POST', '/api/org/use', { id: x.id });
         cache.org = null;                    // реквизиты на экранах теперь другие
         haptic('medium');
         toast('Работаем от другой фирмы');
         go('org');
       } catch (e) { toast(e.message, true); }
     };
-    orgPicker.append(h('div', { class: 'field' },
-      h('label', { for: 'f-active-org', text: 'Работаем от' }), sel,
-      h('div', {
-        class: 'hint',
-        text: 'У каждой фирмы свой ряд номеров и свой баланс с клиентами — '
-          + 'смешать их нельзя, это разные юрлица.',
-      })));
+    const dropOrg = async (x, btn) => {
+      if (x.docs) {
+        toast(`По «${x.name || 'этой фирме'}» выписано документов: ${x.docs}. Пока они есть, фирму не удалить`, true);
+        return;
+      }
+      if (!(await askSure(`Удалить организацию «${x.name || 'без названия'}»? Реквизиты пропадут, вернуть их нельзя.`))) return;
+      await withBusy(btn, async () => {
+        await api('POST', '/api/org/delete', { id: x.id });
+        cache.org = null;
+        haptic('medium');
+        toast('Организация удалена');
+        go('org');
+      });
+    };
+    for (const x of orgs) {
+      const mark = h('span', { class: `org-dot${x.id === active ? ' on' : ''}`, 'aria-hidden': 'true' }, x.id === active ? icon('check') : null);
+      const pick = h('button', {
+        class: 'org-pick', type: 'button', 'aria-pressed': String(x.id === active),
+        onclick: () => (x.id === active ? null : useOrg(x)),
+      }, mark,
+      h('span', { class: 'grow' },
+        h('div', { class: 'ellipsis org-n', text: x.name || 'без названия' }),
+        h('div', { class: 'small muted ellipsis', text: x.inn ? `ИНН ${x.inn}` : 'ИНН не указан' })));
+      const del = h('button', {
+        class: `org-del${x.docs ? ' locked' : ''}`, type: 'button',
+        'aria-label': `Удалить организацию ${x.name || 'без названия'}`,
+        onclick: (e) => dropOrg(x, e.currentTarget),
+      }, icon('trash'));
+      list.append(h('div', { class: 'org-row' }, pick, del));
+    }
+    orgPicker.append(list, h('div', {
+      class: 'hint org-hint',
+      text: 'У каждой фирмы свой ряд номеров и свой баланс с клиентами — смешать их нельзя, это разные юрлица. '
+        + 'Удалить можно фирму, по которой ещё ничего не выписано.',
+    }));
   }
   orgPicker.append(h('div', { class: 'btn-wrap' }, h('button', {
     class: 'btn secondary',

@@ -617,6 +617,65 @@ function getOrg(userId, id) {
 }
 
 /**
+ * Что держит организацию: сколько на ней документов и записей журнала.
+ *
+ * Документы старого вида записаны с org_id = 0 и принадлежат организации по
+ * умолчанию (см. orgOfDoc) — их считаем за ней, иначе «пустой» на вид
+ * дефолтной фирмы хватило бы, чтобы потерять чужую историю.
+ */
+function orgUsage(userId, orgId) {
+  const org = getOrg(userId, orgId);
+  if (!org) return { docs: 0, ops: 0 };
+  const ids = org.is_default ? [org.id, 0] : [org.id];
+  const q = ids.map(() => '?').join(',');
+  const docs = db.prepare(`SELECT COUNT(*) AS n FROM documents WHERE user_id = ? AND org_id IN (${q})`).get(userId, ...ids).n;
+  const ops = db.prepare(`SELECT COUNT(*) AS n FROM operations
+    WHERE org_id IN (${q}) AND cp_id IN (SELECT id FROM counterparties WHERE user_id = ?)`).get(...ids, userId).n;
+  return { docs, ops };
+}
+
+/**
+ * Удалить свою организацию. Только пустую: по которой не выписано ни одного
+ * документа и нет записей в журнале.
+ *
+ * Организация с историей — это бухгалтерский учёт: документы ссылаются на неё
+ * номером и реквизитами, платёжный QR берёт её счёт, сальдо клиентов считается
+ * по паре «организация — клиент». Удалить её значило бы осиротить всё это молча.
+ * А вот лишняя, заведённая по ошибке или «на пробу», должна уходить в одно
+ * касание — иначе она навсегда занимает место в тарифе.
+ *
+ * @returns {{ok:boolean, error?:string, reason?:string, docs?:number, ops?:number}}
+ */
+function deleteOrg(userId, orgId) {
+  const org = getOrg(userId, Number(orgId) || 0);
+  if (!org) return { ok: false, reason: 'none', error: 'Такой организации у вас нет.' };
+  if (listOrgs(userId).length < 2) {
+    return { ok: false, reason: 'last', error: 'Это единственная организация. Её можно править, но не удалить: без неё не выписать документ.' };
+  }
+  const use = orgUsage(userId, org.id);
+  if (use.docs || use.ops) {
+    return {
+      ok: false, reason: 'used', ...use,
+      error: use.docs
+        ? `По ней выписано документов: ${use.docs}. Они ссылаются на эту организацию, `
+          + 'поэтому её не удалить. Сначала удалите документы или оставьте организацию.'
+        : 'В журнале клиентов есть записи по этой организации. Сначала уберите их или оставьте её.',
+    };
+  }
+  db.exec('BEGIN');
+  try {
+    for (const t of ['cp_openings', 'cp_prepay', 'cp_basis']) db.prepare(`DELETE FROM ${t} WHERE org_id = ?`).run(org.id);
+    db.prepare('DELETE FROM orgs WHERE id = ? AND user_id = ?').run(org.id, userId);
+    // Указатели не должны смотреть в пустоту: умолчание и выбранная фирма переезжают на оставшуюся.
+    const left = getDefaultOrg(userId);
+    if (org.is_default && left) setDefaultOrg(userId, left.id);
+    db.prepare('UPDATE bot_users SET active_org_id = 0 WHERE id = ? AND active_org_id = ?').run(userId, org.id);
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
+  return { ok: true };
+}
+
+/**
  * Забрать одноразовую кнопку. true — нажатие первое, действие делать.
  *
  * Сообщения с кнопками в Telegram не гаснут: «✅ Да, внести 50 000» жмут
@@ -3717,7 +3776,7 @@ module.exports = {
   askBizOnce,
   markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
   isSeqTaken, guardSeq, numberTakenInOrg, renumberDoc, takePlaceOf, currentOrgId, currentOrg, setActiveOrg,
-  orgQuota, grantOrgSlots,
+  orgQuota, grantOrgSlots, orgUsage, deleteOrg,
   openingFor, setOpeningFor, cpOrgs,
   prepayFor, setPrepayMode, addPrepay, prepayState, prepayReport, prepayLine, settleFromPrepay,
   setNoDebt, shipmentsOfMonth, monthActOf, monthActsOf, openShipmentsOfMonth,

@@ -923,6 +923,9 @@ const api = {
       active,
       orgs: bdb.listOrgs(user.id).map((o) => ({
         id: o.id, name: o.name, inn: o.inn, active: o.id === active,
+        // Сколько документов держит организацию: по этому приложение решает,
+        // можно ли предлагать удаление, и говорит причину, а не молчит.
+        docs: bdb.orgUsage(user.id, o.id).docs,
       })),
     };
   },
@@ -956,6 +959,14 @@ const api = {
     const id = bdb.createOrg(user.id, { name: '' });
     bdb.setActiveOrg(user.id, id);
     return { active: id };
+  },
+
+  /** Удалить пустую организацию (подробности и условия — в bdb.deleteOrg). */
+  async 'POST /api/org/delete'({ user, body }) {
+    const r = bdb.deleteOrg(user.id, Number(body && body.id));
+    if (!r.ok) return { error: r.error, reason: r.reason };
+    const org = bdb.currentOrg(user.id);
+    return { deleted: true, active: org ? org.id : 0, name: org ? org.name : '' };
   },
 
   async 'POST /api/org'({ user, body }) {
