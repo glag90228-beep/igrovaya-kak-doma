@@ -1,0 +1,8056 @@
+'use strict';
+
+// Telegram-бот «Первичка»: многопользовательский генератор
+// актов сверки, актов услуг, счетов и платёжных поручений.
+// Запуск: BOT_TOKEN=xxxxx node bot.js
+// Логика роутинга экспортируется (handleUpdate) — тестируется без живого бота.
+
+const { Telegram, keyboard } = require('./lib/tg');
+const bdb = require('./lib/bot-db');
+const { formatRub, formatMoney, formatPrice, lineSum, amountInWords, round2, vatTotals } = require('./lib/money');
+const { buildAkt } = require('./lib/xlsx-akt');
+const { buildRegistry } = require('./lib/xlsx-registry');
+const { buildKnigaProdazh, bookRow } = require('./lib/xlsx-kniga');
+const kudir = require('./lib/kudir');
+const { isIp } = require('./lib/doc-html');
+const { buildKudir } = require('./lib/xlsx-kudir');
+const { advanceVat } = require('./lib/avans');
+const { correctionRow, correctionTotals, correctionNet } = require('./lib/ksf');
+const { buildAktUslugHtml } = require('./lib/akt-uslug');
+const { buildSchetHtml } = require('./lib/schet');
+const { buildUpdHtml } = require('./lib/upd');
+const { buildTorg12Html } = require('./lib/torg12');
+const { pdfAvailable, htmlToPdf } = require('./lib/pdf');
+const { visionAvailable, visionHint, readInvoice } = require('./lib/vision');
+const speech = require('./lib/speech');
+const tts = require('./lib/tts');
+const consult = require('./lib/consult');
+let contractFlowInst = null;
+/*
+ * Свой договор и разбор договора — отдельным модулем (lib/bot-contract.js).
+ * Создаём при первом обращении: помощники, которые он получает, объявлены
+ * в этом файле ниже, а к моменту первого сообщения они уже есть.
+ */
+const contractFlow = () => contractFlowInst || (contractFlowInst = require('./lib/bot-contract')({
+  keyboard, esc, mainMenu, ru, sendGenerated, cpMenu, requireQuota, requireOrg, parseAmount, replyVoice,
+}));
+const office = require('./lib/office');
+const { applySetup } = require('./lib/bot-setup');
+const { acquire: acquireLock } = require('./lib/lock');
+const {
+  supportScreen, legalScreen, forwardToSupport, legalLine,
+  OFERTA, POLICY, TARIFFS, CHECK_CODE,
+} = require('./lib/bot-support');
+const billing = require('./lib/billing');
+const { payLink, daysFor, priceText, yearSaving } = require('./lib/lava');
+const platega = require('./lib/platega');
+const dadata = require('./lib/dadata');
+const { parseRequisites, looksLikeBlock, looksLikeAsk } = require('./lib/reqs');
+const reqCheck = require('./lib/requisites-check');
+const docService = require('./lib/doc-service');
+const docLink = require('./lib/doc-link');
+const webLogin = require('./lib/bot-web-login');
+const npd = require('./lib/npd');
+const cheques = require('./lib/cheques');
+const facsimile = require('./lib/facsimile');
+const mailer = require('./lib/mail');
+const mailbox = require('./lib/mailbox');
+const { fetchNew } = require('./lib/imap');
+const mime = require('./lib/mime');
+const bank = require('./lib/bank-statement');
+const recurring = require('./lib/recurring');
+const period = require('./lib/period');
+const bizTypes = require('./lib/biz-types');
+const digest = require('./lib/digest');
+const crm = require('./lib/crm');
+const ai = require('./lib/ai-agent');
+
+// ---------- утилиты дат/чисел ----------
+
+// «Сегодня» и текущий год — по Москве, а не по часовому поясу сервера:
+// иначе документ, выписанный ночью, получал вчерашнюю дату, а в
+// новогоднюю ночь — ещё и номер из прошлого года. Подробности в lib/period.js.
+const { todayISO, todayDate, currentYear } = period;
+
+/**
+ * «15.06.2026» / «15.06.26» / «15.06» → ISO; иначе null.
+ *
+ * Разбор один на весь проект — period.parseDay. Своя копия здесь не
+ * проверяла, существует ли дата: «31.02.2026 приход 94193» заносилось как
+ * 2026-02-31 и вело себя дико — в карточке сумма есть, а в акт за февраль
+ * операция то попадает, то нет, смотря как сравнились строки. «45.99.2026»
+ * пропадало из всех актов вовсе, оставаясь в сальдо карточки.
+ */
+const parseDate = (s) => period.parseDay(s);
+
+/**
+ * «30 тысяч», «30 тыс.», «30к», «1,5 млн», «полтора миллиона» → цифрами.
+ *
+ * Предприниматель говорит и пишет суммы словами, а не нулями, и «Монтаж 30
+ * тысяч» раньше превращалось в название без цены. Подстановка делается до
+ * любого разбора, поэтому и «2 по 15 тысяч» читается обычной парой.
+ * «к» берём только вплотную к числу («30к»): «30 к 2» — не тридцать тысяч.
+ */
+function spellOutMagnitudes(s) {
+  const mult = (w) => (/^м/i.test(w) ? 1e6 : 1e3);
+  const word = '(?:миллион[а-я]*|млн\\.?|тысяч[а-я]*|тыс\\.?)(?![а-яёa-z])';
+  return String(s)
+    .replace(new RegExp('(^|[^а-яёa-z])пол(?:тора|торы)\\s+(' + word + ')', 'gi'),
+      (_, pre, w) => pre + String(1.5 * mult(w)))
+    .replace(new RegExp('(\\d+(?:[.,]\\d+)?)\\s*(' + word + ')', 'gi'),
+      (_, n, w) => String(Math.round(Number(n.replace(',', '.')) * mult(w) * 100) / 100))
+    .replace(/(\d+(?:[.,]\d+)?)к(?![а-яёa-z\d])/gi,
+      (_, n) => String(Math.round(Number(n.replace(',', '.')) * 1e3 * 100) / 100));
+}
+
+/**
+ * Сумма из текста. Пробелы внутри числа убираем: их ставят как разделитель
+ * разрядов. Копейки округляем — доли копейки в деньгах не существует.
+ * Заведомо невозможные величины отвергаем: это опечатка, а не платёж.
+ */
+function parseAmount(s) {
+  const v = Number(spellOutMagnitudes(s).replace(/\s/g, '').replace(',', '.'));
+  if (!Number.isFinite(v) || Math.abs(v) >= 1e12) return null;
+  return Math.round(v * 100) / 100;
+}
+const clean = (s) => (String(s).trim() === '-' ? '' : String(s).trim());
+
+/**
+ * Какие кнопки принадлежат какому незаконченному сценарию.
+ *
+ * Нажатие всего остального — уход в другой раздел, и недописанное надо
+ * отменить: иначе состояние диалога живёт, пока его кто-нибудь не
+ * перезапишет, и следующее слово в чате попадает в брошенный сценарий.
+ *
+ * Таблица, а не список исключений: список пришлось бы выводить из того,
+ * кто читает состояние, — а читают его функции внутри обработчиков, и
+ * пропустить одну ничего не стоит (так и вышло с разбором фотографии).
+ * Здесь же видно каждый сценарий и его кнопки рядом.
+ *
+ * Сценарии, которых тут нет (claim, promo, support, op:, rm:, aktp:, mail:),
+ * ждут только текста, и любая кнопка для них — выход.
+ */
+const FLOW_BUTTONS = {
+  'items:': ['items.', 'tpl:', 'ci:', 'ci.', 'doc.make', 'doc.num', 'doc.date', 'doc.basis', 'doc.vat'],
+  // Основание накладных клиента: сначала ждём текст, потом выбор «кому применить».
+  'cbasis:': [],
+  'cbasis.ok:': ['cb.'],
+  'form:': ['fb:', 'form.skip'],
+  photo: ['ph.'],
+  // Книга учёта и выбор режима — часть работы с выпиской: раньше их нажатие
+  // сбрасывало состояние, и книга не находила строк, которые только что
+  // разобрали. «Пришлите выписку» в ответ на кнопку под выпиской.
+  bank: ['bank:', 'taxmode', 'tax.set:'],
+  'pp:': ['pp.'],
+  'dog:': ['dog.'],
+  'fx:': ['fx.'],
+  'mb:': ['mb.'],
+  'ro:': ['ro.'],
+  // Оба сценария ждут только текста; своих кнопок внутри у них нет, и любая
+  // нажатая кнопка означает «передумал» — состояние сбрасывается.
+  'av:': [],
+  'ksf:': ['ksf.b'],
+  // Свой договор: ждём файл, потом «Сохранить»; файл без контекста — «Разобрать».
+  'mycon:': ['mc.cancel'],
+  'mycon.ok:': ['mc.save:', 'mc.cancel'],
+  ctfile: ['ct.rev', 'ct.tpl', 'mc.cancel'],
+  'dogx:': [],
+  'note:': [],
+  'fu:': [],
+  // Ждём ссылку на чек; кнопки внутри нет, любая нажатая — «передумал».
+  'chq:': [],
+  // Ждём новый номер документа; кнопка внутри одна — «Отмена».
+  'renum:': [],
+};
+
+// ---------- меню ----------
+
+/**
+ * Адрес мини-приложения. Telegram открывает их только по https, поэтому
+ * http-адрес молча игнорируем: лучше остаться без кнопки, чем показать
+ * кнопку, которая у всех выдаёт ошибку.
+ */
+function webAppUrl() {
+  const url = String(process.env.WEBAPP_URL || '').trim();
+  return /^https:\/\/.+/i.test(url) ? url : '';
+}
+
+/**
+ * Главное меню.
+ *
+ * Здесь был параметр user, от которого зависела кнопка почты, — и ни один
+ * из вызовов его не передавал, так что почта в меню не появлялась никогда
+ * ни у кого. Поэтому пункт теперь безусловный: он ведёт на экран почты,
+ * а тот уже сам показывает входящие, если ящик подключён. Меню не должно
+ * зависеть от того, вспомнил ли вызывающий передать аргумент.
+ */
+/*
+ * Главное меню — четыре строки вместо девяти.
+ *
+ * Двенадцать кнопок подряд человек не читает, а обводит взглядом и выбирает
+ * наугад: список из девяти строк — это не меню, а стена. Оставляем то, к чему
+ * возвращаются каждый день, остальное уводим в «Ещё».
+ *
+ * От исходного замысла «три кнопки и Ещё» отступаю в одном месте: «кто
+ * должен» и «не оплачено» остаются здесь. Для малого бизнеса выбивание
+ * оплаты — ежедневная работа, а не редкий раздел; уехав на второй уровень,
+ * они перестанут находиться. Ровно это уже случилось с почтой, пока она
+ * пряталась внутри реквизитов организации.
+ */
+function mainMenu() {
+  const app = webAppUrl();
+  return keyboard([
+    [{ text: '🧾 Выписать счёт за 1 мин', data: 'go.sch' }],
+    ...(app ? [[{ text: '📱 Открыть приложение', webApp: app }]] : []),
+    [{ text: '💸 Долги', data: 'debts' }, { text: '⏳ Ждут оплаты', data: 'unpaid' }],
+    [{ text: '📁 Документы', data: 'docs' }, { text: '⚙️ Ещё', data: 'more' }],
+  ]);
+}
+
+/** Второй уровень: то, к чему возвращаются не каждый день. */
+function moreMenu() {
+  return keyboard([
+    [{ text: '📄 Другой документ', data: 'go.any' }],
+    [{ text: '🏢 Моя организация', data: 'org' }],
+    // «Контрагенты» — слово из 1С. Кто в ней не работал, его не знает.
+    [{ text: '👥 Клиенты и поставщики', data: 'cps' }],
+    // Почта — ежедневная работа, а не настройка, поэтому она первой строкой
+    // среди прочего, а не последней.
+    [{ text: '✉️ Почта', data: 'mb' }],
+    [{ text: '⭐ Подписка', data: 'billing' }],
+    [{ text: '🖥 Сеансы на сайте', data: 'ws' }],
+    [{ text: '❓ Помощь', data: 'help' }, { text: '💬 Поддержка', data: 'support' }],
+    [{ text: '📄 Документы и правила', data: 'legal' }],
+    [{ text: '⬅️ Меню', data: 'menu' }],
+  ]);
+}
+
+/*
+ * Про голос и текст говорим ПРИМЕРОМ, а не описанием возможности.
+ *
+ * «Умею разбирать запросы на естественном языке» человек пропускает: он не
+ * знает, что именно можно сказать, и не пробует. Готовая фраза, которую
+ * достаточно повторить своими словами, снимает этот вопрос за одну строку —
+ * а разбор фразы у нас работает и голосом тоже.
+ */
+const GREETING =
+  '<b>Первичка</b> — счета, акты и УПД с печатью и QR для оплаты за 1 минуту со смартфона.\n\n'
+  + '👇 <b>Как быстрее всего сделать счёт:</b>\n'
+  + '1. Нажмите кнопку <b>«Выписать счёт за 1 мин»</b> ниже.\n'
+  + '2. Или просто <b>отправьте голосовое или текст</b>:\n'
+  + '   <code>Выставь счёт ООО Заря на 50 000 руб за оказание услуг</code>\n\n'
+  + '<i>Счёт сразу с вашей подписью, печатью и QR-кодом: клиент наводит камеру банковского приложения и платит. '
+  + 'Первые 5 документов в месяц — бесплатно. Без 1С и бухгалтера.</i>';
+
+/*
+ * Длинное приветствие — только тому, кто пришёл впервые.
+ *
+ * Тот, у кого уже есть фирма или документы, читал его в первый раз; на каждое
+ * «/start» оно превращалось в стену текста с оффертой и «первые 5 документов
+ * бесплатно», а нужна одна строка и кнопки.
+ */
+function greetingFor(user) {
+  const returning = Boolean(user && (bdb.currentOrg(user.id) || bdb.listDocs(user.id, 1).length));
+  if (!returning) return greeting();
+  const app = webAppUrl() ? ' То же самое удобнее в приложении — кнопка ниже.' : '';
+  return '<b>С возвращением!</b> Что делаем?\n\n'
+    + 'Кнопки ниже — или напишите словами, например: <code>Выставь счёт ООО Заря на 50 000 руб</code>.'
+    + app;
+}
+
+function greeting() {
+  const legal = legalLine();
+  const app = webAppUrl()
+    ? '\n\n<i>То же самое удобнее в приложении — кнопка ниже.</i>'
+    : '';
+  return GREETING + app + (legal ? `\n\n<i>${legal}</i>` : '');
+}
+
+/**
+ * Баланс клиента словами — по знаку, а не одной и той же подписью.
+ *
+ * Раньше у заказчика всегда стояло «(в нашу пользу)», даже когда он внёс
+ * предоплату и долг на самом деле наш: «Баланс: 15 000 руб. (в нашу пользу)»
+ * читалось как «нам должны», хотя это мы должны ему. У поставщика знак
+ * читается наоборот: положительное сальдо — наш долг.
+ */
+function balanceLine(cp, closing) {
+  const sum = formatRub(Math.abs(closing));
+  if (!closing) return `Баланс: <b>${sum}</b> — взаимных долгов нет`;
+  const theyOwe = cp.kind === 'supplier' ? closing < 0 : closing > 0;
+  return `Баланс: <b>${theyOwe ? 'должен нам' : 'мы должны ему'} ${sum}</b>`;
+}
+
+function cpMenu(userId, cp) {
+  const b = bdb.balanceOf(userId, cp.id);
+  const pre = bdb.prepayState(userId, cp.id);
+  const closing = b ? round2(b.closing) : 0;
+  // Кредитовое сальдо заказчика на предоплате — его аванс, а не «мы должны ему»: так и называем,
+  // одной строкой, без повтора суммы.
+  const advance = pre && cp.kind !== 'supplier' && pre.left > 0 && !pre.debt;
+  const info = `<b>${esc(cp.name)}</b>${cp.inn ? ` · ИНН ${esc(cp.inn)}` : ''}\n`
+    + `Тип: ${cp.kind === 'supplier' ? 'поставщик' : 'заказчик'} · операций: ${b ? b.ops.length : 0}\n`
+    + (advance
+      ? `💰 Осталось из предоплаты: <b>${formatRub(pre.left)}</b>${pre.low ? ' — скоро кончится' : ''}\n`
+        + '<i>Столько ещё можно отгрузить в счёт аванса.</i>'
+      : balanceLine(cp, closing) + (pre ? `\n💰 <b>${bdb.prepayLine(pre)}</b>` : ''));
+  const rows = [
+    [{ text: '➕ Внести операцию', data: `op:${cp.id}` }],
+    // Предоплата — отдельная кнопка: это не «оплата по счёту», а режим работы с клиентом.
+    // Нет предоплаты — кнопка сразу про внесение, названная тем, что человек ищет;
+    // есть — «Предоплата» открывает остаток и список списанного, а внести ещё — оттуда.
+    pre ? [{ text: '💰 Предоплата', data: `pp.view:${cp.id}` }, { text: '📄 Акт за месяц', data: `pp.act:${cp.id}` }]
+      : [{ text: '💰 Внести предоплату', data: `pp.in:${cp.id}` }],
+    [{ text: '📄 Акт сверки', data: `d.akt:${cp.id}` }, { text: '🧾 Акт услуг', data: `d.usl:${cp.id}` }],
+    [{ text: '💰 Счёт на оплату', data: `d.sch:${cp.id}` }, { text: '🏦 Платёжка', data: `d.pp:${cp.id}` }],
+    [{ text: '🤝 Счёт-договор', data: `d.schdog:${cp.id}` }],
+    // Самозанятому УПД ни к чему: счёт-фактуру он выставлять не вправе, а
+    // «УПД статус 2» — тот же акт, который у него и так есть (422-ФЗ).
+    npd.isNpd(bdb.currentOrg(userId))
+      ? [{ text: '🚚 ТОРГ-12', data: `d.torg12:${cp.id}` }]
+      : [{ text: '📦 УПД', data: `d.upd:${cp.id}` }, { text: '🚚 ТОРГ-12', data: `d.torg12:${cp.id}` }],
+    [{ text: '📝 Договор', data: `d.dog:${cp.id}` }, { text: '📎 Свой договор', data: `mc.menu:${cp.id}` }],
+    [{ text: '📎 Основание накладных', data: `cb:${cp.id}` }],
+    [{ text: '🕑 История', data: `crm.h:${cp.id}` }, { text: '📝 Заметка', data: `crm.n:${cp.id}` },
+      { text: '⏰ Напомнить мне', data: `crm.f:${cp.id}` }],
+  ];
+  /*
+   * Счета-фактуры показываем только плательщику НДС. Неплательщику они не
+   * положены, и кнопка, ведущая к отказу, — плохая кнопка: человек решит,
+   * что продукт сломан, а не что так нельзя.
+   */
+  if (bdb.vatOf(bdb.currentOrg(userId)).rate != null
+      && !npd.isNpd(bdb.currentOrg(userId))) {
+    rows.push([{ text: '💵 СФ на аванс', data: `d.av:${cp.id}` },
+      { text: '✏️ Корректировка', data: `d.ksf:${cp.id}` }]);
+  }
+  const lastSch = bdb.listDocs(userId, 1, cp.id).find((d) => ITEM_DOCS[d.type]);
+  if (lastSch) {
+    rows.push([{ text: `🔁 Повторить: ${bdb.docShort(lastSch.type)} № ${lastSch.number}`, data: `d.rep:${lastSch.id}` }]);
+  }
+  rows.push([{ text: '📁 Документы по клиенту', data: `docs.cp:${cp.id}` }]);
+  // Повторяющаяся операция живёт здесь, а не в общих настройках: правило
+  // всегда про одного контрагента, и искать его больше нигде не нужно.
+  const repOp = recurring.list(userId).find((r) => r.cp_id === cp.id && recurring.isOp(r));
+  rows.push([repOp
+    ? { text: `🔁 Повторяю: ${repOp.op.kind.toLowerCase()} ${Math.round(repOp.op.amount)} ₽`
+        + (repOp.op.times ? ` (${repOp.op.done} из ${repOp.op.times})` : ''), data: 'rec' }
+    : { text: '🔁 Повторять операцию каждый месяц', data: `ro.new:${cp.id}` }]);
+  rows.push([{ text: '↩️ Удалить последнюю операцию', data: `op.del:${cp.id}` }]);
+  rows.push([{ text: '⬅️ К клиентам', data: 'cps' }]);
+  return { info, kb: keyboard(rows) };
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+
+/**
+ * Имя в кавычках-ёлочках — но не второй раз: у «ООО «Пирамида»» уже есть свои,
+ * и вложенные давали «ООО «Пирамида»». Такое имя оставляем как есть.
+ */
+function quoted(name) {
+  const n = String(name == null ? '' : name);
+  return /[«»"]/.test(n) ? esc(n) : `«${esc(n)}»`;
+}
+
+// ---------- пошаговые формы (организация, клиент) ----------
+
+// Шаги помечены: auto — по значению дозаполняет соседние поля из реестра;
+/** Двенадцать цифр в ИНН — предприниматель; у него нет КПП. */
+const isIpInn = (inn) => String(inn || '').replace(/\D/g, '').length === 12;
+
+// skipIfFilled — пропускается, если значение уже подставлено автозаполнением.
+// skipIf — вопрос вообще неприменим (например, КПП у предпринимателя).
+// Поэтому ИНН и БИК стоят первыми: с них подтягивается всё остальное.
+
+const ORG_STEPS = [
+  {
+    key: 'inn', auto: 'party', opt: true,
+    q: '<b>Проще всего — вставьте реквизиты одним текстом</b> (скопируйте из письма или 1С), '
+      + 'я разберу их на поля.\n\nМожно и по ИНН — подставлю название и адрес из реестра.\n'
+      + '<i>Или «-», чтобы заполнять вручную по одному полю.</i>',
+  },
+  { key: 'name', skipIfFilled: true, q: 'Краткое название (напр. «ИП Иванов И. И.» или «ООО Ромашка»):' },
+  { key: 'full_name', skipIfFilled: true, opt: true, q: 'Полное наименование для документов (или «-»):' },
+  // У предпринимателя КПП не бывает: если ИНН двенадцатизначный, вопрос
+  // не задаём вовсе — незачем спрашивать то, чего у человека нет.
+  { key: 'kpp', skipIfFilled: true, opt: true, skipIf: (v) => isIpInn(v.inn),
+    q: 'КПП (для ООО; ИП отправьте «-»):' },
+  { key: 'address', skipIfFilled: true, opt: true, q: 'Адрес (или «-»):' },
+  { key: 'signer', skipIfFilled: true, opt: true, q: 'ФИО подписанта (напр. «И. И. Иванов»; или «-»):' },
+  {
+    key: 'bik', auto: 'bank', skipIfFilled: true, opt: true,
+    q: 'БИК банка — подставлю название банка и корр. счёт (или «-»):',
+  },
+  { key: 'bank_name', skipIfFilled: true, opt: true, q: 'Банк — наименование (или «-»):' },
+  { key: 'corr_acc', skipIfFilled: true, opt: true, q: 'Корр. счёт к/с (или «-»):' },
+  { key: 'acc', skipIfFilled: true, opt: true, q: 'Расчётный счёт р/с — нужен для QR в счёте (или «-»):' },
+];
+
+const CP_STEPS = [
+  {
+    key: 'inn', auto: 'party', opt: true,
+    q: '<b>Вставьте реквизиты клиента одним текстом</b> — разберу на поля.\n\n'
+      + 'Или ИНН — подставлю название и адрес.\n<i>Или «-», чтобы ввести вручную.</i>',
+  },
+  { key: 'name', skipIfFilled: true, q: 'Краткое имя клиента (напр. «ООО Заря»):' },
+  { key: 'full_name', skipIfFilled: true, opt: true, q: 'Полное наименование (или «-»):' },
+  { key: 'kpp', skipIfFilled: true, opt: true, skipIf: (v) => isIpInn(v.inn),
+    q: 'КПП (или «-»):' },
+  { key: 'address', skipIfFilled: true, opt: true, q: 'Адрес клиента (или «-»):' },
+  {
+    key: 'kind', q: 'Кто это — заказчик или поставщик?',
+    buttons: [{ text: 'Заказчик (платит нам)', val: 'customer' }, { text: 'Поставщик (платим ему)', val: 'supplier' }],
+  },
+  { key: 'contract', opt: true, q: 'Договор (напр. «Договор № 5 от 01.02.2026»; или «-»):' },
+  { key: 'opening_balance', num: true, q: 'Баланс на начало, руб. (0 — если с нуля):' },
+  { key: 'opening_date', date: true, q: 'Дата, на которую указан баланс (ДД.ММ.ГГГГ):' },
+  { key: 'bik', auto: 'bank', skipIfFilled: true, opt: true, q: 'БИК банка клиента — подставлю банк и корр. счёт (или «-»):' },
+  { key: 'bank_name', skipIfFilled: true, opt: true, q: 'Банк клиента (или «-»):' },
+  { key: 'corr_acc', skipIfFilled: true, opt: true, q: 'Корр. счёт клиента (или «-»):' },
+  { key: 'acc', skipIfFilled: true, opt: true, q: 'Расчётный счёт клиента (или «-»):' },
+];
+
+/*
+ * Короткие анкеты для проводника.
+ *
+ * Полные анкеты нужны — в них есть всё, что печатается в документах. Но
+ * показывать новому человеку десять вопросов подряд нельзя: он видит «Шаг 1
+ * из 13» и закрывает бота, ещё ничего не получив. Поэтому у проводника свой
+ * набор — только то, без чего документ не выписать: как называетесь, ИНН и
+ * куда платить. Остальное дозаполняется в разделе организации, когда человек
+ * уже увидел результат и понял, зачем всё это.
+ */
+// ИНН спрашиваем первым: по нему реестр сам подставляет название, и вопрос
+// «как называетесь» нужен только тогда, когда реестр промолчал (нет ключа,
+// не нашёл, человек пропустил ИНН).
+const ORG_QUICK = [
+  {
+    key: 'inn', auto: 'party', opt: true,
+    q: '<b>Ваш ИНН</b> — подставлю название и остальные реквизиты из реестра.\n\n'
+      + '<i>Можно вставить блок реквизитов целиком. Не знаете ИНН — пропустите, спрошу название.</i>',
+  },
+  {
+    key: 'name', skipIfFilled: true,
+    q: '<b>Как называется ваша фирма или ИП?</b>\n\n'
+      + '<i>Так, как должно печататься в счёте: «ИП Иванов И. И.» или «ООО Ромашка».</i>',
+  },
+  {
+    key: 'bik', auto: 'bank', skipIfFilled: true, opt: true,
+    q: '<b>БИК вашего банка</b> — по нему подставлю название банка и корр. счёт.\n\n'
+      + '<i>Он есть в реквизитах счёта в банковском приложении.</i>',
+  },
+  {
+    key: 'acc', skipIfFilled: true, opt: true,
+    q: '<b>Ваш расчётный счёт</b> — 20 цифр.\n\n'
+      + '<i>Без него в счёте не будет QR-кода, и клиенту придётся вбивать реквизиты руками.</i>',
+  },
+];
+
+// Дозаполнение банка после первого документа: только БИК и счёт. Полная
+// анкета организации переспрашивает всё с нуля, а человеку нужна одна вещь —
+// чтобы в счёте появился QR. Остальные поля организации форма не трогает.
+const ORG_BANK = [
+  {
+    key: 'bik', auto: 'bank', skipIfFilled: true, opt: true,
+    q: '<b>БИК вашего банка</b> — по нему подставлю название банка и корр. счёт.\n\n'
+      + '<i>Он есть в реквизитах счёта в банковском приложении.</i>',
+  },
+  {
+    key: 'acc', skipIfFilled: true, opt: true,
+    q: '<b>Ваш расчётный счёт</b> — 20 цифр.\n\n'
+      + '<i>С ним в счёте появится QR-код: клиент платит, наведя камеру.</i>',
+  },
+];
+
+const CP_QUICK = [
+  {
+    key: 'inn', auto: 'party', opt: true,
+    q: '<b>ИНН клиента</b> — подставлю название и адрес из реестра.\n\n'
+      + '<i>Можно вставить его реквизиты текстом или пропустить и написать название сами.</i>',
+  },
+  { key: 'name', skipIfFilled: true, q: '<b>Как называется клиент?</b>' },
+  {
+    key: 'kind', q: 'Он вам платит или вы ему?',
+    buttons: [{ text: 'Платит нам', val: 'customer' }, { text: 'Платим ему', val: 'supplier' }],
+  },
+];
+
+const FORMS = {
+  org: { steps: ORG_STEPS, title: 'организации' },
+  cp: { steps: CP_STEPS, title: 'клиента' },
+  orgq: { steps: ORG_QUICK, title: 'организации', saveAs: 'org' },
+  cpq: { steps: CP_QUICK, title: 'клиента', saveAs: 'cp' },
+  orgb: { steps: ORG_BANK, title: 'банка', saveAs: 'orgb' },
+};
+
+async function startForm(tg, chatId, user, formName) {
+  bdb.setState(user.id, `form:${formName}`, { i: 0, values: {} });
+  await askStep(tg, chatId, formName, 0);
+}
+/**
+ * Вопрос очередного шага.
+ *
+ * Три вещи, без которых человек уходит из формы: он не знает, сколько ещё
+ * терпеть, он не знает, как пропустить лишнее (ответ «-» боту в голову не
+ * приходит), и он не знает, как выйти. Поэтому у каждого шага есть номер,
+ * кнопка «пропустить» на необязательных полях и кнопка отмены.
+ */
+async function askStep(tg, chatId, formName, i) {
+  const form = FORMS[formName];
+  const step = form.steps[i];
+  const rows = [];
+  if (step.buttons) rows.push(step.buttons.map((b) => ({ text: b.text, data: `fb:${b.val}` })));
+  const tail = [];
+  // Номер шага в кнопке обязателен: сообщения в чате остаются, и кнопка из
+  // прошлого вопроса живёт вечно. Без сверки нажатие на неё пропустило бы
+  // текущее поле — в том числе обязательное.
+  if (step.opt && !step.buttons) tail.push({ text: '⏭ Пропустить', data: `form.skip:${i}` });
+  tail.push({ text: '✖️ Отмена', data: 'menu' });
+  rows.push(tail);
+  const head = `<i>Шаг ${i + 1} из ${form.steps.length}</i>\n`;
+  await tg.sendMessage(chatId, head + step.q, keyboard(rows));
+}
+
+/** Следующий незаполненный шаг: пропускаем то, что подставил справочник. */
+async function advanceForm(tg, chatId, user, formName, values, from) {
+  const form = FORMS[formName];
+  let next = from;
+  while (next < form.steps.length) {
+    const s = form.steps[next];
+    // Пропускаем заполненное; после вставки блока — и пустые поля-реквизиты,
+    // кроме расчётного счёта: без него не будет QR, поэтому его переспросим.
+    const skip = (s.skipIfFilled
+      && (values[s.key] || (values.__pasted && s.opt && s.key !== 'acc')))
+      // skipIf — вопрос неприменим к этому человеку, а не «уже отвечен».
+      // Спрашивать у предпринимателя КПП значит просить у него то, чего у
+      // него не бывает: он гадает, что вписать, и вписывает что-нибудь.
+      || (typeof s.skipIf === 'function' && s.skipIf(values));
+    if (skip) { next += 1; continue; }
+    break;
+  }
+  if (next < form.steps.length) {
+    bdb.setState(user.id, `form:${formName}`, { i: next, values });
+    await askStep(tg, chatId, formName, next);
+  } else {
+    bdb.clearState(user.id);
+    await finishForm(tg, chatId, user, formName, values);
+  }
+}
+
+const fill = (values, src, keys) => {
+  let n = 0;
+  for (const k of keys) if (src[k] && !values[k]) { values[k] = src[k]; n += 1; }
+  return n;
+};
+
+/**
+ * Автозаполнение шага. Три источника, по убыванию удобства:
+ *  1) вставленный блок реквизитов — разбираем на поля сами;
+ *  2) ИНН — тянем из реестра (DaData);
+ *  3) БИК — банк и корр. счёт из реестра.
+ * Возвращает { value, note, warn }: value — что записать в само поле шага.
+ */
+async function runAuto(kind, rawValue, values) {
+  const raw = String(rawValue);
+
+  // Вставили целый блок реквизитов (в шаг ИНН или БИК — не важно).
+  if (looksLikeBlock(raw)) {
+    const p = parseRequisites(raw);
+    fill(values, p, ['name', 'full_name', 'inn', 'kpp', 'address', 'bank_name', 'bik', 'acc', 'corr_acc']);
+    values.__pasted = true; // дальше пустые поля-реквизиты не переспрашиваем
+    // Чего в тексте не было — дозапросим из реестра: по ИНН адрес и директора,
+    // по БИК — точное название банка и корр. счёт.
+    if (p.inn && dadata.dadataAvailable() && (!values.address || !values.signer)) {
+      const r = await dadata.partyByInn(p.inn).catch(() => ({ ok: false }));
+      if (r.ok) fill(values, r.fields, ['name', 'full_name', 'kpp', 'address', 'signer', 'ogrnip']);
+    }
+    if (values.bik && dadata.dadataAvailable()) {
+      const rb = await dadata.bankByBik(values.bik).catch(() => ({ ok: false }));
+      if (rb.ok) { values.bank_name = rb.fields.bank_name || values.bank_name; values.corr_acc = values.corr_acc || rb.fields.corr_acc; }
+    }
+    const got = [
+      values.name && `<b>${esc(values.name)}</b>`,
+      values.acc && `р/с …${esc(String(values.acc).slice(-4))}`,
+      values.bik && `БИК ${esc(values.bik)}`,
+    ].filter(Boolean).join(', ');
+    return {
+      value: kind === 'bank' ? (p.bik || '') : (p.inn || ''),
+      note: `Разобрал реквизиты: ${got || 'поля заполнены'}.`,
+      warn: (!values.acc && kind === 'party') ? 'Расчётный счёт в тексте не нашёл — впишите его, без него не будет QR.' : '',
+    };
+  }
+
+  if (kind === 'party') {
+    // Молчать нельзя: человек вводит ИНН, ничего не подставляется, и он
+    // решает, что бот сломался. Говорим, что справочник просто не подключён.
+    if (!dadata.dadataAvailable()) {
+      return { note: '', warn: 'Справочник не подключён — заполним поля вручную.' };
+    }
+    const r = await dadata.partyByInn(raw);
+    if (!r.ok) return { note: '', warn: r.error };
+    fill(values, r.fields, ['name', 'full_name', 'kpp', 'address', 'signer', 'ogrnip']);
+    return { note: `Нашёл: <b>${esc(r.fields.name)}</b>${r.fields.address ? `, ${esc(r.fields.address)}` : ''}.`, warn: r.warn };
+  }
+
+  if (kind === 'bank') {
+    if (!dadata.dadataAvailable()) {
+      return { note: '', warn: 'Справочник не подключён — название банка и к/с впишите сами.' };
+    }
+    const r = await dadata.bankByBik(raw);
+    if (!r.ok) return { note: '', warn: r.error };
+    fill(values, r.fields, ['bank_name', 'corr_acc']);
+    return { note: `Банк: <b>${esc(r.fields.bank_name)}</b>.`, warn: '' };
+  }
+  return { note: '', warn: '' };
+}
+
+async function applyFormValue(tg, chatId, user, state, rawValue) {
+  const formName = state.state.slice(5);
+  const form = FORMS[formName];
+  const { i, values } = state.data;
+  const step = form.steps[i];
+
+  /*
+   * Просьба «Выставь счёт…» посреди формы — не ответ на вопрос.
+   *
+   * Новичок читает в приветствии «просто напишите: Выставь счёт ООО Заря на
+   * 50 000 руб» и пишет это в ответ на «Ваш ИНН». Раньше фраза принималась за
+   * блок реквизитов («Разобрал…») или за ИНН («должно быть 10 цифр, а здесь
+   * 4»). Теперь бот говорит, что сначала дело с реквизитами, и повторяет вопрос.
+   */
+  const numericStep = Boolean(step.auto || step.num) || ['inn', 'kpp', 'bik', 'acc', 'corr_acc'].includes(step.key);
+  if (looksLikeAsk(rawValue, { numeric: numericStep })) {
+    await tg.sendMessage(chatId, formName.startsWith('org')
+      ? 'Сначала закончим реквизиты, потом выпишем счёт.'
+      : 'Сначала закончим с клиентом, потом выпишем счёт.');
+    await askStep(tg, chatId, formName, i);
+    return;
+  }
+
+  let value = rawValue;
+  if (step.date) {
+    const iso = parseDate(rawValue);
+    if (!iso) { await tg.sendMessage(chatId, 'Не понял дату. Формат ДД.ММ.ГГГГ, напр. 01.05.2026:'); return; }
+    value = iso;
+  } else if (step.num) {
+    const n = parseAmount(rawValue);
+    if (n == null) { await tg.sendMessage(chatId, 'Нужно число, напр. 118309 или 0:'); return; }
+    value = n;
+  } else {
+    value = step.opt ? clean(rawValue) : String(rawValue).trim();
+    if (!step.opt && !value) { await tg.sendMessage(chatId, 'Поле обязательно, попробуйте ещё раз:'); return; }
+  }
+
+  values[step.key] = value;
+
+  // Автозаполнение: вставленный блок реквизитов разбираем всегда,
+  // поиск по ИНН/БИК — если подключён справочник.
+  if (step.auto && value) {
+    await tg.sendChatAction(chatId, 'typing');
+    /*
+     * Имя, услышанное во фразе, — только заглушка, и справочник вправе её
+     * перебить.
+     *
+     * Разбор даёт имя в том падеже, в каком его произнесли: «выпиши счёт
+     * Заре» — «Заре». Обычно fill() бережёт уже заполненные поля, и клиент
+     * так и остался бы «Заре» при живом реестре, знающем «ООО „Заря“».
+     * Поэтому на время автозаполнения заглушку убираем, а если справочник
+     * промолчал — возвращаем: пусть лучше падеж не тот, чем пустое имя.
+     */
+    const guess = values.__guessedName ? values.name : '';
+    if (guess) delete values.name;
+    let res = { value: null, note: '', warn: '' };
+    try { res = await runAuto(step.auto, rawValue, values); } catch (e) { res = { value: null, note: '', warn: e.message }; }
+    if (guess && !values.name) values.name = guess;
+    if (values.name && values.name !== guess) delete values.__guessedName;
+    if (res.value != null && res.value !== '') values[step.key] = res.value; // в поле кладём разобранный ИНН/БИК
+    if (res.note) await tg.sendMessage(chatId, `✅ ${res.note}`);
+    if (res.warn) await tg.sendMessage(chatId, `⚠️ ${esc(res.warn)}`);
+  }
+
+  /*
+   * Контрольные суммы реквизитов — на шаге ввода, но уже после разбора:
+   * на шаге ИНН человек часто вставляет весь блок реквизитов целиком, и
+   * проверять надо разобранное значение, а не вставленный текст.
+   *
+   * Проверка тут не ради строгости. Опечатка в расчётном счёте — это
+   * платёж, который не пройдёт, а опечатка в ИНН — документ, который
+   * вернёт бухгалтер контрагента. И то и другое ловится арифметикой, но
+  /*
+   * Перед проверкой числовые реквизиты приводим к цифрам.
+   *
+   * Проверка контрольной суммы сама выбрасывает всё нецифровое, а в базу
+   * значение шло как набрали. Счёт, скопированный из банка по четыре цифры
+   * («4070 2810 4000 0000 1234»), сходился по контрольной сумме и в этом же
+   * виде печатался в счёте и уезжал в платёжный QR — а по ГОСТ Р 56042 в
+   * поле PersonalAcc двадцать цифр, без пробелов. У КПП пятый и шестой знаки
+   * бывают буквами (приказ ФНС), поэтому ему своё правило.
+   */
+  if (values[step.key] && ['inn', 'bik', 'acc', 'corr_acc', 'ogrnip'].includes(step.key)) {
+    values[step.key] = String(values[step.key]).replace(/\D/g, '');
+  }
+  if (values.kpp && step.key === 'kpp') {
+    values.kpp = String(values.kpp).toUpperCase().replace(/[^0-9A-Z]/g, '');
+  }
+
+  const checked = values[step.key];
+  if (checked && ['inn', 'kpp', 'bik', 'acc', 'corr_acc'].includes(step.key)) {
+    const bik = step.key === 'bik' ? checked : values.bik;
+    const r = step.key === 'inn' ? reqCheck.checkInn(checked)
+      : step.key === 'kpp' ? reqCheck.checkKpp(checked)
+        : step.key === 'bik' ? reqCheck.checkBik(checked)
+          : reqCheck.checkAccount(checked, bik, step.key === 'corr_acc');
+    if (!r.ok) {
+      values[step.key] = '';
+      bdb.setState(user.id, `form:${formName}`, { i, values });
+      await tg.sendMessage(chatId,
+        `⚠️ ${esc(r.error)}\n\nПришлите ещё раз${step.opt ? ' или «-», если поля нет' : ''}:`);
+      return;
+    }
+  }
+
+  await advanceForm(tg, chatId, user, formName, values, i + 1);
+}
+
+async function finishForm(tg, chatId, user, rawForm, values) {
+  const formName = (FORMS[rawForm] || {}).saveAs || rawForm;
+  // Форму могли открыть по дороге к документу: тогда после сохранения не
+  // высаживаем человека в меню, а возвращаем к тому, что он начал.
+  const then = values.__then;
+  if (formName === 'org') {
+    if (!values.full_name) values.full_name = values.name;
+    bdb.saveMyOrg(user.id, values); // заменяем организацию, а не плодим новые
+    // Называем недостающее прямо: «не заполнены счёт/БИК» читалось как упрёк, когда человек их вводил, а не хватало корр. счёта.
+    const lacks = [!values.acc && 'расчётный счёт', !values.bik && 'БИК', !values.corr_acc && 'корр. счёт'].filter(Boolean);
+    await tg.sendMessage(chatId,
+      `✅ Ваша фирма <b>${esc(values.name)}</b> сохранена.`
+      + (!lacks.length ? '\nВ счёте будет платёжный QR.' : `\n<i>Не заполнено: ${lacks.join(', ')} — QR для оплаты в счёте не появится.</i>`),
+      then ? undefined : mainMenu());
+    if (then) { await startDoc(tg, chatId, user, then); return; }
+  } else if (formName === 'orgb') {
+    // Пишем только непустое и только банковские поля: «пропустить» не должно
+    // стирать то, что уже сохранено, а остальные реквизиты фирмы не наши.
+    const patch = {};
+    for (const k of ['bik', 'bank_name', 'corr_acc', 'acc']) if (values[k]) patch[k] = values[k];
+    if (Object.keys(patch).length) bdb.updateOrg(user.id, (bdb.currentOrg(user.id) || {}).id, patch);
+    const now = bdb.currentOrg(user.id);
+    await tg.sendMessage(chatId, payable(now)
+      ? '✅ Банк сохранён. В следующих счетах будет платёжный QR.'
+      : 'Сохранил, что было. Без БИК, корр. и расчётного счёта QR в счёте не появится — '
+        + 'дополнить можно в разделе «Моя организация».', mainMenu());
+  } else if (formName === 'cp') {
+    if (!values.full_name) values.full_name = values.name;
+    if (!values.period_end) values.period_end = todayISO();
+    const id = bdb.createCp(user.id, values);
+    if (then && ITEM_DOCS[then]) {
+      await tg.sendMessage(chatId, `✅ ${esc(values.name)} добавлен.`);
+      await startItems(tg, chatId, user, then, id);
+      return;
+    }
+    const { info, kb } = cpMenu(user.id, bdb.getCp(user.id, id));
+    await tg.sendMessage(chatId, `✅ Клиент добавлен.\n\n${info}`, kb);
+  }
+}
+
+// ---------- умный ввод операции ----------
+
+const KIND_CREDIT = ['приход', 'поставка', 'отгрузка', 'услуга', 'услуги', 'реализация'];
+const KIND_DEBIT = ['оплата', 'оплатил', 'принято', 'платеж', 'платёж', 'предоплата'];
+
+/** «15.06 приход 94193 №15» → {date,kind,doc,debit,credit} | null */
+function parseOp(text) {
+  /*
+   * Разряды через пробел склеиваем до разбиения на слова. Иначе «приход
+   * 1 000» распадалось на «1» и «000», первым числом оказывалась единица —
+   * и в журнал молча уходил один рубль вместо тысячи.
+   */
+  let glued = String(text).trim();
+  for (let i = 0; i < 4; i += 1) {                 // «1 000 000» — две склейки
+    const next = glued.replace(/(\d)\s+(\d{3})(?!\d)/g, '$1$2');
+    if (next === glued) break;
+    glued = next;
+  }
+  /*
+   * Дата, написанная явно, но несуществующая — это опечатка, а не «сегодня».
+   * Молча подставлять текущий день нельзя: человек увидит в журнале не ту
+   * дату, которую вводил, и заметит это в лучшем случае при сверке.
+   */
+  const looksLikeDate = /^\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?$/;
+  for (const t of glued.split(/\s+/)) {
+    if (looksLikeDate.test(t) && !parseDate(t)) return null;
+  }
+  const tokens = glued.split(/\s+/);
+  let date = null, kind = null, amount = null, docNo = '';
+  for (const t of tokens) {
+    const low = t.toLowerCase().replace(/[.,;:]$/, '');
+    if (!date) { const d = parseDate(t); if (d) { date = d; continue; } }
+    if (!kind && KIND_CREDIT.includes(low)) { kind = 'credit'; continue; }
+    if (!kind && KIND_DEBIT.includes(low)) { kind = 'debit'; continue; }
+    if (/^№/.test(t)) { docNo = t.replace(/^№/, ''); continue; }
+    if (amount == null) { const a = parseAmount(t); if (a != null && a > 0) { amount = a; continue; } }
+  }
+  if (kind == null || amount == null) return null;
+  if (!date) date = todayISO();
+  const human = kind === 'credit'
+    ? (KIND_CREDIT.includes('поставка') ? 'Приход' : 'Приход') : 'Оплата';
+  const doc = `${human}${docNo ? ` (${docNo})` : ''} (${date.slice(8, 10)}.${date.slice(5, 7)}.${date.slice(0, 4)})`;
+  return {
+    date, kind: kind === 'credit' ? 'Приход' : 'Оплата', doc,
+    debit: kind === 'debit' ? amount : 0, credit: kind === 'credit' ? amount : 0,
+  };
+}
+
+// ---------- отправка документа ----------
+
+const orgForAkt = (o) => ({
+  brand: o.name, org_short: o.name, org_full: o.full_name || o.name,
+  org_inn: o.inn, signer: o.signer,
+});
+// Имя файла: дефис оставляем — номера вида «СЧ-2026/007» читаются лучше,
+// а слеш обязателен к замене, иначе получится подпапка.
+const safeName = (s) => String(s).replace(/[«»"]/g, '').replace(/[^\wА-Яа-яЁё-]+/g, '_').replace(/^[_-]+|[_-]+$/g, '');
+
+/** file — уже собранный файл (его отдаёт docService), иначе собираем из html. */
+async function sendGenerated(tg, chatId, { html, xlsxBuffer, base, caption, file: ready }) {
+  await tg.sendChatAction(chatId, 'upload_document');
+  if (xlsxBuffer) {
+    await tg.sendDocument(chatId, { filename: `${base}.xlsx`, buffer: xlsxBuffer, caption });
+    return;
+  }
+  const file = ready || await docService.renderFile(html, base);
+  await tg.sendDocument(chatId, {
+    filename: file.filename,
+    buffer: file.buffer,
+    caption: file.pdf
+      ? caption
+      : `${caption}\n\n(PDF недоступен — откройте файл в браузере и распечатайте / сохраните в PDF.)`,
+  });
+}
+
+async function requireOrg(tg, chatId, user) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) {
+    await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu());
+    return null;
+  }
+  return org;
+}
+
+/**
+ * Проверка лимита перед выпуском нового документа. Если бесплатные
+ * закончились и подписки нет — показываем экран подписки и не пускаем дальше.
+ * Пересылку уже выписанного файла и просмотр журнала это не трогает.
+ */
+async function requireQuota(tg, chatId, user) {
+  const q = bdb.quota(user.id);
+  if (q.allowed) return true;
+  await tg.sendMessage(chatId,
+    `В этом месяце вы использовали все <b>${q.limit} бесплатных</b> документа.\n\n`
+    + 'Оформите подписку — лимит снимется, всё остальное работает как прежде. '
+    + 'Ранее выписанные документы по-прежнему можно переслать из «Мои документы».',
+    keyboard([[{ text: '⭐ Оформить подписку', data: 'billing' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+  return false;
+}
+
+/**
+ * Акт сверки за период.
+ *
+ * Период задаётся снаружи; по умолчанию — от начала отношений до сегодня.
+ * Раньше конец периода запоминался в карточке при первом акте и больше не
+ * менялся: второй акт печатал в шапке прошлогоднюю дату, а в таблицу
+ * складывал операции по сегодняшний день. Теперь карточку не трогаем —
+ * в ней opening_date значит начало отношений, а не начало выбранного
+ * периода, и подменять одно другим нельзя.
+ */
+async function genAktSverki(tg, chatId, user, cpId, from, to, opts = {}) {
+  if (!(await requireQuota(tg, chatId, user))) return;
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  const p = bdb.cpForPeriod(user.id, cpId, from, to);
+  if (!p) return;
+  const buf = await buildAkt({ org: orgForAkt(org), cp: p.view, ops: p.ops });
+  const seq = bdb.nextSeqForOrg(org.id, 'akt', currentYear());
+  await sendGenerated(tg, chatId, {
+    xlsxBuffer: Buffer.from(buf), base: `Акт_сверки_${safeName(p.cp.name)}`,
+    caption: `Акт сверки с <b>${esc(p.cp.name)}</b> за период ${ru(p.from)}—${ru(p.to)}.\n`
+      + `На начало периода — ${formatRub(Math.abs(p.opening))}, на конец — ${formatRub(Math.abs(p.closing))}.`,
+  });
+  const docId = bdb.saveDoc(user.id, {
+    orgId: org.id, cpId, type: 'akt', number: String(seq), seq, date: todayISO(),
+    total: Math.abs(p.closing), payload: { ops: p.ops.length, from: p.from, to: p.to },
+  });
+
+  /*
+   * Предлагаем отправить сразу. Акт сверки нужен не себе, а контрагенту:
+   * искать его потом в журнале — лишний шаг ровно там, где человек уже
+   * держит документ в руках.
+   *
+   * Отправляем по нажатию, а не сами: письмо уходит другой организации от
+   * имени человека, и решение отправить — его.
+   */
+  const cp = bdb.getCp(user.id, cpId);
+  const rows = [];
+  if (mailbox.resolve(user.id).ok) {
+    rows.push([{
+      text: cp && cp.email ? `✉️ Отправить на ${cp.email}`.slice(0, 60) : '✉️ Отправить клиенту',
+      data: `doc.mail:${docId}`,
+    }]);
+  } else {
+    rows.push([{ text: '✉️ Подключить почту и отправить', data: 'mb' }]);
+  }
+  // Период взят из фразы — значит, его не спрашивали; поменять надо уметь.
+  if (opts.changePeriod) rows.push([{ text: '📅 Другой период', data: `d.akt:${cpId}` }]);
+  rows.push([{ text: `👤 ${cp ? cp.name : 'Клиент'}`.slice(0, 60), data: `cp:${cpId}` }]);
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId,
+    'Отправить акт клиенту на сверку?\n\n'
+    + '<i>В письме будет просьба сверить и ответить: подписать, если сходится, '
+    + 'или назвать строку, если нет.</i>',
+    keyboard(rows));
+}
+
+/**
+ * Спросить период перед актом сверки.
+ *
+ * Бот раньше молча брал весь срок отношений, а сверяются обычно за месяц
+ * или квартал — и в мини-приложении выбор периода уже был. Кнопки закрывают
+ * частые случаи, «свой период» — всё остальное.
+ */
+async function askAktPeriod(tg, chatId, user, cpId) {
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Клиент не найден.', mainMenu()); return; }
+  const rows = [];
+  for (let i = 0; i < period.PRESETS.length; i += 2) {
+    rows.push(period.PRESETS.slice(i, i + 2)
+      .map((p) => ({ text: p.text, data: `akt.p:${cpId}:${p.code}` })));
+  }
+  rows.push([{ text: '📅 Свой период', data: `akt.own:${cpId}` }]);
+  rows.push([{ text: '⬅️ Назад', data: `cp:${cpId}` }]);
+  await tg.sendMessage(chatId,
+    `Акт сверки с <b>${esc(cp.name)}</b>. За какой период?\n\n`
+    + '<i>«За всё время» — от начала расчётов, с начальным балансом из карточки.</i>',
+    keyboard(rows));
+}
+
+/** Свой период текстом: «01.01.2026 - 31.03.2026», «март», «2 квартал». */
+async function handleAktPeriodText(tg, chatId, user, cpId, text) {
+  const r = period.parsePeriodText(text);
+  if (!r) {
+    await tg.sendMessage(chatId,
+      'Не понял период. Напишите одним из способов:\n'
+      + '<code>01.01.2026 - 31.03.2026</code>\n'
+      + '<code>март</code>  ·  <code>апрель 2025</code>\n'
+      + '<code>2 квартал</code>  ·  <code>2025</code>');
+    return;
+  }
+  bdb.clearState(user.id);
+  await genAktSverki(tg, chatId, user, cpId, r.from, r.to);
+}
+
+// ---------- сбор позиций (для акта услуг и счёта) ----------
+
+// Документы, которые набираются позициями: заголовок, сборщик и имя файла.
+// Список общий с мини-приложением — лежит в lib/doc-service.js, чтобы форма
+// документа правилась в одном месте, а не в двух расходящихся копиях.
+const { ITEM_DOCS } = docService;
+
+/**
+ * Подсказки позиций для текущего набора: что выписывали ЭТОМУ клиенту в
+ * таком же документе (см. bdb.suggestItems). Клиент и вид — из состояния.
+ */
+// Короткая метка позиции для кнопки: порядок подсказок меняется (убрали одну,
+// выписали документ), и номер в списке указал бы на другую позицию.
+const itemTag = (name) => require('node:crypto').createHash('md5').update(String(name).trim().toLowerCase()).digest('hex').slice(0, 6);
+
+function suggestionsOf(user) {
+  const st = bdb.getState(user.id);
+  const [, type, cpId] = String((st && st.state) || '').split(':');
+  return bdb.suggestItems(user.id, Number(cpId) || 0, type || '', 6);
+}
+
+/** Клавиатура набора позиций: частые позиции кнопками + управление. */
+function itemsKb(user, data) {
+  const rows = suggestionsOf(user).map((t) => ([{
+    text: `➕ ${t.name} · ${formatRub(t.price)}`.slice(0, 60), data: t.tplId ? `tpl:${t.tplId}` : `ci:${itemTag(t.name)}`,
+  }]));
+  if (rows.length) rows.push([{ text: '🧹 Убрать лишнее из подсказок', data: 'ci.hide' }]);
+  if (data.items.length) {
+    /*
+     * Выпуск одним нажатием: раньше было «Готово», потом «Сформировать» —
+     * два шага там, где человеку нужен один файл. Итог в подписи считаем
+     * тем же vatTotals, что и сводка, чтобы кнопка не обещала одну сумму,
+     * а в документе стояла другая. Сводку с номером, датой и НДС не убрали:
+     * она за второй кнопкой для тех, кому надо поправить.
+     */
+    const doc = data.doc || {};
+    const total = vatTotals(data.items, doc.vatRate == null ? null : Number(doc.vatRate),
+      Boolean(doc.priceIncludesVat)).total;
+    rows.push([{ text: `✅ Сформировать — ${formatRub(total)}`.slice(0, 60), data: 'doc.make' }]);
+    rows.push([{ text: '↩️ Убрать последнюю', data: 'items.undo' }, { text: '✏️ Номер, дата, НДС', data: 'items.done' }]);
+  }
+  rows.push([{ text: '✖️ Отмена', data: 'menu' }]);
+  return keyboard(rows);
+}
+
+async function startItems(tg, chatId, user, type, cpId, extra = {}, when = '') {
+  /*
+   * Платёжка и договор собираются из своих полей, а не из позиций, и у них
+   * свои сценарии. Ассистент законно называет оба вида (они есть в его
+   * списке документов), и раньше просьба «выпиши платёжку Заре на 5000»
+   * попадала сюда: ITEM_DOCS[type].title падал с TypeError, человек не
+   * получал ответа, а брошенное состояние ловило следующее сообщение.
+   * Развилка стоит в самом начале, чтобы упасть здесь не мог ни один
+   * вызывающий, а не только ассистент.
+   */
+  if (!ITEM_DOCS[type]) {
+    if (type === 'pp') return startPp(tg, chatId, user, cpId);
+    if (type === 'dog') return startDogovor(tg, chatId, user, cpId, { amount: extra.amount });
+    await tg.sendMessage(chatId, 'Такой документ из позиций не собирается — выберите его в меню.', mainMenu());
+    return undefined;
+  }
+  if (!(await requireQuota(tg, chatId, user))) return;
+  /*
+   * Дату называют во фразе («счёт на пять тысяч вчерашним числом»). Номер при
+   * этом считаем по году ЭТОЙ даты: ряд номеров идёт по годам, и счёт,
+   * датированный прошлым декабрём, не должен получить номер из нового года.
+   */
+  const docDate = period.isoDay(when) || todayISO();
+  const year = Number(docDate.slice(0, 4));
+  /*
+   * Номер здесь — только показать человеку в сводке; настоящий берёт
+   * doc-service при выписке. Но показанный обязан совпадать с будущим, иначе
+   * человек увидит в предпросмотре один номер, а в файле другой. Считаем по
+   * той же организации, по которой его посчитает doc-service.
+   */
+  const orgForSeq = bdb.currentOrg(user.id);
+  const seq = bdb.nextSeqForOrg(orgForSeq ? orgForSeq.id : 0, type, year);
+
+  /*
+   * Режим НДС организации подставляем здесь, а не только при выписке.
+   *
+   * doc-service всё равно применит его сам, если ставку не назвали. Но
+   * сводка перед выпуском считает итог по тому, что лежит в состоянии, — и
+   * когда набор позиций начинали без ставки, она обещала «Итого: 100 000
+   * (без НДС)», а уходил документ на 120 000. Расхождение видел человек,
+   * уже нажавший «Сформировать».
+   *
+   * Ловилось это на трёх входах из пяти: накладная, счёт голосом или фразой
+   * и счёт сразу после заведения контрагента — то есть везде, где ставку
+   * никто не спрашивал. У накладной кнопки «НДС» в сводке нет вовсе, так
+   * что поправить расхождение было нечем.
+   *
+   * Явно переданную ставку не трогаем: проверяем наличие ключа, а не
+   * значение, потому что null означает «этот документ без налога».
+   */
+  const doc = { ...extra };
+  if (['sch', 'schdog', 'torg12', 'upd', 'usl'].includes(type)
+      && !Object.prototype.hasOwnProperty.call(doc, 'vatRate')) {
+    const v = bdb.vatOf(bdb.currentOrg(user.id));
+    if (v.rate != null) { doc.vatRate = v.rate; doc.priceIncludesVat = v.gross; }
+  }
+
+  const data = { seq, number: String(seq), date: docDate, items: [], ask: '', doc };
+  bdb.setState(user.id, `items:${type}:${cpId}`, data);
+  const sug = bdb.suggestItems(user.id, cpId, type, 6);
+  const tpl = sug.length
+    ? `\n\n${sug[0].own ? 'Что выписывали этому клиенту' : 'Частые позиции'} — кнопками ниже, количество спрошу.` : '';
+  // Пример — позиция самого человека, а не выдуманная: чужой пример только путает.
+  const sample = sug[0] && sug[0].price > 0
+    ? `${sug[0].name} 10 ${Math.round(sug[0].price)}` : 'Название 10 500';
+  await tg.sendMessage(chatId,
+    `Составляем <b>${esc(ITEM_DOCS[type].title)} № ${esc(data.number)}</b> от ${ru(data.date)}.\n`
+    + 'Отправляйте позиции по одной — название, количество, цена:\n'
+    + `<code>${esc(sample)}</code>\n\n`
+    + '<i>Если чего-то не хватит — спрошу.</i>' + tpl,
+    itemsKb(user, data));
+}
+
+/** Сводка перед выпуском: номер и дату можно поправить. */
+async function showPreview(tg, chatId, user, state) {
+  const [, type, cpIdStr] = state.state.split(':');
+  const d = state.data;
+  const extra = d.doc || {};
+  /*
+   * Основание есть только в бланке накладной и УПД. Показываем то, что
+   * действительно напечатается: своё, если вписали, иначе договор из
+   * карточки, а без него — «Без договора». Тот же порядок, что в шаблонах.
+   */
+  const hasBasis = ['torg12', 'upd'].includes(type);
+  const basisLine = hasBasis
+    ? `Основание: <b>${esc(extra.basis || bdb.basisFor(user.id, Number(cpIdStr))
+      || (bdb.getCp(user.id, Number(cpIdStr)) || {}).contract || 'Без договора')}</b>\n`
+    : '';
+  // Итог считаем тем же кодом, что и сам документ: иначе сводка покажет
+  // одно, а в PDF попадёт другое — на НДС «сверху» разница заметная.
+  // Количество и цену берём в том виде, в каком они лягут в документ (три и
+  // четыре знака, см. cleanItems): иначе в сводке 0,3333 кг, а в бланке 0,333.
+  const items = docService.cleanItems(d.items);
+  const sums = vatTotals(items, extra.vatRate == null ? null : Number(extra.vatRate),
+    Boolean(extra.priceIncludesVat));
+  const total = sums.total;
+  const lines = items.map((it, i) =>
+    `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatPrice(it.price)} руб. = <b>${formatRub(lineSum(it.qty, it.price))}</b>`);
+  const head = extra.status
+    ? ` · статус ${extra.status}${extra.status === 1
+      ? `, НДС ${extra.vatRate == null ? 'не облагается' : `${extra.vatRate}%`}`
+      + `${extra.vatRate == null ? '' : (extra.priceIncludesVat ? ', цены с НДС' : ', НДС сверху')}` : ''}`
+    : '';
+  /*
+   * От какой фирмы выписываем — пишем прямо в сводке, но только когда их
+   * несколько. Ошибиться организацией здесь дороже всего: документ уйдёт
+   * клиенту с чужими реквизитами и чужим номером, а заметят это уже у него.
+   * При одной фирме строка была бы лишним шумом в каждом предпросмотре.
+   */
+  const myOrgs = bdb.listOrgs(user.id);
+  const from = myOrgs.length > 1
+    ? `От: <b>${esc((bdb.currentOrg(user.id) || {}).name || '—')}</b>\n` : '';
+  await tg.sendMessage(chatId,
+    `Проверьте документ: <b>${esc(ITEM_DOCS[type].title)} № ${esc(d.number)}</b> от ${ru(d.date)}${head}\n`
+    + from + basisLine + '\n'
+    + (lines.join('\n') || '— пусто —')
+    + (sums.vat == null
+      ? `\n\nИтого: <b>${formatRub(total)}</b> (без НДС)`
+      : `\n\nБез налога: ${formatRub(sums.net)}`
+        + `\nНДС ${extra.vatRate}%: ${formatRub(sums.vat)}`
+        + `\n<b>Всего к оплате: ${formatRub(total)}</b>`),
+    keyboard([
+      [{ text: '📄 Сформировать документ', data: 'doc.make' }],
+      [{ text: '✏️ Номер', data: 'doc.num' }, { text: '📅 Дата', data: 'doc.date' }],
+      ...(hasBasis ? [[{ text: '📎 Основание', data: 'doc.basis' }]] : []),
+      ...(['sch', 'schdog'].includes(type)
+        ? [[{ text: `🧾 НДС: ${sums.vat == null ? 'нет' : `${extra.vatRate}%`}`, data: 'doc.vat' }]] : []),
+      [{ text: '➕ Ещё позиция', data: 'items.more' }],
+      [{ text: '✖️ Отмена', data: 'menu' }],
+    ]));
+}
+
+/**
+ * Единицы измерения, которые встречаются в счетах. Ключ — как пишут люди,
+ * значение — как печатаем в документе.
+ *
+ * Нужны они не для красоты: в строке «Аренда 30 м²» число 30 относится к
+ * названию, а не к количеству, и отличить это можно только по единице,
+ * стоящей сразу за числом.
+ */
+const UNITS = {
+  шт: 'шт.', штук: 'шт.', штука: 'шт.', штуки: 'шт.',
+  уп: 'уп.', упак: 'уп.', упаковка: 'уп.', упаковок: 'уп.', пачка: 'уп.', пачек: 'уп.',
+  компл: 'компл.', комплект: 'компл.', комплектов: 'компл.', набор: 'набор', наборов: 'набор',
+  кг: 'кг', г: 'г', грамм: 'г', т: 'т', тонн: 'т', л: 'л', литр: 'л', литров: 'л',
+  м: 'м', метр: 'м', метров: 'м', км: 'км', см: 'см',
+  'м2': 'м²', 'м²': 'м²', кв: 'м²', квм: 'м²', 'кв.м': 'м²', 'м3': 'м³', 'м³': 'м³',
+  ч: 'ч', час: 'ч', часа: 'ч', часов: 'ч', мин: 'мин',
+  сут: 'сут.', сутки: 'сут.', суток: 'сут.', день: 'дн.', дня: 'дн.', дней: 'дн.', дн: 'дн.',
+  мес: 'мес.', месяц: 'мес.', месяца: 'мес.', месяцев: 'мес.', год: 'год', лет: 'год',
+  усл: 'усл.', услуга: 'усл.', услуг: 'усл.', раз: 'раз', рейс: 'рейс', смена: 'смена', смен: 'смена',
+  квт: 'кВт', 'квт·ч': 'кВт·ч', квтч: 'кВт·ч',
+};
+
+const unitOf = (word) => UNITS[String(word || '').toLowerCase().replace(/\.$/, '')] || null;
+
+/**
+ * Числа из строки — вместе с тем, где они стояли.
+ *
+ * mergeThousands включает склейку разрядов через пробел: «30 000» это одно
+ * число. Она нужна, но она же и опасна — «30 450» с тем же успехом читается
+ * как «30 штук по 450». Поэтому разбор идёт в два прохода, а решает
+ * readItemLine.
+ *
+ * Точка перед ровно тремя цифрами это всегда разряды, а не копейки: копеек
+ * ровно две, и «30.000» человек пишет, имея в виду тридцать тысяч.
+ */
+function numbersIn(text, mergeThousands = false) {
+  // Хвостовой (?!\d) обязателен: без него «Фуршет 10 1500» читается как
+  // «10 150» плюс «0» — разряды съедают пробел между количеством и ценой.
+  const re = mergeThousands
+    ? /\d{1,3}(?:[\s\u00a0]\d{3})+(?:[.,]\d{1,2})?(?!\d)|\d+(?:[.,]\d+)?/g
+    : /\d+(?:[.,]\d+)?/g;
+  const out = [];
+  let m = re.exec(text);
+  while (m) {
+    const raw = m[0];
+    const value = /^\d+\.\d{3}$/.test(raw)
+      ? Number(raw.replace('.', ''))
+      : Number(raw.replace(/[\s\u00a0]/g, '').replace(',', '.'));
+    if (Number.isFinite(value)) out.push({ value, start: m.index, end: m.index + raw.length });
+    m = re.exec(text);
+  }
+  return out;
+}
+
+/** Слово сразу после числа — если это единица измерения, вернём её. */
+function unitAfter(text, pos) {
+  const rest = text.slice(pos).replace(/^[\s.,]+/, '');
+  return unitOf((/^[a-zA-Zа-яА-ЯёЁ²³.]+/.exec(rest) || [''])[0]);
+}
+
+/**
+ * Разбор строки позиции.
+ *
+ * Формат «Наименование; количество; цена» остаётся, но требовать его нельзя:
+ * предприниматель пишет так, как говорит — «Аренда 30 м² 1 30.000»,
+ * «Услуги питания 30 по 450», «Консультация 5000».
+ *
+ * Главная сложность — пробел. В «30 000» он разделяет разряды, в «30 450»
+ * (услуги питания, тридцать порций по 450) он разделяет количество и цену.
+ * Одним выражением это не различить, поэтому пробуем сначала без склейки
+ * разрядов: если так выходит осмысленная пара «количество × цена» — берём
+ * её, потому что это и есть основной формат. И только если не вышло
+ * (цена оказалась нулём или число всего одно), пробуем со склейкой.
+ *
+ * @returns {{name,qty,unit,price}|{name,partial:true}|null}
+ *   partial — поняли только название; количество и цену спросим отдельно.
+ */
+function readItemLine(text) {
+  const line = spellOutMagnitudes(String(text || '').replace(/\u00a0/g, ' ')).trim();
+  if (!line) return null;
+
+  const parts = line.split(/[;|]/).map((s) => s.trim()).filter(Boolean);
+  if (parts.length >= 3) {
+    const qty = parseAmount(parts[1].replace(/[^\d.,]/g, ''));
+    const price = parseAmount(parts[parts.length - 1].replace(/[^\d.,]/g, ''));
+    if (qty != null && price != null) {
+      return { name: parts[0], qty, unit: unitOf(parts[1].replace(/[\d\s.,]/g, '')) || 'шт.', price };
+    }
+  }
+
+  // «х», «*» и «по» между числами — разделители, а не часть названия. Меняем
+  // их на «;», а не на пробел: пробел склеил бы «30 по 450» в 30 450.
+  const plain = line.replace(/\s*[x×хX*]\s*(?=\d)/g, ';').replace(/\s+по\s+(?=\d)/gi, ';');
+  // Хвостовые слова вроде «руб.» отбрасываем, чтобы они не липли к названию.
+  const tail = (from) => plain.slice(from).replace(/^[\s.,]*(?:руб\.?|р\.|₽|рублей)?[\s.,]*$/i, '');
+
+  const pick = (nums) => {
+    if (nums.length < 2) return null;
+    const [q, p] = nums.slice(-2);
+    if (tail(p.end) !== '') return null;
+    const name = plain.slice(0, q.start).replace(/[\s.,;:—-]+$/, '').trim();
+    if (!name || !(p.value > 0) || !(q.value > 0)) return null;
+    return { name, qty: q.value, unit: unitAfter(plain, q.end) || 'шт.', price: p.value };
+  };
+
+  // Пара «количество × цена» важнее разрядов — это основной формат ввода.
+  const asPair = pick(numbersIn(plain, false));
+  if (asPair) return asPair;
+  const merged = pick(numbersIn(plain, true));
+  if (merged) return merged;
+
+  const one = numbersIn(plain, true);
+  if (one.length === 1) {
+    const n = one[0];
+    const name = plain.slice(0, n.start).replace(/[\s.,;:—-]+$/, '').trim();
+    // «Аренда 30 м²» — число с единицей это описание, а не цена.
+    if (name && n.value > 0 && !unitAfter(plain, n.end) && tail(n.end) === '') {
+      return { name, qty: 1, unit: 'шт.', price: n.value };
+    }
+  }
+
+  // Названием считаем всё, что написали: цену и количество доспросим.
+  // Но из одних цифр названия не выйдет — тут действительно нечего понять.
+  if (!/[a-zA-Zа-яА-ЯёЁ]/.test(line)) return null;
+  return { name: line.slice(0, 200), partial: true };
+}
+
+/** Строгий разбор — только полностью понятая позиция. Используется в прогоне. */
+function parseItemLine(text) {
+  const r = readItemLine(text);
+  return r && !r.partial ? r : null;
+}
+
+/**
+ * Выпускает счёт или акт услуг: собирает файл, запоминает позиции
+ * как шаблоны и кладёт документ в журнал — чтобы потом «повторить».
+ */
+async function issueDoc(tg, chatId, user, { type, cpId, doc, extra = {}, replaceId = 0 }) {
+  // Сборка, факсимиле, нумерация и запись в журнал — в общем сервисе:
+  // мини-приложение делает ровно то же самое, и расходиться им нельзя.
+  await tg.sendChatAction(chatId, 'upload_document');
+  const res = replaceId
+    ? await docService.replaceDocument(user.id, replaceId, { items: doc.items, date: doc.date, number: doc.number, extra })
+    : await docService.issueDocument(user.id, {
+      type, cpId, items: doc.items, date: doc.date, number: doc.number, extra,
+    });
+  if (!res.ok) {
+    const kb = res.reason === 'quota'
+      ? keyboard([[{ text: '⭐ Оформить подписку', data: 'billing' }], [{ text: '⬅️ Меню', data: 'menu' }]])
+      : mainMenu();
+    await tg.sendMessage(chatId, esc(res.message), kb);
+    return false;
+  }
+
+  const cp = bdb.getCp(user.id, cpId);
+  const org = bdb.currentOrg(user.id);
+  const q = replaceId ? bdb.quota(user.id) : res.quota;
+  const learned = res.basisLearned
+    ? `\n\n<i>Запомнил основание «${esc(res.basisLearned)}» для ${esc(cp.name)} — дальше подставлю само. `
+      + 'Сменить: карточка клиента → «Основание накладных».</i>' : '';
+  const tail = learned + (res.replaced
+    ? `\n\n<i>Исправлен прежний № ${esc(res.replaced.number)}: старый убран из журнала, лимит не потрачен.`
+      + `${res.replaced.wasPaid ? ' Он был отмечен оплаченным — отметьте оплату у исправленного заново.' : ''}</i>` : '')
+    + (q.paid ? '' : `\n<i>Выписано в этом месяце: ${q.used} из ${q.limit} бесплатных.</i>`);
+  // Проводка в журнал — вещь неочевидная, о ней надо сказать прямо,
+  // иначе человек не поймёт, откуда взялся долг в разделе «Кто должен».
+  /*
+   * Акт или накладная, не попавшие в долг, — говорим об этом сразу.
+   *
+   * При основании «по счёту» и в режиме «журнал веду сам» закрывающий
+   * документ проводки не делает. Так задумано, но бот об этом молчал:
+   * человек выписывал ТОРГ-12, открывал карточку клиента, видел ноль и
+   * считал это поломкой. Кнопка здесь же — переключить одним нажатием, а
+   * пересчёт подтянет и выписанные раньше.
+   */
+  const unseen = !res.debt && res.total > 0 && bdb.DEBT_DOCS.closing.includes(type)
+    && ['manual', 'invoice'].includes(res.basis);
+  /*
+   * Нулевая сумма — отдельная причина «долга нет», и она не про основание.
+   *
+   * Быстрые позиции под профессию кладутся в список без цены, и накладная из
+   * них выходит на 0 ₽: проводку на ноль не пишем, а раньше бот об этом молчал.
+   * Человек видел ноль в карточке клиента и винил основание долга, хотя
+   * переключать там нечего — нужно проставить цены.
+   */
+  const zeroSum = !res.debt && !(res.total > 0) && bdb.DEBT_DOCS.closing.includes(type);
+  const pre = res.prepay;
+  const preNote = res.prepaid
+    ? `\n\n<i>Списано с предоплаты. Осталось ${formatRub(pre.left)}.</i>`
+      + (pre.low ? '\n⚠️ <b>Предоплата скоро кончится.</b>' : '')
+    : (res.debt && pre ? `\n\n<i>Предоплата кончилась: долг ${formatRub(pre.debt)}.</i>` : '');
+  const ledger = res.prepaid ? preNote : zeroSum
+    ? '\n\n<i>Сумма документа 0 ₽ — долг клиента не записан: у позиций не указана цена. '
+      + 'Выпишите документ заново с ценами.</i>'
+    : res.debt
+    ? `\n<i>Долг ${formatRub(res.total)} внесён в журнал. Пришли деньги — нажмите «Оплачено».</i>${preNote}`
+    : (unseen ? `\n\n<i>${res.basis === 'manual'
+      ? 'В долг клиента не попал: выбрано «журнал веду сам».'
+      : 'Долг у вас считается по счетам, поэтому сам документ в долг клиента не попал.'}`
+      + ' Чтобы акты и накладные считались — кнопка ниже, выписанные раньше тоже пересчитаю.</i>'
+      : '');
+  /*
+   * «Оплачено» — прямо под файлом. Раньше за ней надо было идти в карточку
+   * документа: выписал накладную, клиент тут же перевёл деньги, а закрыть
+   * долг можно было только через три экрана. Приложение кнопку здесь
+   * показывало давно, бот — нет.
+   */
+  const buttons = unseen ? [[{ text: '📊 Считать долг по актам и накладным', data: 'basis.set:closing' }]]
+    : (res.debt && !res.prepaid) ? [[{ text: '✅ Оплачено', data: `doc.paid:${res.doc.id}` }]] : [];
+  await tg.sendDocument(chatId, {
+    buttons,
+    filename: res.file.filename,
+    buffer: res.file.buffer,
+    caption: `${esc(res.title)} № ${esc(res.doc.number)}`
+      + ` от ${ru(res.doc.date)} для <b>${esc(cp.name)}</b> на ${formatRub(res.total)}`
+      + (type === 'sch' ? (payable(org)
+        ? '\nВ счёте есть QR — клиент платит, наведя камеру банка.'
+        : '\n\n⚠️ В счёте нет реквизитов для оплаты: не заполнены банк и расчётный счёт. '
+          + 'Клиенту некуда платить — добавьте их в «Моей организации».') : '')
+      + (res.file.pdf ? '' : '\n\n(PDF недоступен — откройте файл в браузере и распечатайте / сохраните в PDF.)')
+      + ledger + tail,
+  });
+  return true;
+}
+
+/** Есть ли куда платить: без банка счёт остаётся просьбой без реквизитов. */
+const payable = (org) => Boolean(org && org.acc && org.bik && org.corr_acc);
+
+/**
+ * Экран после выданного документа.
+ *
+ * Раньше здесь открывалась карточка контрагента — двенадцать кнопок, среди
+ * которых человек ищет, что делать дальше. А дальше он хочет одного из трёх:
+ * отправить документ клиенту, выписать следующий или уйти. Плюс если платить
+ * по счёту некуда, самое полезное сейчас — дозаполнить банк.
+ */
+async function afterDoc(tg, chatId, user, cpId) {
+  const org = bdb.currentOrg(user.id);
+  const last = bdb.listDocs(user.id, 1)[0];
+  const rows = [];
+  if (last) {
+    rows.push([{
+      text: mailbox.has(user.id) ? '✉️ Отправить клиенту на почту' : '✉️ Отправить почтой',
+      data: mailbox.has(user.id) ? `doc.mail:${last.id}` : 'mb',
+    }]);
+  }
+  // Что дальше с выписанным: отметить оплату, когда придёт. Раньше этой кнопки
+  // здесь не было — до карточки документа приходилось идти через «Документы».
+  if (last && ['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(last.type) && last.total > 0) {
+    rows.push([{ text: '✅ Отметить оплату', data: `doc.paid:${last.id}` }]);
+  }
+  if (!payable(org)) rows.push([{ text: '🏦 Добавить банк и счёт', data: 'org.bank' }]);
+  // Повторение заводится здесь, а не отдельным мастером: позиции уже
+  // набраны и проверены человеком, повторять нечего — только выбрать день.
+  if (last && docService.ITEM_DOCS[last.type]) {
+    /*
+     * «Повторить» — разовая копия прямо сейчас: у кого счёта два на неделю,
+     * тому не до расписания. Выходит тот же документ тому же клиенту, но
+     * сначала сводка на проверку — как у любого нового (см. repeatDoc).
+     */
+    rows.push([{ text: '🔁 Повторить', data: `d.rep:${last.id}` }]);
+    rows.push([{ text: '🔁 Повторять по расписанию', data: `rec.new:${last.id}` }]);
+  }
+  /*
+   * «Ещё» — того же вида, что только что выписан. Раньше кнопка всегда вела
+   * в счёт: после ТОРГ-12 нажатие открывало выписку счёта, и казалось, что
+   * вместе с накладной выписывается второй документ.
+   */
+  const sameKind = last && docService.ITEM_DOCS[last.type] ? last.type : 'sch';
+  const sameTitle = (docService.ITEM_DOCS[sameKind] || {}).title || 'счёт';
+  rows.push([{ text: `➕ Ещё: ${sameTitle}`.slice(0, 40), data: `go.${sameKind}` },
+    { text: '📄 Другой документ', data: 'go.any' }]);
+  rows.push([{ text: '👤 Карточка клиента', data: `cp:${cpId}` }]);
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId, '<b>Готово.</b> Что дальше?', keyboard(rows));
+  // «Чем занимаетесь» — один раз за всё время, а не после каждого документа,
+  // пока человек не ответит. Передумать можно в «Ещё» → «Откуда берётся долг».
+  if (bdb.askBizOnce(user.id)) await showBizType(tg, chatId, user);
+}
+
+async function finishItems(tg, chatId, user, state) {
+  const [, type, cpIdStr] = state.state.split(':');
+  const cpId = Number(cpIdStr);
+  const d = state.data;
+  const doc = { number: d.number, date: d.date, items: d.items, ...(d.doc || {}) };
+  bdb.clearState(user.id);
+  const done = await issueDoc(tg, chatId, user, { type, cpId, doc, seq: d.seq, extra: d.doc || {}, replaceId: d.replaceId || 0 });
+  if (!done) return;
+  await afterDoc(tg, chatId, user, cpId);
+}
+
+/**
+ * Исправить выписанный документ под тем же номером: те же клиент, позиции,
+ * дата и номер в обычной сводке — правите и выпускаете. Прежний заменяется
+ * только после удачного выпуска (docService.replaceDocument).
+ */
+async function fixDoc(tg, chatId, user, docId) {
+  const src = bdb.getDoc(user.id, docId);
+  if (!src || !ITEM_DOCS[src.type]) {
+    await tg.sendMessage(chatId, 'Этот документ так не исправить.', mainMenu());
+    return;
+  }
+  // Это тот же документ: его отметки (статус УПД, основание, ставка) остаются, меняются позиции.
+  const { items = [], ...extra } = src.payload || {};
+  const data = { seq: src.seq, number: String(src.number), date: src.date, items, ask: '', doc: extra, replaceId: src.id };
+  bdb.setState(user.id, `items:${src.type}:${src.cp_id}`, data);
+  await tg.sendMessage(chatId,
+    `Исправляем <b>${esc(bdb.docShort(src.type))} № ${esc(src.number)}</b> от ${ru(src.date)}. `
+    + 'Поправьте позиции — номер и дата останутся прежними. Прежний документ заменится, когда выпустите исправленный.');
+  await showPreview(tg, chatId, user, bdb.getState(user.id));
+}
+
+/** Повтор ранее выписанного документа: те же позиции, новый номер и дата. */
+async function repeatDoc(tg, chatId, user, docId) {
+  if (!(await requireQuota(tg, chatId, user))) return;
+  const src = bdb.getDoc(user.id, docId);
+  if (!src || !ITEM_DOCS[src.type]) {
+    await tg.sendMessage(chatId, 'Такой документ повторить нельзя.', mainMenu());
+    return;
+  }
+  /*
+   * reusablePayload, а не разбор payload вручную.
+   *
+   * Ручной вариант тащит в новый документ fix и advDoc — отметку исправления
+   * и ссылку на закрытый аванс. Почему это дорого, написано у самой функции
+   * в lib/doc-service.js: повтор рождается исправлением чужого документа, а
+   * строка 5б закрывает тот же аванс второй раз, и АСК НДС-2 разводит это в
+   * расхождение обеим сторонам сделки.
+   */
+  const { items, extra } = docService.reusablePayload(src.payload);
+  const year = currentYear();
+  /*
+   * Номер — из ряда той фирмы, ОТ КОТОРОЙ документ выйдет, а выходит он
+   * всегда от текущей (issueDocument). Раньше номер брался из ряда исходной
+   * фирмы: повтор счёта фирмы А при выбранной Б выходил от Б с номером из
+   * ряда А — в ряду Б дыра, а если номер там уже занят, выпуск падал.
+   * Раз фирма у повтора другая — говорим об этом вслух, а не молча.
+   */
+  const cur = bdb.currentOrg(user.id) || {};
+  const seq = bdb.nextSeqForOrg(cur.id, src.type, year);
+  const data = { seq, number: String(seq), date: todayISO(), items, ask: '', doc: extra };
+  bdb.setState(user.id, `items:${src.type}:${src.cp_id}`, data);
+  const otherOrg = Number(src.org_id) && Number(src.org_id) !== Number(cur.id);
+  await tg.sendMessage(chatId,
+    `Повторяю <b>${esc(bdb.docShort(src.type))} № ${esc(src.number)}</b>: ${items.length} поз., `
+    + `${formatRub(src.total)}\nНовый номер — ${esc(data.number)}, дата — ${ru(data.date)}.`
+    + (otherOrg ? `\n\n⚠️ Исходный документ выписан от другой организации. Повтор выйдет от `
+      + `текущей — <b>${esc(cur.name || 'без названия')}</b>. Нужна прежняя — переключитесь на неё и повторите.` : ''));
+  await showPreview(tg, chatId, user, bdb.getState(user.id));
+}
+
+/**
+ * «Поправить» в предложении по расписанию: позиции расписания в обычном мастере.
+ * Номер и дату назначает сводка перед выпуском — как у «Повторить», — так что
+ * правка идёт тем же путём, что и ручная выписка, а не особым.
+ * @returns {Promise<boolean>} открылся ли мастер (нет — отметку дня надо вернуть)
+ */
+async function openRecurringForEdit(tg, chatId, user, rec) {
+  if (!(await requireQuota(tg, chatId, user))) return false;
+  if (!docService.ITEM_DOCS[rec.type] || !rec.items.length) {
+    await tg.sendMessage(chatId, 'Из этого расписания документ не собрать.', mainMenu());
+    return false;
+  }
+  const cur = bdb.currentOrg(user.id) || {};
+  const seq = bdb.nextSeqForOrg(cur.id, rec.type, currentYear());
+  bdb.setState(user.id, `items:${rec.type}:${rec.cp_id}`, {
+    seq, number: String(seq), date: todayISO(), items: rec.items, ask: '', doc: rec.extra || {},
+  });
+  await tg.sendMessage(chatId,
+    `Правьте позиции для <b>${esc(rec.cp_name)}</b> и выпускайте. Новый номер — ${esc(String(seq))}, дата — ${ru(todayISO())}.\n`
+    + '<i>Предложение на сегодня закрыто: второй «Всё верно» по нему не сработает.</i>');
+  await showPreview(tg, chatId, user, bdb.getState(user.id));
+  return true;
+}
+
+/**
+ * Границы периода для реестра документов.
+ *
+ * Считает их общий lib/period.js — второй набор периодов в том же боте
+ * рано или поздно разъехался бы с первым. Отличие у реестра одно и оно
+ * осознанное: месяц, квартал и год берутся целиком, а не по сегодня —
+ * реестр собирают за период, в том числе заранее. Подписи свои: в реестре
+ * привычнее «текущий месяц», в акте сверки — «этот месяц».
+ */
+const REGISTRY_PERIODS = {
+  prev: { code: 'pm', title: 'прошлый месяц' },
+  quarter: { code: 'q', title: 'текущий квартал' },
+  year: { code: 'y', title: 'текущий год' },
+  month: { code: 'm', title: 'текущий месяц' },
+};
+
+function periodOf(name) {
+  const p = REGISTRY_PERIODS[name] || REGISTRY_PERIODS.month;
+  const r = period.presetRange(p.code, period.todayDate(), { whole: true });
+  return { from: r.from, to: r.to, title: p.title };
+}
+
+/** Реестр выписанного за период — то, чем закрывают месяц. */
+/**
+ * Книга продаж за период — налоговый регистр, а не список для себя.
+ *
+ * Отдельно от реестра намеренно: в реестр идёт всё выписанное, в книгу —
+ * только счета-фактуры, и именно её данные сверяет АСК НДС-2 с книгой покупок
+ * контрагента. Расхождение здесь оборачивается требованием обеим сторонам.
+ */
+async function sendKniga(tg, chatId, user, periodName) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
+  if (bdb.vatOf(org).rate == null) {
+    await tg.sendMessage(chatId,
+      'Книга продаж ведётся плательщиками НДС. У вас выбрано «без НДС» — '
+      + 'счетов-фактур нет, и книге неоткуда взяться.',
+      keyboard([[{ text: '🧾 Настроить НДС', data: 'vat' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+  const { from, to, title } = periodOf(periodName);
+  const docs = bdb.docsBetween(user.id, from, to)
+    .map((d) => ({ ...d, cpName: (bdb.getCp(user.id, d.cp_id) || {}).name || '', cpInn: (bdb.getCp(user.id, d.cp_id) || {}).inn || '' }));
+
+  await tg.sendChatAction(chatId, 'upload_document');
+  const buf = await buildKnigaProdazh({ org, docs, from, to });
+  const rows = docs.map(bookRow).filter(Boolean);
+  const vat = round2(rows.reduce((a2, r) => a2 + (Number(r.vat) || 0), 0));
+
+  await tg.sendDocument(chatId, {
+    filename: `Книга_продаж_${from}_${to}.xlsx`,
+    buffer: buf,
+    caption: `Книга продаж за ${esc(title)} (${ru(from)}—${ru(to)}).\n`
+      + `Счетов-фактур: <b>${rows.length}</b>, НДС к начислению: <b>${formatRub(vat)}</b>.\n\n`
+      + '<i>Выгрузка для сверки: книга ведётся нарастающим итогом за квартал и подписывается.</i>',
+  });
+}
+
+/**
+ * Режим налогообложения: от него зависит форма книги учёта.
+ *
+ * Отдельным экраном, а не полем в карточке: выбор редкий, но последствия у
+ * него налоговые, и человек должен видеть рядом, что именно этот выбор
+ * меняет. Здесь же показывается отказ решателя, если он есть, — иначе
+ * человек выберет режим и не поймёт, почему книга всё равно не собирается.
+ */
+async function showTaxMode(tg, chatId, user) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
+
+  const cur = String(org.tax_mode || '');
+  const mark = (v) => (cur === v ? '✅ ' : '');
+  const d = kudir.bookFor(org);
+
+  const lines = [
+    '<b>Режим налогообложения</b>', '',
+    'От него зависит форма книги учёта доходов: у упрощёнки и у патента они разные — '
+    + 'приложения 2 и 3 приказа ФНС от 07.11.2023 № ЕА-7-3/816@.', '',
+    cur ? `Сейчас: <b>${esc(kudir.TAX_MODES[cur] || cur)}</b>` : '<i>Пока не указан — книгу не собираю.</i>',
+  ];
+  if (d.blocked && cur) lines.push('', `⚠️ ${esc(d.blocked)}`);
+
+  // Патент — только для предпринимателя (ст. 346.43 НК): организации его
+  // не применяют, и выбор, который ни к чему не ведёт, не показываем.
+  const ip = isIp(org);
+  const withBook = bankRows(user).length > 0 && !d.blocked;
+  await tg.sendMessage(chatId, lines.join('\n'), keyboard([
+    [{ text: `${mark('usn_income')}УСН «доходы»`, data: 'tax.set:usn_income' }],
+    [{ text: `${mark('usn_minus')}УСН «доходы минус расходы»`, data: 'tax.set:usn_minus' }],
+    ...(ip ? [[{ text: `${mark('psn')}Патент`, data: 'tax.set:psn' }]] : []),
+    // Выписка ещё в работе — книгу можно собрать сразу, не присылая файл заново.
+    ...(withBook ? [[{ text: '📒 Собрать книгу учёта доходов', data: 'bank:kudir' }]] : []),
+    [{ text: '⬅️ Меню', data: 'menu' }],
+  ]));
+}
+
+/**
+ * Строки выписки, которые ещё в работе.
+ *
+ * Лежат в состоянии «bank», а после «Занести» и «Отметить» — в «bank-paid»:
+ * книгу можно собрать и до, и после этих шагов.
+ */
+function bankRows(user) {
+  const st = bdb.getState(user.id);
+  return (st.state === 'bank' || st.state === 'bank-paid') && Array.isArray((st.data || {}).all)
+    ? st.data.all : [];
+}
+
+/** Сбросить шаг выписки, но оставить строки для книги. */
+function keepBankRows(user, all) {
+  if (Array.isArray(all) && all.length) bdb.setState(user.id, 'bank', { rows: [], all });
+  else bdb.clearState(user.id);
+}
+
+/**
+ * Книга учёта доходов из присланной выписки.
+ *
+ * Собирается из того файла, который человек только что прислал, а не из
+ * журнала: в журнал попадают только строки, сопоставленные с контрагентом,
+ * а книге нужны все поступления — в том числе свои деньги и займы, которые
+ * надо увидеть, чтобы исключить их осознанно, а не по умолчанию.
+ *
+ * Отсюда и ограничение, о котором сказано в подписи к файлу: книга выходит
+ * за период выписки. Годовая книга — годовая выписка.
+ */
+async function sendKudir(tg, chatId, user) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
+
+  const d = kudir.bookFor(org);
+  if (d.blocked) {
+    // Режим можно поменять из отказа всегда, а не только когда он не указан:
+    // иначе выбравший по ошибке «доходы минус расходы» оставался в тупике.
+    await tg.sendMessage(chatId, esc(d.blocked), keyboard([
+      ...(d.needs === 'npd' ? [] : [[{ text: d.needs === 'tax_mode' ? '⚙️ Указать режим' : '⚙️ Сменить режим', data: 'taxmode' }]]),
+      [{ text: '⬅️ Меню', data: 'menu' }],
+    ]));
+    return;
+  }
+
+  const all = bankRows(user);
+  if (!all.length) {
+    await tg.sendMessage(chatId,
+      'Книга собирается из банковской выписки. Пришлите её файлом — 1С-Клиент-Банк, '
+      + 'OFX или CSV из личного кабинета, — и сразу под разбором появится кнопка.',
+      keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+
+  /*
+   * Книга годовая: выписка с декабря по январь — это две книги, а не одна.
+   * Раньше год брался по первой дате, и январские поступления ложились в
+   * прошлогоднюю книгу — с неверным итогом за оба года.
+   */
+  const dates = all.map((r) => r.date).filter(Boolean).sort();
+  const years = [...new Set(dates.map((x) => x.slice(0, 4)))];
+  await tg.sendChatAction(chatId, 'upload_document');
+  for (const y of years) {
+    const inYear = dates.filter((x) => x.startsWith(y));
+    const from = inYear[0];
+    const to = inYear[inYear.length - 1];
+    // vatPayer — второй рубеж: решатель выше уже отказал бы, но книга
+    // плательщика НДС не должна собраться ни одним путём.
+    const book = kudir.buildIncomeBook(all, { from, to, vatPayer: d.vatPayer });
+    if (book.blocked) {
+      await tg.sendMessage(chatId, esc(book.blocked), keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
+    const buf = await buildKudir({ org, book, year: Number(y), mode: d.mode });
+
+    const caption = [
+      `Книга учёта доходов за ${ru(from)}—${ru(to)}.`,
+      `Строк: <b>${book.rows.length}</b>, доход: <b>${formatRub(book.total)}</b>.`,
+    ];
+    if (book.ask.length) {
+      caption.push('', `⚠️ <b>Не разнесено: ${book.ask.length}</b> — первым листом в файле. `
+        + 'Пока они не разобраны, книга не полна.');
+    }
+    caption.push('', '<i>Книга собрана за период присланной выписки. Для годовой книги '
+      + 'пришлите выписку за год. Проверьте и подпишите — это черновик, а не сданная отчётность.</i>');
+
+    // eslint-disable-next-line no-await-in-loop
+    await tg.sendDocument(chatId, {
+      filename: `Книга_учета_доходов_${from}_${to}.xlsx`,
+      buffer: buf,
+      caption: caption.join('\n'),
+    });
+  }
+}
+
+/** Какие документы можно забрать архивом и как их назвать в кнопке. */
+const ARCHIVE_KINDS = {
+  all: { title: 'Все документы', types: null },
+  torg12: { title: 'ТОРГ-12', types: ['torg12'] },
+  upd: { title: 'УПД', types: ['upd'] },
+  sch: { title: 'Счета', types: ['sch', 'schdog'] },
+  usl: { title: 'Акты', types: ['usl'] },
+  dog: { title: 'Договоры', types: ['dog'] },
+};
+const ARCHIVE_MAX = 80;
+
+/**
+ * Файлы документов за период — одним архивом.
+ *
+ * Файл каждого документа ушёл в чат в момент выписки, но двадцать ТОРГ-12 за
+ * месяц выискивать в переписке по одной — полдня. Собираем заново из журнала
+ * (тем же rebuildDocument, что и «Копия»), квоту это не трогает: новых
+ * документов не появляется. Потолок — чтобы архив за год не держал бота
+ * минутами; больше — по месяцам.
+ */
+async function sendArchive(tg, chatId, user, periodName, kind) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
+  const k = ARCHIVE_KINDS[kind] || ARCHIVE_KINDS.all;
+  const { from, to, title } = periodOf(periodName);
+  const docs = bdb.docsBetween(user.id, from, to).filter((d) => (k.types ? k.types.includes(d.type) : d.type !== 'akt'));
+  if (!docs.length) {
+    await tg.sendMessage(chatId, `${esc(k.title)} за ${esc(title)} (${ru(from)}—${ru(to)}) не найдено.`,
+      keyboard([[{ text: '⬅️ К документам', data: 'docs' }]]));
+    return;
+  }
+  await sendDocsZip(tg, chatId, user, docs, {
+    name: `${k.title.replace(/\s+/g, '_')}_${from}_${to}.zip`,
+    what: `${esc(k.title)} за ${esc(title)} (${ru(from)}—${ru(to)})`,
+  });
+}
+
+/**
+ * Собрать файлы переданных документов из журнала и прислать одним ZIP.
+ * Новых документов не появляется, поэтому лимит не тратится.
+ */
+async function sendDocsZip(tg, chatId, user, docs, { name, what }) {
+  const take = Math.min(docs.length, docService.ZIP_MAX);
+  await tg.sendMessage(chatId, `Собираю ${take} ${plural(take, 'файл', 'файла', 'файлов')} — это займёт до минуты…`);
+  await tg.sendChatAction(chatId, 'upload_document');
+  const z = await docService.zipDocs(user.id, docs);
+  if (!z) {
+    await tg.sendMessage(chatId, 'Не получилось собрать ни одного файла. Попробуйте позже.', mainMenu());
+    return;
+  }
+  await tg.sendDocument(chatId, {
+    filename: name,
+    buffer: z.buffer,
+    caption: `${what}: <b>${z.count}</b> на <b>${formatRub(z.sum)}</b>.`
+      + (z.cut ? `\nВ архиве первые ${take} — остальные выберите по месяцам.` : '')
+      + (z.failed.length ? `\nНе собрались: ${esc(z.failed.join(', '))}.` : ''),
+  });
+}
+
+/**
+ * Основание накладных и УПД клиента — экран карточки.
+ * Показывает, что запомнено, сколько накладных выписано, и даёт задать новое.
+ */
+async function showCpBasis(tg, chatId, user, cpId) {
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) return;
+  const known = bdb.basisFor(user.id, cpId);
+  const docs = bdb.basisDocs(user.id, cpId);
+  const rows = [[{ text: '✏️ Задать основание', data: `cb.set:${cpId}` }]];
+  if (known) rows.push([{ text: '🗑 Сбросить запомненное', data: `cb.reset:${cpId}` }]);
+  rows.push([{ text: '⬅️ К клиенту', data: `cp:${cpId}` }]);
+  await tg.sendMessage(chatId,
+    `<b>Основание накладных и УПД — ${esc(cp.name)}</b>\n\n`
+    + (known ? `Подставляю: <b>${esc(known)}</b>` : `Не задано: печатаю договор из карточки (${esc(cp.contract || 'Без договора')}).`)
+    + `\nНакладных и УПД выписано: <b>${docs.length}</b>.\n\n`
+    + '<i>Само запоминается, если вписать одно и то же основание в три накладные подряд.</i>',
+    keyboard(rows));
+}
+
+async function sendRegistry(tg, chatId, user, periodName, range = null) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
+  // Свой период — из фразы или со списка «за сентябрь»; готовые названия — из меню.
+  const { from, to, title } = range
+    ? { from: range.from, to: range.to, title: period.periodTitle(range.from, range.to) }
+    : periodOf(periodName);
+  const { docs, twins } = bdb.registryDocs(user.id, bdb.docsBetween(user.id, from, to));
+
+  await tg.sendChatAction(chatId, 'upload_document');
+  const buf = await buildRegistry({ org, docs, from, to, twins });
+  const sum = round2(docs.reduce((a2, d) => a2 + (Number(d.total) || 0), 0));
+  const unpaid = docs.filter((d) => !d.paid_at);
+  const unpaidSum = round2(unpaid.reduce((a2, d) => a2 + (Number(d.total) || 0), 0));
+
+  await tg.sendDocument(chatId, {
+    filename: `Реестр_${from}_${to}.xlsx`,
+    buffer: buf,
+    caption: `Реестр за ${esc(title)} (${ru(from)}—${ru(to)}).\n`
+      + `Документов: <b>${docs.length}</b> на <b>${formatRub(sum)}</b>`
+      + (unpaid.length ? `\nЖдут оплаты: <b>${unpaid.length}</b> на <b>${formatRub(unpaidSum)}</b>` : '\nВсё оплачено.'),
+  });
+}
+
+/** Что ещё не оплачено — то, за чем следят каждый день. */
+async function showUnpaid(tg, chatId, user, range = null) {
+  /*
+   * Период назван во фразе («неоплаченные за сентябрь») — сразу показываем
+   * его, не переспрашивая; поменять можно кнопкой под списком.
+   */
+  const per = range && range.to ? range : null;
+  const when = per ? period.periodTitle(per.from, per.to) : '';
+  const scoped = per ? bdb.unpaidBetween(user.id, per.from, per.to) : null;
+  const list = scoped ? scoped.docs : bdb.unpaidDocs(user.id);
+  if (!list.length) {
+    await tg.sendMessage(chatId,
+      per ? `За ${when} неоплаченных документов нет.` : 'Неоплаченных документов нет — все закрыты.',
+      keyboard([...(per ? [[{ text: '📅 Другой период', data: 'lp.pick:unpaid' }, { text: 'Все неоплаченные', data: 'unpaid' }]] : []),
+        [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+  /*
+   * Сумма — сделками, а не документами: счёт и закрывающий его акт на одну
+   * сделку иначе складывались, и сводка расходилась с плиткой в приложении.
+   *
+   * Список при этом показываем целиком — человек хочет видеть оба документа.
+   * Но тогда шапка обязана объяснить, почему сумма меньше сложенных строк:
+   * без пометки «та же сделка» это выглядело ошибкой в расчётах. Приложение
+   * такую пометку рисует давно, бот — теперь тоже.
+   */
+  const { count, sum } = scoped || bdb.dealTotals(user.id, list);
+  /*
+   * Строка кнопки — «Заря · ТОРГ-12 № 2 · 02.09 · 14 000 ₽»: клиент первым,
+   * потому что по нему ищут. Раньше первым шло полное название документа, и на
+   * 60 знаках кнопки до клиента и суммы дело не доходило.
+   */
+  const rows = list.map((d) => {
+    const cp = d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
+    // Сумма без копеек и «руб.»: на кнопке считается каждый знак, а копейки в сводке только мешают.
+    const left = `${new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(d.paid > 0 ? d.left : d.total)} ₽`;
+    // Сколько дней висит — в карточке документа; на кнопке этому места нет.
+    const tail = d.pair ? (d.no_debt ? ' · уже в накладных' : ' · та же сделка') : (d.paid > 0 ? ' · частично' : '');
+    const head = `${d.pair ? '↳ ' : ''}${cp ? cp.name : '—'}`;
+    const body = ` · ${bdb.docShort(d.type)} № ${d.number} · ${ru(d.date).slice(0, 5)} · ${left}`;
+    // Имя уступает место, а не сумма с датой: клиента можно узнать и по обрезку, цифры — нет.
+    const room = Math.max(8, 60 - body.length - tail.length);
+    const name = head.length > room ? `${head.slice(0, room - 1)}…` : head;
+    return [{ text: `${name}${body}${tail}`, data: `doc:${d.id}` }];
+  });
+  // «Напомнить» — клиентам, которые сейчас действительно должны (по журналу, а не по списку документов).
+  const owing = new Map(bdb.debtors(user.id).filter((x) => x.theyOwe).map((x) => [x.cp.id, x.cp.name]));
+  const askedAbout = new Set();
+  for (const d of list) {
+    if (d.pair || !owing.has(d.cp_id) || askedAbout.has(d.cp_id) || askedAbout.size >= 5) continue;
+    askedAbout.add(d.cp_id);
+    rows.push([{ text: `🔔 Напомнить: ${owing.get(d.cp_id)}`.slice(0, 60), data: `rm.one:${d.cp_id}` }]);
+  }
+  if (per) rows.push([{ text: '📅 Другой период', data: 'lp.pick:unpaid' }, { text: 'Все неоплаченные', data: 'unpaid' }]);
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  const twins = list.length - count;
+  await tg.sendMessage(chatId,
+    `<b>Ждут оплаты${per ? ` за ${esc(when)}` : ''}: ${formatRub(sum)}</b> — ${count} ${plural(count, 'сделка', 'сделки', 'сделок')}.`
+    + (twins ? `\n<i>Ниже ${list.length} документов: ${twins} из них закрывают те же сделки `
+      + 'и в сумму не идут.</i>' : ''),
+    keyboard(rows));
+}
+
+/** Журнал выписанного. */
+async function showDocs(tg, chatId, user, cpId = null, range = null) {
+  // Период назван во фразе («документы за август») — показываем его сразу, без вопроса.
+  const per = range && range.to ? range : null;
+  const when = per ? period.periodTitle(per.from, per.to) : '';
+  const inRange = per ? bdb.docsBetween(user.id, per.from, per.to, cpId).reverse() : null;
+  const docs = inRange ? inRange.slice(0, 12) : bdb.listDocs(user.id, 10, cpId);
+  if (!docs.length) {
+    if (per) {
+      await tg.sendMessage(chatId, `За ${esc(when)} документов нет.`,
+        keyboard([[{ text: '📅 Другой период', data: 'lp.pick:docs' }, { text: 'Все документы', data: 'docs' }],
+          [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
+    await tg.sendMessage(chatId, 'Пока ничего не выписано.', mainMenu());
+    return;
+  }
+  const q = bdb.quota(user.id);
+  const rows = docs.map((d) => {
+    const cp = d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
+    const money = d.total ? ` · ${formatRub(d.total)}` : '';
+    const label = `${d.title} № ${d.number} от ${ru(d.date)}${cp ? ` · ${cp.name}` : ''}${money}`;
+    /*
+     * «🔁» — рядом со строкой, а не внутри карточки: так выписывают одинаковые
+     * счета каждый месяц, и лишний экран на каждом из них — это раздражает.
+     * Строка при этом короче: Telegram делит ширину поровну, длинная подпись
+     * обрезалась бы на середине.
+     */
+    return ITEM_DOCS[d.type]
+      ? [{ text: label.slice(0, 44), data: `doc:${d.id}` }, { text: '🔁', data: `d.rep:${d.id}` }]
+      : [{ text: label.slice(0, 60), data: `doc:${d.id}` }];
+  });
+  if (per) {
+    rows.push([{ text: '📊 Реестр за эти даты (Excel)', data: `reg.r:${packDay(per.from) || '0'}:${packDay(per.to)}` }]);
+    rows.push([{ text: '📅 Другой период', data: 'lp.pick:docs' }, { text: 'Все документы', data: 'docs' }]);
+    rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+    await tg.sendMessage(chatId,
+      `<b>Документы за ${esc(when)}</b>: ${inRange.length}`
+      + (inRange.length > docs.length ? ` (показываю последние ${docs.length}; полный список — в реестре)` : '') + '.',
+      keyboard(rows));
+    return;
+  }
+  rows.push([{ text: '📊 Реестр за период (Excel)', data: 'reg' }]);
+  const repeats = recurring.list(user.id).length;
+  rows.push([{ text: `🔁 Регулярные документы${repeats ? ` (${repeats})` : ''}`, data: 'rec' }]);
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId,
+    `Последние документы (в этом месяце ${q.used}${q.paid ? '' : ` из ${q.limit} бесплатных`}):`,
+    keyboard(rows));
+}
+
+/** Карточка документа: выслать файл заново или повторить новым номером. */
+/**
+ * Что сказать после пересчёта основания.
+ *
+ * Про строки оплаты надо говорить наравне с долгом: пересчёт может снять
+ * оплату на 30 000 — сальдо уезжает ровно настолько, — а сообщение раньше
+ * считало только реализации и рапортовало «ничего не менял».
+ */
+function rebuildText(fixed) {
+  const parts = [];
+  if (fixed.added) parts.push(`долг добавлен по ${fixed.added} ${plural(fixed.added, 'документу', 'документам', 'документам')}`);
+  if (fixed.removed) parts.push(`убран у ${fixed.removed}`);
+  if (fixed.paid) parts.push(`поправлено строк оплаты: ${fixed.paid}`);
+  return parts.length ? `Пересчитал журнал: ${parts.join(', ')}.` : '';
+}
+
+/** «Оплатил» как новая оплата: проводка по документу, долг клиента уменьшается. */
+async function payDocAsNew(tg, chatId, user, id) {
+  const when = bdb.markPaid(user.id, id);
+  if (when) await tg.sendMessage(chatId, `✅ Отметил оплату ${ru(when)} — долг закрыт.`);
+  await remindCheque(tg, chatId, user);
+  await showDoc(tg, chatId, user, id);
+}
+
+/**
+ * «Оплатил» при свободных оплатах клиента: спрашиваем, не одна ли из них.
+ * Один и тот же вопрос и одна и та же функция привязки (lib/bot-db.js) — у
+ * бота и у приложения, чтобы они не разошлись в ответе.
+ */
+async function askFreePayment(tg, chatId, user, id, free) {
+  const d = bdb.getDoc(user.id, id);
+  const cp = d && d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
+  const rows = free.length === 1
+    ? [[{ text: 'Да, это она', data: `doc.pfree:${id}:${free[0].opId}` }]]
+    : free.map((p) => [{ text: `Да: ${bdb.freePaymentLabel(p)}`, data: `doc.pfree:${id}:${p.opId}` }]);
+  rows.push([{ text: 'Нет, это новая оплата', data: `doc.pnew:${id}` }]);
+  rows.push([{ text: '⬅️ К документу', data: `doc:${id}` }]);
+  await tg.sendMessage(chatId, esc(bdb.freePaymentQuestion(cp && cp.name, free)), keyboard(rows));
+}
+
+/** Что сказать после привязки свободной оплаты к документу. */
+function linkedText(r) {
+  const head = r.partial
+    ? `✅ Привязал ${formatRub(r.linked)} к документу. Осталось получить ${formatRub(r.left)} — отметьте оплату, когда придёт остальное.`
+    : `✅ Привязал оплату ${formatRub(r.linked)} к документу и отметил его оплаченным ${ru(r.paidAt)}.`;
+  return `${head} Новой оплаты в журнал не добавлял — эти деньги там уже были.`
+    + (r.rest ? ` Ещё ${formatRub(r.rest)} остались оплатой клиента без документа.` : '');
+}
+
+async function showDoc(tg, chatId, user, docId) {
+  const d = bdb.getDoc(user.id, docId);
+  if (!d) { await tg.sendMessage(chatId, 'Документ не найден.', mainMenu()); return; }
+  const cp = d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
+  const items = (d.payload.items || [])
+    .map((it, i) => `${i + 1}. ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n');
+  const rows = [];
+  rows.push([{ text: '📄 Прислать файл заново', data: `doc.get:${d.id}` }]);
+  /*
+   * Исправление — только для счёта-фактуры и только у плательщика НДС.
+   *
+   * Пересобирает тот же документ по текущим данным: поправили ИНН клиента в
+   * карточке — исправление выйдет с верным. Номер и дата остаются прежними,
+   * добавляется пометка «ИСПРАВЛЕНИЕ № N». Для изменения стоимости по
+   * договорённости это не годится — там корректировочный, и это разные вещи.
+   */
+  if (d.type === 'upd' && Number((d.payload || {}).status) === 1) {
+    const fixNo = Number(((d.payload || {}).fix || {}).no || 0);
+    rows.push([{ text: fixNo ? `✏️ Исправление № ${fixNo + 1}` : '✏️ Выставить исправление',
+      data: `doc.fix:${d.id}` }]);
+  }
+  if (d.paid_at && d.type !== 'akt') {
+    rows.push([{ text: '🔵 Копия со штампом «Оплачено»', data: `doc.paidcopy:${d.id}` }]);
+  }
+  // Ссылка для клиента: её отправляют в переписку вместо файла. Показываем
+  // ту, что уже роздана, — чтобы не плодить адреса и было что отозвать.
+  const link = docLink.available() ? docLink.activeFor(user.id, d.id) : null;
+  if (docLink.available()) {
+    rows.push([link
+      ? { text: '🚫 Отозвать ссылку', data: `doc.unlink:${d.id}` }
+      : { text: '🔗 Ссылка для клиента', data: `doc.link:${d.id}` }]);
+  }
+  const payable = ['sch', 'usl', 'upd', 'torg12'].includes(d.type) && d.total > 0;
+  if (payable) {
+    rows.push([d.paid_at
+      ? { text: `↩️ Снять отметку об оплате (${ru(d.paid_at)})`, data: `doc.unpaid:${d.id}` }
+      : { text: '✅ Отметить оплаченным', data: `doc.paid:${d.id}` }]);
+  }
+  // Отмену проводки надо уметь отменить. Без этой кнопки документ навсегда
+  // выпадал из долга, продолжая числиться в «Ждут оплаты».
+  if (d.no_debt) rows.push([{ text: '↩️ Вернуть в долг', data: `doc.debt:${d.id}` }]);
+  // Самозанятому — состояние чека прямо в карточке: пробит ли и куда смотреть.
+  const chq = cheques.forDoc(user.id, d.id);
+  if (chq) {
+    rows.push([chq.status === 'done'
+      ? { text: chq.link ? '🧾 Чек пробит · приложена ссылка' : '🧾 Чек пробит · приложить ссылку', data: `chq.link:${chq.id}` }
+      : { text: `🧾 Ждёт чека до ${ru(chq.due)}`, data: `chq.show:${chq.id}` }]);
+  }
+  // Акт сверки отправляют почтой чаще всех остальных: он нужен не себе, а
+  // контрагенту — согласиться или возразить. Раньше кнопки у него не было,
+  // потому что он не умел пересобираться; теперь умеет.
+  if (mailbox.resolve(user.id).ok) {
+    rows.push([{
+      text: cp && cp.email ? `✉️ Отправить на ${cp.email}`.slice(0, 60) : '✉️ Отправить на почту',
+      data: `doc.mail:${d.id}`,
+    }]);
+  }
+  if (ITEM_DOCS[d.type]) rows.push([{ text: '✏️ Исправить — номер тот же', data: `d.fix:${d.id}` }]);
+  if (d.type !== 'akt') rows.push([{ text: '🔢 Изменить номер', data: `d.num:${d.id}` }]);
+  if (ITEM_DOCS[d.type]) rows.push([{ text: '🔁 Повторить новым номером', data: `d.rep:${d.id}` }]);
+  if (cp) rows.push([{ text: `👤 ${cp.name}`, data: `cp:${cp.id}` }]);
+  rows.push([{ text: '🗑 Убрать из журнала', data: `doc.del:${d.id}` }]);
+  rows.push([{ text: '⬅️ К документам', data: 'docs' }]);
+  await tg.sendMessage(chatId,
+    `<b>${esc(d.title)} № ${esc(d.number)}</b> от ${ru(d.date)}\n`
+    + (cp ? `Клиент: ${esc(cp.name)}\n` : '')
+    + (d.total ? `Сумма: <b>${formatRub(d.total)}</b>\n` : '')
+    + (payable ? `Оплата: <b>${d.paid_at ? `получена ${ru(d.paid_at)}` : 'не отмечена'}</b>\n` : '')
+    + (d.no_debt ? 'Долг по этому документу отменён вручную.\n' : '')
+    + (chq ? (chq.status === 'done'
+      ? `Чек «Мой налог»: <b>пробит</b>${chq.number ? ` (№ ${esc(chq.number)})` : ''}${chq.link ? `\n${esc(chq.link)}` : ''}\n`
+      : `Чек «Мой налог»: <b>не пробит</b>, срок до ${ru(chq.due)}\n`) : '')
+    + (link ? `\n🔗 ${esc(link.url)}\nдействует до ${ru(link.expiresAt.slice(0, 10))}`
+      + `, ${link.opens ? `открывали ${link.opens} ${plural(link.opens, 'раз', 'раза', 'раз')}` : 'ещё не открывали'}\n` : '')
+    + (items ? `\n${items}` : ''),
+    keyboard(rows));
+}
+
+/**
+ * Напоминание про чек «Моего налога» — только для тех, кто на НПД.
+ *
+ * Приходит сразу после отметки оплаты, и это единственный подходящий
+ * момент: деньги по переводу падают на счёт молча, документ к тому времени
+ * уже выписан, и всё выглядит законченным. А доход у самозанятого считается
+ * принятым только с чеком.
+ *
+ * Чек за человека не формируем: это заявление в налоговую от его имени.
+ * Открываем приложение и уходим — дальше он сам.
+ */
+async function remindCheque(tg, chatId, user) {
+  await remindFresh(tg, chatId, user);
+}
+
+/**
+ * Напоминания про чеки по свежим поступлениям — теми словами, что и раньше.
+ *
+ * Запись о чеке заводится сама в момент появления проводки «Оплата» (см.
+ * lib/cheques.js): с любого экрана, на любую сумму, включая частичную оплату,
+ * аванс и платёж из выписки. Здесь мы только забираем записи, о которых
+ * человеку ещё не говорили, и показываем: одна — карточкой, несколько — общим
+ * списком. Забрали — второй раз не покажем.
+ */
+async function remindFresh(tg, chatId, user) {
+  const made = cheques.takeFresh(user.id);
+  if (!made.length) return;
+  if (made.length === 1) { await sendChequeCard(tg, chatId, user, made[0]); return; }
+  const total = made.reduce((a, c) => a + c.amount, 0);
+  await tg.sendMessage(chatId,
+    `🧾 Пробейте чеки в «Мой налог»: ${made.length} шт. на ${formatRub(total)}.\n\n`
+    + made.slice(0, 8).map((c) => `• ${formatRub(c.amount)} — ${esc(c.buyer_name || c.service)}`).join('\n')
+    + (made.length > 8 ? `\n…и ещё ${made.length - 8}` : '')
+    + '\n\n<i>По переводу на счёт срок — до 9-го числа следующего месяца. '
+    + 'Данные для каждого чека — в списке.</i>',
+    keyboard([[{ text: '🧾 Чеки к пробитию', data: 'chq.list' }], [{ text: '🧾 Открыть «Мой налог»', url: npd.LK_URL }]]));
+}
+
+/** Карточка одного чека: готовые данные и три кнопки. Деньги пришли — человеку остаётся ввести их в «Мой налог». */
+async function sendChequeCard(tg, chatId, user, c) {
+  const cp = c.cp_id ? bdb.getCp(user.id, c.cp_id) : null;
+  await tg.sendMessage(chatId, `🧾 ${esc(cheques.reminderText(c, cp && cp.name))}`,
+    keyboard([
+      [{ text: '✅ Чек пробил', data: `chq.ok:${c.id}` }, { text: '⏳ Позже', data: `chq.later:${c.id}` }],
+      [{ text: '🧾 Открыть «Мой налог»', url: npd.LK_URL }],
+    ]));
+}
+
+/** Список непробитых чеков. */
+async function showCheques(tg, chatId, user) {
+  const list = cheques.open(user.id);
+  if (!list.length) {
+    await tg.sendMessage(chatId, '🧾 Непробитых чеков нет.', mainMenu());
+    return;
+  }
+  const rows = list.slice(0, 12).map((c) => ([{
+    text: `${cheques.rub(c.amount)} · ${c.cp_name || c.buyer_name || 'клиент'} · до ${ru(c.due).slice(0, 5)}`.slice(0, 60),
+    data: `chq.show:${c.id}`,
+  }]));
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId,
+    `<b>Чеки не пробиты: ${list.length}</b>\n\nНажмите на строку — покажу данные для чека.`, keyboard(rows));
+}
+
+/**
+ * Повторная отправка файла по сохранённым данным.
+ *
+ * Сборку делает doc-service — тот же код, что и в мини-приложении. Раньше
+ * здесь была своя копия сборки, и она собирала документ без факсимиле:
+ * оригинал уходил с подписью и печатью, а копия того же счёта — пустая.
+ *
+ * @param {{paid?:boolean, copy?:boolean}} [stamp] какие штампы поставить
+ */
+async function resendDoc(tg, chatId, user, docId, stamp = null) {
+  const built = await docService.rebuildDocument(user.id, docId, { stamp });
+  if (!built.ok) { await tg.sendMessage(chatId, esc(built.message), mainMenu()); return; }
+  const d = built.doc;
+  const marks = built.stamp
+    ? ` Штамп: ${[built.stamp.paid ? 'оплачено' : '', built.stamp.copy ? 'копия' : '']
+      .filter(Boolean).join(', ')}.` : '';
+  await tg.sendChatAction(chatId, 'upload_document');
+  await tg.sendDocument(chatId, {
+    filename: built.file.filename,
+    buffer: built.file.buffer,
+    caption: `${esc(built.title)} № ${esc(d.number)} от ${ru(d.date)} — копия.${marks}`
+      + (built.file.pdf ? ''
+        : '\n\n(PDF недоступен — откройте файл в браузере и распечатайте / сохраните в PDF.)'),
+  });
+}
+
+// ---------- платёжка (сумма + назначение) ----------
+
+// ---------- подписка ----------
+
+/*
+ * Владелец — это ЧЕЛОВЕК, а не чат.
+ *
+ * Раньше сверялся chat.id. В личной переписке это одно и то же число, и
+ * разницы не видно. Но стоит поставить в SUPPORT_CHAT_ID групповой чат
+ * поддержки — а так делают, когда обращения смотрят вдвоём, — и владельцем
+ * становится каждый участник группы: команды начинаются со слэша, значит
+ * доходят до бота при любых настройках приватности. Любой из них выдал бы
+ * себе подписку на десять лет, снял доступ другому и выгрузил список
+ * платящих клиентов с их номерами.
+ */
+const isOwner = (fromId) => Boolean(process.env.SUPPORT_CHAT_ID)
+  && String(fromId) === String(process.env.SUPPORT_CHAT_ID);
+
+async function showBilling(tg, chatId, user) {
+  bdb.clearState(user.id);
+  const a = billing.accessInfo(user.id);
+  const q = bdb.quota(user.id);
+  const link = payLink(user.tg_id);
+
+  const lines = ['<b>Подписка</b>', ''];
+  if (a.active) {
+    lines.push(`Доступ оплачен до <b>${ru(a.until)}</b> — осталось ${a.left} ${plural(a.left, 'день', 'дня', 'дней')}.`);
+  } else {
+    lines.push(`Сейчас бесплатно: выписано ${q.used} из ${q.limit} документов в этом месяце.`);
+    lines.push('');
+    lines.push('Подписка снимает лимит и оставляет всё остальное как есть.');
+  }
+  // Цену называем до кнопки, а не после перехода на оплату: человек имеет
+  // право знать, сколько это стоит, прежде чем куда-то нажимать.
+  const price = priceText();
+  if (price) {
+    lines.push('', `<b>${esc(price)}</b>`);
+    const save = yearSaving();
+    if (save > 0) lines.push(`<i>За год — выгода ${formatRub(save)}.</i>`);
+  }
+  const hasPlatega = platega.isConfigured();
+  if (!link && !hasPlatega) {
+    lines.push('');
+    lines.push('<i>Оплата пока не подключена. Напишите в поддержку — выдадим доступ вручную.</i>');
+  }
+  lines.push('');
+  lines.push(`<i>Проверочный код: ${CHECK_CODE}</i>`);
+
+  const rows = [];
+  if (hasPlatega) {
+    /*
+     * Обе цены — из сетки. Годовая стояла числом «3 490 ₽», а списание шло
+     * по сетке (2 990): кнопка обещала одну цену, касса брала другую. Нет
+     * тарифа в сетке — нет и кнопки: платить за «Год» и получать месяц
+     * хуже, чем не видеть кнопку вовсе.
+     */
+    const month = platega.planByName('month');
+    const year = platega.planByName('year');
+    const pay = [];
+    if (month) pay.push({ text: `⚡ Оплатить СБП (${month.amount} ₽)`, data: 'pay.plt:month' });
+    if (year) pay.push({ text: `⭐ Год (${year.amount} ₽)`, data: 'pay.plt:year' });
+    if (pay.length) rows.push(pay);
+  }
+  if (link) rows.push([{ text: a.active ? '⭐ Продлить' : '⭐ Оформить подписку', url: link }]);
+  if (link || hasPlatega) rows.push([{ text: '✅ Я оплатил', data: 'pay.claim' }]);
+  // Код доступа показываем всегда: им пользуются и до подключения оплаты,
+  // и когда доступ дают за отзыв, тест или взамен сорвавшегося платежа.
+  rows.push([{ text: '🎟 У меня есть код', data: 'promo' }]);
+  rows.push([
+    { text: '📄 Оферта', url: OFERTA() },
+    { text: '🔒 Конфиденциальность', url: POLICY() },
+  ]);
+  rows.push([{ text: '⭐ Тарифы сервиса', url: TARIFFS() }]);
+  const history = billing.paymentsOf(user.id, 3);
+  if (history.length) {
+    lines.push('');
+    lines.push('Последние оплаты: ' + history
+      .map((h) => `${formatRub(h.amount)} · ${ru(String(h.created_at).slice(0, 10))}`).join(', '));
+  }
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId, lines.join('\n'), keyboard(rows));
+}
+
+/**
+ * Письмо с кодом подтверждения на адрес из платежа.
+ *
+ * Уходит с НАШЕГО служебного ящика (SMTP_* в окружении), а не с ящика
+ * пользователя: тот подключается для писем контрагентам и к подписке
+ * отношения не имеет.
+ */
+async function sendClaimCode(email, code) {
+  return mailer.sendMail({
+    to: email,
+    subject: `Код подтверждения ${code} — Первичка`,
+    text: `Код подтверждения: ${code}\n\n`
+      + 'Введите его в боте, чтобы получить доступ за свою оплату.\n'
+      + 'Код действует 30 минут.\n\n'
+      + 'Если вы ничего не оплачивали и не запрашивали код — просто не вводите его. '
+      + 'Без кода доступ по вашей оплате никто не получит.',
+  });
+}
+
+/**
+ * «Я оплатил», шаг первый: приняли почту, выслали на неё код.
+ *
+ * Раньше здесь доступ выдавался сразу. Но Lava не возвращает Telegram-id, и
+ * ничьим приходит каждый платёж — значит достаточно было знать чужой адрес с
+ * кассы, чтобы забрать чужую подписку. Владение почтой теперь доказывается.
+ */
+async function claimByEmail(tg, chatId, user, email) {
+  bdb.clearState(user.id);
+  const clean = String(email).trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(clean)) {
+    await tg.sendMessage(chatId, 'Это не похоже на почту. Пришлите адрес, который указывали при оплате.',
+      keyboard([[{ text: '⬅️ Подписка', data: 'billing' }]]));
+    return;
+  }
+
+  /*
+   * Без служебной почты подтвердить владение нечем.
+   *
+   * Выдавать доступ «пока без проверки» тут нельзя — это ровно та дыра,
+   * которую закрываем. Поэтому зовём владельца: он видит платёж и человека и
+   * выдаёт доступ вручную. Деньги при этом не теряются, а сама оплата уже
+   * лежит в базе.
+   */
+  if (!mailer.mailAvailable()) {
+    const found = billing.unclaimedByEmail(clean);
+    const owner = process.env.SUPPORT_CHAT_ID || '';
+    if (found.length && owner) {
+      await tg.sendMessage(owner,
+        `🔐 ${esc(user.name || 'Пользователь')} (<code>${user.tg_id}</code>) просит доступ `
+        + `за оплату с почты <b>${esc(clean)}</b>, но служебная почта не настроена — `
+        + 'код выслать нечем. Проверьте и выдайте доступ вручную.').catch(() => {});
+    }
+    await tg.sendMessage(chatId,
+      'Проверить почту сейчас нечем — я передал вашу просьбу владельцу, он выдаст доступ вручную. '
+      + 'Обычно это занимает недолго.',
+      keyboard([[{ text: '💬 Поддержка', data: 'support' }], [{ text: '⬅️ Подписка', data: 'billing' }]]));
+    return;
+  }
+
+  const r = billing.startEmailClaim(user.id, clean);
+  if (!r.ok && r.error === 'много-попыток') {
+    await tg.sendMessage(chatId,
+      'Сегодня код запрашивали слишком много раз. Попробуйте завтра или напишите в поддержку.',
+      keyboard([[{ text: '💬 Поддержка', data: 'support' }], [{ text: '⬅️ Подписка', data: 'billing' }]]));
+    return;
+  }
+  /*
+   * «Оплаты нет» и «код выслан» отвечают одинаково.
+   *
+   * Иначе форма превращается в проверялку: перебирая адреса, посторонний
+   * узнавал бы, кто у нас платил. Настоящему плательщику это не мешает — он
+   * знает свой адрес и получит письмо.
+   */
+  if (r.ok) {
+    /*
+     * Письмо не ушло — это надо знать нам, а не человеку.
+     *
+     * Сказать ему «отправка не удалась» нельзя: такой ответ приходил бы
+     * только на адрес, с которого была оплата, и форма снова превращается в
+     * проверялку «кто у вас платил» — ровно то, от чего защищает одинаковый
+     * ответ выше. Поэтому пишем в журнал офиса и возвращаем попытку: иначе
+     * человек, который УЖЕ заплатил, молча сидит без доступа, ждёт письма,
+     * которого не было, и сжигает пять попыток в сутки на пустые отправки.
+     */
+    const posted = await sendClaimCode(clean, r.code).then(() => true).catch((e) => {
+      office.record({ kind: 'claim-mail', where: 'claimByEmail', text: clean,
+        error: e && e.message ? e.message : String(e), userId: user.id }).catch(() => {});
+      billing.refundClaimSend(user.id);
+      return false;
+    });
+    if (posted) bdb.setState(user.id, 'claim-code', {});
+  }
+  await tg.sendMessage(chatId,
+    `Если оплата с адреса <b>${esc(clean)}</b> у меня есть, я выслал туда код из шести цифр. `
+    + 'Пришлите его сюда — код действует 30 минут.\n\n'
+    + '<i>Письма нет? Загляните в «Спам». Адрес мог быть другим — попробуйте ещё раз.</i>',
+    keyboard([[{ text: '✅ Я оплатил', data: 'pay.claim' }],
+      [{ text: '💬 Поддержка', data: 'support' }], [{ text: '⬅️ Подписка', data: 'billing' }]]));
+}
+
+/** «Я оплатил», шаг второй: проверяем код и выдаём доступ. */
+async function claimByCode(tg, chatId, user, code) {
+  const clean = String(code).replace(/\D/g, '');
+  if (clean.length !== 6) {
+    await tg.sendMessage(chatId, 'Код — это шесть цифр из письма. Пришлите его целиком.',
+      keyboard([[{ text: '⬅️ Подписка', data: 'billing' }]]));
+    return;
+  }
+  const r = billing.confirmEmailClaim(user.id, clean);
+  if (!r.ok) {
+    const said = {
+      'нет-заявки': 'Заявки нет — начните с кнопки «Я оплатил».',
+      просрочен: 'Код устарел, ему больше 30 минут. Запросите новый.',
+      'много-ошибок': 'Код вводили неверно пять раз. Запросите новый.',
+    }[r.error] || `Код не подошёл. Осталось попыток: ${r.left}.`;
+    if (r.error !== 'не-тот-код') bdb.clearState(user.id);
+    await tg.sendMessage(chatId, said,
+      keyboard([[{ text: '✅ Я оплатил', data: 'pay.claim' }], [{ text: '⬅️ Подписка', data: 'billing' }]]));
+    return;
+  }
+  bdb.clearState(user.id);
+  if (!r.taken) {
+    // Не «не вижу оплату»: она есть, её просто уже зачли — обычно в
+    // приложении, секундой раньше. Человеку важно, что доступ у него есть.
+    const info = billing.accessInfo(user.id);
+    await tg.sendMessage(chatId,
+      info.active
+        ? `✅ Эта оплата уже зачтена. Доступ до <b>${ru(info.until)}</b>.`
+        : 'Эту оплату уже зачли. Если доступа всё равно нет — напишите в поддержку, разберёмся.',
+      mainMenu());
+    return;
+  }
+  await tg.sendMessage(chatId,
+    `✅ Нашёл ${r.taken} ${plural(r.taken, 'оплату', 'оплаты', 'оплат')}. `
+    + `Доступ до <b>${ru(r.until)}</b>.`, mainMenu());
+}
+
+/** Кого имел в виду владелец: номер, @имя или пересланное сообщение. */
+function findTarget(who) {
+  const clean = String(who || '').replace(/^@/, '').trim();
+  if (!clean) return null;
+  // По номеру заводим карточку сразу: доступ можно выдать заранее, ещё до
+  // того как человек нажал «Старт», — при первом заходе он его уже увидит.
+  if (/^\d+$/.test(clean)) return bdb.getOrCreateUser(Number(clean));
+  return bdb.findUserByUsername(clean);
+}
+
+const OWNER_HELP = [
+  '<b>Команды владельца</b>',
+  '',
+  '<b>Доступ конкретному человеку</b>',
+  '<code>/grant 123456789 30</code> — выдать 30 дней по номеру',
+  '<code>/grant @ivanov 30</code> — то же по имени (если он уже запускал бота)',
+  '<code>/ungrant @ivanov</code> — снять доступ (пригодится, чтобы посмотреть, как выглядит бесплатный режим)',
+  '<code>/orgs @ivanov 1</code> — открыть место под ещё одну организацию (в тариф входит две)',
+  '<code>/who</code> — у кого сейчас есть доступ',
+  '',
+  '<b>Коды доступа</b> — когда номера человека нет',
+  '<code>/code</code> — один код на 30 дней',
+  '<code>/code 90</code> — на 90 дней',
+  '<code>/code 30 5</code> — сразу пять кодов по 30 дней',
+  '<code>/code 30 5 бета-тест</code> — с пометкой, чтобы потом вспомнить',
+  '<code>/code 30 1x20 вебинар</code> — один код на 20 активаций',
+  '<code>/codes</code> — список кодов и кто их активировал',
+  '<code>/revoke PRV-XXXX-XXXX</code> — отключить код',
+  '',
+  '<b>Разное</b>',
+  '<code>/id</code> — узнать свой номер (эту команду можно дать клиенту)',
+].join('\n');
+
+/** Команды владельца: выдать доступ руками, кодами и посмотреть, у кого он есть. */
+async function ownerCommand(tg, chatId, text) {
+  if (text === '/admin' || text === '/owner') {
+    await tg.sendMessage(chatId, OWNER_HELP);
+    return true;
+  }
+
+  const grant = /^\/grant\s+(\S+)\s+(\d+)/.exec(text);
+  if (grant) {
+    const who = grant[1].replace(/^@/, '');
+    const days = Number(grant[2]);
+    const target = findTarget(who);
+    if (!target) {
+      await tg.sendMessage(chatId,
+        `Не нашёл пользователя ${esc(who)}.\n\nПо имени получится только если человек уже запускал бота. `
+        + 'Иначе выдайте по номеру (<code>/grant 123456789 30</code>) — номер он узнает командой <code>/id</code> — '
+        + 'или пришлите ему код: <code>/code</code>.');
+      return true;
+    }
+    const until = billing.grantDays(target.id, days);
+    await tg.sendMessage(chatId, `Выдал ${days} ${plural(days, 'день', 'дня', 'дней')} пользователю ${esc(target.name || who)} — до ${ru(until)}.`);
+    try {
+      await tg.sendMessage(target.tg_id, `✅ Доступ продлён до <b>${ru(until)}</b>.`);
+    } catch (e) { if (e && e.blocked) bdb.markBlocked(target.id); }
+    return true;
+  }
+
+  /*
+   * Место под ещё одну организацию — после доплаты.
+   *
+   * Отдельной командой, а не автоматом по платежу: сумма за место в тарифах
+   * не описана, и выдумывать её код не должен. Владелец получил деньги —
+   * владелец и открывает место.
+   */
+  const orgGrant = /^\/orgs\s+(\S+)(?:\s+(\d+))?/.exec(text);
+  if (orgGrant) {
+    const target = findTarget(orgGrant[1].replace(/^@/, ''));
+    if (!target) { await tg.sendMessage(chatId, `Не нашёл пользователя ${esc(orgGrant[1])}.`); return true; }
+    const n = Number(orgGrant[2] || 1);
+    const now = bdb.grantOrgSlots(target.id, n);
+    const q = bdb.orgQuota(target.id);
+    await tg.sendMessage(chatId,
+      `Открыл ${n} ${plural(n, 'место', 'места', 'мест')} пользователю ${esc(target.name || orgGrant[1])}.\n`
+      + `Теперь у него ${q.used} из ${q.limit} организаций (сверх тарифа — ${now}).`);
+    try {
+      await tg.sendMessage(target.tg_id,
+        `✅ Открыл место под ещё ${n === 1 ? 'одну организацию' : `${n} организации`}. `
+        + 'Завести — в разделе «Моя организация».');
+    } catch (e) { if (e && e.blocked) bdb.markBlocked(target.id); }
+    return true;
+  }
+
+  const ungrant = /^\/ungrant\s+(\S+)/.exec(text);
+  if (ungrant) {
+    const target = findTarget(ungrant[1]);
+    if (!target) { await tg.sendMessage(chatId, `Не нашёл пользователя ${esc(ungrant[1])}.`); return true; }
+    billing.revokeAccess(target.id);
+    await tg.sendMessage(chatId, `Доступ снят: ${esc(target.name || target.tg_id)}. Остался бесплатный лимит.`);
+    return true;
+  }
+
+  if (text === '/who') {
+    const list = billing.paidUsers();
+    await tg.sendMessage(chatId, list.length
+      ? '<b>С доступом:</b>\n' + list.map((u) => {
+        const how = billing.usedCodes(u.id).length ? ' · по коду' : '';
+        return `• ${esc(u.name || u.tg_id)}${u.username ? ` @${esc(u.username)}` : ''}`
+          + ` — до ${ru(u.access_until)}${how}\n  <code>${u.tg_id}</code>`;
+      }).join('\n')
+      : 'Доступов нет. Выдать: <code>/grant номер 30</code> или <code>/code</code>.');
+    return true;
+  }
+
+  // /code [дней] [сколько кодов | 1x20 активаций] [пометка]
+  // Список разбираем раньше выдачи: «/codes» тоже начинается с «/code».
+  const code = text === '/codes' ? null : /^\/code\b\s*(.*)$/.exec(text);
+  if (code) {
+    const rest = code[1].trim();
+    const m = /^(\d+)?\s*(?:(\d+)(?:x(\d+))?)?\s*(.*)$/i.exec(rest) || [];
+    const days = Number(m[1]) || 30;
+    const count = Number(m[2]) || 1;
+    const maxUses = Number(m[3]) || 1;
+    const note = (m[4] || '').trim();
+    const made = billing.createCodes({ days, count, maxUses, note });
+    const many = maxUses > 1 ? ` · до ${maxUses} активаций каждый` : '';
+    await tg.sendMessage(chatId,
+      `Готово: ${made.length} ${plural(made.length, 'код', 'кода', 'кодов')} на ${days} `
+      + `${plural(days, 'день', 'дня', 'дней')}${many}${note ? ` · ${esc(note)}` : ''}\n\n`
+      + made.map((c) => `<code>${c.pretty}</code>`).join('\n')
+      + '\n\nОтдайте код человеку: в боте «⭐ Подписка» → «🎟 У меня есть код». '
+      + 'Или пусть просто пришлёт код сообщением — бот поймёт.');
+    return true;
+  }
+
+  if (text === '/codes') {
+    const list = billing.listCodes(20);
+    if (!list.length) {
+      await tg.sendMessage(chatId, 'Кодов нет. Создать: <code>/code 30</code>.');
+      return true;
+    }
+    const lines = list.map((c) => {
+      const who = billing.codeUsers(c.code)
+        .map((u) => (u.username ? `@${u.username}` : (u.name || u.tg_id))).join(', ');
+      const state = c.revoked_at ? 'отключён'
+        : (c.uses >= c.max_uses ? 'использован' : `свободен ${c.max_uses - c.uses} из ${c.max_uses}`);
+      return `${c.live ? '🟢' : '⚪️'} <code>${c.pretty}</code> — ${c.days} дн. · ${state}`
+        + `${c.note ? ` · ${esc(c.note)}` : ''}${who ? `\n   ${esc(who)}` : ''}`;
+    });
+    await tg.sendMessage(chatId, `<b>Коды доступа</b>\n\n${lines.join('\n')}`);
+    return true;
+  }
+
+  const revoke = /^\/revoke\s+(\S+)/.exec(text);
+  if (revoke) {
+    const target = billing.getCode(revoke[1]);
+    if (!target) { await tg.sendMessage(chatId, 'Такого кода нет.'); return true; }
+    const done = billing.revokeCode(revoke[1]);
+    await tg.sendMessage(chatId, done
+      ? `Код <code>${target.pretty}</code> отключён. Уже выданный по нему доступ остаётся — снять: <code>/ungrant номер</code>.`
+      : `Код <code>${target.pretty}</code> и так был отключён.`);
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Активация кода доступа. Работает и из формы, и когда человек просто
+ * прислал код сообщением — узнать его по виду несложно, а лишний шаг
+ * «сначала нажмите кнопку» раздражает.
+ */
+async function redeemPromo(tg, chatId, user, text) {
+  bdb.clearState(user.id);
+  const res = billing.redeemCode(user.id, text);
+  if (!res.ok) {
+    await tg.sendMessage(chatId, `${esc(res.error)}`, keyboard([
+      [{ text: '🎟 Ввести ещё раз', data: 'promo' }],
+      [{ text: '💬 Поддержка', data: 'support' }, { text: '⬅️ Подписка', data: 'billing' }],
+    ]));
+    return;
+  }
+  await tg.sendMessage(chatId,
+    `✅ Код принят: ${res.days} ${plural(res.days, 'день', 'дня', 'дней')} без ограничений.\n`
+    + `Доступ до <b>${ru(res.until)}</b>.`, mainMenu());
+}
+
+// ---------- поддержка ----------
+
+async function showSupport(tg, chatId, user) {
+  bdb.clearState(user.id);
+  const { text, rows } = supportScreen();
+  await tg.sendMessage(chatId, text, keyboard(rows));
+}
+
+async function showLegal(tg, chatId, user) {
+  bdb.clearState(user.id);
+  const { text, rows } = legalScreen();
+  await tg.sendMessage(chatId, text, keyboard(rows));
+}
+
+async function handleSupportText(tg, chatId, user, text) {
+  bdb.clearState(user.id);
+  let sentOk = false;
+  try {
+    sentOk = await forwardToSupport(tg, { user, chatId, text });
+  } catch (e) {
+    sentOk = false;
+  }
+  await tg.sendMessage(chatId, sentOk
+    ? '✅ Отправил. Ответим сюда же, в этот чат.'
+    : 'Не получилось отправить обращение. Напишите нам напрямую — контакт в разделе «Поддержка».',
+  mainMenu());
+}
+
+// ---------- УПД: статус и НДС ----------
+
+/**
+ * У УПД два режима, и разница принципиальная: статус 1 — это счёт-фактура,
+ * его выставляет только плательщик НДС. Молча выбрать за пользователя нельзя,
+ * поэтому спрашиваем — и сразу подписываем, кому какой нужен.
+ */
+async function askUpdStatus(tg, chatId, user, cpId) {
+  if (!(await requireQuota(tg, chatId, user))) return;
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  await tg.sendMessage(chatId,
+    'Какой УПД нужен?\n\n'
+    + '<b>Статус 2</b> — только передаточный документ (акт). Для тех, кто НДС '
+    + 'не платит: упрощёнка до порога, патент, самозанятость.\n'
+    + '<b>Статус 1</b> — счёт-фактура и акт в одном документе. Выставляют плательщики НДС; '
+    + 'спрошу ставку и посчитаю налог.\n\n'
+    // Прежний текст звал сюда по слову «упрощёнка», и это перестало быть
+    // правдой: с 2026 года упрощенец со ставкой 5% или 7% — плательщик НДС и
+    // счёт-фактуру выставлять обязан. Прочитав «для тех, кто на упрощёнке»,
+    // он выбирал статус 2, где ставка принудительно пустая, и отдавал
+    // контрагенту документ, по которому нечего принять к вычету.
+    + '<i>На упрощёнке со ставкой 5% или 7% нужен статус 1: с 2026 года это '
+    + 'тоже плательщик НДС.</i>',
+    keyboard([
+      [{ text: '📄 Статус 2 — без счёта-фактуры', data: `upd.s2:${cpId}` }],
+      [{ text: '🧾 Статус 1 — со счётом-фактурой', data: `upd.s1:${cpId}` }],
+      [{ text: '✖️ Отмена', data: `cp:${cpId}` }],
+    ]));
+}
+
+async function askUpdRate(tg, chatId, user, cpId) {
+  await tg.sendMessage(chatId, 'Ставка НДС:',
+    keyboard([
+      [{ text: '22%', data: `upd.r:${cpId}:22` }, { text: '20%', data: `upd.r:${cpId}:20` }],
+      [{ text: '10%', data: `upd.r:${cpId}:10` }, { text: '5%', data: `upd.r:${cpId}:5` }],
+      [{ text: '7%', data: `upd.r:${cpId}:7` }, { text: '0%', data: `upd.r:${cpId}:0` }],
+      [{ text: 'Без НДС (освобождение)', data: `upd.r:${cpId}:none` }],
+      [{ text: '✖️ Отмена', data: `cp:${cpId}` }],
+    ]));
+}
+
+async function askUpdGross(tg, chatId, user, cpId, rate) {
+  if (rate === 'none') {
+    await startItems(tg, chatId, user, 'upd', cpId, { status: 1, vatRate: null });
+    return;
+  }
+  /*
+   * При нулевой ставке спрашивать нечего: налога нет, и «выделить из суммы»
+   * с «начислить сверху» дают ровно одно и то же. Лишний вопрос на ровном
+   * месте заставляет человека гадать, есть ли между ответами разница.
+   */
+  if (String(rate) === '0') {
+    await startItems(tg, chatId, user, 'upd', cpId,
+      { status: 1, vatRate: 0, priceIncludesVat: false });
+    return;
+  }
+  await tg.sendMessage(chatId,
+    `Ставка ${rate}%. Цены, которые будете вводить, — с налогом или без?\n`
+    + '<i>От этого зависит, что попадёт в графу 4 и в сумму налога.</i>',
+    keyboard([
+      [{ text: 'Цены с НДС (выделить из суммы)', data: `upd.g:${cpId}:${rate}:1` }],
+      [{ text: 'Цены без НДС (начислить сверху)', data: `upd.g:${cpId}:${rate}:0` }],
+      [{ text: '✖️ Отмена', data: `cp:${cpId}` }],
+    ]));
+}
+
+// ---------- фотография счёта → операция ----------
+
+/**
+ * Присланное фото распознаём и предлагаем занести операцией.
+ * Ничего не сохраняем молча: пользователь видит, что прочиталось,
+ * и подтверждает. Ошибиться в сумме тут стоит дороже, чем переспросить.
+ */
+// ---------- отправка документа на почту ----------
+
+/**
+ * Текст письма. Нарочно короткий и деловой: длинные автоприветствия
+ * в деловой переписке читаются как спам, а получателю нужно понять за
+ * две секунды, что пришло и что с этим делать.
+ */
+function letterFor(doc, org, cp) {
+  const kind = (doc.title || 'Документ').toLowerCase();
+  const money = doc.total ? ` на сумму ${formatRub(doc.total)}` : '';
+  const lines = [
+    `Здравствуйте${cp.signer ? `, ${cp.signer}` : ''}!`,
+    '',
+    `Во вложении ${kind} № ${doc.number} от ${ru(doc.date)}${money}.`,
+  ];
+  if (doc.type === 'sch') {
+    lines.push('', 'В счёте есть QR-код: оплатить можно, наведя камеру в приложении банка.');
+  }
+  /*
+   * У акта сверки письмо другое по смыслу. Остальные документы отправляют,
+   * чтобы человек их получил; акт сверки — чтобы он с ним согласился или
+   * возразил. Поэтому прямо просим сверить и ответить: без этой просьбы
+   * акт кладут в папку, и расхождение всплывает через полгода.
+   */
+  if (doc.type === 'akt') {
+    lines.push('',
+      'Просьба сверить данные со своей стороны. Если расхождений нет — подпишите '
+      + 'и пришлите скан в ответ. Если что-то не сходится, напишите, по какой '
+      + 'строке, и я проверю у себя.');
+  }
+  lines.push('', 'С уважением,', org.name || org.full_name || '');
+  return lines.join('\n');
+}
+
+/**
+ * Отправляет ранее выписанный документ на почту контрагента.
+ * Если почта не сохранена — спрашиваем её и запоминаем на будущее.
+ */
+async function mailDoc(tg, chatId, user, docId, emailOverride = null) {
+  // Письмо уходит из ящика самого пользователя: с нашего адреса оно
+  // попадало бы в спам и юридически отправителем были бы мы.
+  const box = mailbox.resolve(user.id);
+  if (!box.ok) {
+    await tg.sendMessage(chatId, esc(box.reason),
+      keyboard([[{ text: '✉️ Подключить почту', data: 'mb' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+  const d = bdb.getDoc(user.id, docId);
+  if (!d) { await tg.sendMessage(chatId, 'Документ не найден.', mainMenu()); return; }
+  const cp = bdb.getCp(user.id, d.cp_id);
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
+
+  const to = String(emailOverride || cp.email || '').trim();
+  if (!to) {
+    bdb.setState(user.id, `mail:${docId}`);
+    await tg.sendMessage(chatId,
+      `На какую почту отправить <b>${esc(d.title)} № ${esc(d.number)}</b>?\n`
+      + 'Напишите адрес — я запомню его для этого клиента.',
+      keyboard([[{ text: '✖️ Отмена', data: `doc:${docId}` }]]));
+    return;
+  }
+  if (!mailer.validEmail(to)) {
+    await tg.sendMessage(chatId, `«${esc(to)}» не похоже на адрес. Напишите ещё раз.`);
+    return;
+  }
+
+  await tg.sendChatAction(chatId, 'typing');
+  const built = await docService.rebuildDocument(user.id, docId);
+  if (!built.ok) { await tg.sendMessage(chatId, esc(built.message), mainMenu()); return; }
+
+  const org = bdb.getOrg(user.id, d.org_id) || bdb.currentOrg(user.id) || {};
+  const res = await mailer.sendMail({
+    to,
+    subject: `${d.title} № ${d.number} от ${ru(d.date)}`,
+    text: letterFor(d, org, cp),
+    attachments: [{
+      filename: built.file.filename,
+      content: built.file.buffer,
+      contentType: built.file.mime,
+    }],
+  }, box.options);
+
+  bdb.clearState(user.id);
+  if (!res.ok) {
+    // Настоящая причина (адрес сервера, порт, код) — в журнал; человеку — одна понятная фраза.
+    await tg.sendMessage(chatId,
+      `${esc(mailer.failText(res))}\n\nПопробуйте ещё раз или пришлите файл вручную.`,
+      keyboard([[{ text: '⚙️ Настройки почты', data: 'mb' }],
+        [{ text: '↩️ К документу', data: `doc:${docId}` }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+
+  if (to !== cp.email) bdb.updateCp(user.id, cp.id, { email: to });
+  await tg.sendMessage(chatId,
+    `✉️ Отправил <b>${esc(d.title)} № ${esc(d.number)}</b> на <b>${esc(to)}</b>.`
+    + (to !== cp.email ? '\nАдрес запомнил — в следующий раз спрашивать не буду.' : ''),
+    keyboard([[{ text: '↩️ К документу', data: `doc:${docId}` }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+}
+
+/**
+ * Акт сверки себе на почту.
+ *
+ * Только себе, в свой же ящик. Контрагенту отсюда не уходит ничего: акт
+ * сверки — двусторонний документ, на него отвечают, и рассылка без ведома
+ * человека означала бы, что он отправил клиенту бумагу, которую не видел.
+ * Клиенту письмо уходит отдельной кнопкой, где виден текст.
+ *
+ * Собираем заново из операций: акт сверки не хранится файлом, в отличие от
+ * счетов и актов услуг, — он всегда актуален на момент сборки.
+ *
+ * Тихо не падаем: письмо здесь — приложение к операции, а не сама операция.
+ * Ящик не настроен или почта не ответила — строка в журнале всё равно
+ * должна остаться.
+ *
+ * @returns {Promise<{ok:boolean, error?:string}>}
+ */
+async function mailAktToSelf(user, cp) {
+  const box = mailbox.resolve(user.id);
+  if (!box.ok) return { ok: false, error: box.reason };
+  /*
+   * Адрес «себе» знаем только у своего ящика. Общий SMTP из окружения —
+   * это наш служебный отправитель, и куда слать копию, из него не следует.
+   * Слать на непонятно чей адрес хуже, чем не слать.
+   */
+  const to = box.own ? String(box.options.from || box.options.user || '').trim() : '';
+  if (!to) return { ok: false, error: 'Не знаю вашего адреса — подключите свой ящик.' };
+  const org = bdb.currentOrg(user.id);
+  if (!org) return { ok: false, error: 'Ваша фирма не заведена.' };
+  const p = bdb.cpForPeriod(user.id, cp.id, '', '');
+  if (!p) return { ok: false, error: 'Не удалось собрать акт.' };
+
+  const buf = await buildAkt({ org: orgForAkt(org), cp: p.view, ops: p.ops });
+  return mailer.sendMail({
+    to,
+    subject: `Акт сверки с ${cp.name} на ${ru(todayISO())}`,
+    text: `Акт сверки с ${cp.name} за период ${ru(p.from)}—${ru(p.to)}.\n`
+      + `Долг на начало периода — ${Math.abs(p.opening)}, на конец — ${Math.abs(p.closing)}.\n\n`
+      + 'Письмо собрано автоматически по вашему повторению. '
+      + 'Клиенту оно не отправлялось.',
+    attachments: [{
+      filename: `Акт_сверки_${safeName(cp.name)}.xlsx`,
+      content: Buffer.from(buf),
+      contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    }],
+  }, box.options);
+}
+
+// ---------- почтовый ящик пользователя ----------
+
+/** Экран «Почта для отправки»: что подключено и как это поменять. */
+async function showMailbox(tg, chatId, user) {
+  const box = mailbox.info(user.id);
+  const rows = [];
+  let txt = '<b>Почта для отправки</b>\n\n';
+  if (box) {
+    txt += `Подключён ящик <b>${esc(box.from)}</b>\n`
+      + `Сервер: ${esc(box.host)}:${box.port}\n`
+      + `Проверен: ${box.checkedAt ? 'да' : '<b>ещё нет</b>'}\n\n`
+      + 'Счета и акты уходят клиентам с этого адреса — как будто вы отправили их сами.';
+    // Сверху то, чем пользуются каждый день; настройка ящика — снизу.
+    if (box.canRead) rows.push([{ text: '📥 Проверить входящие', data: 'inbox' }]);
+    rows.push([{ text: '📨 Отправить проверочное письмо', data: 'mb.test' }]);
+    rows.push([{ text: '🔁 Подключить другой ящик', data: 'mb.new' }]);
+    rows.push([{ text: '🗑 Отключить почту', data: 'mb.del' }]);
+  } else {
+    txt += 'Ящик не подключён. Подключите свой — и документы будут уходить '
+      + 'клиентам <b>с вашего адреса</b>.\n\n'
+      + '<i>Почему со своего: письмо с чужого адреса почтовые службы кладут '
+      + 'в спам, а получатель видит незнакомого отправителя и не открывает его.</i>';
+    rows.push([{ text: '✉️ Подключить ящик', data: 'mb.new' }]);
+  }
+  rows.push([{ text: '⬅️ К организации', data: 'org' }]);
+  await tg.sendMessage(chatId, txt, keyboard(rows));
+}
+
+/** Проверочное письмо самому себе: убедиться, что пароль принят. */
+async function testMailbox(tg, chatId, user) {
+  const box = mailbox.resolve(user.id);
+  if (!box.ok) { await tg.sendMessage(chatId, esc(box.reason)); return; }
+  await tg.sendChatAction(chatId, 'typing');
+  const res = await mailer.sendMail({
+    to: box.options.from,
+    subject: 'Проверка почты — Первичка',
+    text: 'Это проверочное письмо от бота «Первичка».\n\n'
+      + 'Если вы его видите, отправка документов клиентам настроена верно.',
+  }, box.options);
+  if (!res.ok) {
+    await tg.sendMessage(chatId,
+      `${esc(mailer.failText(res))}\n\n`
+      + '<i>Чаще всего дело в пароле: у Яндекса и Mail.ru нужен не обычный '
+      + 'пароль от почты, а отдельный «пароль приложения».</i>',
+      keyboard([[{ text: '🔁 Ввести заново', data: 'mb.new' }], [{ text: '⬅️ Назад', data: 'mb' }]]));
+    return;
+  }
+  mailbox.markChecked(user.id);
+  await tg.sendMessage(chatId,
+    `✅ Письмо ушло на <b>${esc(box.options.from)}</b> — проверьте ящик.\n`
+    + 'Почта настроена, документы можно отправлять клиентам.');
+  await showMailbox(tg, chatId, user);
+}
+
+/**
+ * Проверка входящей почты: забираем новые письма и показываем те, в которых
+ * есть вложения похожие на документы.
+ *
+ * Письма не помечаем прочитанными и ничего не удаляем — человек по-прежнему
+ * ведёт свою почту сам, а бот только подсматривает. Помечать чужие письма
+ * своими действиями значит ломать чужой рабочий процесс.
+ */
+async function checkInbox(tg, chatId, user) {
+  const conf = mailbox.resolveImap(user.id);
+  if (!conf.ok) {
+    await tg.sendMessage(chatId, `${esc(conf.reason)}`,
+      keyboard([[{ text: '✉️ Настроить почту', data: 'mb' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+
+  await tg.sendChatAction(chatId, 'typing');
+  const res = await fetchNew(conf.config, { limit: 15, unseenOnly: false, sinceDays: 14 });
+  if (!res.ok) {
+    await tg.sendMessage(chatId,
+      `Не смог прочитать почту: ${esc(res.error)}\n\n`
+      + '<i>Если пароль подошёл для отправки, но не подходит здесь — у некоторых '
+      + 'провайдеров доступ по IMAP включается отдельно в настройках почты.</i>',
+      keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+
+  // Оставляем только письма с вложениями-документами и только новые.
+  const found = [];
+  for (const m of res.messages) {
+    if (m.uid <= conf.lastUid) continue;
+    const parsed = mime.parseMessage(m.raw);
+    const docs = parsed.attachments.filter(mime.looksLikeDocument);
+    if (!docs.length) continue;
+    const kinds = [...new Set(docs
+      .map((d) => mime.documentKind(d.filename, parsed.subject))
+      .filter(Boolean))].join(', ');
+    found.push({ uid: m.uid, ...parsed, docs, kinds });
+  }
+
+  if (!found.length) {
+    await tg.sendMessage(chatId,
+      `Просмотрел ${res.messages.length} ${plural(res.messages.length, 'письмо', 'письма', 'писем')} `
+      + 'за две недели — новых писем с документами не нашёл.\n\n'
+      + '<i>Смотрю вложения: счета, акты, УПД, накладные, договоры — PDF, Word, Excel и сканы.</i>',
+      keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+
+  inboxPut(user.id, found);
+  const maxUid = Math.max(...found.map((f) => f.uid));
+  mailbox.setLastUid(user.id, maxUid);
+
+  await tg.sendMessage(chatId,
+    `Нашёл ${found.length} ${plural(found.length, 'письмо', 'письма', 'писем')} с документами:`,
+    keyboard([
+      // В строке письма — вид документа, а не только тема: человек ищет
+      // глазами «где акт», и открывать каждое письмо ради этого незачем.
+      ...found.map((f, i) => [{
+        text: `${f.kinds || '📎'} · ${f.fromName || f.from}`.slice(0, 60),
+        data: `in.m:${i}`,
+      }]),
+      [{ text: '⬅️ Меню', data: 'menu' }],
+    ]));
+}
+
+/*
+ * Разобранные письма держим в памяти до следующей проверки — но не вечно.
+ *
+ * В записи лежат буферы всех вложений, а класть их сюда мы обязаны: человек
+ * листает письма кнопками и нажимает «сохранить» отдельным шагом, второй раз
+ * с почты их не забрать. Беда была в том, что запись не убиралась никогда: у
+ * каждого, кто хоть раз проверил почту, содержимое писем висело в памяти
+ * бота до перезапуска, а бот один на всех.
+ *
+ * Час — с запасом на то, чтобы посмотреть письма и решить, что с ними
+ * делать. Просроченное убираем при любом обращении к кэшу, чтобы уборка не
+ * зависела от отдельного таймера, который однажды забудут завести.
+ */
+const INBOX_TTL_MS = 60 * 60 * 1000;
+const inboxCache = new Map();
+
+function inboxPut(userId, list) {
+  inboxCache.set(userId, { at: Date.now(), list });
+  inboxSweep();
+}
+
+function inboxGet(userId) {
+  inboxSweep();
+  const row = inboxCache.get(userId);
+  return row ? row.list : [];
+}
+
+function inboxSweep() {
+  const edge = Date.now() - INBOX_TTL_MS;
+  for (const [id, row] of inboxCache) if (row.at < edge) inboxCache.delete(id);
+}
+
+/*
+ * Имя клиента, названное вслух, но не найденное в списке.
+ *
+ * Держим его до нажатия «Добавить», чтобы подставить в форму. В callback_data
+ * имя не кладём: там 64 байта на всё, а название вроде
+ * «ООО Производственно-торговая компания „Заря“» и двоеточия внутри разнесут
+ * разбор, который у нас везде идёт по двоеточиям.
+ *
+ * Четверть часа — с запасом на «отвлёкся и вернулся», но без вечной памяти:
+ * подставить позавчерашнее имя в сегодняшнюю форму хуже, чем спросить заново.
+ */
+const PENDING_CP_TTL_MS = 15 * 60 * 1000;
+const pendingCpName = new Map();
+
+function pendingCpPut(userId, name) {
+  pendingCpName.set(userId, { at: Date.now(), name });
+  const edge = Date.now() - PENDING_CP_TTL_MS;
+  for (const [id, row] of pendingCpName) if (row.at < edge) pendingCpName.delete(id);
+}
+
+function pendingCpGet(userId) {
+  const row = pendingCpName.get(userId);
+  if (!row || row.at < Date.now() - PENDING_CP_TTL_MS) { pendingCpName.delete(userId); return ''; }
+  return row.name;
+}
+
+/**
+ * Кнопки для «клиентов ещё нет» из ассистента. Ведут в короткую анкету
+ * (ИНН, имя, кто платит), а не в полную из 13 шагов; имя из фразы кладём
+ * в память, чтобы не спрашивать его второй раз.
+ */
+function addClientKb(user, who, type) {
+  let first;
+  if (who) {
+    pendingCpPut(user.id, who);
+    first = [{ text: `➕ Завести «${who}»`.slice(0, 60), data: `cp.pre:${type || 'none'}` }];
+  } else first = [{ text: '👤 Добавить клиента', data: 'cp.q' }];
+  return keyboard([first, [{ text: '⬅️ Меню', data: 'menu' }]]);
+}
+
+/**
+ * Фраза-просьба, а не строка позиции: «выставь счёт ООО Заря на 50 000».
+ *
+ * В наборе позиций любой текст — это позиция, и такая фраза превращалась в
+ * позицию с названием «выставь счёт ООО Заря» на сумму 50 000. Отличаем по
+ * двум признакам сразу: начинается с глагола просьбы или названия документа
+ * И называет клиента (из списка или с «ООО/ИП» впереди). Одного глагола мало:
+ * «Акт приёмки 1 3000» — честная позиция, клиента в ней нет.
+ */
+const REQUEST_START = /^\s*(выстав|выпиш|сдела|сформир|подготов|составь|оформи|создай|нужен|нужна|нужно|счёт|счет|акт|упд|накладн|торг)/i;
+/*
+ * Строже, чем looksLikeRequest: ответы на вопросы шаблона договора сами
+ * начинаются со слов вроде «Торговая площадка», «Актовый зал», «Нужно
+ * поставить…» — по корню они похожи на просьбу, а это ответ. Здесь — только
+ * глагол выписки или название документа целым словом.
+ */
+const DOC_REQUEST = /^\s*(?:(?:выстав|выпиш|сформир|оформи|создай|сделай)[\p{L}]*\s+|(?:счёт|счет|акт|упд|торг-?12|накладн[\p{L}]*)(?![\p{L}\d-]))/iu;
+function looksLikeDocRequest(text, cps) {
+  return DOC_REQUEST.test(text) && looksLikeRequest(text, cps);
+}
+
+function looksLikeRequest(text, cps) {
+  if (!REQUEST_START.test(text)) return false;
+  if (/(?:^|\s)(?:ооо|оао|зао|пао|ип|ао)\s+[«"„]?[\p{L}\p{N}]/iu.test(text)) return true;
+  const words = String(text).split(/[^\p{L}\p{N}]+/u).slice(1).filter((w) => w.length >= 3);
+  return words.some((w) => { const m = ai.matchCp(cps, w); return Boolean(m.cp || m.choices); });
+}
+
+/** Карточка письма: от кого, что во вложении, что с этим делать. */
+async function showInboxMessage(tg, chatId, user, index) {
+  const list = inboxGet(user.id);
+  const m = list[index];
+  if (!m) { await tg.sendMessage(chatId, 'Письмо уже неактуально — проверьте почту заново.', mainMenu()); return; }
+
+  const files = m.docs.map((d, i) => {
+    const kind = mime.documentKind(d.filename, m.subject);
+    return `${i + 1}. ${kind ? `<b>${esc(kind)}</b> — ` : ''}${esc(d.filename)}`
+      + ` (${Math.round(d.size / 1024)} КБ)`;
+  }).join('\n');
+  const cps = bdb.listCps(user.id);
+  /*
+   * Контрагента здесь именно УГАДЫВАЕМ, и говорить об этом надо вслух.
+   *
+   * Адрес берётся из заголовка From, а он подделывается тривиально: ни SPF,
+   * ни DKIM мы не проверяем. Рядом с угаданным именем стоит кнопка «внести
+   * долг» с уже выбранным контрагентом — то есть поддельный счёт от знакомого
+   * поставщика получал опору в интерфейсе. Это самая частая схема обмана в
+   * малом бизнесе, и молчаливое «Похоже на контрагента» работало на неё.
+   *
+   * Убирать кнопку не стали: в подавляющем большинстве случаев письмо
+   * настоящее, и лишние шаги делают работу невыносимой. Но подпись под ней
+   * теперь честная — сверить реквизиты человек должен сам.
+   */
+  const guess = cps.find((c) => c.email && c.email.toLowerCase() === m.from)
+    || cps.find((c) => m.fromName && c.name && m.fromName.toLowerCase().includes(c.name.toLowerCase().slice(0, 8)));
+
+  await tg.sendMessage(chatId,
+    `<b>${esc(m.fromName || m.from)}</b>\n${esc(m.from)}\n\n`
+    + `<b>${esc(m.subject || 'Без темы')}</b>\n\n`
+    + `Вложения:\n${files}\n\n`
+    + (guess
+      ? `Похоже на клиента <b>${esc(guess.name)}</b>.\n\n`
+        + '<i>Адрес отправителя подделать несложно, я его не проверяю. '
+        + 'Перед оплатой сверьте счёт и реквизиты — особенно если они '
+        + 'изменились с прошлого раза.</i>'
+      : 'Клиент не опознан.'),
+    keyboard([
+      [{ text: '📎 Прислать вложение сюда', data: `in.f:${index}` }],
+      ...(guess ? [[{ text: `💸 Внести долг перед ${guess.name}`.slice(0, 60), data: `in.op:${index}:${guess.id}` }]] : []),
+      [{ text: '⬅️ К письмам', data: 'inbox' }],
+    ]));
+}
+
+// ---------- подпись и печать (факсимиле) ----------
+
+const FX_NAMES = { sign: 'подпись', stamp: 'печать' };
+
+/*
+ * Ставки НДС, которые бывают. Тот же список, что и у мини-приложения.
+ *
+ * Проверять надо и здесь, хотя значение приходит из callback_data собственной
+ * кнопки: callback_data подделывается кем угодно, а «vat.set:1e9:0» уходило в
+ * настройку организации как есть и печатало в счетах «НДС 1000000000%». Своим
+ * же документам, но чинить надо не выборочно — правило проекта требует
+ * проверять вход на границе, и кнопка такая же граница, как HTTP-запрос.
+ */
+const VAT_RATES = ['0', '5', '7', '10', '20', '22'];
+const okRate = (r) => r === 'none' || VAT_RATES.includes(String(r));
+
+/** Человеческое название режима НДС организации. */
+function vatLabel(org) {
+  const v = bdb.vatOf(org);
+  if (v.rate == null) return 'без НДС';
+  return `${v.rate}%${v.rate === 0 ? '' : (v.gross ? ', цены с НДС' : ', НДС сверху')}`;
+}
+
+const BASIS_LABEL = {
+  closing: 'по акту, УПД или накладной',
+  invoice: 'по выставленному счёту',
+  manual: 'не считать — веду журнал сам',
+};
+
+/**
+ * Из чего возникает долг. Развилка не техническая, а про устройство бизнеса,
+ * поэтому объясняем на примерах, а не терминами.
+ */
+async function showBasis(tg, chatId, user) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
+  const now = bdb.basisOf(org);
+  await tg.sendMessage(chatId,
+    `<b>Когда клиент становится должен</b>\n\nСейчас: <b>${esc(BASIS_LABEL[now])}</b>\n\n`
+    + '<b>По акту</b> — обычный подряд и торговля: счёт это просьба заплатить, '
+    + 'а долг появляется, когда работа сдана или товар отгружен.\n\n'
+    + '<b>По счёту</b> — аренда и субаренда, абонентское обслуживание: акт '
+    + 'каждый месяц не составляют, счёт и есть основание.\n\n'
+    + '<i>Выбор один на организацию — иначе долг задвоится: сначала по счёту, '
+    + 'потом по акту на ту же сделку.</i>',
+    keyboard([
+      [{ text: 'Долг по акту / УПД / накладной', data: 'basis.set:closing' }],
+      [{ text: 'Долг по счёту (аренда)', data: 'basis.set:invoice' }],
+      [{ text: 'Не считать автоматически', data: 'basis.set:manual' }],
+      [{ text: '🤔 Не знаю — подберите по моему делу', data: 'biz' }],
+      [{ text: '⬅️ К организации', data: 'org' }],
+    ]));
+}
+
+// ---------- свободный ввод ----------
+
+/**
+ * Последняя попытка понять фразу, когда ни один разбор не сработал.
+ *
+ * Документ отсюда не выписывается никогда: в лучшем случае открывается
+ * обычный мастер с заполненными позициями, и человек нажимает ту же кнопку,
+ * что и всегда. Номера документов идут сквозным рядом — лишний счёт нельзя
+ * тихо удалить, дыру в нумерации придётся объяснять при проверке.
+ *
+ * @returns {Promise<boolean>} true — ответили, меню показывать не надо
+ */
+/**
+ * Вносит оплату (или приход) и отчитывается, что сделал.
+ *
+ * Сумма не названа — не гадаем: показываем долг из журнала и предлагаем
+ * внести его целиком одной кнопкой. Внесённое сразу можно отменить: раз
+ * проводку сделал бот, у человека должен быть способ убрать её тем же
+ * количеством нажатий, каким она появилась.
+ */
+/** Токен одноразовой кнопки — см. bdb.claimButton. Короткий: у данных кнопки лимит 64 байта. */
+const oneShot = () => require('node:crypto').randomBytes(4).toString('hex');
+
+/*
+ * Кнопка «внести оплату». Дата, названная во фразе, едет в самой кнопке:
+ * между фразой и нажатием состояния у бота нет, а «оплатил вчера» без даты
+ * превратилось бы в оплату сегодняшним числом. 8 цифр вместо ISO — кнопка
+ * ограничена 64 байтами.
+ */
+const packDay = (iso) => String(iso || '').replace(/-/g, '');
+const unpackDay = (v) => (/^\d{8}$/.test(v || '') ? period.isoDay(`${v.slice(0, 4)}-${v.slice(4, 6)}-${v.slice(6)}`) : '');
+const payData = (cpId, sum, flag, when = '', tok = oneShot()) => `pay.cp:${cpId}:${sum}:${flag}:${tok}${when ? `:${packDay(when)}` : ''}`;
+const prepayData = (cpId, sum, when = '', tok = oneShot()) => `pp.do:${cpId}:${sum}:${tok}${when ? `:${packDay(when)}` : ''}`;
+
+/*
+ * Предоплата клиента.
+ *
+ * Деньги ложатся обычной строкой «Оплата» (bdb.addPrepay) — не документом и не
+ * второй проводкой, иначе каждая накладная оплачивалась бы дважды. Дальше всё
+ * делает выписка: пока остаток покрывает накладную, она сразу «оплачена».
+ */
+async function doPrepay(tg, chatId, user, cpId, amount, when = '') {
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
+  const sum = round2(Math.abs(Number(amount) || 0));
+  if (!sum || sum >= 1e10) { await tg.sendMessage(chatId, 'Не разобрал сумму. Напишите число, например <code>140000</code>.'); return; }
+  const r = bdb.addPrepay(user.id, cpId, sum, period.isoDay(when) || todayISO());
+  const st = bdb.prepayState(user.id, cpId);
+  await tg.sendMessage(chatId,
+    `✅ Предоплата <b>${formatRub(sum)}</b> от ${quoted(cp.name)} внесена.\n\n`
+    + `${esc(bdb.prepayLine(st))}.\n`
+    + '<i>Накладные, акты и УПД этого клиента будут сами отмечаться оплаченными, пока хватает остатка.</i>',
+    keyboard([
+      [{ text: '↩️ Отменить запись', data: `pay.undo:${cpId}:${r.opId}` }],
+      [{ text: `📂 Карточка «${cp.name}»`.slice(0, 60), data: `cp:${cpId}` }],
+    ]));
+  // Аванс самозанятому — такое же поступление, как любое другое: чек на него нужен сразу.
+  await remindFresh(tg, chatId, user);
+}
+
+/**
+ * Предоплата клиента: сколько внесено, списано, осталось и какие накладные
+ * ушли из неё. Показ — цифры берём у bdb.prepayReport, те же, что в приложении.
+ * Клиент не на предоплате — сразу спрашиваем сумму, смотреть не на что.
+ */
+async function showPrepay(tg, chatId, user, cpId) {
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
+  const rep = bdb.prepayReport(user.id, cpId);
+  if (!rep) {
+    bdb.setState(user.id, `ppay:${cpId}`, {});
+    await tg.sendMessage(chatId, `Сколько внёс ${quoted(cp.name)} предоплатой? Напишите сумму, например <code>140000</code>.`);
+    return;
+  }
+  const docLine = (d) => `${esc(d.short || d.title)} № ${esc(d.number)} · ${ru(d.date)} · ${formatRub(d.sum || d.total)}`;
+  const lines = [
+    `💰 <b>Предоплата · ${esc(cp.name)}</b>`,
+    rep.paid > 0 ? `Внесено ${formatRub(rep.paid)} · списано ${formatRub(rep.spent)}` : '',
+    rep.debt > 0 ? '<b>Предоплата кончилась.</b>' : `<b>Осталось ${formatRub(rep.left)}</b>${rep.state.low ? ' — скоро кончится' : ''}`,
+  ];
+  if (rep.before > 0) lines.push(`<i>Накладные на ${formatRub(rep.before)} выписаны до предоплаты — они уже вычтены из остатка.</i>`);
+  if (rep.covered.length) {
+    const last = rep.covered.slice(-8);
+    lines.push('', `<b>Списано накладными (${rep.covered.length}):</b>`,
+      ...(rep.covered.length > last.length ? [`… и ещё ${rep.covered.length - last.length}`] : []),
+      ...last.map(docLine));
+  }
+  if (rep.debt > 0) {
+    lines.push('', `🔴 <b>Сверх предоплаты: ${formatRub(rep.debt)} — это долг.</b>`);
+    if (rep.over.length) {
+      lines.push(`Эти накладные в остаток целиком не поместились${rep.partial > 0 ? ` (${formatRub(rep.partial)} предоплаты ушло на них, остальное — долг)` : ''}:`,
+        ...rep.over.slice(0, 5).map(docLine));
+    }
+  }
+  await tg.sendMessage(chatId, lines.filter((x, i) => x !== '' || lines[i - 1] !== '').join('\n'),
+    keyboard([
+      [{ text: '➕ Пополнить', data: `pp.in:${cpId}` }, { text: '📄 Акт за месяц', data: `pp.act:${cpId}` }],
+      [{ text: `📂 Карточка «${cp.name}»`.slice(0, 60), data: `cp:${cpId}` }],
+    ]));
+}
+
+const monthAct = require('./lib/month-act');
+
+/** Выбор месяца для акта: три последних, с суммой не вошедших в акт отгрузок на кнопке. */
+async function askMonthAct(tg, chatId, user, cpId) {
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
+  const rows = [];
+  for (const { ym, title } of monthAct.lastMonths(3)) {
+    const p = monthAct.preview(user.id, cpId, ym);
+    if (p.docs.length) {
+      // «(после акта)»: акт за месяц уже был, а это — отгрузки, пришедшие после него.
+      rows.push([{ text: `${title} · ${formatMoney(p.sum)} ₽${p.acts.length ? ' (после акта)' : ''}`, data: `pp.act:${cpId}:${ym}` }]);
+    } else if (p.done) {
+      const total = p.acts.reduce((a, x) => a + (Number(x.total) || 0), 0);
+      rows.push([{ text: `${title} · ${formatMoney(total)} ₽ ✓`, data: `pp.act:${cpId}:${ym}` }]);
+    }
+  }
+  if (!rows.length) {
+    await tg.sendMessage(chatId, `У ${quoted(cp.name)} за последние три месяца нет накладных и УПД — акту не на чем строиться.`,
+      keyboard([[{ text: '⬅️ Карточка', data: `cp:${cpId}` }]]));
+    return;
+  }
+  await tg.sendMessage(chatId,
+    'Акт за какой месяц? Сумма — по накладным и УПД этого клиента, которые ещё не вошли в акт. Он подтверждает месяц целиком, '
+    + 'поэтому <b>нового долга не создаёт</b>: сумма уже учтена по накладным.',
+    keyboard([...rows, [{ text: '⬅️ Карточка', data: `cp:${cpId}` }]]));
+}
+
+/** Акт услуг за месяц на сумму отгрузок — без проводки, чтобы не задвоить долг (см. lib/month-act.js). */
+async function issueMonthAct(tg, chatId, user, cpId, ym) {
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(ym)) return;
+  const cp = bdb.getCp(user.id, cpId);
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
+  await tg.sendChatAction(chatId, 'upload_document');
+  const res = await monthAct.issue(user.id, cpId, ym);
+  if (!res.ok && res.reason === 'have') {
+    await tg.sendMessage(chatId, `${esc(res.message)} Найдёте его в документах клиента.`,
+      keyboard([[{ text: '📁 Документы клиента', data: `docs.cp:${cpId}` }]]));
+    return;
+  }
+  if (!res.ok) { await tg.sendMessage(chatId, esc(res.message), mainMenu()); return; }
+  const st = bdb.prepayState(user.id, cpId);
+  await tg.sendDocument(chatId, {
+    filename: res.file.filename, buffer: res.file.buffer,
+    caption: `Акт № ${esc(res.doc.number)} от ${ru(res.date)} для <b>${esc(cp.name)}</b> на ${formatRub(res.total)} `
+      + `за ${res.month}.\n<i>Долг не изменился: сумма уже в накладных.</i>`,
+  });
+  const ended = !st || st.ended || st.low;
+  await tg.sendMessage(chatId,
+    (st ? `${esc(bdb.prepayLine(st))}.\n\n` : '')
+    + (ended
+      ? 'Предоплата закончилась (или вот-вот): выпишите клиенту счёт на новую предоплату и допсоглашение.'
+      : 'Когда будете продлевать предоплату — счёт и договор здесь же.')
+    + '\n<i>Текст допсоглашения я не придумываю: «Договор» соберёт по вашему шаблону.</i>',
+    keyboard([
+      [{ text: '🧾 Счёт на новую предоплату', data: `d.sch:${cpId}` }],
+      [{ text: '📝 Договор', data: `d.dog:${cpId}` }, { text: '📎 Свой договор', data: `mc.menu:${cpId}` }],
+      [{ text: '💰 Внёс предоплату', data: `pp.in:${cpId}` }],
+    ]));
+}
+
+async function recordPay(tg, chatId, user, cpId, amount, kind, when = '') {
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
+  const isIncome = kind === 'Приход';
+  const sum = round2(Number(amount) || 0);
+
+  if (!sum) {
+    const bal = bdb.balanceOf(user.id, cpId);
+    const owed = round2(Math.abs(bal.closing));
+    if (!owed || bal.closing <= 0) {
+      await tg.sendMessage(chatId,
+        `За ${quoted(cp.name)} сейчас долга нет. Напишите сумму — например «оплата 50000».`,
+        keyboard([[{ text: `📂 Карточка «${cp.name}»`.slice(0, 60), data: `cp:${cpId}` }],
+          [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
+    await tg.sendMessage(chatId,
+      `За ${quoted(cp.name)} числится <b>${formatRub(owed)}</b>. Внести эту сумму как оплату?`,
+      keyboard([
+        [{ text: `✅ Да, ${formatMoney(owed)}`, data: payData(cpId, owed, 'o', when) }],
+        [{ text: '⬅️ Меню', data: 'menu' }],
+      ]));
+    return;
+  }
+
+  // Дата — если назвали («оплатил вчера»); иначе сегодня. Будущую без нажатия сюда не присылают (см. handleFreeText).
+  const op = { date: period.isoDay(when) || todayISO(), kind: isIncome ? 'Приход' : 'Оплата' };
+  if (isIncome) op.credit = sum; else op.debit = sum;
+  const opId = bdb.addOp(user.id, cpId, op);
+  /*
+   * Деньги в журнале — это полдела. Раньше документы после этого так и висели
+   * в «Не оплачено»: сальдо ноль, а счета «ждут оплаты». Закрываем те, что
+   * внесённая сумма покрывает целиком (старые первыми); частично покрытые не
+   * трогаем — пометка «оплачен» означала бы, что пришли все деньги. Человек
+   * нажал кнопку сам, так что подтверждение уже есть.
+   */
+  let closedDocs = [];
+  const undoIds = [opId];
+  if (!isIncome) {
+    const m = bdb.matchPaymentsToDocs(user.id, [{ opId, cpId, amount: sum, date: op.date, doc: '' }]);
+    if (m.deals.length) {
+      bdb.closeDocsFromBank(user.id, m.deals);
+      closedDocs = m.deals;
+      undoIds.length = 0;
+      for (const d of m.deals) {
+        const row = bdb.opsOfDoc(user.id, d.leadId).find((o) => o.kind === 'Оплата');
+        if (row) undoIds.push(row.id);
+      }
+      // Свободная строка могла остаться, если часть суммы никого не закрыла.
+      if (bdb.listOps(user.id, cpId).some((o) => o.id === opId)) undoIds.push(opId);
+    }
+  }
+  const bal = bdb.balanceOf(user.id, cpId);
+  const closing = round2(bal.closing);
+  await tg.sendMessage(chatId,
+    `✅ Внёс: <b>${op.kind} ${formatRub(sum)}</b> по ${quoted(cp.name)} за ${ru(op.date)}.\n\n`
+    + (closedDocs.length
+      ? `Отметил оплаченными: ${closedDocs.map((d) => esc(d.title)).join(', ')}.\n\n` : '')
+    + (closing > 0 ? `Остаток долга: <b>${formatRub(closing)}</b>.`
+      : closing < 0 ? `Переплата: <b>${formatRub(Math.abs(closing))}</b>.`
+        : 'Расчёты закрыты — долга нет.'),
+    keyboard([
+      [{ text: '↩️ Отменить запись', data: `pay.undo:${cpId}:${undoIds.join(',')}` }],
+      [{ text: `📂 Карточка «${cp.name}»`.slice(0, 60), data: `cp:${cpId}` }],
+    ]));
+  // Самозанятому деньги пришли — значит, пора пробить чек.
+  if (!isIncome) await remindFresh(tg, chatId, user);
+}
+
+/*
+ * Ответ голосом.
+ *
+ * Спросили голосом — отвечаем и голосом: человек за рулём или с товаром в
+ * руках читать не будет. Текст при этом тоже приходит — его можно
+ * перечитать и переслать. Синтез стоит денег, поэтому он в общем кошельке
+ * ИИ и упирается в тот же предел; кончился предел — отвечаем текстом молча,
+ * ответ-то уже есть.
+ */
+async function replyVoice(tg, chatId, user, text) {
+  if (typeof tg.sendVoice !== 'function' || !tts.ttsAvailable() || !bdb.isVoiceReply(user.id)) return false;
+  if (ai.budget(user.id).left <= 0) return false;
+  await tg.sendChatAction(chatId, 'record_voice');
+  ai.spend(user.id);
+  const got = await tts.synthesize(text, { format: 'ogg' });
+  if (got.spent) ai.spend(user.id, got.spent);
+  if (!got.ok || got.format !== 'ogg') {
+    Promise.resolve(office.record({ kind: 'tts', where: 'бот', error: String(got.error || got.oggError || ''), userId: user.id }))
+      .catch(() => {});
+    return false;
+  }
+  try {
+    await tg.sendVoice(chatId, {
+      buffer: got.buffer, duration: got.seconds,
+      buttons: [[{ text: '🔇 Отвечать текстом', data: 'voice.off' }]],
+    });
+    return true;
+  } catch (e) {
+    // Голосовые можно запретить в приватности Telegram. Это выбор человека,
+    // а не поломка: запоминаем и дальше не пытаемся.
+    if (e.forbidden) {
+      bdb.setVoiceReply(user.id, false);
+      await tg.sendMessage(chatId, 'Голосовые сообщения у вас закрыты в настройках Telegram — дальше отвечаю текстом.');
+    }
+    return false;
+  }
+}
+
+
+// ---------- что ассистент умеет по фразе: напомнить, повторить, сверить, показать за период ----------
+
+/** Кнопки выбора клиента: «Кого именно вы имели в виду — „зоре“?» */
+function whichClientKb(list, dataOf) {
+  return keyboard([...list.slice(0, 8).map((c) => ([{ text: c.name.slice(0, 60), data: dataOf(c) }])),
+    [{ text: '⬅️ Меню', data: 'menu' }]]);
+}
+
+/**
+ * «Напомни Вектору про долг» — тот же экран, что у кнопки «🔔 Напомнить»:
+ * текст в трёх тонах и кнопка отправки. Письмо уходит только по нажатию —
+ * ни при включённом ассистенте, ни при выключенном фраза сама ничего не шлёт:
+ * отправленное письмо должнику не вернуть.
+ */
+async function aiRemind(tg, chatId, user, intent) {
+  const debtors = bdb.debtors(user.id).filter((r) => r.theyOwe);
+  const debtorsKb = () => keyboard([
+    ...debtors.slice(0, 8).map((r) => ([{ text: `${r.cp.name} · ${formatRub(r.amount)}`.slice(0, 60), data: `rm.one:${r.cp.id}` }])),
+    [{ text: '⬅️ Меню', data: 'menu' }]]);
+  // «Всем должникам» — тексты на каждого, каждый со своей кнопкой отправки.
+  if (intent.all) { await debtReminder(tg, chatId, user); return; }
+  if (!intent.who) {
+    if (!debtors.length) { await tg.sendMessage(chatId, 'Должников нет — напоминать некому.', mainMenu()); return; }
+    await tg.sendMessage(chatId, 'Кому напомнить о долге?', debtorsKb());
+    return;
+  }
+  const found = ai.matchCp(bdb.listCps(user.id), intent.who);
+  if (found.cp) { await remindOne(tg, chatId, user, found.cp.id); return; }
+  if (found.choices) {
+    await tg.sendMessage(chatId, `Кого именно вы имели в виду — «${esc(intent.who)}»?`,
+      whichClientKb(found.choices, (c) => `rm.one:${c.id}`));
+    return;
+  }
+  // Такого клиента нет. Заводить его ради напоминания незачем — предлагаем должников.
+  if (!debtors.length) {
+    await tg.sendMessage(chatId, `Клиента «${esc(intent.who)}» у вас нет, да и должников сейчас нет.`, mainMenu());
+    return;
+  }
+  await tg.sendMessage(chatId,
+    `Клиента «${esc(intent.who)}» у вас нет. Напомнить кому-то из должников?`, debtorsKb());
+}
+
+/**
+ * «Повтори вчерашнюю накладную Заре» — находим документ и открываем тот же
+ * «Повторить», что и по кнопке: новый номер, сегодняшняя дата, сводка на
+ * проверку, оплата не копируется. Выписывает человек кнопкой, и при включённом
+ * ассистенте тоже: повтор — это копия чужого решения, а не просьба с готовой
+ * суммой, и показать её перед выпуском дешевле, чем исправлять.
+ */
+async function aiRepeat(tg, chatId, user, intent) {
+  // Решение — в ai.planRepeat: оно общее с приложением. Здесь только слова и кнопки.
+  const plan = ai.planRepeat(user.id, { who: intent.who, docType: intent.docType, date: intent.date });
+  await sayRepeat(tg, chatId, user, plan);
+}
+
+const REPEAT_WHAT = { sch: 'счетов', schdog: 'счетов-договоров', usl: 'актов', upd: 'УПД', torg12: 'накладных' };
+
+async function sayRepeat(tg, chatId, user, plan) {
+  const cp = plan.cp || null;
+  const whose = cp ? ` у ${quoted(cp.name)}` : '';
+  const what = REPEAT_WHAT[plan.type] || 'документов';
+  switch (plan.kind) {
+    case 'forbidden':
+      await tg.sendMessage(chatId,
+        'Платёжку и договор повторить не получится — они собираются из своих полей. '
+        + 'Откройте клиента и выпишите заново.', mainMenu());
+      return;
+    case 'choices':
+      await tg.sendMessage(chatId, `Кого именно вы имели в виду — «${esc(plan.who)}»?`,
+        whichClientKb(plan.choices, (c) => `rp.cp:${c.id}:${plan.type || '-'}:${packDay(plan.date) || '0'}`));
+      return;
+    case 'missing':
+      await tg.sendMessage(chatId,
+        `Клиента «${esc(plan.who)}» у вас нет — повторять нечего. `
+        + 'Нажмите 🔁 рядом с документом в журнале, если нужен другой.', mainMenu());
+      return;
+    case 'ask':
+      // «Повтори» без слов о том, что именно: гадать нельзя, но журнал с кнопкой «🔁» под рукой.
+      await tg.sendMessage(chatId, 'Какой документ повторить? Нажмите 🔁 рядом с нужным.');
+      await showDocs(tg, chatId, user);
+      return;
+    case 'fallback': {
+      // На названное число ничего нет — не подсовываем молча другой документ, а показываем кнопкой.
+      const d = plan.doc;
+      await tg.sendMessage(chatId,
+        `За ${ru(plan.date)}${whose} ${what} не нашёл. Последний — ${esc(bdb.docShort(d.type))} № ${esc(d.number)} `
+        + `от ${ru(d.date)}, ${formatRub(d.total)}. Повторить его?`,
+        keyboard([[{ text: `🔁 Повторить № ${d.number}`.slice(0, 60), data: `d.rep:${d.id}` }],
+          [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
+    case 'none':
+      await tg.sendMessage(chatId,
+        `Подходящих документов${whose} не нашёл — повторять нечего. Выпишите первый, а дальше повтор в одно нажатие.`,
+        mainMenu());
+      return;
+    case 'pick': {
+      // Названо число и под него подходит несколько — выбирает человек.
+      const rows = plan.docs.map((d) => {
+        const c = d.cp_id ? bdb.getCp(user.id, d.cp_id) : null;
+        return [{ text: `${c ? c.name : '—'} · ${bdb.docShort(d.type)} № ${d.number} · ${formatRub(d.total)}`.slice(0, 60), data: `d.rep:${d.id}` }];
+      });
+      rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+      await tg.sendMessage(chatId, `За ${ru(plan.date)} нашёл несколько. Какой повторить?`, keyboard(rows));
+      return;
+    }
+    default:
+      await repeatDoc(tg, chatId, user, plan.doc.id);
+  }
+}
+
+/**
+ * Акт сверки по фразе.
+ *
+ * Период назван («за сентябрь») — не спрашиваем его снова. Ассистент включён —
+ * собираем сразу, с кнопкой «Другой период» под файлом; выключен — показываем,
+ * что соберём, одной кнопкой. Период не назван — спрашиваем, как раньше.
+ */
+async function aiAkt(tg, chatId, user, intent, auto) {
+  const cps = bdb.listCps(user.id);
+  if (!cps.length) {
+    await tg.sendMessage(chatId, 'Сверяться пока не с кем — сначала добавьте клиента.',
+      addClientKb(user, intent.who, 'akt'));
+    return;
+  }
+  const range = intent.period && intent.period.to ? intent.period : null;
+  const pick = (c) => (range ? `akt.r:${c.id}:${packDay(range.from) || '0'}:${packDay(range.to)}` : `d.akt:${c.id}`);
+  const found = intent.who ? ai.matchCp(cps, intent.who) : {};
+  if (found.cp) {
+    if (!range) { await askAktPeriod(tg, chatId, user, found.cp.id); return; }
+    if (auto) { await genAktSverki(tg, chatId, user, found.cp.id, range.from, range.to, { changePeriod: true }); return; }
+    await tg.sendMessage(chatId,
+      `Подготовил: акт сверки с <b>${esc(found.cp.name)}</b> за ${esc(period.periodTitle(range.from, range.to))}.\n\n`
+      + '<i>Сам я акт не собираю — нажмите, и соберу.</i>',
+      keyboard([[{ text: '✅ Собрать акт', data: pick(found.cp) }],
+        [{ text: '📅 Другой период', data: `d.akt:${found.cp.id}` }],
+        [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+  if (found.choices) {
+    await tg.sendMessage(chatId, `Кого именно вы имели в виду — «${esc(intent.who)}»?`,
+      whichClientKb(found.choices, pick));
+    return;
+  }
+  await tg.sendMessage(chatId,
+    `${intent.who ? `Клиента «${esc(intent.who)}» у вас нет. ` : ''}С кем сверяемся`
+    + `${range ? ` за ${esc(period.periodTitle(range.from, range.to))}` : ''}?`,
+    whichClientKb(cps, pick));
+}
+
+/** Свой период для списка («документы», «неоплаченные») — те же кнопки, что у акта сверки. */
+async function askListPeriod(tg, chatId, kind) {
+  const rows = [];
+  for (let i = 0; i < period.PRESETS.length; i += 2) {
+    rows.push(period.PRESETS.slice(i, i + 2).map((p) => ({ text: p.text, data: `lp.p:${kind}:${p.code}` })));
+  }
+  rows.push([{ text: '📅 Свой период', data: `lp.own:${kind}` }]);
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId, 'За какой период показать?', keyboard(rows));
+}
+
+async function showListFor(tg, chatId, user, kind, range) {
+  if (kind === 'unpaid') await showUnpaid(tg, chatId, user, range);
+  else await showDocs(tg, chatId, user, null, range);
+}
+
+async function handleListPeriodText(tg, chatId, user, kind, text) {
+  const r = period.parsePeriodText(text);
+  if (!r) {
+    await tg.sendMessage(chatId,
+      'Не понял период. Напишите одним из способов:\n'
+      + '<code>01.09.2026 - 30.09.2026</code>\n'
+      + '<code>сентябрь</code>  ·  <code>апрель 2025</code>\n'
+      + '<code>2 квартал</code>  ·  <code>2025</code>');
+    return;
+  }
+  bdb.clearState(user.id);
+  await showListFor(tg, chatId, user, kind, r);
+}
+
+const VOICE_OFF = /^(?:отвечай|отвечать|пиши|ответь)\s+(?:мне\s+)?(?:текстом|буквами|письменно)|^(?:не\s+отвечай|хватит\s+отвечать)\s+голосом/i;
+const VOICE_ON = /^(?:отвечай|отвечать|ответь|говори)\s+(?:мне\s+)?(?:голосом|вслух)/i;
+
+async function handleFreeText(tg, chatId, user, text, opts = {}) {
+  // «Отвечай текстом» / «отвечай голосом» — настройка словами, без меню.
+  if (VOICE_OFF.test(String(text).trim()) || VOICE_ON.test(String(text).trim())) {
+    const on = bdb.setVoiceReply(user.id, VOICE_ON.test(String(text).trim()));
+    await tg.sendMessage(chatId, on
+      ? 'Хорошо: на голосовые отвечаю голосом и текстом.'
+      : 'Хорошо: отвечаю только текстом. Вернуть голос — скажите «отвечай голосом».', mainMenu());
+    return true;
+  }
+  if (!opts.isVoice) {
+    bdb.saveAiMessage({ userId: user.id, source: 'bot', role: 'user', type: 'text', text });
+  }
+  /*
+   * Тумблер решает не «понимать или нет», а «делать или показать кнопку».
+   *
+   * Включён — ассистент выписывает документ сам и отдаёт файл: человек
+   * попросил словами, это и есть его нажатие. Выключен — тот же разбор, но в
+   * конце предпросмотр и кнопка: «я подготовил, выпускайте вы».
+   *
+   * Первая редакция просто отключала разбор целиком, и получалось, что
+   * выключенный ассистент делает вид, будто не слышал вопроса. Это не то, что
+   * от него хотели: не доверяют ему выписку, а не понимание.
+   */
+  const auto = bdb.isAiEnabled(user.id);
+  const intent = await ai.understand(text, user.id);
+  const logAiReply = (reply) => {
+    bdb.saveAiMessage({
+      userId: user.id, source: 'bot', role: 'assistant', type: 'text',
+      text: reply || intent.action || '', intent, action: intent.action || '',
+    });
+  };
+
+  if (intent.action === 'debts') {
+    logAiReply('Показываю долги');
+    await showDebts(tg, chatId, user);
+    if (opts.isVoice) await replyVoice(tg, chatId, user, consult.spokenDebts(user.id));
+    return true;
+  }
+  if (intent.action === 'unpaid') {
+    logAiReply(intent.period ? 'Показываю неоплаченные счета за период' : 'Показываю неоплаченные счета');
+    await showUnpaid(tg, chatId, user, intent.period);
+    return true;
+  }
+  if (intent.action === 'docs') {
+    logAiReply(intent.period ? 'Показываю документы за период' : 'Показываю документы');
+    await showDocs(tg, chatId, user, null, intent.period);
+    return true;
+  }
+  // Оба только готовят: письмо уходит по нажатию, повтор выходит после сводки на проверку.
+  if (intent.action === 'remind') { logAiReply('Напоминание должнику'); await aiRemind(tg, chatId, user, intent); return true; }
+  if (intent.action === 'repeat') { logAiReply('Повтор документа'); await aiRepeat(tg, chatId, user, intent); return true; }
+  if (intent.action === 'cps') { logAiReply('Показываю клиентов'); await showCps(tg, chatId, user); return true; }
+  if (intent.action === 'org') { logAiReply('Показываю организацию'); await showOrg(tg, chatId, user); return true; }
+  if (intent.action === 'vat') { logAiReply('Показываю НДС'); await showVat(tg, chatId, user); return true; }
+  if (intent.action === 'kudir') { logAiReply('Книга учёта доходов'); await sendKudir(tg, chatId, user); return true; }
+
+  /*
+   * Оплата по фразе — ассистент вносит её сам.
+   *
+   * Ради этого переключатель и заводился: включён — бот делает, а не готовит
+   * человеку форму, которую тот и так умеет открыть руками. Проводка для
+   * этого подходит лучше всего: она обратима одной кнопкой, в отличие от
+   * выписанного документа с номером в сквозном ряду.
+   *
+   * Чего не хватает — спрашиваем, а не выдумываем. Не назван клиент — даём
+   * список; не названа сумма — показываем ту, что числится за ним в журнале,
+   * и предлагаем нажать. «Проведи оплату, я всё получил» — обычная фраза, и
+   * ответ на неё в журнале есть.
+   */
+  if (intent.action === 'pay') {
+    const cps = bdb.listCps(user.id);
+    if (!cps.length) {
+      await tg.sendMessage(chatId, 'Сначала добавьте клиента — потом внесём оплату.',
+        addClientKb(user, intent.who, 'pay'));
+      return true;
+    }
+    const found = intent.who ? ai.matchCp(cps, intent.who) : {};
+    /*
+     * Дата оплаты, если её назвали («оплатил вчера»). Названная дата в будущем
+     * («оплатил двадцатого», а сегодня девятнадцатое) — повод остановиться:
+     * в прошедшем времени так не говорят, скорее всего ошиблось распознавание.
+     * Тогда внесение — только по кнопке, даже при включённом ассистенте, и дата
+     * в тексте на виду.
+     */
+    const payDate = period.isoDay(intent.date);
+    const future = Boolean(payDate) && payDate > todayISO();
+    const onDate = payDate ? ` от ${ru(payDate)}` : '';
+    const autoPay = auto && !future;
+    /*
+     * Единственному клиенту оплату приписываем, только если плательщика не
+     * назвали вовсе. Раньше «Ромашка заплатила 50 000» при одном клиенте
+     * «Заря» вносило оплату Заре — имя не совпало, а запасной вариант
+     * сработал молча.
+     */
+    const cp = found.cp || (!intent.who && cps.length === 1 ? cps[0] : null);
+    if (!cp) {
+      // Один токен на все кнопки списка: выбрав одного клиента, остальных нажать уже нельзя.
+      const tok = oneShot();
+      const rows = (found.choices || cps).slice(0, 8)
+        .map((c) => ([{ text: c.name.slice(0, 60), data: intent.prepay
+          ? (intent.amount ? prepayData(c.id, round2(intent.amount), payDate, tok) : `pp.in:${c.id}`)
+          : payData(c.id, intent.amount || 0, intent.kind === 'Приход' ? 'p' : 'o', payDate, tok) }]));
+      await tg.sendMessage(chatId,
+        intent.who ? `Кого именно вы имели в виду — «${esc(intent.who)}»?` : 'По кому вносим?',
+        keyboard([...rows, [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return true;
+    }
+    if (intent.prepay) {
+      const pSum = round2(Number(intent.amount) || 0);
+      if (!pSum) {
+        bdb.setState(user.id, `ppay:${cp.id}`, {});
+        await tg.sendMessage(chatId, `Сколько внёс ${quoted(cp.name)}? Напишите сумму предоплаты.`);
+        return true;
+      }
+      if (!autoPay) {
+        await tg.sendMessage(chatId,
+          `Подготовил: <b>предоплата ${formatRub(pSum)}</b> от ${quoted(cp.name)}${onDate}.\n\n`
+          + (future ? '⚠️ Эта дата ещё впереди — проверьте, что она верная.\n\n' : '')
+          + '<i>Сам я ничего не провожу — нажмите, и внесу.</i>',
+          keyboard([[{ text: `✅ Внести ${formatMoney(pSum)}`, data: prepayData(cp.id, pSum, payDate) }],
+            [{ text: '⬅️ Меню', data: 'menu' }]]));
+        return true;
+      }
+      await doPrepay(tg, chatId, user, cp.id, pSum, payDate);
+      return true;
+    }
+    if (!autoPay) {
+      const sum = round2(Number(intent.amount) || 0);
+      // Только долг, не переплата: с Math.abs переплата 30 000 предлагалась
+      // к внесению как оплата — и удваивалась.
+      const bal = round2(Math.max(0, bdb.balanceOf(user.id, cp.id).closing));
+      const use = sum || bal;
+      if (!use) {
+        await tg.sendMessage(chatId, `За ${quoted(cp.name)} долга нет. Напишите сумму.`, mainMenu());
+        return true;
+      }
+      await tg.sendMessage(chatId,
+        `Подготовил: <b>${intent.kind} ${formatRub(use)}</b> по ${quoted(cp.name)}${onDate}.\n\n`
+        + (future ? '⚠️ Эта дата ещё впереди — проверьте, что она верная.\n\n' : '')
+        + '<i>Сам я ничего не провожу — нажмите, и внесу.</i>',
+        keyboard([
+          [{ text: `✅ Внести ${formatMoney(use)}`, data: payData(cp.id, use, intent.kind === 'Приход' ? 'p' : 'o', payDate) }],
+          [{ text: '⬅️ Меню', data: 'menu' }],
+        ]));
+      return true;
+    }
+    await recordPay(tg, chatId, user, cp.id, intent.amount, intent.kind, payDate);
+    return true;
+  }
+  if (intent.action === 'recurring') { logAiReply('Показываю регулярные счета'); await showRecurring(tg, chatId, user); return true; }
+  if (intent.action === 'billing') { logAiReply('Показываю тарифы и оплату'); await showBilling(tg, chatId, user); return true; }
+  if (intent.action === 'help') {
+    // Раньше здесь падали в общий тупик, и «что умеешь» получало «не понял».
+    logAiReply('Подсказка');
+    await tg.sendMessage(chatId,
+      'Я выписываю документы и слежу за долгами. Напишите или скажите, например: '
+      + '«счёт Заре на 30 000 за монтаж» или «кто мне должен». Остальное — в меню.', mainMenu());
+    return true;
+  }
+
+  // Акт сверки собирается по конкретному контрагенту — спрашиваем, по кому; период, если назван, не переспрашиваем.
+  if (intent.action === 'akt') {
+    logAiReply(intent.period ? 'Сверка расчётов за период' : 'Сверка расчётов');
+    await aiAkt(tg, chatId, user, intent, auto);
+    return true;
+  }
+
+  /*
+   * Чужая работа. Налоговый учёт обязателен независимо от режима, и у
+   * предпринимателя к нему масса вопросов — но бот не видит ни банка, ни
+   * кассы, ни расходов. Совет по срокам и суммам, выданный по памяти,
+   * стоит человеку денег и штрафов, поэтому здесь мы честно отказываемся
+   * и говорим, что умеем вместо этого.
+   */
+  if (intent.action === 'outofscope') {
+    /*
+     * Сначала пробуем ответить, и только потом отказываем.
+     *
+     * Раньше здесь был глухой отказ на всё подряд. Владелец попросил, чтобы
+     * ассистент отвечал и на налоговые вопросы — по своей базе, а чего в ней
+     * нет, то с пометкой, что не сверяли. Отказ остался последним рубежом:
+     * когда и базе нечего сказать, и модель не разрешена или не ответила.
+     */
+    const got = await ai.answerTax(text, user.id);
+    if (got.text) {
+      logAiReply(got.from === 'base' ? `Справка из базы (${got.id})` : 'Справка моделью, не сверено');
+      await tg.sendMessage(chatId, esc(got.text), mainMenu());
+      if (opts.isVoice) await replyVoice(tg, chatId, user, got.text);
+      return true;
+    }
+    logAiReply('Вне компетенции (налоги, зарплата)');
+    await tg.sendMessage(chatId, ai.OUTOFSCOPE_REPLY, mainMenu());
+    return true;
+  }
+
+  if (intent.action === 'draft') {
+    logAiReply(`Подготовка документа: ${intent.docType || 'документ'}`);
+    const cps = bdb.listCps(user.id);
+    if (!cps.length) {
+      await tg.sendMessage(chatId, 'Сначала добавьте клиента — потом выпишем документ.',
+        addClientKb(user, intent.who, intent.docType));
+      return true;
+    }
+    const found = ai.matchCp(cps, intent.who);
+    if (found.choices) {
+      await tg.sendMessage(chatId, `Кого именно вы имели в виду — «${esc(intent.who)}»?`,
+        keyboard([...found.choices.map((c) => ([{ text: c.name.slice(0, 60), data: `d.${intent.docType}:${c.id}` }])),
+          [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return true;
+    }
+    if (!found.cp) {
+      /*
+       * Имя названо, но такого клиента нет.
+       *
+       * Заводить его молча нельзя: разбор даёт имя в том падеже, в каком его
+       * произнесли, и в базе появился бы «Заре» или выправленная «Зара» рядом
+       * с настоящей «ООО Заря» — без ИНН, без реквизитов, документ такому не
+       * выписать. Плюс любая опечатка оставляла бы мусорную запись навсегда.
+       *
+       * Показывать один голый список тоже плохо: человек назвал имя, а бот
+       * делает вид, что не слышал. Поэтому предлагаем добавить именно его —
+       * имя подставится в форму, а решает по-прежнему человек.
+       */
+      if (intent.who) {
+        pendingCpPut(user.id, intent.who);
+        const others = cps.slice(0, 6).map((c) => ([{
+          text: c.name.slice(0, 60), data: `d.${intent.docType}:${c.id}`,
+        }]));
+        await tg.sendMessage(chatId,
+          `Клиента «${esc(intent.who)}» у вас пока нет.\n\n`
+          + '<i>Могу завести его — имя подставлю, останется ИНН и реквизиты. '
+          + 'Или выберите из списка, если это кто-то из них.</i>',
+          keyboard([
+            [{ text: `➕ Завести «${intent.who}»`.slice(0, 60), data: `cp.pre:${intent.docType}` }],
+            ...others,
+            [{ text: '⬅️ Меню', data: 'menu' }],
+          ]));
+        return true;
+      }
+      // Имени во фразе не было вовсе — показываем список, гадать не о чем.
+      await startDoc(tg, chatId, user, intent.docType);
+      return true;
+    }
+
+    /*
+     * Ставку, названную во фразе, доносим до документа.
+     *
+     * Разбор её уже достаёт («…счёт на 100 тысяч с НДС 22%»), но раньше она
+     * никуда не шла: документ брал ставку организации, и человек, назвавший
+     * другую вслух, получал не то, что просил, без единого слова об этом.
+     */
+    /*
+     * Ставку из разбора фразы проверяем по тому же списку, что и кнопки.
+     *
+     * intent приходит из ответа модели, а он не обязан быть осмысленным:
+     * отменённая с 2019 года 18, строка «22%», просто число 999 — всё это
+     * молча уходило в документ, и получался бланк с несуществующей ставкой.
+     * null здесь — законное значение, «без НДС», его и пропускаем отдельно.
+     */
+    const extra = {};
+    if (intent.vatRate !== undefined) {
+      const asked = intent.vatRate;
+      if (asked === null || okRate(String(asked))) {
+        extra.vatRate = asked === null ? null : Number(asked);
+        extra.priceIncludesVat = Boolean(intent.priceIncludesVat);
+      } else {
+        await tg.sendMessage(chatId,
+          `Ставки ${esc(String(asked))}% нет. Возьму ставку из ваших настроек — `
+          + 'поменять можно в разделе «НДС».');
+      }
+    }
+    // Дата документа, если её назвали («вчерашним числом»). Будущая — повод показать сводку, а не выписывать сразу.
+    const docDate = period.isoDay(intent.date);
+    const futureDoc = Boolean(docDate) && docDate > todayISO();
+    // У договора нет позиций: сумма из фразы — это сумма договора, её шаблон и подставит.
+    if (intent.docType === 'dog') {
+      extra.amount = docService.cleanItems(intent.items || [])
+        .reduce((a, it) => a + (Number(it.qty) || 1) * (Number(it.price) || 0), 0);
+    }
+    await startItems(tg, chatId, user, intent.docType, found.cp.id, extra, docDate);
+    const items = docService.cleanItems(intent.items || []);
+    if (items.length) {
+      const st = bdb.getState(user.id);
+      // Проверка на существование состояния — не придирка: startItems выше
+      // могла упереться в лимит документов и состояние не завести.
+      if (st && st.state.startsWith('items:')) {
+        st.data.items = items;
+        bdb.setState(user.id, st.state, st.data);
+        /*
+         * Включённый ассистент доводит дело до файла.
+         *
+         * Просьба словами — это и есть нажатие: человек сказал, что ему
+         * нужно, и ждёт документ, а не форму. Выписанное при этом не
+         * бесследно: документ виден в журнале и удаляется оттуда, а бот
+         * сразу говорит, что именно выписал.
+         */
+        /*
+         * Но несколько позиций от модели сразу не выписываем. Это её догадка о
+         * том, что сказал человек: перепутать, что к чему относится, проще
+         * всего именно в перечислении, а документ с номером в сквозном ряду
+         * потом не вернуть. Показываем сводку «Всё верно?» — ошибка в цене
+         * видна до выписки. Одна позиция с названной суммой, как и всё, что
+         * разобрали правила, выписывается сразу.
+         */
+        if (auto && !futureDoc && !(intent.source === 'model' && items.length > 1)) {
+          await finishItems(tg, chatId, user, bdb.getState(user.id));
+          return true;
+        }
+        await showPreview(tg, chatId, user, bdb.getState(user.id));
+        return true;
+      }
+    }
+    return true;
+  }
+
+  if (intent.source === 'limit') {
+    logAiReply('Разбор фраз на этот месяц исчерпан');
+    await tg.sendMessage(chatId,
+      'Разбор фраз на этот месяц исчерпан — понимаю пока только команды и кнопки.\n\n'
+      + '<i>Операция вносится текстом: <code>15.06 приход 94193</code>.</i>');
+    return true;
+  }
+
+  /*
+   * Отказ разбора — не то же самое, что «не понял», и молчать об этом нельзя.
+   *
+   * Раньше веток на 'off' и 'error' здесь не было вовсе: человек с истёкшим
+   * ключом или без нужной роли у сервисного аккаунта весь месяц видел, что
+   * бот «не понимает» обычные фразы, и правил формулировки — вместо того
+   * чтобы посмотреть настройку. Текст ошибки не читался нигде, даже в журнале
+   * поддержки, хотя разбор его честно возвращает.
+   */
+  if (intent.source === 'off') {
+    logAiReply('Разбор фраз выключен');
+    await tg.sendMessage(chatId,
+      'Разбор фраз сейчас выключен — кнопки и команды работают как обычно.', mainMenu());
+    return true;
+  }
+  if (intent.source === 'error') {
+    logAiReply('Сервис разбора фраз недоступен');
+    // Подробность — владельцу в журнал поддержки: чинить по ней может только
+    // он, а человеку она ничего не объясняет.
+    office.record({ kind: 'ai', where: 'бот', error: String(intent.error || ''), userId: user.id });
+    await tg.sendMessage(chatId,
+      'Разбор фраз сейчас не отвечает — это у меня, а не у вас.\n\n'
+      + 'Кнопки и команды работают как обычно, а операцию можно внести текстом: '
+      + '<code>15.06 приход 94193</code>.', mainMenu());
+    return true;
+  }
+  /*
+   * Не поняли — запоминаем фразу. По этим записям видно, что люди просят
+   * на самом деле, и чему учить агента дальше. Команды не пишем: они
+   * начинаются со слэша и ничего о живой речи не говорят.
+   */
+  /*
+   * Не команда — значит, вопрос. Раньше здесь был тупик «не понял», и на
+   * «чем акт отличается от УПД» или «что написать Заре, она тянет с
+   * оплатой» человек уходил искать ответ в чужих чатах. Теперь отвечает
+   * помощник — по данным самого человека и с памятью разговора.
+   */
+  if (!String(text || '').startsWith('/') && consult.consultAvailable()) {
+    await tg.sendChatAction(chatId, 'typing');
+    const got = await consult.reply(user.id, text);
+    if (got.ok) {
+      logAiReply(got.text);
+      await tg.sendMessage(chatId, esc(got.text), mainMenu());
+      if (opts.isVoice) await replyVoice(tg, chatId, user, got.text);
+      return true;
+    }
+    if (got.from === 'busy') {
+      await tg.sendMessage(chatId, 'Секунду — ещё отвечаю на прошлый вопрос.', mainMenu());
+      return true;
+    }
+    if (got.from === 'error') {
+      Promise.resolve(office.record({ kind: 'ai', where: 'помощник', error: String(got.error || ''), userId: user.id }))
+        .catch(() => {});
+    }
+  }
+  if (!String(text || '').startsWith('/')) {
+    logAiReply('Не понял');
+    office.record({ kind: 'unknown', where: 'bot', text, userId: user.id }).catch(() => {});
+  }
+  return false;
+}
+
+// ---------- регулярные документы ----------
+
+/**
+ * Список повторений. Здесь их можно только посмотреть и выключить:
+ * заводятся они сразу после выписанного документа, где позиции уже готовы.
+ */
+async function showRecurring(tg, chatId, user) {
+  const list = recurring.list(user.id);
+  if (!list.length) {
+    await tg.sendMessage(chatId,
+      '<b>Регулярные документы</b>\n\n'
+      + 'Пока ничего не повторяется.\n\n'
+      + 'Выпишите счёт, накладную или акт и нажмите «🔁 Повторять по расписанию» — '
+      + 'каждый день, по будням, раз в неделю или раз в месяц я пришлю такой же документ '
+      + 'на проверку.\n\n'
+      + 'А в карточке клиента есть «🔁 Повторять операцию каждый месяц» — '
+      + 'для зачётов и списаний, которых в банковской выписке не бывает.', mainMenu());
+    return;
+  }
+  // Подпись строки: у документа это его название, у операции — что и на
+  // сколько. Одно слово «op» в списке ничего человеку не сказало бы.
+  const label = (r) => (recurring.isOp(r)
+    ? `${r.op.kind} ${formatRub(r.op.amount).replace(/<[^>]+>/g, '')}`
+    : (docService.ITEM_DOCS[r.type] ? docService.ITEM_DOCS[r.type].title : r.type));
+  const rows = list.map((r) => ([{
+    text: `⏹ Остановить: ${label(r)} · ${r.cp_name}`.slice(0, 60),
+    data: `rec.off:${r.id}`,
+  }]));
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  const hasOps = list.some((r) => recurring.isOp(r));
+  await tg.sendMessage(chatId,
+    '<b>Что повторяется</b>\n\n'
+    + list.map((r) => {
+      if (recurring.isOp(r)) {
+        const left = r.op.times ? ` · осталось ${r.op.left} из ${r.op.times}` : '';
+        return `• <b>${esc(r.op.kind)} ${formatRub(r.op.amount)}</b> — ${esc(r.cp_name)}, `
+          + `${r.dayText}${left}${r.op.note ? `\n  <i>${esc(r.op.note)}</i>` : ''}`;
+      }
+      // С НДС, как у будущего документа: см. docService.plannedTotal.
+      const sum = docService.plannedTotal(user.id, r);
+      return `• <b>${esc(label(r))}</b> для ${esc(r.cp_name)} — ${formatRub(sum)}, ${r.dayText}`;
+    }).join('\n')
+    + '\n\n<i>Документы сами не выписываются: в нужный день придёт предложение '
+    + 'с проверкой — выпишу после «Всё верно».</i>'
+    + (hasOps
+      ? '\n<i>Операции журнала вношу сам — они внутренние и никуда не уходят, — '
+        + 'но каждый раз сообщу и дам отменить.</i>'
+      : '')
+    + '\n\nНажмите на строку ниже, чтобы остановить.',
+    keyboard(rows));
+}
+
+/** Предложение выписать очередной документ. Отправляется раз в месяц. */
+/**
+ * Предложить напоминание по виду деятельности.
+ *
+ * У аренды каждый месяц счёт, у обслуживания — акт. Это единственное, что
+ * из вида деятельности можно вывести помимо основания долга, и предлагать
+ * это надо ровно один раз: когда человек только сказал, чем занимается.
+ *
+ * Молчим, если предлагать нечего (в подряде объём каждый раз разный),
+ * если клиентов ещё нет и если повторение уже заведено — второй раз тот же
+ * вопрос выглядит навязчивостью.
+ *
+ * @returns {Promise<boolean>} true — предложили, показывать меню не надо
+ */
+async function offerRoutine(tg, chatId, user, key) {
+  const r = bizTypes.routineOf(key);
+  if (!r) return false;
+  if (!bdb.listCps(user.id).length) return false;
+  if (recurring.list(user.id).length) return false;
+
+  await tg.sendMessage(chatId,
+    `В вашем деле каждый месяц повторяется одно и то же — <b>${esc(r.what)}</b>.\n\n`
+    + 'Могу напоминать про него в нужный день. Выписывать буду не сам: пришлю '
+    + 'напоминание с кнопкой, а документ выпустите вы.',
+    keyboard([
+      [{ text: '🔔 Напоминать каждый месяц', data: `rt.new:${key}` }],
+      [{ text: 'Не нужно', data: 'rt.no' }],
+    ]));
+  return true;
+}
+
+async function offerRecurring(tg, rec, month = recurring.monthKey()) {
+  const user = bdb.userById(rec.user_id);
+  if (!user || user.blocked_at) return false;
+  const kind = docService.ITEM_DOCS[rec.type];
+  if (!kind) return false;
+  // Сумма — как у будущего документа, с НДС организации (plannedTotal), а не qty × price.
+  const sum = docService.plannedTotal(user.id, rec);
+
+  /*
+   * Повторение без позиций — это напоминание, а не готовый документ.
+   * Такое заводится из подсказки по виду деятельности, когда суммы ещё
+   * никто не называл. Выписать его «как есть» нельзя: вышел бы документ
+   * на ноль рублей с номером из сквозного ряда. Поэтому кнопка ведёт в
+   * обычный мастер с уже выбранным клиентом.
+   */
+  const empty = !rec.items.length;
+  await tg.sendMessage(user.tg_id,
+    `🔁 <b>Пора выставить: ${esc(kind.title)}</b>\n\n`
+    + `Клиент: <b>${esc(rec.cp_name)}</b>\n`
+    + (empty
+      ? '\n<i>Позиции и сумму укажете сами — я только напоминаю про срок.</i>'
+      : `Сумма: <b>${formatRub(sum)}</b>\n`
+        + `${rec.items.slice(0, 5).map((it) => `• ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n')}`
+        + (rec.items.length > 5 ? `\n…и ещё ${rec.items.length - 5}` : '')),
+    keyboard([
+      [empty
+        ? { text: '✍️ Заполнить и выписать', data: `d.${rec.type}:${rec.cp_id}` }
+        : { text: '✅ Выписать', data: `rec.go:${rec.id}:${month}` }],
+      [{ text: '⏭ Пропустить месяц', data: `rec.skip:${rec.id}:${month}` }],
+      [{ text: '✖️ Больше не напоминать', data: `rec.off:${rec.id}` }],
+    ]));
+  return true;
+}
+
+/** Шаг «какого числа»: спрашивается и после подписи, и вместо неё. */
+async function askRoDay(tg, chatId, user, cpId, data) {
+  bdb.setState(user.id, `ro:day:${cpId}`, data);
+  await tg.sendMessage(chatId, 'Какого числа вносить?', keyboard([
+    [1, 5, 10, 15, 20, 25].map((d) => ({ text: String(d), data: `ro.day:${cpId}:${d}` })),
+    [{ text: 'Последнее число месяца', data: `ro.day:${cpId}:0` }],
+    [{ text: '✖️ Отмена', data: `cp:${cpId}` }],
+  ]));
+}
+
+/**
+ * Провести повторяющуюся операцию журнала.
+ *
+ * В отличие от документа, эту строку бот вносит сам — она внутренняя, не
+ * забирает номер в сквозном ряду и никуда не уходит. Но молчать при этом
+ * нельзя: сальдо изменилось, а сальдо человек показывает контрагенту.
+ * Поэтому каждый раз сообщение с суммой, счётчиком и кнопкой отмены.
+ *
+ * Порядок важен: сначала считаем счётчик, потом вносим. Если упасть между
+ * ними, лучше пропустить месяц, чем внести строку дважды — задвоенная
+ * оплата в учёте хуже ненайденной.
+ */
+async function postRecurringOp(tg, rec, month) {
+  const user = bdb.userById(rec.user_id);
+  if (!user || user.blocked_at) return false;
+  const cp = bdb.getCp(user.id, rec.cp_id);
+  if (!cp) return false;
+
+  const step = recurring.bumpOp(user.id, rec.id, 1, undefined, month);
+  if (!step) return false;
+
+  const { kind, amount, note } = rec.op;
+  const opId = bdb.addOp(user.id, cp.id, {
+    date: todayISO(),
+    kind,
+    doc: note || `${kind} по повторению`,
+    debit: kind === 'Оплата' ? amount : 0,
+    credit: kind === 'Приход' ? amount : 0,
+    note: 'по повторению',
+  });
+
+  const b = bdb.balanceOf(user.id, cp.id);
+  const counter = rec.op.times ? ` · ${step.done} из ${rec.op.times}` : '';
+  const rows = [
+    [{ text: '↩️ Отменить', data: `ro.undo:${rec.id}:${opId}` }],
+    [{ text: '📄 Акт сверки', data: `d.akt:${cp.id}` }],
+  ];
+  if (!step.finished) rows.push([{ text: '✖️ Больше не повторять', data: `rec.off:${rec.id}` }]);
+  rows.push([{ text: `👤 ${cp.name}`.slice(0, 60), data: `cp:${cp.id}` }]);
+
+  await tg.sendMessage(user.tg_id,
+    `🔁 Внёс по вашему правилу:\n<b>${esc(kind)} ${formatRub(amount)}</b>${counter}\n`
+    + `${esc(cp.name)}${note ? `\n<i>${esc(note)}</i>` : ''}\n\n`
+    + `Баланс теперь: <b>${formatRub(Math.abs(round2(b ? b.closing : 0)))}</b>.`
+    + (step.finished ? '\n\n<i>Это был последний раз — правило выключено.</i>' : ''),
+    keyboard(rows));
+
+  // Себе на почту — если человек этого попросил при настройке. Контрагенту
+  // отсюда не уходит ничего: письмо ему человек подтверждает отдельно и
+  // видит текст (правило проекта, и оно не формальное — акт сверки
+  // двусторонний, на него отвечают).
+  if (rec.op.mailSelf) await mailAktToSelf(user, cp).catch(() => {});
+  if (kind === 'Оплата') await remindFresh(tg, user.tg_id, user);
+  return true;
+}
+
+/**
+ * Ежедневная проверка повторений.
+ *
+ * Отметку «предложено» ставим сразу после отправки, а не после ответа:
+ * иначе бот пришёл бы с тем же предложением и завтра, и послезавтра, пока
+ * человек не нажмёт кнопку.
+ *
+ * at — момент, от которого считается «сегодня». По умолчанию настоящее время;
+ * задаётся он ровно затем же, зачем у todayISO и todayDate: чтобы поведение,
+ * привязанное к числу месяца, можно было проверить, не дожидаясь этого числа.
+ * Без такого шва проверка просрочки была неисполнима первого числа — просрочка
+ * наступает со дня после срока оплаты, а первого числа такого дня в месяце
+ * ещё не было.
+ */
+async function runDaily(tg, at = new Date()) {
+  const on = todayDate(at);
+  let sent = 0;
+  // Только месячные: короткие периоды («обеды каждый день») приходят утром, а не в
+  // полночь, — для них отдельный обход runPeriodic.
+  for (const rec of recurring.due(on, { periodic: false })) {
+    try {
+      // За какой месяц это предложение — не всегда текущий (догонялка
+      // «последнего дня», см. recurring.offerMonth). Им же и отмечаем.
+      const month = recurring.offerMonth(rec, on);
+      if (recurring.isOp(rec)) {
+        // eslint-disable-next-line no-await-in-loop
+        if (await postRecurringOp(tg, rec, month)) sent += 1;
+        continue;                       // счётчик двигает сам postRecurringOp
+      }
+      // eslint-disable-next-line no-await-in-loop
+      if (await offerRecurring(tg, rec, month)) sent += 1;
+      recurring.markOffered(rec.user_id, rec.id, on, month);
+    } catch (e) {
+      console.error('регулярные документы:', e.message);
+    }
+  }
+  for (const rec of recurring.overdue(on)) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      if (await warnOverdue(tg, rec, on)) sent += 1;
+      recurring.markDueNoticed(rec.id, on, recurring.dueMonth(rec, on));
+    } catch (e) {
+      console.error('просрочка:', e.message);
+    }
+  }
+  if (sent) console.log(`Ежедневные дела: отправлено сообщений — ${sent}`);
+  return sent;
+}
+
+/**
+ * Предложение документа «на сегодня» по короткому расписанию.
+ *
+ * Документа ещё нет: он получит номер только по «Всё верно». Выписанный заранее
+ * и «пропущенный» документ оставил бы дыру в нумерации, а удалить его бесследно
+ * нельзя (см. шапку lib/recurring.js). Поэтому здесь проверка, а не готовая
+ * бумага, и клиенту отсюда не уходит ничего: отправку человек нажимает сам.
+ */
+async function offerPeriodic(tg, rec, key, on = todayDate()) {
+  const user = bdb.userById(rec.user_id);
+  if (!user || user.blocked_at) return false;
+  const kind = docService.ITEM_DOCS[rec.type];
+  // Расписание без позиций выписать нечем: оно заводится только по готовому документу.
+  if (!kind || !rec.items.length) return false;
+  // Сумма — как у будущего документа, с НДС организации (plannedTotal), а не qty × price.
+  const sum = docService.plannedTotal(user.id, rec);
+  await tg.sendMessage(user.tg_id,
+    `🔁 <b>${esc(kind.title)} на сегодня</b> · ${recurring.dayCaption(on)}\n\n`
+    + `Клиент: <b>${esc(rec.cp_name)}</b>\n`
+    + `Сумма: <b>${formatRub(sum)}</b>\n`
+    + `${rec.items.slice(0, 6).map((it) => `• ${esc(it.name)} — ${it.qty} × ${formatRub(it.price)}`).join('\n')}`
+    + (rec.items.length > 6 ? `\n…и ещё ${rec.items.length - 6}` : '')
+    + '\n\n<i>Пока ничего не выписано и клиенту не отправлено. Проверьте и нажмите «Всё верно» — '
+    + 'документ получит новый номер и сегодняшнюю дату.</i>',
+    keyboard([
+      [{ text: '✅ Всё верно', data: `rec.go:${rec.id}:${key}` }],
+      [{ text: '✏️ Поправить', data: `rec.fix:${rec.id}:${key}` },
+        { text: '⏭ Пропустить сегодня', data: `rec.skip:${rec.id}:${key}` }],
+      [{ text: '⏹ Остановить расписание', data: `rec.off:${rec.id}` }],
+    ]));
+  return true;
+}
+
+/**
+ * Утренний обход коротких расписаний: каждый день, по будням, раз в неделю.
+ *
+ * Отметку «предложено» ставим сразу после отправки — как у месячных, — и она же
+ * делает обход безопасным для повторов: цикл бота вызывает его много раз за
+ * утро, а перезапуск днём не пришлёт то, что уже приходило. Час и пояс —
+ * московские, как у сводки: пояса пользователя мы нигде не храним.
+ *
+ * @param {Date} at момент, от которого считается «сегодня» (для проверки)
+ */
+async function runPeriodic(tg, at = new Date()) {
+  const on = todayDate(at);
+  let sent = 0;
+  for (const rec of recurring.due(on, { periodic: true })) {
+    try {
+      const key = recurring.periodKey(rec, on);
+      // eslint-disable-next-line no-await-in-loop
+      if (await offerPeriodic(tg, rec, key, on)) sent += 1;
+      recurring.markOffered(rec.user_id, rec.id, on, key);
+    } catch (e) {
+      console.error('расписания:', e.message);
+    }
+  }
+  if (sent) console.log(`Расписания: отправлено предложений — ${sent}`);
+  return sent;
+}
+
+/** «Напомнить мне» по клиентам — утром, вместе со сводкой. */
+async function sendFollowups(tg, today = todayISO()) {
+  let n = 0;
+  for (const f of crm.dueFollowups(today)) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await tg.sendMessage(f.tg_id, `⏰ <b>${esc(f.cp_name || 'Клиент')}</b>: ${esc(f.text)}`, keyboard([
+        [{ text: '✅ Сделано', data: `crm.done:${f.id}` }, { text: '⏰ Через 3 дня', data: `crm.snz:${f.id}` }],
+        [{ text: '🕑 История клиента', data: `crm.h:${f.cp_id}` }],
+      ]));
+      crm.markSent(f.id);
+      n += 1;
+    } catch (e) {
+      if (e && e.blocked) bdb.markBlocked(f.user_id);
+    }
+  }
+  return n;
+}
+
+/** Завести повторение по уже выписанному документу и рассказать, что будет. */
+async function addRecurring(tg, chatId, user, src, when) {
+  const { items, extra } = docService.reusablePayload(src.payload);
+  const periodic = Boolean(when.period) && when.period !== 'month';
+  if (periodic) {
+    // Нажатие по кнопке из старого сообщения не должно заводить второе такое же
+    // расписание: в свой день пришли бы два одинаковых предложения.
+    const twin = recurring.list(user.id).find((r) => r.cp_id === src.cp_id && r.type === src.type
+      && r.period === when.period && (r.period !== 'week' || r.weekday === recurring.normalizeWeekday(when.weekday)));
+    if (twin) {
+      await tg.sendMessage(chatId, 'Такое расписание уже есть.', keyboard([
+        [{ text: '🔁 Все повторения', data: 'rec' }], [{ text: '⬅️ Меню', data: 'menu' }],
+      ]));
+      return;
+    }
+    // «Каждый день» на бесплатном тарифе съест лимит за несколько дней — говорим
+    // до, с цифрами, а не на шестое утро, когда документ не выпишется.
+    if (!when.confirmFree) {
+      const warn = recurring.freeLimitNote(user.id, when.period);
+      if (warn) {
+        const code = when.period === 'day' ? 'd' : when.period === 'weekdays' ? 'w' : `k${when.weekday}`;
+        await tg.sendMessage(chatId, `⚠️ ${esc(warn)}`, keyboard([
+          [{ text: 'Всё равно создать расписание', data: `rec.pok:${src.id}:${code}` }],
+          [{ text: '⬅️ Выбрать другое', data: `rec.new:${src.id}` }],
+        ]));
+        return;
+      }
+    }
+    // Сегодняшнее предложение пропускаем, только если документ за сегодня уже выписан:
+    // иначе расписание, заведённое по старому документу, молча съело бы сегодняшнюю доставку.
+    when = { ...when, offeredThisMonth: src.date === todayISO() };
+  }
+  const { confirmFree, ...schedule } = when;
+  const id = recurring.add(user.id, {
+    cpId: src.cp_id, type: src.type, items, extra, ...schedule,
+  });
+  const rec = recurring.get(user.id, id);
+  const title = docService.ITEM_DOCS[src.type].title;
+
+  if (periodic) {
+    const next = rec.last_offer && rec.last_offer >= recurring.periodKey(rec)
+      ? `Следующее предложение: ${recurring.dayCaption(recurring.nextDate(rec))}.`
+      : 'Если сегодня день по расписанию, предложение придёт в течение минуты.';
+    await tg.sendMessage(chatId,
+      `✅ Настроил для <b>${esc(rec.cp_name)}</b>: «${esc(title)}», ${esc(rec.dayText)}.\n\n`
+      + '• Утром пришлю такой же документ на проверку: «Всё верно», «Поправить» или «Пропустить сегодня»\n'
+      + `• ${next}\n\n`
+      + '<i>Сам ничего не выпишу и клиенту не отправлю: выписывается по «Всё верно», '
+      + 'а письмо клиенту уходит только по вашему нажатию. Остановить можно в «Все повторения».</i>',
+      keyboard([
+        [{ text: '🔁 Все повторения', data: 'rec' }],
+        [{ text: '⬅️ Меню', data: 'menu' }],
+      ]));
+    return;
+  }
+
+  // Показываем весь цикл, а не только ближайшее действие: человек должен
+  // понимать, за чем бот теперь следит, иначе напоминание о просрочке
+  // придёт неожиданно и будет выглядеть ошибкой.
+  const plan = [`• ${rec.offerDay}-го — предложу выписать «${esc(title)}»`];
+  if (rec.pay_day) {
+    plan.push(`• ${rec.pay_day}-го — срок оплаты по договору`);
+    plan.push(`• ${rec.pay_day + 1}-го — напомню, если оплата не отмечена`);
+  }
+
+  await tg.sendMessage(chatId,
+    `✅ Настроил для <b>${esc(rec.cp_name)}</b>:\n\n${plan.join('\n')}\n\n`
+    + '<i>Сам ничего не выпишу и клиенту не напишу — пришлю предложение с кнопкой. '
+    + 'За этот месяц документ уже выписан, так что начну со следующего.</i>',
+    keyboard([
+      ...(src.type !== 'usl'
+        ? [[{ text: '➕ Ещё и акт в конце месяца', data: `rec.akt:${src.cp_id}` }]] : []),
+      [{ text: '🔁 Все повторения', data: 'rec' }],
+      [{ text: '⬅️ Меню', data: 'menu' }],
+    ]));
+}
+
+/**
+ * Первый день просрочки.
+ *
+ * Сообщаем владельцу, а не контрагенту. Письмо клиенту с требованием
+ * заплатить — разговор, который человек ведёт сам: тон, отсрочка,
+ * договорённость по телефону боту неизвестны, а испорченные отношения с
+ * арендатором стоят дороже, чем несколько нажатий. Поэтому здесь готовый
+ * текст и кнопка отправки, а не автоматическая рассылка.
+ */
+async function warnOverdue(tg, rec, on = period.todayDate()) {
+  const user = bdb.userById(rec.user_id);
+  if (!user || user.blocked_at) return false;
+
+  /*
+   * Смотрим тот месяц, чей срок оплаты прошёл, — а он не всегда текущий.
+   *
+   * Если сегодняшнее число ещё не миновало день оплаты, значит мы догоняем
+   * пропущенное: срок прошёл в прошлом месяце, а сказать об этом не успели,
+   * потому что служба не работала. Ищи мы счета текущего месяца, догон был
+   * бы пустым — их там просто нет.
+   *
+   * Отсутствие неоплаченных документов и есть настоящая защита от ложной
+   * тревоги: без счёта сообщения не будет, чем бы ни решил календарь.
+   */
+  const month = on.getDate() > rec.pay_day
+    ? recurring.monthKey(on)
+    : recurring.prevMonthKey(on);
+  const unpaid = bdb.unpaidDocs(user.id, 200)
+    .filter((d) => d.cp_id === rec.cp_id && String(d.date).startsWith(month));
+  if (!unpaid.length) return false;              // оплачено или счёта не было
+
+  const sum = bdb.dealTotals(user.id, unpaid).sum;
+  const list = unpaid.slice(0, 5)
+    .map((d) => `• ${esc(d.title)} № ${esc(d.number)} от ${ru(d.date)} — ${formatRub(d.total)}`);
+
+  await tg.sendMessage(user.tg_id,
+    `⏰ <b>Просрочка: ${esc(rec.cp_name)}</b>\n\n`
+    // Срок называем того месяца, о котором говорим: при догоне текущий был бы
+    // неправдой — там срок ещё и не наступал.
+    + `Срок оплаты был ${ru(`${month}-${String(rec.pay_day).padStart(2, '0')}`)}, деньги не отмечены.\n`
+    + `Ждут оплаты: <b>${formatRub(sum)}</b>\n${list.join('\n')}\n\n`
+    + '<i>Если оплата пришла — отметьте её, и напоминание исчезнет.</i>',
+    keyboard([
+      [{ text: '✉️ Текст напоминания', data: 'debt.remind' }],
+      [{ text: '✅ Оплата пришла', data: `doc.paid:${unpaid[0].id}` }],
+      [{ text: '👤 Карточка клиента', data: `cp:${rec.cp_id}` }],
+    ]));
+  return true;
+}
+
+/**
+ * «Чем занимаетесь» вместо «откуда берётся долг».
+ *
+ * Из всех настроек основание долга — единственная, в которой новичок
+ * гарантированно теряется: вопрос бухгалтерский, а человек пришёл выставить
+ * счёт. На вопрос о своём деле он отвечает не задумываясь, а правило
+ * выводится само.
+ */
+async function showBizType(tg, chatId, user) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
+  await tg.sendMessage(chatId,
+    '<b>Чем занимаетесь?</b>\n\n'
+    + '<i>По ответу подберу, когда клиент становится должен, — этот вопрос '
+    + 'больше задавать не буду.</i>',
+    keyboard([
+      ...bizTypes.list().map((t) => ([{ text: `${t.name} — ${t.hint}`, data: `biz.set:${t.key}` }])),
+      [{ text: '⬅️ К организации', data: 'org' }],
+    ]));
+}
+
+/**
+ * Экран выбора системы налогообложения. Спрашиваем один раз у организации,
+ * а не у каждого счёта: бухгалтер выписывает их десятками, а режим меняется
+ * раз в год. У конкретного документа его всё равно можно переопределить.
+ */
+async function showVat(tg, chatId, user) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
+  /*
+   * Самозанятому говорим прямо, и до кнопок, а не после.
+   *
+   * Экраны «Самозанятость» и «НДС» независимы, и человек, прочитавший про
+   * реформу 2026 года, спокойно ставил себе ставку поверх включённого НПД.
+   * Выставленный после этого счёт-фактура с выделенным налогом обязывает
+   * его уплатить этот НДС в бюджет (п. 5 ст. 173 НК) — при том, что
+   * заказчик вычет всё равно не получит.
+   */
+  const npdWarn = npd.isNpd(org)
+    ? '⚠️ У вас включена <b>самозанятость</b>. Плательщик НПД не может быть '
+      + 'плательщиком НДС, и ставку здесь выбирать не нужно — оставьте «без НДС». '
+      + 'Если вы с НПД снялись, выключите галочку в разделе «Самозанятость».\n\n'
+    : '';
+  await tg.sendMessage(chatId,
+    `<b>НДС в счетах</b>\n\nСейчас: <b>${esc(vatLabel(org))}</b>\n\n${npdWarn}`
+    + 'Без НДС — упрощёнка до 20 млн дохода, патент, самозанятость. Плательщикам НДС '
+    + 'важно выбрать, как указаны ваши цены: «с НДС» значит налог уже внутри '
+    + 'цены, «сверху» — что он прибавится к сумме счёта.',
+    keyboard([
+      [{ text: 'Без НДС (упрощёнка, патент, НПД)', data: 'vat.set:none:0' }],
+      [{ text: '22%, цены с НДС', data: 'vat.set:22:1' },
+        { text: '22% сверху', data: 'vat.set:22:0' }],
+      [{ text: '20%, цены с НДС', data: 'vat.set:20:1' },
+        { text: '20% сверху', data: 'vat.set:20:0' }],
+      [{ text: '10%, цены с НДС', data: 'vat.set:10:1' },
+        { text: '10% сверху', data: 'vat.set:10:0' }],
+      // У пониженных ставок УСН обе формы такие же осмысленные, как у общей:
+      // расчётная ставка 5/105 и 7/107 — п. 4 ст. 164 НК. Раньше здесь была
+      // одна кнопка «сверху», и продавец с ценами, включающими налог, не мог
+      // выписать верный документ из приложения вовсе — ставка туда приходит
+      // только отсюда, своей кнопки НДС у документа в приложении нет.
+      [{ text: '5%, цены с НДС', data: 'vat.set:5:1' },
+        { text: '5% сверху', data: 'vat.set:5:0' }],
+      [{ text: '7%, цены с НДС', data: 'vat.set:7:1' },
+        { text: '7% сверху', data: 'vat.set:7:0' }],
+      [{ text: '0% (экспорт)', data: 'vat.set:0:0' }],
+      [{ text: '⬅️ К организации', data: 'org' }],
+    ]));
+}
+
+/**
+ * Экран «Самозанятость». Одна галочка — и та не про документы.
+ *
+ * Спрашиваем прямо, потому что вывести режим неоткуда: по ИНН видно только,
+ * ИП это или организация, а НПД применяют и обычные физлица, и
+ * предприниматели. Нужен признак ровно для одного — напомнить про чек,
+ * когда человек отметит оплату.
+ */
+async function showNpd(tg, chatId, user) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) { await tg.sendMessage(chatId, 'Сначала заведите свою фирму.', mainMenu()); return; }
+  const on = npd.isNpd(org);
+  await tg.sendMessage(chatId,
+    `<b>Налог на профессиональный доход</b>\n\nСейчас: <b>${on ? 'применяю' : 'не применяю'}</b>\n\n`
+    + 'Если вы самозанятый или ИП на НПД, счёт и акт сами по себе доход не '
+    + 'закрывают: его закрывает чек из «Моего налога». Включите галочку — и '
+    + 'после каждой отметки об оплате я дам готовые данные для чека и буду помнить, '
+    + 'пока вы не отметите его пробитым: непробитые чеки — в утренней сводке.\n\n'
+    + '<i>Сам чек не выписываю и выписывать не буду: это заявление в налоговую '
+    + 'от вашего имени, его делаете вы.</i>',
+    keyboard([
+      [{ text: on ? '✅ Применяю НПД' : 'Применяю НПД', data: 'npd.set:1' }],
+      [{ text: on ? 'Не применяю' : '✅ Не применяю', data: 'npd.set:0' }],
+      ...(cheques.openCount(user.id)
+        ? [[{ text: `🧾 Чеки не пробиты: ${cheques.openCount(user.id)}`, data: 'chq.list' }]] : []),
+      [{ text: '🧾 Открыть «Мой налог»', url: npd.LK_URL }],
+      [{ text: '⬅️ К организации', data: 'org' }],
+    ]));
+}
+
+/** Экран «Подпись и печать»: что загружено, куда ставится, как поменять. */
+async function showFacsimile(tg, chatId, user) {
+  const sign = facsimile.get(user.id, 'sign');
+  const stamp = facsimile.get(user.id, 'stamp');
+  const scope = facsimile.scopeOf(user.id);
+  const kb = (v) => Math.round(v / 1024);
+
+  const txt = '<b>Подпись и печать</b>\n\n'
+    + 'Загрузите снимок подписи и печати — они лягут на счета и акты, '
+    + 'и документ можно будет сразу отправлять клиенту.\n\n'
+    + `Подпись: ${sign ? `<b>загружена</b> (${kb(sign.bytes.length)} КБ)` : '—'}\n`
+    + `Печать: ${stamp ? `<b>загружена</b> (${kb(stamp.bytes.length)} КБ)` : '—'}\n`
+    + `Ставим: <b>${esc(facsimile.SCOPES[scope])}</b>\n\n`
+    + '<i>Как снять: распишитесь на белом листе чёрной ручкой и сфотографируйте '
+    + 'сверху при дневном свете. Фон убирать не нужно — бот сам сделает белое '
+    + 'прозрачным.\n\n'
+    + 'Картинка подписи и печати не ставится на платёжное поручение и договор — там нужна живая '
+    + 'подпись, — а также на счета-фактуры: авансовый, корректировочный и УПД '
+    + 'со статусом 1. По счёту-фактуре с картинкой подписи покупателю откажут в вычете '
+    + '(п. 6 ст. 169 НК), и узнает он об этом от своей инспекции.</i>';
+
+  const rows = [
+    [{ text: sign ? '🖊 Заменить подпись' : '🖊 Загрузить подпись', data: 'fx.add:sign' }],
+    [{ text: stamp ? '⭕ Заменить печать' : '⭕ Загрузить печать', data: 'fx.add:stamp' }],
+  ];
+  if (sign) rows.push([{ text: '🗑 Убрать подпись', data: 'fx.del:sign' }]);
+  if (stamp) rows.push([{ text: '🗑 Убрать печать', data: 'fx.del:stamp' }]);
+  for (const [key, label] of Object.entries(facsimile.SCOPES)) {
+    if (key !== scope) rows.push([{ text: `Ставить ${label}`, data: `fx.scope:${key}` }]);
+  }
+  rows.push([{ text: '⬅️ К организации', data: 'org' }]);
+  await tg.sendMessage(chatId, txt, keyboard(rows));
+}
+
+/** Принимает присланный снимок подписи или печати. */
+async function acceptFacsimile(tg, chatId, user, msg, kind) {
+  let fileId = null; let mime = 'image/jpeg';
+  if (msg.photo && msg.photo.length) {
+    fileId = msg.photo[msg.photo.length - 1].file_id;
+  } else if (msg.document && /^image\//.test(msg.document.mime_type || '')) {
+    fileId = msg.document.file_id;
+    mime = msg.document.mime_type;
+  }
+  if (!fileId) return;
+
+  await tg.sendChatAction(chatId, 'typing');
+  let buf;
+  try {
+    buf = await tg.downloadFile(fileId, facsimile.MAX_BYTES);
+  } catch (e) {
+    /*
+     * Снимок с телефона, отправленный файлом, Telegram не сжимает — и в
+     * предел не влезает. Отправленный как фото, сжимается им самим. Разница
+     * невидима: в меню вложений это соседние пункты, и человек не знает,
+     * что выбрал не тот. Поэтому подсказываем, а не сообщаем о неудаче.
+     */
+    const big = /слишком большой/i.test(e.message || '');
+    await tg.sendMessage(chatId, big
+      ? `Файл больше ${Math.round(facsimile.MAX_BYTES / 1024)} КБ.\n\n`
+        + 'Отправьте тот же снимок <b>фотографией</b>, а не файлом: Telegram сожмёт '
+        + 'его сам, и качества для печати хватит.'
+      : `Не смог забрать файл: ${esc(e.message)}`);
+    return;
+  }
+
+  const res = facsimile.save(user.id, kind, buf, mime);
+  if (!res.ok) {
+    await tg.sendMessage(chatId, `${esc(res.error)}\n\n`
+      + 'Проще всего — отправить снимок фотографией, а не файлом: Telegram сожмёт его сам.');
+    return;
+  }
+  bdb.clearState(user.id);
+  await tg.sendMessage(chatId,
+    `Сохранил ${FX_NAMES[kind]}. Проверьте на документе: выпишите счёт — `
+    + 'если легло криво или бледно, пришлите снимок получше.');
+  await showFacsimile(tg, chatId, user);
+}
+
+// ---------- банковская выписка, присланная файлом ----------
+
+/**
+ * Похоже ли вложение на выписку.
+ *
+ * Смотрим на имя, а не на mime: Telegram отдаёт для выгрузок из банка то
+ * text/plain, то application/octet-stream, то вовсе ничего.
+ */
+const STATEMENT_FILE = /\.(csv|txt|ofx|qfx|xlsx|xls)$/i;
+
+/**
+ * Файл, который бот не разбирает, — ответ, а не тишина.
+ *
+ * Раньше документ, не похожий на выписку по расширению, проваливался мимо
+ * всех обработчиков: человек присылал выписку из Сбера в PDF и ждал.
+ * Теперь бот говорит, что это за файл и в каком виде его прислать.
+ */
+async function handleOtherDocument(tg, chatId, user, msg) {
+  const name = String((msg.document && msg.document.file_name) || '');
+  const pdf = /\.pdf$/i.test(name) || /pdf/i.test((msg.document && msg.document.mime_type) || '');
+  const looksStatement = /выписк|statement|vypisk/i.test(name);
+  await tg.sendMessage(chatId, looksStatement || pdf
+    ? `Файл «${esc(name.slice(0, 80))}» я прочитать не могу: ${pdf ? 'в PDF нет таблицы, только изображение страниц' : 'такой формат я не знаю'}.\n\n`
+      + 'Выписку пришлите файлом в одном из форматов:\n'
+      + '• «1С» (текстовый файл .txt) — есть в любом интернет-банке в экспорте выписки;\n'
+      + '• Excel (.xlsx);\n• OFX или CSV.\n\n'
+      + 'Под разбором появится кнопка «📒 Собрать книгу учёта доходов».'
+    : `Файл «${esc(name.slice(0, 80))}» я не разбираю. Умею: выписку из банка (1С, Excel, OFX, CSV) `
+      + 'и фото счёта — его пришлите картинкой.', mainMenu());
+}
+
+/**
+ * Разбор выписки прямо в чате.
+ *
+ * В чате занести можно только уверенные совпадения — те, где сошёлся ИНН
+ * или точное название вместе с точной суммой долга. Остальное отправляем в
+ * приложение: перебирать десяток платежей кнопками мучительно, а угадывать
+ * за человека нельзя.
+ */
+async function handleStatement(tg, chatId, user, msg) {
+  const doc = msg.document;
+  // Годовая выписка для книги учёта в Excel весит мегабайты — два было мало.
+  if (doc.file_size > 10 * 1024 * 1024) {
+    await tg.sendMessage(chatId, 'Файл больше 10 МБ — выгрузите выписку по кварталам.');
+    return;
+  }
+  await tg.sendChatAction(chatId, 'typing');
+
+  // Скачивание может не выйти — связь с Telegram рвётся. Раньше ошибка
+  // роняла обработку, и человек, приславший выписку, не получал ответа.
+  let buf;
+  try {
+    buf = await tg.downloadFile(doc.file_id, 10 * 1024 * 1024);
+  } catch (e) {
+    console.error('выписка: не скачалась:', e.message);
+    await tg.sendMessage(chatId, 'Не смог забрать файл у Telegram — связь оборвалась. '
+      + 'Пришлите выписку ещё раз.', mainMenu());
+    return;
+  }
+  const org = bdb.currentOrg(user.id);
+  const { format, rows, unsupported } = await bank.parseStatementFile(buf,
+    { ownAccounts: [org && org.acc].filter(Boolean) });
+  if (unsupported === 'xls') {
+    await tg.sendMessage(chatId,
+      'Это старый формат Excel (.xls) — его я не читаю. Откройте файл и сохраните как .xlsx, '
+      + 'или выгрузите выписку в формате «1С» (.txt).', mainMenu());
+    return;
+  }
+  if (!rows.length) {
+    await tg.sendMessage(chatId,
+      'Не нашёл в файле ни одной операции.\n\n'
+      + 'Подойдёт выгрузка «1С Клиент-Банк», Excel (.xlsx), OFX или CSV, где есть колонки '
+      + 'с датой и суммой.', mainMenu());
+    return;
+  }
+
+  const cps = bdb.listCps(user.id);
+  const debt = new Map();
+  for (const cp of cps) {
+    const b = bdb.balanceOf(user.id, cp.id);
+    debt.set(cp.id, b ? b.closing : 0);
+  }
+  const matched = bank.matchToCounterparties(rows, cps, (id) => debt.get(id) || 0);
+  const known = bdb.knownBankKeys(user.id, matched.map((t) => t.key));
+  const fresh = matched.filter((t) => !known.has(t.key));
+  const sure = fresh.filter((t) => t.cp && t.confidence >= 60);
+
+  /*
+   * Все разобранные строки — сразу в состояние, до любых выходов.
+   *
+   * Книге учёта они нужны целиком: в журнал попадают только те, у кого
+   * нашёлся контрагент, а книге надо увидеть и свои деньги, и займы, и
+   * возвраты налога — исключить их следует осознанно, а не потому, что они
+   * потерялись по дороге. Раньше состояние писалось ниже раннего выхода, и
+   * выписка, уже занесённая в журнал, книгу не давала вовсе: её присылают
+   * повторно ровно ради книги. Поля только те, что нужны книге.
+   */
+  const all = rows.map((r) => ({
+    date: r.date, amount: r.amount, incoming: r.incoming,
+    name: r.name || '', purpose: r.purpose || '', doc: r.doc || '',
+  }));
+  const bookBtn = (book) => [{
+    text: book.blocked ? '📒 Книга учёта доходов' : '📒 Собрать книгу учёта доходов', data: 'bank:kudir',
+  }];
+
+  const lines = [`Выписка ${format}: строк ${rows.length}, поступлений ${matched.length}.`];
+  if (matched.length !== fresh.length) {
+    lines.push(`Уже занесено раньше: ${matched.length - fresh.length}.`);
+  }
+  if (!fresh.length) {
+    bdb.setState(user.id, 'bank', { rows: [], all });
+    lines.push('', 'Новых поступлений нет — повторно они не пройдут.');
+    await tg.sendMessage(chatId, lines.join('\n'), keyboard([
+      bookBtn(kudir.bookFor(org)),
+      [{ text: '⬅️ Меню', data: 'menu' }],
+    ]));
+    return;
+  }
+
+  if (sure.length) {
+    lines.push('', `<b>Узнал уверенно (${sure.length}):</b>`);
+    for (const t of sure.slice(0, 15)) {
+      lines.push(`• ${ru(t.date)} — ${esc(t.cp.name)} — <b>${formatRub(t.amount)}</b>`);
+    }
+    if (sure.length > 15) lines.push(`…и ещё ${sure.length - 15}`);
+  }
+  const rest = fresh.length - sure.length;
+  if (rest) {
+    lines.push('', `Ещё ${rest} ${plural(rest, 'поступление', 'поступления', 'поступлений')} `
+      + 'не удалось привязать к клиенту наверняка — это видно в приложении.');
+  }
+  // Спорные называем поимённо: «не привязалось» без причины выглядит как
+  // недоработка, а тут причина понятная и человеку решать её секунду.
+  const doubtful = fresh.filter((t) => t.ambiguous);
+  if (doubtful.length) {
+    lines.push('', `Из них ${doubtful.length} совпало сразу с двумя клиентами:`);
+    for (const t of doubtful.slice(0, 5)) {
+      lines.push(`• ${ru(t.date)} · ${formatRub(t.amount)} — ${esc(t.rivals.join(' или '))}`);
+    }
+    lines.push('<i>Выберите нужного в приложении — сам не угадываю.</i>');
+  }
+
+  // Строки кладём в состояние: кнопка нажимается позже, а файла к тому
+  // времени уже нет.
+  bdb.setState(user.id, 'bank', {
+    rows: sure.map((t) => ({ key: t.key, cpId: t.cp.id, amount: t.amount, date: t.date, doc: t.doc, purpose: t.purpose || '' })),
+    all,
+  });
+
+  const app = webAppUrl();
+  const book = kudir.bookFor(bdb.currentOrg(user.id));
+  await tg.sendMessage(chatId, lines.join('\n'), keyboard([
+    ...(sure.length ? [[{ text: `✅ Занести ${sure.length} ${plural(sure.length, 'оплату', 'оплаты', 'оплат')}`, data: 'bank:take' }]] : []),
+    // Кнопку показываем и когда книга не положена: отказ с объяснением
+    // полезнее молчания, а из него ведёт кнопка к выбору режима.
+    bookBtn(book),
+    ...(app ? [[{ text: '📱 Разобрать в приложении', webApp: app }]] : []),
+    [{ text: '⬅️ Меню', data: 'menu' }],
+  ]));
+}
+
+/**
+ * Какие счета закрыли пришедшие деньги.
+ *
+ * Занести оплату в журнал — половина дела: документы после этого всё равно
+ * висят в «не оплачено», и человек идёт отмечать их по одному. Здесь бот
+ * говорит вслух то, что и так следует из сумм: «пришло 30 000 от Зари —
+ * значит, счёт № 7 закрыт», — и предлагает отметить всё разом.
+ *
+ * Предлагает, а не делает: отмечает по-прежнему человек, одним нажатием.
+ * Автоматически закрытый долг — ошибка, которую замечают через месяц, когда
+ * клиент не платит, а счёт уже помечен оплаченным.
+ *
+ * @returns {Promise<boolean>} true — предложение отправлено, своё сообщение не нужно
+ */
+async function offerClosedDocs(tg, chatId, user, rows, head) {
+  const { deals, leftovers } = bdb.matchPaymentsToDocs(user.id, rows);
+  if (!deals.length) return false;
+
+  // Закрытые целиком и оплаченные частично — разные решения, и показываем их
+  // по отдельности: «закрыт» значит, что пришли все деньги по документу.
+  const whole = deals.filter((d) => !d.partial);
+  const part = deals.filter((d) => d.partial);
+  const lines = [head, ''];
+  if (whole.length) {
+    lines.push(`<b>Эти документы закрыты (${whole.length}):</b>`);
+    for (const d of whole.slice(0, 15)) {
+      lines.push(`• ${esc(d.title)} · ${esc(d.cpName)} · <b>${formatRub(d.total)}</b>`
+        + (d.alsoTitle ? `\n  <i>и ${esc(d.alsoTitle)} — та же сделка</i>` : ''));
+    }
+    if (whole.length > 15) lines.push(`…и ещё ${whole.length - 15}`);
+  }
+  if (part.length) {
+    // Номер документа назвал сам плательщик в назначении платежа — поэтому деньги
+    // привязываем к нему, но документ остаётся неоплаченным до последней копейки.
+    if (whole.length) lines.push('');
+    lines.push(`<b>Оплачены частично (${part.length}):</b>`);
+    for (const d of part.slice(0, 15)) {
+      lines.push(`• ${esc(d.title)} · ${esc(d.cpName)} · пришло <b>${formatRub(d.total)}</b>, `
+        + `осталось <b>${formatRub(d.left)}</b>`);
+    }
+    lines.push('<i>Документ назван в назначении платежа. Он останется в «Ждут оплаты» на остаток.</i>');
+  }
+
+  // Остаток называем вслух: человеку важно понять, ждёт ли он ещё денег от
+  // этого клиента, или пришло больше, чем было выставлено.
+  const spare = leftovers.filter((l) => l.amount > 0);
+  if (spare.length) {
+    lines.push('', 'Не легло ни на один счёт:');
+    for (const l of spare.slice(0, 5)) {
+      lines.push(`• ${esc(l.cpName)} — ${formatRub(l.amount)}`);
+    }
+    lines.push('<i>Либо счёт ещё не выписан, либо оплата частичная — такие не закрываю.</i>');
+  }
+
+  const count = whole.reduce((n, d) => n + (d.twinId ? 2 : 1), 0);
+  bdb.setState(user.id, 'bank-paid', { deals, all: bankRows(user) });
+  await tg.sendMessage(chatId, lines.join('\n'), keyboard([
+    [{ text: whole.length ? `✅ Отметить оплаченными (${count})` : '✅ Привязать оплату', data: 'bank:paid' }],
+    [{ text: 'Не надо', data: 'menu' }],
+  ]));
+  return true;
+}
+
+/**
+ * Голосовое сообщение.
+ *
+ * Расшифровка — не действие, а всего лишь ввод: дальше фраза идёт ровно тем
+ * же путём, что и напечатанная. Поэтому распознанное сначала показываем, и
+ * только потом отвечаем: человек должен увидеть, что бот услышал, прежде
+ * чем тот начнёт заполнять счёт. Расслышать «Заре» как «Заре-Строй» дороже,
+ * чем лишняя строка в переписке.
+ */
+async function handleVoice(tg, chatId, user, msg) {
+  if (!speech.speechAvailable()) {
+    await tg.sendMessage(chatId,
+      'Голосовые я пока не разбираю — нужен внешний сервис распознавания речи.\n'
+      + `<i>${esc(speech.speechHint())}</i>\n\n`
+      + 'Напишите то же самое текстом — пойму так же.', mainMenu());
+    return;
+  }
+
+  /*
+   * Распознавание речи считаем в тот же кошелёк, что и разбор текста.
+   *
+   * Своего предела у него не было вовсе: скачивался файл до 20 МБ и сразу
+   * уходил в облако, а тарифицируется он по секундам звука — это самый
+   * дорогой путь в продукте и единственный, где кран отсутствовал. Один
+   * человек с заклинившей кнопкой мог потратить месячный счёт за минуты.
+   *
+   * Заводить второй счётчик не стали: предел общий с разбором фраз, и
+   * человек видит одну понятную границу, а не две разные.
+   */
+  if (ai.budget(user.id).left <= 0) {
+    await tg.sendMessage(chatId,
+      'На этот месяц разбор голоса и фраз закончился. Напишите текстом — '
+      + 'бот поймёт так же, и это ничем не ограничено.', mainMenu());
+    return;
+  }
+
+  const src = msg.voice || msg.audio || msg.video_note || {};
+  if (!src.file_id) return;
+  // Потолок Telegram на скачивание ботом — 20 МБ, выше него файла не будет.
+  const buf = await tg.downloadFile(src.file_id, 20 * 1024 * 1024).catch(() => null);
+  if (!buf) {
+    await tg.sendMessage(chatId, 'Не смог забрать запись из Telegram. Попробуйте ещё раз.', mainMenu());
+    return;
+  }
+
+  await tg.sendMessage(chatId, '🎧 Слушаю…');
+  // Занимаем до обращения: считается попытка, а не удача. Иначе отказ
+  // провайдера ничего не стоил бы, и упереться в потолок было бы нельзя.
+  ai.spend(user.id);
+  const seconds = Number(src.duration) || 0;
+  const got = await speech.transcribe(buf, seconds);
+  if (!got.ok) {
+    // Как в приложении: подробность ответа провайдера — в журнал владельцу,
+    // иначе 404 от неверной модели не отличить от кончившейся квоты.
+    if (got.detail) office.record({ kind: 'speech', where: 'бот', error: got.detail, userId: user.id });
+    await tg.sendMessage(chatId, `Не разобрал запись: ${esc(got.error)}`, mainMenu());
+    return;
+  }
+  /*
+   * Считаем по факту, если провайдер вернул расход.
+   *
+   * SpeechKit токенов не возвращает, и минуты для него — единственное, что
+   * у нас есть: цена за минуту берётся из настроек. Gemini считает звук
+   * токенами (около 25 на секунду) и сообщает их в ответе, а токен у нас уже
+   * посчитан по цене входа. Прикидка нужна там, где нет факта, и мешает там,
+   * где он есть.
+   *
+   * Дописываем ПОСЛЕ удачи: за сорвавшееся распознавание провайдер обычно
+   * не берёт денег.
+   */
+  ai.spend(user.id, got.usage ? { usage: got.usage } : { voiceSeconds: seconds });
+
+  await tg.sendMessage(chatId, `Услышал: «${esc(got.text)}»`);
+  bdb.saveAiMessage({
+    userId: user.id, source: 'bot', role: 'user', type: 'voice',
+    text: got.text, audioSeconds: Number(src.duration) || 0,
+  });
+  const answered = await handleFreeText(tg, chatId, user, got.text, { isVoice: true });
+  if (!answered) {
+    await tg.sendMessage(chatId,
+      'Не понял, что с этим сделать. Скажите иначе — например: «выставь счёт Заре на 30 тысяч» '
+      + 'или «кто мне должен».', mainMenu());
+  }
+}
+
+async function handlePhoto(tg, chatId, user, msg) {
+  // Ждём снимок подписи или печати — тогда это не счёт для распознавания.
+  const st = bdb.getState(user.id);
+  if (st && /^fx:(sign|stamp)$/.test(st.state)) {
+    return acceptFacsimile(tg, chatId, user, msg, st.state.split(':')[1]);
+  }
+  // Ждали свой договор или фото подписано «договор» — это не счёт.
+  if (await contractFlow().onPhoto(tg, chatId, user, msg)) return undefined;
+
+  if (!visionAvailable()) {
+    await tg.sendMessage(chatId,
+      'Распознавание фото пока не подключено — нужен внешний сервис.\n'
+      + `<i>${esc(visionHint())}</i>\n\n`
+      + 'Пока внесите операцию текстом: <code>15.06 приход 94193</code>', mainMenu());
+    return;
+  }
+
+  // самое крупное превью или картинка-документом
+  let fileId = null; let mime = 'image/jpeg';
+  if (msg.photo && msg.photo.length) {
+    fileId = msg.photo[msg.photo.length - 1].file_id;
+  } else if (msg.document && /^image\//.test(msg.document.mime_type || '')) {
+    fileId = msg.document.file_id;
+    mime = msg.document.mime_type;
+  }
+  if (!fileId) return;
+
+  // Снимок счёта уходит в ту же модель и в тот же кошелёк, что голос и фразы.
+  if (ai.budget(user.id).left <= 0) {
+    await tg.sendMessage(chatId,
+      'На этот месяц разбор снимков и фраз закончился. Реквизиты и суммы '
+      + 'можно ввести руками — это ничем не ограничено.', mainMenu());
+    return;
+  }
+
+  await tg.sendChatAction(chatId, 'typing');
+  let buf;
+  try { buf = await tg.downloadFile(fileId); } catch (e) {
+    await tg.sendMessage(chatId, `Не смог забрать файл: ${esc(e.message)}`, mainMenu());
+    return;
+  }
+
+  ai.spend(user.id);
+  const res = await readInvoice(buf, mime);
+  if (!res.ok) {
+    await tg.sendMessage(chatId,
+      `Распознать не вышло: ${esc(res.error)}\nВнесите операцию текстом.`, mainMenu());
+    return;
+  }
+  // Снимок стоит на два порядка дороже фразы: картинка разворачивается в
+  // тысячи входных токенов, и расход в ответе не приходит. Считаем по
+  // заданной цене за снимок — иначе в бюджете он весит столько же, сколько
+  // «кто мне должен», и потолок в штуках перестаёт что-либо значить.
+  ai.spend(user.id, { photos: 1 });
+  const f = res.fields || {};
+  if (!f.amount) {
+    await tg.sendMessage(chatId,
+      'Сумму на снимке разобрать не удалось — бывает при бликах и мятой бумаге.\n'
+      + 'Пришлите фото поровнее или внесите операцию текстом.', mainMenu());
+    return;
+  }
+
+  // если ИНН совпал с известным контрагентом — предложим его первым
+  const cps = bdb.listCps(user.id);
+  const digits = (s) => String(s || '').replace(/\D/g, '');
+  const matched = f.inn ? cps.find((c) => digits(c.inn) && digits(c.inn) === digits(f.inn)) : null;
+
+  bdb.setState(user.id, 'photo', { fields: f });
+
+  const rows = [];
+  if (matched) rows.push([{ text: `✅ ${matched.name}`, data: `ph.cp:${matched.id}` }]);
+  for (const c of cps) {
+    if (matched && c.id === matched.id) continue;
+    rows.push([{ text: `${c.kind === 'supplier' ? '📦' : '🧑‍💼'} ${c.name}`, data: `ph.cp:${c.id}` }]);
+  }
+  rows.push([{ text: '✖️ Отмена', data: 'menu' }]);
+
+  await tg.sendMessage(chatId,
+    'Со снимка прочитал:\n'
+    + `Сумма: <b>${formatRub(f.amount)}</b>\n`
+    + `Дата: ${f.date ? ru(f.date) : '<i>не видно, поставлю сегодняшнюю</i>'}\n`
+    + (f.docNo ? `Документ: № ${esc(f.docNo)}\n` : '')
+    + (f.name ? `Клиент: ${esc(f.name)}\n` : '')
+    + (f.inn ? `ИНН: ${esc(f.inn)}${matched ? ' — узнал' : ' — такого клиента нет'}\n` : '')
+    + '\nК кому отнести операцию?',
+    keyboard(rows));
+}
+
+async function photoPickKind(tg, chatId, user, cpId) {
+  const state = bdb.getState(user.id);
+  if (state.state !== 'photo') return;
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
+  bdb.setState(user.id, 'photo', { ...state.data, cpId });
+  await tg.sendMessage(chatId,
+    `<b>${esc(cp.name)}</b> · ${formatRub(state.data.fields.amount)}\nЧто это за операция?`,
+    keyboard([
+      [{ text: '📈 Приход — мы оказали, нам должны', data: 'ph.k:credit' }],
+      [{ text: '📉 Оплата — нам заплатили', data: 'ph.k:debit' }],
+      [{ text: '✖️ Отмена', data: 'menu' }],
+    ]));
+}
+
+async function photoSaveOp(tg, chatId, user, kind) {
+  const state = bdb.getState(user.id);
+  if (state.state !== 'photo' || !state.data.cpId) return;
+  const f = state.data.fields;
+  const date = f.date || todayISO();
+  const human = kind === 'credit' ? 'Приход' : 'Оплата';
+  const op = {
+    date, kind: human,
+    doc: `${human}${f.docNo ? ` (${f.docNo})` : ''} (${ru(date)})`,
+    debit: kind === 'debit' ? f.amount : 0,
+    credit: kind === 'credit' ? f.amount : 0,
+    note: 'с фотографии',
+  };
+  const cpId = state.data.cpId;
+  bdb.clearState(user.id);
+  bdb.addOp(user.id, cpId, op);
+  const b = bdb.balanceOf(user.id, cpId);
+  const cp = bdb.getCp(user.id, cpId);
+  await tg.sendMessage(chatId,
+    `✅ ${human}: ${formatRub(f.amount)} (${ru(date)}) — занёс со снимка.\n`
+    + `Баланс: <b>${formatRub(Math.abs(round2(b.closing)))}</b>.`);
+  const { info, kb } = cpMenu(user.id, cp);
+  await tg.sendMessage(chatId, info, kb);
+  if (human === 'Оплата') await remindFresh(tg, chatId, user);
+}
+
+// ---------- дебиторка ----------
+
+const plural = (n, one, few, many) => {
+  const a = Math.abs(n) % 100; const b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b > 1 && b < 5) return few;
+  if (b === 1) return one;
+  return many;
+};
+
+async function showDebts(tg, chatId, user) {
+  const rows = bdb.debtors(user.id);
+  /*
+   * Прежде чем сказать «все рассчитались», убеждаемся, что это правда.
+   *
+   * При основании «по отгрузке» долг создаёт акт, УПД или накладная, но не
+   * счёт. Человек, работающий счетами, выписывал их, видел здесь ровно ноль
+   * и решал, что цифра сломана, — а объяснение было только в мини-приложении.
+   * Кто смотрел долги в боте, не получал ни слова.
+   */
+  const org = bdb.currentOrg(user.id);
+  const basis = bdb.basisMismatch(user.id, org,
+    rows.filter((r) => r.theyOwe).reduce((s, r) => s + r.amount, 0));
+  /*
+   * В ручном режиме разбор выше молчит — человек сам сказал, что журнал ведёт
+   * он. Но «все рассчитались» при невнесённых накладных и актах звучит как
+   * правда, а это не она: документы просто не считаются. Называем режим.
+   */
+  const manualNote = !basis && bdb.basisOf(org || {}) === 'manual' && bdb.unpaidDocs(user.id, 1).length
+    ? '\n\n<i>Долг у вас сам не считается: выбрано «журнал веду сам», и выписанные '
+      + 'акты, накладные и счета сюда не попадают. Поменять — «📊 Долг» в настройках.</i>'
+    : '';
+  const basisNote = manualNote || (basis
+    ? `\n\n<i>${basis.to === 'invoice'
+      ? 'Долг у вас считается по актам, а не по счетам'
+      : 'Долг у вас считается по счетам, а не по актам'}, поэтому `
+      + `${basis.count} ${plural(basis.count, 'документ', 'документа', 'документов')} `
+      + `на ${formatRub(basis.sum)} `
+      // После загрузки выписки состояние третье и самое пугающее: деньги
+      // пришли, а обязательства по ним не возникало — и клиент, который
+      // расплатился, показан тем, кому должны мы.
+      + (basis.advance
+        ? 'показаны авансом, будто должны вы.'
+        : 'сюда не попали.')
+      + ' Поменять — «📊 Долг» в настройках.</i>'
+    : '');
+
+  if (!rows.length) {
+    await tg.sendMessage(chatId,
+      `Все рассчитались — долгов не осталось. 👌${basisNote}`, mainMenu());
+    return;
+  }
+  const theyOwe = rows.filter((r) => r.theyOwe);
+  // Остаток предоплаты клиента — не «мы должны»: это его аванс, который мы
+  // отработаем отгрузками, и в одной куче с долгом поставщикам он путает.
+  const isPre = (r) => !r.theyOwe && r.cp.kind !== 'supplier' && bdb.prepayState(user.id, r.cp.id);
+  const prepaid = rows.filter(isPre);
+  const weOwe = rows.filter((r) => !r.theyOwe && !isPre(r));
+  const sum = (list) => round2(list.reduce((s, r) => s + r.amount, 0));
+
+  const line = (r) => {
+    const quiet = r.days == null ? '' : (r.days === 0 ? ' · движение было сегодня' : ` · без движения ${r.days} ${plural(r.days, 'день', 'дня', 'дней')}`);
+    const flag = r.days != null && r.days > 60 ? ' ⚠️' : '';
+    // Когда напоминали — чтобы не написать второй раз за день и не забыть на месяц.
+    const ago = r.theyOwe ? digest.lastReminded(user.id, r.cp.id) : null;
+    const rem = ago == null ? '' : ago === 0 ? ' · напомнили сегодня' : ` · напоминали ${ago} ${plural(ago, 'день', 'дня', 'дней')} назад`;
+    if (isPre(r)) {
+      const st = bdb.prepayState(user.id, r.cp.id);
+      return `• <b>${esc(r.cp.name)}</b> — осталось ${formatRub(r.amount)}${st.low ? ' · скоро кончится' : ''}${quiet}`;
+    }
+    const pl = bdb.prepayLine(bdb.prepayState(user.id, r.cp.id));
+    return `• <b>${esc(r.cp.name)}</b> — ${formatRub(r.amount)}${quiet}${rem}${flag}`
+      + (pl ? `\n   💰 ${pl}` : '');
+  };
+
+  let text = '';
+  if (theyOwe.length) {
+    text += `<b>Нам должны — ${formatRub(sum(theyOwe))}</b>\n${theyOwe.map(line).join('\n')}\n\n`;
+  }
+  if (weOwe.length) {
+    text += `<b>Мы должны — ${formatRub(sum(weOwe))}</b>\n${weOwe.map(line).join('\n')}\n\n`;
+  }
+  if (prepaid.length) {
+    text += `<b>На предоплате — аванс клиентов, не долг</b>\n${prepaid.map(line).join('\n')}\n\n`;
+  }
+  text += `⚠️ — больше двух месяцев без единой операции.${basisNote}`;
+
+  const kb = [];
+  if (theyOwe.length) {
+    kb.push([{ text: `📄 Акты сверки всем должникам (${theyOwe.length})`, data: 'debt.akts' }]);
+    kb.push([{ text: '🔔 Напомнить о долге', data: 'debt.remind' }]);
+  }
+  /*
+   * Рядом с должником — «Оплатил»: одно нажатие вносит оплату на весь долг,
+   * а под ответом есть «Отменить проводку». Токен одноразовый, чтобы
+   * двойное нажатие не провело деньги дважды. И «Напомнить»: текст письма
+   * именно этому клиенту, а не общий список всех должников.
+   */
+  for (const r of rows.slice(0, 6)) {
+    const card = { text: `${r.theyOwe ? '🧑‍💼' : '📦'} ${r.cp.name} · ${formatRub(r.amount)}`.slice(0, 60), data: `cp:${r.cp.id}` };
+    kb.push([card]);
+    if (r.theyOwe) {
+      kb.push([{ text: '✅ Оплатил', data: `pay.cp:${r.cp.id}:${round2(r.amount)}:o:${oneShot()}` },
+        { text: '🔔 Напомнить', data: `rm.one:${r.cp.id}` }]);
+    }
+  }
+  kb.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId, text, keyboard(kb));
+}
+
+/** Акты сверки по всем, кто нам должен, — одним нажатием. */
+async function sendDebtAkts(tg, chatId, user) {
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  const rows = bdb.debtors(user.id).filter((r) => r.theyOwe);
+  if (!rows.length) { await tg.sendMessage(chatId, 'Должников нет.', mainMenu()); return; }
+  await tg.sendMessage(chatId,
+    `Собираю ${rows.length} ${plural(rows.length, 'акт', 'акта', 'актов')} сверки — по одному на должника.`);
+  for (const r of rows) {
+    await genAktSverki(tg, chatId, user, r.cp.id);
+  }
+  await tg.sendMessage(chatId,
+    'Готово. Перешлите файлы должникам — или отправьте письмом из «Напомнить о долге»: '
+    + 'акт сверки уйдёт вложением.',
+    keyboard([[{ text: '🔔 Напомнить о долге', data: 'debt.remind' }],
+      [{ text: '⬅️ Меню', data: 'menu' }]]));
+}
+
+/*
+ * Текст напоминания: и для копирования, и для письма — один и тот же.
+ *
+ * Три тона, потому что первое напоминание и третье — разные письма.
+ * Начинать со «строго» — испортить отношения с клиентом, который просто
+ * забыл; писать «мягко» в третий раз — дать понять, что можно не платить.
+ * Строгий тон называет только то, что действительно следует из закона:
+ * претензию и проценты по ст. 395 ГК РФ — без выдуманных штрафов.
+ */
+const REMIND_TONES = { soft: 'Мягко', biz: 'По делу', firm: 'Строго' };
+
+function reminderText(org, r, tone = 'biz') {
+  const bank = org && org.acc
+    ? `\n\nРеквизиты для оплаты:\n${org.bank_name || ''}\nБИК ${org.bik || '—'}\nР/с ${org.acc}`
+    : '';
+  const sum = `${formatRub(r.amount).replace(/ /g, ' ').replace(/\sруб\.$/, ' руб')}`;
+  const by = r.cp.contract ? ` по ${r.cp.contract}` : '';
+  const sign = `${bank}\n\nС уважением,\n${(org && (org.full_name || org.name)) || ''}`;
+  /*
+   * Какие именно документы не оплачены — номерами, датами и суммами.
+   * Должник, получив «числится задолженность 54 250 руб», первым делом
+   * спрашивает «за что?», и письмо без списка заставляет его искать ответ
+   * самому. Список один на все тона: меняется тон, а не факты.
+   */
+  const listed = r.cp.user_id ? bdb.debtListText(bdb.unpaidLinesFor(r.cp.user_id, r.cp.id).lines, r.amount) : '';
+  const list = listed ? `\n\n${listed}` : '';
+  if (tone === 'soft') {
+    return 'Здравствуйте!\n\n'
+      + `Небольшое напоминание: у нас не отмечена оплата на ${sum}${by}.${list}\n\n`
+      + 'Возможно, платёж уже в пути — тогда просто пришлите, пожалуйста, платёжку, и я закрою вопрос.'
+      + `${sign}`;
+  }
+  if (tone === 'firm') {
+    return 'Здравствуйте!\n\n'
+      + `На ${ru(todayISO())} задолженность ${sum}${by} не погашена, хотя мы уже напоминали о ней.${list}\n\n`
+      + 'Просим оплатить её в течение 5 рабочих дней или сообщить точный срок оплаты.\n\n'
+      + 'Если оплаты не будет, мы будем вынуждены направить претензию и взыскивать долг '
+      + 'вместе с процентами за пользование чужими денежными средствами (ст. 395 ГК РФ).'
+      + `${sign}`;
+  }
+  return 'Здравствуйте!\n\n'
+    + `По нашим данным на ${ru(todayISO())} за вами числится задолженность ${sum}${by}.${list}\n\n`
+    + 'Направляем акт сверки. Просим подтвердить сумму и сообщить срок оплаты. '
+    + 'Если платёж уже прошёл — пришлите, пожалуйста, платёжное поручение.'
+    + `${sign}`;
+}
+
+/**
+ * Ссылка «переслать клиенту»: встроенный в Telegram выбор чата с готовым
+ * текстом. Бот сам клиенту не пишет — человек выбирает, кому и куда.
+ *
+ * Предел длины: Telegram отвергает кнопку со ссылкой за ~2 тысячи знаков, а
+ * кириллица после кодирования раздувается в шесть раз. Поэтому полный текст
+ * (строгий тон с реквизитами почти всегда не влезает) заменяем коротким в
+ * том же тоне; не влез и он — кнопки нет, текст для копирования остаётся.
+ */
+function shareReminderUrl(org, row, tone) {
+  const make = (text) => `https://t.me/share/url?url=&text=${encodeURIComponent(text)}`;
+  // Сначала полный текст, как в сообщении; не влез — короткий в том же тоне.
+  for (const text of [reminderText(org, row, tone), reminderShort(org, row, tone)]) {
+    const u = make(text);
+    if (u.length <= 2000) return u;
+  }
+  return null;
+}
+
+/** Короткое напоминание для ссылки: тот же тон и тот же смысл, без реквизитов. */
+function reminderShort(org, r, tone = 'biz') {
+  const sum = formatRub(r.amount).replace(/\sруб\.$/, ' руб');
+  const sign = (org && (org.full_name || org.name)) ? `\n\n${org.full_name || org.name}` : '';
+  if (tone === 'soft') {
+    return `Здравствуйте! Небольшое напоминание: не отмечена оплата на ${sum}. `
+      + `Если уже заплатили — пришлите, пожалуйста, платёжку.${sign}`;
+  }
+  if (tone === 'firm') {
+    return `Здравствуйте! Задолженность ${sum} на ${ru(todayISO())} не погашена, хотя мы уже напоминали. `
+      + 'Просим оплатить в течение 5 рабочих дней или назвать точный срок, иначе придётся '
+      + `взыскивать долг с процентами по ст. 395 ГК РФ.${sign}`;
+  }
+  return `Здравствуйте! По нашим данным за вами числится задолженность ${sum}. `
+    + `Просим подтвердить сумму и сообщить срок оплаты. Если уже заплатили — пришлите платёжку.${sign}`;
+}
+
+/*
+ * Напоминание одному должнику — из утренней сводки и списка долгов.
+ * Тон переключается кнопками; «напоминали N дней назад» подсказывает,
+ * какой выбрать. Отправка письмом — только по нажатию.
+ */
+async function remindOne(tg, chatId, user, cpId, tone = '') {
+  const org = bdb.currentOrg(user.id);
+  const row = bdb.debtors(user.id).find((d) => d.theyOwe && d.cp.id === cpId);
+  if (!row) { await tg.sendMessage(chatId, 'За этим клиентом долга нет — напоминать не о чем.', mainMenu()); return; }
+  const ago = digest.lastReminded(user.id, cpId);
+  // Тон по умолчанию — по истории: первый раз мягко, потом по делу, после двух недель — строго.
+  const t = REMIND_TONES[tone] ? tone : ago == null ? 'soft' : ago >= 14 ? 'firm' : 'biz';
+  const head = `<b>Напоминание: ${esc(row.cp.name)}</b> — ${formatRub(row.amount)}`
+    + (ago == null ? '' : ago === 0 ? ' · сегодня уже напоминали' : ` · напоминали ${ago} ${plural(ago, 'день', 'дня', 'дней')} назад`);
+  const kb = [Object.entries(REMIND_TONES).map(([k, name]) => ({ text: k === t ? `• ${name}` : name, data: `rm.one:${cpId}:${k}` }))];
+  if (mailbox.has(user.id)) {
+    kb.push([row.cp.email
+      ? { text: `✉️ Отправить на ${row.cp.email}`.slice(0, 60), data: `rm.mail:${cpId}:${t}` }
+      : { text: '✉️ Указать почту и отправить', data: `rm.ask:${cpId}:${t}` }]);
+  }
+  const share = shareReminderUrl(org, row, t);
+  if (share) kb.push([{ text: '📤 Переслать клиенту', url: share }]);
+  kb.push([{ text: '✅ Отправил сам', data: `rm.done:${cpId}:${t}` }, { text: '⬅️ Долги', data: 'debts' }]);
+  await tg.sendMessage(chatId, `${head}\n\nНажмите на текст, чтобы скопировать, и перешлите клиенту:`);
+  await tg.sendMessage(chatId, `<code>${esc(reminderText(org, row, t))}</code>`, keyboard(kb));
+}
+
+/**
+ * Напоминания должникам.
+ *
+ * Кнопка отправки появляется, если подключён свой ящик. Раньше здесь был
+ * только текст «скопируйте и отправьте сами» — и это не сходилось с
+ * остальным: счёт тому же клиенту уходит с того же ящика по кнопке.
+ * Разницы между ними нет, в обоих случаях письмо отправляет человек,
+ * увидев текст. Чего по-прежнему не бывает — писем без нажатия.
+ */
+async function debtReminder(tg, chatId, user) {
+  const org = bdb.currentOrg(user.id);
+  const rows = bdb.debtors(user.id).filter((r) => r.theyOwe);
+  if (!rows.length) { await tg.sendMessage(chatId, 'Должников нет.', mainMenu()); return; }
+  const canMail = mailbox.has(user.id);
+  await tg.sendMessage(chatId, canMail
+    ? 'Тексты ниже. Отправлю письмом с актом сверки по кнопке — или скопируйте '
+      + 'и отправьте как удобно.'
+    : 'Тексты ниже — скопируйте и отправьте каждому.\n\n'
+      + '<i>Подключите свою почту, и я смогу отправлять их письмом отсюда.</i>');
+
+  for (const r of rows.slice(0, 10)) {
+    const kb = [];
+    if (canMail) {
+      kb.push([r.cp.email
+        ? { text: `✉️ Отправить на ${r.cp.email}`.slice(0, 60), data: `rm.mail:${r.cp.id}` }
+        : { text: '✉️ Указать почту и отправить', data: `rm.ask:${r.cp.id}` }]);
+    }
+    const share = shareReminderUrl(org, r, 'biz');
+    if (share) kb.push([{ text: '📤 Переслать клиенту', url: share }]);
+    kb.push([{ text: '🎚 Мягче или строже', data: `rm.one:${r.cp.id}` }]);
+    await tg.sendMessage(chatId, `<code>${esc(reminderText(org, r))}</code>`, keyboard(kb));
+  }
+}
+
+/** Отправить напоминание должнику письмом — с актом сверки во вложении. */
+async function sendReminderMail(tg, chatId, user, cpId, email, tone = 'biz') {
+  const box = mailbox.resolve(user.id);
+  if (!box.ok) { await tg.sendMessage(chatId, esc(box.reason), mainMenu()); return; }
+  const cp = bdb.getCp(user.id, cpId);
+  if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
+  const to = String(email || cp.email || '').trim();
+  if (!mailer.validEmail(to)) {
+    await tg.sendMessage(chatId, 'Адрес почты выглядит неправильно.', mainMenu());
+    return;
+  }
+  const row = bdb.debtors(user.id).find((d) => d.cp.id === cpId);
+  if (!row) { await tg.sendMessage(chatId, 'Долга за этим клиентом нет.', mainMenu()); return; }
+  const org = bdb.currentOrg(user.id) || {};
+
+  await tg.sendChatAction(chatId, 'typing');
+  /*
+   * Акт прикладываем: в тексте прямо написано «направляем акт сверки», и
+   * письмо без вложения этому противоречит. Не собрался — отправляем без
+   * него, а не молчим: напоминание важнее приложения к нему.
+   */
+  const attachments = [];
+  try {
+    /*
+     * Акт — тем же путём, что обычный акт сверки (cpForPeriod), а не
+     * сборкой вручную. Ручная сборка навсегда записывала period_end в
+     * карточку при первом напоминании: через полгода контрагент получал акт
+     * с шапкой «по 01.03» и операциями по сентябрь. И начальное сальдо она
+     * брала с карточки, а не у пары фирма—клиент — при нескольких фирмах
+     * это сальдо чужой фирмы. Период здесь — всё время по сегодня: долг,
+     * о котором напоминаем, считается так же.
+     */
+    const p = bdb.cpForPeriod(user.id, cp.id, '', todayISO(), org.id || null);
+    if (!p) throw new Error('не собрался период');
+    const buf = await buildAkt({
+      org: { brand: org.name, org_short: org.name, org_full: org.full_name || org.name,
+        org_inn: org.inn, signer: org.signer },
+      cp: p.view,
+      ops: p.ops,
+    });
+    attachments.push({
+      filename: `Акт_сверки_${docService.safeName(cp.name)}.xlsx`,
+      content: Buffer.from(buf),
+      contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    });
+  } catch (e) {
+    console.error('акт сверки к напоминанию:', e.message);
+  }
+
+  const res = await mailer.sendMail({
+    to,
+    subject: `Задолженность по расчётам${org.name ? ` — ${org.name}` : ''}`,
+    text: reminderText(org, row, REMIND_TONES[tone] ? tone : 'biz'),
+    attachments,
+  }, box.options);
+  if (!res.ok) {
+    await tg.sendMessage(chatId, esc(mailer.failText(res)),
+      keyboard([[{ text: '⚙️ Настройки почты', data: 'mb' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+  digest.logReminder(user.id, cp.id, { tone, via: 'mail' });
+  if (to !== cp.email) bdb.updateCp(user.id, cp.id, { email: to });
+  await tg.sendMessage(chatId,
+    `✅ Отправлено на <b>${esc(to)}</b>${attachments.length ? ' вместе с актом сверки' : ''}.`,
+    mainMenu());
+}
+
+// ---------- договор (три вопроса, остальное из реквизитов) ----------
+
+const DOG_STEPS = [
+  { key: 'subject', q: 'Предмет договора — что оказываем? Напр.: «услуги по организации фуршетного обслуживания»:' },
+  { key: 'price', q: 'Фиксированная сумма договора, руб. Если платим по счетам — отправьте <code>0</code>:', num: true },
+  { key: 'term', q: 'До какой даты действует? Напр. «31.12.2026» или «-» = до конца года:', opt: true },
+];
+
+async function startDogovor(tg, chatId, user, cpId, { typical = false, amount = 0 } = {}) {
+  // Есть свой договор (для этого клиента или для всех) — выписываем по нему.
+  const tpl = typical ? null : require('./lib/my-contract').getTemplate(user.id, cpId);
+  const cpT = tpl ? bdb.getCp(user.id, cpId) : null;
+  if (tpl && cpT) { await contractFlow().startTpl(tg, chatId, user, cpT, tpl, { amount }); return; }
+  if (!(await requireQuota(tg, chatId, user))) return;
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  const cp = bdb.getCp(user.id, cpId); if (!cp) return;
+  /*
+   * Номер не берём заранее. Раньше он резервировался здесь, до трёх
+   * вопросов, и если за это время договор выписывали из приложения, запись
+   * падала на занятом номере — уже после того, как файл ушёл человеку.
+   * Номер присваивает issuePlain в момент выпуска.
+   */
+  bdb.setState(user.id, `dog:${cpId}`, { i: 0, values: {} });
+  await tg.sendMessage(chatId,
+    `Договор с <b>${esc(cp.name)}</b>. Реквизиты обеих сторон подставлю сам — `
+    + 'нужно три ответа.'
+    + (typical ? '' : '\n\n<i>Работаете по своему договору? Пришлите его кнопкой ниже — дальше буду заполнять его.</i>'),
+    typical ? undefined : keyboard([[{ text: '📎 Загрузить свой договор', data: `mc.menu:${cpId}` }]]));
+  await tg.sendMessage(chatId, esc(DOG_STEPS[0].q));
+}
+
+async function handleDogText(tg, chatId, user, state, text) {
+  const cpId = Number(state.state.split(':')[1]);
+  const d = state.data;
+  const step = DOG_STEPS[d.i];
+
+  if (step.num) {
+    const n = parseAmount(text);
+    if (n == null || n < 0) { await tg.sendMessage(chatId, 'Нужно число, напр. 150000 или 0:'); return; }
+    d.values[step.key] = n;
+  } else {
+    d.values[step.key] = clean(text);
+  }
+
+  d.i += 1;
+  if (d.i < DOG_STEPS.length) {
+    bdb.setState(user.id, state.state, d);
+    await tg.sendMessage(chatId, esc(DOG_STEPS[d.i].q));
+    return;
+  }
+
+  bdb.clearState(user.id);
+  await tg.sendChatAction(chatId, 'upload_document');
+  const res = await docService.issuePlain(user.id, { type: 'dog', cpId, fields: d.values });
+  if (!res.ok) { await tg.sendMessage(chatId, esc(res.message), mainMenu()); return; }
+  const cp = bdb.getCp(user.id, cpId);
+  await sendGenerated(tg, chatId, {
+    file: res.file,
+    caption: `Договор № ${esc(res.doc.number)} от ${ru(res.doc.date)} с <b>${esc(cp.name)}</b>.`
+      + '\nШаблон общего назначения — под конкретную сделку покажите юристу.',
+  });
+  const { info, kb } = cpMenu(user.id, cp);
+  await tg.sendMessage(chatId, info, kb);
+}
+
+async function startPp(tg, chatId, user, cpId) {
+  if (!(await requireQuota(tg, chatId, user))) return;
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  // Номер — в момент выпуска, как у договора выше.
+  bdb.setState(user.id, `pp:${cpId}`, { step: 'amount' });
+  await tg.sendMessage(chatId, 'Платёжное поручение. Введите <b>сумму</b>, руб.:');
+}
+async function handlePpText(tg, chatId, user, state, text) {
+  const cpId = Number(state.state.split(':')[1]);
+  if (state.data.step === 'amount') {
+    const a = parseAmount(text);
+    if (a == null || a <= 0) { await tg.sendMessage(chatId, 'Нужна сумма числом, напр. 26496.42:'); return; }
+    bdb.setState(user.id, `pp:${cpId}`, { ...state.data, step: 'purpose', amount: a });
+    await tg.sendMessage(chatId, 'Назначение платежа (напр. «Оплата по договору № 5 от 01.02.2026»):');
+    return;
+  }
+  // purpose
+  bdb.clearState(user.id);
+  await tg.sendChatAction(chatId, 'upload_document');
+  const res = await docService.issuePlain(user.id, {
+    type: 'pp', cpId, fields: { amount: state.data.amount, purpose: text },
+  });
+  if (!res.ok) { await tg.sendMessage(chatId, esc(res.message), mainMenu()); return; }
+  const cp = bdb.getCp(user.id, cpId);
+  await sendGenerated(tg, chatId, {
+    file: res.file,
+    caption: `Платёжное поручение № ${esc(res.doc.number)} получателю <b>${esc(cp.name)}</b> `
+      + `на ${formatRub(res.total)}`,
+  });
+  const { info, kb } = cpMenu(user.id, cp);
+  await tg.sendMessage(chatId, info, kb);
+}
+
+const ru = (iso) => (iso && /^\d{4}-\d{2}-\d{2}$/.test(iso) ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : iso || '');
+
+// ---------- контрагенты: список и вход ----------
+
+/**
+ * Проводник «выписать документ».
+ *
+ * Главный экран продукта. Человек приходит выставить счёт, а не изучать
+ * разделы: до этой кнопки, чтобы добраться до счёта, нужно было догадаться,
+ * что документы живут внутри карточки контрагента — сначала завести
+ * организацию, потом контрагента, потом найти его в списке. Кто не работал
+ * в 1С, не догадывался и уходил.
+ *
+ * Здесь наоборот: жмём «Выписать счёт», а недостающее спрашиваем по дороге
+ * и сразу возвращаемся к начатому делу.
+ */
+/*
+ * ---------- счета-фактуры: аванс, корректировка, исправление ----------
+ *
+ * Три документа, которых до сих пор не было ни в одном экране, хотя формы и
+ * расчёты уже готовы. Все три — про НДС, поэтому неплательщику они не
+ * показываются вовсе: счёт-фактуру он выставлять не вправе, и предлагать её
+ * значит подталкивать к нарушению.
+ */
+
+/** Плательщик ли НДС и можно ли ему счёт-фактуру. Ответ словами, если нельзя. */
+function sfBlocked(org) {
+  if (npd.isNpd(org)) {
+    return 'Самозанятый не выставляет счета-фактуры: он не плательщик НДС (422-ФЗ). '
+      + 'Если вы с НПД снялись — выключите галочку в разделе «Самозанятость».';
+  }
+  if (bdb.vatOf(org).rate == null) {
+    return 'Счёт-фактура выставляется со ставкой НДС, а у вас выбрано «без НДС». '
+      + 'Поменять можно в разделе «НДС».';
+  }
+  return '';
+}
+
+/** Счёт-фактура на полученную предоплату: сумма → платёжка → за что. */
+async function startAvans(tg, chatId, user, cpId) {
+  if (!(await requireQuota(tg, chatId, user))) return;
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  const no = sfBlocked(org);
+  if (no) {
+    await tg.sendMessage(chatId, no, keyboard([[{ text: '🧾 НДС', data: 'vat' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+  const rate = bdb.vatOf(org).rate;
+  bdb.setState(user.id, `av:${cpId}`, { step: 'sum', rate });
+  await tg.sendMessage(chatId,
+    `<b>Счёт-фактура на аванс</b>, ставка ${rate}%.\n\n`
+    + 'Сколько денег пришло? Введите сумму <b>целиком, как получили</b> — налог в ней уже сидит, '
+    + `я выделю его расчётной ставкой ${rate}/${100 + rate}.`);
+}
+
+async function handleAvansText(tg, chatId, user, state, text) {
+  const cpId = Number(state.state.split(':')[1]);
+  const d = state.data;
+
+  if (d.step === 'sum') {
+    const a = parseAmount(text);
+    if (a == null || a <= 0) { await tg.sendMessage(chatId, 'Нужна сумма числом, напр. 100000:'); return; }
+    const { vat, label } = advanceVat(a, d.rate);
+    bdb.setState(user.id, `av:${cpId}`, { ...d, step: 'payDoc', sum: a });
+    await tg.sendMessage(chatId,
+      `Из ${formatRub(a)} налог по ставке ${label} — <b>${formatRub(vat)}</b>.\n\n`
+      + 'Теперь <b>номер и дата платёжного поручения</b>, которым пришли деньги '
+      + '(напр. «№ 55 от 01.09.2026»). Это обязательный реквизит строки 5 — '
+      + 'без него налоговая не свяжет счёт-фактуру с поступлением.');
+    return;
+  }
+
+  if (d.step === 'payDoc') {
+    // Пропустить нельзя: без строки 5 авансовый счёт-фактура недействителен,
+    // и лучше переспросить здесь, чем отказать в самом конце.
+    const pd = String(text).trim().slice(0, 200);
+    if (!pd || pd === '-' || pd === '—') {
+      await tg.sendMessage(chatId,
+        'Без платёжного поручения авансовый счёт-фактура недействителен — покупатель не '
+        + 'примет налог к вычету. Пришлите номер и дату, например «№ 55 от 01.09.2026».');
+      return;
+    }
+    bdb.setState(user.id, `av:${cpId}`, { ...d, step: 'subject', payDoc: pd });
+    await tg.sendMessage(chatId,
+      'За что предоплата? Одной строкой, как в договоре (напр. «Монтаж по договору № 7»).\n\n'
+      + '<i>Или «-», и напишу «Предварительная оплата по договору».</i>');
+    return;
+  }
+
+  // subject — последний шаг, выпускаем
+  const subject = String(text).trim() === '-' ? '' : String(text).trim().slice(0, 300);
+  bdb.clearState(user.id);
+  const res = await docService.issueFlat(user.id, {
+    type: 'avans', cpId, total: d.sum,
+    payload: { sum: d.sum, vatRate: d.rate, payDoc: d.payDoc, subject },
+  });
+  if (!res.ok) { await tg.sendMessage(chatId, res.message, mainMenu()); return; }
+  const { vat, label } = advanceVat(d.sum, d.rate);
+  await tg.sendDocument(chatId, {
+    filename: res.file.filename,
+    buffer: res.file.buffer,
+    caption: `Счёт-фактура на аванс № ${esc(res.doc.number)} — ${formatRub(d.sum)}, `
+      + `в том числе НДС ${esc(label)} — <b>${formatRub(vat)}</b>.\n\n`
+      + '<i>При отгрузке сошлюсь на него в строке 5б — это обязательно с 1 апреля 2026 года.</i>',
+  });
+  await tg.sendMessage(chatId, 'Готово.', mainMenu());
+}
+
+/** Корректировочный: выбрать исходный документ, потом ввести новые строки. */
+async function startKsf(tg, chatId, user, cpId) {
+  const org = await requireOrg(tg, chatId, user); if (!org) return;
+  const no = sfBlocked(org);
+  if (no) { await tg.sendMessage(chatId, no, mainMenu()); return; }
+
+  // Корректировать можно только то, что было счётом-фактурой.
+  const base = bdb.listDocs(user.id, 20, cpId)
+    .filter((x) => x.type === 'upd' && Number((x.payload || {}).status) === 1);
+  if (!base.length) {
+    await tg.sendMessage(chatId,
+      'Корректировать нечего: по этому клиенту нет ни одного УПД со счётом-фактурой.\n\n'
+      + '<i>Корректировочный выставляют к уже выданному счёту-фактуре, когда стороны '
+      + 'договорились об изменении стоимости.</i>', mainMenu());
+    return;
+  }
+  await tg.sendMessage(chatId, 'К какому счёту-фактуре корректировка?',
+    keyboard([...base.slice(0, 8).map((x) => ([{
+      text: `${x.title} № ${x.number} от ${ru(x.date)}`.slice(0, 60), data: `ksf.b:${x.id}`,
+    }])), [{ text: '⬅️ Отмена', data: `cp:${cpId}` }]]));
+}
+
+async function askKsfLines(tg, chatId, user, docId) {
+  const src = bdb.getDoc(user.id, docId);
+  if (!src) { await tg.sendMessage(chatId, 'Документ не найден.', mainMenu()); return; }
+  const items = (src.payload || {}).items || [];
+  bdb.setState(user.id, `ksf:${src.cp_id}`, { step: 'lines', baseId: docId });
+  await tg.sendMessage(chatId,
+    `<b>Корректировка к № ${esc(src.number)} от ${ru(src.date)}</b>\n\n`
+    + 'Было:\n'
+    + items.map((it) => `• ${esc(it.name)}; ${it.qty}; ${it.price}`).join('\n')
+    + '\n\nПришлите строки в том же виде, но с <b>новыми</b> количеством и ценой — '
+    + 'по строке на позицию, в том же порядке.\n\n'
+    + '<i>Например: Монтаж; 8; 900</i>');
+}
+
+async function handleKsfText(tg, chatId, user, state, text) {
+  const d = state.data;
+  const src = bdb.getDoc(user.id, d.baseId);
+  if (!src) { bdb.clearState(user.id); await tg.sendMessage(chatId, 'Исходный документ пропал.', mainMenu()); return; }
+
+  if (d.step === 'lines') {
+    // Разбираем построчно тем же разбором, что и позиции документа: человек
+    // уже знает этот формат, и второй придумывать незачем.
+    const after = String(text).split('\n').map((l) => parseItemLine(l.trim())).filter(Boolean);
+    const before = (src.payload || {}).items || [];
+    if (!after.length) { await tg.sendMessage(chatId, 'Не разобрал строки. Формат: <code>Монтаж; 8; 900</code>'); return; }
+    if (after.length !== before.length) {
+      await tg.sendMessage(chatId,
+        `В исходном документе ${before.length} ${plural(before.length, 'позиция', 'позиции', 'позиций')}, `
+        + `а прислано ${after.length}. Строки должны идти в том же порядке и в том же количестве — `
+        + 'иначе непонятно, что с чем сравнивать.');
+      return;
+    }
+    bdb.setState(user.id, state.state, { ...d, step: 'reason', after });
+    await tg.sendMessage(chatId,
+      'На каком основании меняем? Договор, соглашение или иной документ '
+      + '(напр. «Соглашение № 3 от 04.09.2026»).\n\n'
+      + '<i>Реквизит обязательный: без основания корректировочный недействителен.</i>');
+    return;
+  }
+
+  // reason — выпускаем
+  const p = src.payload || {};
+  const before = p.items || [];
+  const lines = before.map((it, i) => ({
+    name: it.name, unit: it.unit,
+    before: { qty: it.qty, price: it.price },
+    after: { qty: d.after[i].qty, price: d.after[i].price },
+  }));
+  const rate = p.vatRate == null ? null : Number(p.vatRate);
+  const rows = lines.map((l) => correctionRow(l.before, l.after, rate, Boolean(p.priceIncludesVat)));
+  const { up, down } = correctionTotals(rows);
+  bdb.clearState(user.id);
+
+  const res = await docService.issueFlat(user.id, {
+    type: 'ksf', cpId: src.cp_id, total: correctionNet({ up, down }).total,
+    payload: { vatRate: rate, priceIncludesVat: Boolean(p.priceIncludesVat),
+      base: { number: src.number, date: src.date }, reason: String(text).trim().slice(0, 300), lines },
+  });
+  if (!res.ok) { await tg.sendMessage(chatId, res.message, mainMenu()); return; }
+
+  await tg.sendDocument(chatId, {
+    filename: res.file.filename,
+    buffer: res.file.buffer,
+    caption: `Корректировочный № ${esc(res.doc.number)} к № ${esc(src.number)}.\n`
+      + (up.total ? `Увеличение: <b>${formatRub(up.total)}</b>, налог ${formatRub(up.vat)}.\n` : '')
+      + (down.total ? `Уменьшение: <b>${formatRub(down.total)}</b>, налог ${formatRub(down.vat)}.\n` : '')
+      + `\n<i>${up.total ? 'Увеличение идёт в книгу продаж. ' : ''}`
+      + `${down.total ? 'Уменьшение — в книгу покупок, это ваш вычет.' : ''}</i>`,
+  });
+  await tg.sendMessage(chatId, 'Готово.', mainMenu());
+}
+
+/**
+ * Исправление: тот же счёт-фактура, тот же номер и дата, но заново собранный
+ * по текущим данным и с пометкой «ИСПРАВЛЕНИЕ № N».
+ *
+ * Это не корректировка: ничего не менялось по договорённости, документ просто
+ * был неверен — не тот ИНН, не та ставка. Поэтому номер и дата остаются
+ * прежними, а исправлению даётся свой порядковый номер.
+ */
+async function makeFix(tg, chatId, user, docId) {
+  const src = bdb.getDoc(user.id, docId);
+  if (!src) { await tg.sendMessage(chatId, 'Документ не найден.', mainMenu()); return; }
+  const p = src.payload || {};
+  if (src.type !== 'upd' || Number(p.status) !== 1) {
+    await tg.sendMessage(chatId,
+      'Исправление выставляют к счёту-фактуре. Этот документ им не является.', mainMenu());
+    return;
+  }
+  const no = sfBlocked(bdb.currentOrg(user.id));
+  if (no) { await tg.sendMessage(chatId, no, mainMenu()); return; }
+
+  const fixNo = Number(p.fix && p.fix.no ? p.fix.no : 0) + 1;
+  const res = await docService.rebuildDocument(user.id, docId, {
+    extra: { fix: { no: fixNo, date: todayISO() } },
+  });
+  if (!res || !res.ok) {
+    await tg.sendMessage(chatId, (res && res.message) || 'Не получилось собрать исправление.', mainMenu());
+    return;
+  }
+  await tg.sendDocument(chatId, {
+    filename: res.file.filename,
+    buffer: res.file.buffer,
+    caption: `Исправление № ${fixNo} к счёту-фактуре № ${esc(src.number)} от ${ru(src.date)}.\n\n`
+      + '<i>Номер и дата исходного счёта-фактуры не меняются — так и должно быть. '
+      + 'Передайте этот экземпляр покупателю взамен прежнего.</i>',
+  });
+}
+
+async function startDoc(tg, chatId, user, type) {
+  const org = bdb.currentOrg(user.id);
+  if (!org || !org.name) {
+    // Реквизиты нужны не «для порядка», а чтобы клиенту было куда платить, —
+    // так и объясняем, иначе форма выглядит бюрократией на ровном месте.
+    bdb.setState(user.id, 'form:orgq', { i: 0, values: { __then: type } });
+    await tg.sendMessage(chatId,
+      'Сначала пара слов о вас — это один раз, дальше не спрошу.\n\n'
+      + '<i>Ваше название и счёт печатаются в документе: без них клиенту некуда платить.</i>');
+    await askStep(tg, chatId, 'orgq', 0);
+    return;
+  }
+
+  const cps = bdb.listCps(user.id);
+  if (!cps.length) {
+    bdb.setState(user.id, 'form:cpq', { i: 0, values: { __then: type } });
+    await tg.sendMessage(chatId, 'Кому выставляем? Добавим первого клиента.');
+    await askStep(tg, chatId, 'cpq', 0);
+    return;
+  }
+
+  const rows = cps.slice(0, 12).map((c) => [{ text: `${c.kind === 'supplier' ? '📦' : '🧑‍💼'} ${c.name}`, data: `d.${type}:${c.id}` }]);
+  rows.push([{ text: '➕ Новый клиент', data: `cp.new.${type}` }]);
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  const title = (ITEM_DOCS[type] || docService.ALL_DOCS[type] || { title: type === 'akt' ? 'Акт сверки' : 'Документ' }).title;
+  await tg.sendMessage(chatId,
+    `<b>${esc(title)}</b>\nКому выписываем?`, keyboard(rows));
+}
+
+/** Выбор вида документа, когда нужен не счёт. */
+async function chooseDoc(tg, chatId, user) {
+  bdb.clearState(user.id);
+  const self = npd.isNpd(bdb.currentOrg(user.id));   // самозанятому УПД не предлагаем
+  const rows = [
+    [{ text: '🧾 Счёт на оплату', data: 'go.sch' }, { text: '📝 Счёт-договор', data: 'go.schdog' }],
+    self
+      ? [{ text: '🧾 Акт услуг', data: 'go.usl' }, { text: '🚚 ТОРГ-12', data: 'go.torg12' }]
+      : [{ text: '🧾 Акт услуг', data: 'go.usl' }, { text: '📦 УПД', data: 'go.upd' }],
+    self
+      ? [{ text: '📝 Договор', data: 'go.dog' }]
+      : [{ text: '🚚 ТОРГ-12', data: 'go.torg12' }, { text: '📝 Договор', data: 'go.dog' }],
+    [{ text: '🏦 Платёжка', data: 'go.pp' }, { text: '📄 Акт сверки', data: 'go.akt' }],
+    [{ text: '⬅️ Меню', data: 'menu' }],
+  ];
+  await tg.sendMessage(chatId,
+    '<b>Какой документ нужен?</b>\n\n'
+    + '<i>Счёт — попросить оплату. Акт — подтвердить, что услуга оказана. '
+    + (self ? 'ТОРГ-12 — передать товар. ' : 'УПД и ТОРГ-12 — передать товар. ')
+    + 'Счёт-договор — счёт вместо договора. '
+    + 'Платёжка — заплатить самому. Сверка — кто сколько должен.</i>',
+    keyboard(rows));
+}
+
+async function showCps(tg, chatId, user) {
+  const cps = bdb.listCps(user.id);
+  if (!cps.length) {
+    await tg.sendMessage(chatId, 'Клиентов пока нет.', keyboard([[{ text: '➕ Добавить клиента', data: 'cp.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+  /*
+   * Клиенты общие на аккаунт, и когда фирм несколько, надо видеть, чей это
+   * клиент: выписать документ не от той организации — дело одного промаха, а
+   * замечают это уже у контрагента. Пока фирма одна, «свои» — вообще все, и
+   * метка была бы шумом: её тогда просто нет.
+   */
+  const multiOrg = cps.some((c) => !c.mine);
+  const rows = cps.map((c) => [{
+    text: `${c.kind === 'supplier' ? '📦' : '🧑‍💼'} ${c.name}${multiOrg && !c.mine ? ' · другая фирма' : ''}`,
+    data: `cp:${c.id}`,
+  }]);
+  rows.push([{ text: '➕ Добавить клиента', data: 'cp.new' }]);
+  rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+  await tg.sendMessage(chatId, 'Ваши клиенты:', keyboard(rows));
+}
+
+/** Список своих организаций: от какой работаем. */
+async function showOrgPick(tg, chatId, user) {
+  const orgs = bdb.listOrgs(user.id);
+  const cur = bdb.currentOrgId(user.id);
+  const rows = orgs.map((o) => [{
+    text: `${o.id === cur ? '● ' : '○ '}${o.name}${o.inn ? ` · ИНН ${o.inn}` : ''}`.slice(0, 60),
+    data: `org.use:${o.id}`,
+  }]);
+  rows.push([{ text: '➕ Добавить организацию', data: 'org.add' }]);
+  rows.push([{ text: '⬅️ К организации', data: 'org' }]);
+  await tg.sendMessage(chatId,
+    '<b>От какой фирмы работаем</b>\n\n'
+    + 'Выбор запоминается: документы, долги и отчёты дальше будут её. '
+    + 'У каждой фирмы свой ряд номеров и свои долги и расчёты с клиентами — '
+    + 'смешать их нельзя, это разные юрлица.',
+    keyboard(rows));
+}
+
+/**
+ * Завести ещё одну организацию.
+ *
+ * Переключаемся на неё ДО формы, а не после: форма сохраняет реквизиты через
+ * saveMyOrg, а он правит текущую. Не переключившись, человек заполнил бы
+ * анкету новой фирмы, а переписал бы ею старую — и заметил бы это по чужим
+ * реквизитам в ближайшем счёте.
+ */
+async function startAddOrg(tg, chatId, user) {
+  const q = bdb.orgQuota(user.id);
+  if (!q.canAdd) {
+    await tg.sendMessage(chatId,
+      `В тариф входит ${q.limit === 1 ? 'одна организация' : `${q.limit} организации`}, `
+      + 'и они уже заведены.\n\n'
+      + 'Нужна ещё — напишите в поддержку, откроем место за доплату. '
+      + 'Ничего при этом не отключится: всё заведённое остаётся на месте.',
+      keyboard([
+        [{ text: '💬 Написать в поддержку', data: 'support' }],
+        [{ text: '⬅️ К организации', data: 'org' }],
+      ]));
+    return;
+  }
+  const id = bdb.createOrg(user.id, { name: '' });
+  bdb.setActiveOrg(user.id, id);
+  await tg.sendMessage(chatId,
+    'Заводим ещё одну организацию. Отвечайте по порядку — реквизиты те же, '
+    + 'что и у первой.\n\n'
+    + '<i>Прежняя фирма никуда не денется: между ними можно переключаться.</i>');
+  await startForm(tg, chatId, user, 'org');
+}
+
+async function showOrg(tg, chatId, user) {
+  const org = bdb.currentOrg(user.id);
+  if (!org) {
+    await tg.sendMessage(chatId, 'Ваша фирма ещё не заведена.', keyboard([[{ text: '➕ Завести свою фирму', data: 'org.new' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+    return;
+  }
+  const txt = `<b>${esc(org.name)}</b>\n`
+    + `${esc(org.full_name || '')}\n`
+    + `ИНН ${esc(org.inn || '—')}${org.kpp ? ` · КПП ${esc(org.kpp)}` : ''}\n`
+    + `Подписант: ${esc(org.signer || '—')}\n`
+    + `Банк: ${esc(org.bank_name || '—')}${org.bik ? ` · БИК ${esc(org.bik)}` : ''}\n`
+    + `Р/с: ${esc(org.acc || '—')}`;
+  const fxSign = facsimile.get(user.id, 'sign');
+  const fxStamp = facsimile.get(user.id, 'stamp');
+  const fxLabel = fxSign || fxStamp
+    ? `🖊 Подпись и печать · ${[fxSign && 'подпись', fxStamp && 'печать'].filter(Boolean).join(' и ')}`
+    : '🖊 Подпись и печать';
+  /*
+   * Переключатель показываем, только когда фирм больше одной.
+   *
+   * У подавляющего большинства она одна, и кнопка «Сменить организацию» на
+   * экране с единственной организацией — это вопрос без ответа: человек
+   * жмёт, видит список из одной строки и не понимает, что от него хотели.
+   * Зато «Добавить организацию» нужна всегда — иначе второй фирме взяться
+   * неоткуда.
+   */
+  const orgs = bdb.listOrgs(user.id);
+  const rows = [[{ text: '✏️ Изменить (ввести заново)', data: 'org.new' }]];
+  if (orgs.length > 1) {
+    rows.push([{ text: `🔀 Сейчас: ${org.name}`.slice(0, 60), data: 'org.pick' }]);
+  }
+  rows.push([{ text: '➕ Добавить организацию', data: 'org.add' }]);
+  await tg.sendMessage(chatId, txt, keyboard([
+    ...rows,
+    [{ text: fxLabel, data: 'fx' }],
+    [{ text: `🧾 НДС: ${vatLabel(org)}`.slice(0, 60), data: 'vat' }],
+    [{ text: `💼 Самозанятость: ${npd.isNpd(org) ? 'да' : 'нет'}`, data: 'npd' }],
+    // Режим налогов — для книги учёта. Раньше экран открывался только из
+    // отказа «не знаю ваш режим», и выбранный однажды режим было не сменить.
+    [{ text: `📒 Режим: ${kudir.TAX_MODES[org.tax_mode] || 'не указан'}`.slice(0, 60), data: 'taxmode' }],
+    [{ text: `📊 Долг: ${BASIS_LABEL[bdb.basisOf(org)]}`.slice(0, 60), data: 'basis' }],
+    [{ text: bdb.isAiEnabled(user.id) ? '🤖 Помощник: включён' : '🤖 Помощник: выключен', data: 'toggle.ai' }],
+    [digest.isOn(user.id)
+      ? { text: '☀️ Утренняя сводка: включена', data: 'dg.off' }
+      : { text: '🔕 Утренняя сводка: выключена', data: 'dg.on' }],
+    [{ text: mailbox.has(user.id) ? '✉️ Почта: подключена' : '✉️ Подключить почту', data: 'mb' }],
+    [{ text: '⬅️ Меню', data: 'menu' }],
+  ]));
+}
+
+// ---------- главный обработчик апдейта ----------
+
+async function handleUpdate(tg, update) {
+  try {
+    return await route(tg, update);
+  } catch (e) {
+    // Пользователь заблокировал бота или удалил чат: писать ему больше некуда.
+    // Помечаем и молчим — иначе каждая попытка будет ошибкой в логе.
+    if (e && e.blocked) {
+      const from = (update.callback_query || update.message || {}).from || {};
+      if (from.id) {
+        const u = bdb.getOrCreateUser(from.id);
+        bdb.markBlocked(u.id);
+        console.log(`Пользователь ${from.id} заблокировал бота — помечен`);
+      }
+      return undefined;
+    }
+    throw e;
+  }
+}
+
+async function route(tg, update) {
+  if (update.callback_query) return handleCallback(tg, update.callback_query);
+  const msg = update.message;
+  if (!msg) return undefined;
+  if (msg.photo || (msg.document && /^image\//.test(msg.document.mime_type || ''))) {
+    const from = msg.from || {};
+    const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
+    bdb.markActive(user.id);
+    return handlePhoto(tg, msg.chat.id, user, msg);
+  }
+  if (msg.document && STATEMENT_FILE.test(msg.document.file_name || '')) {
+    const from = msg.from || {};
+    const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
+    bdb.markActive(user.id);
+    return handleStatement(tg, msg.chat.id, user, msg);
+  }
+  if (msg.document) {
+    const from = msg.from || {};
+    const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
+    bdb.markActive(user.id);
+    // PDF и Word — скорее всего договор: разобрать или сделать своим шаблоном.
+    if (await contractFlow().onFile(tg, msg.chat.id, user, msg)) return undefined;
+    return handleOtherDocument(tg, msg.chat.id, user, msg);
+  }
+  if (msg.voice || msg.audio || msg.video_note) {
+    const from = msg.from || {};
+    const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
+    bdb.markActive(user.id);
+    return handleVoice(tg, msg.chat.id, user, msg);
+  }
+  if (msg.text) return handleMessage(tg, msg);
+  return undefined;
+}
+
+async function handleMessage(tg, msg) {
+  const chatId = msg.chat.id;
+  const from = msg.from || {};
+  const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
+  bdb.markActive(user.id); // писал — значит не заблокирован
+  const text = msg.text.trim();
+
+  if (isOwner(from.id) && await ownerCommand(tg, chatId, text)) return;
+
+  /*
+   * `/start` с меткой — это человек с рекламы, а не мусор.
+   *
+   * Telegram присылает переход по ссылке t.me/бот?start=МЕТКА обычным
+   * сообщением «/start МЕТКА». Точное сравнение его не ловило: приветствие
+   * не показывалось, и фраза проваливалась дальше — в разбор ИИ, который
+   * честно отвечал «не понял». То есть каждый, кто пришёл по объявлению,
+   * первым делом получал отказ, а откуда он пришёл, мы не узнавали.
+   *
+   * Метку запоминаем при первой встрече и больше не трогаем: интересно,
+   * откуда человек пришёл ИЗНАЧАЛЬНО, а не какую ссылку он открыл последней.
+   */
+  const startMatch = /^\/start(?:@\w+)?(?:\s+(.+))?$/i.exec(text);
+  if (startMatch) {
+    bdb.clearState(user.id);
+    const rawPayload = (startMatch[1] || '').trim();
+    const payload = rawPayload.slice(0, 64);
+
+    // 0. Вход на сайт: /start login_<nonce>. Раньше всех прочих меток: это не
+    // реклама и не промокод, а запрос на доступ к данным человека, и метку
+    // источника он не заводит.
+    if (/^login_/i.test(payload)) {
+      await webLogin.offer(tg, msg.chat, payload.slice(6));
+      return;
+    }
+
+    // 1. Активация промокода: /start promo_PRV123 или /start promo-PRV123
+    if (/^promo[_-]/i.test(payload)) {
+      const code = payload.replace(/^promo[_-]/i, '');
+      if (!user.source) {
+        try { user.source = bdb.setSource(user.id, payload); } catch (_) {}
+      }
+      await redeemPromo(tg, chatId, user, code);
+      return;
+    }
+
+    // 2. Открытие карточки документа: /start doc_123 или /start doc-123
+    if (/^doc[_-]/i.test(payload)) {
+      const docId = Number(payload.replace(/^doc[_-]/i, ''));
+      if (Number.isFinite(docId) && docId > 0) {
+        await showDoc(tg, chatId, user, docId);
+        return;
+      }
+      // Невалидный docId — не падаем в AI, показываем приветствие
+      await tg.sendMessage(chatId, greetingFor(user), mainMenu());
+      return;
+    }
+
+    // 3. Реферальная ссылка: /start ref_12345 или /start ref-12345
+    if (/^ref[_-]/i.test(payload)) {
+      if (!user.source) {
+        try { user.source = bdb.setSource(user.id, payload); } catch (_) {}
+      }
+      await tg.sendMessage(chatId, greetingFor(user), mainMenu());
+      return;
+    }
+
+    // 4. Любая другая метка (e.g. utm_* или reels_qr)
+    if (payload) {
+      if (!user.source) {
+        try { user.source = bdb.setSource(user.id, payload); } catch (_) {}
+      }
+      await tg.sendMessage(chatId, greetingFor(user), mainMenu());
+      return;
+    }
+
+    // 5. Обычный /start без параметров
+    await tg.sendMessage(chatId, greetingFor(user), mainMenu());
+    return;
+  }
+  // Свой номер нужен, чтобы владелец выдал доступ: имя в Telegram есть не у
+  // всех и меняется, номер — нет.
+  if (text === '/id') {
+    await tg.sendMessage(chatId, `Ваш номер: <code>${user.tg_id}</code>\n\n`
+      + '<i>Нажмите на номер, чтобы скопировать, и пришлите его в поддержку.</i>');
+    return;
+  }
+  if (text === '/ai') {
+    const next = !bdb.isAiEnabled(user.id);
+    bdb.setAiEnabled(user.id, next);
+    await tg.sendMessage(chatId, next
+      ? '🤖 <b>Помощник включён.</b> Пишите задачу словами, например:\n'
+        + '<i>«выставь Заре счёт на 50 тысяч за разработку сайта с НДС 22%»</i>'
+      : '🤖 <b>Помощник выключен.</b> Документы создаются через меню, шаг за шагом.');
+    return;
+  }
+  if (text === '/menu' || text === '/cancel') { bdb.clearState(user.id); await tg.sendMessage(chatId, 'Главное меню:', mainMenu()); return; }
+  // Команды из меню Telegram — те же экраны, что и кнопки. Если человек
+  // выбрал команду в середине формы, шаг сбрасываем: он передумал.
+  const SLASH = { '/org': 'org', '/cps': 'cps', '/debts': 'debts', '/docs': 'docs',
+    '/help': 'help', '/support': 'support', '/subscription': 'billing',
+    '/legal': 'legal', '/terms': 'legal', '/privacy': 'legal', '/tariffs': 'legal', '/oferta': 'legal',
+    '/sessions': 'ws' };
+  if (SLASH[text]) {
+    bdb.clearState(user.id);
+    await handleCallback(tg, {
+      id: 'cmd', from: msg.from, data: SLASH[text], message: { chat: { id: chatId } },
+    });
+    return;
+  }
+
+  const state = bdb.getState(user.id);
+  // Код можно просто прислать сообщением, без захода в меню, — но только
+  // когда человек не заполняет форму: там «PRV-…» может оказаться названием.
+  if (!state.state && billing.looksLikeCode(text)) {
+    await redeemPromo(tg, chatId, user, text);
+    return;
+  }
+  if (state.state.startsWith('form:')) { await applyFormValue(tg, chatId, user, state, text); return; }
+  if (state.state.startsWith('items:')) {
+    const d = state.data;
+
+    // ждём номер, дату или количество для позиции из шаблона
+    if (d.ask === 'number') {
+      d.number = text.slice(0, 20); d.ask = '';
+      bdb.setState(user.id, state.state, d);
+      await showPreview(tg, chatId, user, bdb.getState(user.id));
+      return;
+    }
+    if (d.ask === 'date') {
+      const iso = parseDate(text);
+      if (!iso) { await tg.sendMessage(chatId, 'Не понял дату. Формат ДД.ММ.ГГГГ:'); return; }
+      d.date = iso; d.ask = '';
+      bdb.setState(user.id, state.state, d);
+      await showPreview(tg, chatId, user, bdb.getState(user.id));
+      return;
+    }
+    if (d.ask === 'basis') {
+      // Предел тот же, что у договора в карточке и у поля в приложении.
+      const basis = text.trim().slice(0, 200);
+      const doc = { ...(d.doc || {}) };
+      if (!basis || /^[-—–]$/.test(basis)) delete doc.basis; else doc.basis = basis;
+      d.doc = doc; d.ask = '';
+      bdb.setState(user.id, state.state, d);
+      await showPreview(tg, chatId, user, bdb.getState(user.id));
+      return;
+    }
+    if (d.ask === 'qty') {
+      const qty = parseAmount(text);
+      if (qty == null || qty <= 0) { await tg.sendMessage(chatId, 'Нужно количество числом, напр. 20:'); return; }
+      const t = d.tplItem || bdb.getTemplate(user.id, d.tplId);
+      d.ask = ''; d.tplId = 0; d.tplItem = null;
+      if (t) d.items.push({ name: t.name, qty, unit: t.unit || 'шт.', price: t.price });
+      bdb.setState(user.id, state.state, d);
+      await tg.sendMessage(chatId,
+        t ? `Добавлено: ${esc(t.name)} — ${qty} ${esc(t.unit || 'шт.')} × ${formatRub(t.price)}` : 'Шаблон не найден.',
+        itemsKb(user, d));
+      return;
+    }
+
+    // Дозапрос по начатой позиции: название уже знаем, ждём количество и цену.
+    if (d.ask === 'np') {
+      const p = d.pending || {};
+      const reply = text.replace(/\s*[x×хX*]\s*(?=\d)/g, ';').replace(/\s+по\s+(?=\d)/gi, ';');
+      const loose = numbersIn(reply, false);   // «2 4500» — два числа
+      const tight = numbersIn(reply, true);    // «30 000» — одно число
+      const unit = unitAfter(reply, ((loose[0] || {}).end) || 0);
+      if (unit) p.unit = unit;
+
+      if (p.qty != null) {
+        // Количество уже знаем — значит это цена, и «30 000» здесь тридцать
+        // тысяч, а не тридцать и ноль.
+        if (tight.length) p.price = tight[tight.length - 1].value;
+      } else if (loose.length >= 2 && loose[loose.length - 1].value > 0) {
+        [p.qty, p.price] = [loose[0].value, loose[loose.length - 1].value];
+      } else if (tight.length === 1) {
+        p.qty = tight[0].value;
+      }
+
+      if (p.qty == null || p.qty <= 0) {
+        d.pending = p; bdb.setState(user.id, state.state, d);
+        await tg.sendMessage(chatId, 'Нужно количество числом. Например: <code>1</code> или <code>20 шт</code>');
+        return;
+      }
+      if (p.price == null) {
+        d.pending = p; bdb.setState(user.id, state.state, d);
+        await tg.sendMessage(chatId,
+          `<b>${esc(p.name)}</b> — ${p.qty} ${esc(p.unit || 'шт.')}\nПо какой цене за единицу?`);
+        return;
+      }
+      d.items.push({ name: p.name, qty: p.qty, unit: p.unit || 'шт.', price: p.price });
+      d.ask = ''; d.pending = null;
+      bdb.setState(user.id, state.state, d);
+      await tg.sendMessage(chatId,
+        `Добавлено: ${esc(p.name)} — ${p.qty} ${esc(p.unit || 'шт.')} × ${formatRub(p.price)}\nЕщё позицию или «Сформировать».`,
+        itemsKb(user, d));
+      return;
+    }
+
+    /*
+     * Просьба посреди набора — не позиция. Отдаём её обычному разбору
+     * фраз: он начнёт новый документ (и скажет об этом сам). Если разбор
+     * не взялся — читаем как позицию, как и раньше.
+     */
+    if (looksLikeRequest(text, bdb.listCps(user.id)) && await handleFreeText(tg, chatId, user, text)) return;
+
+    const item = readItemLine(text);
+    // Не поняли количество и цену — не отказываем, а спрашиваем. Человек
+    // пишет позицию так, как говорит; подстраиваться должны мы.
+    if (!item || item.partial) {
+      if (!item) { await tg.sendMessage(chatId, 'Не разобрал — напишите наименование позиции.'); return; }
+      d.ask = 'np'; d.pending = { name: item.name, qty: null, price: null, unit: null };
+      bdb.setState(user.id, state.state, d);
+      await tg.sendMessage(chatId,
+        `<b>${esc(item.name)}</b>\nСколько и по какой цене?\n\n`
+        + '<i>Можно одним сообщением: <code>1 30000</code>. Или сначала количество.</i>');
+      return;
+    }
+    d.items.push(item);
+    bdb.setState(user.id, state.state, d);
+    await tg.sendMessage(chatId,
+      `Добавлено: ${esc(item.name)} — ${item.qty} ${esc(item.unit)} × ${formatRub(item.price)}\nЕщё позицию или «Сформировать».`,
+      itemsKb(user, d));
+    return;
+  }
+  if (state.state.startsWith('pp:')) { await handlePpText(tg, chatId, user, state, text); return; }
+  if (state.state.startsWith('av:')) { await handleAvansText(tg, chatId, user, state, text); return; }
+  if (state.state.startsWith('ksf:')) { await handleKsfText(tg, chatId, user, state, text); return; }
+  if (state.state.startsWith('cbasis:')) {
+    const cpId = Number(state.state.slice(7));
+    const basis = text.replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (!basis || /^[-—–]$/.test(basis)) { await tg.sendMessage(chatId, 'Напишите основание текстом, например «Договор № 12 от 01.03.2026».'); return; }
+    const all = bdb.basisDocs(user.id, cpId);
+    const prev = periodOf('prev');
+    const last = bdb.basisDocs(user.id, cpId, prev.from, prev.to);
+    bdb.setState(user.id, `cbasis.ok:${cpId}`, { basis });
+    const rows = [];
+    if (all.length) rows.push([{ text: `Всем выписанным (${all.length}) и на будущее`.slice(0, 60), data: `cb.all:${cpId}` }]);
+    if (last.length && last.length !== all.length) rows.push([{ text: `Только за прошлый месяц (${last.length}) и на будущее`.slice(0, 60), data: `cb.prev:${cpId}` }]);
+    rows.push([{ text: 'Только на будущее', data: `cb.new:${cpId}` }]);
+    rows.push([{ text: '✖️ Отмена', data: `cb:${cpId}` }]);
+    await tg.sendMessage(chatId, `Основание: <b>${esc(basis)}</b>\n\nК каким накладным и УПД этого клиента применить?`
+      + (all.length ? '\n<i>Это надпись в бланке: суммы, номера и долг не меняются. Исправленные файлы пришлю архивом.</i>' : ''),
+    keyboard(rows));
+    return;
+  }
+  if (state.state.startsWith('renum:')) {
+    const id = Number(state.state.slice(6));
+    const res = await docService.renumberDocument(user.id, id, text);
+    if (!res.ok) { await tg.sendMessage(chatId, `${esc(res.message)} Напишите другой номер:`); return; }
+    bdb.clearState(user.id);
+    const d = bdb.getDoc(user.id, id);
+    await tg.sendDocument(chatId, {
+      filename: res.file.filename, buffer: res.file.buffer,
+      caption: `Номер изменён: было № ${esc(res.old)}, стало <b>№ ${esc(d.number)}</b>. Файл — с новым номером.`,
+    });
+    return;
+  }
+  /*
+   * Договор на середине вопросов — а человек уже просит счёт.
+   *
+   * «Счёт Вектору на 45 000» уходило ответом на «Дата мероприятия», и вместо
+   * счёта выходил ещё один договор; выбраться было нельзя, пока не ответишь
+   * на все поля. Как у позиций документа (см. items: выше): новая просьба
+   * бросает недоделанный договор и выполняется сама.
+   */
+  if (/^dogx?:/.test(state.state) && looksLikeDocRequest(text, bdb.listCps(user.id))) {
+    // Состояние договора не трогаем до разбора: не вышла просьба — текст
+    // остаётся ответом на вопрос, как и раньше, и введённое не пропадает.
+    if (await handleFreeText(tg, chatId, user, text)) {
+      const now = bdb.getState(user.id);
+      if (now && now.state === state.state) bdb.clearState(user.id);
+      return;
+    }
+  }
+  if (await contractFlow().onText(tg, chatId, user, state, text)) return;
+  if (state.state.startsWith('note:')) {
+    const cpId = Number(state.state.slice(5));
+    bdb.clearState(user.id);
+    crm.addNote(user.id, cpId, text);
+    await tg.sendMessage(chatId, '📝 Записал в историю клиента.',
+      keyboard([[{ text: '🕑 История', data: `crm.h:${cpId}` }, { text: '⏰ Напомнить мне', data: `crm.f:${cpId}` }]]));
+    return;
+  }
+  if (state.state.startsWith('chq:')) {
+    const id = Number(state.state.slice(4));
+    if (!cheques.attachLink(user.id, id, text)) {
+      await tg.sendMessage(chatId,
+        'Это не похоже на ссылку из «Моего налога». Она должна начинаться с '
+        + '<code>https://lknpd.nalog.ru/</code>. Пришлите её ещё раз или нажмите «Не нужно».',
+        keyboard([[{ text: 'Не нужно', data: 'menu' }]]));
+      return;
+    }
+    bdb.clearState(user.id);
+    const c = cheques.get(user.id, id);
+    // Ссылка на чек говорит, что он пробит, — отдельно отмечать не просят.
+    if (c && c.status !== 'done') cheques.markDone(user.id, id, text);
+    await tg.sendMessage(chatId, '🔗 Ссылку на чек приложил к документу.', mainMenu());
+    return;
+  }
+  if (state.state.startsWith('fu:')) {
+    const [, cpIdStr, daysStr] = state.state.split(':');
+    bdb.clearState(user.id);
+    const t = text.trim();
+    const fu = crm.addFollowup(user.id, Number(cpIdStr), { today: todayISO(), days: Number(daysStr), text: t === '-' ? '' : t });
+    await tg.sendMessage(chatId, `⏰ Напомню ${ru(fu.due)} утром: «${esc(fu.text)}».`, mainMenu());
+    return;
+  }
+  if (state.state.startsWith('dog:')) { await handleDogText(tg, chatId, user, state, text); return; }
+  if (state.state === 'support') { await handleSupportText(tg, chatId, user, text); return; }
+  if (state.state.startsWith('rm:')) {
+    const cpId = Number(state.state.slice(3));
+    const tone = (state.data && state.data.tone) || 'biz';
+    bdb.clearState(user.id);
+    await sendReminderMail(tg, chatId, user, cpId, text.trim(), tone);
+    return;
+  }
+  if (state.state.startsWith('aktp:')) {
+    await handleAktPeriodText(tg, chatId, user, Number(state.state.slice(5)), text);
+    return;
+  }
+  if (state.state === 'lp:docs' || state.state === 'lp:unpaid') {
+    await handleListPeriodText(tg, chatId, user, state.state.slice(3), text);
+    return;
+  }
+  if (state.state === 'claim') { await claimByEmail(tg, chatId, user, text); return; }
+  if (state.state === 'claim-code') { await claimByCode(tg, chatId, user, text); return; }
+  if (state.state === 'promo') { await redeemPromo(tg, chatId, user, text); return; }
+  if (state.state === 'mb:email') {
+    const addr = text.trim().toLowerCase();
+    if (!mailer.validEmail(addr)) {
+      await tg.sendMessage(chatId, 'Это не похоже на адрес почты. Напишите ещё раз:');
+      return;
+    }
+    const preset = mailbox.guessPreset(addr);
+    const p = mailbox.PRESETS[preset];
+    // У своего домена сервер известен только клиенту — без этого шага
+    // подключить корпоративную почту было бы нельзя вовсе.
+    if (preset === 'custom') {
+      bdb.setState(user.id, 'mb:host', { email: addr, preset });
+      await tg.sendMessage(chatId,
+        `Почта <b>${esc(addr)}</b> — сервис незнакомый, нужен адрес его SMTP-сервера.\n\n`
+        + 'Пришлите его в виде <code>smtp.вашдомен.ру</code> или '
+        + '<code>smtp.вашдомен.ру:587</code>, если порт нестандартный.\n'
+        + '<i>Адрес есть в справке вашего почтового провайдера, раздел «настройка почтовых программ».</i>',
+        keyboard([[{ text: '✖️ Отмена', data: 'mb' }]]));
+      return;
+    }
+    bdb.setState(user.id, 'mb:pass', { email: addr, preset });
+    // Ссылка кнопкой: описание меню («Безопасность → Пароли приложений»)
+    // устаревает раньше, чем мы успеваем выпустить обновление.
+    const rows = [];
+    if (p.passUrl) rows.push([{ text: '🔑 Открыть страницу пароля', url: p.passUrl }]);
+    rows.push([{ text: '✖️ Отмена', data: 'mb' }]);
+    await tg.sendMessage(chatId,
+      `Почта <b>${esc(addr)}</b> — похоже на <b>${esc(p.title)}</b>.\n\n`
+      + `${esc(p.hint)}\n\n`
+      + 'Пришлите пароль сюда одним сообщением. Он хранится в зашифрованном виде и '
+      + 'нигде не показывается; сразу после сохранения удалите своё сообщение с паролем из чата.',
+      keyboard(rows));
+    return;
+  }
+  if (state.state === 'mb:host') {
+    const m = /^([a-z0-9.-]+)(?::(\d{2,5}))?$/i.exec(text.trim());
+    if (!m) {
+      await tg.sendMessage(chatId, 'Не разобрал адрес сервера. Пример: <code>smtp.вашдомен.ру:465</code>');
+      return;
+    }
+    const port = Number(m[2] || 465);
+    bdb.setState(user.id, 'mb:pass', {
+      ...state.data, host: m[1], port, secure: port === 465,
+    });
+    await tg.sendMessage(chatId,
+      `Сервер <b>${esc(m[1])}:${port}</b>. Теперь пришлите пароль от ящика.\n\n`
+      + 'Он хранится в зашифрованном виде и нигде не показывается; '
+      + 'сразу после сохранения удалите своё сообщение с паролем из чата.',
+      keyboard([[{ text: '✖️ Отмена', data: 'mb' }]]));
+    return;
+  }
+  if (state.state === 'mb:pass') {
+    const { email, preset, host, port, secure } = state.data;
+    const saved = await mailbox.save(user.id, {
+      preset, login: email, pass: text, from: email, host, port, secure,
+    });
+    bdb.clearState(user.id);
+    if (!saved.ok) { await tg.sendMessage(chatId, esc(saved.error)); return; }
+    await tg.sendMessage(chatId, 'Сохранил. Проверяю — отправлю письмо вам же…');
+    await testMailbox(tg, chatId, user);
+    return;
+  }
+  if (state.state.startsWith('mail:')) {
+    await mailDoc(tg, chatId, user, Number(state.state.split(':')[1]), text.trim());
+    return;
+  }
+  if (state.state.startsWith('fx:')) {
+    await tg.sendMessage(chatId,
+      `Жду картинку: <b>${FX_NAMES[state.state.split(':')[1]] || 'изображение'}</b>. `
+      + 'Пришлите фото или файл — или отмените.',
+      keyboard([[{ text: '✖️ Отмена', data: 'fx' }]]));
+    return;
+  }
+  // Настройка повторяющейся операции: сумма и примечание вводятся текстом,
+  // остальное кнопками.
+  if (state.state.startsWith('ro:amount:')) {
+    const cpId = Number(state.state.split(':')[2]);
+    const amount = parseAmount(text);
+    if (amount == null || amount <= 0) {
+      await tg.sendMessage(chatId, 'Не разобрал сумму. Напишите числом, например <code>27680</code>.');
+      return;
+    }
+    bdb.setState(user.id, `ro:note:${cpId}`, { ...state.data, amount });
+    await tg.sendMessage(chatId,
+      `Сумма: <b>${formatRub(amount)}</b>.\n\n`
+      + 'Как назвать эту операцию в журнале? Эта подпись попадёт в акт сверки, '
+      + 'и по ней клиент поймёт, чем закрыт долг.\n\n'
+      + '<i>Например: «Зачёт встречных требований по акту № 1 от 01.07.2026».</i>',
+      keyboard([
+        [{ text: 'Без подписи', data: `ro.nonote:${cpId}` }],
+        [{ text: '✖️ Отмена', data: `cp:${cpId}` }],
+      ]));
+    return;
+  }
+  if (state.state.startsWith('ro:note:')) {
+    const cpId = Number(state.state.split(':')[2]);
+    await askRoDay(tg, chatId, user, cpId, { ...state.data, note: text.slice(0, 200) });
+    return;
+  }
+
+  if (state.state.startsWith('ppay:')) {
+    const cpId = Number(state.state.split(':')[1]);
+    const num = Number(String(text).replace(/[\s\u00A0]/g, '').replace(',', '.').replace(/(?:₽|руб\.?|р\.?)$/i, ''));
+    if (!(num > 0)) { await tg.sendMessage(chatId, 'Не разобрал сумму. Напишите число, например <code>140000</code>.'); return; }
+    bdb.clearState(user.id);
+    await doPrepay(tg, chatId, user, cpId, num);
+    return;
+  }
+
+  if (state.state.startsWith('op:')) {
+    const cpId = Number(state.state.split(':')[1]);
+    const op = parseOp(text);
+    if (!op) { await tg.sendMessage(chatId, 'Не разобрал операцию. Пример: <code>15.06 приход 94193</code> или <code>02.07 оплата 50000</code>'); return; }
+    bdb.addOp(user.id, cpId, op);
+    const b = bdb.balanceOf(user.id, cpId);
+    await tg.sendMessage(chatId,
+      `✅ ${op.kind}: ${formatRub(op.debit || op.credit)} (${ru(op.date)}).\nБаланс: <b>${formatRub(Math.abs(round2(b.closing)))}</b>.\n\nЕщё операция или /menu.`);
+    if (op.debit) await remindFresh(tg, chatId, user);
+    return;
+  }
+
+  // Активного шага нет и ни один разбор не сработал — последняя попытка
+  // понять фразу. Стоит она либо ничего (местные шаблоны), либо одного
+  // обращения к модели в пределах месячного бюджета.
+  if (await handleFreeText(tg, chatId, user, text)) return;
+
+  await tg.sendMessage(chatId,
+    'Не понял. Попробуйте, например: «счёт Заре на 30 000 за монтаж» или «кто мне должен».',
+    mainMenu());
+}
+
+async function handleCallback(tg, cq) {
+  const chatId = cq.message.chat.id;
+  const from = cq.from || {};
+  const user = bdb.getOrCreateUser(from.id, [from.first_name, from.last_name].filter(Boolean).join(' '), from.username || '');
+  bdb.markActive(user.id);
+  const data = cq.data || '';
+  await tg.answerCallbackQuery(cq.id).catch(() => {});
+
+  try {
+    /*
+     * Ушёл в другой раздел — недописанное отменяем.
+     *
+     * Состояние диалога жило до тех пор, пока его кто-нибудь не перезапишет.
+     * Человек начинал счёт, передумывал, уходил в «Мои документы» — и любое
+     * следующее слово в чате попадало в брошенный сценарий: на «Спасибо»
+     * бот отвечал «Сколько и по какой цене?». Выглядело как поломка.
+     *
+     * Кнопки самого сценария (позиции, предпросмотр, шаги формы) состояние,
+     * разумеется, сохраняют — иначе сценарий не пройти.
+     */
+    {
+      const was = bdb.getState(user.id);
+      const own = was.state ? (FLOW_BUTTONS[Object.keys(FLOW_BUTTONS)
+        .find((k) => was.state.startsWith(k))] || []) : [];
+      if (was.state && !own.some((p) => data.startsWith(p))) {
+        bdb.clearState(user.id);
+        // Молча терять набранное нельзя: человек мог ввести десяток позиций.
+        const items = (was.data && was.data.items) || [];
+        if (was.state.startsWith('items:') && items.length) {
+          await tg.sendMessage(chatId,
+            `Незаконченный документ отменил — ${items.length} `
+            + `${plural(items.length, 'позиция', 'позиции', 'позиций')} не сохранились.`);
+        }
+      }
+    }
+
+    if (data === 'menu') { await tg.sendMessage(chatId, 'Главное меню:', mainMenu()); return; }
+    // Вход на сайт. Подтверждает тот, кто нажал: id берём из кнопки, а личность —
+    // из самого нажатия (cq.from), так что чужой чат подтвердить вход не может.
+    if (data.startsWith('wl.')) {
+      await webLogin.answer(tg, cq.message.chat, user, data, cq.message.message_id, mainMenu());
+      return;
+    }
+    if (data === 'ws') { await webLogin.sessions(tg, cq.message.chat, user, mainMenu()); return; }
+    if (data === 'ws.all') { await webLogin.endAll(tg, cq.message.chat, user, mainMenu()); return; }
+    if (data === 'more') {
+      await tg.sendMessage(chatId,
+        'Ваша фирма, клиенты, почта и настройки — здесь.', moreMenu());
+      return;
+    }
+    if (data === 'bank:take') {
+      const st = bdb.getState(user.id);
+      const rows = st.state === 'bank' && Array.isArray(st.data.rows) ? st.data.rows : [];
+      // Занесли оплаты — а книгу ещё собирать: строки выписки оставляем.
+      keepBankRows(user, bankRows(user));
+      if (!rows.length) {
+        await tg.sendMessage(chatId, 'Выписка уже не в работе — пришлите файл заново.', mainMenu());
+        return;
+      }
+      const res = bdb.importBankRows(user.id, rows);
+      if (!res.added) {
+        await tg.sendMessage(chatId, 'Ничего не занёс — эти оплаты уже есть в журнале.', mainMenu());
+        return;
+      }
+      const head = `✅ Занёс ${res.added} ${plural(res.added, 'оплату', 'оплаты', 'оплат')} в журнал.`
+        + (res.skipped ? `\nПропущено (уже были): ${res.skipped}.` : '');
+      if (!(await offerClosedDocs(tg, chatId, user, res.addedRows, head))) {
+        await tg.sendMessage(chatId, head, mainMenu());
+      }
+      // Каждое поступление самозанятого — отдельный чек, и деньги пришли именно сейчас.
+      await remindFresh(tg, chatId, user);
+      return;
+    }
+    /*
+     * Отметить закрытыми счета, которые закрывают пришедшие деньги.
+     *
+     * Список сложен в состоянии на предыдущем шаге и здесь только читается:
+     * заново пересчитывать нельзя — человек мог за это время что-то отметить
+     * руками, и тогда одно нажатие закрыло бы не то, что было на экране.
+     */
+    if (data === 'bank:paid') {
+      const st = bdb.getState(user.id);
+      const deals = st.state === 'bank-paid' && Array.isArray(st.data.deals) ? st.data.deals : [];
+      keepBankRows(user, bankRows(user));
+      if (!deals.length) {
+        await tg.sendMessage(chatId, 'Список уже не в работе — пришлите выписку заново.', mainMenu());
+        return;
+      }
+      const done = bdb.closeDocsFromBank(user.id, deals);
+      const s = bdb.unpaidSummary(user.id);
+      await tg.sendMessage(chatId,
+        '✅ '
+        + (done.docs || !done.partial
+          ? `Отметил оплаченными: ${done.docs} ${plural(done.docs, 'документ', 'документа', 'документов')}.` : '')
+        + (done.partial ? `${done.docs ? '\n' : ''}Частично оплачено: ${done.partial} — остаток виден в «Ждут оплаты».` : '')
+        + '\n\n'
+        + (s.count
+          ? `Осталось не оплачено: <b>${formatRub(s.sum)}</b> — `
+            + `${s.count} ${plural(s.count, 'сделка', 'сделки', 'сделок')}.`
+          : 'Неоплаченных документов больше нет.'),
+        mainMenu());
+      // Через выписку закрывают сразу пачку — и именно тут про чек забывают
+      // вернее всего: человек ничего не выписывал, он просто прислал файл.
+      await remindFresh(tg, chatId, user);
+      return;
+    }
+    if (data === 'help') {
+      const q = bdb.quota(user.id);
+      await tg.sendMessage(chatId,
+        'Как пользоваться:\n'
+        + '1) Нажмите <b>«Выписать счёт»</b> — спрошу название, ИНН, банк и клиента.\n'
+        + '2) Пришлите позиции, например <code>Ремонт 1 3500</code>, затем «Готово».\n'
+        + '3) Пришлю файл. Его можно сразу переслать клиенту. QR в счёте будет, если заполнен банк.\n\n'
+        + '«Другой документ» — акт, УПД, накладная, договор, платёжка, сверка.\n'
+        + 'После первого документа спрошу, чем занимаетесь — от этого зависит, когда клиент становится должен.\n\n'
+        + `В этом месяце выписано: ${q.used}${q.paid ? '' : ` из ${q.limit} бесплатных`}.\n\n`
+        + '/menu — вернуться в меню.', mainMenu());
+      return;
+    }
+    if (data === 'org') { await showOrg(tg, chatId, user); return; }
+    if (data === 'toggle.ai') {
+      const next = !bdb.isAiEnabled(user.id);
+      bdb.setAiEnabled(user.id, next);
+      await tg.sendMessage(chatId, next
+        ? '🤖 <b>Помощник включён.</b> Пишите задачу словами — «выставь Заре счёт '
+          + 'на 50 тысяч за монтаж с НДС 22%», — и я подготовлю документ. Выписывать '
+          + 'сам я всё равно ничего не буду: кнопку нажимаете вы.'
+        : '🤖 <b>Помощник выключен.</b> Документы создаются через меню, шаг за шагом.');
+      await showOrg(tg, chatId, user);
+      return;
+    }
+    if (data === 'doc.vat') {
+      await tg.sendMessage(chatId, 'НДС для этого счёта:', keyboard([
+        [{ text: 'Без НДС', data: 'doc.vat.set:none:0' }],
+        [{ text: '22%, цены с НДС', data: 'doc.vat.set:22:1' },
+          { text: '22% сверху', data: 'doc.vat.set:22:0' }],
+        [{ text: '20%, цены с НДС', data: 'doc.vat.set:20:1' },
+          { text: '20% сверху', data: 'doc.vat.set:20:0' }],
+        [{ text: '10%, цены с НДС', data: 'doc.vat.set:10:1' },
+          { text: '10% сверху', data: 'doc.vat.set:10:0' }],
+        [{ text: '5% УСН', data: 'doc.vat.set:5:0' }, { text: '7% УСН', data: 'doc.vat.set:7:0' }],
+      ]));
+      return;
+    }
+    if (data.startsWith('doc.vat.set:')) {
+      const st2 = bdb.getState(user.id);
+      if (!st2 || !st2.state.startsWith('items:')) return;
+      const [rate, gross] = data.slice(12).split(':');
+      if (!okRate(rate)) return;
+      const dd = st2.data;
+      dd.doc = dd.doc || {};
+      // Именно null, а не удаление ключа: «без НДС» для этого счёта должно
+      // перебивать настройку организации, а пустое место она заполнит сама.
+      if (rate === 'none') { dd.doc.vatRate = null; dd.doc.priceIncludesVat = false; } else {
+        dd.doc.vatRate = Number(rate);
+        dd.doc.priceIncludesVat = gross === '1';
+      }
+      bdb.setState(user.id, st2.state, dd);
+      await showPreview(tg, chatId, user, bdb.getState(user.id));
+      return;
+    }
+    if (data === 'basis') { await showBasis(tg, chatId, user); return; }
+    if (data.startsWith('basis.set:')) {
+      const org = bdb.currentOrg(user.id);
+      if (org) {
+        bdb.updateOrg(user.id, org.id, { debt_basis: data.slice(10) });
+        // Пересобираем журнал под новое правило. Без этого переключение
+        // меняло строчку в настройках и больше ничего: проводки создаются
+        // при выписке, и уже выписанные документы оставались как были —
+        // человек переключал основание и не видел никакой разницы.
+        const fixed = bdb.rebuildDebt(user.id);
+        const said = rebuildText(fixed);
+        if (said) await tg.sendMessage(chatId, said);
+      }
+      await showBasis(tg, chatId, user);
+      return;
+    }
+    if (data === 'biz') { await showBizType(tg, chatId, user); return; }
+    if (data.startsWith('biz.set:')) {
+      const t = bizTypes.get(data.slice(8));
+      const org = bdb.currentOrg(user.id);
+      if (t && org) {
+        const key = data.slice(8);
+        bdb.updateOrg(user.id, org.id, { biz_type: key, debt_basis: t.basis });
+        // Та же дверь к тому же правилу, что и basis.set — значит, и тот же
+        // пересчёт. Иначе выбравший «Аренда» читает «долг по счёту», а долг
+        // по уже выписанным счетам не появляется.
+        const said = rebuildText(bdb.rebuildDebt(user.id));
+        // Готовые строки под это дело — кнопками при выписке, цену спрошу.
+        const presets = bizTypes.itemsOf(key);
+        const seeded = bdb.seedItems(user.id, presets);
+        const presetNote = seeded
+          ? `\n\nДобавил готовые позиции — будут кнопками при выписке: ${presets.map((x) => esc(x.name)).join(', ')}.`
+          : '';
+        await tg.sendMessage(chatId,
+          `<b>${esc(t.name)}</b>\n\n${esc(t.why)}${said ? `\n\n${said}` : ''}${presetNote}`);
+        if (await offerRoutine(tg, chatId, user, key)) return;
+      }
+      await showBasis(tg, chatId, user);
+      return;
+    }
+
+    /*
+     * Настройка напоминания из подсказки по виду деятельности.
+     *
+     * Три шага: клиент → число → готово. Правило заводится пустым — без
+     * позиций и сумм, их никто ещё не называл. В нужный день бот придёт с
+     * напоминанием, а документ заполнит и выпустит человек.
+     */
+    if (data === 'rt.no') {
+      await tg.sendMessage(chatId, 'Хорошо, не буду. Захотите — «Ещё» → «Повторяющиеся документы».');
+      await showBasis(tg, chatId, user);
+      return;
+    }
+    if (data.startsWith('rt.new:')) {
+      const cps = bdb.listCps(user.id);
+      const rows = cps.slice(0, 10).map((c) => ([{ text: c.name.slice(0, 60), data: `rt.cp:${data.slice(7)}:${c.id}` }]));
+      rows.push([{ text: '⬅️ Меню', data: 'menu' }]);
+      await tg.sendMessage(chatId, 'Кому напоминать выставлять?', keyboard(rows));
+      return;
+    }
+    if (data.startsWith('rt.cp:')) {
+      const [, key, cpId] = data.split(':');
+      const r = bizTypes.routineOf(key);
+      if (!r) { await tg.sendMessage(chatId, 'Не понял, что напоминать.', mainMenu()); return; }
+      const days = [1, 5, 10, 15, 20, 25].map((d) => ({ text: String(d), data: `rt.day:${key}:${cpId}:${d}` }));
+      await tg.sendMessage(chatId, 'Какого числа напоминать?',
+        keyboard([days.slice(0, 3), days.slice(3),
+          [{ text: 'Последнее число месяца', data: `rt.day:${key}:${cpId}:0` }]]));
+      return;
+    }
+    if (data.startsWith('rt.day:')) {
+      const [, key, cpId, day] = data.split(':');
+      const r = bizTypes.routineOf(key);
+      const cp = bdb.getCp(user.id, Number(cpId));
+      if (!r || !cp) { await tg.sendMessage(chatId, 'Клиент не найден.', mainMenu()); return; }
+      /*
+       * Сообщение с кнопками в чате не гаснет после нажатия, и по нему можно
+       * нажать ещё раз — хоть завтра, хоть трижды подряд. Без этой проверки
+       * заводилось второе такое же правило, и в свой день приходили два
+       * одинаковых напоминания, выключать которые надо по одному.
+       */
+      if (recurring.list(user.id).some((x) => x.cp_id === cp.id && x.type === r.type)) {
+        await tg.sendMessage(chatId, 'Такое напоминание уже настроено.', keyboard([
+          [{ text: '🔁 Все повторения', data: 'rec' }], [{ text: '⬅️ Меню', data: 'menu' }],
+        ]));
+        return;
+      }
+      recurring.add(user.id, {
+        cpId: cp.id, type: r.type, items: [], day: Number(day),
+        // Документа сейчас не выписывали, поэтому этот месяц отработанным
+        // считаем, только если названный день уже прошёл.
+        offeredThisMonth: recurring.dayPassed(Number(day)),
+      });
+      await tg.sendMessage(chatId,
+        `Готово. ${Number(day) ? `${day}-го числа` : 'В последний день месяца'} напомню про `
+        + `<b>${esc(r.what)}</b> для ${quoted(cp.name)}.\n\n`
+        + '<i>Выписывать буду не сам — пришлю напоминание с кнопкой.</i>',
+        mainMenu());
+      return;
+    }
+
+    // --- регулярные документы ---
+    if (data === 'rec') { await showRecurring(tg, chatId, user); return; }
+    if (data.startsWith('rec.new:')) {
+      const src = bdb.getDoc(user.id, Number(data.slice(8)));
+      if (!src || !docService.ITEM_DOCS[src.type]) {
+        await tg.sendMessage(chatId, 'Такой документ повторять нельзя.', mainMenu());
+        return;
+      }
+      // Счёт на аренду живёт по договору: платят к определённому числу, а
+      // счёт нужен заранее. Остальные документы просто привязаны к числу.
+      const rent = ['sch', 'schdog'].includes(src.type);
+      await tg.sendMessage(chatId,
+        `<b>Повторять «${esc(docService.ITEM_DOCS[src.type].title)}» по расписанию</b>\n\n`
+        + 'Как часто? Каждый день, по будням и раз в неделю я утром пришлю такой же документ '
+        + '<b>на проверку</b> — выпишу только после «Всё верно».\n\n'
+        + (rent
+          ? 'Раз в месяц: какого числа клиент должен платить? Это число из договора — счёт пришлю '
+            + 'заранее, а на следующий день после срока напомню, если денег не будет.\n\n'
+          : 'Раз в месяц: какого числа напоминать?\n\n')
+        + '<i>29, 30 и 31 наступают не в каждом месяце — если нужен конец месяца, '
+        + 'выберите «в последний день».</i>',
+        keyboard([
+          [{ text: '📅 Каждый день', data: `rec.per:${src.id}:d` }],
+          [{ text: '💼 По будням (пн–пт)', data: `rec.per:${src.id}:w` }],
+          [{ text: '🗓 Раз в неделю', data: `rec.per:${src.id}:k` }],
+          [{ text: '1-го', data: `rec.add:${src.id}:1` }, { text: '5-го', data: `rec.add:${src.id}:5` },
+            { text: '10-го', data: `rec.add:${src.id}:10` }],
+          [{ text: '15-го', data: `rec.add:${src.id}:15` }, { text: '20-го', data: `rec.add:${src.id}:20` },
+            { text: '25-го', data: `rec.add:${src.id}:25` }],
+          [{ text: 'В последний день месяца', data: `rec.add:${src.id}:0` }],
+          [{ text: '⬅️ Меню', data: 'menu' }],
+        ]));
+      return;
+    }
+    // Каждый день / по будням / раз в неделю.
+    if (data.startsWith('rec.per:')) {
+      const [, idStr, kind] = data.split(':');
+      const src = bdb.getDoc(user.id, Number(idStr));
+      if (!src || !docService.ITEM_DOCS[src.type]) return;
+      if (kind === 'k') {
+        const wd = (n) => ({ text: ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'][n - 1], data: `rec.pw:${src.id}:${n}` });
+        await tg.sendMessage(chatId, 'В какой день недели?', keyboard([
+          [1, 2, 3, 4].map(wd), [5, 6, 7].map(wd), [{ text: '⬅️ Меню', data: 'menu' }],
+        ]));
+        return;
+      }
+      await addRecurring(tg, chatId, user, src, { period: kind === 'd' ? 'day' : 'weekdays' });
+      return;
+    }
+    // «Всё равно создать» после предупреждения о бесплатном лимите.
+    if (data.startsWith('rec.pok:')) {
+      const [, idStr, code] = data.split(':');
+      const src = bdb.getDoc(user.id, Number(idStr));
+      if (!src || !docService.ITEM_DOCS[src.type]) return;
+      const when = code === 'd' ? { period: 'day' } : code === 'w' ? { period: 'weekdays' }
+        : { period: 'week', weekday: Number(code.slice(1)) };
+      await addRecurring(tg, chatId, user, src, { ...when, confirmFree: true });
+      return;
+    }
+    if (data.startsWith('rec.pw:')) {
+      const [, idStr, wd] = data.split(':');
+      const src = bdb.getDoc(user.id, Number(idStr));
+      if (!src || !docService.ITEM_DOCS[src.type]) return;
+      await addRecurring(tg, chatId, user, src, { period: 'week', weekday: Number(wd) });
+      return;
+    }
+    if (data.startsWith('rec.add:')) {
+      const [, idStr, dayStr] = data.split(':');
+      const src = bdb.getDoc(user.id, Number(idStr));
+      if (!src || !docService.ITEM_DOCS[src.type]) return;
+      const day = Number(dayStr);
+
+      // У счёта спрашиваем ещё и за сколько дней выставлять: в аренде это
+      // отдельная договорённость, а «за 3 дня» — самый частый случай.
+      if (['sch', 'schdog'].includes(src.type) && day) {
+        await tg.sendMessage(chatId,
+          `Оплата ${day}-го числа. За сколько дней выставлять счёт?`,
+          keyboard([
+            [{ text: 'За 3 дня', data: `rec.lead:${src.id}:${day}:3` },
+              { text: 'За 5 дней', data: `rec.lead:${src.id}:${day}:5` }],
+            [{ text: 'За 7 дней', data: `rec.lead:${src.id}:${day}:7` },
+              { text: 'В день оплаты', data: `rec.lead:${src.id}:${day}:0` }],
+            [{ text: '⬅️ Меню', data: 'menu' }],
+          ]));
+        return;
+      }
+      await addRecurring(tg, chatId, user, src, { day });
+      return;
+    }
+    if (data.startsWith('rec.akt:')) {
+      const cpId = Number(data.slice(8));
+      const mine = recurring.list(user.id);
+      if (mine.some((r) => r.cp_id === cpId && r.type === 'usl')) {
+        await tg.sendMessage(chatId, 'Акт этому клиенту уже повторяется.', keyboard([
+          [{ text: '🔁 Все повторения', data: 'rec' }], [{ text: '⬅️ Меню', data: 'menu' }],
+        ]));
+        return;
+      }
+      // Позиции берём из счёта этому же клиенту: акт закрывает ровно то,
+      // за что выставлен счёт, и набирать их второй раз незачем.
+      const src = mine.find((r) => r.cp_id === cpId && ['sch', 'schdog'].includes(r.type));
+      if (!src) { await tg.sendMessage(chatId, 'Сначала настройте счёт.', mainMenu()); return; }
+      const id = recurring.add(user.id, {
+        cpId, type: 'usl', items: src.items, extra: src.extra, day: recurring.LAST_DAY,
+      });
+      const rec = recurring.get(user.id, id);
+      await tg.sendMessage(chatId,
+        `✅ Акт для <b>${esc(rec.cp_name)}</b> — ${rec.dayText}.\n\n`
+        + '<i>Тоже предложением с кнопкой, не сам.</i>',
+        keyboard([[{ text: '🔁 Все повторения', data: 'rec' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
+    if (data.startsWith('rec.lead:')) {
+      const [, idStr, dayStr, leadStr] = data.split(':');
+      const src = bdb.getDoc(user.id, Number(idStr));
+      if (!src || !docService.ITEM_DOCS[src.type]) return;
+      await addRecurring(tg, chatId, user, src,
+        { payDay: Number(dayStr), leadDays: Number(leadStr) });
+      return;
+    }
+    if (data.startsWith('rec.go:') || data.startsWith('rec.fix:') || data.startsWith('rec.skip:')) {
+      // rec.go|fix|skip:<id>:<ключ периода>: месяц для месячных, дата для коротких.
+      const act = data.slice(4, data.indexOf(':'));
+      const [idStr, keyStr] = data.slice(data.indexOf(':') + 1).split(':');
+      const rec = recurring.get(user.id, Number(idStr));
+      if (!rec) { await tg.sendMessage(chatId, 'Это повторение уже удалено.', mainMenu()); return; }
+      // Ключ из кнопки годится, только если он того же вида, что у расписания; старые
+      // кнопки без ключа — за текущий период.
+      const keyRe = rec.periodic ? /^\d{4}-\d{2}-\d{2}$/ : /^\d{4}-\d{2}$/;
+      const key = keyRe.test(keyStr || '') ? keyStr : recurring.periodKey(rec);
+
+      if (act === 'skip') {
+        if (rec.periodic) {
+          recurring.skip(user.id, rec.id, key);
+          const next = recurring.nextDate(rec);
+          await tg.sendMessage(chatId,
+            `Пропустил — документа не будет. Следующее предложение: ${recurring.dayCaption(next)}.`, mainMenu());
+          return;
+        }
+        recurring.markOffered(user.id, rec.id, undefined, key);
+        await tg.sendMessage(chatId, 'Пропустил. Напомню в следующем месяце.', mainMenu());
+        return;
+      }
+
+      /*
+       * Предложение за прошлый день выписывать нельзя: документ выйдет с
+       * сегодняшней датой, а доставка была вчера. Кнопка не гаснет сама,
+       * и под вчерашним сообщением её легко нажать утром.
+       */
+      if (rec.periodic && key !== recurring.periodKey(rec, todayDate())) {
+        await tg.sendMessage(chatId,
+          'Это предложение устарело — оно было на другой день. Нужен документ на сегодня — '
+          + 'выпишите его кнопкой «Повторить».', mainMenu());
+        return;
+      }
+      /*
+       * Одно нажатие — один документ за период напоминания. Кнопка не гаснет,
+       * и раньше двойной тап или возврат к вчерашнему сообщению выпускали
+       * второй счёт с новым номером: долг клиента удваивался.
+       */
+      const claim = recurring.claimIssue(user.id, rec.id, key);
+      if (!claim.ok) {
+        await tg.sendMessage(chatId, claim.skipped
+          ? 'Вы пропустили это предложение — документ не выписываю.'
+          : 'По этому напоминанию документ уже выписан — второй не делаю. '
+            + 'Нужен ещё один — выпишите его обычным путём.', mainMenu());
+        return;
+      }
+      if (act === 'fix') {
+        // Те же позиции открываем в мастере: поправить количество и выпустить самому.
+        const opened = await openRecurringForEdit(tg, chatId, user, rec);
+        if (!opened) recurring.releaseIssue(user.id, rec.id, key, claim.prev);
+        return;
+      }
+      const done = await issueDoc(tg, chatId, user, {
+        type: rec.type,
+        cpId: rec.cp_id,
+        doc: { items: rec.items, date: todayISO(), number: '' },
+        extra: rec.extra,
+      });
+      // Не вышло (лимит, ошибка сборки) — возвращаем отметку, чтобы кнопка
+      // сработала, когда причину уберут.
+      if (!done) recurring.releaseIssue(user.id, rec.id, key, claim.prev);
+      if (done && rec.periodic) {
+        await tg.sendMessage(chatId, `Следующее предложение: ${recurring.dayCaption(recurring.nextDate(rec))}.`);
+      }
+      if (done) await afterDoc(tg, chatId, user, rec.cp_id);
+      return;
+    }
+    if (data.startsWith('rec.off:')) {
+      recurring.off(user.id, Number(data.slice(8)));
+      await tg.sendMessage(chatId, 'Больше напоминать не буду.');
+      await showRecurring(tg, chatId, user);
+      return;
+    }
+    // --- чеки «Мой налог» (самозанятые) ---
+    if (data === 'chq.list') { await showCheques(tg, chatId, user); return; }
+    if (data.startsWith('chq.show:')) {
+      const c = cheques.get(user.id, Number(data.slice(9)));
+      if (!c) { await tg.sendMessage(chatId, 'Этого чека уже нет в списке.', mainMenu()); return; }
+      if (c.status === 'done') {
+        await tg.sendMessage(chatId, `🧾 Чек на ${formatRub(c.amount)} уже пробит.`,
+          keyboard([[{ text: c.link ? '🔗 Заменить ссылку' : '🔗 Приложить ссылку', data: `chq.link:${c.id}` }]]));
+        return;
+      }
+      await sendChequeCard(tg, chatId, user, c);
+      return;
+    }
+    if (data.startsWith('chq.ok:')) {
+      const c = cheques.markDone(user.id, Number(data.slice(7)));
+      if (!c) { await tg.sendMessage(chatId, 'Этого чека уже нет в списке.', mainMenu()); return; }
+      const left = cheques.openCount(user.id);
+      await tg.sendMessage(chatId,
+        `✅ Отметил: чек на ${formatRub(c.amount)} пробит.`
+        + (left ? `\n\nЕщё не пробито: <b>${left}</b>.` : '\n\nБольше непробитых чеков нет.')
+        + '\n\n<i>Ссылку на чек можно приложить к документу — тогда она будет в его карточке.</i>',
+        keyboard([
+          [{ text: '🔗 Приложить ссылку', data: `chq.link:${c.id}` }],
+          ...(left ? [[{ text: '🧾 Чеки к пробитию', data: 'chq.list' }]] : []),
+          [{ text: '⬅️ Меню', data: 'menu' }],
+        ]));
+      return;
+    }
+    if (data.startsWith('chq.later:')) {
+      await tg.sendMessage(chatId,
+        'Хорошо. Напомню в утренней сводке, пока чек не отмечен. '
+        + 'Список — «Ещё» → «Моя организация» → «Самозанятость».',
+        keyboard([[{ text: '🧾 Чеки к пробитию', data: 'chq.list' }], [{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
+    if (data.startsWith('chq.link:')) {
+      const c = cheques.get(user.id, Number(data.slice(9)));
+      if (!c) { await tg.sendMessage(chatId, 'Этого чека уже нет в списке.', mainMenu()); return; }
+      bdb.setState(user.id, `chq:${c.id}`, {});
+      await tg.sendMessage(chatId,
+        'Пришлите ссылку на чек. В приложении «Мой налог» откройте чек и нажмите «Поделиться» — '
+        + 'ссылка начинается с <code>https://lknpd.nalog.ru/</code>.',
+        keyboard([[{ text: 'Не нужно', data: 'menu' }]]));
+      return;
+    }
+    if (data.startsWith('doc.paid:')) {
+      const id = Number(data.slice(9));
+      // Есть свободная оплата клиента — сначала спрашиваем, не она ли это:
+      // иначе те же деньги записались бы второй раз.
+      const free = bdb.freePaymentsFor(user.id, id);
+      if (free.length) { await askFreePayment(tg, chatId, user, id, free); return; }
+      await payDocAsNew(tg, chatId, user, id);
+      return;
+    }
+    if (data.startsWith('doc.pnew:')) {
+      await payDocAsNew(tg, chatId, user, Number(data.slice(9)));
+      return;
+    }
+    if (data.startsWith('doc.pfree:')) {
+      const [id, opId] = data.slice(10).split(':').map(Number);
+      const r = bdb.linkFreePayment(user.id, id, opId);
+      if (!r) {
+        await tg.sendMessage(chatId, 'Эта оплата уже привязана к документу или удалена. '
+          + 'Нажмите «Отметить оплаченным» ещё раз.');
+      } else {
+        await tg.sendMessage(chatId, linkedText(r));
+        await remindCheque(tg, chatId, user);
+      }
+      await showDoc(tg, chatId, user, id);
+      return;
+    }
+    if (data.startsWith('doc.unpaid:')) {
+      const id = Number(data.slice(11));
+      const un = bdb.unmarkPaid(user.id, id);
+      // Деньги из выписки пришли на самом деле — их не убираем, и долг по
+      // документу поэтому не вернётся. Сказать «вернул долг» было бы неправдой.
+      await tg.sendMessage(chatId, un && un.kept
+        ? `Отметку об оплате снял. ${formatRub(un.kept)} из выписки оставил в журнале`
+          + ' как оплату клиента без документа — деньги ведь пришли.'
+        : 'Отметку об оплате снял, долг вернул в журнал.');
+      await showDoc(tg, chatId, user, id);
+      return;
+    }
+    if (data.startsWith('doc.debt:')) {
+      const id = Number(data.slice(9));
+      const d = bdb.getDoc(user.id, id);
+      if (d && bdb.restoreDebt(user.id, id)) {
+        const b = d.cp_id ? bdb.balanceOf(user.id, d.cp_id) : null;
+        await tg.sendMessage(chatId, 'Вернул документ в долг.'
+          + (b ? ` Баланс: <b>${formatRub(Math.abs(b.closing))}</b>.` : ''));
+      }
+      await showDoc(tg, chatId, user, id);
+      return;
+    }
+    if (data === 'unpaid') { await showUnpaid(tg, chatId, user); return; }
+    if (data === 'reg') {
+      await tg.sendMessage(chatId, 'Реестр за какой период?', keyboard([
+        [{ text: 'Текущий месяц', data: 'reg.p:month' }, { text: 'Прошлый месяц', data: 'reg.p:prev' }],
+        [{ text: 'Квартал', data: 'reg.p:quarter' }, { text: 'Год', data: 'reg.p:year' }],
+        [{ text: '📕 Книга продаж за квартал', data: 'kniga.p:quarter' }],
+        [{ text: '📦 Файлы документов архивом', data: 'arch' }],
+        [{ text: '⬅️ К документам', data: 'docs' }],
+      ]));
+      return;
+    }
+    if (data === 'arch' || /^arch\.p:\w+$/.test(data)) {
+      // Сначала период, потом вид: чаще всего нужен прошлый месяц целиком.
+      if (data === 'arch') {
+        await tg.sendMessage(chatId, 'Файлы за какой период?', keyboard([
+          [{ text: 'Прошлый месяц', data: 'arch.p:prev' }, { text: 'Текущий месяц', data: 'arch.p:month' }],
+          [{ text: 'Квартал', data: 'arch.p:quarter' }],
+          [{ text: '⬅️ К документам', data: 'docs' }],
+        ]));
+        return;
+      }
+      const per = data.slice(7);
+      const kinds = Object.entries(ARCHIVE_KINDS).map(([key, v]) => ({ text: v.title, data: `arch.k:${per}:${key}` }));
+      await tg.sendMessage(chatId, 'Какие документы?', keyboard([kinds.slice(0, 2), kinds.slice(2, 4), kinds.slice(4),
+        [{ text: '⬅️ К документам', data: 'docs' }]]));
+      return;
+    }
+    if (/^arch\.k:\w+:\w+$/.test(data)) {
+      const [, per, kind] = data.split(':');
+      /*
+       * Не ждём: обновления бот разбирает по одному, и архив на десятки PDF
+       * держал бы минуту всех остальных. Файл придёт сам, когда соберётся.
+       */
+      sendArchive(tg, chatId, user, per, kind).catch((e) => {
+        office.record({ kind: 'crash', where: 'архив документов', error: e.message, userId: user.id }).catch(() => {});
+        tg.sendMessage(chatId, 'Архив собрать не получилось. Попробуйте позже.').catch(() => {});
+      });
+      return;
+    }
+    if (data.startsWith('reg.p:')) { await sendRegistry(tg, chatId, user, data.slice(6)); return; }
+    if (data.startsWith('reg.r:')) {
+      const [a, b] = data.slice(6).split(':');
+      const from = a === '0' ? '' : unpackDay(a);
+      const to = unpackDay(b);
+      if (!to || (a !== '0' && !from)) { await tg.sendMessage(chatId, 'Не понял период.', mainMenu()); return; }
+      await sendRegistry(tg, chatId, user, '', { from, to });
+      return;
+    }
+    // Другой период для списка «документы» / «неоплаченные».
+    if (data.startsWith('lp.pick:')) { await askListPeriod(tg, chatId, data.slice(8)); return; }
+    if (data.startsWith('lp.p:')) {
+      const [kind, code] = data.slice(5).split(':');
+      const r = period.presetRange(code);
+      await showListFor(tg, chatId, user, kind, { from: r.from, to: r.to });
+      return;
+    }
+    if (data.startsWith('lp.own:')) {
+      const kind = data.slice(7) === 'unpaid' ? 'unpaid' : 'docs';
+      bdb.setState(user.id, `lp:${kind}`, {});
+      await tg.sendMessage(chatId,
+        'Напишите период — как удобно:\n'
+        + '<code>01.09.2026 - 30.09.2026</code>\n'
+        + '<code>сентябрь</code>  ·  <code>апрель 2025</code>\n'
+        + '<code>2 квартал</code>  ·  <code>2025</code>',
+        keyboard([[{ text: '✖️ Отмена', data: 'menu' }]]));
+      return;
+    }
+    // Повтор по фразе, когда клиент оказался неоднозначным: после выбора ищем документ заново.
+    if (data.startsWith('rp.cp:')) {
+      const [cpId, type, day] = data.slice(6).split(':');
+      await sayRepeat(tg, chatId, user,
+        ai.planRepeat(user.id, { cpId: Number(cpId), docType: type === '-' ? '' : type, date: unpackDay(day) }));
+      return;
+    }
+    if (data.startsWith('kniga.p:')) { await sendKniga(tg, chatId, user, data.slice(8)); return; }
+    if (data === 'taxmode') { await showTaxMode(tg, chatId, user); return; }
+    if (data.startsWith('tax.set:')) {
+      const v = data.slice(8);
+      // Пишем только известные значения: решатель на незнакомый режим
+      // отвечает отказом, и молча записанный мусор превратился бы в
+      // «книга почему-то не собирается» без единой подсказки.
+      if (!Object.prototype.hasOwnProperty.call(kudir.TAX_MODES, v)) return;
+      const org = bdb.currentOrg(user.id);
+      if (v === 'psn' && org && !isIp(org)) {
+        await tg.sendMessage(chatId, 'Патент применяют только предприниматели — у организации его не бывает.');
+        await showTaxMode(tg, chatId, user);
+        return;
+      }
+      if (org) bdb.updateOrg(user.id, org.id, { tax_mode: v });
+      await showTaxMode(tg, chatId, user);
+      return;
+    }
+    // 'kudir' — у кнопок в уже отправленных сообщениях.
+    if (data === 'bank:kudir' || data === 'kudir') { await sendKudir(tg, chatId, user); return; }
+    if (data === 'vat') { await showVat(tg, chatId, user); return; }
+    if (data === 'npd') { await showNpd(tg, chatId, user); return; }
+    if (data.startsWith('npd.set:')) {
+      const org = bdb.currentOrg(user.id);
+      if (org) bdb.updateOrg(user.id, org.id, { npd: data.slice(8) === '1' ? 1 : 0 });
+      await showNpd(tg, chatId, user);
+      return;
+    }
+    if (data.startsWith('vat.set:')) {
+      const [rate, gross] = data.slice(8).split(':');
+      if (!okRate(rate)) return;
+      const org = bdb.currentOrg(user.id);
+      if (org) {
+        bdb.updateOrg(user.id, org.id, {
+          vat_rate: rate === 'none' ? '' : rate,
+          vat_gross: gross === '1' ? 1 : 0,
+        });
+      }
+      await showVat(tg, chatId, user);
+      return;
+    }
+    if (data === 'inbox') { await checkInbox(tg, chatId, user); return; }
+    if (data.startsWith('in.m:')) { await showInboxMessage(tg, chatId, user, Number(data.slice(5))); return; }
+    if (data.startsWith('in.f:')) {
+      const m = inboxGet(user.id)[Number(data.slice(5))];
+      if (!m) { await tg.sendMessage(chatId, 'Письмо уже неактуально.', mainMenu()); return; }
+      for (const d of m.docs) {
+        // eslint-disable-next-line no-await-in-loop
+        await tg.sendDocument(chatId, {
+          filename: d.filename, buffer: d.content,
+          caption: `Из письма «${esc(m.subject || 'без темы')}» от ${esc(m.fromName || m.from)}.`,
+        });
+      }
+      return;
+    }
+    if (data.startsWith('in.op:')) {
+      const [idx, cpIdStr] = data.slice(6).split(':');
+      const m = inboxGet(user.id)[Number(idx)];
+      if (!m) { await tg.sendMessage(chatId, 'Письмо уже неактуально.', mainMenu()); return; }
+      bdb.setState(user.id, `op:${Number(cpIdStr)}`);
+      await tg.sendMessage(chatId,
+        `Внесу операцию по клиенту. Напишите сумму и вид, например:\n`
+        + `<code>${ru(todayISO())} приход 60000</code>\n\n`
+        + `<i>Из письма: ${esc(m.subject || 'без темы')}</i>`);
+      return;
+    }
+    if (data === 'mb') { await showMailbox(tg, chatId, user); return; }
+    if (data === 'mb.new') {
+      bdb.setState(user.id, 'mb:email');
+      await tg.sendMessage(chatId,
+        'С какого адреса отправлять документы?\n\nНапишите почту, например <code>buh@yandex.ru</code>.',
+        keyboard([[{ text: '✖️ Отмена', data: 'mb' }]]));
+      return;
+    }
+    if (data === 'mb.test') { await testMailbox(tg, chatId, user); return; }
+    if (data === 'mb.del') {
+      mailbox.remove(user.id);
+      await tg.sendMessage(chatId, 'Почту отключил. Документы можно по-прежнему скачивать и пересылать вручную.');
+      await showMailbox(tg, chatId, user);
+      return;
+    }
+    if (data === 'fx') { await showFacsimile(tg, chatId, user); return; }
+    if (data.startsWith('fx.add:')) {
+      const kind = data.split(':')[1];
+      bdb.setState(user.id, `fx:${kind}`);
+      await tg.sendMessage(chatId,
+        `Пришлите снимок: <b>${FX_NAMES[kind]}</b>.\n\n`
+        + 'Фотографией или файлом — PNG, JPEG или WebP, до 1 МБ. '
+        + 'Лучше всего: белый лист, дневной свет, снимок строго сверху.',
+        keyboard([[{ text: '✖️ Отмена', data: 'fx' }]]));
+      return;
+    }
+    if (data.startsWith('fx.del:')) {
+      const kind = data.split(':')[1];
+      facsimile.remove(user.id, kind);
+      await tg.sendMessage(chatId, `Убрал ${FX_NAMES[kind]}.`);
+      await showFacsimile(tg, chatId, user);
+      return;
+    }
+    if (data.startsWith('fx.scope:')) {
+      facsimile.setScope(user.id, data.split(':')[1]);
+      await showFacsimile(tg, chatId, user);
+      return;
+    }
+    /*
+     * Повторяющаяся операция журнала: клиент → тип → сумма → примечание →
+     * число → сколько раз → почта. Каждый шаг показывает, что бот уже
+     * понял: правило работает само каждый месяц, и ошибка в нём повторится
+     * молча — значит, человек должен видеть её до того, как согласится.
+     */
+    if (data.startsWith('ro.new:')) {
+      const cp = bdb.getCp(user.id, Number(data.slice(7)));
+      if (!cp) { await tg.sendMessage(chatId, 'Клиент не найден.', mainMenu()); return; }
+      if (recurring.list(user.id).some((r) => r.cp_id === cp.id && recurring.isOp(r))) {
+        await tg.sendMessage(chatId, 'По этому клиенту повторение уже настроено.', keyboard([
+          [{ text: '🔁 Все повторения', data: 'rec' }], [{ text: '⬅️ Назад', data: `cp:${cp.id}` }],
+        ]));
+        return;
+      }
+      bdb.setState(user.id, `ro:kind:${cp.id}`, {});
+      await tg.sendMessage(chatId,
+        `<b>Повторять операцию каждый месяц</b>\nКлиент: ${esc(cp.name)}\n\n`
+        + 'Что повторять? <i>Оплата</i> уменьшает то, что вам должны, '
+        + '<i>приход</i> — увеличивает.',
+        keyboard([
+          [{ text: '💸 Оплата', data: `ro.kind:${cp.id}:pay` }],
+          [{ text: '📥 Приход', data: `ro.kind:${cp.id}:in` }],
+          [{ text: '✖️ Отмена', data: `cp:${cp.id}` }],
+        ]));
+      return;
+    }
+    if (data.startsWith('ro.kind:')) {
+      const [, cpIdStr, k] = data.split(':');
+      const cp = bdb.getCp(user.id, Number(cpIdStr));
+      if (!cp) { await tg.sendMessage(chatId, 'Клиент не найден.', mainMenu()); return; }
+      bdb.setState(user.id, `ro:amount:${cp.id}`, { opKind: k === 'in' ? 'Приход' : 'Оплата' });
+      await tg.sendMessage(chatId,
+        `${k === 'in' ? '📥 Приход' : '💸 Оплата'} · ${esc(cp.name)}\n\n`
+        + 'Какая сумма? Напишите числом, например <code>27680</code> или <code>27 680,50</code>.',
+        keyboard([[{ text: '✖️ Отмена', data: `cp:${cp.id}` }]]));
+      return;
+    }
+    if (data.startsWith('ro.nonote:')) {
+      const cpId = Number(data.slice(10));
+      const st = bdb.getState(user.id);
+      if (!bdb.getCp(user.id, cpId) || !st.data || !st.data.amount) {
+        await tg.sendMessage(chatId, 'Настройка потерялась — начните заново.', mainMenu());
+        return;
+      }
+      await askRoDay(tg, chatId, user, cpId, { ...st.data, note: '' });
+      return;
+    }
+    if (data.startsWith('ro.day:')) {
+      const [, cpIdStr, dayStr] = data.split(':');
+      const st = bdb.getState(user.id);
+      const cp = bdb.getCp(user.id, Number(cpIdStr));
+      if (!cp || !st.data || !st.data.amount) {
+        await tg.sendMessage(chatId, 'Настройка потерялась — начните заново.', mainMenu());
+        return;
+      }
+      bdb.setState(user.id, `ro:times:${cp.id}`, { ...st.data, day: Number(dayStr) });
+      await tg.sendMessage(chatId,
+        'Сколько раз повторить?\n\n'
+        + '<i>Когда гасите долг частями, число известно заранее — правило само '
+        + 'выключится после последнего раза и не будет списывать то, чего уже нет.</i>',
+        keyboard([
+          [{ text: '3', data: `ro.times:${cp.id}:3` }, { text: '5', data: `ro.times:${cp.id}:5` },
+            { text: '10', data: `ro.times:${cp.id}:10` }, { text: '12', data: `ro.times:${cp.id}:12` }],
+          [{ text: '♾ Без конца', data: `ro.times:${cp.id}:0` }],
+          [{ text: '✖️ Отмена', data: `cp:${cp.id}` }],
+        ]));
+      return;
+    }
+    if (data.startsWith('ro.times:')) {
+      const [, cpIdStr, timesStr] = data.split(':');
+      const st = bdb.getState(user.id);
+      const cp = bdb.getCp(user.id, Number(cpIdStr));
+      if (!cp || !st.data || !st.data.amount) {
+        await tg.sendMessage(chatId, 'Настройка потерялась — начните заново.', mainMenu());
+        return;
+      }
+      bdb.setState(user.id, `ro:mail:${cp.id}`, { ...st.data, times: Number(timesStr) });
+      const box = mailbox.resolve(user.id);
+      await tg.sendMessage(chatId,
+        'Присылать себе акт сверки на почту после каждого раза?\n\n'
+        + (box.ok
+          ? '<i>Только вам, в ваш же ящик. Клиенту ничего не уходит — это вы '
+            + 'подтверждаете отдельно и видите текст письма.</i>'
+          : `<i>${esc(box.reason)} Пока можно без почты — включите позже.</i>`),
+        keyboard([
+          ...(box.ok ? [[{ text: '✉️ Да, присылать себе', data: `ro.save:${cp.id}:1` }]] : []),
+          [{ text: 'Не надо', data: `ro.save:${cp.id}:0` }],
+          [{ text: '✖️ Отмена', data: `cp:${cp.id}` }],
+        ]));
+      return;
+    }
+    if (data.startsWith('ro.save:')) {
+      const [, cpIdStr, mailStr] = data.split(':');
+      const st = bdb.getState(user.id);
+      const cp = bdb.getCp(user.id, Number(cpIdStr));
+      if (!cp || !st.data || !st.data.amount) {
+        await tg.sendMessage(chatId, 'Настройка потерялась — начните заново.', mainMenu());
+        return;
+      }
+      const d = st.data;
+      bdb.clearState(user.id);
+      recurring.add(user.id, {
+        cpId: cp.id,
+        type: recurring.OP_TYPE,
+        items: [],
+        day: Number(d.day),
+        // Месяц отмечаем отработанным, только если день уже прошёл: иначе
+        // бот обещает провести 1-го и молчит до следующего месяца.
+        offeredThisMonth: recurring.dayPassed(Number(d.day)),
+        extra: {
+          opKind: d.opKind,
+          amount: d.amount,
+          note: d.note || '',
+          times: Number(d.times) || 0,
+          done: 0,
+          mailSelf: mailStr === '1',
+        },
+      });
+      await tg.sendMessage(chatId,
+        `✅ Готово.\n\n<b>${esc(d.opKind)} ${formatRub(d.amount)}</b> · ${esc(cp.name)}\n`
+        + `${recurring.dayLabel(Number(d.day))}`
+        + (Number(d.times) ? ` · ${d.times} ${plural(Number(d.times), 'раз', 'раза', 'раз')}` : ' · без конца')
+        + (d.note ? `\n<i>${esc(d.note)}</i>` : '')
+        + (mailStr === '1' ? '\n✉️ Акт сверки буду присылать вам на почту.' : '')
+        + '\n\nВносить буду сам, но каждый раз сообщу и дам отменить одним нажатием.',
+        keyboard([
+          [{ text: '🔁 Все повторения', data: 'rec' }],
+          [{ text: `👤 ${cp.name}`.slice(0, 60), data: `cp:${cp.id}` }],
+        ]));
+      return;
+    }
+    /*
+     * Отмена только что внесённой строки. Возвращаем и счётчик: иначе пятая
+     * часть долга «сгорала» бы от одного случайного нажатия, а правило
+     * выключилось бы раньше времени.
+     */
+    if (data.startsWith('ro.undo:')) {
+      const [, recIdStr, opIdStr] = data.split(':');
+      const removed = bdb.deleteOp(user.id, Number(opIdStr));
+      /*
+       * Счётчик откатываем, только если строка действительно убрана. Раньше
+       * откат шёл всегда: второе нажатие «Отменить» уже ничего не удаляло,
+       * но счётчик уменьшало ещё раз — и правило «5 раз по 10 000» вносило
+       * шестой платёж, лишние 10 000 уходили в сальдо и в акт сверки.
+       */
+      if (removed) recurring.bumpOp(user.id, Number(recIdStr), -1);
+      await tg.sendMessage(chatId,
+        removed
+          ? '↩️ Убрал операцию из журнала. Счётчик вернул назад — в следующий раз внесу снова.'
+          : 'Этой операции уже нет в журнале.',
+        mainMenu());
+      return;
+    }
+    if (data === 'org.new') { await startForm(tg, chatId, user, 'org'); return; }
+    if (data === 'org.bank') {
+      const o = bdb.currentOrg(user.id) || {};
+      // Уже известное не переспрашиваем: полный банк берём как есть, а счёт — если он есть.
+      const values = {};
+      if (o.bik && o.bank_name && o.corr_acc) Object.assign(values, { bik: o.bik, bank_name: o.bank_name, corr_acc: o.corr_acc });
+      if (o.acc) values.acc = o.acc;
+      await advanceForm(tg, chatId, user, 'orgb', values, 0);
+      return;
+    }
+    // Короткая анкета клиента — из ассистента, где полная из 13 шагов пугает.
+    if (data === 'cp.q') {
+      bdb.setState(user.id, 'form:cpq', { i: 0, values: {} });
+      await askStep(tg, chatId, 'cpq', 0);
+      return;
+    }
+    if (data === 'org.pick') { await showOrgPick(tg, chatId, user); return; }
+    if (data === 'org.add') { await startAddOrg(tg, chatId, user); return; }
+    if (data.startsWith('org.use:')) {
+      const okSwitch = bdb.setActiveOrg(user.id, Number(data.slice(8)));
+      if (!okSwitch) { await tg.sendMessage(chatId, 'Такой организации у вас нет.', mainMenu()); return; }
+      const now = bdb.currentOrg(user.id);
+      await tg.sendMessage(chatId,
+        `Работаем от <b>${esc(now.name)}</b>.\n\n`
+        + '<i>Документы, долги и отчёты дальше — её. У каждой фирмы свои номера '
+        + 'и свои долги и расчёты с клиентами.</i>');
+      await showOrg(tg, chatId, user);
+      return;
+    }
+    if (data === 'cps') { await showCps(tg, chatId, user); return; }
+    if (data === 'cp.new') { await startForm(tg, chatId, user, 'cp'); return; }
+    // Выбор клиента и суммы для проводки, начатой фразой.
+    if (data.startsWith('pay.cp:')) {
+      const [cpIdStr, sumStr, kindFlag, tok, day] = data.slice(7).split(':');
+      if (!bdb.claimButton(user.id, tok)) {
+        await tg.sendMessage(chatId, 'Эта оплата уже внесена — повторно не провожу.', mainMenu());
+        return;
+      }
+      // Дату нажатие подтверждает: даже будущая, названная во фразе, внесётся — человек её видел.
+      await recordPay(tg, chatId, user, Number(cpIdStr), Number(sumStr), kindFlag === 'p' ? 'Приход' : 'Оплата',
+        unpackDay(day));
+      return;
+    }
+    if (data.startsWith('pp.in:')) {
+      const cpId = Number(data.slice(6));
+      const cp = bdb.getCp(user.id, cpId);
+      if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
+      bdb.setState(user.id, `ppay:${cpId}`, {});
+      await tg.sendMessage(chatId, `Сколько внёс ${quoted(cp.name)} предоплатой? Напишите сумму, например <code>140000</code>.`);
+      return;
+    }
+    if (data.startsWith('pp.view:')) {
+      await showPrepay(tg, chatId, user, Number(data.slice(8)));
+      return;
+    }
+    if (data.startsWith('pp.do:')) {
+      const [cpIdStr, sumStr, tok, day] = data.slice(6).split(':');
+      if (!bdb.claimButton(user.id, tok)) {
+        await tg.sendMessage(chatId, 'Эта предоплата уже внесена — повторно не провожу.', mainMenu());
+        return;
+      }
+      await doPrepay(tg, chatId, user, Number(cpIdStr), Number(sumStr), unpackDay(day));
+      return;
+    }
+    if (data.startsWith('pp.act:')) {
+      const [cpIdStr, ym] = data.slice(7).split(':');
+      if (ym) await issueMonthAct(tg, chatId, user, Number(cpIdStr), ym);
+      else await askMonthAct(tg, chatId, user, Number(cpIdStr));
+      return;
+    }
+    if (data.startsWith('pay.undo:')) {
+      const [cpIdStr, opIdStr] = data.slice(9).split(':');
+      // Оплата могла закрыть несколько документов — ids через запятую; отмена
+      // каждой строки сама снимает отметку «оплачено» с документа.
+      const gone = opIdStr.split(',').map((id) => bdb.deleteOp(user.id, Number(id))).some(Boolean);
+      const bal = bdb.balanceOf(user.id, Number(cpIdStr));
+      await tg.sendMessage(chatId, gone
+        ? `↩️ Запись убрана. Баланс: <b>${formatRub(Math.abs(round2(bal.closing)))}</b>.`
+        : 'Эта запись уже убрана.',
+      keyboard([[{ text: '⬅️ Меню', data: 'menu' }]]));
+      return;
+    }
+    /*
+     * «Завести клиента с этим именем и вернуться к документу».
+     *
+     * Имя кладём в values формы: advanceForm пропускает заполненные шаги, так
+     * что вопрос «краткое имя» не задаётся — человек сразу отвечает про ИНН.
+     * __then возвращает его к тому документу, ради которого всё начиналось,
+     * тем же путём, каким это уже работает у справочника реквизитов.
+     */
+    if (data.startsWith('cp.pre:')) {
+      const type = data.slice(7);
+      const name = pendingCpGet(user.id);
+      if (!name) {
+        // Память о разговоре истекла — переспрашиваем, а не подставляем пустое.
+        await tg.sendMessage(chatId, 'Забыл, о ком речь — заведём клиента с начала.');
+        await startForm(tg, chatId, user, 'cpq');
+        return;
+      }
+      // __guessedName помечает имя как услышанное, а не введённое: справочник
+      // по ИНН вправе заменить его настоящим названием из реестра.
+      const values = { name, __guessedName: true };
+      if (ITEM_DOCS[type]) values.__then = type;
+      await tg.sendMessage(chatId, `Завожу клиента <b>${esc(name)}</b>. `
+        + 'Имя подставил из вашей фразы — если укажете ИНН, поправлю на название из реестра.');
+      await advanceForm(tg, chatId, user, 'cpq', values, 0);
+      return;
+    }
+    // Проводник: «выписать счёт» с любого места, недостающее спросим по пути.
+    if (data === 'go.any') { await chooseDoc(tg, chatId, user); return; }
+    if (data.startsWith('go.')) { await startDoc(tg, chatId, user, data.slice(3)); return; }
+    if (data.startsWith('cp.new.')) {
+      bdb.setState(user.id, 'form:cpq', { i: 0, values: { __then: data.slice(7) } });
+      await askStep(tg, chatId, 'cpq', 0);
+      return;
+    }
+    /*
+     * «Пропустить» — то же, что прислать «-», только руками этого никто не
+     * делает. Для числа и даты «-» не годится: форма встанет и будет
+     * бесконечно повторять «нужно число». Подставляем разумное умолчание —
+     * ноль и сегодня.
+     */
+    if (data.startsWith('form.skip')) {
+      const st = bdb.getState(user.id);
+      if (!st.state.startsWith('form:')) return;
+      const at = Number(data.split(':')[1]);
+      if (Number.isFinite(at) && at !== st.data.i) return;   // кнопка из прошлого вопроса
+      const form = FORMS[st.state.slice(5)];
+      const step = form && form.steps[st.data.i];
+      if (!step || !step.opt) return;                        // обязательное не пропускаем
+      const value = step.num ? '0' : (step.date ? ru(docService.todayISO()) : '-');
+      await applyFormValue(tg, chatId, user, st, value);
+      return;
+    }
+    if (data.startsWith('fb:')) {
+      const state = bdb.getState(user.id);
+      if (state.state.startsWith('form:')) { await applyFormValue(tg, chatId, user, state, data.slice(3)); }
+      return;
+    }
+    if (data.startsWith('cp:')) {
+      const cp = bdb.getCp(user.id, Number(data.slice(3)));
+      if (!cp) { await tg.sendMessage(chatId, 'Такого клиента нет в вашем списке.', mainMenu()); return; }
+      const { info, kb } = cpMenu(user.id, cp);
+      await tg.sendMessage(chatId, info, kb);
+      return;
+    }
+    if (data.startsWith('op:')) {
+      const cpId = Number(data.slice(3));
+      bdb.setState(user.id, `op:${cpId}`, {});
+      await tg.sendMessage(chatId, 'Введите операцию текстом, напр.:\n<code>15.06 приход 94193</code>\n<code>02.07 оплата 50000 №79000</code>\n\nТипы: приход/поставка (нам должны больше) · оплата/принято (нам заплатили).');
+      return;
+    }
+    if (data.startsWith('op.del:')) {
+      const cpId = Number(data.slice(7));
+      const ok = bdb.deleteLastOp(user.id, cpId);
+      const cp = bdb.getCp(user.id, cpId);
+      const { info, kb } = cpMenu(user.id, cp);
+      await tg.sendMessage(chatId, (ok ? '↩️ Последняя операция удалена.\n\n' : 'Операций нет.\n\n') + info, kb);
+      return;
+    }
+    if (data.startsWith('d.akt:')) { await askAktPeriod(tg, chatId, user, Number(data.slice(6))); return; }
+    // Акт за период, названный во фразе: даты едут в кнопке (0 в начале — «от начала расчётов»).
+    if (data.startsWith('akt.r:')) {
+      const [cpId, a, b] = data.slice(6).split(':');
+      const from = a === '0' ? '' : unpackDay(a);
+      const to = unpackDay(b);
+      if (!to || (a !== '0' && !from)) { await askAktPeriod(tg, chatId, user, Number(cpId)); return; }
+      await genAktSverki(tg, chatId, user, Number(cpId), from, to, { changePeriod: true });
+      return;
+    }
+    if (data.startsWith('akt.p:')) {
+      const [cpId, code] = data.slice(6).split(':');
+      const r = period.presetRange(code);
+      await genAktSverki(tg, chatId, user, Number(cpId), r.from, r.to);
+      return;
+    }
+    if (data.startsWith('akt.own:')) {
+      const cpId = Number(data.slice(8));
+      bdb.setState(user.id, `aktp:${cpId}`, {});
+      await tg.sendMessage(chatId,
+        'Напишите период — как удобно:\n'
+        + '<code>01.01.2026 - 31.03.2026</code>\n'
+        + '<code>март</code>  ·  <code>апрель 2025</code>\n'
+        + '<code>2 квартал</code>  ·  <code>2025</code>',
+        keyboard([[{ text: '✖️ Отмена', data: `cp:${cpId}` }]]));
+      return;
+    }
+    if (data.startsWith('d.usl:')) { await startItems(tg, chatId, user, 'usl', Number(data.slice(6))); return; }
+    if (data.startsWith('d.schdog:')) {
+      // Счёт-договор — тот же счёт по сути, ставку НДС берём так же.
+      const org = bdb.currentOrg(user.id);
+      const v = org ? bdb.vatOf(org) : { rate: null, gross: false };
+      await startItems(tg, chatId, user, 'schdog', Number(data.slice(9)),
+        v.rate == null ? {} : { vatRate: v.rate, priceIncludesVat: v.gross });
+      return;
+    }
+    if (data.startsWith('d.sch:')) {
+      // Ставку не спрашиваем — берём режим организации; у документа его
+      // можно поменять кнопкой в сводке перед выпуском.
+      const org = bdb.currentOrg(user.id);
+      const v = org ? bdb.vatOf(org) : { rate: null, gross: false };
+      await startItems(tg, chatId, user, 'sch', Number(data.slice(6)),
+        v.rate == null ? {} : { vatRate: v.rate, priceIncludesVat: v.gross });
+      return;
+    }
+    if (data.startsWith('d.upd:')) { await askUpdStatus(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('upd.s2:')) { await startItems(tg, chatId, user, 'upd', Number(data.slice(7)), { status: 2 }); return; }
+    if (data.startsWith('upd.s1:')) { await askUpdRate(tg, chatId, user, Number(data.slice(7))); return; }
+    if (data.startsWith('upd.r:')) {
+      const [cpIdStr, rate] = data.slice(6).split(':');
+      if (!okRate(rate)) return;
+      await askUpdGross(tg, chatId, user, Number(cpIdStr), rate);
+      return;
+    }
+    if (data.startsWith('upd.g:')) {
+      const [cpIdStr, rate, gross] = data.slice(6).split(':');
+      if (!okRate(rate)) return;
+      await startItems(tg, chatId, user, 'upd', Number(cpIdStr),
+        { status: 1, vatRate: Number(rate), priceIncludesVat: gross === '1' });
+      return;
+    }
+    if (data.startsWith('d.torg12:')) { await startItems(tg, chatId, user, 'torg12', Number(data.slice(9))); return; }
+    if (data.startsWith('d.dog:')) { await startDogovor(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('d.dogstd:')) { await startDogovor(tg, chatId, user, Number(data.slice(9)), { typical: true }); return; }
+    if ((data.startsWith('mc.') || data.startsWith('ct.')) && await contractFlow().onCallback(tg, chatId, user, data)) return;
+    if (data.startsWith('d.pp:')) { await startPp(tg, chatId, user, Number(data.slice(5))); return; }
+    if (data.startsWith('d.av:')) { await startAvans(tg, chatId, user, Number(data.slice(5))); return; }
+    if (data.startsWith('d.ksf:')) { await startKsf(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('ksf.b:')) { await askKsfLines(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('doc.fix:')) { await makeFix(tg, chatId, user, Number(data.slice(8))); return; }
+    if (data === 'items.done') {
+      const state = bdb.getState(user.id);
+      if (!state.state.startsWith('items:')) return;
+      if (!state.data.items.length) {
+        await tg.sendMessage(chatId, 'Пока ни одной позиции — добавьте хотя бы одну.', itemsKb(user, state.data));
+        return;
+      }
+      await showPreview(tg, chatId, user, state);
+      return;
+    }
+    if (data === 'items.more' || data === 'items.undo') {
+      const state = bdb.getState(user.id);
+      if (!state.state.startsWith('items:')) return;
+      const d = state.data;
+      let note = 'Отправьте ещё позицию:';
+      if (data === 'items.undo' && d.items.length) {
+        const gone = d.items.pop();
+        note = `Убрал: ${esc(gone.name)}.`;
+        bdb.setState(user.id, state.state, d);
+      }
+      await tg.sendMessage(chatId, note, itemsKb(user, d));
+      return;
+    }
+    if (data === 'doc.make') {
+      const state = bdb.getState(user.id);
+      if (state.state.startsWith('items:')) await finishItems(tg, chatId, user, state);
+      return;
+    }
+    if (data === 'doc.num' || data === 'doc.date') {
+      const state = bdb.getState(user.id);
+      if (!state.state.startsWith('items:')) return;
+      state.data.ask = data === 'doc.num' ? 'number' : 'date';
+      bdb.setState(user.id, state.state, state.data);
+      await tg.sendMessage(chatId, data === 'doc.num'
+        ? `Введите номер документа (сейчас ${esc(state.data.number)}):`
+        : `Введите дату ДД.ММ.ГГГГ (сейчас ${ru(state.data.date)}):`);
+      return;
+    }
+    if (data === 'doc.basis') {
+      const state = bdb.getState(user.id);
+      if (!state.state.startsWith('items:')) return;
+      state.data.ask = 'basis';
+      bdb.setState(user.id, state.state, state.data);
+      await tg.sendMessage(chatId, 'Напишите основание — например, '
+        + '<code>Договор поставки № 7 от 01.09.2026</code> или <code>Заказ № 45</code>.\n'
+        + '<i>Отправьте «-» — подставлю запомненное для клиента основание, а если его нет, '
+        + 'договор из карточки (без него — «Без договора»).</i>');
+      return;
+    }
+    // Позиция из подсказок по клиенту (то, что выписывали ему раньше).
+    if (data.startsWith('ci:')) {
+      const state = bdb.getState(user.id);
+      if (!state.state.startsWith('items:')) return;
+      const t = suggestionsOf(user).find((x) => !x.tplId && itemTag(x.name) === data.slice(3));
+      if (!t) { await tg.sendMessage(chatId, 'Подсказка устарела — нажмите позицию заново.', itemsKb(user, state.data)); return; }
+      if (!(t.price > 0)) {
+        state.data.ask = 'np'; state.data.pending = { name: t.name, unit: t.unit };
+        bdb.setState(user.id, state.state, state.data);
+        await tg.sendMessage(chatId, `<b>${esc(t.name)}</b>\nСколько и по какой цене?`);
+        return;
+      }
+      state.data.ask = 'qty'; state.data.tplId = 0; state.data.tplItem = { name: t.name, unit: t.unit, price: t.price };
+      bdb.setState(user.id, state.state, state.data);
+      await tg.sendMessage(chatId, `<b>${esc(t.name)}</b> по ${formatRub(t.price)} за ${esc(t.unit)}\nСколько?`);
+      return;
+    }
+    // «Убрать лишнее»: список подсказок с корзиной, нажатое пропадает из кнопок.
+    if (data === 'ci.hide' || data.startsWith('ci.x:')) {
+      const state = bdb.getState(user.id);
+      if (!state.state.startsWith('items:')) return;
+      const cpId = Number(state.state.split(':')[2]) || 0;
+      const list = suggestionsOf(user);
+      if (data.startsWith('ci.x:')) {
+        const t = list.find((x) => itemTag(x.name) === data.slice(5));
+        if (t) {
+          bdb.hideItem(user.id, cpId, t.name, { global: !t.own });
+          await tg.sendMessage(chatId, `Убрал «${esc(t.name)}» из подсказок.`, itemsKb(user, state.data));
+        }
+        return;
+      }
+      if (!list.length) { await tg.sendMessage(chatId, 'Подсказок нет.', itemsKb(user, state.data)); return; }
+      await tg.sendMessage(chatId, 'Какую позицию убрать из подсказок? Сами документы это не меняет.',
+        keyboard([...list.map((t) => ([{ text: `🗑 ${t.name}`.slice(0, 60), data: `ci.x:${itemTag(t.name)}` }])),
+          [{ text: '⬅️ Назад к позициям', data: 'ci.back' }]]));
+      return;
+    }
+    if (data === 'ci.back') {
+      const state = bdb.getState(user.id);
+      if (state.state.startsWith('items:')) await tg.sendMessage(chatId, 'Продолжаем.', itemsKb(user, state.data));
+      return;
+    }
+    if (data.startsWith('tpl:')) {
+      const state = bdb.getState(user.id);
+      if (!state.state.startsWith('items:')) return;
+      const t = bdb.getTemplate(user.id, Number(data.slice(4)));
+      if (!t) { await tg.sendMessage(chatId, 'Шаблон не найден.'); return; }
+      // Готовая позиция без цены (из набора под профессию) — спрашиваем и
+      // количество, и цену тем же путём, что у новой позиции.
+      if (!(Number(t.price) > 0)) {
+        state.data.ask = 'np'; state.data.pending = { name: t.name, unit: t.unit || 'шт.' };
+        bdb.setState(user.id, state.state, state.data);
+        await tg.sendMessage(chatId, `<b>${esc(t.name)}</b>\nСколько и по какой цене?\n\n`
+          + '<i>Можно одним сообщением: <code>40 2500</code> — сорок по 2 500.</i>');
+        return;
+      }
+      state.data.ask = 'qty'; state.data.tplId = t.id;
+      bdb.setState(user.id, state.state, state.data);
+      await tg.sendMessage(chatId, `<b>${esc(t.name)}</b> по ${formatRub(t.price)} за ${esc(t.unit)}\nСколько?`);
+      return;
+    }
+    if (data.startsWith('ph.cp:')) { await photoPickKind(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('ph.k:')) { await photoSaveOp(tg, chatId, user, data.slice(5)); return; }
+    if (data === 'billing') { await showBilling(tg, chatId, user); return; }
+    if (data.startsWith('pay.plt:')) {
+      const plan = data.slice(8);
+      /*
+       * Цена и срок — из тарифной сетки, а не числом здесь.
+       *
+       * Раньше стояло `plan === 'year' ? 3490 : 349`, а в сетке жили 390 и
+       * 2990. Ни один платёж в сетку не попадал, все проваливались в
+       * умолчание — 30 дней. Месяц случайно работал, год превращался в месяц.
+       */
+      const tariff = platega.planByName(plan);
+      if (!tariff) { await tg.sendMessage(chatId, 'Подписка пока не настроена.'); return; }
+      const amount = tariff.amount;
+      if (platega.isConfigured()) {
+        const res = await platega.createTransaction({
+          amount,
+          days: tariff.days,
+          userId: user.id,
+          tgId: user.tg_id,
+          paymentMethod: 2,
+          plan,
+          description: `Подписка Первичка на ${plan === 'year' ? '1 год' : '1 месяц'}`,
+        });
+        if (res.ok && res.redirect) {
+          await tg.sendMessage(chatId,
+            `💳 <b>Оплата подписки (${amount} ₽)</b>\n\n`
+            + 'Оплата через Систему быстрых платежей (СБП) или карту любого банка РФ.\n'
+            + 'После завершения платежа доступ продлится автоматически.',
+            keyboard([
+              [{ text: `⚡ Оплатить ${amount} ₽ (СБП / Карты)`, url: res.redirect }],
+              [{ text: '⬅️ Назад к подписке', data: 'billing' }],
+            ]));
+          return;
+        }
+      }
+      const fallback = payLink(user.tg_id);
+      if (fallback) {
+        await tg.sendMessage(chatId, `Оформить подписку (${amount} ₽):`,
+          keyboard([
+            [{ text: `⭐ Оплатить ${amount} ₽`, url: fallback }],
+            [{ text: '⬅️ Назад к подписке', data: 'billing' }],
+          ]));
+        return;
+      }
+      await tg.sendMessage(chatId,
+        'Оплата временно недоступна. Напишите нам в поддержку — подключим доступ вручную.',
+        keyboard([[{ text: '💬 Написать в поддержку', data: 'support' }]]));
+      return;
+    }
+    if (data === 'pay.claim') {
+      bdb.setState(user.id, 'claim', {});
+      await tg.sendMessage(chatId, 'Пришлите почту, которую указывали при оплате:',
+        keyboard([[{ text: '✖️ Отмена', data: 'billing' }]]));
+      return;
+    }
+    if (data === 'promo') {
+      bdb.setState(user.id, 'promo', {});
+      await tg.sendMessage(chatId,
+        'Пришлите код доступа — он выглядит так: <code>PRV-A3KD-9MQX</code>.\n\n'
+        + '<i>Регистр и дефисы неважны.</i>',
+        keyboard([[{ text: '✖️ Отмена', data: 'billing' }]]));
+      return;
+    }
+    if (data.startsWith('crm.h:')) {
+      const cpId = Number(data.slice(6));
+      const cp = bdb.getCp(user.id, cpId);
+      if (!cp) return;
+      const items = crm.timeline(user.id, cpId);
+      const open = crm.openFollowups(user.id, cpId);
+      const lines = [`🕑 <b>История: ${esc(cp.name)}</b>`, ''];
+      if (open.length) lines.push(...open.map((f) => `⏰ ${ru(f.due)} — ${esc(f.text)}`), '');
+      lines.push(...(items.length ? items.map((x) => `${x.icon} ${ru(x.at)} — ${esc(x.text)}`) : ['Пока пусто.']));
+      await tg.sendMessage(chatId, lines.join('\n').slice(0, 4000), keyboard([
+        [{ text: '📝 Заметка', data: `crm.n:${cpId}` }, { text: '⏰ Напомнить мне', data: `crm.f:${cpId}` }],
+        [{ text: `📂 ${cp.name}`.slice(0, 60), data: `cp:${cpId}` }],
+      ]));
+      return;
+    }
+    if (data.startsWith('crm.n:')) {
+      const cpId = Number(data.slice(6));
+      bdb.setState(user.id, `note:${cpId}`, {});
+      await tg.sendMessage(chatId, 'Что записать? Например: «договорились на банкет 20 июня, 40 гостей, предоплата 30%».',
+        keyboard([[{ text: '✖️ Отмена', data: `cp:${cpId}` }]]));
+      return;
+    }
+    if (data.startsWith('crm.f:')) {
+      const cpId = Number(data.slice(6));
+      await tg.sendMessage(chatId, 'Когда напомнить?', keyboard([
+        [{ text: 'Завтра', data: `crm.fd:${cpId}:1` }, { text: 'Через 3 дня', data: `crm.fd:${cpId}:3` }],
+        [{ text: 'Через неделю', data: `crm.fd:${cpId}:7` }, { text: 'Через 2 недели', data: `crm.fd:${cpId}:14` }],
+        [{ text: '✖️ Отмена', data: `cp:${cpId}` }],
+      ]));
+      return;
+    }
+    if (data.startsWith('crm.fd:')) {
+      const [cpIdStr, daysStr] = data.slice(7).split(':');
+      bdb.setState(user.id, `fu:${Number(cpIdStr)}:${Number(daysStr)}`, {});
+      await tg.sendMessage(chatId, 'О чём напомнить? Например: «позвонить насчёт предоплаты». Или «-» — просто связаться.');
+      return;
+    }
+    if (data.startsWith('crm.done:')) {
+      await tg.sendMessage(chatId, crm.done(user.id, Number(data.slice(9))) ? '✅ Отметил: сделано.' : 'Уже отмечено.', mainMenu());
+      return;
+    }
+    if (data.startsWith('crm.snz:')) {
+      await tg.sendMessage(chatId, crm.snooze(user.id, Number(data.slice(8)), todayISO(), 3)
+        ? '⏰ Напомню через три дня.' : 'Это напоминание уже закрыто.', mainMenu());
+      return;
+    }
+    if (data === 'dg.off' || data === 'dg.on') {
+      const on = digest.setOn(user.id, data === 'dg.on');
+      await tg.sendMessage(chatId, on
+        ? '☀️ Утренняя сводка включена: в 9 утра пришлю, кто сколько должен, — если есть что сказать.'
+        : '🔕 Сводку больше не присылаю. Включить — «Моя организация» → «Утренняя сводка».', mainMenu());
+      return;
+    }
+    if (data === 'voice.off' || data === 'voice.on') {
+      const on = bdb.setVoiceReply(user.id, data === 'voice.on');
+      await tg.sendMessage(chatId, on
+        ? 'Снова отвечаю на голосовые голосом.'
+        : 'Понял, дальше отвечаю только текстом.',
+      keyboard([[on ? { text: '🔇 Отвечать текстом', data: 'voice.off' } : { text: '🔊 Отвечать голосом', data: 'voice.on' }]]));
+      return;
+    }
+    if (data === 'support') { await showSupport(tg, chatId, user); return; }
+    if (['legal', 'terms', 'privacy', 'tariffs'].includes(data)) { await showLegal(tg, chatId, user); return; }
+    if (data === 'sup.write') {
+      bdb.setState(user.id, 'support', {});
+      await tg.sendMessage(chatId, 'Опишите, что случилось. Одним сообщением — я передам целиком.',
+        keyboard([[{ text: '✖️ Отмена', data: 'menu' }]]));
+      return;
+    }
+    if (data === 'debts') { await showDebts(tg, chatId, user); return; }
+    if (data === 'debt.akts') { await sendDebtAkts(tg, chatId, user); return; }
+    if (data === 'debt.remind') { await debtReminder(tg, chatId, user); return; }
+    if (data.startsWith('rm.one:')) {
+      const [cpIdStr, tone] = data.slice(7).split(':');
+      await remindOne(tg, chatId, user, Number(cpIdStr), tone || '');
+      return;
+    }
+    if (data.startsWith('rm.done:')) {
+      const [cpIdStr, tone] = data.slice(8).split(':');
+      digest.logReminder(user.id, Number(cpIdStr), { tone: tone || '', via: 'text' });
+      await tg.sendMessage(chatId, 'Записал, что напомнили. В сводке будет видно, сколько дней прошло.', mainMenu());
+      return;
+    }
+    if (data.startsWith('rm.mail:')) {
+      const [cpIdStr, tone] = data.slice(8).split(':');
+      await sendReminderMail(tg, chatId, user, Number(cpIdStr), undefined, tone || 'biz');
+      return;
+    }
+    if (data.startsWith('rm.ask:')) {
+      const [cpIdStr, tone] = data.slice(7).split(':');
+      const cpId = Number(cpIdStr);
+      bdb.setState(user.id, `rm:${cpId}`, { tone: tone || 'biz' });
+      const cp = bdb.getCp(user.id, cpId);
+      await tg.sendMessage(chatId,
+        `Куда отправить напоминание для <b>${esc((cp && cp.name) || 'клиента')}</b>?\n\n`
+        + '<i>Пришлите адрес почты — запомню его в карточке клиента.</i>',
+        keyboard([[{ text: '✖️ Отмена', data: 'debts' }]]));
+      return;
+    }
+    if (data === 'docs') { await showDocs(tg, chatId, user); return; }
+    if (data.startsWith('docs.cp:')) { await showDocs(tg, chatId, user, Number(data.slice(8))); return; }
+    if (data.startsWith('doc.get:')) { await resendDoc(tg, chatId, user, Number(data.slice(8))); return; }
+    // Копия со штампом «Оплачено» — отдельной кнопкой, а не всегда: тот же
+    // счёт то уходит клиенту с отметкой об оплате, то подшивается без неё.
+    if (data.startsWith('doc.paidcopy:')) {
+      await resendDoc(tg, chatId, user, Number(data.slice(13)), { paid: true });
+      return;
+    }
+    /*
+     * Ссылка для клиента. Отдаём её отдельным сообщением, а не только в
+     * карточке: из чата ссылку пересылают одним нажатием, а карточку с
+     * кнопками пересылать неудобно.
+     */
+    if (data.startsWith('doc.link:')) {
+      const docId = Number(data.slice(9));
+      const d = bdb.getDoc(user.id, docId);
+      if (!d) { await tg.sendMessage(chatId, 'Документ не найден.', mainMenu()); return; }
+      const made = docLink.create(user.id, docId);
+      if (!made) {
+        await tg.sendMessage(chatId,
+          'Ссылки пока не работают: у приложения нет своего адреса в интернете.');
+        return;
+      }
+      // Кнопка «Отправить клиенту» — это встроенный в Telegram выбор чата:
+      // человек выбирает получателя и отправляет, не копируя адрес руками.
+      const share = 'https://t.me/share/url?url='
+        + `${encodeURIComponent(made.url)}&text=`
+        + encodeURIComponent(`${d.title} № ${d.number} от ${ru(d.date)}`);
+      await tg.sendMessage(chatId,
+        `🔗 Ссылка на <b>${esc(d.title)} № ${esc(d.number)}</b>:\n\n${esc(made.url)}\n\n`
+        + `Действует до ${ru(made.expiresAt.slice(0, 10))}. Отправьте её клиенту — `
+        + 'документ откроется у него в браузере, скачивать ничего не нужно. '
+        + 'Если передумаете, ссылку можно отозвать в карточке документа.',
+        keyboard([
+          [{ text: '📤 Отправить клиенту', url: share }],
+          [{ text: '↩️ К документу', data: `doc:${docId}` }],
+        ]));
+      return;
+    }
+    if (data.startsWith('doc.unlink:')) {
+      const docId = Number(data.slice(11));
+      const n = docLink.revoke(user.id, docId);
+      await tg.sendMessage(chatId, n
+        ? 'Отозвал. По старой ссылке документ больше не откроется.'
+        : 'Действующих ссылок на этот документ нет.');
+      await showDoc(tg, chatId, user, docId);
+      return;
+    }
+    if (data.startsWith('doc.mail:')) { await mailDoc(tg, chatId, user, Number(data.slice(9))); return; }
+    if (data.startsWith('doc.del:')) {
+      bdb.deleteDoc(user.id, Number(data.slice(8)));
+      await tg.sendMessage(chatId, 'Убрал из журнала. Сам файл у вас остаётся в переписке.');
+      await showDocs(tg, chatId, user);
+      return;
+    }
+    if (data.startsWith('doc:')) { await showDoc(tg, chatId, user, Number(data.slice(4))); return; }
+    if (data.startsWith('d.rep:')) { await repeatDoc(tg, chatId, user, Number(data.slice(6))); return; }
+    if (/^cb:\d+$/.test(data)) { await showCpBasis(tg, chatId, user, Number(data.slice(3))); return; }
+    if (/^cb\.set:\d+$/.test(data)) {
+      const cpId = Number(data.slice(7));
+      if (!bdb.getCp(user.id, cpId)) return;
+      bdb.setState(user.id, `cbasis:${cpId}`, {});
+      await tg.sendMessage(chatId,
+        'Напишите основание так, как оно должно стоять в накладной:\n<code>Договор № 12 от 01.03.2026</code>',
+        keyboard([[{ text: '✖️ Отмена', data: `cb:${cpId}` }]]));
+      return;
+    }
+    if (/^cb\.reset:\d+$/.test(data)) {
+      const cpId = Number(data.slice(9));
+      bdb.setBasisFor(user.id, cpId, '');
+      bdb.applyBasisToRules(user.id, cpId, '');
+      await tg.sendMessage(chatId, 'Сбросил: дальше печатаю договор из карточки клиента.');
+      await showCpBasis(tg, chatId, user, cpId);
+      return;
+    }
+    // Применить основание: ко всем выпущенным, к прошлому месяцу или только на будущее.
+    if (/^cb\.(all|prev|new):\d+$/.test(data)) {
+      const [scope, id] = data.slice(3).split(':');
+      const cpId = Number(id);
+      const st = bdb.getState(user.id);
+      const basis = st && st.state === `cbasis.ok:${cpId}` ? String((st.data || {}).basis || '') : '';
+      if (!basis || !bdb.getCp(user.id, cpId)) { await tg.sendMessage(chatId, 'Основание потерялось — задайте заново.', mainMenu()); return; }
+      bdb.clearState(user.id);
+      bdb.setBasisFor(user.id, cpId, basis);
+      bdb.applyBasisToRules(user.id, cpId, basis);   // расписание тоже выписывает с новым
+      if (scope === 'new') {
+        await tg.sendMessage(chatId, `Готово: новые накладные и УПД этого клиента — с основанием «${esc(basis)}».`);
+        return;
+      }
+      const r = scope === 'prev' ? periodOf('prev') : { from: '', to: '' };
+      const ids = bdb.applyBasis(user.id, cpId, basis, r.from, r.to);
+      await tg.sendMessage(chatId, `Основание «${esc(basis)}» поставлено у ${ids.length} ${plural(ids.length, 'документ', 'документа', 'документов')}. `
+        + 'Суммы, номера и долг не менялись.');
+      const docs = bdb.basisDocs(user.id, cpId, r.from, r.to);
+      if (docs.length) {
+        // Файлы с новым основанием — архивом, не заставляя бот ждать (как у обычного архива).
+        sendDocsZip(tg, chatId, user, docs, {
+          name: `Накладные_с_новым_основанием.zip`, what: 'Накладные и УПД с новым основанием',
+        }).catch((e) => {
+          office.record({ kind: 'crash', where: 'основание накладных', error: e.message, userId: user.id }).catch(() => {});
+          tg.sendMessage(chatId, 'Архив собрать не получилось. Файлы можно получить в Документы → Файлы архивом.').catch(() => {});
+        });
+      }
+      return;
+    }
+    if (data.startsWith('d.fix:')) { await fixDoc(tg, chatId, user, Number(data.slice(6))); return; }
+    if (data.startsWith('d.num:')) {
+      const d = bdb.getDoc(user.id, Number(data.slice(6)));
+      if (!d) return;
+      bdb.setState(user.id, `renum:${d.id}`, {});
+      await tg.sendMessage(chatId, `Новый номер для «${esc(bdb.docShort(d.type))} № ${esc(d.number)}»:`,
+        keyboard([[{ text: '✖️ Отмена', data: `doc:${d.id}` }]]));
+      return;
+    }
+  } catch (e) {
+    if (e && e.blocked) throw e; // разберётся handleUpdate
+    console.error('Ошибка обработки:', e.message);
+    office.record({ kind: 'crash', where: 'handleCallback', error: e.message, userId: user.id }).catch(() => {});
+    await tg.sendMessage(chatId,
+      '⚠️ Что-то пошло не так на этом шаге. Попробуйте ещё раз, а если повторится — '
+      + 'напишите в поддержку, я посмотрю.', mainMenu());
+  }
+}
+
+// ---------- запуск (long polling) ----------
+
+async function main() {
+  const token = process.env.BOT_TOKEN;
+  if (!token) { console.error('Не задан BOT_TOKEN. Запуск: BOT_TOKEN=xxxxx node bot.js'); process.exit(1); }
+  // Диагностика справочника — до обращения к Telegram: она про DaData,
+  // и не должна падать из-за токена бота.
+  if (process.argv.includes('--dadata')) {
+    const value = process.argv[process.argv.indexOf('--dadata') + 1] || '';
+    console.log(`Ключ DaData: ${process.env.DADATA_TOKEN
+      ? `задан, ${process.env.DADATA_TOKEN.length} символов, начинается на ${process.env.DADATA_TOKEN.slice(0, 6)}…`
+      : 'НЕ ЗАДАН — автозаполнение выключено, поля придётся вводить руками'}`);
+    if (!value) {
+      console.log('\nЧто проверить:  node bot.js --dadata 044525974   (БИК)');
+      console.log('                node bot.js --dadata 7707083893  (ИНН)');
+      return;
+    }
+    const digits = value.replace(/\D/g, '');
+    const isBik = digits.length === 9;
+    console.log(`Проверяю ${isBik ? 'БИК' : 'ИНН'} ${digits}…`);
+    const r = isBik ? await dadata.bankByBik(digits) : await dadata.partyByInn(digits);
+    if (r.ok) {
+      console.log('✅ Справочник ответил:');
+      for (const [k, v] of Object.entries(r.fields)) if (v) console.log(`   ${k}: ${v}`);
+    } else {
+      console.log(`❌ Не получилось: ${r.error}`);
+      console.log('\nЧастые причины:');
+      console.log('  • DADATA_TOKEN пуст или это «секретный ключ» вместо «API-ключа»');
+      console.log('  • в кабинете dadata.ru стоит ограничение по IP — добавьте адрес сервера');
+      console.log('  • закончился дневной лимит бесплатного тарифа');
+      console.log('  • сервер не выпускает наружу https — проверьте: curl -sI https://dadata.ru');
+    }
+    return;
+  }
+
+  const tg = new Telegram(token);
+  office.attach((chat, text) => tg.sendMessage(chat, text));
+
+  /*
+   * Кто мы. Пробуем несколько раз: у российского хостинга связь с
+   * api.telegram.org иногда моргает, и падать из-за этого при старте нельзя —
+   * systemd поднимет заново, но в журнал ляжет трассировка, а бот всё равно
+   * будет ждать сети. Лучше подождать сами и написать понятно.
+   *
+   * Попыток три, а не пять: с тех пор как lib/tg.js сам повторяет отказы на
+   * подключении, каждая попытка стоит до трёх обращений с паузами. Пять
+   * внешних заходов давали пятнадцать обращений и около трёх минут молчания
+   * вместо задуманных тридцати секунд — человек в это время видит службу,
+   * которая «висит», и не понимает, ждать ему или чинить.
+   */
+  let me = null;
+  for (let attempt = 1; attempt <= 3 && !me; attempt += 1) {
+    try {
+      me = await tg.call('getMe');                    // eslint-disable-line no-await-in-loop
+    } catch (e) {
+      if (attempt === 3) throw e;
+      console.error(`Telegram не отвечает (${e.message}), попытка ${attempt} из 3…`);
+      await new Promise((r) => setTimeout(r, attempt * 3000));   // eslint-disable-line no-await-in-loop
+    }
+  }
+
+  if (process.argv.includes('--check')) {
+    console.log(`Токен рабочий: @${me.username} (${me.first_name}), id ${me.id}`);
+    const hook = await tg.call('getWebhookInfo').catch(() => null);
+    if (hook && hook.url) {
+      console.log(`⚠️  У бота настроен вебхук ${hook.url} — long polling работать не будет.`);
+      console.log('   Снять: node bot.js --drop-webhook');
+    } else {
+      console.log('Вебхук не задан — long polling свободен.');
+    }
+    const cmds = await tg.call('getMyCommands').catch(() => []);
+    console.log(`Команд в меню: ${cmds.length}`);
+    return;
+  }
+
+  if (process.argv.includes('--drop-webhook')) {
+    await tg.call('deleteWebhook', { drop_pending_updates: false });
+    console.log('Вебхук снят, long polling свободен.');
+    return;
+  }
+
+  if (process.argv.includes('--setup')) {
+    console.log(`Оформляю @${me.username}:`);
+    await applySetup(tg);
+    return;
+  }
+
+  // Второй экземпляр на этой машине не запускаем: два читателя одного
+  // токена отбирают обновления друг у друга, и бот отвечает через раз.
+  const lock = acquireLock(`bot-${String(token).split(':')[0]}`);
+  if (!lock.ok) {
+    console.error(`Бот уже запущен на этой машине (процесс ${lock.pid}).`);
+    console.error('Два экземпляра на одном токене мешают друг другу: Telegram отдаёт');
+    console.error('входящие только одному, и сообщения будут теряться.');
+    console.error('');
+    console.error(`  что это за процесс:  ps -p ${lock.pid} -o pid,cmd`);
+    console.error('  остановить службу:   systemctl stop trapeza-bot');
+    console.error(`  снять замок вручную: rm ${lock.file}   (только если процесс мёртв)`);
+    process.exit(1);
+  }
+
+  console.log(`Бот запущен: @${me.username}`);
+  let offset = 0;
+  let conflicts = 0;
+  let quietUntil = 0;
+  let netFails = 0;
+  let netQuiet = 0;
+  /*
+   * Ежедневные дела делаем внутри того же цикла, а не отдельной службой:
+   * второй процесс с той же базой — это второй источник ошибок и ещё один
+   * unit, который надо не забыть перезапустить. Цикл и так просыпается не
+   * реже чем раз в полминуты, а метка дня не даёт повториться.
+   *
+   * Первое пробуждение после запуска пропускаем намеренно: перезапуск бота
+   * не должен превращаться в рассылку предложений.
+   */
+  let dailyDone = todayISO();
+  // Сводка — с 9 утра по Москве. Отметка «отправлено сегодня» у каждого
+  // человека лежит в базе, поэтому перезапуск днём сводку не повторит.
+  let digestDone = '';
+  let periodicAt = 0;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    if (dailyDone !== todayISO()) {
+      dailyDone = todayISO();
+      try { await runDaily(tg); } catch (e) { console.error('ежедневные дела:', e.message); }
+    }
+    // Короткие расписания — утром и не чаще раза в минуту: расписание, заведённое днём
+    // и не выписанное сегодня, должно прийти сразу, а не ждать завтрашнего утра.
+    if (Date.now() - periodicAt > 60000 && digest.isMorning()) {
+      periodicAt = Date.now();
+      try { await runPeriodic(tg); } catch (e) { console.error('расписания:', e.message); }
+    }
+    if (digestDone !== todayISO() && digest.isMorning()) {
+      digestDone = todayISO();
+      try {
+        const n = await digest.run(tg, keyboard);
+        if (n) console.log(`Утренняя сводка: отправлено — ${n}`);
+      } catch (e) { console.error('утренняя сводка:', e.message); }
+      try { await sendFollowups(tg); } catch (e) { console.error('напоминания по клиентам:', e.message); }
+    }
+    let updates = [];
+    try {
+      updates = await tg.getUpdates(offset, 30);
+      // Связь восстановилась — молчание про сбои снимаем, чтобы следующий
+      // обрыв был виден сразу, а не через минуту.
+      if (netFails) { console.log(`Связь с Telegram восстановлена (сбоев было ${netFails}).`); }
+      conflicts = 0; netFails = 0; netQuiet = 0;
+    } catch (e) {
+      // 409 — тот же токен читает кто-то ещё. Сыпать в лог по строке каждые
+      // три секунды бессмысленно и опасно: журнал вырастет на гигабайты и
+      // забьёт диск. Говорим один раз подробно, дальше — раз в минуту.
+      const clash = e.code === 409 || /Conflict/i.test(e.message || '');
+      if (clash) {
+        conflicts += 1;
+        if (Date.now() > quietUntil) {
+          console.error(`Тот же токен читает другой процесс (${conflicts} попыток подряд).`);
+          console.error('Скорее всего где-то запущена вторая копия бота — на этом сервере');
+          console.error('или на другом. Пока их две, сообщения будут теряться.');
+          quietUntil = Date.now() + 60000;
+        }
+        await new Promise((r) => setTimeout(r, 15000));
+        continue;
+      }
+      /*
+       * Обрыв связи. Та же беда, что с конфликтом: при долгом сбое строка
+       * каждые три секунды за ночь превращается в гигабайты и забивает диск,
+       * а полезного в ней ничего. Говорим раз в минуту и с числом попыток,
+       * между попытками ждём всё дольше — до полминуты.
+       */
+      netFails += 1;
+      if (Date.now() > netQuiet) {
+        console.error(`getUpdates: ${e.message} (сбоев подряд: ${netFails})`);
+        netQuiet = Date.now() + 60000;
+      }
+      await new Promise((r) => setTimeout(r, Math.min(3000 * netFails, 30000)));
+      continue;
+    }
+    for (const u of updates) {
+      offset = u.update_id + 1;
+      try { await handleUpdate(tg, u); } catch (e) {
+        // У «fetch failed» причина лежит в e.cause — без неё сообщение
+        // ничего не говорит: ни что оборвалось, ни где.
+        const why = e.cause ? ` (${e.cause.code || e.cause.message})` : '';
+        console.error('handleUpdate:', e.message + why);
+        office.record({ kind: 'crash', where: 'handleUpdate', error: e.message + why }).catch(() => {});
+      }
+    }
+  }
+}
+
+if (require.main === module) main();
+
+module.exports = {
+  looksLikeRequest,
+  handleUpdate, runDaily, runPeriodic, sendFollowups, parseOp, parseDate, parseItemLine, readItemLine, parseAmount, spellOutMagnitudes,
+};

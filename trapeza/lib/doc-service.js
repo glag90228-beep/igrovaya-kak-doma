@@ -1,0 +1,973 @@
+'use strict';
+
+/**
+ * Выпуск документов без Telegram.
+ *
+ * Раньше вся сборка жила внутри bot.js и была намертво сцеплена с отправкой
+ * в чат. Мини-приложению нужно то же самое, но результат — не сообщение, а
+ * файл в ответе HTTP. Копировать логику нельзя: два места разъедутся на
+ * первой же правке формы. Поэтому здесь общая часть — какие бывают
+ * документы, как собрать файл, как посчитать сумму, как записать в журнал, —
+ * а бот и мини-апп сверху лишь по-своему отдают готовое пользователю.
+ *
+ * Правила нумерации и лимитов те же, что были: номер сквозной по типу за год,
+ * бесплатных документов в месяц — сколько скажет quota().
+ */
+
+const bdb = require('./bot-db');
+const { withStamps } = require('./doc-html');
+const { round2, round3, round4, vatTotals } = require('./money');
+const facsimile = require('./facsimile');
+const { pdfAvailable, htmlToPdf } = require('./pdf');
+const { buildAktUslugHtml } = require('./akt-uslug');
+const { buildSchetHtml } = require('./schet');
+const { buildSchetDogovorHtml } = require('./schet-dogovor');
+const { buildPlatyozhkaHtml } = require('./platyozhka');
+const { buildUpdHtml } = require('./upd');
+const { buildTorg12Html } = require('./torg12');
+const { buildDogovorHtml } = require('./dogovor');
+const { buildAvansHtml } = require('./avans');
+const { buildKsfHtml } = require('./ksf');
+const { isNpd } = require('./npd');
+// Акт сверки — Excel, а не HTML: это журнал, его дополняют и считают в нём.
+const { buildAkt } = require('./xlsx-akt');
+// А для просмотра — печатная форма: таблицу браузер не показывает (см. ниже).
+const { buildAktHtml } = require('./akt-html');
+
+/** Документы, которые состоят из позиций «наименование × количество × цена». */
+const ITEM_DOCS = {
+  sch: { title: 'Счёт на оплату', build: buildSchetHtml, file: 'Счет' },
+  schdog: { title: 'Счёт-договор', build: buildSchetDogovorHtml, file: 'Счет-договор' },
+  usl: { title: 'Акт об оказании услуг', build: buildAktUslugHtml, file: 'Акт_услуг' },
+  upd: { title: 'УПД', build: buildUpdHtml, file: 'УПД' },
+  torg12: { title: 'Товарная накладная ТОРГ-12', build: buildTorg12Html, file: 'ТОРГ-12' },
+};
+
+/** Остальные: собираются из своих полей, а не из позиций. */
+const OTHER_DOCS = {
+  pp: { title: 'Платёжное поручение', build: buildPlatyozhkaHtml, file: 'Платежка' },
+  // Свой договор человека — тот же тип и тот же ряд номеров, что у типового:
+  // договор № 7 не должен оказаться и «своим», и «типовым» одновременно. В
+  // payload своего лежит его текст (body) — по нему и выбираем вёрстку, в
+  // том числе при пересборке копии через месяц.
+  dog: {
+    title: 'Договор',
+    build: (a) => (a.doc && a.doc.body ? require('./my-contract').buildHtml(a) : buildDogovorHtml(a)),
+    file: 'Договор',
+  },
+  // Счёт-фактура на предоплату: позиций нет, есть полученная сумма.
+  avans: { title: 'Счёт-фактура на аванс', build: buildAvansHtml, file: 'СФ_аванс' },
+  // Корректировочный: строки парные «было/стало», обычными позициями не лягут.
+  ksf: { title: 'Корректировочный счёт-фактура', build: buildKsfHtml, file: 'КСФ' },
+};
+
+const ALL_DOCS = { ...ITEM_DOCS, ...OTHER_DOCS };
+
+// «Сегодня» — по Москве, а не по поясу сервера (пояснение в lib/period.js).
+const { todayISO, isoDay } = require('./period');
+
+/** ДД.ММ.ГГГГ — так дата пишется во всех наших бланках. */
+const ruDate = (iso) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
+  return m ? `${m[3]}.${m[2]}.${m[1]}` : String(iso || '');
+};
+
+/** Имя файла: кириллицу оставляем, всё остальное — в подчёркивания. */
+const safeName = (s) => String(s)
+  .replace(/[«»"]/g, '')
+  .replace(/[^\wА-Яа-яЁё-]+/g, '_')
+  .replace(/^[_-]+|[_-]+$/g, '');
+
+/**
+ * HTML → файл. PDF, если поднимается Chromium; иначе тот же HTML —
+ * его можно открыть в браузере и распечатать. Молча ронять выпуск
+ * из-за неустановленного браузера нельзя: документ нужен человеку сейчас.
+ */
+async function renderFile(html, base) {
+  if (pdfAvailable()) {
+    try {
+      const buffer = await htmlToPdf(html);
+      return { filename: `${base}.pdf`, buffer, mime: 'application/pdf', pdf: true };
+    } catch (_) { /* падаем на HTML ниже */ }
+  }
+  return {
+    filename: `${base}.html`,
+    buffer: Buffer.from(html, 'utf8'),
+    mime: 'text/html; charset=utf-8',
+    pdf: false,
+  };
+}
+
+/**
+ * Сумма документа — единственный источник итога, руками её не передают.
+ *
+ * С НДС «сверху» сумма к оплате больше произведения количества на цену:
+ * 100 руб. + 20% это 120. Если считать без налога, в журнале и в подписи
+ * к файлу окажется заниженная сумма, а долг контрагента — неверный.
+ */
+function totalOf(items, extra = {}) {
+  const rate = extra.vatRate == null ? null : Number(extra.vatRate);
+  return vatTotals(items || [], rate, Boolean(extra.priceIncludesVat)).total;
+}
+
+/**
+ * Число из того, что прислали: «1,5», «1 500,25» и обычное 1.5 читаются одинаково.
+ *
+ * Приложение шлёт то, что человек набрал, и запятая там — норма. Number('1,5')
+ * даёт NaN, и позиция молча превращалась в «одну штуку».
+ * Пустое и не-число — NaN, чтобы вызывающий мог отличить «не указано».
+ */
+function parseNum(v) {
+  if (typeof v === 'number') return v;
+  if (v == null) return NaN;
+  const t = String(v).replace(/[\s\u00A0\u202F]/g, '').replace(',', '.');
+  return t === '' ? NaN : Number(t);
+}
+
+/** Потолок количества и цены: защита от переполнения, см. cleanItems. */
+const ITEM_MAX = 1e9;
+
+/** Длиннее название позиции не помещается в графу бланка; дальше его резали молча. */
+const NAME_MAX = 300;
+
+/**
+ * Потолок суммы документа — триллион рублей.
+ *
+ * Потолки количества и цены по миллиарду допускали произведение в 1e18, а
+ * сумма прописью от 1e15 выходила «Один рублей 00 копеек»: слов для триллионов
+ * и дальше в словаре нет. Триллион заведомо больше любой первички малого
+ * бизнеса и ещё читается словами верно.
+ */
+const DOC_MAX_TOTAL = 1e12;
+
+/** Отказ по слишком большой сумме — или '' если сумма в пределах. */
+function totalProblem(total) {
+  if (Number(total) <= DOC_MAX_TOTAL) return '';
+  return 'Сумма документа больше 1 000 000 000 000 ₽ — такой бланк не напечатать верно '
+    + '(сумма прописью не поместится). Проверьте количество и цену: возможно, лишний ноль.';
+}
+
+/**
+ * Что не так с присланными позициями — человеческим текстом, или '' если всё в порядке.
+ *
+ * Тихая подмена опаснее отказа. Количество «0», «−2» или «abc» раньше
+ * становилось единицей, и клиент получал документ на сумму, которой человек
+ * не называл. Не указанное вовсе количество по-прежнему считаем единицей
+ * (так заведено в «Услуге на 30 тысяч»), а указанное, но неверное — отказ.
+ * Цена не указана — ноль (бывают документы на ноль), указана и отрицательна
+ * или не число — отказ.
+ */
+function itemsProblem(raw) {
+  for (const it of Array.isArray(raw) ? raw.slice(0, 200) : []) {
+    const name = String((it && it.name) || '').trim();
+    if (!name) continue;
+    const label = name.length > 40 ? `${name.slice(0, 40)}…` : name;
+    /*
+     * Длинное название раньше молча обрезалось на 300-м знаке — прямо в
+     * юридическом документе, который уходит контрагенту. Человек не узнавал,
+     * что в бланке не всё, что он написал. Теперь отказ с цифрами: пусть
+     * сократит сам, чем получит обрезанное «Поставка продукции по догов».
+     */
+    if (name.length > NAME_MAX) {
+      return `Позиция «${label}»: название длиннее ${NAME_MAX} знаков (сейчас ${name.length}). `
+        + 'Сократите его — в бланк такое не помещается, и обрезать молча мы не будем.';
+    }
+    const q = it.qty;
+    if (q != null && String(q).trim() !== '') {
+      const qty = parseNum(q);
+      if (!Number.isFinite(qty) || qty <= 0 || round3(qty) <= 0) {
+        return `Позиция «${label}»: количество должно быть числом больше нуля (можно с запятой, до трёх знаков).`;
+      }
+    }
+    const p = it.price;
+    if (p != null && String(p).trim() !== '') {
+      const price = parseNum(p);
+      if (!Number.isFinite(price) || price < 0) {
+        return `Позиция «${label}»: цена должна быть числом, не меньше нуля.`;
+      }
+    }
+  }
+  return '';
+}
+
+/**
+ * Приводит присланные позиции к нашему виду и отбрасывает мусор.
+ * Данные приходят из браузера, поэтому доверять типам нельзя.
+ *
+ * Количество — до трёх знаков, цена — до четырёх (см. money.round3): суммы
+ * строк и итог округляются до копеек уже потом, при расчёте.
+ */
+function cleanItems(raw) {
+  const out = [];
+  for (const it of Array.isArray(raw) ? raw.slice(0, 200) : []) {
+    const name = String((it && it.name) || '').trim().slice(0, NAME_MAX);
+    if (!name) continue;
+    const qty = parseNum(it.qty);
+    const price = parseNum(it.price);
+    out.push({
+      name,
+      unit: String((it && it.unit) || 'шт.').trim().slice(0, 20) || 'шт.',
+      /*
+       * Потолок — не придирка, а защита от переполнения. Само по себе
+       * количество конечно, но произведение количества на цену считается
+       * дальше в double: два числа по 1e200 дают бесконечность, и документ
+       * с такой позицией останавливал весь процесс. Миллиард штук по
+       * миллиарду рублей — заведомо больше всего, что бывает в первичке,
+       * и произведение таких чисел double держит с запасом.
+       */
+      qty: Number.isFinite(qty) && qty > 0 ? Math.max(0.001, round3(Math.min(qty, ITEM_MAX))) : 1,
+      price: Number.isFinite(price) && price >= 0 ? round4(Math.min(price, ITEM_MAX)) : 0,
+    });
+  }
+  return out;
+}
+
+/**
+ * Дата документа: пусто — сегодня, настоящая дата — она, выдуманная — отказ.
+ *
+ * Одного шаблона ГГГГ-ММ-ДД мало: «2026-02-30» ему подходит, а в журнале и в
+ * нумерации по годам такая строка ломает отбор по периоду. Раньше её молча
+ * принимали, а любую непохожую строку молча заменяли сегодняшним днём — то
+ * есть документ с датой «вчера» выходил сегодняшним.
+ *
+ * @returns {{ok:true, date:string}|{ok:false, message:string}}
+ */
+function pickDate(date) {
+  if (date == null || String(date).trim() === '') return { ok: true, date: todayISO() };
+  const day = isoDay(String(date).trim());
+  if (day) return { ok: true, date: day };
+  const raw = String(date).trim().slice(0, 20);
+  return {
+    ok: false,
+    message: `Такой даты нет в календаре: ${raw}. Укажите существующую дату, например 2026-10-18.`,
+  };
+}
+
+/*
+ * Очередь выписки по ряду номеров (организация + вид документа).
+ *
+ * Номер берётся до сборки файла, а сборка идёт около секунды. Четыре выписки
+ * разом брали один и тот же номер, одна проходила, остальные три перебирали
+ * попытки по одной — и четвёртая падала на «UNIQUE constraint failed». Теперь
+ * выписки одного ряда идут друг за другом внутри процесса: каждая видит уже
+ * занятый номер предыдущей. От второго процесса (бот и приложение могут жить
+ * отдельно) по-прежнему защищает уникальный индекс и повтор с запасом попыток.
+ */
+const numberQueues = new Map();
+function inNumberQueue(key, job) {
+  const prev = numberQueues.get(key) || Promise.resolve();
+  const run = prev.then(job, job);
+  const tail = run.catch(() => {});
+  numberQueues.set(key, tail);
+  tail.then(() => { if (numberQueues.get(key) === tail) numberQueues.delete(key); });
+  return run;
+}
+
+/** Попыток взять номер, когда его перехватил другой процесс. */
+const SEQ_ATTEMPTS = 6;
+
+/** Ошибка выпуска с понятной человеку причиной. */
+function fail(reason, message) {
+  return { ok: false, reason, message };
+}
+
+/**
+ * Добавляет к организации подпись и печать для этого типа документа.
+ * Шаблоны про базу ничего не знают — получают готовые картинки в org.fx.
+ *
+ * Платёжка, договор и счета-фактуры сюда не попадают намеренно — что и
+ * почему, перечислено в NEVER и appliesTo в lib/facsimile.js. Сам документ
+ * передаём туда же: у УПД решение зависит от статуса, а он лежит в doc.
+ */
+function withFx(userId, org, docType, doc) {
+  return { ...org, fx: facsimile.forDocument(userId, docType, doc) };
+}
+
+/**
+ * Поля НДС документа: то, что назвали явно, иначе ставка организации.
+ *
+ * Вынесено из issueDocument, чтобы «сколько будет стоить документ» (см.
+ * plannedTotal) считалось ровно тем же правилом, что и сам выпуск: иначе
+ * предложение по расписанию обещает одну сумму, а выходит другая.
+ *
+ * Самозанятому ставка обнуляется: итог считается по ней, и долг вырастал бы
+ * на налог, которого он брать не вправе.
+ */
+function vatFieldsFor(org, type, extra = {}) {
+  let fields = extra || {};
+  if (['sch', 'schdog', 'torg12', 'upd', 'usl'].includes(type)
+      && !Object.prototype.hasOwnProperty.call(fields, 'vatRate')) {
+    const v = bdb.vatOf(org);
+    if (v.rate != null) fields = { ...fields, vatRate: v.rate, priceIncludesVat: v.gross };
+  }
+  if (isNpd(org)) fields = { ...fields, vatRate: null };
+  return fields;
+}
+
+/**
+ * Сумма, на которую выйдет документ, если выписать его сейчас: с НДС, как у
+ * будущего документа, а не «количество на цену».
+ *
+ * Для предложений по расписанию. Они показывали qty × price, а документ потом
+ * выходил на 122 000 при обещанных 100 000 — у плательщика НДС, где ставка
+ * берётся из настроек фирмы.
+ */
+function plannedTotal(userId, { type, items, extra = {} }) {
+  const org = bdb.currentOrg(userId);
+  return totalOf(cleanItems(items), org ? vatFieldsFor(org, type, extra) : extra);
+}
+
+/**
+ * Выпускает документ: собирает файл и кладёт запись в журнал.
+ *
+ * @returns {{ok:true, doc:object, file:object, total:number, title:string}
+ *          |{ok:false, reason:string, message:string, quota?:object}}
+ */
+async function issueDocument(userId, {
+  type, cpId, items, date, number, extra = {}, skipQuota = false, noDebt = false, replaceId = 0,
+}) {
+  const kind = ITEM_DOCS[type];
+  if (!kind) return fail('type', 'Такой документ выписать нельзя.');
+
+  const org = bdb.currentOrg(userId);
+  if (!org) return fail('org', 'Сначала заполните реквизиты своей организации.');
+
+  const cp = bdb.getCp(userId, Number(cpId));
+  if (!cp) return fail('cp', 'Такого клиента нет в вашем списке.');
+
+  const problem = itemsProblem(items);
+  if (problem) return fail('items', problem);
+  const clean = cleanItems(items);
+  if (!clean.length) return fail('items', 'Добавьте хотя бы одну позицию.');
+
+  /*
+   * УПД самозанятому не выписывается — ни из бота, ни из приложения.
+   *
+   * В боте кнопки УПД у него нет, но запрос можно прислать и мимо кнопки,
+   * а правило «статус всегда 2» ниже лишь прятало беду: УПД — документ тех,
+   * кто работает с НДС и счетами-фактурами, самозанятому он не нужен, а
+   * выписанный по ошибке уходил контрагенту под видом счёта-фактуры.
+   */
+  if (type === 'upd' && isNpd(org)) {
+    return fail('npd', 'Самозанятый не выставляет УПД: он нужен тем, кто работает с НДС. '
+      + 'Выпишите счёт, акт или товарную накладную.');
+  }
+
+  // Режим НДС организации применяем здесь, а не в боте: иначе мини-приложение
+  // выписывало бы счета всегда без налога, игнорируя настройку.
+  // Явно переданный vatRate (в том числе null — «этот счёт без НДС»)
+  // сильнее умолчания, поэтому проверяем наличие ключа, а не значение.
+  // Накладная сюда добавлена не сразу: она считала «без НДС» всегда, даже
+  // у плательщика, и печатала одинаковый итог в графах с налогом и без.
+  // УПД добавлен в этот список по той же причине, что накладная до него: без
+  // него мини-приложение выписывало его всегда без налога, хотя ставка у
+  // организации задана.
+  //
+  // Акт услуг — третий по тому же счёту, и он был хуже прочих. В боте `usl`
+  // в этом списке БЫЛ (bot.js, startItems), здесь его не было: один и тот же
+  // акт выходил из бота на 122 000, а из приложения на 100 000. Заказчик
+  // подписывал документ, заниженный ровно на налог, долг в журнале занижался
+  // тоже, а ставка undefined уезжала в payload — то есть «Повторить» и
+  // ежемесячное повторение этого акта оставались без налога навсегда.
+  let fields = vatFieldsFor(org, type, extra);
+
+  /*
+   * Статус УПД, когда его не назвали, выводим из режима НДС организации.
+   *
+   * lib/upd.js читает отсутствующий статус как двойку — «передаточный
+   * документ без счёта-фактуры», где ставка принудительно пустая. Из
+   * мини-приложения статус не передавался вовсе, и плательщик НДС получал
+   * бланк без шапки счёта-фактуры и с «без НДС» в налоговой графе, хотя
+   * плитка обещает «счёт-фактура и акт». Покупателю нечего было принять к
+   * вычету.
+   *
+   * Единица не годится всем подряд: у того, кто на упрощёнке, счёта-фактуры
+   * нет и быть не должно, и двойка для него верна. Поэтому решает режим
+   * налога, а не догадка.
+   *
+   * Самозанятый — исключение из этого правила, и цена ошибки здесь не
+   * бухгалтерская, а денежная. Плательщик НПД не может быть плательщиком НДС
+   * (ФЗ № 422-ФЗ, ч. 9 ст. 2), но экраны «Самозанятость» и «НДС» в настройках
+   * независимы: ничто не мешает включить НПД и следом выбрать ставку. Дальше
+   * правило «есть ставка → значит статус 1» молча выписывало ему счёт-фактуру
+   * с выделенным налогом, а по п. 5 ст. 173 НК неплательщик, выставивший
+   * такой счёт-фактуру, обязан уплатить весь этот НДС в бюджет и подать
+   * декларацию. Заказчик вычет всё равно не получит. То есть человек забирал
+   * себе налоговое обязательство на ровном месте, а программа, заведённая
+   * ровно для того, чтобы он не ошибся, не говорила ни слова.
+   *
+   * Поэтому у самозанятого статус всегда 2 — передаточный документ без
+   * счёта-фактуры, и вместе со статусом обнуляется ставка.
+   *
+   * Ставку раньше не трогали, считая, что противоречие в настройках — дело
+   * человека. Но итог документа считается по ней (totalOf), и долг у
+   * контрагента вырастал на налог, которого самозанятый брать не вправе:
+   * бланк показывал одно, долг — другое, и требовал он больше, чем должен.
+   * Ставка без права её выделять не значит ничего, поэтому её здесь и нет.
+   *
+   * УПД самозанятому теперь не выписывается вовсе (см. выше), и это правило
+   * осталось только страховкой.
+   */
+  /*
+   * Основание накладной и УПД: что вписал человек — его; не вписал — то, что
+   * запомнено за этим клиентом (после трёх одинаковых вводов подряд, см.
+   * bdb.learnBasis), а дальше, как раньше, договор из карточки.
+   */
+  const typedBasis = ['torg12', 'upd'].includes(type) ? String(fields.basis || '').trim() : '';
+  if (['torg12', 'upd'].includes(type) && !typedBasis) {
+    const known = bdb.basisFor(userId, cp.id, org.id);
+    if (known) fields = { ...fields, basis: known };
+  }
+
+  if (type === 'upd' && !Object.prototype.hasOwnProperty.call(fields, 'status')) {
+    const payer = bdb.vatOf(org).rate != null && !isNpd(org);
+    fields = { ...fields, status: payer ? 1 : 2 };
+  }
+  // И явно попрошенная единица самозанятому не достаётся: кнопка «Статус 1»
+  // в боте и поле status в приложении раньше проходили мимо правила выше.
+
+  /*
+   * Строка 5б: чем закрываем ранее полученный аванс.
+   *
+   * С 1 апреля 2026 года (постановление № 26 от 23.01.2026) отгрузочный
+   * счёт-фактура обязан ссылаться на авансовый, если отгрузка идёт в счёт
+   * предоплаты. Ссылку не выдумываем: берём номера и даты счетов-фактур на
+   * аванс, выписанных этому же контрагенту и ещё не закрытых. Их может быть
+   * несколько — тогда через «;», как требует форма.
+   *
+   * Явно переданный advDoc сильнее: человек мог указать, какой именно аванс
+   * закрывает эта отгрузка, и наша догадка не должна его перебивать.
+   */
+  if (type === 'upd' && Number(fields.status) === 1
+      && !Object.prototype.hasOwnProperty.call(fields, 'advDoc')) {
+    const open = bdb.openAdvances(userId, Number(cpId));
+    if (open.length) {
+      fields = { ...fields, advDoc: open.map((a) => `№ ${a.number} от ${ruDate(a.date)}`).join('; ') };
+    }
+  }
+
+  const quota = bdb.quota(userId);
+  if (!skipQuota && !quota.allowed) {
+    return { ...fail('quota', `Бесплатные документы на этот месяц закончились (${quota.limit}).`), quota };
+  }
+
+  const picked = pickDate(date);
+  if (!picked.ok) return fail('date', picked.message);
+  const when = picked.date;
+  const year = Number(when.slice(0, 4));
+  const total = totalOf(clean, fields);
+  const tooBig = totalProblem(total);
+  if (tooBig) return fail('total', tooBig);
+
+  /*
+   * Заданный руками номер проверяем на занятость.
+   *
+   * Уникальный индекс защищает порядковый номер, но не сам номер: его можно
+   * ввести своей рукой, и он строка. Отсюда выходило так: первый счёт с
+   * номером «3» руками, второй и третий — сами, и третий получал тот же
+   * номер 3. Два счёта с одним номером за год — вопрос от бухгалтера
+   * контрагента и повод для спора, а ряд при этом ещё и ломался: второй
+   * документ оказывался с меньшим номером, чем первый.
+   *
+   * Отказываем до сборки файла, чтобы человек не получил PDF, которого нет
+   * в журнале.
+   */
+  const wanted = number == null || number === '' ? '' : String(number).slice(0, 40);
+  if (wanted && bdb.numberTakenInOrg(org.id, type, year, wanted, replaceId)) {
+    return fail('number', `${kind.title} № ${wanted} за ${year} год уже выписан. Укажите другой номер.`);
+  }
+
+  /*
+   * Номер берётся до сборки файла — он в нём напечатан, — а сборка PDF идёт
+   * около секунды. За это время тот же номер может занять другой документ:
+   * из мини-приложения, со второго нажатия, из повторной попытки. База такую
+   * запись не пропустит, и тогда мы берём следующий номер и пересобираем
+   * файл. Три попытки: больше одновременных выписок у одного человека не
+   * бывает, а бесконечный цикл в проде хуже отказа.
+   */
+  let num; let file; let id;
+  await inNumberQueue(`${org.id}:${type}:${year}`, async () => {
+    for (let attempt = 0; ; attempt += 1) {
+      let seq = bdb.nextSeqForOrg(org.id, type, year);
+      /*
+       * Порядковый номер и номер документа — разные вещи, и совпадают они лишь
+       * пока никто не вводил номер руками. Стоит человеку выписать счёт № 3
+       * своей рукой, и присвоенная тройка через две выписки столкнётся с ним:
+       * порядковый свободен, а номер занят. Сдвигаемся до свободного — ряд от
+       * этого прерывается, но два документа с одним номером хуже пропуска.
+       */
+      if (!wanted) {
+        while (bdb.numberTakenInOrg(org.id, type, year, String(seq))) seq += 1;
+      }
+      num = String(wanted || seq).slice(0, 40);
+      const doc = { number: num, date: when, items: clean, ...fields };
+      // eslint-disable-next-line no-await-in-loop
+      file = await renderFile(
+        kind.build({ org: withFx(userId, org, type, doc), cp, doc }),
+        `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
+      );
+      try {
+        id = bdb.saveDoc(userId, {
+          orgId: org.id, cpId: cp.id, type, number: num, seq, date: when, total,
+          payload: { items: clean, ...fields },
+        });
+        break;
+      } catch (e) {
+        if (!bdb.isSeqTaken(e) || attempt >= SEQ_ATTEMPTS - 1) throw e;
+      }
+    }
+  });
+
+  bdb.rememberItems(userId, clean);
+  bdb.unhideItems(userId, cp.id, clean);
+  // Исправление документа основание не «вводит»: оно уже было в прежнем. Повтор и
+  // расписание несут его из старого документа, а «три раза» они не должны ни копить,
+  // ни перебивать выбор человека, поэтому учёт идёт только по документам новее его выбора.
+  const basisLearned = typedBasis && !replaceId && bdb.learnBasis(userId, cp.id, typedBasis, 0, org.id) ? typedBasis : '';
+
+  // Долг в журнал — если этот тип документа его создаёт при выбранном
+  // основании. Проводка привязана к документу: её видно, можно отменить,
+  // и повторный выпуск того же документа её не задвоит.
+  // noDebt — закрывающий акт за месяц: сумма уже в долге через накладные,
+  // и второй «Реализацией» она бы удвоилась. Флаг ставим ДО проводки и ДО
+  // пересчёта, иначе rebuildDebt заведёт её сам.
+  if (noDebt) bdb.setNoDebt(userId, id);
+  const debt = !noDebt && bdb.makesDebt(org, type) && total > 0
+    ? Boolean(bdb.addOpForDoc(userId, cp.id, {
+      date: when, kind: 'Реализация', doc: `${kind.title} № ${num}`, credit: total,
+    }, id))
+    : false;
+  // Клиент на предоплате: пока остаток её покрывает, документ сразу оплачен.
+  const prepaid = debt ? bdb.settleFromPrepay(userId, id) : false;
+  const prepay = bdb.prepayState(userId, cp.id, org.id);
+
+  return {
+    ok: true,
+    total,
+    debt,
+    prepaid,
+    prepay,
+    basis: bdb.basisOf(org),
+    title: kind.title,
+    file,
+    basisLearned,
+    doc: {
+      id, type, number: num, date: when, total, title: kind.title,
+      cp: { id: cp.id, name: cp.name },
+    },
+    quota: bdb.quota(userId),
+  };
+}
+
+/**
+ * Какие штампы поставить на копию — с проверкой по базе.
+ *
+ * «Оплачено» ставится только тогда, когда оплата действительно отмечена.
+ * Это не придирка: документ со штампом уходит контрагенту и в банк, и
+ * галочка в интерфейсе не должна уметь напечатать на бумаге то, чего в
+ * учёте нет. Дата берётся из базы по той же причине.
+ *
+ * @param {object} saved строка документа из журнала
+ * @param {{paid?:boolean, copy?:boolean}} want что попросили
+ */
+/**
+ * Выпуск документа, у которого нет позиций: счёт-фактура на аванс и
+ * корректировочный.
+ *
+ * Отдельно от issueDocument, потому что у тех вся суть в позициях —
+ * количество на цену, потолки, шаблоны, память о введённом. Здесь этого нет:
+ * у аванса одна полученная сумма, у корректировочного — парные строки
+ * «было/стало», которые обычным списком позиций не лягут. Общими остаются
+ * нумерация, квота и запись в журнал, и их мы честно повторяем, а не обходим:
+ * два счёта-фактуры с одним номером за год — спор с контрагентом.
+ *
+ * Долг эти документы не создают. Аванс — деньги уже пришли, и приход по нему
+ * заводит платёж, а не счёт-фактура. Корректировочный меняет сумму прежней
+ * отгрузки, и трогать журнал за неё он не вправе.
+ *
+ * @returns {{ok:true, doc, file, total, title}|{ok:false, reason, message}}
+ */
+async function issueFlat(userId, {
+  type, cpId, date, number, payload = {}, total = 0, skipQuota = false,
+}) {
+  const kind = OTHER_DOCS[type];
+  if (!kind || !['avans', 'ksf'].includes(type)) {
+    return fail('type', 'Такой документ выписать нельзя.');
+  }
+  const org = bdb.currentOrg(userId);
+  if (!org) return fail('org', 'Сначала заполните реквизиты своей организации.');
+  const cp = bdb.getCp(userId, Number(cpId));
+  if (!cp) return fail('cp', 'Такого клиента нет в вашем списке.');
+
+  /*
+   * Счёт-фактуру не выписывает тот, кто не плательщик НДС.
+   *
+   * У самозанятого это прямо запрещено (422-ФЗ), и последствие описано выше
+   * у статуса УПД: выставил с выделенным налогом — обязан уплатить его в
+   * бюджет. У остальных без ставки счёт-фактура бессмыслен: нечего в него
+   * писать.
+   */
+  if (isNpd(org)) {
+    return fail('npd', 'Самозанятый не может выставлять счета-фактуры: он не плательщик НДС.');
+  }
+  if (payload.vatRate == null) {
+    return fail('vat', 'Счёт-фактура выставляется со ставкой НДС. Выберите её в разделе «НДС».');
+  }
+  /*
+   * У авансового счёта-фактуры строка 5 обязательна.
+   *
+   * Документ выставляется именно на ПОЛУЧЕННЫЕ деньги, и без ссылки на
+   * платёжку налоговая не свяжет его с поступлением (п. 5.1 ст. 169 НК).
+   * Раньше на её месте печатался прочерк — то есть выходил заведомо
+   * дефектный счёт-фактура, по которому покупателю откажут в вычете, а
+   * узнал бы он об этом уже от своей инспекции.
+   */
+  if (type === 'avans' && !String(payload.payDoc || '').trim()) {
+    return fail('payDoc', 'Нужен номер и дата платёжного поручения: без них авансовый '
+      + 'счёт-фактура недействителен, и покупатель не примет налог к вычету.');
+  }
+
+  const quota = bdb.quota(userId);
+  if (!skipQuota && !quota.allowed) {
+    return { ...fail('quota', `Бесплатные документы на этот месяц закончились (${quota.limit}).`), quota };
+  }
+
+  const picked = pickDate(date);
+  if (!picked.ok) return fail('date', picked.message);
+  const when = picked.date;
+  const year = Number(when.slice(0, 4));
+  const wanted = number == null || number === '' ? '' : String(number).slice(0, 40);
+  if (wanted && bdb.numberTakenInOrg(org.id, type, year, wanted)) {
+    return fail('number', `${kind.title} № ${wanted} за ${year} год уже выписан. Укажите другой номер.`);
+  }
+
+  const { file, id } = await saveNumbered(userId, {
+    org, cp, kind, type, when, wanted, payload, total: round2(total),
+  });
+  return {
+    ok: true, total: round2(total), title: kind.title, file,
+    doc: bdb.getDoc(userId, id),
+  };
+}
+
+/**
+ * Номер, файл и запись в журнал для документа без позиций.
+ *
+ * Тот же цикл, что в issueDocument, и по тем же причинам: номер печатается
+ * в файле, файл собирается около секунды, и за это время номер может занять
+ * другой документ. База повтор не пропустит — берём следующий и
+ * пересобираем. Номер, заданный руками, к этому моменту уже проверен.
+ */
+async function saveNumbered(userId, { org, cp, kind, type, when, wanted, payload, total }) {
+  const year = Number(when.slice(0, 4));
+  return inNumberQueue(`${org.id}:${type}:${year}`, async () => {
+    for (let attempt = 0; ; attempt += 1) {
+      let seq = bdb.nextSeqForOrg(org.id, type, year);
+      if (!wanted) {
+        while (bdb.numberTakenInOrg(org.id, type, year, String(seq))) seq += 1;
+      }
+      const num = String(wanted || seq).slice(0, 40);
+      const doc = { number: num, date: when, ...payload };
+      // eslint-disable-next-line no-await-in-loop
+      const file = await renderFile(
+        kind.build({ org: withFx(userId, org, type, doc), cp, doc }),
+        `${kind.file}_${safeName(num)}_${safeName(cp.name)}`,
+      );
+      try {
+        const id = bdb.saveDoc(userId, {
+          orgId: org.id, cpId: cp.id, type, number: num, seq, date: when, total, payload,
+        });
+        return { num, file, id };
+      } catch (e) {
+        if (!bdb.isSeqTaken(e) || attempt >= SEQ_ATTEMPTS - 1) throw e;
+      }
+    }
+  });
+}
+
+/**
+ * Платёжка и договор — из бота и из приложения одним путём.
+ *
+ * Раньше у каждого был свой, и оба мимо общей нумерации. Бот брал номер в
+ * начале диалога, до трёх вопросов: выпиши за это время документ того же
+ * вида из приложения — запись падала на уникальном номере, когда PDF уже
+ * ушёл человеку, и в журнале его не оказывалось. Приложение не проверяло
+ * номер, введённый руками, и не округляло сумму до копеек.
+ *
+ * @param {object} p
+ * @param {'pp'|'dog'} p.type
+ * @param {object} p.fields pp: {amount, purpose}; dog: {subject, price, term}
+ * @returns {Promise<{ok:true, doc, file, total, title}|{ok:false, reason, message}>}
+ */
+async function issuePlain(userId, {
+  type, cpId, date, number, fields = {}, skipQuota = false,
+}) {
+  const kind = OTHER_DOCS[type];
+  if (!kind || !['pp', 'dog'].includes(type)) return fail('type', 'Такой документ выписать нельзя.');
+  const org = bdb.currentOrg(userId);
+  if (!org) return fail('org', 'Сначала заполните реквизиты своей организации.');
+  const cp = bdb.getCp(userId, Number(cpId));
+  if (!cp) return fail('cp', 'Такого клиента нет в вашем списке.');
+
+  let payload;
+  if (type === 'pp') {
+    payload = { amount: round2(Math.abs(Number(fields.amount) || 0)), purpose: String(fields.purpose || '').trim().slice(0, 400) };
+  } else if (fields.tplId) {
+    /*
+     * Договор по своему шаблону. Текст шаблона копируем в документ: шаблон
+     * могут заменить завтра, а этот договор уже подписан именно таким.
+     * Значения — только по полям шаблона и с потолком длины.
+     */
+    const tpl = require('./my-contract').getTemplateById(userId, fields.tplId);
+    if (!tpl) return fail('tpl', 'Шаблон договора не найден — загрузите его заново.');
+    const values = {};
+    for (const f of tpl.fields || []) {
+      const v = (fields.values || {})[f.key];
+      if (v == null || String(v).trim() === '') continue;
+      values[f.key] = f.type === 'money'
+        ? round2(Math.abs(Number(String(v).replace(/\s/g, '').replace(',', '.')) || 0))
+        : String(v).trim().slice(0, 500);
+    }
+    payload = {
+      tplId: tpl.id, title: tpl.title, usRole: tpl.usRole, themRole: tpl.themRole, body: tpl.body, values,
+      subject: String(values.subject || tpl.title).slice(0, 500),
+      price: round2(Number(values.price) || 0),
+    };
+  } else {
+    payload = {
+      subject: String(fields.subject || '').trim().slice(0, 500),
+      price: round2(Math.abs(Number(fields.price) || 0)),
+      term: String(fields.term || '').trim().slice(0, 60),
+    };
+  }
+  if (type === 'pp' && !payload.amount) return fail('amount', 'Укажите сумму платежа.');
+  if (type === 'pp' && !payload.purpose) return fail('purpose', 'Укажите назначение платежа.');
+  if (type === 'dog' && !payload.subject) return fail('subject', 'Укажите предмет договора.');
+
+  const quota = bdb.quota(userId);
+  if (!skipQuota && !quota.allowed) {
+    return { ...fail('quota', `Бесплатные документы на этот месяц закончились (${quota.limit}).`), quota };
+  }
+
+  const picked = pickDate(date);
+  if (!picked.ok) return fail('date', picked.message);
+  const when = picked.date;
+  const year = Number(when.slice(0, 4));
+  const wanted = number == null || number === '' ? '' : String(number).slice(0, 40);
+  if (wanted && bdb.numberTakenInOrg(org.id, type, year, wanted)) {
+    return fail('number', `${kind.title} № ${wanted} за ${year} год уже выписан. Укажите другой номер.`);
+  }
+
+  const total = type === 'pp' ? payload.amount : payload.price;
+  const { file, id } = await saveNumbered(userId, {
+    org, cp, kind, type, when, wanted, payload, total,
+  });
+  return {
+    ok: true, total, title: kind.title, file,
+    doc: { ...bdb.getDoc(userId, id), cp: { id: cp.id, name: cp.name } },
+  };
+}
+
+function stampFor(saved, want) {
+  if (!want) return null;
+  const paid = Boolean(want.paid) && Boolean(saved.paid_at);
+  const copy = Boolean(want.copy);
+  return paid || copy ? { paid, copy, paidAt: saved.paid_at || '' } : null;
+}
+
+/**
+ * Пересобирает ранее выписанный документ по сохранённым данным.
+ * Журнал хранит не файл, а поля — поэтому копия всегда свежая
+ * и не занимает места, а номер и дата остаются прежними.
+ *
+ * @param {object} [opts] opts.stamp — {paid, copy}, см. stampFor;
+ *        opts.forView — собрать для просмотра в браузере, а не для работы
+ */
+async function rebuildDocument(userId, docId, opts = {}) {
+  const saved = bdb.getDoc(userId, Number(docId));
+  if (!saved) return fail('notfound', 'Документ не найден.');
+
+  const org0 = bdb.getOrg(userId, saved.org_id) || bdb.currentOrg(userId);
+  const cp0 = bdb.getCp(userId, saved.cp_id);
+  if (!org0 || !cp0) return fail('data', 'Не хватает данных для сборки: проверьте организацию и клиента.');
+
+  /*
+   * Акт сверки собирается иначе всех остальных: не из позиций документа, а
+   * из журнала операций за период. Позиций у него нет и не было, поэтому он
+   * долго не умел пересобираться — а значит, и уходить почтой, хотя именно
+   * его чаще всего и отправляют: сверка нужна не себе, а контрагенту.
+   *
+   * Период берём тот, за который акт выписывали (он записан в payload).
+   * Пересчёт по свежему журналу — намеренно: если после выписки внесли
+   * оплату, контрагент должен увидеть её, а не устаревшую бумагу.
+   */
+  if (saved.type === 'akt') {
+    // Журнал — той фирмы, что в шапке акта (org0), а не текущей.
+    const p = bdb.cpForPeriod(userId, saved.cp_id, saved.payload.from || '', saved.payload.to || '', org0.id);
+    if (!p) return fail('data', 'Не удалось собрать акт: проверьте клиента.');
+    const forAkt = {
+      org: {
+        brand: org0.name, org_short: org0.name, org_full: org0.full_name || org0.name,
+        org_inn: org0.inn, inn: org0.inn, signer: org0.signer,
+      },
+      cp: p.view,
+      ops: p.ops,
+    };
+    const head = {
+      ok: true,
+      title: 'Акт сверки',
+      doc: saved,
+      total: Math.abs(p.closing),
+      period: { from: p.from, to: p.to },
+    };
+
+    /*
+     * Два вида одного акта, и выбор между ними — не про красоту.
+     *
+     * Таблицу браузер не открывает: по ссылке контрагент вместо документа
+     * получал окно «Загрузить файл?» от незнакомого сайта. Поэтому для
+     * просмотра собираем печатную форму, а таблица остаётся там, где она и
+     * нужна, — файлом в чат и почтой тому, кто будет считать.
+     */
+    if (opts.forView) {
+      const file = await renderFile(buildAktHtml(forAkt), `Акт_сверки_${safeName(cp0.name)}`);
+      return { ...head, file };
+    }
+
+    return {
+      ...head,
+      file: {
+        filename: `Акт_сверки_${safeName(cp0.name)}.xlsx`,
+        buffer: Buffer.from(await buildAkt(forAkt)),
+        mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        pdf: false,
+      },
+    };
+  }
+
+  const kind = ALL_DOCS[saved.type];
+  if (!kind) return fail('type', 'Этот документ пересобрать нельзя.');
+
+  const org = org0;
+  const cp = cp0;
+
+  /*
+   * opts.extra — то, что добавляется к сохранённому документу при пересборке.
+   *
+   * Нужен ровно для исправления счёта-фактуры: номер и дата остаются
+   * прежними, а к ним добавляется пометка «ИСПРАВЛЕНИЕ № N». Пометку
+   * сохраняем обратно в payload, иначе следующее исправление снова окажется
+   * первым, а сам документ забудет, что был исправлен.
+   */
+  const doc = { number: saved.number, date: saved.date, ...saved.payload, ...(opts.extra || {}) };
+  if (opts.extra && Object.keys(opts.extra).length) {
+    bdb.updateDocPayload(userId, saved.id, { ...saved.payload, ...opts.extra });
+  }
+  const stamp = stampFor(saved, opts.stamp);
+  const file = await renderFile(
+    withStamps(kind.build({ org: withFx(userId, org, saved.type, doc), cp, doc }), stamp),
+    `${kind.file}_${safeName(saved.number)}_${safeName(cp.name)}`,
+  );
+  return {
+    ok: true, file, stamp, title: saved.title || kind.title, doc: saved, total: saved.total,
+  };
+}
+
+/**
+ * Что из старого документа можно взять в новый — при повторе и при
+ * ежемесячном повторении.
+ *
+ * Раньше в оба места payload уезжал целиком, минус позиции. Настройки так и
+ * надо переносить: ставка НДС, статус УПД, договор — человек их уже задал.
+ * Но два поля описывают одно-единственное событие и в новом документе
+ * означают неправду:
+ *
+ *   fix    — отметка «Исправление № N от такого-то числа». Повтор родился бы
+ *            уже исправлением документа, к которому не имеет отношения.
+ *   advDoc — строка 5б УПД, ссылка на счёт-фактуру по авансу, который эта
+ *            отгрузка закрывает. Она уходит в книгу продаж (графа 11а), и
+ *            повтор закрывал бы тот же аванс второй раз: у покупателя стоит
+ *            один вычет, а у продавца две записи, и АСК НДС-2 сводит их в
+ *            расхождение. Убираем — и doc-service подставит ссылку заново,
+ *            по тем авансам, что открыты на самом деле.
+ *
+ * @param {object} payload сохранённый payload документа
+ * @returns {{items:Array, extra:object}}
+ */
+function reusablePayload(payload) {
+  const { items = [], fix, advDoc, ...extra } = payload || {};
+  return { items, extra };
+}
+
+/**
+ * Исправить выписанный документ, не меняя его номера.
+ *
+ * Ошибся в накладной (не то число обедов) — раньше выход был один: удалить и
+ * выписать заново, и новая выходила следующим номером, 22 вместо 7. Здесь
+ * новый документ выписывается с номером прежнего, и только когда он
+ * получился, прежний убирается — сорвись сборка, старый останется на месте.
+ * Лимит не тратится, порядковый номер и время выписки — прежние.
+ */
+async function replaceDocument(userId, oldId, { items, date, number, extra = {} }) {
+  const old = bdb.getDoc(userId, Number(oldId));
+  if (!old) return fail('notfound', 'Документ не найден.');
+  if (!ITEM_DOCS[old.type]) return fail('type', 'Этот документ так не исправить.');
+  const cur = bdb.currentOrgId(userId);
+  if (Number(old.org_id) && Number(old.org_id) !== Number(cur)) {
+    return fail('org', 'Документ выписан от другой вашей организации — переключитесь на неё и исправьте там.');
+  }
+  const res = await issueDocument(userId, {
+    type: old.type, cpId: old.cp_id, items, date: date || old.date,
+    number: number || old.number, extra, skipQuota: true, replaceId: old.id,
+  });
+  if (!res.ok) return res;
+  bdb.deleteDoc(userId, old.id, { keepQuota: true });
+  bdb.takePlaceOf(userId, res.doc.id, old);
+  return { ...res, replaced: { id: old.id, number: old.number, wasPaid: Boolean(old.paid_at) } };
+}
+
+/** Потолок файлов в одном архиве: каждый — это отрисованный PDF. */
+const ZIP_MAX = 80;
+
+/**
+ * Файлы выписанных документов — одним ZIP, собранные заново из журнала.
+ * Общая для бота и приложения: новых документов не появляется, лимит не тратится.
+ * @returns {Promise<{buffer:Buffer, count:number, sum:number, failed:string[], cut:boolean}|null>}
+ *   null — ни один файл не собрался
+ */
+async function zipDocs(userId, docs, max = ZIP_MAX) {
+  const take = docs.slice(0, max);
+  const files = {};
+  const failed = [];
+  for (const d of take) {
+    const res = await rebuildDocument(userId, d.id).catch(() => null);
+    if (!res || !res.ok || !res.file) { failed.push(`№ ${d.number}`); continue; }
+    // Одинаковые имена у двух документов одному клиенту — архив не должен их склеить.
+    let name = res.file.filename;
+    for (let i = 2; files[name]; i += 1) name = res.file.filename.replace(/(\.\w+)$/, `_${i}$1`);
+    files[name] = res.file.buffer;
+  }
+  const count = Object.keys(files).length;
+  if (!count) return null;
+  return {
+    buffer: require('./zip').makeZip(files),
+    count,
+    sum: Math.round(take.reduce((a, d) => a + (Number(d.total) || 0), 0) * 100) / 100,
+    failed,
+    cut: docs.length > take.length,
+  };
+}
+
+/** Сменить номер выписанного документа и собрать файл заново — уже с новым номером. */
+async function renumberDocument(userId, id, number) {
+  const r = bdb.renumberDoc(userId, Number(id), number);
+  if (!r.ok) return fail('number', r.error);
+  const res = await rebuildDocument(userId, Number(id));
+  return res.ok ? { ...res, old: r.old } : res;
+}
+
+module.exports = {
+  ITEM_DOCS, OTHER_DOCS, ALL_DOCS,
+  issueDocument, issueFlat, issuePlain, rebuildDocument, renderFile, stampFor, replaceDocument, renumberDocument, zipDocs, ZIP_MAX,
+  totalOf, plannedTotal, vatFieldsFor, cleanItems, itemsProblem, pickDate, safeName, todayISO, reusablePayload,
+};

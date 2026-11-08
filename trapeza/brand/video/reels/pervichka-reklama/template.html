@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="UTF-8" /><meta name="viewport" content="width=1080, height=1920" />
+<title>Первичка — реклама</title>
+<script src="gsap.min.js"></script>
+<style>
+@font-face{font-family:Unb;font-weight:200 900;src:url(unbounded-cyrillic-wght-normal.woff2) format('woff2');unicode-range:U+0400-045F,U+2116,U+00AB,U+00BB,U+2014}
+@font-face{font-family:Unb;font-weight:200 900;src:url(unbounded-latin-wght-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+20BD,U+2212}
+@font-face{font-family:Man;font-weight:200 800;src:url(manrope-cyrillic-wght-normal.woff2) format('woff2');unicode-range:U+0400-045F,U+2116,U+00AB,U+00BB}
+@font-face{font-family:Man;font-weight:200 800;src:url(manrope-latin-wght-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+20BD,U+2212}
+html,body{margin:0;background:#F4F7FC}
+#root{position:relative;width:1080px;height:1920px;overflow:hidden;font-family:Unb,Man,sans-serif;color:#0A1230;background:#F4F7FC}
+.clip{position:absolute;inset:0}
+.scn{position:absolute;inset:0;opacity:0;overflow:hidden;background:#F4F7FC}
+.bl{position:absolute;border-radius:50%;filter:blur(110px);opacity:.75}
+.hl{position:absolute;left:0;right:0;text-align:center;font-weight:800;text-transform:uppercase;line-height:1.08;letter-spacing:-.01em}
+.hl span{display:inline-block;opacity:0;margin:0 .1em}
+.chip{position:absolute;left:50%;top:150px;transform:translateX(-50%);height:84px;border-radius:42px;background:#fff;box-shadow:0 14px 40px rgba(30,50,110,.16);display:flex;align-items:center;gap:16px;padding:0 34px 0 12px;font:800 34px Man;white-space:nowrap;color:#0A1230;opacity:0}
+.chip .av{width:60px;height:60px;border-radius:50%;background:#E3E9FA url(hero2.png) no-repeat;background-size:136px auto;background-position:-32px -39px}
+.card{position:absolute;box-sizing:border-box;border-radius:40px;background:#fff;box-shadow:0 24px 60px rgba(30,50,110,.14)}
+.st{position:absolute}
+.phone{position:absolute;box-sizing:border-box;border:10px solid #0A1230;background:#0A1230;overflow:hidden;box-shadow:0 40px 90px rgba(30,50,110,.35),0 0 0 2px #2A3560}
+.phone>img{display:block;width:100%;height:100%}
+.msg{position:absolute;opacity:0;border-radius:26px;font:600 25px/1.3 Man;padding:16px 20px;box-sizing:border-box;color:#0A1230}
+.me{right:20px;background:#EFFDDE;border-bottom-right-radius:8px;width:380px}
+.bot{left:20px;background:#fff;border-bottom-left-radius:8px;width:420px;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+.wv{display:inline-block;width:6px;border-radius:3px;background:#4FAE4E;margin-right:4px;vertical-align:middle}
+.pdf{margin-top:12px;display:flex;gap:12px;align-items:center;background:#F1F4FA;border-radius:16px;padding:10px 12px}
+.pdf i{width:52px;height:62px;border-radius:10px;background:#E5484D;color:#fff;font:800 18px/62px Unb;text-align:center;font-style:normal}
+.pdf b{font:700 22px Man;display:block}.pdf em{font:500 19px Man;color:#6B7A99;font-style:normal}
+.btn{margin-top:10px;border-radius:14px;background:#E8F0FF;text-align:center;font:700 23px Man;padding:11px 0;color:#2E5BD9}
+.ex{position:absolute;padding:6px 16px;border-radius:10px;background:#FFE9A8;color:#6B4E00;font:800 22px Man;letter-spacing:.08em;z-index:5;opacity:0}
+.cap{position:absolute;left:60px;right:60px;top:1690px;text-align:center;font:800 48px/1.2 Man;opacity:0;z-index:60}
+.cap i{font-style:normal;display:inline-block;margin:0 .1em;color:rgba(10,18,48,.28)}
+.pz{position:absolute;left:0;bottom:0;height:100%;opacity:0;transform:translateX(-50%)}
+.pz img{height:100%;width:auto;display:block}
+.mo{position:absolute;border-radius:50%;background:#0B1550;transform:translate(-50%,-50%) scaleY(.1);box-shadow:inset 0 -.3em 0 rgba(255,110,140,.55)}
+#hero{position:absolute;width:0;z-index:50}
+#caps{position:absolute;inset:0;z-index:70}
+</style></head><body>
+<div id="root" data-composition-id="pervichka-reklama" data-width="1080" data-height="1920" data-duration="__T__">
+  <section id="main" class="clip" data-start="0" data-duration="__T__" data-track-index="1"><div id="stage" class="clip"></div></section>
+  <section id="heroc" class="clip" data-start="0" data-duration="__T__" data-track-index="3" style="z-index:50"><div id="hero"></div></section>
+  <section id="ui" class="clip" data-start="0" data-duration="__T__" data-track-index="4" style="z-index:70"><div id="caps"></div></section>
+  <audio id="sfx" src="audio.wav" data-start="0" data-duration="__T__" data-track-index="32"></audio>
+</div>
+<script>
+const D = __DATA__, T = D.T, BEAT = 60 / D.bpm;
+const tl = gsap.timeline({ paused: true });
+window.__timelines = window.__timelines || {}; window.__timelines['pervichka-reklama'] = tl;
+// всё, что появляется позже, прячем с нуля: fromTo без этого оставляет элемент видимым до начала твина
+const _fromTo = tl.fromTo.bind(tl);
+tl.fromTo = (t, f, to, pos) => { if (typeof t !== 'string' && f && (f.autoAlpha === 0 || f.opacity === 0)) tl.set(t, f.autoAlpha === 0 ? { autoAlpha: 0 } : { opacity: 0 }, 0); return _fromTo(t, f, to, pos); };
+const $ = (s) => document.querySelector(s), stage = $('#stage');
+const mk = (tag, cls, css, html, parent) => { const e = document.createElement(tag); if (cls) e.className = cls; if (css) Object.assign(e.style, css); if (html !== undefined) e.innerHTML = html; (parent || stage).appendChild(e); return e; };
+const fmt = (n) => Math.round(n).toLocaleString('ru-RU').replace(/ /g, ' ');
+const RED = '#E5484D', GREEN = '#0E9F58', BLUE = '#2E3A8C';
+const sc = (id) => D.scenes.find((s) => s.id === id);
+// ---------- сцены ----------
+const SC = {};
+D.scenes.forEach((s, i) => { const el = mk('div', 'scn', null, ''); el.id = s.id;
+  [['#C9D4FF', -200, 100, 700], ['#BDEED3', 650, 900, 600], ['#D9E3FF', 100, 1400, 700]].forEach(([c, x, y, z], k) => { const b = mk('i', 'bl', { background: c, left: x + 'px', top: y + 'px', width: z + 'px', height: z + 'px' }, '', el);
+    tl.to(b, { x: k % 2 ? -80 : 90, y: k % 2 ? 60 : -70, duration: s.end - s.start, ease: 'sine.inOut' }, s.start); });
+  SC[s.id] = { el, ...s }; });
+const chip = (id, text, top = 150) => { const c = mk('div', 'chip', { top: top + 'px' }, `<i class="av"></i>${text}`, SC[id].el); const t = sc(id).start;
+  tl.fromTo(c, { autoAlpha: 0, y: -40, scale: 0.9 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.45, ease: 'expo.out', immediateRender: false }, t + 0.55); return c; };
+const head = (id, lines, top, size, t0, step = 0.18, colors = []) => lines.forEach((ln, i) => {
+  const h = mk('div', 'hl', { top: (top + i * size * 1.12) + 'px', fontSize: size + 'px', color: colors[i] || '#0A1230' }, `<span>${ln}</span>`, SC[id].el);
+  tl.fromTo(h.firstChild, { autoAlpha: 0, y: 50, filter: 'blur(14px)' }, { autoAlpha: 1, y: 0, filter: 'blur(0px)', duration: 0.5, ease: 'expo.out', immediateRender: false }, t0 + i * step); });
+const phone = (id, src, x, y, w) => { const h = w * 2532 / 1170 + 20; const p = mk('div', 'phone', { left: x + 'px', top: y + 'px', width: (w + 20) + 'px', height: h + 'px', borderRadius: (w * 0.14) + 'px' }, '', SC[id].el);
+  if (src) { const im = mk('img', '', { borderRadius: (w * 0.1) + 'px' }, '', p); im.src = src; } return p; };
+const counter = (el, from, to, t, d, pre = '', suf = ' ₽') => { const o = { v: from }; tl.fromTo(o, { v: from }, { v: to, duration: d, ease: 'power2.out', immediateRender: false, onUpdate: () => { el.textContent = pre + fmt(o.v) + suf; } }, t); };
+
+// ---------- S1 ХУК ----------
+{ const id = 's1', e = SC[id].el;
+  head(id, ['Тебе должны'], 150, 88, 0.0, 0);
+  const n = mk('div', 'hl', { top: '270px', fontSize: '148px', color: RED }, '<span id="n148">148 000 ₽</span>', e); tl.set(n.firstChild, { autoAlpha: 1 }, 0);
+  tl.fromTo(n.firstChild, { scale: 1.12 }, { scale: 1, duration: 0.6, ease: 'expo.out', immediateRender: false }, 0.05);
+  tl.to(n.firstChild, { scale: 1.05, duration: BEAT, yoyo: true, repeat: 5, ease: 'sine.inOut' }, 0.7);
+  const cl = mk('div', 'clipbox', { position: 'absolute', left: '0', top: '0', width: '1080px', height: '1640px', overflow: 'hidden' }, '', e);
+  const ph = phone(id, 'home-debt.png', 290, 560, 500); cl.appendChild(ph);
+  tl.fromTo(ph, { y: 90, scale: 0.96 }, { y: 0, scale: 1, duration: 0.7, ease: 'expo.out', immediateRender: false }, 0.0);
+  tl.to(ph, { y: -18, duration: 1.6, ease: 'sine.inOut', yoyo: true, repeat: 1 }, 0.8);
+  const ring = mk('i', '', { position: 'absolute', left: '8%', top: '14%', width: '84%', height: '10%', borderRadius: '24px', border: '5px solid ' + RED, opacity: 0 }, '', ph);
+  tl.fromTo(ring, { opacity: 0, scale: 1.1 }, { opacity: 1, scale: 1, duration: 0.4, ease: 'expo.out', immediateRender: false }, 1.0); tl.to(ring, { opacity: 0.25, duration: BEAT, yoyo: true, repeat: 5 }, 1.5); }
+// ---------- S2 БОЛЬ ----------
+{ const id = 's2', e = SC[id].el, t = sc(id).start;
+  chip(id, 'Для ИП, самозанятых и малого бизнеса');
+  [['st-file.webp', 'Счёт руками', '40 минут'], ['st-receipt.webp', 'Акт с ошибками', 'не та форма'], ['st-nosee.webp', 'Кто должен — в голове', 'забыл напомнить']].forEach(([img, a, b], i) => {
+    const y = 330 + i * 300; const cd = mk('div', 'card', { left: '80px', top: y + 'px', width: '920px', height: '250px' }, '', e);
+    const im = mk('img', 'st', { left: '36px', top: '45px', width: '160px' }, '', cd); im.src = img;
+    mk('div', '', { position: 'absolute', left: '240px', top: '52px', width: '600px', font: '800 40px/1.1 Unb' }, a, cd); mk('div', '', { position: 'absolute', left: '240px', top: '150px', font: '700 36px Man', color: '#6B7A99' }, b, cd);
+    const x = mk('div', '', { position: 'absolute', right: '40px', top: '80px', width: '90px', height: '90px', borderRadius: '50%', background: RED, color: '#fff', font: '800 56px/90px Unb', textAlign: 'center' }, '✕', cd);
+    tl.fromTo(cd, { autoAlpha: 0, y: 160, scale: 0.94 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.6, ease: 'expo.out', immediateRender: false }, t + 0.9 + i * 1.1);
+    tl.fromTo(x, { autoAlpha: 0, scale: 2.4 }, { autoAlpha: 1, scale: 1, duration: 0.3, ease: 'back.out(2)', immediateRender: false }, t + 1.55 + i * 1.1); });
+  const p = mk('div', 'card', { left: '190px', top: '1250px', width: '700px', height: '120px', background: RED, color: '#fff', font: '800 38px/120px Unb', textAlign: 'center', borderRadius: '60px', boxShadow: '0 20px 50px rgba(229,72,77,.35)' }, 'ТАК ТЕРЯЮТСЯ ДЕНЬГИ', e);
+  tl.fromTo(p, { autoAlpha: 0, scale: 0.7, y: 30 }, { autoAlpha: 1, scale: 1, y: 0, duration: 0.5, ease: 'back.out(2)', immediateRender: false }, t + 4.1); }
+// ---------- S3 ЧТО ПРОДАЁМ ----------
+{ const id = 's3', e = SC[id].el, t = sc(id).start;
+  const lg = mk('div', 'hl', { top: '170px', fontSize: '124px', color: BLUE }, '<span>Первичка</span>', e);
+  tl.fromTo(lg.firstChild, { autoAlpha: 0, scale: 1.4, filter: 'blur(20px)' }, { autoAlpha: 1, scale: 1, filter: 'blur(0px)', duration: 0.7, ease: 'expo.out', immediateRender: false }, t + 0.35);
+  const sub = mk('div', 'hl', { top: '330px', fontSize: '42px', fontFamily: 'Man', textTransform: 'none', color: '#44507A' }, '<span>бот в Телеграме — для ИП и малого бизнеса</span>', e);
+  tl.fromTo(sub.firstChild, { autoAlpha: 0, y: 30 }, { autoAlpha: 1, y: 0, duration: 0.5, ease: 'expo.out', immediateRender: false }, t + 0.8);
+  ['СЧЁТ', 'АКТ', 'УПД', 'ТОРГ-12', 'ДОГОВОР'].forEach((w, i) => { const c = mk('div', 'card', { left: (i < 3 ? 70 + i * 320 : 230 + (i - 3) * 340) + 'px', top: (i < 3 ? 480 : 640) + 'px', width: i < 3 ? '300px' : '320px', height: '120px', background: ['#2E3A8C', '#0E9F58', '#7B3FE4', '#E0701F', '#0A1230'][i], color: '#fff', font: '800 40px/120px Unb', textAlign: 'center', borderRadius: '60px' }, w, e);
+    tl.fromTo(c, { autoAlpha: 0, y: 80, scale: 0.8 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.45, ease: 'expo.out', immediateRender: false }, t + 1.3 + i * 0.22); }); }
+// ---------- S4 КАК 1: голосом → PDF с QR ----------
+{ const id = 's4', e = SC[id].el, t = sc(id).start;
+  chip(id, '1 · Скажи голосом');
+  const ph = phone(id, null, 90, 320, 520); ph.style.background = '#E7EEF6';
+  const hd = mk('div', '', { position: 'absolute', left: 0, right: 0, top: 0, height: '120px', background: '#fff', display: 'flex', alignItems: 'flex-end', padding: '0 26px 16px', boxSizing: 'border-box', gap: '14px', font: '700 28px Man' }, '<i style="width:60px;height:60px;border-radius:50%;background:linear-gradient(135deg,#4F6BFF,#2E3A8C);color:#fff;font:800 30px/60px Unb;text-align:center;font-style:normal">П</i>Первичка<small style="font:500 20px Man;color:#8795AD;margin-left:-4px">бот</small>', ph);
+  const m0 = mk('div', 'msg me', { top: '160px' }, '<span id="w4"></span> <span style="font:600 20px Man;color:#4FAE4E">0:04</span><div style="font:600 24px/1.3 Man;margin-top:6px;color:#3C5A38">«счёт Вектору на 82 000»</div>', ph);
+  const m1 = mk('div', 'msg bot', { top: '380px' }, 'Счёт № 1 для <b>ООО «Вектор»</b> на 82 000 ₽<div class="pdf"><i>PDF</i><div><b>Счёт_1_Вектор.pdf</b><em>с QR для оплаты</em></div></div><div class="btn">✅ Оплачено</div>', ph);
+  const w4 = $('#w4'); for (let k = 0; k < 20; k++) { const w = document.createElement('i'); w.className = 'wv'; w.style.height = (8 + ((k * 37) % 28)) + 'px'; w4.appendChild(w); }
+  tl.fromTo(ph, { autoAlpha: 0, y: 160, rotationY: -20 }, { autoAlpha: 1, y: 0, rotationY: 0, duration: 0.7, ease: 'expo.out', immediateRender: false }, t + 0.5);
+  tl.fromTo(m0, { autoAlpha: 0, y: 24 }, { autoAlpha: 1, y: 0, duration: 0.4, ease: 'expo.out', immediateRender: false }, t + 1.6);
+  tl.fromTo(ph.querySelectorAll('.wv'), { scaleY: 0.3 }, { scaleY: 1, duration: 0.16, stagger: { each: 0.025, repeat: 3, yoyo: true }, ease: 'sine.inOut', immediateRender: false }, t + 1.7);
+  tl.fromTo(m1, { autoAlpha: 0, y: 24 }, { autoAlpha: 1, y: 0, duration: 0.45, ease: 'expo.out', immediateRender: false }, t + 2.4);
+  const inv = mk('div', 'card', { left: '600px', top: '330px', width: '400px', height: '520px', padding: '28px', overflow: 'hidden' }, '<div style="font:800 26px Unb;color:#2E3A8C">СЧЁТ № 1</div><div style="font:700 26px Man;margin-top:10px">ООО «Вектор»</div><div style="font:800 56px Unb;margin-top:12px;letter-spacing:-.03em">82 000 ₽</div><img src="qr.svg" style="width:230px;height:230px;margin-top:18px">', e);
+  tl.fromTo(inv, { autoAlpha: 0, x: -200, y: 40, rotationY: 50, scale: 0.8 }, { autoAlpha: 1, x: 0, y: 0, rotationY: -6, scale: 1, duration: 0.8, ease: 'expo.out', immediateRender: false }, t + 3.5);
+  tl.to(inv, { y: -14, duration: 1.2, ease: 'sine.inOut', yoyo: true, repeat: 1 }, t + 4.4);
+  const ex = mk('span', 'ex', { left: '830px', top: '300px' }, 'ПРИМЕР', e); tl.fromTo(ex, { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.3 }, t + 3.9);
+  const q = mk('div', '', { position: 'absolute', left: '610px', top: '880px', width: '380px', font: '800 34px/1.2 Man', color: GREEN, textAlign: 'center' }, 'Клиент платит, наведя камеру банка', e);
+  tl.fromTo(q, { autoAlpha: 0, y: 30 }, { autoAlpha: 1, y: 0, duration: 0.5, ease: 'expo.out', immediateRender: false }, t + 4.6); }
+// ---------- S5 КАК 2: видно, кто должен → «Напомнить» ----------
+{ const id = 's5', e = SC[id].el, t = sc(id).start;
+  chip(id, '2 · Видно, кто должен');
+  const ph = phone(id, 'unpaid.png', 470, 330, 500);
+  tl.fromTo(ph, { autoAlpha: 0, scale: 1.25, y: 60 }, { autoAlpha: 1, scale: 1, y: 0, duration: 0.7, ease: 'expo.out', immediateRender: false }, t + 0.2);
+  const ring = mk('i', '', { position: 'absolute', left: '4%', top: '23%', width: '92%', height: '9%', borderRadius: '20px', border: '5px solid ' + BLUE, opacity: 0 }, '', ph);
+  tl.fromTo(ring, { opacity: 0, scale: 1.12 }, { opacity: 1, scale: 1, duration: 0.4, ease: 'expo.out', immediateRender: false }, t + 2.2); tl.to(ring, { opacity: 0.2, duration: BEAT, yoyo: true, repeat: 3 }, t + 2.6);
+  const rem = mk('div', 'card', { left: '420px', top: '1000px', width: '560px', padding: '26px 28px', borderRadius: '30px' }, '<div style="font:800 28px Man">Напомнить: ООО «Вектор»</div><div style="font:600 24px/1.3 Man;color:#44507A;margin-top:8px">Добрый день! Напоминаем про счёт № 1 от 03.11 на 82 000 ₽. QR для оплаты — во вложении.</div><div class="btn" style="margin-top:14px;background:#2E5BD9;color:#fff">✉️ Отправить клиенту</div>', e);
+  tl.fromTo(rem, { autoAlpha: 0, y: 200, scale: 0.9 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.7, ease: 'expo.out', immediateRender: false }, t + 4.0);
+  const rp = mk('i', '', { position: 'absolute', left: '640px', top: '1170px', width: '100px', height: '100px', borderRadius: '50%', border: '8px solid ' + GREEN, opacity: 0 }, '', e);
+  tl.fromTo(rp, { scale: 0.3, opacity: 1 }, { scale: 2.4, opacity: 0, duration: 0.6, ease: 'expo.out', immediateRender: false }, t + 5.6);
+  const cap2 = mk('div', '', { position: 'absolute', left: '60px', top: '560px', width: '360px', font: '700 32px/1.25 Man', color: '#44507A', textAlign: 'center' }, 'Письмо уйдёт только по твоей кнопке', e);
+  tl.fromTo(cap2, { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.5 }, t + 5.2); }
+// ---------- S6 ЧТО ДАЁТ: 148 000 → 0 ----------
+{ const id = 's6', e = SC[id].el, t = sc(id).start;
+  chip(id, '3 · Деньги получены');
+  const n = mk('div', 'hl', { top: '270px', fontSize: '150px', color: RED }, '<span id="n6">148 000 ₽</span>', e); tl.fromTo(n.firstChild, { autoAlpha: 0, y: 50 }, { autoAlpha: 1, y: 0, duration: 0.6, ease: 'expo.out', immediateRender: false }, t + 0.6);
+  const clipb = mk('div', '', { position: 'absolute', left: 0, top: 0, width: '1080px', height: '1640px', overflow: 'hidden' }, '', e);
+  const ph = phone(id, 'home-debt.png', 290, 600, 500); clipb.appendChild(ph);
+  const ph2 = mk('img', '', { position: 'absolute', left: '0', top: '0', width: '100%', height: '100%', opacity: 0, borderRadius: '50px' }, '', ph); ph2.src = 'home-paid.png';
+  tl.fromTo(ph, { autoAlpha: 0, y: 200 }, { autoAlpha: 1, y: 0, duration: 0.7, ease: 'expo.out', immediateRender: false }, t + 0.4);
+  const o = { v: 148000 }, n6 = $('#n6');
+  tl.to(n6, { color: RED, duration: 0.01 }, t + 0.5);
+  tl.to(o, { v: 0, duration: 1.4, ease: 'power3.inOut', onUpdate: () => { n6.textContent = fmt(o.v) + ' ₽'; } }, t + 2.2);
+  tl.to(ph2, { opacity: 1, duration: 0.5 }, t + 3.2);
+  tl.to(n6, { color: GREEN, scale: 1.12, duration: 0.5, ease: 'expo.out' }, t + 3.3); tl.to(n6, { scale: 1, duration: 0.4 }, t + 3.8);
+  const ok = mk('div', 'card', { left: '280px', top: '440px', width: '520px', height: '90px', background: GREEN, color: '#fff', font: '800 36px/90px Unb', textAlign: 'center', borderRadius: '45px' }, '✓ ДОЛГ ЗАКРЫТ', e);
+  tl.fromTo(ok, { autoAlpha: 0, scale: 0.6, y: 20 }, { autoAlpha: 1, scale: 1, y: 0, duration: 0.5, ease: 'back.out(2.2)', immediateRender: false }, t + 3.4);
+  for (let k = 0; k < 5; k++) { const c = mk('img', 'st', { left: '0px', top: '0px', width: '110px' }, '', e); c.src = 'st-coin.webp';
+    tl.fromTo(c, { autoAlpha: 0, x: 540, y: 1100, scale: 0.4, rotation: -30 }, { autoAlpha: 1, x: [110, 880, 260, 800, 520][k], y: [760, 700, 1000, 1000, 640][k], scale: 1, rotation: 20 * (k - 2), duration: 0.6, ease: 'expo.out', immediateRender: false }, t + 3.3 + k * 0.08);
+    tl.to(c, { y: '-=30', duration: 1.2, ease: 'sine.inOut', yoyo: true, repeat: 1 }, t + 3.9); } }
+// ---------- S7 ЦЕНА ----------
+{ const id = 's7', e = SC[id].el, t = sc(id).start;
+  head(id, ['Всё это за'], 260, 70, t + 0.3, 0);
+  const pr = mk('div', 'hl', { top: '420px', fontSize: '250px', color: GREEN }, '<span id="pr">390 ₽</span>', e);
+  tl.fromTo(pr.firstChild, { autoAlpha: 0, scale: 1.5, filter: 'blur(20px)' }, { autoAlpha: 1, scale: 1, filter: 'blur(0px)', duration: 0.7, ease: 'expo.out', immediateRender: false }, t + 0.7);
+  const m = mk('div', 'hl', { top: '700px', fontSize: '60px', fontFamily: 'Man', textTransform: 'none', color: '#44507A' }, '<span>в месяц, без ограничений</span>', e); tl.fromTo(m.firstChild, { autoAlpha: 0, y: 30 }, { autoAlpha: 1, y: 0, duration: 0.5, ease: 'expo.out', immediateRender: false }, t + 1.3);
+  [['5 документов в месяц — бесплатно', '#0E9F58', 880], ['Без бухгалтера и без 1С', '#2E3A8C', 1030]].forEach(([tx, c, y], i) => { const b = mk('div', 'card', { left: '100px', top: y + 'px', width: '880px', height: '110px', background: c, color: '#fff', font: '800 31px/110px Unb', textAlign: 'center', borderRadius: '55px' }, tx, e);
+    tl.fromTo(b, { autoAlpha: 0, y: 70, scale: 0.9 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.5, ease: 'expo.out', immediateRender: false }, t + 1.9 + i * 0.35); }); }
+// ---------- S8 ПРИЗЫВ ----------
+{ const id = 's8', e = SC[id].el, t = sc(id).start;
+  head(id, ['Напиши'], 260, 70, t + 0.3, 0);
+  const w = mk('div', 'hl', { top: '380px', fontSize: '230px', color: GREEN }, '<span>СЧЁТ</span>', e); tl.fromTo(w.firstChild, { autoAlpha: 0, scale: 1.6, filter: 'blur(20px)' }, { autoAlpha: 1, scale: 1, filter: 'blur(0px)', duration: 0.7, ease: 'expo.out', immediateRender: false }, t + 0.7);
+  const b = mk('div', 'card', { left: '150px', top: '780px', width: '780px', height: '150px', background: '#0A1230', color: '#fff', font: '800 50px/150px Unb', textAlign: 'center', borderRadius: '75px' }, 'Открыть бота →', e);
+  tl.fromTo(b, { autoAlpha: 0, y: 70, scale: 0.85 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.55, ease: 'expo.out', immediateRender: false }, t + 1.3); tl.to(b, { scale: 1.04, duration: BEAT / 2, yoyo: true, repeat: 5, ease: 'sine.inOut' }, t + 2.0);
+  const h = mk('div', 'hl', { top: '965px', fontSize: '42px', fontFamily: 'Man', textTransform: 'none', color: '#44507A' }, '<span>@pervichka_app_bot</span>', e); tl.fromTo(h.firstChild, { autoAlpha: 0, y: 20 }, { autoAlpha: 1, y: 0, duration: 0.4 }, t + 1.7);
+  const f = mk('div', 'hl', { top: '1080px', fontSize: '34px', fontFamily: 'Man', textTransform: 'none', color: '#6B7A99' }, '<span>Для ИП, самозанятых и малого бизнеса</span>', e); tl.fromTo(f.firstChild, { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.5 }, t + 2.2);
+  const ex = mk('div', 'hl', { top: '1160px', fontSize: '26px', fontFamily: 'Man', textTransform: 'none', color: '#8795AD' }, '<span>Суммы и клиенты в ролике — пример</span>', e); tl.fromTo(ex.firstChild, { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.5 }, t + 2.4); }
+// ---------- порядок показа и переходы ----------
+D.scenes.forEach((s, i) => { const o = SC[s.id].el, t = s.start, prev = i ? SC[D.scenes[i - 1].id].el : null;
+  tl.set(o, { autoAlpha: 1 }, t);
+  if (prev) {
+    if (s.trans === 'push') { tl.fromTo(o, { y: 260, opacity: 0 }, { y: 0, opacity: 1, duration: 0.7, ease: 'expo.out', immediateRender: false }, t); tl.to(prev, { y: -150, scale: 0.96, opacity: 0, duration: 0.55, ease: 'power3.in' }, t); }
+    if (s.trans === 'left') { tl.fromTo(o, { x: 460, opacity: 0 }, { x: 0, opacity: 1, duration: 0.7, ease: 'expo.out', immediateRender: false }, t); tl.to(prev, { x: -280, opacity: 0, duration: 0.55, ease: 'power3.in' }, t); }
+    if (s.trans === 'zoom') { tl.fromTo(o, { scale: 1.3, opacity: 0 }, { scale: 1, opacity: 1, duration: 0.7, ease: 'expo.out', immediateRender: false }, t); tl.to(prev, { scale: 0.86, opacity: 0, duration: 0.5, ease: 'power3.in' }, t); }
+    if (s.trans === 'circle') { tl.fromTo(o, { clipPath: 'circle(0px at 50% 90%)' }, { clipPath: 'circle(1800px at 50% 90%)', duration: 0.85, ease: 'expo.inOut', immediateRender: false }, t); tl.set(o, { clipPath: 'none' }, t + 0.9); }
+    tl.set(prev, { autoAlpha: 0 }, t + 0.95); }
+  tl.fromTo(o.querySelectorAll('.card,.phone,.hl'), { y: '+=0' }, { y: '+=0', duration: 0.01 }, t); });
+// петля: к концу последний кадр перетекает в первый
+tl.to(SC.s8.el, { opacity: 0, duration: 0.45, ease: 'power2.inOut' }, T - 0.45); tl.set('#s1', { autoAlpha: 1 }, T - 0.45);
+// ---------- субтитры ----------
+const WORDS = [];
+D.vo.forEach(([a, b, txt]) => { const tok = txt.split(' ').map((w) => ({ w: w.replace(/\*/g, ''), key: w.includes('*') })), wts = tok.map((x) => x.w.length + 2), sum = wts.reduce((p, q) => p + q, 0); let acc = a;
+  const cap = mk('div', 'cap', null, '', $('#caps')); const kc = a < 4 ? RED : GREEN;
+  const sp = tok.map((x, i) => { const el = mk('i', '', null, x.w, cap); const t0 = acc, t1 = acc + (b - a) * wts[i] / sum; acc = t1; WORDS.push({ t0, t1, w: x.w, key: x.key }); el._t = t0; el._k = x.key; return el; });
+  tl.set(cap, { autoAlpha: 1 }, a); tl.set(cap, { autoAlpha: 0 }, b + 0.3);
+  sp.forEach((el) => tl.set(el, { color: el._k ? kc : '#0A1230' }, el._t)); });
+// ---------- герой: картинки из Nano Banana, рот рисуем кодом ----------
+const POSE = { 'hero1.png': { W: 876, H: 900 }, 'hero2.png': { W: 751, H: 900, m: { cx: 343, cy: 470, w: 84 } }, 'hero3.png': { W: 753, H: 900 }, 'hero4.png': { W: 620, H: 900 }, 'hero5.png': { W: 1112, H: 900, m: { cx: 554, cy: 780, w: 140 } } };
+const hero = $('#hero'), pz = {}, mouths = [];
+Object.entries(POSE).forEach(([f, p]) => { const z = mk('div', 'pz', { aspectRatio: p.W + '/' + p.H }, '', hero); const im = mk('img', '', null, '', z); im.src = f; pz[f] = z;
+  if (p.m) { const m = mk('i', 'mo', { left: (p.m.cx / p.W * 100) + '%', top: (p.m.cy / p.H * 100) + '%', width: (p.m.w / p.W * 100) + '%', aspectRatio: '2/1' }, '', z); mouths.push(m); } });
+tl.set(hero, { left: 900, top: 1640, height: 420, yPercent: 0 }, 0); tl.set(hero, { xPercent: 0 }, 0);
+const show = (t, f) => Object.entries(pz).forEach(([k, z]) => tl.set(z, { autoAlpha: k === f ? 1 : 0 }, t));
+const moveTo = (t, x, y, h, d = 0.7) => tl.to(hero, { left: x, top: y, height: h, duration: d, ease: 'expo.inOut' }, t);
+const hop = (t, k = 1) => { tl.to(hero, { y: -70 * k, duration: 0.2, ease: 'power2.out' }, t); tl.to(hero, { y: 0, duration: 0.4, ease: 'bounce.out' }, t + 0.2); };
+const place = (t, f, x, y, h, pop = true) => { show(t, f); tl.set(hero, { left: x, top: y + 600, height: h }, t - 0.01); tl.to(hero, { top: y, duration: 0.7, ease: 'expo.out' }, t); };
+tl.set(hero, { yPercent: -100 }, 0);
+const S = (id) => sc(id).start;
+place(2.9, 'hero2.png', 900, 1640, 400);                                            // S1: выглядывает справа
+tl.to(hero, { top: 2300, duration: 0.5, ease: 'expo.in' }, 3.55);
+place(S('s2') + 0.8, 'hero2.png', 190, 1640, 400);                                   // S2: слева, сочувствует
+tl.to(hero, { top: 2300, duration: 0.5, ease: 'expo.in' }, S('s3') - 0.15);
+place(S('s3') + 0.5, 'hero2.png', 540, 1650, 780);                                   // S3: большой, представляет
+hop(S('s3') + 1.3, 0.8);
+tl.to(hero, { top: 2500, duration: 0.5, ease: 'expo.in' }, S('s4') - 0.1);
+place(S('s4') + 1.2, 'hero4.png', 860, 1640, 500);                                   // S4: держит счёт
+tl.to(hero, { top: 2300, duration: 0.5, ease: 'expo.in' }, S('s5') - 0.1);
+place(S('s5') + 0.8, 'hero2.png', 190, 1640, 560);                                   // S5: показывает на телефон
+tl.to(hero, { top: 2300, duration: 0.5, ease: 'expo.in' }, S('s6') - 0.1);
+place(S('s6') + 3.2, 'hero3.png', 220, 1640, 540); hop(S('s6') + 3.9, 0.9);          // S6: радуется, когда долг закрыт
+tl.to(hero, { top: 2300, duration: 0.5, ease: 'expo.in' }, S('s7') - 0.1);
+place(S('s7') + 1.6, 'hero1.png', 860, 1640, 500); hop(S('s7') + 2.4, 0.5);          // S7: с телефоном
+place(S('s8') + 0.2, 'hero1.png', 860, 1640, 460); tl.set(hero, { top: 1640 }, S('s8') + 1.0);
+tl.to(hero, { top: 2300, duration: 0.5, ease: 'expo.in' }, T - 0.8);
+// лёгкое «дыхание» героя
+for (let k = 0; k < 40; k++) tl.to(hero, { rotation: k % 2 ? -1.2 : 1.2, duration: 1.0, ease: 'sine.inOut' }, k);
+// рот: по гласным в каждом слове; пока голоса нет — по оценке времени слов, потом — по громкости записи
+const vow = (w) => (w.toLowerCase().match(/[аеёиоуыэюя]/g) || []).length || 1;
+WORDS.forEach((w) => { const n = vow(w.w), step = Math.max(0.1, (w.t1 - w.t0) / n);
+  for (let k = 0; k < n; k++) { const t = w.t0 + k * step; mouths.forEach((m) => { tl.to(m, { scaleY: w.key ? 1 : 0.75, duration: 0.05, ease: 'power2.out' }, t); tl.to(m, { scaleY: 0.1, duration: 0.07, ease: 'power2.in' }, t + Math.min(step * 0.6, 0.12)); }); } });
+tl.set({}, {}, T);
+</script>
+</body></html>

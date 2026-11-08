@@ -1,0 +1,3728 @@
+'use strict';
+
+// Многопользовательский слой для бота: пользователи Telegram, их организации,
+// контрагенты и операции. Всё строго изолировано по user_id — пользователь
+// никогда не видит чужие данные. Надстройка над существующей базой (db.js).
+
+const { db, computeBalance, priorOps } = require('../db');
+const { round2, formatRub } = require('./money');
+
+// «Сегодня» — по Москве, а не по поясу сервера (пояснение в lib/period.js).
+const { todayISO, currentYear } = require('./period');
+
+// ---------- миграции (не ломают существующие таблицы) ----------
+
+function columns(table) {
+  return db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+}
+function addColumn(table, name, def) {
+  try {
+    if (!columns(table).includes(name)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${def}`);
+    }
+  } catch (e) {
+    if (e && /duplicate column/i.test(e.message)) return;
+    throw e;
+  }
+}
+
+function migrate() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS bot_users (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      tg_id      INTEGER NOT NULL UNIQUE,
+      name       TEXT    NOT NULL DEFAULT '',
+      username   TEXT    NOT NULL DEFAULT '',
+      created_at TEXT    NOT NULL,
+      state      TEXT    NOT NULL DEFAULT '',
+      state_data TEXT    NOT NULL DEFAULT '',
+      access_until TEXT  NOT NULL DEFAULT ''
+    );
+
+    CREATE TABLE IF NOT EXISTS orgs (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+      name       TEXT    NOT NULL DEFAULT '',
+      full_name  TEXT    NOT NULL DEFAULT '',
+      inn        TEXT    NOT NULL DEFAULT '',
+      kpp        TEXT    NOT NULL DEFAULT '',
+      signer     TEXT    NOT NULL DEFAULT '',
+      address    TEXT    NOT NULL DEFAULT '',
+      bank_name  TEXT    NOT NULL DEFAULT '',
+      bik        TEXT    NOT NULL DEFAULT '',
+      acc        TEXT    NOT NULL DEFAULT '',
+      corr_acc   TEXT    NOT NULL DEFAULT '',
+      is_default INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_orgs_user ON orgs(user_id);
+  `);
+
+  db.exec(`
+    -- Выписанные документы. Храним не файл, а данные: файл пересобирается
+    -- по требованию, зато «повторить прошлый счёт» получается бесплатно.
+    CREATE TABLE IF NOT EXISTS documents (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+      org_id     INTEGER NOT NULL DEFAULT 0,
+      cp_id      INTEGER NOT NULL DEFAULT 0,
+      type       TEXT    NOT NULL,              -- sch | usl | pp | akt | upd | torg12 | dog
+      number     TEXT    NOT NULL DEFAULT '',
+      seq        INTEGER NOT NULL DEFAULT 0,    -- порядковый номер внутри года
+      year       INTEGER NOT NULL DEFAULT 0,
+      date       TEXT    NOT NULL DEFAULT '',
+      total      REAL    NOT NULL DEFAULT 0,
+      payload    TEXT    NOT NULL DEFAULT '',   -- JSON: позиции, сумма, назначение
+      created_at TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_doc_user ON documents(user_id, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_doc_seq  ON documents(user_id, type, year);
+
+    -- Часто повторяющиеся позиции: у малого бизнеса счёт — почти всегда
+    -- копия предыдущего, набирать «Канапе ассорти; 20; 650» каждый раз незачем.
+    CREATE TABLE IF NOT EXISTS item_templates (
+      id       INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id  INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+      name     TEXT    NOT NULL,
+      unit     TEXT    NOT NULL DEFAULT 'шт.',
+      price    REAL    NOT NULL DEFAULT 0,
+      uses     INTEGER NOT NULL DEFAULT 1,
+      used_at  TEXT    NOT NULL DEFAULT ''
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_tpl_uniq ON item_templates(user_id, name);
+
+    -- Строки банковской выписки, уже занесённые в журнал.
+    --
+    -- Хранить приходится не сами строки, а их ключи: выписку за месяц
+    -- выгружают повторно ради последних дней, и без такой памяти каждая
+    -- загрузка задваивала бы все прошлые оплаты. Уникальный индекс — не
+    -- перестраховка: он держит правило даже тогда, когда приложение
+    -- пришлёт одну и ту же строку дважды.
+    CREATE TABLE IF NOT EXISTS bank_imports (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+      key        TEXT    NOT NULL,             -- дата|направление|сумма|назначение
+      op_id      INTEGER NOT NULL DEFAULT 0,
+      cp_id      INTEGER NOT NULL DEFAULT 0,
+      amount     REAL    NOT NULL DEFAULT 0,
+      created_at TEXT    NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_bank_uniq ON bank_imports(user_id, key);
+
+    -- Регулярные документы: «каждый месяц счёт за аренду этому клиенту».
+    -- Хранится договорённость, а не документ: в нужный день бот приходит
+    -- с предложением, а выписывает человек. Подробности — в lib/recurring.js.
+    CREATE TABLE IF NOT EXISTS recurring (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+      cp_id      INTEGER NOT NULL,
+      type       TEXT    NOT NULL,              -- sch | schdog | usl | upd | torg12
+      day        INTEGER NOT NULL DEFAULT 1,    -- 1..28, либо 0 — последнее число
+      items      TEXT    NOT NULL DEFAULT '[]', -- JSON позиций
+      extra      TEXT    NOT NULL DEFAULT '{}', -- остальные поля документа: НДС, статус УПД
+      note       TEXT    NOT NULL DEFAULT '',
+      active     INTEGER NOT NULL DEFAULT 1,
+      last_offer TEXT    NOT NULL DEFAULT '',   -- YYYY-MM: за какой месяц предлагали
+      created_at TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_rec_user ON recurring(user_id, active);
+
+    -- Переписка с ассистентом: что человек сказал и что ассистент ответил.
+    --
+    -- Нужна для двух вещей. Первая видна человеку: приложение открывает чат
+    -- с историей, а не с чистого листа, — иначе непонятно, слышал ли тебя
+    -- бот вчера. Вторая — для владельца: по этим строкам видно, какие фразы
+    -- ассистент не понял, и есть на чём его улучшать.
+    --
+    -- intent храним целиком в JSON, а не разложенным по колонкам: разбор
+    -- меняется чаще, чем схема, и добавленное в нём поле не должно требовать
+    -- миграции.
+    CREATE TABLE IF NOT EXISTS ai_messages (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id       INTEGER NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+      source        TEXT    NOT NULL DEFAULT '',   -- bot | miniapp
+      role          TEXT    NOT NULL DEFAULT '',   -- user | assistant
+      type          TEXT    NOT NULL DEFAULT 'text', -- text | voice
+      text          TEXT    NOT NULL DEFAULT '',
+      intent        TEXT    NOT NULL DEFAULT '',   -- JSON разбора, как есть
+      action        TEXT    NOT NULL DEFAULT '',
+      audio_seconds REAL    NOT NULL DEFAULT 0,
+      created_at    TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ai_user ON ai_messages(user_id, id);
+  `);
+
+  /*
+   * Цикл аренды: счёт заранее, оплата к числу договора, сигнал о просрочке.
+   *
+   *   pay_day   — число, к которому арендатор платит (из договора);
+   *   lead_days — за сколько дней до него предложить выставить счёт;
+   *   last_due  — YYYY-MM: за какой месяц уже сообщали о просрочке.
+   *
+   * Без pay_day повторение просто привязано к числу месяца (day). С ним
+   * появляется срок оплаты, а значит и первый день просрочки — то, чего
+   * иначе неоткуда взять: в счёте даты платежа нет.
+   */
+  addColumn('recurring', 'pay_day', 'INTEGER NOT NULL DEFAULT 0');
+  addColumn('recurring', 'lead_days', 'INTEGER NOT NULL DEFAULT 0');
+  addColumn('recurring', 'last_due', "TEXT NOT NULL DEFAULT ''");
+  // YYYY-MM, за какой месяц документ по правилу уже выписан. Защита кнопки
+  // «Выписать» от второго нажатия — см. recurring.claimIssue.
+  addColumn('recurring', 'last_issued', "TEXT NOT NULL DEFAULT ''");
+  // Период расписания: month (как было), day, weekdays, week — и день недели для week.
+  addColumn('recurring', 'period', "TEXT NOT NULL DEFAULT 'month'");
+  addColumn('recurring', 'weekday', 'INTEGER NOT NULL DEFAULT 0');
+  // За какой день/неделю человек нажал «Пропустить»: выписать по такому предложению уже нельзя.
+  addColumn('recurring', 'last_skip', "TEXT NOT NULL DEFAULT ''");
+
+  /*
+   * Одноразовые кнопки — см. claimButton. Первичный ключ и есть защита:
+   * второй INSERT того же токена не пройдёт, сколько бы нажатий ни пришло
+   * одновременно.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS button_uses (
+      user_id INTEGER NOT NULL,
+      token   TEXT    NOT NULL,
+      used_at TEXT    NOT NULL,
+      PRIMARY KEY (user_id, token)
+    );
+    -- Выписанные и потом удалённые документы: только когда выписаны. Нужны
+    -- бесплатному лимиту — см. docsThisMonth.
+    CREATE TABLE IF NOT EXISTS docs_removed (
+      user_id    INTEGER NOT NULL,
+      created_at TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS docs_removed_user ON docs_removed(user_id, created_at);
+    -- Основание накладных и УПД, которое запомнено за клиентом (см. basisFor).
+    CREATE TABLE IF NOT EXISTS cp_basis (
+      user_id  INTEGER NOT NULL,
+      cp_id    INTEGER NOT NULL,
+      org_id   INTEGER NOT NULL,            -- основание договора одной фирмы с клиентом не годится другой
+      basis    TEXT    NOT NULL DEFAULT '', -- пусто — сброшено, но отметка since_id нужна
+      since_id INTEGER NOT NULL DEFAULT 0,  -- «три раза» считаются только по документам новее этого
+      PRIMARY KEY (user_id, cp_id, org_id)
+    );
+    -- Подсказки позиций, которые человек убрал: cp_id = 0 — для всех клиентов.
+    CREATE TABLE IF NOT EXISTS item_hidden (
+      user_id INTEGER NOT NULL,
+      cp_id   INTEGER NOT NULL,
+      name    TEXT    NOT NULL,
+      PRIMARY KEY (user_id, cp_id, name)
+    );
+  `);
+
+  /*
+   * Чем занимается бизнес. Нужен ровно для одного: подсказать, откуда у
+   * этого бизнеса берётся долг, и не заставлять новичка выбирать между
+   * «по акту» и «по счёту», не понимая вопроса.
+   *
+   * На боевом сервере колонку добавляли скриптом поверх файлов, минуя
+   * миграции, — поэтому в репозитории её не было, и обновление кода снесло
+   * бы правку. Место колонки — здесь.
+   */
+  addColumn('orgs', 'biz_type', "TEXT NOT NULL DEFAULT ''");
+  // Вопрос «чем занимаетесь» уже задавали. Без этой отметки его повторяли
+  // после каждого выписанного документа, пока человек не ответит.
+  addColumn('orgs', 'biz_asked', 'INTEGER NOT NULL DEFAULT 0');
+
+  // Заблокировавшие бота: рассылать им бессмысленно, а каждая попытка —
+  // ошибка в логе и лишний запрос.
+  addColumn('bot_users', 'blocked_at', "TEXT NOT NULL DEFAULT ''");
+  addColumn('bot_users', 'ai_enabled', 'INTEGER NOT NULL DEFAULT 1');
+  // Отвечать ли голосом на голосовые. По умолчанию да: спросил голосом —
+  // значит, руки заняты, и читать ответ неудобно.
+  addColumn('bot_users', 'voice_reply', 'INTEGER NOT NULL DEFAULT 1');
+  /*
+   * От лица какой организации человек работает прямо сейчас.
+   *
+   * Хранится у человека, а не в состоянии экрана: выбор должен пережить и
+   * закрытое приложение, и перезапуск бота. Иначе тот, кто ведёт две фирмы,
+   * каждое утро начинал бы с чужой и замечал это по выписанному документу.
+   *
+   * Ноль значит «не выбирал» — тогда берём организацию по умолчанию. Так же
+   * ведёт себя и запись, которая указывает на удалённую организацию: выбор
+   * молча возвращается к умолчанию, а не роняет экран.
+   */
+  addColumn('bot_users', 'active_org_id', 'INTEGER NOT NULL DEFAULT 0');
+  /*
+   * Сколько организаций сверх тарифа человек оплатил.
+   *
+   * В тариф входят две — и платящему, и нет: разница между бесплатным и
+   * платным в числе документов, а не в числе фирм. Иначе главное отличие
+   * продукта — что он не путает два юрлица — человек увидел бы только после
+   * оплаты и мог решить, что продукт ему не подходит.
+   */
+  addColumn('bot_users', 'orgs_extra', 'INTEGER NOT NULL DEFAULT 0');
+  // Откуда человек пришёл: метка из ссылки t.me/бот?start=МЕТКА. Без неё
+  // нельзя понять, какая реклама привела платящих, а какая — только шум.
+  addColumn('bot_users', 'source', "TEXT NOT NULL DEFAULT ''");
+
+  // расширяем контрагентов: владелец + банковские реквизиты (для счёта/платёжки)
+  addColumn('counterparties', 'user_id', 'INTEGER');
+  addColumn('counterparties', 'address', "TEXT NOT NULL DEFAULT ''");
+  addColumn('counterparties', 'bank_name', "TEXT NOT NULL DEFAULT ''");
+  addColumn('counterparties', 'bik', "TEXT NOT NULL DEFAULT ''");
+  addColumn('counterparties', 'acc', "TEXT NOT NULL DEFAULT ''");
+  addColumn('counterparties', 'corr_acc', "TEXT NOT NULL DEFAULT ''");
+  // Почта контрагента: чтобы отправлять счёт сразу, не спрашивая каждый раз.
+  addColumn('counterparties', 'email', "TEXT NOT NULL DEFAULT ''");
+
+  // Режим НДС организации: спрашивать ставку у каждого счёта — мучение,
+  // бухгалтер выписывает их десятками, а система налогообложения меняется
+  // раз в год. Храним у организации, у документа можно переопределить.
+  addColumn('orgs', 'vat_rate', "TEXT NOT NULL DEFAULT ''");   // '' | '0' | '5' | '7' | '10' | '20' | '22'
+  addColumn('orgs', 'vat_gross', 'INTEGER NOT NULL DEFAULT 0'); // 1 — цены уже с НДС
+  // ОГРНИП: в УПД есть графа, а поля не было — печаталось пусто.
+  addColumn('orgs', 'ogrnip', "TEXT NOT NULL DEFAULT ''");
+  /*
+   * Налог на профессиональный доход. Вывести этот режим неоткуда: по ИНН
+   * видно только, ИП это или организация, а НПД применяют и обычные
+   * физлица, и предприниматели. Значит, спрашиваем — но не у каждого, а
+   * галочкой в настройках: она нужна ровно для одного, напомнить про чек
+   * при отметке оплаты (lib/npd.js).
+   */
+  addColumn('orgs', 'npd', 'INTEGER NOT NULL DEFAULT 0');
+
+  /*
+   * Из чего возникает долг контрагента — свойство бизнеса, а не общее правило.
+   *
+   *   closing — из акта, УПД или накладной. Так у подрядчика и в торговле:
+   *             счёт лишь просьба заплатить, задолженность даёт реализация.
+   *   invoice — из счёта. Так в аренде и субаренде: акт по ГК не обязателен,
+   *             его часто не составляют вовсе, а счёт выставляют ежемесячно.
+   *   manual  — ничего не создавать, журнал ведётся руками.
+   *
+   * Выбор один на организацию: смешивать нельзя, иначе долг задвоится —
+   * сначала по счёту, потом по акту на ту же сделку.
+   */
+  addColumn('orgs', 'debt_basis', "TEXT NOT NULL DEFAULT 'closing'");
+
+  /*
+   * Режим налогообложения — нужен книге учёта доходов.
+   *
+   * '' | 'usn_income' | 'usn_minus' | 'psn'
+   *
+   * Отдельным полем, а не догадкой по ставке НДС: пустая ставка одинаково
+   * выглядит и у упрощенца до порога, и у патента, а формы книги у них
+   * разные (приложения 2 и 3 приказа ФНС от 07.11.2023 № ЕА-7-3/816@).
+   * Отдать не ту форму хуже, чем не отдать никакой, поэтому пустое
+   * значение означает «не знаем» и книга не собирается.
+   *
+   * Плательщика НДС сюда не пишем: он уже выводится из vat_rate. Второе
+   * поле о том же разъехалось бы с первым при первой же правке.
+   */
+  addColumn('orgs', 'tax_mode', "TEXT NOT NULL DEFAULT ''");
+
+  // Отметка оплаты документа и связь операции с документом: по ней
+  // отменяют проводку и не создают её дважды.
+  addColumn('documents', 'paid_at', "TEXT NOT NULL DEFAULT ''");
+  addColumn('operations', 'doc_id', 'INTEGER NOT NULL DEFAULT 0');
+  /*
+   * Чья это операция — расчёты ведутся между МОЕЙ фирмой и клиентом.
+   *
+   * Контрагенты у нас общие на аккаунт (решение владельца: один список, с
+   * пометкой, кто с кем работал), а вот деньги общими быть не могут. Зачесть
+   * долг клиента перед ООО «А» его оплатой в ООО «Б» нельзя: это разные
+   * юрлица, и в акте сверки каждое показывает только своё. Без этой колонки
+   * два бизнеса на одном аккаунте видели бы одно перемешанное сальдо.
+   */
+  addColumn('operations', 'org_id', 'INTEGER NOT NULL DEFAULT 0');
+  /*
+   * Оплата, которая раньше висела свободной строкой, а потом была привязана к
+   * документу словами человека («Да, это она», см. linkFreePayment). Деньги
+   * пришли на самом деле, и привязка — только наше решение, какой документ они
+   * закрыли: снимая отметку или удаляя документ, строку надо отвязать, а не
+   * стереть. Банковские строки узнаём по пометке, а эти — по этой графе.
+   */
+  addColumn('operations', 'was_free', 'INTEGER NOT NULL DEFAULT 0');
+
+  /*
+   * Начальное сальдо принадлежит ПАРЕ «организация — клиент», а не клиенту.
+   *
+   * Оно лежало на контрагенте, и при общих контрагентах это ломается тише
+   * всего остального: клиент, который на начало работы был должен 15 000,
+   * показал бы эти 15 000 обеим фирмам сразу — то есть долг задвоился бы, а
+   * человек увидел бы правдоподобную сумму и ничего не заподозрил.
+   *
+   * Поле на контрагенте остаётся: по нему рисуется карточка, и переучивать
+   * три десятка мест показа ради одной суммы ни к чему. Считаются же деньги
+   * отсюда, и это главное — сальдо и акт сверки берут пару.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cp_openings (
+      org_id          INTEGER NOT NULL,
+      cp_id           INTEGER NOT NULL,
+      opening_balance REAL    NOT NULL DEFAULT 0,
+      opening_date    TEXT    NOT NULL DEFAULT '',
+      PRIMARY KEY (org_id, cp_id)
+    );
+  `);
+  /*
+   * «Работает по предоплате» — отметка ПАРЫ «организация — клиент», как и
+   * начальное сальдо: с одной фирмой клиент платит вперёд, с другой — по
+   * факту, и общая галочка на карточке перепутала бы их.
+   * last_sum — последняя внесённая предоплата: от неё считаем «скоро кончится».
+   * Деньги здесь не хранятся: предоплата — обычная строка «Оплата» в журнале,
+   * а остаток — это минус сальдо. Вторая копия суммы разъехалась бы с журналом.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cp_prepay (
+      org_id   INTEGER NOT NULL,
+      cp_id    INTEGER NOT NULL,
+      prepay   INTEGER NOT NULL DEFAULT 0,
+      last_sum REAL    NOT NULL DEFAULT 0,
+      base_doc TEXT    NOT NULL DEFAULT '',
+      PRIMARY KEY (org_id, cp_id)
+    );
+  `);
+  // Человек отменил проводку долга по этому документу руками. Без такой
+  // отметки пересчёт основания создавал её заново: он видит, что проводки
+  // нет, и считает это упущением, — а это было решение человека.
+  addColumn('documents', 'no_debt', 'INTEGER NOT NULL DEFAULT 0');
+  // Сколько денег закрыла отметка «оплачено». Не всегда вся сумма документа:
+  // если часть уже внесли руками, дописывать полную — значит увести сальдо
+  // в минус. Ноль означает «отметки не было» или «поставлена до этой графы»,
+  // и тогда в дело идёт полная сумма, как и было раньше.
+  addColumn('documents', 'paid_sum', 'REAL NOT NULL DEFAULT 0');
+  /*
+   * Второй документ сделки — тот, что закрыли заодно с первым.
+   *
+   * Счёт и закрывающий его акт на одну сумму закрываются вместе, но проводка
+   * оплаты только одна, на документе-источнике долга. Без этой связи отмена
+   * оплаты снимала отметку с него одного, а второй так и оставался
+   * «оплаченным» — с долгом, который вернулся, и документом, которого нет
+   * в списке «не оплачено».
+   */
+  addColumn('documents', 'paid_with', 'INTEGER NOT NULL DEFAULT 0');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ops_doc ON operations(doc_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_cp_user ON counterparties(user_id)');
+}
+
+migrate();
+
+// ---------- пользователи и состояние диалога ----------
+
+function getOrCreateUser(tgId, name = '', username = '') {
+  let u = db.prepare('SELECT * FROM bot_users WHERE tg_id = ?').get(tgId);
+  if (!u) {
+    db.prepare('INSERT INTO bot_users(tg_id, name, username, created_at) VALUES(?,?,?,?)')
+      .run(tgId, name, username, new Date().toISOString());
+    u = db.prepare('SELECT * FROM bot_users WHERE tg_id = ?').get(tgId);
+  } else if ((name && name !== u.name) || (username && username !== u.username)) {
+    db.prepare('UPDATE bot_users SET name = ?, username = ? WHERE id = ?').run(name, username, u.id);
+  }
+  return u;
+}
+
+function setState(userId, state, data = null) {
+  db.prepare('UPDATE bot_users SET state = ?, state_data = ? WHERE id = ?')
+    .run(state || '', data == null ? '' : JSON.stringify(data), userId);
+}
+function getState(userId) {
+  const u = db.prepare('SELECT state, state_data FROM bot_users WHERE id = ?').get(userId);
+  if (!u) return { state: '', data: {} };
+  let data = {};
+  try { data = u.state_data ? JSON.parse(u.state_data) : {}; } catch (_) { data = {}; }
+  return { state: u.state || '', data };
+}
+function clearState(userId) { setState(userId, '', null); }
+function isAiEnabled(userId) {
+  const u = db.prepare('SELECT ai_enabled FROM bot_users WHERE id = ?').get(userId);
+  return u ? Boolean(u.ai_enabled !== 0) : true;
+}
+function setAiEnabled(userId, enabled) {
+  db.prepare('UPDATE bot_users SET ai_enabled = ? WHERE id = ?').run(enabled ? 1 : 0, userId);
+  return Boolean(enabled);
+}
+function isVoiceReply(userId) {
+  const u = db.prepare('SELECT voice_reply FROM bot_users WHERE id = ?').get(userId);
+  return u ? u.voice_reply !== 0 : true;
+}
+function setVoiceReply(userId, on) {
+  db.prepare('UPDATE bot_users SET voice_reply = ? WHERE id = ?').run(on ? 1 : 0, userId);
+  return Boolean(on);
+}
+
+/**
+ * Записать реплику диалога с ассистентом.
+ *
+ * Зовут её из семи мест бота и приложения, и ни одно из них не проверяет
+ * результат: запись переписки — дело служебное, и ронять из-за неё ответ
+ * человеку нельзя. Отсюда try/catch: диалог важнее журнала диалога.
+ *
+ * Ошибку глотаем не молча, а в консоль. Тихо потерянная история — это
+ * пустой чат в приложении и «ассистент меня не помнит» в поддержке, и
+ * искать причину тогда неоткуда.
+ *
+ * @param {object} m
+ * @param {number} m.userId
+ * @param {string} m.source 'bot' | 'miniapp'
+ * @param {string} m.role   'user' | 'assistant'
+ * @param {string} m.type   'text' | 'voice'
+ * @param {string} m.text
+ * @param {object} [m.intent] разбор целиком — ляжет в JSON
+ * @param {string} [m.action]
+ * @param {number} [m.audioSeconds]
+ */
+function saveAiMessage({
+  userId, source = '', role = '', type = 'text', text = '',
+  intent = null, action = '', audioSeconds = 0,
+} = {}) {
+  const uid = Number(userId) || 0;
+  if (!uid) return 0;
+  let intentJson = '';
+  try {
+    intentJson = intent ? JSON.stringify(intent).slice(0, 4000) : '';
+  } catch (_) {
+    // Разбор мог прийти с циклической ссылкой — тогда просто без него.
+    intentJson = '';
+  }
+  try {
+    const info = db.prepare(`
+      INSERT INTO ai_messages(user_id, source, role, type, text, intent, action, audio_seconds, created_at)
+      VALUES(?,?,?,?,?,?,?,?,?)`).run(
+      uid,
+      String(source || '').slice(0, 20),
+      String(role || '').slice(0, 20),
+      String(type || 'text').slice(0, 20),
+      String(text == null ? '' : text).slice(0, 4000),
+      intentJson,
+      String(action || '').slice(0, 40),
+      Number.isFinite(Number(audioSeconds)) ? Math.max(0, Number(audioSeconds)) : 0,
+      new Date().toISOString(),
+    );
+    return Number(info.lastInsertRowid);
+  } catch (e) {
+    console.error('saveAiMessage:', e.message);
+    return 0;
+  }
+}
+
+/**
+ * История диалога — старые сверху, как её рисует приложение.
+ *
+ * Берём последние `limit` записей и разворачиваем: если читать сразу по
+ * возрастанию, при длинной переписке в чат попадёт её начало, а не конец,
+ * и человек увидит позапрошлый месяц вместо вчерашнего разговора.
+ */
+function listAiMessages(userId, limit = 50) {
+  const n = Math.min(Math.max(Number(limit) || 50, 1), 500);
+  const rows = db.prepare(
+    'SELECT * FROM ai_messages WHERE user_id = ? ORDER BY id DESC LIMIT ?',
+  ).all(userId, n);
+  return rows.reverse().map((r) => ({
+    id: r.id,
+    source: r.source,
+    role: r.role,
+    type: r.type,
+    text: r.text,
+    action: r.action,
+    audioSeconds: r.audio_seconds,
+    createdAt: r.created_at,
+  }));
+}
+
+/**
+ * Выгрузка для разбора: какие фразы ассистент понял, а какие нет.
+ *
+ * Без user_id и без чьих-либо имён: смотреть тут надо на формулировки, а не
+ * на то, кто их написал. Отдаём только реплики человека — ответы ассистента
+ * в обучении бесполезны, он их сам и породил.
+ */
+function getAiDataset({ limit = 1000, type = null } = {}) {
+  const n = Math.min(Math.max(Number(limit) || 1000, 1), 5000);
+  const rows = type
+    ? db.prepare(
+      "SELECT text, intent, action, type, created_at FROM ai_messages"
+      + " WHERE role = 'user' AND type = ? ORDER BY id DESC LIMIT ?",
+    ).all(String(type), n)
+    : db.prepare(
+      "SELECT text, intent, action, type, created_at FROM ai_messages"
+      + " WHERE role = 'user' ORDER BY id DESC LIMIT ?",
+    ).all(n);
+  return rows.map((r) => {
+    let intent = null;
+    try { intent = r.intent ? JSON.parse(r.intent) : null; } catch (_) { intent = null; }
+    return { text: r.text, type: r.type, action: r.action, intent, createdAt: r.created_at };
+  });
+}
+
+/**
+ * Запоминает, откуда человек пришёл. Пишем ТОЛЬКО в пустое поле.
+ *
+ * Первая метка — настоящая: она отвечает, какая реклама его привела. Если
+ * перезаписывать, любой повторный переход по свежей ссылке затрёт источник,
+ * и окажется, что всех привёл последний баннер.
+ */
+function setSource(userId, label) {
+  const clean = String(label || '').trim().slice(0, 64);
+  if (!clean) return '';
+  db.prepare("UPDATE bot_users SET source = ? WHERE id = ? AND source = ''").run(clean, userId);
+  const row = db.prepare('SELECT source FROM bot_users WHERE id = ?').get(userId) || {};
+  return row.source || '';
+}
+
+// ---------- организации пользователя ----------
+
+function createOrg(userId, fields) {
+  const cols = ['name', 'full_name', 'inn', 'kpp', 'signer', 'address',
+    'bank_name', 'bik', 'acc', 'corr_acc', 'ogrnip'];
+  const vals = cols.map((c) => fields[c] || '');
+  const anyDefault = db.prepare('SELECT COUNT(*) AS n FROM orgs WHERE user_id = ?').get(userId).n;
+  const info = db.prepare(`
+    INSERT INTO orgs(user_id, ${cols.join(',')}, is_default, created_at)
+    VALUES(?, ${cols.map(() => '?').join(',')}, ?, ?)`)
+    .run(userId, ...vals, anyDefault === 0 ? 1 : 0, new Date().toISOString());
+  return Number(info.lastInsertRowid);
+}
+/** Режим НДС организации в удобном виде: {rate: number|null, gross: boolean}. */
+function vatOf(org) {
+  const raw = org && org.vat_rate;
+  const rate = raw === '' || raw == null ? null : Number(raw);
+  return { rate: Number.isFinite(rate) ? rate : null, gross: Boolean(org && org.vat_gross) };
+}
+
+function updateOrg(userId, id, fields) {
+  const allowed = ['name', 'full_name', 'inn', 'kpp', 'signer', 'address',
+    'bank_name', 'bik', 'acc', 'corr_acc', 'ogrnip', 'vat_rate', 'vat_gross', 'debt_basis',
+    'biz_type', 'biz_asked', 'npd', 'tax_mode'];
+  const sets = [], vals = [];
+  for (const k of allowed) if (k in fields) { sets.push(`${k} = ?`); vals.push(fields[k]); }
+  if (!sets.length) return;
+  vals.push(id, userId);
+  db.prepare(`UPDATE orgs SET ${sets.join(', ')} WHERE id = ? AND user_id = ?`).run(...vals);
+}
+/**
+ * Спросить «чем занимаетесь» — один раз, а не после каждого документа.
+ *
+ * Раньше вопрос возвращался, пока человек не ответит: пропустил — получил его
+ * снова после следующего счёта, и после следующего. Теперь «задавали» —
+ * отдельная отметка на организации, и ответ «не сейчас» тоже запоминается.
+ * Передумать можно в любой момент — «Ещё» → «Откуда берётся долг».
+ *
+ * @returns {boolean} true — вопрос надо задать сейчас (и отметка уже поставлена)
+ */
+function askBizOnce(userId) {
+  const org = currentOrg(userId);
+  if (!org || org.biz_type || org.biz_asked) return false;
+  updateOrg(userId, org.id, { biz_asked: 1 });
+  return true;
+}
+function listOrgs(userId) {
+  return db.prepare('SELECT * FROM orgs WHERE user_id = ? ORDER BY is_default DESC, id').all(userId);
+}
+function getOrg(userId, id) {
+  return db.prepare('SELECT * FROM orgs WHERE id = ? AND user_id = ?').get(id, userId);
+}
+
+/**
+ * Забрать одноразовую кнопку. true — нажатие первое, действие делать.
+ *
+ * Сообщения с кнопками в Telegram не гаснут: «✅ Да, внести 50 000» жмут
+ * дважды, возвращаются к нему назавтра, пальцем задевают при прокрутке. Раньше
+ * каждое нажатие проводило оплату заново, и сальдо показывало переплату,
+ * которой не было. Токен кладётся в данные кнопки при отрисовке; все кнопки
+ * одного сообщения несут один токен, так что и выбор из списка срабатывает
+ * один раз.
+ */
+function claimButton(userId, token) {
+  if (!token) return true;          // старые кнопки без токена — как раньше
+  return db.prepare('INSERT OR IGNORE INTO button_uses(user_id, token, used_at) VALUES(?,?,?)')
+    .run(userId, String(token), new Date().toISOString()).changes === 1;
+}
+
+/**
+ * Организация, от которой выписан документ.
+ *
+ * Не «текущая»: человек с несколькими фирмами переключается между ними, а
+ * документ остаётся за той, что его выписала. Раньше в нескольких местах
+ * брали текущую — и платёжный QR счёта фирмы А вёл на расчётный счёт фирмы Б:
+ * клиент сканировал и платил не тому получателю. Текущая — только запасной
+ * путь для старых документов, выписанных до того, как фирм стало несколько
+ * (у них org_id = 0).
+ */
+function orgOfDoc(userId, doc) {
+  return (doc && getOrg(userId, doc.org_id)) || currentOrg(userId);
+}
+function getDefaultOrg(userId) {
+  return db.prepare('SELECT * FROM orgs WHERE user_id = ? ORDER BY is_default DESC, id LIMIT 1').get(userId);
+}
+function setDefaultOrg(userId, id) {
+  db.prepare('UPDATE orgs SET is_default = 0 WHERE user_id = ?').run(userId);
+  db.prepare('UPDATE orgs SET is_default = 1 WHERE id = ? AND user_id = ?').run(id, userId);
+}
+
+/**
+ * От лица какой организации человек сейчас работает.
+ *
+ * Единственное место, которое это решает, — и в том весь смысл. Журнал
+ * операций спрашивает организацию у него, а не принимает её аргументом:
+ * balanceOf зовётся из 122 мест, и протаскивать туда ещё один числовой
+ * параметр рядом с userId значило бы однажды перепутать их местами. Оба
+ * целые, оба маленькие, ошибка вышла бы молча и с неверным сальдо.
+ *
+ * Пока организация у всех одна, это просто «та, что по умолчанию». Когда
+ * появится переключатель, менять придётся ровно эту функцию — остальные
+ * 122 места поедут за ней сами.
+ *
+ * @returns {number} id организации; 0 — организаций нет вовсе
+ */
+function currentOrgId(userId) {
+  const u = db.prepare('SELECT active_org_id FROM bot_users WHERE id = ?').get(userId);
+  const picked = u && Number(u.active_org_id);
+  if (picked) {
+    // Проверяем, что выбранная всё ещё существует и всё ещё наша. Указатель
+    // на удалённую организацию не должен ронять экран — тихо берём умолчание.
+    const own = db.prepare('SELECT id FROM orgs WHERE id = ? AND user_id = ?').get(picked, userId);
+    if (own) return own.id;
+  }
+  const org = getDefaultOrg(userId);
+  return org ? org.id : 0;
+}
+
+/** Организация, от лица которой работаем, целиком — не только id. */
+function currentOrg(userId) {
+  const id = currentOrgId(userId);
+  return id ? db.prepare('SELECT * FROM orgs WHERE id = ?').get(id) : undefined;
+}
+
+/**
+ * Переключиться на другую свою организацию.
+ *
+ * Чужую не принимаем: id приходит из кнопки, а кнопку видно в переписке.
+ * @returns {boolean} удалось ли переключиться
+ */
+function setActiveOrg(userId, orgId) {
+  const own = db.prepare('SELECT id FROM orgs WHERE id = ? AND user_id = ?').get(Number(orgId) || 0, userId);
+  if (!own) return false;
+  db.prepare('UPDATE bot_users SET active_org_id = ? WHERE id = ?').run(own.id, userId);
+  return true;
+}
+
+/**
+ * «Ввести заново» должно ЗАМЕНЯТЬ мою организацию, а не плодить новые.
+ * Раньше каждая правка создавала ещё одну организацию, а бот продолжал
+ * брать самую первую — поэтому изменения будто не применялись. Теперь
+ * обновляем организацию по умолчанию на месте и убираем дубликаты.
+ */
+function saveMyOrg(userId, fields) {
+  /*
+   * Правим ТЕКУЩУЮ организацию и не трогаем остальные.
+   *
+   * Здесь стояло «обновить умолчание и удалить все прочие». Появилось это от
+   * старой беды: каждая правка реквизитов заводила ещё одну организацию, а
+   * бот продолжал брать самую первую, и человеку казалось, что изменения не
+   * применяются. Дубликаты убирали заодно с правкой.
+   *
+   * С несколькими организациями то же удаление стало прямой потерей: завёл
+   * вторую фирму, зашёл поправить реквизиты первой — и второй больше нет, а
+   * её документы остались ссылаться на несуществующую строку. Причина, по
+   * которой дубликаты вообще заводились, давно устранена: правка идёт в
+   * updateOrg по конкретному id, новых строк она не создаёт.
+   */
+  const cur = currentOrg(userId);
+  if (cur) {
+    updateOrg(userId, cur.id, fields);
+    return cur.id;
+  }
+  return createOrg(userId, fields);
+}
+
+// ---------- контрагенты пользователя ----------
+
+/**
+ * Незакрытые авансовые счета-фактуры контрагента.
+ *
+ * «Незакрытые» — те, на которые ещё не сослалась ни одна отгрузка в строке
+ * 5б. Ссылка живёт в payload отгрузочного документа, поэтому и ищем по нему:
+ * отдельной таблицы связей заводить не стали — на объёмах малого бизнеса это
+ * лишняя сущность, которую надо чинить при каждом удалении документа.
+ *
+ * Порядок — от старых к новым: закрывают предоплаты в порядке получения.
+ */
+/**
+ * Дописывает поля в payload уже выписанного документа.
+ *
+ * Нужна ровно для пометки исправления: сам документ при этом не меняется —
+ * ни номер, ни дата, ни суммы, — но он должен помнить, что исправление было,
+ * иначе следующее снова окажется первым.
+ */
+function updateDocPayload(userId, docId, payload) {
+  return db.prepare('UPDATE documents SET payload = ? WHERE id = ? AND user_id = ?')
+    .run(JSON.stringify(payload), Number(docId), userId).changes > 0;
+}
+
+/**
+ * Авансы этого контрагента, ещё не закрытые отгрузкой, — с остатком.
+ *
+ * Раньше здесь было два изъяна, и оба тихие.
+ *
+ * Первый: закрытость определялась поиском подстроки `№ N ` в склеенных
+ * строках 5б всех отгрузок. Нумерация у нас сквозная ПО ГОДАМ, поэтому
+ * аванс № 1 за 2025 год гасился отгрузкой, сославшейся на № 1 за 2026-й, —
+ * и переставал предлагаться, хотя закрыт не был. Теперь ссылка разбирается
+ * на номер и дату, и год сверяется.
+ *
+ * Второй: зачёт был «всё или ничего». Отгрузили на 60 000 в счёт аванса на
+ * 100 000 — аванс считался закрытым целиком, и оставшиеся 40 000 из строки
+ * 5б следующей отгрузки пропадали. По ним НДС с аванса не принимался к
+ * вычету (п. 8 ст. 171, п. 6 ст. 172 НК), то есть налог оставался
+ * переплаченным. Теперь считается остаток: отгрузки разносятся по авансам
+ * в порядке дат, каждая закрывает не больше, чем в ней есть.
+ *
+ * @returns {Array<{id, number, date, year, sum, left}>} left — сколько ещё не закрыто
+ */
+function openAdvances(userId, cpId) {
+  const all = db.prepare(`
+    SELECT id, number, date, year, total, payload FROM documents
+     WHERE user_id = ? AND cp_id = ? AND type = 'avans'
+     ORDER BY date, id`).all(userId, Number(cpId));
+  if (!all.length) return [];
+
+  const advances = all.map((a) => {
+    let sum = 0;
+    try { sum = Number(JSON.parse(a.payload || '{}').sum) || 0; } catch (_) { sum = 0; }
+    if (!sum) sum = Number(a.total) || 0;
+    return { id: a.id, number: a.number, date: a.date, year: a.year, sum, left: sum };
+  });
+
+  // Ссылка в строке 5б выглядит как «№ 7 от 01.09.2026», несколько — через «;».
+  const refsOf = (payload) => {
+    let adv = '';
+    try { adv = JSON.parse(payload || '{}').advDoc || ''; } catch (_) { adv = ''; }
+    return String(adv).split(';')
+      .map((s) => /№\s*(\S+)\s+от\s+(\d{2})\.(\d{2})\.(\d{4})/.exec(s.trim()))
+      .filter(Boolean)
+      .map((m) => ({ number: m[1], year: Number(m[4]) }));
+  };
+
+  const ships = db.prepare(`
+    SELECT total, payload FROM documents
+     WHERE user_id = ? AND cp_id = ? AND type = 'upd'
+     ORDER BY date, id`).all(userId, Number(cpId));
+
+  for (const s of ships) {
+    // Отгрузка закрывает не больше, чем сама стоит: остаток сверх авансов —
+    // обычная реализация, чужие авансы он не трогает.
+    let rest = Number(s.total) || 0;
+    for (const ref of refsOf(s.payload)) {
+      const a = advances.find((x) => String(x.number) === String(ref.number)
+        && Number(x.year) === ref.year && x.left > 0);
+      if (!a) continue;
+      const take = Math.min(a.left, rest);
+      a.left = Math.round((a.left - take) * 100) / 100;
+      rest = Math.round((rest - take) * 100) / 100;
+      if (rest <= 0) break;
+    }
+  }
+
+  return advances.filter((a) => a.left > 0.005);
+}
+
+function createCp(userId, fields) {
+  const cols = ['name', 'full_name', 'inn', 'kpp', 'extra', 'kind', 'contract',
+    'opening_balance', 'opening_date', 'period_end', 'signer',
+    'address', 'bank_name', 'bik', 'acc', 'corr_acc', 'email'];
+  const vals = cols.map((c) => (c === 'opening_balance' ? (Number(fields[c]) || 0) : (fields[c] || '')));
+  const info = db.prepare(`
+    INSERT INTO counterparties(user_id, ${cols.join(',')})
+    VALUES(?, ${cols.map(() => '?').join(',')})`).run(userId, ...vals);
+  const id = Number(info.lastInsertRowid);
+  // Начальное сальдо принадлежит паре: заводим его той организации, от лица
+  // которой клиента и завели. Соседней фирме чужая история не достанется.
+  setOpeningFor(id, currentOrgId(userId), Number(fields.opening_balance) || 0, fields.opening_date || '');
+  return id;
+}
+function updateCp(userId, id, fields) {
+  const allowed = ['name', 'full_name', 'inn', 'kpp', 'extra', 'kind', 'contract',
+    'opening_balance', 'opening_date', 'period_end', 'signer',
+    'address', 'bank_name', 'bik', 'acc', 'corr_acc', 'email'];
+  const sets = [], vals = [];
+  for (const k of allowed) if (k in fields) { sets.push(`${k} = ?`); vals.push(fields[k]); }
+  if (!sets.length) return;
+  vals.push(id, userId);
+  db.prepare(`UPDATE counterparties SET ${sets.join(', ')} WHERE id = ? AND user_id = ?`).run(...vals);
+  /*
+   * Правку начального сальдо дублируем в пару — считается оно оттуда.
+   * Поле на карточке при этом остаётся: по нему рисуется экран, и держать
+   * их в согласии дешевле, чем переучивать три десятка мест показа.
+   */
+  if ('opening_balance' in fields || 'opening_date' in fields) {
+    const org = currentOrgId(userId);
+    const was = openingFor(id, org);
+    setOpeningFor(
+      id, org,
+      'opening_balance' in fields ? Number(fields.opening_balance) || 0 : was.opening_balance,
+      'opening_date' in fields ? (fields.opening_date || '') : was.opening_date,
+    );
+  }
+}
+/**
+ * С какими из моих организаций у этого клиента есть история.
+ *
+ * История — это выписанный документ, проводка в журнале или сам факт, что
+ * клиента завели от лица этой фирмы (пара в cp_openings появляется при
+ * заведении). Всё вместе одним запросом, а не тремя: список контрагентов
+ * рисуется на каждом экране, и три похода в базу на каждого клиента — это
+ * заметная задержка там, где человек ждёт списка.
+ */
+const CP_ORGS_SQL = `
+  SELECT cp_id, GROUP_CONCAT(DISTINCT org_id) AS orgs FROM (
+    SELECT cp_id, org_id FROM documents  WHERE user_id = ? AND org_id <> 0
+    UNION
+    SELECT o.cp_id, o.org_id FROM operations o
+      JOIN counterparties c ON c.id = o.cp_id
+     WHERE c.user_id = ? AND o.org_id <> 0
+    UNION
+    SELECT p.cp_id, p.org_id FROM cp_openings p
+      JOIN counterparties c ON c.id = p.cp_id
+     WHERE c.user_id = ? AND p.org_id <> 0
+  ) GROUP BY cp_id`;
+
+function cpOrgsMap(userId) {
+  const out = new Map();
+  for (const r of db.prepare(CP_ORGS_SQL).all(userId, userId, userId)) {
+    out.set(r.cp_id, String(r.orgs || '').split(',').map(Number).filter(Boolean));
+  }
+  return out;
+}
+
+/**
+ * Контрагенты — общие на аккаунт, но с пометкой, кто с кем работал.
+ *
+ * Так решил владелец, и решение разумное: один и тот же клиент часто
+ * обслуживается от обеих фирм, и заводить его дважды — значит развести
+ * реквизиты. Но список без пометки хуже раздельного: выписать документ не от
+ * той организации станет делом одного промаха, а замечают такое уже у
+ * контрагента.
+ *
+ * Поэтому у каждого клиента видно, с какими фирмами он связан, а свои идут
+ * первыми — в выборе по умолчанию человек попадает в них, не задумываясь.
+ *
+ * @param {number} userId
+ * @param {number|null} orgId чьими считать «своих»; по умолчанию — текущая
+ */
+function listCps(userId, orgId = null) {
+  const rows = db.prepare('SELECT * FROM counterparties WHERE user_id = ? ORDER BY id').all(userId);
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const map = cpOrgsMap(userId);
+  const marked = rows.map((cp) => {
+    const orgIds = map.get(cp.id) || [];
+    return { ...cp, orgIds, mine: org ? orgIds.includes(org) : true };
+  });
+  // Свои выше чужих, внутри — прежний порядок по id: он привычен людям.
+  return marked.sort((a, b) => (a.mine === b.mine ? a.id - b.id : (a.mine ? -1 : 1)));
+}
+
+/** С какими организациями связан один клиент — для карточки. */
+function cpOrgs(userId, cpId) {
+  const ids = cpOrgsMap(userId).get(Number(cpId)) || [];
+  if (!ids.length) return [];
+  const all = db.prepare('SELECT id, name FROM orgs WHERE user_id = ?').all(userId);
+  return all.filter((o) => ids.includes(o.id));
+}
+function getCp(userId, id) {
+  return db.prepare('SELECT * FROM counterparties WHERE id = ? AND user_id = ?').get(id, userId);
+}
+
+// ---------- операции контрагента (с проверкой владельца) ----------
+
+/** @returns {number} id созданной операции — нужен импорту выписки. */
+/*
+ * Журнал ведётся парой «организация — контрагент», а не одним контрагентом.
+ *
+ * Организацию не принимаем аргументом, а спрашиваем у currentOrgId: так
+ * ни одно из полусотни мест вызова не сможет перепутать её с userId. Кому
+ * нужна не текущая, а названная — передаёт orgId последним параметром;
+ * так делают отчёты, где организация уже под рукой.
+ */
+function addOp(userId, cpId, op, orgId = null) {
+  const cp = getCp(userId, cpId);
+  if (!cp) throw new Error('Такого клиента нет в вашем списке');
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const sort = db.prepare(
+    'SELECT COALESCE(MAX(sort),-1)+1 AS s FROM operations WHERE cp_id = ? AND org_id = ?',
+  ).get(cpId, org).s;
+  const info = db.prepare(`INSERT INTO operations(cp_id, org_id, date, kind, doc, debit, credit, note, sort)
+              VALUES(?,?,?,?,?,?,?,?,?)`)
+    .run(cpId, org, op.date, op.kind || '', op.doc || '', Number(op.debit) || 0, Number(op.credit) || 0,
+      op.note || '', sort);
+  const id = Number(info.lastInsertRowid);
+  noteIncome(userId, id, op);
+  return id;
+}
+function listOps(userId, cpId, orgId = null) {
+  const cp = getCp(userId, cpId);
+  if (!cp) return [];
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  return db.prepare(
+    'SELECT * FROM operations WHERE cp_id = ? AND org_id = ? ORDER BY date, sort, id',
+  ).all(cpId, org);
+}
+function deleteLastOp(userId, cpId, orgId = null) {
+  const cp = getCp(userId, cpId);
+  if (!cp) return false;
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const row = db.prepare(
+    'SELECT id FROM operations WHERE cp_id = ? AND org_id = ? ORDER BY date DESC, sort DESC, id DESC LIMIT 1',
+  ).get(cpId, org);
+  return row ? deleteOp(userId, row.id) : false;
+}
+
+/**
+ * Убрать одну операцию — любую, а не только последнюю.
+ *
+ * В боте отменяют последнюю, и этого мало: сумму на главной держат четыре
+ * строки, внесённые руками полгода назад, и чтобы добраться до второй,
+ * приходилось сносить все. В приложении их видно списком и смахивается
+ * нужная.
+ */
+function deleteOp(userId, opId) {
+  const row = db.prepare(`
+    SELECT o.id, o.kind, o.doc_id FROM operations o
+      JOIN counterparties c ON c.id = o.cp_id
+     WHERE o.id = ? AND c.user_id = ?`).get(Number(opId), userId);
+  if (!row) return false;
+  db.prepare('DELETE FROM operations WHERE id = ?').run(row.id);
+  dropChequeWait(userId, { opIds: [row.id] });
+  /*
+   * Проводка пришла из документа — значит, отменили не строку в журнале, а
+   * решение по документу, и хранить это надо на нём. Иначе ближайший
+   * пересчёт вернёт проводку: он не отличает «ещё не создали» от «человек
+   * убрал». Отмену видно в карточке документа, и оттуда же её можно снять.
+   *
+   * Оплата и реализация — две стороны одной пары, поэтому и отменяются
+   * по-разному: убрали реализацию — документ выходит из долга целиком;
+   * убрали оплату — снимается отметка «оплачено», иначе пересчёт впишет
+   * её обратно, ведь отметка на документе осталась.
+   */
+  if (row.doc_id && row.kind === 'Реализация') {
+    db.prepare('UPDATE documents SET no_debt = 1 WHERE id = ? AND user_id = ?').run(row.doc_id, userId);
+    // Оплату этого документа забираем сразу же: одна без другой оставляет
+    // сальдо в минусе — выходит, что это мы должны клиенту. Отметку
+    // «оплачено» не трогаем, она вернётся вместе с долгом.
+    deleteOpsOfDoc(userId, row.doc_id, 'Оплата');
+  }
+  if (row.doc_id && row.kind === 'Оплата') {
+    db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0 WHERE id = ? AND user_id = ?")
+      .run(row.doc_id, userId);
+    // И со второго документа сделки, если его закрыли заодно с этим.
+    db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0, paid_with = 0 WHERE paid_with = ? AND user_id = ?")
+      .run(row.doc_id, userId);
+  }
+  // Если операция пришла из выписки, забываем и отметку о загрузке: иначе
+  // отменённую по ошибке оплату больше не загрузить — строка навсегда
+  // числится импортированной.
+  db.prepare('DELETE FROM bank_imports WHERE user_id = ? AND op_id = ?').run(userId, row.id);
+  return true;
+}
+
+/**
+ * Сверка за период: входящее сальдо, операции внутри, исходящее сальдо.
+ *
+ * Так акт сверки и устроен по смыслу: «на начало периода за вами столько,
+ * за период было то-то, на конец — столько». Раньше в акт шли все операции
+ * за всю историю, а в шапке стоял период — и начиная со второго акта шапка
+ * противоречила таблице.
+ *
+ * Входящее сальдо считается, а не хранится: это начальное сальдо
+ * контрагента плюс всё, что случилось до начала периода. Хранить его
+ * отдельно значило бы держать число, которое разъедется с журналом при
+ * первой же правке задним числом.
+ *
+ * @param {string} from ISO-дата начала (включительно)
+ * @param {string} to ISO-дата конца (включительно)
+ */
+function periodBalance(userId, cpId, from, to, orgId = null) {
+  const cp0 = getCp(userId, cpId);
+  if (!cp0) return null;
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const all = listOps(userId, cpId, org);
+  // Начальное сальдо — пары, по тем же соображениям, что и в balanceOf.
+  const cp = { ...cp0, ...openingFor(cpId, org) };
+
+  /*
+   * Операции до даты сальдо уже внутри него (см. priorOps в db.js). Чтобы
+   * акт за любой период сходился с карточкой, отсчёт ведём от остатка ДО
+   * них: сальдо минус то, что в него вошло. Дальше всё как раньше.
+   */
+  const priors = priorOps(cp, all);
+  const prior = priors.reduce((s, o) => round2(s + round2(o.credit) - round2(o.debit)), 0);
+  /*
+   * Акт без периода начинается с даты сальдо, если до неё есть вошедшие в
+   * него операции: иначе он открывался нулём и показывал их строками под
+   * датой сальдо, хотя в карточке на эту дату стоит долг на начало.
+   */
+  if (!from && priors.length) from = cp.opening_date;
+  let opening = round2((Number(cp.opening_balance) || 0) - prior);
+  const inside = [];
+  for (const op of all) {
+    const d = String(op.date || '');
+    if (from && d < from) {
+      // Округляем на каждом шаге: иначе входящее сальдо длинного периода
+      // накапливает двоичную погрешность так же, как накапливало сальдо
+      // карточки — 1.0000000000000007 вместо рубля.
+      opening = round2(opening + round2(op.credit) - round2(op.debit));
+    } else if (!to || d <= to) {
+      inside.push(op);
+    }
+  }
+  const totalDebit = inside.reduce((s, o) => round2(s + round2(o.debit)), 0);
+  const totalCredit = inside.reduce((s, o) => round2(s + round2(o.credit)), 0);
+  return {
+    cp,
+    ops: inside,
+    opening: round2(opening),
+    totalDebit,
+    totalCredit,
+    closing: round2(opening + totalCredit - totalDebit),
+    from: from || cp.opening_date || '',
+    to: to || todayISO(),
+  };
+}
+
+/**
+ * Контрагент «как на период»: тот же объект, но с сальдо и датами периода.
+ *
+ * Шаблон акта читает opening_balance, opening_date и period_end прямо из
+ * контрагента. Подменяя их копией, мы получаем правильный акт без правки
+ * шаблона — и не трогаем саму карточку, где эти поля значат другое:
+ * начало отношений, а не начало выбранного периода.
+ */
+/*
+ * orgId — чей журнал брать. По умолчанию текущей фирмы, как раньше; но акт,
+ * который пересобирают или шлют почтой, обязан брать журнал СВОЕЙ фирмы.
+ * Иначе контрагент получал акт «между ООО А и …» с операциями фирмы Б.
+ */
+function cpForPeriod(userId, cpId, from, to, orgId = null) {
+  const b = periodBalance(userId, cpId, from, to, orgId);
+  if (!b) return null;
+  return {
+    ...b,
+    view: {
+      ...b.cp, opening_balance: b.opening, opening_date: b.from, period_end: b.to,
+    },
+  };
+}
+
+// ---------- банковская выписка ----------
+
+/** Какие строки выписки уже заносили: их показываем как загруженные. */
+function knownBankKeys(userId, keys) {
+  const out = new Set();
+  if (!keys || !keys.length) return out;
+  const stmt = db.prepare('SELECT 1 AS y FROM bank_imports WHERE user_id = ? AND key = ?');
+  for (const k of keys) {
+    if (k && stmt.get(userId, String(k))) out.add(String(k));
+  }
+  return out;
+}
+
+/**
+ * Занести подтверждённые человеком строки выписки в журнал.
+ *
+ * Отметка о загрузке ставится первой и в той же транзакции, что и проводка:
+ * если строку уже заносили, уникальный индекс не даст вставить отметку, и
+ * оплаты не будет. Порядок именно такой, потому что при обратном между
+ * двумя запросами помещается второй такой же запрос — и платёж задваивается.
+ *
+ * @returns {{added: number, skipped: number}}
+ */
+function importBankRows(userId, rows) {
+  const now = new Date().toISOString();
+  const remember = db.prepare(
+    'INSERT OR IGNORE INTO bank_imports(user_id, key, op_id, cp_id, amount, created_at) VALUES(?,?,?,?,?,?)',
+  );
+  const link = db.prepare('UPDATE bank_imports SET op_id = ? WHERE user_id = ? AND key = ?');
+  let added = 0;
+  let skipped = 0;
+  // Какие строки действительно легли: по ним потом предлагаем закрыть счета.
+  // Пропущенные повторы туда попадать не должны — их деньги уже в журнале.
+  const addedRows = [];
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const r of rows || []) {
+      const key = String(r && r.key ? r.key : '');
+      const cp = key ? getCp(userId, Number(r.cpId)) : null;
+      const amount = Math.round(Math.abs(Number(r && r.amount) || 0) * 100) / 100;
+      if (!cp || !amount) { skipped += 1; continue; }
+
+      if (!remember.run(userId, key, 0, cp.id, amount, now).changes) { skipped += 1; continue; }
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(r.date || '') ? r.date : now.slice(0, 10);
+      const doc = String(r.doc || 'Оплата по выписке').slice(0, 120);
+      const opId = addOp(userId, cp.id, {
+        date, kind: 'Оплата', doc, debit: amount, credit: 0, note: BANK_NOTE,
+      });
+      link.run(opId, userId, key);
+      addedRows.push({ key, opId, cpId: cp.id, amount, date, doc, purpose: String(r.purpose || '').slice(0, 300) });
+      added += 1;
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return { added, skipped, addedRows };
+}
+
+// ---------- связь документов с журналом ----------
+
+/**
+ * Какие документы создают задолженность при таком основании.
+ * Пустой список — режим «вручную»: бот в журнал не лезет.
+ */
+const DEBT_DOCS = {
+  closing: ['usl', 'upd', 'torg12'],
+  invoice: ['sch', 'schdog'],
+  manual: [],
+};
+
+const basisOf = (org) => (DEBT_DOCS[org && org.debt_basis] ? org.debt_basis : 'closing');
+const makesDebt = (org, type) => DEBT_DOCS[basisOf(org)].includes(type);
+
+/**
+ * Расхождение между тем, как человек работает, и тем, как считается долг.
+ *
+ * Счета выписаны и не оплачены, а в долгах их не видно — потому что при
+ * основании «по отгрузке» долг создаёт акт, УПД или накладная, но не счёт.
+ * Так бывает законно, и для учёта это верно: счёт — требование оплаты, а не
+ * первичный документ. Но человеку, который работает счетами, это выглядит
+ * сломанной цифрой: он выписывает счета, а главное число не шевелится.
+ *
+ * Живёт здесь, а не в мини-приложении, потому что спрашивают оба: раньше
+ * объяснение было только на одном экране, и тот, кто смотрел долги в боте,
+ * видел ровно ноль без единого слова.
+ *
+ * @param {number} owedToUs текущая цифра «нам должны» — только для формулировки
+ * @returns {{to:string, count:number, sum:number, zero:boolean}|null}
+ */
+function basisMismatch(userId, org, owedToUs) {
+  // В ручном режиме молчим: человек сам сказал, что журнал ведёт он, и кнопка
+  // рядом с подсказкой молча начала бы делать проводки за него.
+  const basis = basisOf(org || {});
+  if (basis === 'manual') return null;
+
+  /*
+   * Берём все документы, чей вид при нынешнем основании обязательства не
+   * создаёт, — а не только неоплаченные.
+   *
+   * Раньше выборка шла по неоплаченным, и подсказка замолкала ровно тогда,
+   * когда становилась нужнее всего. Человек загружал выписку, счета
+   * помечались оплаченными и выпадали из выборки, а деньги ложились в журнал
+   * проводкой. Обязательства по ним нет — счёт его не создавал, — и сальдо
+   * уходило в минус: клиент, только что расплатившийся, показывался тем,
+   * кому должны мы. Объяснение при этом исчезало.
+   *
+   * Формально минус здесь не выдумка: деньги, полученные до закрывающего
+   * документа, — это аванс, то есть обязательство перед клиентом. Но человеку,
+   * который работает счетами, такое объяснение не нужно: ему нужно, чтобы
+   * долг считался со счёта. Об этом и говорим.
+   */
+  const rows = db.prepare(
+    'SELECT id, cp_id, type, total, paid_at FROM documents WHERE user_id = ? AND total > 0 AND no_debt = 0',
+  ).all(userId);
+  /*
+   * Счета-фактуры на аванс и корректировочные исключаем из этого разбора.
+   *
+   * Они не закрывают реализацию ни при каком основании и потому попадали в
+   * «непосчитанные» всегда: подсказка начинала звать переключить основание из-
+   * за документа, который к основанию отношения не имеет. Аванс выставляется
+   * на уже полученные деньги, а корректировочный меняет сумму прежней
+   * отгрузки — обязательство создаёт она, а не он.
+   */
+  /*
+   * И вообще берём только продажные документы — те, что создают долг хоть
+   * при каком-то основании. Список исключений (аванс, корректировочный) не
+   * спасал от остальных: платёжка, договор и акт сверки тоже попадали в
+   * «непосчитанные», и подсказка замолкала у всякого, кто выписал хоть одну
+   * платёжку поставщику, — вывести из такой смеси, куда переключать, нельзя.
+   */
+  const SALES = [...DEBT_DOCS.closing, ...DEBT_DOCS.invoice];
+  const mute = rows.filter((d) => SALES.includes(d.type) && !DEBT_DOCS[basis].includes(d.type));
+  if (!mute.length) return null;
+
+  /*
+   * Говорим в двух случаях: либо такие документы висят неоплаченными и их
+   * не видно в долге, либо по ним уже пришли деньги и сальдо ушло в минус.
+   * Молчим, когда ни того, ни другого: у человека просто нет документов,
+   * которые его основание не считает, — и лезть с советом незачем.
+   */
+  const unpaidMute = mute.filter((d) => !d.paid_at);
+  const advanceCps = [...new Set(mute.map((d) => d.cp_id))]
+    .filter((id) => (balanceOf(userId, id) || {}).closing < 0);
+  const speak = unpaidMute.length ? unpaidMute
+    : mute.filter((d) => advanceCps.includes(d.cp_id));
+  if (!speak.length) return null;
+  /*
+   * Куда переключать — выводим из самих документов, а не подставляем «по
+   * счёту» всегда. Иначе выходил замкнутый круг: у человека уже стоит «по
+   * счёту», висит неоплаченный акт, экран советует включить включённое,
+   * кнопка ничего не меняет и рапортует «Готово».
+   */
+  const to = speak.every((d) => DEBT_DOCS.invoice.includes(d.type)) ? 'invoice'
+    : (speak.every((d) => DEBT_DOCS.closing.includes(d.type)) ? 'closing' : null);
+  if (!to || to === basis) return null;
+  return {
+    to,
+    count: speak.length,
+    sum: round2(speak.reduce((a, d) => a + (Number(d.total) || 0), 0)),
+    zero: Number(owedToUs || 0) <= 0,
+    // Деньги уже пришли, а обязательства по ним нет — сальдо в минусе.
+    // Экран говорит об этом иначе: не «их не видно», а «показаны авансом».
+    advance: !unpaidMute.length,
+  };
+}
+
+/**
+ * Операция, привязанная к документу: по ней можно отменить и не задвоить.
+ *
+ * Обычно одна на вид: «Реализация» и «Оплата» у документа по одной, и
+ * повторный вызов ничего не портит. Исключение — частичные оплаты из выписки:
+ * «20 000, потом ещё 30 000 по счёту № 1» — это две привязанные строки
+ * «Оплата» у одного документа, и их разрешает `many`.
+ *
+ * @returns {number|false} id созданной строки, false — ничего не создано
+ */
+function addOpForDoc(userId, cpId, op, docId, many = false) {
+  const cp = getCp(userId, cpId);
+  if (!cp) return false;
+  const exists = db.prepare(
+    'SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = ?',
+  ).get(docId, op.kind).n;
+  if (exists && !many) return false;           // повторный вызов ничего не портит
+  /*
+   * Организацию берём с самого документа, а не текущую. Проводка рождена
+   * документом и принадлежит той же фирме, что выписала его, — даже если
+   * человек к этому моменту переключился на другую.
+   */
+  const src = db.prepare('SELECT org_id FROM documents WHERE id = ?').get(docId);
+  const org = (src && Number(src.org_id)) || currentOrgId(userId);
+  const sort = db.prepare(
+    'SELECT COALESCE(MAX(sort),-1)+1 AS s FROM operations WHERE cp_id = ? AND org_id = ?',
+  ).get(cpId, org).s;
+  const info = db.prepare(`INSERT INTO operations(cp_id, org_id, date, kind, doc, debit, credit, note, sort, doc_id)
+              VALUES(?,?,?,?,?,?,?,?,?,?)`)
+    .run(cpId, org, op.date, op.kind || '', op.doc || '', Number(op.debit) || 0,
+      Number(op.credit) || 0, op.note || '', sort, docId);
+  const id = Number(info.lastInsertRowid);
+  noteIncome(userId, id, op);
+  return id;
+}
+
+/** Сколько рублей привязано к документу строками «Оплата» — его оплаченная часть. */
+function linkedPaid(docId) {
+  return round2(db.prepare(
+    "SELECT COALESCE(SUM(debit), 0) AS s FROM operations WHERE doc_id = ? AND kind = 'Оплата'",
+  ).get(Number(docId)).s);
+}
+
+/**
+ * Привести журнал в соответствие с выбранным основанием долга.
+ *
+ * Смена основания раньше меняла одну строчку в настройках и больше ничего.
+ * Человек, который работает счетами, переключался на «долг по счёту» — и не
+ * видел никакой разницы: проводки создаются в момент выписки документа, а
+ * уже выписанные счета так и оставались без них. Главная цифра «должны вам»
+ * стояла нулём, сколько бы счетов он ни выставил.
+ *
+ * Здесь мы досоздаём проводки тем документам, которые теперь создают долг,
+ * и убираем у тех, которые перестали.
+ *
+ * Оплата ходит с реализацией в паре, и вести её надо тем же правилом, что в
+ * markPaid: проводка «Оплата» есть ровно у того документа, который создаёт
+ * долг и отмечен оплаченным. Пока пересчёт трогал одну реализацию, пары
+ * рвались в обе стороны. Арендодатель с четырьмя счетами, три из которых
+ * оплачены, переключался на «долг по счёту» и получал 200 000 вместо 50 000:
+ * реализации создались всем четырём, а оплат не было ни одной. Подрядчик,
+ * наоборот, уходил в минус — оплата по акту оставалась, а её реализацию
+ * пересчёт снимал, и приложение сообщало, что это он должен клиенту.
+ *
+ * Документы, у которых человек отменил проводку руками (no_debt), не трогаем:
+ * его решение — не то же самое, что «мы ещё не создали».
+ */
+function rebuildDebt(userId) {
+  // Пересчёт снимает и возвращает проводки не потому, что деньги пришли или
+  // ушли, — чеки самозанятого он не создаёт и не стирает (adoptCheque).
+  return quietly(() => rebuildDebtInner(userId));
+}
+function rebuildDebtInner(userId) {
+  /*
+   * Основание долга — у каждой организации своё.
+   *
+   * Здесь брали основание текущей фирмы и применяли ко всем документам
+   * человека. Пока фирма одна, это то же самое; с двумя — нет. У подрядчика
+   * долг возникает по акту, у арендодателя по счёту, и человек, ведущий обе,
+   * получил бы пересчёт, который для половины документов заводит проводки не
+   * по тому правилу: у одной фирмы долг задвоится, у другой исчезнет.
+   *
+   * Поэтому правило берём у организации самого документа.
+   */
+  const basisCache = new Map();
+  const typesFor = (orgId) => {
+    if (!basisCache.has(orgId)) {
+      const o = orgId ? db.prepare('SELECT * FROM orgs WHERE id = ?').get(orgId) : null;
+      basisCache.set(orgId, DEBT_DOCS[basisOf(o || currentOrg(userId) || {})]);
+    }
+    return basisCache.get(orgId);
+  };
+  const docs = db.prepare(
+    'SELECT id, cp_id, org_id, type, date, total, number, paid_at, paid_sum, paid_with, no_debt FROM documents WHERE user_id = ? AND total > 0',
+  ).all(userId);
+
+  let added = 0;
+  let removed = 0;
+  let paid = 0;                            // сколько строк оплаты поправили
+  const revived = [];                      // восстановленные проводки оплаты — чекам за ними надо найти хозяина
+  const hasOp = (docId, kind) => db.prepare(
+    'SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = ?',
+  ).get(docId, kind).n > 0;
+  const hasManualPay = (docId) => db.prepare(
+    "SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = 'Оплата' AND note <> ? AND was_free = 0",
+  ).get(docId, BANK_NOTE).n > 0;
+
+  // Одной транзакцией: на середине пересчёта журнал показывал бы долг
+  // наполовину по старому правилу, наполовину по новому.
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const d of docs) {
+      if (!d.cp_id) continue;
+      const title = DOC_TITLES[d.type] || d.type;
+      const should = typesFor(d.org_id).includes(d.type) && !d.no_debt;
+
+      if (should && !hasOp(d.id, 'Реализация')) {
+        if (addOpForDoc(userId, d.cp_id, {
+          date: d.date, kind: 'Реализация', doc: `${title} № ${d.number}`, credit: d.total,
+        }, d.id)) added += 1;
+      } else if (!should && hasOp(d.id, 'Реализация')) {
+        removed += deleteOpsOfDoc(userId, d.id, 'Реализация');
+      }
+
+      /*
+       * Оплату держим в паре с реализацией — и на ту же сумму, что была
+       * записана при отметке (paid_sum). Полная сумма документа годится
+       * только для старых отметок, поставленных до появления этой графы:
+       * если оплата была частичной, пересчёт вернул бы её полной и увёл
+       * сальдо в минус.
+       *
+       * Движение по оплатам считаем отдельно и показываем человеку: раньше
+       * пересчёт мог молча снять оплату на 30 000 и отчитаться «ничего не
+       * менял» — сальдо уезжало, а сообщение говорило обратное.
+       */
+      /*
+       * Восстанавливаем ровно ту сумму, что была записана при отметке, и
+       * только если она была. Ноль в paid_sum означает «проводки по этому
+       * документу нет» — обычно потому, что долг к моменту отметки уже был
+       * закрыт оплатой из журнала или из выписки. Подставлять сюда полную
+       * сумму документа, как раньше, значило считать одну оплату дважды.
+       */
+      const paySum = round2(Number(d.paid_sum) || 0);
+      // Два разных вопроса, и путать их нельзя. «Оплачен» решает, уместна ли
+      // проводка вообще: нет отметки — старую надо убрать. «Есть что
+      // восстанавливать» решает, создавать ли недостающую. Держи мы это одним
+      // условием, документ с отметкой и нулевой суммой лишался бы законной
+      // проводки, пришедшей из выписки.
+      const isPaid = should && Boolean(d.paid_at);
+      const shouldPay = isPaid && paySum > 0;
+      /*
+       * paid_sum — только то, что проводкой записала отметка «Оплатил».
+       * Строки из выписки пересчёт не воссоздаёт: деньги в банке были на самом
+       * деле, при смене основания они остаются в журнале свободной строкой
+       * (releaseBankPay) и возвращаться на документ сами не должны — иначе
+       * туда-обратно по основаниям оплата выходила бы дважды. Поэтому и
+       * «есть ли что-то привязанное» спрашиваем только про такие, ручные, строки.
+       */
+      if (shouldPay && !hasManualPay(d.id)) {
+        const restored = addOpForDoc(userId, d.cp_id, {
+          date: d.paid_at,
+          kind: 'Оплата',
+          doc: `${title} № ${d.number}`,
+          debit: paySum,
+        }, d.id, true);
+        if (restored) {
+          paid += 1;
+          revived.push({ d, opId: restored, sum: paySum });
+        }
+      } else if (!should && hasOp(d.id, 'Оплата')) {
+        // Документ долга больше не создаёт — оплата без пары не нужна.
+        paid += deleteOpsOfDoc(userId, d.id, 'Оплата');
+      }
+      /*
+       * Документ долг создаёт, но не отмечен оплаченным, а привязанные оплаты у
+       * него есть — это частичные оплаты из выписки («20 000 из 50 000»). Их
+       * не трогаем: раньше пересчёт снимал любую привязанную оплату у
+       * неотмеченного документа, и частичная оплата терялась.
+       */
+    }
+    // Чек прежней проводки переезжает на новую. Делаем это после обхода всех документов:
+    // пока он идёт, старая проводка пары может ещё существовать (порядок документов любой).
+    for (const r of revived) {
+      if (adoptCheque(userId, r.d, r.opId, r.sum)) continue;
+      // Хозяина у чека не нашлось (его ожидание снимали раньше), а деньги в журнале снова есть —
+      // чек на них нужен, как на любое поступление.
+      try { require('./cheques').recordIncome(userId, r.opId); } catch (e) {
+        console.error('чек самозанятого не записан:', e && e.message);
+      }
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return { added, removed, paid };
+}
+
+/**
+ * Вернуть документ в долг после отмены проводки руками.
+ *
+ * Без этого отмена была дорогой в один конец: флаг no_debt ставился, а снять
+ * его было нечем — документ навсегда выпадал из долга, продолжая при этом
+ * числиться в «Ждут оплаты». Кнопка «Вернуть в долг» — обратный ход, и
+ * пересчёт восстанавливает пару целиком, включая оплату.
+ */
+function restoreDebt(userId, docId) {
+  const d = getDoc(userId, docId);
+  if (!d) return false;
+  db.prepare('UPDATE documents SET no_debt = 0 WHERE id = ? AND user_id = ?').run(docId, userId);
+  rebuildDebt(userId);
+  return true;
+}
+
+function opsOfDoc(userId, docId) {
+  const d = getDoc(userId, docId);
+  if (!d) return [];
+  return db.prepare('SELECT * FROM operations WHERE doc_id = ? ORDER BY id').all(docId);
+}
+
+/*
+ * Оплата из выписки — деньги, которые на самом деле пришли на счёт.
+ * Привязка к документу — только наше решение, какой счёт они закрыли.
+ * Снимая отметку, удаляя документ или меняя основание долга, человек
+ * отменяет решение, а не поступление, — поэтому строку не удаляем, а
+ * отвязываем. Раньше она удалялась, а отметка в bank_imports оставалась,
+ * и та же выписка при повторной загрузке строку пропускала: деньги
+ * пропадали из учёта насовсем.
+ *
+ * Узнаём такую строку по пометке (её ставят importBankRows и
+ * closeDocsFromBank) или по ссылке из bank_imports — у строк, привязанных
+ * до появления пометки, есть только ссылка.
+ *
+ * @returns {{n: number, sum: number}} сколько строк и рублей осталось в
+ *   журнале свободной оплатой
+ */
+const BANK_NOTE = 'банковская выписка';
+function releaseBankPay(userId, docId) {
+  // Свободные оплаты, привязанные словами человека, отвязываются так же, как
+  // банковские: деньги пришли на самом деле, а привязка — только наше решение.
+  const where = `doc_id = ? AND kind = 'Оплата'
+    AND (note = ? OR was_free = 1 OR id IN (SELECT op_id FROM bank_imports WHERE user_id = ?))`;
+  const { s } = db.prepare(`SELECT COALESCE(SUM(debit), 0) AS s FROM operations WHERE ${where}`)
+    .get(docId, BANK_NOTE, userId);
+  const ids = db.prepare(`SELECT id FROM operations WHERE ${where}`).all(docId, BANK_NOTE, userId).map((r) => r.id);
+  // Пометку «банковская выписка» ставим только строкам из банка; у свободной
+  // оплаты остаётся её собственная подпись.
+  const n = db.prepare(`UPDATE operations SET doc_id = 0, note = CASE WHEN was_free = 1 THEN note ELSE ? END,
+      was_free = 0 WHERE ${where}`)
+    .run(BANK_NOTE, docId, BANK_NOTE, userId).changes;
+  // Деньги пришли на самом деле — чек по ним остаётся, но уже не «за документ».
+  if (ids.length) {
+    try {
+      db.prepare(`UPDATE npd_cheques SET doc_id = 0 WHERE user_id = ? AND op_id IN (${ids.map(() => '?').join(',')})`)
+        .run(userId, ...ids);
+    } catch (_) { /* таблицы нет */ }
+  }
+  return { n, sum: round2(Number(s) || 0) };
+}
+
+function deleteOpsOfDoc(userId, docId, kind = null) {
+  const d = getDoc(userId, docId);
+  if (!d) return 0;
+  const kept = !kind || kind === 'Оплата' ? releaseBankPay(userId, docId).n : 0;
+  // Чек ждали по оплате, которой больше нет, — ожидание снимаем вместе с ней.
+  const payIds = !kind || kind === 'Оплата'
+    ? db.prepare("SELECT id FROM operations WHERE doc_id = ? AND kind = 'Оплата'").all(docId).map((r) => r.id)
+    : [];
+  dropChequeWait(userId, { opIds: payIds });
+  const info = kind
+    ? db.prepare('DELETE FROM operations WHERE doc_id = ? AND kind = ?').run(docId, kind)
+    : db.prepare('DELETE FROM operations WHERE doc_id = ?').run(docId);
+  return info.changes + kept;
+}
+
+/*
+ * Чеки самозанятого (lib/cheques.js) — по каждому поступлению.
+ *
+ * Деньги вносят из десятка мест: «Оплатил», оплата словами, выписка, предоплата,
+ * повторяющаяся операция, фото. Чек нужен на каждое поступление, поэтому запись
+ * заводим здесь, в момент появления проводки «Оплата», а не в каждом экране
+ * отдельно — забытый экран означал бы потерянный чек, а срок по закону жёсткий.
+ *
+ * Модуль чеков зависит от этого файла, поэтому подключаем его по требованию.
+ * Ошибка учёта чеков не должна ронять учёт денег: проводка уже записана, а
+ * чек можно завести и позже — пишем в журнал ошибок и идём дальше.
+ *
+ * chequesQuiet — пересчёт и перестановка денег внутри выписки: там проводки
+ * создаются и удаляются не потому, что пришли или ушли деньги, и чекам про это
+ * знать незачем (они переезжают сами, см. moveCheque и adoptCheque).
+ */
+let chequesQuiet = 0;
+function quietly(fn) {
+  chequesQuiet += 1;
+  try { return fn(); } finally { chequesQuiet -= 1; }
+}
+function noteIncome(userId, opId, op) {
+  if (chequesQuiet || !(Number(op && op.debit) > 0) || (op.kind || '') !== 'Оплата') return;
+  try { require('./cheques').recordIncome(userId, opId); } catch (e) {
+    console.error('чек самозанятого не записан:', e && e.message);
+  }
+}
+
+/** Отметили оплату документа, который в журнал деньгами не лёг: чек самозанятому всё равно нужен. */
+function noteDocIncome(userId, docId) {
+  if (chequesQuiet) return;
+  try { require('./cheques').recordForDoc(userId, docId); } catch (e) {
+    console.error('чек самозанятого не записан:', e && e.message);
+  }
+}
+
+/**
+ * Проводки сняли — самозанятому не от чего ждать чека по ним. Пробитый чек не
+ * трогаем: он уже в налоговой. Прямой запрос, а не вызов модуля чеков: тот сам
+ * зависит от этого файла. Таблицы может не быть, если модуль не подключали, —
+ * тогда и ждать нечего.
+ *
+ * @param {{opIds?: number[], docId?: number}} what проводки; docId — ещё и
+ *   записи документа без живой проводки: старые (op_id = 0) и оставшиеся от
+ *   проводки, которую пересчёт основания снял
+ */
+function dropChequeWait(userId, { opIds = [], docId = 0 } = {}) {
+  if (chequesQuiet) return;
+  try {
+    for (const id of opIds) {
+      db.prepare("DELETE FROM npd_cheques WHERE user_id = ? AND op_id = ? AND status = 'open'")
+        .run(userId, Number(id));
+    }
+    if (docId) {
+      // Старые записи без проводки и записи, чья проводка исчезла при пересчёте основания.
+      db.prepare(`DELETE FROM npd_cheques WHERE user_id = ? AND doc_id = ? AND status = 'open'
+                    AND (op_id = 0 OR op_id NOT IN (SELECT id FROM operations))`)
+        .run(userId, Number(docId));
+    }
+  } catch (_) { /* таблицы нет */ }
+}
+
+/**
+ * Пересчёт восстановил проводку оплаты под новым номером — чек, оставшийся от
+ * прежней (проводки уже нет), переезжает на неё. Ищем сначала среди чеков самого
+ * документа и его пары, потом по клиенту и сумме. Новый чек не заводим: деньги
+ * те же, а не новые.
+ */
+function adoptCheque(userId, doc, newOpId, amount) {
+  try {
+    const gone = 'op_id > 0 AND op_id NOT IN (SELECT id FROM operations)';
+    const kin = db.prepare('SELECT id FROM documents WHERE user_id = ? AND (id = ? OR paid_with = ? OR id = ?)')
+      .all(userId, doc.id, doc.id, Number(doc.paid_with) || 0).map((r) => r.id);
+    let row = kin.length
+      ? db.prepare(`SELECT id FROM npd_cheques WHERE user_id = ? AND ${gone} AND doc_id IN (${kin.map(() => '?').join(',')})
+                     AND ABS(amount - ?) < 0.005 ORDER BY id LIMIT 1`).get(userId, ...kin, amount)
+      : null;
+    if (!row) {
+      row = db.prepare(`SELECT id FROM npd_cheques WHERE user_id = ? AND ${gone} AND cp_id = ?
+                         AND ABS(amount - ?) < 0.005 ORDER BY id LIMIT 1`).get(userId, doc.cp_id, amount);
+    }
+    if (row) {
+      db.prepare('UPDATE npd_cheques SET op_id = ?, doc_id = ? WHERE id = ?').run(newOpId, doc.id, row.id);
+      return true;
+    }
+  } catch (_) { /* таблицы нет */ }
+  return false;
+}
+
+/**
+ * Часть денег (или все) переехала со свободной строки выписки на документ.
+ *
+ * Чек самозанятого относится к деньгам, а не к строке: платёж целиком — чек
+ * переезжает вместе с ним; переехала часть — непробитый чек делится на две
+ * записи (остаток на старой строке и переехавшая сумма на новой). Уже пробитый
+ * чек покрывает платёж целиком, делить его не нужно и нельзя.
+ */
+function moveCheque(userId, srcOpId, { dropped, rest, freshId, docId, total }) {
+  try {
+    const old = db.prepare('SELECT * FROM npd_cheques WHERE user_id = ? AND op_id = ?').get(userId, srcOpId);
+    if (!old) {
+      if (freshId) noteIncome(userId, freshId, { debit: total, kind: 'Оплата' });
+      return;
+    }
+    if (dropped) {
+      db.prepare('UPDATE npd_cheques SET op_id = ?, doc_id = ? WHERE id = ?').run(freshId, docId, old.id);
+    } else if (old.status === 'open') {
+      db.prepare('UPDATE npd_cheques SET amount = ? WHERE id = ?').run(rest, old.id);
+      db.prepare(`INSERT INTO npd_cheques(user_id, org_id, doc_id, cp_id, amount, service, buyer_inn, buyer_name,
+          paid_at, due, status, created_at, op_id, notified) VALUES(?,?,?,?,?,?,?,?,?,?,'open',?,?,?)`)
+        .run(userId, old.org_id, docId, old.cp_id, total, old.service, old.buyer_inn, old.buyer_name,
+          old.paid_at, old.due, new Date().toISOString(), freshId, old.notified);
+    }
+  } catch (_) { /* таблицы нет */ }
+}
+
+/**
+ * Сделка, в которую входит документ: главный (создаёт долг при выбранном
+ * основании) и парный (счёт к акту или акт к счёту — те же деньги).
+ *
+ * Парных ищем среди неоплаченных документов этого клиента той же фирмы тем же
+ * правилом, что и «Ждут оплаты» (dealTotals), — расходиться им нельзя.
+ *
+ * @returns {{lead: object, twin: object|null}}
+ */
+function dealOf(userId, d) {
+  const solo = { lead: d, twin: null };
+  if (!d.cp_id || !(Number(d.total) > 0) || d.no_debt) return solo;
+  const org = orgOfDoc(userId, d) || {};
+  if (basisOf(org) === 'manual') return solo;
+  const docs = db.prepare(`
+    SELECT * FROM documents
+     WHERE user_id = ? AND cp_id = ? AND org_id = ? AND paid_at = '' AND total > 0
+       AND type IN ('sch','schdog','usl','upd','torg12')`)
+    .all(userId, d.cp_id, Number(d.org_id) || 0).map(withPayload);
+  if (!docs.some((x) => x.id === d.id)) docs.push(d);
+  dealTotals(userId, docs, basisOf(org));
+  const me = docs.find((x) => x.id === d.id);
+  if (me.pair) {
+    const lead = docs.find((x) => x.id === me.pairOf);
+    return lead ? { lead, twin: d } : solo;
+  }
+  return { lead: d, twin: docs.find((x) => x.pair && x.pairOf === d.id) || null };
+}
+
+/** Отметка оплаты документа + поступление денег в журнал. */
+function markPaid(userId, docId, date) {
+  const d = getDoc(userId, docId);
+  if (!d) return null;
+  const when = /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? date : todayISO();
+  /*
+   * Повторная отметка уже оплаченного документа — холостая.
+   *
+   * Раньше она шла дальше: пересчитывала «остаток» по долгу клиента целиком и
+   * могла записать чужие деньги на этот документ — накладная № 3 исчезала из
+   * долга оттого, что дважды нажали на № 1. Отметка уже стоит; чтобы
+   * изменить дату или сумму, её снимают и ставят заново.
+   */
+  if (d.paid_at) return d.paid_at;
+
+  // В ручном режиме журнал ведёт человек, и лезть туда нельзя: проводка
+  // оплаты без встречной реализации увела бы сальдо в минус — вышло бы,
+  // что это мы должны контрагенту. Отметку об оплате при этом сохраняем:
+  // она нужна списку «Не оплачено» и живёт отдельно от журнала.
+  /*
+   * Основание долга и сальдо — фирмы ДОКУМЕНТА, той же, куда addOpForDoc
+   * положит проводку. Раньше брались по текущей: документ фирмы Б при
+   * выбранной фирме А получал основание и сальдо А, выходило left = 0 —
+   * документ помечался оплаченным, а долг в фирме Б оставался висеть.
+   */
+  const org = orgOfDoc(userId, d);
+  const docOrgId = Number(d.org_id) || currentOrgId(userId);
+
+  /*
+   * Сделка целиком. Счёт и закрывающий его акт на одну сумму — одни деньги, и
+   * «Оплатил» на любом из них оплачивает оба: проводка ложится на тот, что
+   * создаёт долг, а парный получает отметку со ссылкой на него (как при
+   * закрытии из выписки). Без этого при смене основания парный документ,
+   * оставшийся «неоплаченным», становился главным и оживлял закрытый долг.
+   */
+  const { lead, twin } = dealOf(userId, d);
+  const mark = db.prepare('UPDATE documents SET paid_at = ?, paid_with = ? WHERE id = ? AND user_id = ?');
+  mark.run(when, lead.id === d.id ? 0 : lead.id, d.id, userId);
+  if (lead.id !== d.id) mark.run(when, 0, lead.id, userId);
+  if (twin && twin.id !== d.id) mark.run(when, lead.id, twin.id, userId);
+
+  if (basisOf(org || {}) === 'manual') {
+    settleMonthActs(userId, d.cp_id);
+    noteDocIncome(userId, lead.id);
+    return when;
+  }
+
+  /*
+   * Проводку оплаты делаем только по тому документу, который создаёт долг.
+   *
+   * Иначе одна оплата попадала в журнал дважды. При основании «по счёту»
+   * долг создаёт счёт; человек отмечает оплаченным и счёт, и закрывающий
+   * его акт — оба с суммой 30 000, — и сальдо уходит в минус, это мы
+   * должны клиенту, который просто заплатил один раз.
+   */
+  /*
+   * И только на то, что по документу ещё не оплачено.
+   *
+   * Остаток документа — его сумма минус оплаты, ПРИВЯЗАННЫЕ к нему (частичная
+   * оплата из выписки «20 000 из 50 000» уже лежит на документе). Свободная
+   * оплата, внесённая строкой в журнал, документу не приписывается: мы не
+   * знаем, за что именно она пришла.
+   *
+   * Одно исключение, давнее и описанное выше: человек вносит оплату строкой —
+   * «пришло 20 000 из 50 000», — а потом жмёт «оплачен», имея в виду
+   * «остальное тоже пришло». Полная сумма поверх неё давала −20 000, и
+   * приложение объявляло, что это мы должны клиенту, который просто доплатил.
+   * Поэтому берём меньшее из остатка и долга клиента: аванс и свободная оплата
+   * уменьшают то, что осталось закрыть, но минус «Оплатил» не создаёт никогда.
+   */
+  let left = 0;
+  const leadDebt = lead.cp_id && lead.total && !lead.no_debt && makesDebt(org || {}, lead.type);
+  if (leadDebt) {
+    const rem = Math.max(0, round2(Number(lead.total) - linkedPaid(lead.id)));
+    const bal = balanceOf(userId, lead.cp_id, docOrgId);
+    const debt = Math.max(0, round2(bal ? bal.closing : 0));
+    left = round2(Math.min(rem, debt));
+    if (left > 0) {
+      addOpForDoc(userId, lead.cp_id, {
+        date: when, kind: 'Оплата', doc: `${lead.title} № ${lead.number}`, debit: left,
+      }, lead.id, true);
+    }
+    /*
+     * Записываем всегда, в том числе ноль.
+     *
+     * Раньше запись стояла внутри условия, и когда долг к моменту отметки был
+     * уже закрыт — клиент заплатил вперёд или оплату внесли строкой в журнал,
+     * — проводки не появлялось, а paid_sum оставался нулём. Пересчёт видел
+     * отметку без проводки и создавал её на ПОЛНУЮ сумму документа: ноль он
+     * считал за «графы не было». Оплата удваивалась, сальдо уходило в минус,
+     * и приложение сообщало, что это вы должны клиенту, который заплатил.
+     *
+     * Теперь у графы одно значение: сколько именно записано проводкой по
+     * этому документу. Ноль означает «проводки нет», а не «неизвестно», и
+     * догадываться пересчёту больше не о чем.
+     *
+     * Парному документу пишем ту же сумму: при смене основания проводка
+     * переедет на него, и пересчёт восстановит её там.
+     */
+    db.prepare('UPDATE documents SET paid_sum = ? WHERE id = ? AND user_id = ?').run(left, lead.id, userId);
+    if (twin) db.prepare('UPDATE documents SET paid_sum = ? WHERE id = ? AND user_id = ?').run(left, twin.id, userId);
+  } else {
+    // В журнале денег не видно, а получены они — самозанятому чек всё равно нужен.
+    noteDocIncome(userId, lead.id);
+  }
+  settleMonthActs(userId, d.cp_id);
+  return when;
+}
+
+/**
+ * Свободные оплаты клиента, одну из которых человек мог иметь в виду, нажимая
+ * «Оплатил»: до трёх, самые подходящие по сумме.
+ *
+ * Почему вообще спрашиваем. Человек вносит оплату строкой («пришло 3 000»), а
+ * потом, выписав накладные, жмёт «Оплатил» на первой — и по смыслу это та же
+ * самая оплата. Новая проводка поверх неё записывала те же деньги дважды: при
+ * накладных 3 000 и 4 000 долг после этого был 1 000 вместо 4 000. Угадать
+ * за человека нельзя — оплата могла быть и за что-то другое, — поэтому
+ * спрашиваем и привязываем только по его слову.
+ *
+ * Спрашиваем лишь там, где ответ меняет учёт: документ создаёт долг (иначе
+ * оплата привязывать не к чему — см. closeDocsFromBank) и остаток по нему
+ * не нулевой. Предоплату не предлагаем: она предназначена для отгрузок и
+ * гасится сама.
+ *
+ * @returns {Array<{opId:number, amount:number, date:string, doc:string, rem:number, enough:boolean}>}
+ *   enough — сумма покрывает остаток документа целиком
+ */
+function freePaymentsFor(userId, docId, limit = 3) {
+  const d = getDoc(userId, docId);
+  if (!d || d.paid_at || !d.cp_id || !(Number(d.total) > 0)) return [];
+  const cp = getCp(userId, d.cp_id);
+  if (!cp || cp.kind === 'supplier') return [];
+  const { lead } = dealOf(userId, d);
+  const org = orgOfDoc(userId, d) || {};
+  if (lead.no_debt || !lead.cp_id || !(Number(lead.total) > 0) || !makesDebt(org, lead.type)) return [];
+  const rem = Math.max(0, round2(Number(lead.total) - linkedPaid(lead.id)));
+  if (rem <= 0.004) return [];
+  const orgId = Number(d.org_id) || currentOrgId(userId);
+  const rows = db.prepare(`
+    SELECT id, date, doc, debit FROM operations
+     WHERE cp_id = ? AND org_id = ? AND kind = 'Оплата' AND doc_id = 0 AND debit > 0 AND note <> 'Предоплата'
+     ORDER BY date DESC, id DESC`).all(d.cp_id, orgId);
+  return rows
+    .map((o) => ({
+      opId: o.id, amount: round2(o.debit), date: o.date, doc: o.doc || '', rem,
+      enough: round2(o.debit) >= rem - 0.004,
+    }))
+    // Ближе всего к остатку — первой; при равенстве свежая оплата вероятнее старой.
+    .sort((a, b) => Math.abs(a.amount - rem) - Math.abs(b.amount - rem))
+    .slice(0, limit);
+}
+
+const dayMonth = (iso) => `${String(iso).slice(8, 10)}.${String(iso).slice(5, 7)}`;
+
+/** Подпись кнопки: «3 000 ₽ от 12.10». */
+const freePaymentLabel = (p) => `${fmtRub(p.amount)} от ${dayMonth(p.date)}`;
+
+/**
+ * Вопрос человеку: «Это она?» — одним текстом для бота и приложения.
+ * Названия клиента не склоняем (ООО «Заря» в родительный не поставить), поэтому
+ * «у клиента …», а не «у Зари».
+ */
+function freePaymentQuestion(cpName, list) {
+  const day = dayMonth;
+  const who = cpName ? `клиента ${cpName}` : 'клиента';
+  if (list.length === 1) {
+    const p = list[0];
+    return `У ${who} уже есть оплата ${fmtRub(p.amount)} от ${day(p.date)}, `
+      + 'не привязанная к документу. Это она?';
+  }
+  return `У ${who} есть оплаты, не привязанные к документу. Какая из них за этот документ?`;
+}
+
+/**
+ * Привязать свободную оплату к документу — по слову человека «Да, это она».
+ *
+ * Новой проводки нет: деньги уже в журнале, сальдо не меняется ни на копейку.
+ * Меняется только то, что известно про эти деньги, — за какой они документ.
+ *
+ *   • Оплата не больше остатка документа — привязывается вся строка (doc_id).
+ *     Меньше остатка — это частичная оплата, документ остаётся в «Ждут оплаты»
+ *     с остатком, как при частичной оплате из выписки.
+ *   • Оплата больше остатка — привязывается часть, остальное остаётся
+ *     свободной строкой, как делает закрытие из выписки (closeDocsFromBank).
+ *
+ * Чек самозанятого по этим деньгам уже заведён при внесении оплаты и переезжает
+ * вместе со строкой — второй не появляется (moveCheque).
+ *
+ * @returns {null|{linked:number, left:number, partial:boolean, paidAt:string, rest:number}}
+ *   null — такой свободной оплаты для этого документа нет (уже привязали,
+ *   удалили, другой клиент); left — сколько осталось закрыть по документу
+ */
+function linkFreePayment(userId, docId, opId) {
+  const d = getDoc(userId, docId);
+  if (!d || d.paid_at) return null;
+  // Проверяем, что это действительно свободная оплата ЭТОГО клиента и фирмы: opId приходит из запроса.
+  const p = freePaymentsFor(userId, docId, 1000).find((x) => x.opId === Number(opId));
+  if (!p) return null;
+  const { lead, twin } = dealOf(userId, d);
+  const src = db.prepare('SELECT * FROM operations WHERE id = ?').get(p.opId);
+  const amount = Math.min(p.amount, p.rem);
+  const whole = amount >= round2(src.debit) - 0.004;
+  const full = amount >= p.rem - 0.004;
+  const rest = whole ? 0 : round2(src.debit - amount);
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if (whole) {
+      db.prepare('UPDATE operations SET doc_id = ?, was_free = 1 WHERE id = ?').run(lead.id, src.id);
+      try {
+        db.prepare('UPDATE npd_cheques SET doc_id = ? WHERE user_id = ? AND op_id = ?').run(lead.id, userId, src.id);
+      } catch (_) { /* таблицы нет */ }
+    } else {
+      db.prepare('UPDATE operations SET debit = ? WHERE id = ?').run(rest, src.id);
+      // Новая строка — те же деньги, а не новые: чек за них не заводим заново.
+      const freshId = quietly(() => addOpForDoc(userId, lead.cp_id, {
+        date: src.date, kind: 'Оплата', doc: src.doc, debit: amount, note: src.note,
+      }, lead.id, true));
+      db.prepare('UPDATE operations SET was_free = 1 WHERE id = ?').run(freshId);
+      moveCheque(userId, src.id, { dropped: false, rest, freshId, docId: lead.id, total: amount });
+    }
+    if (full) {
+      const mark = db.prepare('UPDATE documents SET paid_at = ?, paid_with = ? WHERE id = ? AND user_id = ?');
+      mark.run(p.date, lead.id === d.id ? 0 : lead.id, d.id, userId);
+      if (lead.id !== d.id) mark.run(p.date, 0, lead.id, userId);
+      if (twin && twin.id !== d.id) mark.run(p.date, lead.id, twin.id, userId);
+    }
+    settleMonthActs(userId, d.cp_id);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return {
+    linked: amount, rest, partial: !full, paidAt: full ? p.date : '',
+    left: full ? 0 : round2(p.rem - amount), leadId: lead.id,
+  };
+}
+
+/**
+ * @returns {false|{kept: number}} kept — сколько рублей из выписки осталось
+ *   в журнале: долг по документу при этом не вернётся, и человеку надо
+ *   сказать почему.
+ */
+function unmarkPaid(userId, docId) {
+  const d = getDoc(userId, docId);
+  if (!d) return false;
+  /*
+   * Оплата сделки снимается целиком. Нажали на парный документ (акт к
+   * счёту) — снимать надо с главного: отметка о паре лежит на нём.
+   */
+  const lead = Number(d.paid_with) > 0 ? getDoc(userId, d.paid_with) : null;
+  if (lead) return unmarkPaid(userId, lead.id);
+  /*
+   * Проводка оплаты могла переехать на парный документ: при смене основания
+   * долг создаёт уже он, и пересчёт восстановил оплату именно там. Поэтому
+   * чистим оплаты у всех документов сделки, а не только у того, на котором
+   * нажали.
+   */
+  const twins = db.prepare('SELECT id FROM documents WHERE paid_with = ? AND user_id = ?').all(docId, userId)
+    .map((r) => r.id);
+  db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0 WHERE id = ? AND user_id = ?").run(docId, userId);
+  db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0, paid_with = 0 WHERE paid_with = ? AND user_id = ?")
+    .run(docId, userId);
+  let kept = 0;
+  for (const id of [docId, ...twins]) {
+    dropChequeWait(userId, { docId: id });            // старые записи без проводки
+    kept += releaseBankPay(userId, id).sum;
+    deleteOpsOfDoc(userId, id, 'Оплата');
+  }
+  settleMonthActs(userId, d.cp_id);
+  return { kept: round2(kept) };
+}
+
+/**
+ * Акт за месяц оплачен ровно тогда, когда оплачены документы, которые он
+ * закрывает. Сам он долга не создаёт (noDebt) и денег не принимает — только
+ * повторяет отметку своих накладных.
+ *
+ * Раньше акт помечался оплаченным при выпуске, даже если по месяцу оставался
+ * долг: «Оплачен» на документе, который клиенту ещё должен закрыть, — неправда.
+ * Теперь отметка следует за документами месяца: ставится, когда оплачен
+ * последний из них, и снимается, если оплату одного из них отменили.
+ */
+function settleMonthActs(userId, cpId) {
+  if (!cpId) return;
+  const acts = db.prepare(`
+    SELECT * FROM documents
+     WHERE user_id = ? AND cp_id = ? AND type = 'usl' AND no_debt = 1 AND payload LIKE '%"monthAct"%'
+     ORDER BY id`).all(userId, cpId).map(withPayload).filter((a) => a.payload && a.payload.monthAct);
+  const prevByMonth = new Map();
+  for (const a of acts) {
+    const ym = a.payload.monthAct;
+    const key = `${a.org_id}|${ym}`;
+    const prev = prevByMonth.get(key) || 0;
+    prevByMonth.set(key, a.id);
+    const covered = db.prepare(`
+      SELECT paid_at FROM documents
+       WHERE user_id = ? AND org_id = ? AND cp_id = ? AND type IN ('torg12','upd') AND no_debt = 0
+         AND date LIKE ? AND id > ? AND id < ?`).all(userId, a.org_id, cpId, `${ym}-%`, prev, a.id);
+    if (!covered.length) continue;
+    const allPaid = covered.every((x) => x.paid_at);
+    if (allPaid && !a.paid_at) {
+      const last = covered.map((x) => x.paid_at).sort().pop();
+      db.prepare('UPDATE documents SET paid_at = ? WHERE id = ? AND user_id = ?').run(last, a.id, userId);
+    } else if (!allPaid && a.paid_at) {
+      db.prepare("UPDATE documents SET paid_at = '' WHERE id = ? AND user_id = ?").run(a.id, userId);
+    }
+  }
+}
+
+/** Документы за период — для реестра. Имя контрагента подставляем сразу. */
+/**
+ * Документы за период — ОДНОЙ организации.
+ *
+ * Реестр и книга продаж, собранные сразу по двум юрлицам, негодны для того,
+ * ради чего их и собирают: сверки с декларацией. У каждой фирмы своя
+ * декларация, свой ряд номеров и свой НДС, а в одном файле это превращается
+ * в кашу, которую бухгалтер разберёт только вручную — если вообще заметит,
+ * что там две фирмы.
+ */
+function docsBetween(userId, from, to, cpId = null, orgId = null) {
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const rows = cpId
+    ? db.prepare(`SELECT * FROM documents WHERE user_id = ? AND org_id = ? AND date >= ? AND date <= ?
+                    AND cp_id = ? ORDER BY date, id`).all(userId, org, from, to, cpId)
+    : db.prepare(`SELECT * FROM documents WHERE user_id = ? AND org_id = ? AND date >= ? AND date <= ?
+                    ORDER BY date, id`).all(userId, org, from, to);
+  const names = new Map();
+  return rows.map(withPayload).map((d) => {
+    if (d.cp_id && !names.has(d.cp_id)) {
+      const cp = getCp(userId, d.cp_id);
+      names.set(d.cp_id, cp ? cp.name : '');
+    }
+    return { ...d, cpName: d.cp_id ? names.get(d.cp_id) : '' };
+  });
+}
+
+/*
+ * Типы документов, которые попадают в реестр: то, чем что-то продано.
+ *
+ * Раньше в реестр шло всё подряд, и «ИТОГО» оказывался в шесть с лишним раз
+ * больше продажи: счёт, накладная и акт одной сделки складывались втроём, к
+ * ним добавлялись платёжка (деньги, а не продажа) и акт сверки (сумма долга,
+ * а не выручка), а у двух последних ещё и горела красная «не оплачен» — у
+ * платёжки и акта сверки оплаты быть не может.
+ */
+const REGISTRY_TYPES = ['sch', 'schdog', 'usl', 'upd', 'torg12', 'avans', 'ksf'];
+const DEAL_TYPES = ['sch', 'schdog', 'usl', 'upd', 'torg12'];
+
+/**
+ * Документы для реестра: только продажные и без второго документа сделки.
+ *
+ * Парных ищем тем же правилом, что «Ждут оплаты» (dealTotals): счёт и
+ * закрывающий его акт на одну сумму — одна сделка, в реестре остаётся тот,
+ * что создаёт долг при выбранном основании. Акт за месяц повторяет накладные
+ * месяца и тоже не считается второй раз.
+ *
+ * @returns {{docs: object[], twins: number, other: number}} twins — сколько
+ *   парных документов не показано, other — сколько непродажных (платёжки,
+ *   акты сверки, договоры) пропущено
+ */
+function registryDocs(userId, docs) {
+  const sale = (docs || []).filter((d) => REGISTRY_TYPES.includes(d.type));
+  const deal = sale.filter((d) => DEAL_TYPES.includes(d.type)).map((d) => ({ ...d }));
+  const org = (deal[0] && orgOfDoc(userId, deal[0])) || currentOrg(userId) || {};
+  dealTotals(userId, deal, basisOf(org));
+  const twin = new Set(deal.filter((d) => d.pair).map((d) => d.id));
+  return {
+    docs: sale.filter((d) => !twin.has(d.id)),
+    twins: twin.size,
+    other: (docs || []).length - sale.length,
+  };
+}
+
+/**
+ * Неоплаченные документы с суммой — то, за чем следят каждый день.
+ *
+ * У каждого `paid` — сколько уже привязано к нему оплатами (частичная оплата
+ * из выписки) и `left` — сколько осталось. Складывать «ждут оплаты» надо по
+ * `left`: документ, на который пришло 20 000 из 50 000, ждёт 30 000, а не 50 000.
+ */
+function unpaidDocs(userId, limit = 50) {
+  const rows = db.prepare(`
+    SELECT * FROM documents
+     WHERE user_id = ? AND paid_at = '' AND total > 0
+       AND type IN ('sch','schdog','usl','upd','torg12')
+     ORDER BY date, id LIMIT ?`).all(userId, limit);
+  return rows.map(withPayload).map((d) => {
+    const paid = linkedPaid(d.id);
+    return { ...d, paid, left: Math.max(0, round2(Number(d.total) - paid)) };
+  });
+}
+
+/**
+ * Сколько денег ждём — одним числом, без задвоения по одной сделке.
+ *
+ * Список неоплаченных показываем целиком: человек хочет видеть оба документа.
+ * А вот складывать их нельзя. На одну сделку выписывают счёт и закрывающий
+ * его акт на те же 30 000 — markPaid прямо пишет, что это обычное дело, — и
+ * в сводке выходило 60 000. Считаем сделками: у одного контрагента счёт и
+ * закрывающий документ на одну и ту же сумму — это одна сделка, а не две.
+ *
+ * Число берут и плитка на главной, и сводка в боте, и напоминание: пока
+ * каждый считал сам, они расходились между собой.
+ */
+const CLOSING_DOCS = ['usl', 'upd', 'torg12'];
+
+/**
+ * Пометить дубли пары прямо на документах и посчитать сделки.
+ *
+ * Считать сделки одним числом было мало: плитка на главной брала это число,
+ * а экран за ней и сводка в боте складывали список сами — и показывали
+ * вдвое больше. Человек видел «30 000», нажимал и получал «2 счёта на
+ * 60 000». Поэтому теперь отметка живёт на самом документе: у кого стоит
+ * `pair`, тот в сумму не идёт, и складывать список может кто угодно.
+ *
+ * Главный в паре — тот, что создаёт долг: при «долге по отгрузке» это акт,
+ * при «долге по счёту» — счёт. Второй его повторяет. В ручном режиме
+ * правила нет, и пары не ищем.
+ */
+/*
+ * Насколько далеко друг от друга могут стоять счёт и закрывающий его акт,
+ * чтобы считаться одной сделкой.
+ *
+ * Без этого окна одинаковая сумма склеивала что угодно: у аренды и
+ * обслуживания — тех самых дел, ради которых сделаны напоминания, — счёт
+ * каждый месяц один и тот же. Неоплаченный январский акт на 50 000 и
+ * августовский счёт на 50 000 — это два разных долга, а выглядели одной
+ * сделкой, и сводка показывала половину того, что человеку должны.
+ *
+ * Полтора месяца покрывают обычный порядок «счёт в конце месяца — акт в
+ * начале следующего» и любую нормальную отсрочку, но не сводят вместе
+ * документы из разных кварталов.
+ */
+const DEAL_WINDOW_DAYS = 45;
+
+const dayNum = (iso) => {
+  const t = Date.parse(`${String(iso || '').slice(0, 10)}T00:00:00Z`);
+  return Number.isFinite(t) ? Math.round(t / 86400000) : null;
+};
+
+function dealTotals(userId, docs, basisArg = null) {
+  const basis = basisArg || basisOf(currentOrg(userId) || {});
+  const groups = new Map();
+  for (const d of docs) {
+    delete d.pair;
+    delete d.pairOf;
+    if (d.left == null) d.left = Math.max(0, round2(Number(d.total) || 0));
+    // Фирма в ключе: клиент общий для двух фирм, а их документы — разные сделки.
+    const key = `${d.org_id || 0}|${d.cp_id}|${round2(Number(d.total) || 0)}`;
+    if (!groups.has(key)) groups.set(key, { bills: [], closings: [] });
+    const g = groups.get(key);
+    if (CLOSING_DOCS.includes(d.type)) g.closings.push(d); else g.bills.push(d);
+  }
+  if (basis !== 'manual') {
+    for (const g of groups.values()) {
+      // Пару ищем ближайшую по дате: если счетов и актов несколько, склеить
+      // январский с августовским, оставив рядом стоящие непарными, — худший
+      // из возможных разборов.
+      const lead = basis === 'closing' ? g.closings : g.bills;
+      const twins = (basis === 'closing' ? g.bills : g.closings)
+        .slice().sort((a, b) => String(a.date).localeCompare(String(b.date)));
+      const taken = new Set();
+      for (const l of lead.slice().sort((a, b) => String(a.date).localeCompare(String(b.date)))) {
+        const ld = dayNum(l.date);
+        let best = null;
+        let bestGap = Infinity;
+        for (const t of twins) {
+          if (taken.has(t)) continue;
+          const td = dayNum(t.date);
+          const gap = ld === null || td === null ? 0 : Math.abs(ld - td);
+          if (gap <= DEAL_WINDOW_DAYS && gap < bestGap) { best = t; bestGap = gap; }
+        }
+        // Ссылка на главный документ нужна тем, кто отмечает оплату сделки:
+        // деньги кладутся на него, а парный получает отметку (markPaid).
+        if (best) { taken.add(best); best.pair = true; best.pairOf = l.id; }
+      }
+    }
+  }
+  /*
+   * Акт за месяц сам долга не создаёт и повторяет сумму накладных, которые
+   * уже в списке. Пока он не оплачен (оплачены не все накладные месяца), его
+   * сумма в «ждут оплаты» не идёт — иначе накладные считались бы дважды.
+   * В списке он остаётся.
+   */
+  for (const d of docs) {
+    if (!d.pair && d.no_debt && d.type === 'usl' && d.payload && d.payload.monthAct) d.pair = true;
+  }
+  const counted = docs.filter((d) => !d.pair && d.left > 0.004);
+
+  /*
+   * «Ждут оплаты» не может быть больше, чем клиент реально должен.
+   *
+   * Свободная оплата (строка в журнале, предоплата, платёж из выписки без
+   * привязки к документу) уменьшает долг, но документу не приписывается —
+   * мы не знаем, за что именно она пришла. Поэтому документы остаются в
+   * списке целиком, а вот ИТОГ ограничиваем долгом клиента: иначе плитка
+   * «ждут 50 000» стоит рядом с долгом 10 000 у того же клиента, и один из
+   * двух чисел человек не верит.
+   *
+   * Ограничиваем только документы, которые создают долг: счёт при долге «по
+   * акту» в журнале его не оставляет, и сравнивать его с сальдо нечем. В
+   * ручном режиме журнал вообще не связан с документами — там итог без
+   * ограничения.
+   */
+  const capped = new Map();               // «фирма|клиент» → сумма долговых документов
+  const members = new Map();              // «фирма|клиент» → сколько там документов
+  let sum = 0;
+  let count = counted.length;
+  for (const d of counted) {
+    const dOrg = orgOfDoc(userId, d) || {};
+    if (!d.no_debt && d.cp_id && makesDebt(dOrg, d.type) && basisOf(dOrg) !== 'manual') {
+      const k = `${Number(d.org_id) || 0}|${d.cp_id}`;
+      capped.set(k, round2((capped.get(k) || 0) + (Number(d.left) || 0)));
+      members.set(k, (members.get(k) || 0) + 1);
+    } else {
+      sum += Number(d.left) || 0;
+    }
+  }
+  for (const [k, v] of capped) {
+    const [org, cpId] = k.split('|');
+    const cp = getCp(userId, Number(cpId));
+    const b = cp && cp.kind !== 'supplier' ? balanceOf(userId, cp.id, Number(org) || null) : null;
+    const take = b ? Math.min(v, Math.max(0, round2(b.closing))) : v;
+    sum += take;
+    // Долг закрыт свободной оплатой целиком — ждать там уже нечего.
+    if (take <= 0.004) count -= members.get(k);
+  }
+  return { docs, count, sum: round2(sum) };
+}
+
+function unpaidSummary(userId, limit = 200) {
+  return dealTotals(userId, unpaidDocs(userId, limit));
+}
+
+/**
+ * То же за период: «покажи неоплаченные за сентябрь». Отбор по дате документа.
+ *
+ * Сделки считаем внутри отобранного: счёт августа и закрывающий его акт
+ * сентября в «сентябре» — не пара, и обе суммы нужно видеть. Общая для бота и
+ * приложения, чтобы цифра за период не расходилась между ними.
+ */
+function unpaidBetween(userId, from, to, limit = 500) {
+  const list = unpaidDocs(userId, limit)
+    .filter((d) => (!from || d.date >= from) && (!to || d.date <= to));
+  return dealTotals(userId, list);
+}
+
+/**
+ * Номера документов, названные в назначении платежа: «по накладной № 3»,
+ * «счёт 12 от 03.10», «акт №5».
+ *
+ * Плательщик сам пишет, за что платит, и это лучшее, что у нас есть: сумма
+ * говорит только «похоже», номер — «вот этот». Поэтому по номеру ищем первым.
+ *
+ * Номер после слова «договор» не берём: «по договору № 17» не про наш
+ * документ, а совпасть с ним может случайно.
+ *
+ * @returns {Array<{num: string, types: string[]|null}>} types — какие документы
+ *   подходят по слову перед номером (счёт, накладная, акт), null — слова не было
+ */
+function docNumbersIn(text) {
+  const src = String(text || '');
+  // \b в JavaScript не видит кириллицу, поэтому границу слова задаём просмотром назад/вперёд.
+  const L = '(?<![A-Za-zА-Яа-яЁё])';
+  const re = new RegExp(`(№|${L}N[o°º]?\\.?|${L}номер|${L}сч[её]т[а-яё]*|${L}накладн[а-яё]*|${L}акт[а-яё]*|${L}упд(?![А-Яа-яЁё]))`
+    + '\\s*(?:№\\s*)?([A-Za-zА-Яа-яЁё]{0,3}-?\\d[\\w\\-/]*)', 'gi');
+  const out = [];
+  for (let m = re.exec(src); m; m = re.exec(src)) {
+    const before = src.slice(Math.max(0, m.index - 16), m.index);
+    if (/(договор|контракт|дог\.)[а-яё]*\s*$/i.test(before)) continue;
+    const word = m[1].toLowerCase();
+    let types = null;
+    if (/^сч/.test(word)) types = ['sch', 'schdog'];
+    else if (/^накладн/.test(word)) types = ['torg12', 'upd'];
+    else if (/^акт/.test(word)) types = ['usl'];
+    else if (word === 'упд') types = ['upd'];
+    out.push({ num: m[2].replace(/[.,;]+$/, ''), types });
+  }
+  return out;
+}
+
+const normNumber = (n) => String(n || '').trim().toLowerCase().replace(/^0+(?=\d)/, '');
+
+/** Единственный неоплаченный документ, чей номер назван в назначении, или null. */
+function namedDoc(purpose, docs) {
+  const hits = new Map();
+  for (const { num, types } of docNumbersIn(purpose)) {
+    for (const d of docs) {
+      if (normNumber(d.number) !== normNumber(num)) continue;
+      if (types && !types.includes(d.type)) continue;
+      hits.set(d.id, d);
+    }
+  }
+  // Два разных документа с таким номером (счёт № 3 и накладная № 3) без слова,
+  // которое их различает, — не угадываем: пусть решит подбор по сумме.
+  return hits.size === 1 ? [...hits.values()][0] : null;
+}
+
+/**
+ * Какие счета закрывают поступления из выписки.
+ *
+ * Деньги из банка попадают в журнал сами (importBankRows), но документы при
+ * этом остаются в списке «не оплачено»: связь «пришло 30 000 от Зари» →
+ * «значит, счёт № 7 закрыт» до сих пор человек делал глазами и руками. На
+ * полусотне строк это и есть та работа, ради которой заводят бухгалтера.
+ *
+ * Здесь эта связь только предполагается. Ничего не отмечаем и в журнал не
+ * лезем: возвращаем список, который бот показывает одним сообщением, а
+ * нажимает человек. Долг, закрытый по ошибке, обнаруживают через месяц —
+ * когда клиент не платит, а счёт уже помечен оплаченным.
+ *
+ * Правила подбора — намеренно осторожные:
+ *
+ *   • Сначала смотрим, что написал сам плательщик: номер документа в
+ *     назначении платежа («по накладной № 3»). Найденный так документ
+ *     получает деньги, даже если рядом лежит другой на ту же сумму или
+ *     старее. Если денег хватает на остаток документа — закрываем его; если
+ *     нет — предлагаем частичную оплату («20 000 из 50 000»): документ при
+ *     этом остаётся неоплаченным, а деньги привязываются к нему. Остаток
+ *     платежа идёт дальше по сумме.
+ *   • Без номера — как раньше, по сумме: документы от старых к новым, пока
+ *     платёж покрывает документ целиком. Частично оплачивать документы,
+ *     названные не по номеру, не предлагаем: пометка «оплачен» означала бы,
+ *     что пришли все деньги, а частичная — что нам известно, за что именно.
+ *   • Считаем сделками, а не документами. Счёт и закрывающий его акт на одну
+ *     и ту же сумму — это один долг на 30 000, а не два по 30 000; закрывать
+ *     их надо вместе, а деньги списывать один раз. Пары ищет dealTotals —
+ *     тот же расчёт, что и во всех остальных местах.
+ *   • Один платёж — один источник. Складывать два поступления, чтобы вместе
+ *     они закрыли счёт, не берёмся: угадать, что это оплата по частям, а не
+ *     две разные, отсюда нельзя (если только в назначении не назван номер).
+ *   • Остаток называем вслух: человеку надо знать, ждёт ли он ещё денег.
+ *
+ * @param {number} userId
+ * @param {Array<{key:string, opId:number, cpId:number, amount:number, date:string, doc:string, purpose?:string}>} payments
+ * @returns {{deals:Array<object>, leftovers:Array<object>}} у сделки `total` —
+ *   сколько рублей платежа ложится на документ, `partial` — документ после
+ *   этого всё ещё не оплачен, `left` — сколько по нему останется
+ */
+function matchPaymentsToDocs(userId, payments) {
+  const deals = [];
+  const leftovers = [];
+  const spent = new Set();               // документы, уже закрытые в этом разборе
+  const applied = new Map();             // документ → сколько уже легло в этом разборе
+  const cache = new Map();
+
+  for (const p of payments || []) {
+    const cpId = Number(p && p.cpId) || 0;
+    const amount = round2(Math.abs(Number(p && p.amount) || 0));
+    if (!cpId || !amount) continue;
+    const cp = getCp(userId, cpId);
+    if (!cp) continue;
+
+    if (!cache.has(cpId)) {
+      const docs = unpaidDocs(userId, 200).filter((d) => d.cp_id === cpId);
+      dealTotals(userId, docs);          // расставит pair на вторых документах сделок
+      cache.set(cpId, docs);
+    }
+    const docs = cache.get(cpId);
+    const remOf = (d) => round2((Number(d.left) || 0) - (applied.get(d.id) || 0));
+    const twinOf = (lead) => docs.find((t) => t.pair && t.pairOf === lead.id && !spent.has(t.id)) || null;
+    let left = amount;
+
+    const push = (lead, twin, total, partial) => {
+      applied.set(lead.id, round2((applied.get(lead.id) || 0) + total));
+      if (!partial) { spent.add(lead.id); if (twin) spent.add(twin.id); }
+      left = round2(left - total);
+      deals.push({
+        opId: Number(p.opId) || 0,
+        cpId,
+        cpName: cp.name,
+        date: p.date,
+        doc: p.doc || '',
+        total,
+        partial,
+        left: partial ? round2(remOf(lead)) : 0,
+        leadId: lead.id,
+        twinId: twin ? twin.id : 0,
+        title: `${lead.title} № ${lead.number}`,
+        alsoTitle: twin ? `${twin.title} № ${twin.number}` : '',
+      });
+    };
+
+    // 1. Документ, названный самим плательщиком.
+    const named = namedDoc(p.purpose, docs);
+    if (named) {
+      const lead = named.pair ? docs.find((x) => x.id === named.pairOf) : named;
+      const rem = lead && !spent.has(lead.id) ? remOf(lead) : 0;
+      if (lead && rem > 0) {
+        const twin = twinOf(lead);
+        const canSplit = !lead.no_debt && makesDebt(orgOfDoc(userId, lead) || {}, lead.type);
+        if (left >= rem) push(lead, twin, rem, false);
+        else if (canSplit) push(lead, twin, left, true);
+      }
+    }
+
+    // 2. Остаток платежа — по сумме, как раньше: целиком покрытые документы, старые первыми.
+    if (left > 0) {
+      for (const lead of docs.filter((d) => !d.pair)) {
+        const rem = remOf(lead);
+        if (spent.has(lead.id) || (applied.get(lead.id) || 0) > 0 || rem <= 0 || rem > left) continue;
+        push(lead, twinOf(lead), rem, false);
+      }
+    }
+    if (left > 0) leftovers.push({ cpId, cpName: cp.name, amount: left });
+  }
+  return { deals, leftovers };
+}
+
+/**
+ * Отметить закрытыми счета, которые закрыли поступления из выписки.
+ *
+ * Деньги на этот момент уже в журнале — их занёс importBankRows отдельной
+ * строкой. Поэтому здесь не «добавить оплату», а «переставить» её: сумма
+ * сделки уходит из свободной строки выписки в строку, привязанную к
+ * документу, и общий итог по клиенту не меняется ни на копейку.
+ *
+ * Почему именно так, а не проще:
+ *
+ *   • Просто поставить «оплачено» и не трогать журнал нельзя. Пересчёт
+ *     (rebuildDebt) видит документ с отметкой и без привязанной проводки —
+ *     и добросовестно создаёт вторую. Одна оплата, посчитанная дважды.
+ *   • Просто вызвать markPaid тоже нельзя: он рассчитан на отметку руками,
+ *     когда денег в журнале ещё нет, и добавляет проводку поверх той, что
+ *     уже пришла из банка. Долг уходит в минус.
+ *
+ * Номер платёжки сохраняем: в привязанной строке остаётся тот же текст, что
+ * был в выписке, — иначе при сверке не найти, каким платежом закрыт счёт.
+ *
+ * Сделка может оказаться частичной (`total` меньше остатка документа): деньги
+ * привязываются к документу, а отметку «оплачен» он получает только тогда,
+ * когда привязанное сравнялось с его суммой.
+ *
+ * @returns {{docs:number, deals:number, leads:number[], partial:number}} сколько
+ *   документов и сделок закрыто; leads — id главных документов сделок (по ним
+ *   самозанятому ждать чек); partial — сколько частичных оплат привязано
+ */
+function closeDocsFromBank(userId, deals) {
+  /*
+   * Владельца операции спрашиваем, а не подразумеваем.
+   *
+   * opId приходит прямо из тела запроса приложения. leadId проверен getDoc,
+   * cpId — getCp, а этот не проверялся ничем: чужой идентификатор в поле
+   * молча удалял операцию другого человека и менял его сальдо. Следа не
+   * оставалось — строка просто исчезала из журнала, и владелец узнать об
+   * этом не мог.
+   *
+   * Операция принадлежит контрагенту, а контрагент — человеку, поэтому
+   * спрашиваем через counterparties, как это делает deleteOp. Условие
+   * повторено в трёх запросах намеренно: проверка в одном месте держится
+   * только на том, что порядок вызовов никто не переставит.
+   */
+  const own = 'cp_id IN (SELECT id FROM counterparties WHERE user_id = ?)';
+  const cut = db.prepare(`UPDATE operations SET debit = ? WHERE id = ? AND ${own}`);
+  const drop = db.prepare(`DELETE FROM operations WHERE id = ? AND ${own}`);
+  const amountOf = db.prepare(`SELECT debit FROM operations WHERE id = ? AND ${own}`);
+  const markDone = db.prepare('UPDATE documents SET paid_at = ? WHERE id = ? AND user_id = ?');
+  const markTwin = db.prepare('UPDATE documents SET paid_at = ?, paid_sum = 0 WHERE id = ? AND user_id = ?');
+  // Переставить сумму сделки из свободной строки выписки в строку документа.
+  const moveBankPay = (d, lead, when, total) => {
+    const src = d.opId ? amountOf.get(Number(d.opId), userId) : null;
+    let dropped = false;
+    let rest = 0;
+    if (src) {
+      rest = round2((Number(src.debit) || 0) - total);
+      if (rest > 0.004) cut.run(rest, Number(d.opId), userId);
+      else { drop.run(Number(d.opId), userId); dropped = true; }
+    }
+    // Новая строка — те же деньги, а не новые: чек самозанятого за них не заводим заново.
+    const freshId = quietly(() => addOpForDoc(userId, d.cpId, {
+      date: when, kind: 'Оплата', doc: d.doc || `${lead.title} № ${lead.number}`, debit: total,
+      note: BANK_NOTE,
+    }, lead.id, true));
+    if (src) moveCheque(userId, Number(d.opId), { dropped, rest, freshId, docId: lead.id, total });
+    else if (freshId) noteIncome(userId, freshId, { debit: total, kind: 'Оплата' });
+    /*
+     * Отметку о загрузке переставляем на новую строку. По ней deleteOp
+     * узнаёт, что операция пришла из выписки, и при отмене разрешает
+     * загрузить её заново. Оставь мы ссылку на удалённую строку — оплату,
+     * отменённую по ошибке, было бы уже не вернуть: файл считается
+     * загруженным навсегда.
+     */
+    if (dropped && freshId) {
+      db.prepare('UPDATE bank_imports SET op_id = ? WHERE user_id = ? AND op_id = ?')
+        .run(freshId, userId, Number(d.opId));
+    }
+  };
+  let docs = 0;
+  let done = 0;
+  let partial = 0;
+  const leads = [];
+  const cps = new Set();
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const d of deals || []) {
+      const lead = getDoc(userId, Number(d.leadId));
+      if (!lead || lead.paid_at) continue;
+      const when = /^\d{4}-\d{2}-\d{2}$/.test(String(d.date)) ? d.date : todayISO();
+
+      /*
+       * Документ, который долга не создаёт — счёт при долге «по акту», любой
+       * в ручном режиме, — только отмечаем, а деньги оставляем свободной
+       * строкой. Привязанную к нему оплату пересчёт журнала (rebuildDebt)
+       * считает лишней и убирает: у документа без реализации оплаты быть не
+       * должно.
+       *
+       * Для документа, который долг создаёт, считаем остаток: сумма минус уже
+       * привязанные оплаты. Больше остатка на документ не кладём — лишнее
+       * остаётся свободной строкой.
+       */
+      const debt = !lead.no_debt && makesDebt(orgOfDoc(userId, lead) || {}, lead.type);
+      const rem = Math.max(0, round2(Number(lead.total) - linkedPaid(lead.id)));
+      const amount = debt ? Math.min(round2(Number(d.total) || 0), rem) : round2(Number(d.total) || 0);
+      if (debt && amount > 0) moveBankPay(d, lead, when, amount);
+      const full = !debt || amount >= rem - 0.004;
+      // Документ долга не создаёт, а строки выписки в журнале нет (её не заносили):
+      // денег в учёте не видно, но получены они — самозанятому нужен чек по документу.
+      if (!debt && full && !(d.opId && amountOf.get(Number(d.opId), userId))) noteDocIncome(userId, lead.id);
+
+      if (!full) { partial += 1; cps.add(lead.cp_id); continue; }
+      markDone.run(when, lead.id, userId);
+      docs += 1;
+      leads.push(lead.id);
+      cps.add(lead.cp_id);
+      /*
+       * У пары проводки нет и быть не должно — долг создаёт только один
+       * документ сделки. Отметка нужна, чтобы второй не висел в «не оплачено»
+       * уже в одиночку: без неё он остался бы там без своей половины и пошёл
+       * бы в сумму как отдельный долг на те же 30 000.
+       *
+       * Ссылка на первый — чтобы отмена оплаты сняла отметку с обоих.
+       */
+      if (d.twinId) {
+        markTwin.run(when, Number(d.twinId), userId);
+        db.prepare('UPDATE documents SET paid_with = ? WHERE id = ? AND user_id = ?')
+          .run(lead.id, Number(d.twinId), userId);
+        docs += 1;
+      }
+      done += 1;
+    }
+    for (const cpId of cps) settleMonthActs(userId, cpId);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return { docs, deals: done, leads, partial };
+}
+
+/**
+ * Что из журнала вошло в долг на начало: столько операций до даты сальдо
+ * больше не прибавляются к долгу. Показываем это человеку при сохранении —
+ * иначе пропавший из итога октябрь выглядел бы потерей денег.
+ * @returns {null|{count:number, date:string}}
+ */
+function openingCovers(userId, cpId, orgId = null) {
+  const b = balanceOf(userId, cpId, orgId);
+  if (!b) return null;
+  const n = priorOps(b.cp, b.ops).length;
+  return n ? { count: n, date: b.cp.opening_date } : null;
+}
+
+/** Сальдо по контрагенту (переиспользует computeBalance из db.js) */
+function balanceOf(userId, cpId, orgId = null) {
+  const cp = getCp(userId, cpId);
+  if (!cp) return null;
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const ops = listOps(userId, cpId, org);
+  /*
+   * Начальное сальдо берём у ПАРЫ, а не с карточки контрагента. Иначе долг,
+   * с которым клиент пришёл к первой фирме, посчитался бы и второй тоже.
+   */
+  const open = openingFor(cpId, org);
+  const view = { ...cp, ...open };
+  return { cp: view, ops, ...computeBalance(view, ops) };
+}
+
+// ---------- заблокировавшие бота ----------
+
+function markBlocked(userId) {
+  db.prepare('UPDATE bot_users SET blocked_at = ? WHERE id = ?')
+    .run(new Date().toISOString(), userId);
+}
+function markActive(userId) {
+  db.prepare("UPDATE bot_users SET blocked_at = '' WHERE id = ? AND blocked_at <> ''").run(userId);
+}
+function isBlocked(userId) {
+  const u = db.prepare('SELECT blocked_at FROM bot_users WHERE id = ?').get(userId);
+  return Boolean(u && u.blocked_at);
+}
+/**
+ * Поиск по @имени. Только для команд владельца: имя в Telegram меняется
+ * когда угодно, поэтому оно годится, чтобы найти человека глазами, но не
+ * чтобы что-то к нему привязывать — для этого есть tg_id.
+ */
+function findUserByUsername(username) {
+  const clean = String(username || '').replace(/^@/, '').trim().toLowerCase();
+  if (!clean) return null;
+  return db.prepare('SELECT * FROM bot_users WHERE lower(username) = ?').get(clean) || null;
+}
+
+/** Кому имеет смысл писать: для будущих напоминаний и рассылок. */
+function reachableUsers() {
+  return db.prepare("SELECT * FROM bot_users WHERE blocked_at = ''").all();
+}
+
+/** Пользователь по внутреннему id — нужен рассылкам, где есть только user_id. */
+function userById(id) {
+  return db.prepare('SELECT * FROM bot_users WHERE id = ?').get(Number(id));
+}
+
+// ---------- дебиторка ----------
+
+/**
+ * Кто сколько должен. Знак сальдо трактуем по типу контрагента:
+ * у заказчика положительное сальдо — долг нам, у поставщика — наш долг ему.
+ *
+ * «Без движения» считаем от даты последней операции, а не от срока оплаты:
+ * сроков мы не храним и придумывать их за пользователя не будем. Зато
+ * «полгода тишины при долге в 54 тысячи» — сигнал понятный и честный.
+ */
+function debtors(userId) {
+  const today = new Date();
+  const out = [];
+  for (const cp of listCps(userId)) {
+    const b = balanceOf(userId, cp.id);
+    if (!b) continue;
+    const closing = Math.round(b.closing * 100) / 100;
+    if (Math.abs(closing) < 0.005) continue;
+    const lastOp = b.ops.length ? b.ops[b.ops.length - 1].date : cp.opening_date;
+    const days = lastOp
+      ? Math.max(0, Math.floor((today - new Date(lastOp)) / 86400000))
+      : null;
+    out.push({
+      cp,
+      amount: Math.abs(closing),
+      // нам должны или мы должны
+      theyOwe: cp.kind === 'supplier' ? closing < 0 : closing > 0,
+      // Кредитовое сальдо заказчика на предоплате — это не «мы должны», а его аванс,
+      // который мы отработаем отгрузками. Показ обязан называть его так, а не долгом.
+      prepaid: cp.kind !== 'supplier' && closing < 0 && Boolean(prepayState(userId, cp.id)),
+      lastOp,
+      days,
+      ops: b.ops.length,
+    });
+  }
+  // сначала самые крупные долги в нашу пользу
+  out.sort((a, b) => (Number(b.theyOwe) - Number(a.theyOwe)) || (b.amount - a.amount));
+  return out;
+}
+
+/**
+ * Из чего складывается сумма «должны вам».
+ *
+ * Самая частая жалоба: «удалил документы, а сумма на главной прежняя».
+ * Обычно это не поломка — цифру держит начальное сальдо из карточки или
+ * проводка, внесённая руками: документы к ним отношения не имеют. Но по
+ * экрану этого не видно, и человек справедливо считает, что число мёртвое.
+ * Поэтому раскладываем его по источникам прямо в приложении, а не в
+ * консольном скрипте, до которого клиенту не добраться.
+ *
+ * Четвёртый источник — поломка: проводка есть, а её документа уже нет.
+ * Такие оставляли старые версии бота; убрать их из приложения нельзя,
+ * поэтому показываем отдельной строкой и зовём tools/debt-audit.js.
+ *
+ * Считаем только сторону «должны вам»: наверху стоит именно эта цифра.
+ * Сирот при этом две породы — те, что сидят в самой сумме (orphanCount), и
+ * те, что висят у остальных контрагентов (orphanOther). Складывать их в один
+ * счётчик нельзя: экран сказал бы «три операции держат 3 000», хотя эти
+ * 3 000 держит одна, а две другие гасят друг друга у совсем другого клиента.
+ *
+ * Слагаемые берём не из самих проводок, а из того, насколько каждая сдвинула
+ * сальдо: computeBalance округляет после каждого шага, и повторять его
+ * арифметику отдельной формулой — значит однажды разойтись с ней на копейку.
+ * Разница соседних значений в колонке сальдо сходится к итогу всегда, какое
+ * бы округление ни применялось внутри.
+ */
+function debtBreakdown(userId) {
+  const lost = new Set(db.prepare(`
+    SELECT o.id FROM operations o
+      JOIN counterparties c ON c.id = o.cp_id
+     WHERE c.user_id = ?
+       AND o.doc_id IS NOT NULL AND o.doc_id > 0
+       AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = o.doc_id)`)
+    .all(userId).map((r) => r.id));
+
+  const sum = { opening: 0, docs: 0, manual: 0, orphan: 0 };
+  let total = 0;
+  let counted = 0;                         // сирот попало в саму сумму
+  for (const d of debtors(userId)) {
+    if (!d.theyOwe) continue;              // «должны вам» — только эта сторона
+    const b = balanceOf(userId, d.cp.id);
+    if (!b || !b.rows) continue;
+    // У поставщика знак читается наоборот — тот же разворот, что в debtors().
+    const sgn = b.closing < 0 ? -1 : 1;
+    // Начальное сальдо — это первая точка колонки: сальдо до первой операции.
+    let prev = b.rows.length
+      ? round2(b.rows[0].balance - (round2(Number(b.rows[0].credit) || 0) - round2(Number(b.rows[0].debit) || 0)))
+      : b.closing;
+    sum.opening = round2(sum.opening + sgn * prev);
+    for (const row of b.rows) {
+      const v = round2(sgn * (row.balance - prev));
+      prev = row.balance;
+      if (lost.has(row.id)) { sum.orphan = round2(sum.orphan + v); counted += 1; }
+      else if (row.doc_id) sum.docs = round2(sum.docs + v);
+      else sum.manual = round2(sum.manual + v);
+    }
+    total = round2(total + d.amount);
+  }
+  return { total, ...sum, orphanCount: counted, orphanOther: lost.size - counted };
+}
+
+// ---------- выписанные документы и сквозная нумерация ----------
+
+// Тип, которого здесь нет, показывается человеку своим кодом: `DOC_TITLES[t]
+// || t` уходит и в журнал, и в тему письма — «Во вложении avans № 1».
+const DOC_TITLES = {
+  sch: 'Счёт на оплату', schdog: 'Счёт-договор',
+  usl: 'Акт об оказании услуг', pp: 'Платёжное поручение',
+  akt: 'Акт сверки', upd: 'УПД', torg12: 'Товарная накладная ТОРГ-12',
+  dog: 'Договор',
+  avans: 'Счёт-фактура на аванс', ksf: 'Корректировочный счёт-фактура',
+};
+
+/**
+ * Короткое название документа для строки списка: «ТОРГ-12», «Акт», «Счёт».
+ * Полное название («Товарная накладная ТОРГ-12») в строку не влезает, и на
+ * узком экране его хвост с номером и датой обрезался многоточием.
+ */
+const DOC_SHORT = {
+  sch: 'Счёт', schdog: 'Счёт-договор', usl: 'Акт', pp: 'Платёжка', akt: 'Акт сверки', upd: 'УПД',
+  torg12: 'ТОРГ-12', dog: 'Договор', avans: 'СФ на аванс', ksf: 'Корректировочный СФ',
+};
+const docShort = (type) => DOC_SHORT[type] || DOC_TITLES[type] || type;
+
+/** Дата «02.09.2026» из ISO; не дата — как есть. */
+const ruDay = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(String(iso || ''))
+  ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : String(iso || ''));
+
+/**
+ * Неоплаченные документы одного клиента — для напоминания о долге.
+ *
+ * Тот же разбор, что у «Ждут оплаты» (dealTotals): документ-пара сделки в
+ * список не идёт, у частично оплаченного указан остаток. Должник получает
+ * письмо «за вами числится 54 250 руб.» и первым делом спрашивает «за что?» —
+ * номера, даты и суммы отвечают на это заранее.
+ *
+ * @returns {{lines: Array<{short:string, number:string, date:string, left:number}>, sum:number}}
+ */
+function unpaidLinesFor(userId, cpId) {
+  const docs = unpaidDocs(userId, 200).filter((d) => d.cp_id === cpId);
+  dealTotals(userId, docs);
+  const lines = docs
+    .filter((d) => !d.pair && d.left > 0.004)
+    .map((d) => ({ short: docShort(d.type), number: String(d.number), date: d.date, left: round2(d.left) }));
+  return { lines, sum: round2(lines.reduce((a, l) => a + l.left, 0)) };
+}
+
+/**
+ * Список для текста напоминания: «• ТОРГ-12 № 2 от 02.09.2026 — 14 000,00 руб.».
+ * Пустая строка, если документов нет (долг — из журнала, по начальному сальдо).
+ *
+ * Если оплаты клиента, не отнесённые к документам, уменьшили долг, сумма списка
+ * больше долга — и должник, сложив строки, решил бы, что ему насчитали лишнее.
+ * Поэтому в этом случае пишем итог отдельной строкой.
+ */
+function debtListText(lines, amount) {
+  if (!lines || !lines.length) return '';
+  const rub = (n) => formatRub(n).replace(/\sруб\.$/, ' руб.');
+  const shown = lines.slice(0, 10);
+  const total = round2(lines.reduce((a, l) => a + l.left, 0));
+  let out = 'Не оплачено:\n'
+    + shown.map((l) => `• ${l.short} № ${l.number} от ${ruDay(l.date)} — ${rub(l.left)}`).join('\n');
+  if (lines.length > shown.length) out += `\n• и ещё ${lines.length - shown.length}`;
+  if (amount != null && Math.abs(total - Number(amount)) > 0.5) {
+    out += `\nС учётом уже поступивших оплат к оплате ${rub(amount)}.`;
+  }
+  return out;
+}
+
+/**
+ * Следующий номер документа этого типа в этом году.
+ * Нумерация у каждого пользователя своя и не зависит от контрагента —
+ * так требует практика: сквозной ряд по журналу, а не по клиентам.
+ */
+/**
+ * Следующий порядковый номер — в ряду ОРГАНИЗАЦИИ, а не человека.
+ *
+ * Раньше ряд был общий на аккаунт: MAX(seq) WHERE user_id. Пока организация
+ * одна, разницы нет, но как только их две, это уже ошибка учёта. Сквозная
+ * нумерация ведётся юридическим лицом: у каждого свой ряд, начинающийся с
+ * единицы. Общий ряд означал бы, что первый счёт второй фирмы выходит,
+ * скажем, сорок восьмым — а куда делись сорок семь предыдущих, объяснять
+ * инспекции будет владелец.
+ *
+ * Функция переименована намеренно, а не просто получила другой аргумент.
+ * И организация, и человек — целые числа: подставь по недосмотру не тот id,
+ * и номер молча посчитается по чужому ряду. Переименование превращает такой
+ * недосмотр в понятную ошибку «нет такой функции» ещё на прогоне.
+ */
+function nextSeqForOrg(orgId, type, year) {
+  const row = db.prepare(
+    'SELECT COALESCE(MAX(seq), 0) AS n FROM documents WHERE org_id = ? AND type = ? AND year = ?',
+  ).get(Number(orgId) || 0, type, year);
+  return row.n + 1;
+}
+
+/**
+ * Уникальность номера внутри года — на уровне базы, а не надежды.
+ *
+ * Номер берётся до сборки файла (он в нём напечатан), а сборка PDF занимает
+ * секунду. За эту секунду второй документ — из мини-приложения или второго
+ * нажатия — успевает взять тот же номер. Два счёта с одним номером бухгалтеру
+ * не объяснишь, поэтому пусть лучше вторая запись честно не пройдёт: код
+ * возьмёт следующий номер и пересоберёт файл.
+ *
+ * В старых базах дубли уже могли появиться — тогда индекс не создастся, и это
+ * не повод падать при запуске: остальное продолжает работать.
+ *
+ * Сторожим по организации, а не по человеку. Прежний индекс на
+ * (user_id, type, year, seq) не просто лишний — он МЕШАЕТ: не давал второй
+ * организации завести свой номер 1, потому что единица в этом году у
+ * человека уже занята первой фирмой.
+ *
+ * Порядок перехода: сначала достраиваем org_id там, где его нет, потом
+ * создаём новый индекс и только при его успехе убираем старый. Наоборот
+ * нельзя: если новый не построится из-за повторов, база останется вовсе без
+ * сторожа, и два счёта с одним номером пройдут молча.
+ */
+function guardSeq() {
+  /*
+   * Документы без организации. В боевой базе таких нет, но чужая может
+   * приехать любой: строки с org_id = 0 от РАЗНЫХ людей схлопнулись бы в
+   * один ряд и подрались за номера. Ставим организацию по умолчанию, а нет
+   * её — любую из заведённых этим человеком.
+   */
+  try {
+    db.exec(`
+      UPDATE documents SET org_id = COALESCE(
+        (SELECT id FROM orgs WHERE orgs.user_id = documents.user_id AND is_default = 1 LIMIT 1),
+        (SELECT id FROM orgs WHERE orgs.user_id = documents.user_id ORDER BY id LIMIT 1),
+        0)
+      WHERE org_id = 0 OR org_id IS NULL
+    `);
+  } catch (_) { /* не вышло — ниже честно не создастся индекс */ }
+
+  let built = false;
+  try {
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_seq_org ON documents(org_id, type, year, seq)');
+    built = true;
+  } catch (_) {
+    built = false;                      // в базе уже есть повторы номеров
+  }
+  // Старый сторож убираем, только когда новый точно встал на его место.
+  if (built) {
+    try { db.exec('DROP INDEX IF EXISTS idx_doc_seq_uniq'); } catch (_) { /* переживём */ }
+  }
+  return built;
+}
+guardSeq();
+
+/**
+ * Расставить организацию у операций, заведённых до появления колонки.
+ *
+ * Порядок важен. Проводка, рождённая документом, принадлежит той же фирме,
+ * что и документ, — это знание точное, берём его. Внесённой руками операции
+ * документа нет, и остаётся одно разумное предположение: фирма по умолчанию
+ * у владельца контрагента. Пока организация у всех одна, предположение
+ * верное; когда их станет несколько, все старые операции уже будут
+ * размечены, и гадать не придётся ни разу.
+ *
+ * Делаем один раз: на строках с org_id = 0. Повторный запуск ничего не
+ * трогает, поэтому вызов при каждой загрузке безопасен.
+ */
+function fillOpOrgs() {
+  try {
+    // 1. Из документа — там организация известна наверняка.
+    db.exec(`
+      UPDATE operations SET org_id = (
+        SELECT d.org_id FROM documents d WHERE d.id = operations.doc_id
+      )
+      WHERE org_id = 0 AND doc_id <> 0
+        AND EXISTS (SELECT 1 FROM documents d WHERE d.id = operations.doc_id AND d.org_id <> 0)
+    `);
+    // 2. Остальным — организация по умолчанию у хозяина контрагента.
+    db.exec(`
+      UPDATE operations SET org_id = COALESCE((
+        SELECT o.id FROM orgs o
+          JOIN counterparties c ON c.user_id = o.user_id
+         WHERE c.id = operations.cp_id
+         ORDER BY o.is_default DESC, o.id LIMIT 1
+      ), 0)
+      WHERE org_id = 0
+    `);
+  } catch (_) { /* колонки может не быть в очень старой базе — не повод падать */ }
+
+  /*
+   * Начальные сальдо переносим в пары — по одному разу на контрагента, для
+   * той организации, от лица которой он и заводился. Сегодня она у человека
+   * одна, так что перенос однозначен; заводить второй паре чужое начальное
+   * сальдо нельзя, иначе долг задвоится ровно тем способом, от которого мы
+   * и уходим.
+   *
+   * Переносим только тем, у кого пары нет ВОВСЕ: это клиенты, заведённые
+   * до появления пар. Новым пару ставит createCp — от текущей фирмы, и она
+   * не обязательно основная. Без этого условия перенос при каждой загрузке
+   * досоздавал пару ещё и основной фирме, и сальдо клиента, заведённого от
+   * второй, удваивалось после первого же перезапуска.
+   */
+  try {
+    db.exec(`
+      INSERT OR IGNORE INTO cp_openings(org_id, cp_id, opening_balance, opening_date)
+      SELECT o.id, c.id, c.opening_balance, c.opening_date
+        FROM counterparties c
+        JOIN orgs o ON o.user_id = c.user_id
+       WHERE o.id = (SELECT id FROM orgs WHERE user_id = c.user_id
+                      ORDER BY is_default DESC, id LIMIT 1)
+         AND NOT EXISTS (SELECT 1 FROM cp_openings p WHERE p.cp_id = c.id)
+    `);
+  } catch (_) { /* таблицы может не быть — не повод падать при загрузке */ }
+}
+fillOpOrgs();
+
+/**
+ * Начальное сальдо пары «организация — клиент».
+ *
+ * Пары нет — значит эта фирма с этим клиентом начала с нуля, и это верный
+ * ответ, а не пропуск. Подставлять сюда сальдо с карточки было бы той самой
+ * ошибкой: второй организации досталась бы история первой.
+ */
+function openingFor(cpId, orgId) {
+  const row = db.prepare(
+    'SELECT opening_balance, opening_date FROM cp_openings WHERE org_id = ? AND cp_id = ?',
+  ).get(Number(orgId) || 0, Number(cpId) || 0);
+  return {
+    opening_balance: row ? Number(row.opening_balance) || 0 : 0,
+    opening_date: row ? row.opening_date || '' : '',
+  };
+}
+
+/** Записать начальное сальдо пары. Карточку держим в согласии для показа. */
+function setOpeningFor(cpId, orgId, balance, date) {
+  const org = Number(orgId) || 0;
+  db.prepare(`
+    INSERT INTO cp_openings(org_id, cp_id, opening_balance, opening_date)
+    VALUES(?,?,?,?)
+    ON CONFLICT(org_id, cp_id) DO UPDATE SET
+      opening_balance = excluded.opening_balance,
+      opening_date    = excluded.opening_date
+  `).run(org, Number(cpId) || 0, Number(balance) || 0, String(date || ''));
+}
+
+/** Режим предоплаты пары «организация — клиент». Пары нет — значит, обычный клиент. */
+function prepayFor(cpId, orgId) {
+  const row = db.prepare(
+    'SELECT prepay, last_sum, base_doc FROM cp_prepay WHERE org_id = ? AND cp_id = ?',
+  ).get(Number(orgId) || 0, Number(cpId) || 0);
+  return {
+    prepay: Boolean(row && row.prepay),
+    last_sum: row ? Number(row.last_sum) || 0 : 0,
+    base_doc: row ? row.base_doc || '' : '',
+  };
+}
+
+/** Включить или выключить режим. Сумму последней предоплаты при этом не теряем. */
+function setPrepayMode(userId, cpId, orgId, on, baseDoc) {
+  if (!getCp(userId, cpId)) return false;
+  db.prepare(`
+    INSERT INTO cp_prepay(org_id, cp_id, prepay, base_doc) VALUES(?,?,?,?)
+    ON CONFLICT(org_id, cp_id) DO UPDATE SET
+      prepay = excluded.prepay,
+      base_doc = CASE WHEN excluded.base_doc <> '' THEN excluded.base_doc ELSE base_doc END
+  `).run(Number(orgId) || 0, Number(cpId), on ? 1 : 0, String(baseDoc || '').slice(0, 120));
+  return true;
+}
+
+/**
+ * Внести предоплату: свободная строка «Оплата» (debit) с пометкой и режим.
+ *
+ * Именно свободная строка, без привязки к документу: она сама уводит сальдо
+ * в минус, и каждая накладная съедает её своим «Реализация». Вторая проводка
+ * поверх задвоила бы оплату.
+ */
+function addPrepay(userId, cpId, sum, date, orgId = null, comment = '') {
+  const amount = round2(Math.abs(Number(sum) || 0));
+  if (!amount || !getCp(userId, cpId)) return null;
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  // Договор или допсоглашение, по которому внесли, — в основание строки; note остаётся
+  // ровно «Предоплата»: по нему свободную оплату отличают от предоплаты (см. привязку оплат к документам).
+  const why = String(comment || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+  const opId = addOp(userId, cpId, {
+    date: /^\d{4}-\d{2}-\d{2}$/.test(String(date)) ? date : todayISO(),
+    kind: 'Оплата', doc: why && !/^предоплата$/i.test(why) ? `Предоплата · ${why}` : 'Предоплата',
+    note: 'Предоплата', debit: amount,
+  }, org);
+  setPrepayMode(userId, cpId, org, true);
+  db.prepare('UPDATE cp_prepay SET last_sum = ? WHERE org_id = ? AND cp_id = ?').run(amount, org, cpId);
+  /*
+   * Накладные, выписанные ДО предоплаты (или до пополнения), сами отметку «оплачено»
+   * не получат: settleFromPrepay вызывается только при выписке. Деньги при этом уже
+   * в сальдо, и документ висел в «Ждут оплаты», хотя его покрыли. Закрываем их тем же
+   * правилом: сальдо не выше нуля — значит, всё выписанное покрыто. Не хватило — не
+   * дробим и ничего не трогаем, как и при выписке.
+   */
+  const waiting = db.prepare(`
+    SELECT id FROM documents WHERE user_id = ? AND org_id = ? AND cp_id = ? AND paid_at = ''
+       AND no_debt = 0 AND total > 0 ORDER BY date, id`).all(userId, org, cpId);
+  for (const w of waiting) settleFromPrepay(userId, w.id);
+  return { opId, amount };
+}
+
+/**
+ * Состояние предоплаты для показа: остаток, долг, «скоро кончится».
+ * null — клиент не на предоплате. «Скоро» — остаток не больше 20% последней
+ * внесённой суммы, но ещё положительный: на нуле уже не «скоро», а «кончилась».
+ */
+function prepayState(userId, cpId, orgId = null) {
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const pp = prepayFor(cpId, org);
+  if (!pp.prepay) return null;
+  const b = balanceOf(userId, cpId, org);
+  if (!b) return null;
+  const closing = round2(b.closing);
+  const left = closing < 0 ? round2(-closing) : 0;
+  return {
+    left,
+    debt: closing > 0 ? closing : 0,
+    lastSum: pp.last_sum,
+    low: left > 0 && pp.last_sum > 0 && left <= round2(pp.last_sum * 0.2),
+    ended: closing >= 0,
+  };
+}
+
+const fmtRub = (n) => `${new Intl.NumberFormat('ru-RU').format(round2(n)).replace(/\u00A0|\u202F/g, ' ')} ₽`;
+
+/** Строка для карточки клиента и «Кто должен». Пустая — не на предоплате. */
+function prepayLine(st) {
+  if (!st) return '';
+  if (st.debt > 0) return `Предоплата закончилась, долг ${fmtRub(st.debt)}`;
+  if (st.left <= 0) return 'Предоплата закончилась';
+  return `Предоплата: осталось ${fmtRub(st.left)}` + (st.low ? ' — скоро кончится' : '');
+}
+
+/**
+ * Что стало с предоплатой клиента: сколько внесено, что с неё списано, что
+ * не поместилось. Только показ — ничего не пишет и не пересчитывает, поэтому
+ * приложение и бот читают одни и те же цифры, а не складывают свои.
+ *
+ * «Списано» — накладные, закрытые самой предоплатой (отметка «оплачено» без
+ * собственной проводки оплаты, см. settleFromPrepay). Неоплаченные накладные,
+ * выписанные до первой предоплаты и всё ещё не закрытые, идут отдельной суммой
+ * `before`, иначе «списано» не сходилось бы с перечнем, и человек решил бы,
+ * что цифры врут. «До» определяем по номеру проводки, а не по дате:
+ * накладную легко выписать задним числом, а порядок записи не обманешь.
+ *
+ * @returns {null|{state:object, paid:number, spent:number, left:number, debt:number,
+ *   covered:object[], over:object[], before:number, partial:number}} null — клиент не на предоплате
+ */
+function prepayReport(userId, cpId, orgId = null) {
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const state = prepayState(userId, cpId, org);
+  if (!state) return null;
+  const ops = listOps(userId, cpId, org);
+  const isPre = (o) => !o.doc_id && o.kind === 'Оплата' && Number(o.debit) > 0
+    && /предоплат/i.test(`${o.doc} ${o.note}`);
+  const pre = ops.filter(isPre);
+  // Первая по времени записи, а не по дате: журнал отсортирован по дате, и предоплата,
+  // внесённая задним числом, оказалась бы «первой» по ошибке.
+  const firstId = pre.length ? Math.min(...pre.map((o) => o.id)) : 0;
+  const paid = round2(pre.reduce((a, o) => a + (Number(o.debit) || 0), 0));
+  const spent = round2(Math.min(Math.max(0, paid - state.left), paid));
+  const brief = (o) => {
+    const d = getDoc(userId, o.doc_id);
+    return d ? {
+      id: d.id, type: d.type, title: d.title, short: docShort(d.type), number: d.number,
+      date: d.date, total: Number(d.total) || 0, sum: round2(Number(o.credit) || 0), opId: o.id,
+    } : null;
+  };
+  const covered = [];
+  const unpaid = [];
+  for (const o of ops) {
+    if (!o.doc_id || o.kind !== 'Реализация') continue;
+    const d = getDoc(userId, o.doc_id);
+    if (!d) continue;
+    // Накладную закрыли отдельными деньгами («Оплатил») — это не списание с предоплаты.
+    const ownPay = ops.some((x) => x.doc_id === o.doc_id && x.kind === 'Оплата');
+    const b = brief(o);
+    if (d.paid_at && !ownPay) covered.push(b);
+    else if (!d.paid_at) unpaid.push(b);
+  }
+  /*
+   * Что не поместилось: предоплата гасит накладные по порядку, поэтому долг
+   * образуют самые новые из неоплаченных — берём их, пока сумма не дотянет до долга.
+   * Старые неоплаченные (выписаны до предоплаты) в этот список не попадают.
+   */
+  const over = [];
+  if (state.debt > 0) {
+    let acc = 0;
+    for (let i = unpaid.length - 1; i >= 0 && acc < state.debt - 0.004; i -= 1) {
+      over.unshift(unpaid[i]);
+      acc += unpaid[i].sum;
+    }
+  }
+  const overIds = new Set(over.map((d) => d.id));
+  const before = round2(unpaid.filter((d) => !overIds.has(d.id) && d.opId < firstId)
+    .reduce((a, d) => a + d.sum, 0));
+  // Часть остатка, ушедшая на накладную, которая целиком не поместилась: сама она остаётся
+  // неоплаченной, но деньги из предоплаты уже взяла. Без этой строки «списано» не сходилось бы со списком.
+  const partial = round2(Math.max(0, spent - round2(covered.reduce((a, d) => a + d.sum, 0)) - before));
+  return { state, paid, spent, left: state.left, debt: state.debt, covered, over, before, partial };
+}
+
+const hasOpOfDoc = (docId, kind) => db.prepare(
+  'SELECT COUNT(*) AS n FROM operations WHERE doc_id = ? AND kind = ?').get(docId, kind).n > 0;
+
+/**
+ * После выписки документа: если клиент на предоплате и сальдо с этим
+ * документом не выше нуля — предоплата его покрыла, ставим «оплачено».
+ * Накладную, которая не помещается в остаток, не дробим: она остаётся
+ * неоплаченной и сальдо показывает долг. Проводку оплаты markPaid не пишет
+ * (долг уже закрыт предоплатой, left = 0) — ровно то, что нужно.
+ * @returns {boolean} закрыт ли документ предоплатой
+ */
+function settleFromPrepay(userId, docId) {
+  const d = getDoc(userId, docId);
+  if (!d || !d.cp_id || d.paid_at || d.no_debt || !(Number(d.total) > 0)) return false;
+  const org = Number(d.org_id) || currentOrgId(userId);
+  if (!prepayFor(d.cp_id, org).prepay) return false;
+  if (!makesDebt(orgOfDoc(userId, d) || {}, d.type)) return false;
+  if (!hasOpOfDoc(docId, 'Реализация')) return false;
+  const b = balanceOf(userId, d.cp_id, org);
+  if (!b || round2(b.closing) > 0) return false;
+  markPaid(userId, docId, d.date);
+  return true;
+}
+
+/** Закрывающий документ без долга: сумма уже учтена накладными. */
+function setNoDebt(userId, docId) {
+  db.prepare('UPDATE documents SET no_debt = 1 WHERE id = ? AND user_id = ?').run(docId, userId);
+}
+
+/** Отгрузки клиента за месяц YYYY-MM: накладные и УПД, создавшие долг. */
+function shipmentsOfMonth(userId, cpId, ym, orgId = null) {
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const rows = db.prepare(`
+    SELECT id, type, number, date, total FROM documents
+     WHERE user_id = ? AND org_id = ? AND cp_id = ? AND type IN ('torg12','upd')
+       AND no_debt = 0 AND date LIKE ? ORDER BY date, id`).all(userId, org, cpId, `${ym}-%`);
+  return {
+    docs: rows,
+    sum: round2(rows.reduce((a, r) => a + (Number(r.total) || 0), 0)),
+  };
+}
+
+/** Все акты за этот месяц (payload.monthAct) по порядку выписки. */
+function monthActsOf(userId, cpId, ym, orgId = null) {
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const rows = db.prepare(
+    "SELECT * FROM documents WHERE user_id = ? AND org_id = ? AND cp_id = ? AND type = 'usl' AND payload LIKE ? ORDER BY id",
+  ).all(userId, org, cpId, '%"monthAct"%');
+  return rows.map(withPayload).filter((r) => r.payload.monthAct === ym);
+}
+
+/** Первый акт за этот месяц: по нему видно, что месяц уже закрывали. */
+function monthActOf(userId, cpId, ym, orgId = null) {
+  return monthActsOf(userId, cpId, ym, orgId)[0] || null;
+}
+
+/**
+ * Отгрузки месяца, которые ещё не вошли ни в один акт.
+ *
+ * Отдельной отметки «вошло в акт» у накладной нет, и заводить её незачем: акт
+ * складывает ВСЕ отгрузки месяца, существовавшие в момент выписки, а номера
+ * документов растут. Значит, всё, что старше последнего акта месяца (по id), уже
+ * в нём, а что новее — например накладная 30-го числа после акта 28-го или
+ * задним числом внесённая — ещё нет. Так же получается без новых колонок и
+ * для актов, выписанных старой версией. Удалили акт — его отгрузки свободны.
+ */
+function openShipmentsOfMonth(userId, cpId, ym, orgId = null) {
+  const acts = monthActsOf(userId, cpId, ym, orgId);
+  const lastAct = acts.length ? acts[acts.length - 1].id : 0;
+  const all = shipmentsOfMonth(userId, cpId, ym, orgId);
+  const docs = all.docs.filter((d) => d.id > lastAct);
+  return {
+    docs,
+    sum: round2(docs.reduce((a, r) => a + (Number(r.total) || 0), 0)),
+    acts,
+    covered: all.docs.length - docs.length,
+  };
+}
+
+/**
+ * Занят ли уже такой номер в этом году у этого вида документа.
+ *
+ * Уникальный индекс стоит на порядковом номере (seq), а на самом номере —
+ * ни на чём: он строка и его разрешено задавать руками. Поэтому «счёт № 3»,
+ * выписанный вручную, спокойно уживался со счётом № 3, который через две
+ * выписки присвоился сам, и в году оказывалось два документа с одним
+ * номером. Индексом это не закрыть: в базах, где повторы уже есть, он
+ * попросту не создастся, — поэтому спрашиваем перед записью.
+ *
+ * Спрашиваем по организации — из тех же соображений, что и nextSeqForOrg:
+ * «счёт № 3» у одной фирмы ничем не мешает счёту № 3 у другой, это разные
+ * ряды. Переименована по той же причине: перепутать id организации с id
+ * человека молча нельзя.
+ */
+function numberTakenInOrg(orgId, type, year, number, exceptId = 0) {
+  // exceptId — сам документ, которому номер меняют или которого исправляют:
+  // свой же номер ему не помеха.
+  return Boolean(db.prepare(
+    'SELECT id FROM documents WHERE org_id = ? AND type = ? AND year = ? AND number = ? AND id <> ? LIMIT 1',
+  ).get(Number(orgId) || 0, type, Number(year), String(number), Number(exceptId) || 0));
+}
+
+/**
+ * Сменить номер выписанного документа.
+ *
+ * Номер ставит человек, а ошибается он так: удалил накладную № 7, выписал
+ * заново — и она вышла № 22, потому что следующий номер — «самый большой
+ * плюс один». Порядковый номер (seq) тоже переносим, если новый номер —
+ * число и такой порядковый свободен: иначе следующая выписка перескочила бы
+ * через дыру. В строках журнала номер записан текстом — меняем и там.
+ * @returns {{ok:boolean, error?:string, old?:string}}
+ */
+function renumberDoc(userId, id, number) {
+  const d = getDoc(userId, id);
+  if (!d) return { ok: false, error: 'Документ не найден.' };
+  const num = String(number || '').trim().slice(0, 40);
+  if (!num) return { ok: false, error: 'Нужен номер.' };
+  if (num === String(d.number)) return { ok: true, old: d.number };
+  if (numberTakenInOrg(d.org_id, d.type, d.year, num, d.id)) {
+    return { ok: false, error: `№ ${num} за ${d.year} год уже есть у другого документа этого вида.` };
+  }
+  const seq = /^\d{1,9}$/.test(num) && !db.prepare(
+    'SELECT id FROM documents WHERE org_id = ? AND type = ? AND year = ? AND seq = ? AND id <> ?',
+  ).get(d.org_id, d.type, d.year, Number(num), d.id) ? Number(num) : d.seq;
+  db.prepare('UPDATE documents SET number = ?, seq = ? WHERE id = ? AND user_id = ?').run(num, seq, d.id, userId);
+  db.prepare('UPDATE operations SET doc = replace(doc, ?, ?) WHERE doc_id = ?').run(`№ ${d.number}`, `№ ${num}`, d.id);
+  return { ok: true, old: d.number };
+}
+
+/**
+ * Исправленный документ встаёт на место прежнего: тот же порядковый номер и
+ * то же время выписки — исправление не новая выписка, и бесплатный лимит
+ * оно не тратит. Вызывается после того, как прежний удалён.
+ */
+function takePlaceOf(userId, newId, old) {
+  const busy = db.prepare('SELECT id FROM documents WHERE org_id = ? AND type = ? AND year = ? AND seq = ? AND id <> ?')
+    .get(old.org_id, old.type, old.year, old.seq, newId);
+  db.prepare(`UPDATE documents SET created_at = ?${busy ? '' : ', seq = ?'} WHERE id = ? AND user_id = ?`)
+    .run(...(busy ? [old.created_at, newId, userId] : [old.created_at, old.seq, newId, userId]));
+}
+
+/** Не прошла ли запись именно из-за занятого номера. */
+const isSeqTaken = (e) => /idx_doc_seq_org|idx_doc_seq_uniq|UNIQUE constraint failed: documents/i
+  .test(String(e && e.message));
+
+/** Документ сохраняется данными; файл всегда пересобирается заново. */
+function saveDoc(userId, { orgId, cpId, type, number, seq, date, total, payload }) {
+  const year = Number(String(date).slice(0, 4)) || currentYear();
+  const info = db.prepare(`
+    INSERT INTO documents(user_id, org_id, cp_id, type, number, seq, year, date, total, payload, created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(
+    userId, orgId || 0, cpId || 0, type, String(number), Number(seq) || 0, year,
+    date || '', Number(total) || 0, payload ? JSON.stringify(payload) : '', new Date().toISOString(),
+  );
+  return Number(info.lastInsertRowid);
+}
+
+/**
+ * Журнал документов — текущей организации.
+ *
+ * Список из двух фирм вперемешку читается как ошибка нумерации: подряд идут
+ * «Счёт № 4» и «Счёт № 4», и понять, что это разные юрлица, по строке
+ * невозможно. Пока фирма одна, отбор ничего не меняет.
+ */
+function listDocs(userId, limit = 10, cpId = null, orgId = null) {
+  const org = orgId == null ? currentOrgId(userId) : Number(orgId) || 0;
+  const sql = cpId
+    ? 'SELECT * FROM documents WHERE user_id = ? AND org_id = ? AND cp_id = ? ORDER BY id DESC LIMIT ?'
+    : 'SELECT * FROM documents WHERE user_id = ? AND org_id = ? ORDER BY id DESC LIMIT ?';
+  const rows = cpId
+    ? db.prepare(sql).all(userId, org, cpId, limit)
+    : db.prepare(sql).all(userId, org, limit);
+  return rows.map(withPayload);
+}
+
+/** Типы, которые «Повторить» умеет: набираются позициями (то же, что ITEM_DOCS в doc-service). */
+const REPEATABLE = ['sch', 'schdog', 'usl', 'upd', 'torg12'];
+
+/**
+ * Что можно повторить по фразе «повтори вчерашнюю накладную Заре».
+ *
+ * Общая для бота и приложения: что считать «тем самым документом» не должно
+ * зависеть от того, откуда спросили. Берём документы текущей фирмы (как в
+ * журнале), с позициями — без них повторять нечего. Новые сверху.
+ *
+ * @param {number} userId
+ * @param {{cpId?:number, type?:string, date?:string, limit?:number}} [by]
+ *   cpId — клиент, type — вид бумаги, date — число исходного документа
+ * @returns {object[]} пусто — ничего подходящего, или вид бумаги не повторяется
+ */
+function repeatSources(userId, { cpId = 0, type = '', date = '', limit = 6 } = {}) {
+  const types = type ? REPEATABLE.filter((t) => t === type) : REPEATABLE;
+  if (!types.length) return [];
+  const where = ['user_id = ?', 'org_id = ?', `type IN (${types.map(() => '?').join(',')})`];
+  const args = [userId, currentOrgId(userId), ...types];
+  if (cpId) { where.push('cp_id = ?'); args.push(Number(cpId)); }
+  if (date) { where.push('date = ?'); args.push(date); }
+  const rows = db.prepare(`SELECT * FROM documents WHERE ${where.join(' AND ')}
+                            ORDER BY date DESC, id DESC LIMIT 60`).all(...args);
+  return rows.map(withPayload)
+    .filter((d) => Array.isArray(d.payload.items) && d.payload.items.length > 0)
+    .slice(0, limit);
+}
+
+function getDoc(userId, id) {
+  const row = db.prepare('SELECT * FROM documents WHERE id = ? AND user_id = ?').get(id, userId);
+  return row ? withPayload(row) : null;
+}
+
+function withPayload(row) {
+  let payload = {};
+  try { payload = row.payload ? JSON.parse(row.payload) : {}; } catch (_) { payload = {}; }
+  return { ...row, payload, title: DOC_TITLES[row.type] || row.type };
+}
+
+/**
+ * Удаление документа вместе с его проводками.
+ *
+ * Без этого удалённый счёт оставлял долг в журнале навсегда: карточки, через
+ * которую проводку отменяют, больше нет, а сальдо у контрагента висит. Долг,
+ * которого никто не может убрать, — худшее, что может быть в акте сверки.
+ */
+/**
+ * Сколько долга висит на каждом документе списка — одним запросом.
+ *
+ * Нужно, чтобы честно сказать перед удалением, изменится сальдо или нет.
+ * Долг создают не все документы: при основании «по отгрузке» счёт проводку
+ * не делает, и удаление такого счёта сальдо не трогает. Раньше приложение
+ * обещало обратное — «долг по нему тоже снимется» — и человек справедливо
+ * считал, что удаление сломано.
+ */
+function debtByDoc(userId, ids) {
+  const list = [...new Set((ids || []).map(Number).filter(Boolean))];
+  if (!list.length) return new Map();
+  const rows = db.prepare(`
+    SELECT o.doc_id AS id, COUNT(*) AS n,
+           ROUND(SUM(o.credit) - SUM(o.debit), 2) AS delta
+      FROM operations o
+      JOIN counterparties c ON c.id = o.cp_id
+     WHERE c.user_id = ? AND o.doc_id IN (${list.map(() => '?').join(',')})
+     GROUP BY o.doc_id`).all(userId, ...list);
+  return new Map(rows.map((r) => [r.id, { ops: r.n, delta: Number(r.delta) || 0 }]));
+}
+
+function deleteDoc(userId, id, { keepQuota = false } = {}) {
+  // Проводки убираем первыми: deleteOpsOfDoc сверяется с документом, и после
+  // его удаления она уже ничего не найдёт.
+  const doc = getDoc(userId, id);
+  if (!doc) return false;
+  deleteOpsOfDoc(userId, id);
+  dropChequeWait(userId, { docId: id });
+  /*
+   * Парный документ сделки, оплаченной через удаляемый, возвращается в неоплаченные:
+   * оплата лежала на удаляемом и уходит вместе с ним. Иначе отметка с суммой
+   * оставалась бы у второго документа, и при смене основания пересчёт
+   * «восстановил» бы оплату, которой уже нет.
+   */
+  db.prepare("UPDATE documents SET paid_at = '', paid_sum = 0, paid_with = 0 WHERE paid_with = ? AND user_id = ?")
+    .run(id, userId);
+  const gone = db.prepare('DELETE FROM documents WHERE id = ? AND user_id = ?').run(id, userId).changes > 0;
+  // keepQuota — документ не исчезает, а заменяется исправленным: его выписку
+  // унаследует замена (takePlaceOf), и считать её второй раз нельзя.
+  if (gone && doc.created_at && !keepQuota) db.prepare('INSERT INTO docs_removed(user_id, created_at) VALUES (?, ?)').run(userId, doc.created_at);
+  return gone;
+}
+
+// ---------- шаблоны позиций ----------
+
+/** Запоминаем позицию: в следующий раз её можно поставить кнопкой. */
+function rememberItems(userId, items) {
+  const now = new Date().toISOString();
+  for (const it of items || []) {
+    const name = String(it.name || '').trim();
+    if (!name) continue;
+    const exists = db.prepare('SELECT id FROM item_templates WHERE user_id = ? AND name = ?')
+      .get(userId, name);
+    if (exists) {
+      db.prepare('UPDATE item_templates SET price = ?, unit = ?, uses = uses + 1, used_at = ? WHERE id = ?')
+        .run(Number(it.price) || 0, it.unit || 'шт.', now, exists.id);
+    } else {
+      db.prepare('INSERT INTO item_templates(user_id, name, unit, price, uses, used_at) VALUES(?,?,?,?,1,?)')
+        .run(userId, name, it.unit || 'шт.', Number(it.price) || 0, now);
+    }
+  }
+}
+
+/**
+ * Готовые позиции под вид деятельности — без цены и с нулём употреблений,
+ * чтобы свои, настоящие, всегда стояли выше. Уже существующие не трогаем.
+ */
+function seedItems(userId, items) {
+  const now = new Date().toISOString();
+  let added = 0;
+  for (const it of items || []) {
+    const name = String(it.name || '').trim();
+    if (!name) continue;
+    added += db.prepare('INSERT OR IGNORE INTO item_templates(user_id, name, unit, price, uses, used_at) VALUES(?,?,?,?,0,?)')
+      .run(userId, name, it.unit || 'шт.', 0, now).changes;
+  }
+  return added;
+}
+
+const normName = (v) => String(v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+/**
+ * Позиции, которые этот клиент уже получал, — по его же документам.
+ *
+ * Общий список частых позиций считается по всему аккаунту, и у того, кто
+ * выписывает и канапе по счетам, и обеды по накладным, в кнопки лезло чужое:
+ * на ТОРГ-12 клиенту предлагались позиции из счетов другим людям, а нужных
+ * не было. Здесь ранжирование по клиенту и по виду документа: что выписывали
+ * ЭТОМУ клиенту именно в таком документе — первым, цена — последняя, какую
+ * ему ставили.
+ */
+function clientItems(userId, cpId, type, limit = 6, { ignoreHidden = false } = {}) {
+  const hidden = new Set(ignoreHidden ? [] : db.prepare('SELECT name FROM item_hidden WHERE user_id = ? AND cp_id IN (?, 0)')
+    .all(userId, Number(cpId)).map((r) => normName(r.name)));
+  const rows = db.prepare('SELECT type, payload FROM documents WHERE user_id = ? AND cp_id = ? ORDER BY id DESC LIMIT 60')
+    .all(userId, Number(cpId));
+  const seen = new Map();
+  let hadSame = false;   // в таких документах позиции были, но все убраны
+  for (const r of rows) {
+    let items = [];
+    try { items = (JSON.parse(r.payload || '{}').items) || []; } catch (_) { items = []; }
+    for (const it of items) {
+      const name = String((it && it.name) || '').trim();
+      const key = normName(name);
+      if (!key) continue;
+      if (hidden.has(key)) { if (r.type === type) hadSame = true; continue; }
+      let e = seen.get(key);
+      if (!e) {
+        // Строки идут от новых к старым, поэтому первая встреча — самая свежая цена.
+        e = { name, unit: it.unit || 'шт.', price: Number(it.price) || 0, count: 0, same: 0, order: seen.size };
+        seen.set(key, e);
+      }
+      e.count += 1;
+      if (r.type === type) e.same += 1;
+    }
+  }
+  let list = [...seen.values()];
+  // Есть позиции именно из такого документа — остальные не предлагаем:
+  // обеды из накладных не должны делить кнопки с канапе из чужих счетов.
+  const same = list.filter((e) => e.same > 0);
+  // Убрали всё, что было в таких документах, — пусто, а не позиции из других документов клиента.
+  if (same.length || hadSame) list = same;
+  list.sort((a, b) => b.same - a.same || b.count - a.count || a.order - b.order);
+  return list.slice(0, limit);
+}
+
+/**
+ * Что предложить кнопками при выписке: сначала то, что выписывали этому
+ * клиенту; у нового клиента — общие частые, кроме убранных.
+ * @returns {Array<{name:string, unit:string, price:number, tplId?:number, own?:boolean}>}
+ */
+function suggestItems(userId, cpId, type, limit = 6) {
+  if (Number(cpId)) {
+    const own = clientItems(userId, cpId, type, limit);
+    if (own.length) return own.map((e) => ({ name: e.name, unit: e.unit, price: e.price, own: true }));
+    // История у клиента есть, но всё из неё убрано, — пусто и остаётся. Общий список
+    // вернул бы ровно то лишнее, от чего человек избавлялся; он только для клиента без истории.
+    if (clientItems(userId, cpId, type, 1, { ignoreHidden: true }).length) return [];
+  }
+  const hidden = new Set(db.prepare('SELECT name FROM item_hidden WHERE user_id = ? AND cp_id = 0')
+    .all(userId).map((r) => normName(r.name)));
+  return listTemplates(userId, limit + 20)
+    .filter((t) => !hidden.has(normName(t.name)))
+    .slice(0, limit)
+    .map((t) => ({ name: t.name, unit: t.unit || 'шт.', price: Number(t.price) || 0, tplId: t.id }));
+}
+
+/** Убрать подсказку: у этого клиента; у общих (без собственной истории) — совсем. */
+function hideItem(userId, cpId, name, { global = false } = {}) {
+  const n = String(name || '').trim().slice(0, 200);
+  if (!n) return;
+  db.prepare('INSERT OR IGNORE INTO item_hidden(user_id, cp_id, name) VALUES (?, ?, ?)').run(userId, global ? 0 : Number(cpId) || 0, n);
+  if (global) db.prepare('DELETE FROM item_templates WHERE user_id = ? AND name = ?').run(userId, n);
+}
+
+/** Выписал позицию снова — значит она нужна: подсказка возвращается. */
+function unhideItems(userId, cpId, items) {
+  for (const it of items || []) {
+    db.prepare('DELETE FROM item_hidden WHERE user_id = ? AND cp_id IN (?, 0) AND name = ?')
+      .run(userId, Number(cpId) || 0, String(it.name || '').trim());
+  }
+}
+
+// ---------- основание накладных и УПД ----------
+
+const normBasis = (v) => String(v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+const cleanBasis = (v) => String(v || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+// Сколько раз подряд одно и то же основание должно встретиться, чтобы его запомнили.
+const BASIS_LEARN_AFTER = 3;
+
+const orgIdOf = (userId, orgId) => (orgId == null ? currentOrgId(userId) : Number(orgId) || 0);
+
+/** Самый свежий документ клиента, у которого есть графа «основание». */
+function lastBasisDocId(userId, cpId, orgId) {
+  return db.prepare("SELECT COALESCE(MAX(id), 0) AS n FROM documents WHERE user_id = ? AND cp_id = ? AND org_id = ? AND type IN ('torg12', 'upd')")
+    .get(userId, Number(cpId), orgId).n;
+}
+
+/** Запомненное основание накладных и УПД клиента у этой фирмы; пусто — не запомнено. */
+function basisFor(userId, cpId, orgId = null) {
+  const row = db.prepare('SELECT basis FROM cp_basis WHERE user_id = ? AND cp_id = ? AND org_id = ?')
+    .get(userId, Number(cpId), orgIdOf(userId, orgId));
+  return row ? row.basis : '';
+}
+
+/**
+ * Задать или сбросить (пустая строка) основание клиента.
+ *
+ * С отметкой «с этого документа»: «три раза подряд» после явного выбора
+ * человека считаются заново. Иначе сброшенное тут же запоминалось бы снова —
+ * старых накладных с прежним основанием уже три и больше.
+ */
+function setBasisFor(userId, cpId, basis, orgId = null) {
+  if (!getCp(userId, Number(cpId))) return '';
+  const org = orgIdOf(userId, orgId);
+  const b = cleanBasis(basis);
+  db.prepare(`INSERT INTO cp_basis(user_id, cp_id, org_id, basis, since_id) VALUES (?, ?, ?, ?, ?)
+              ON CONFLICT(user_id, cp_id, org_id) DO UPDATE SET basis = excluded.basis, since_id = excluded.since_id`)
+    .run(userId, Number(cpId), org, b, lastBasisDocId(userId, cpId, org));
+  return b;
+}
+
+/**
+ * Основание, которое человек вписывает руками раз за разом, запоминаем.
+ * Вызывается после выписки документа с основанием, которое он ввёл сам:
+ * в третий раз за клиента — и дальше оно подставляется само.
+ * exceptDocId — заменённый документ, его считать нельзя.
+ * @returns {boolean} запомнено только что
+ */
+function learnBasis(userId, cpId, basis, exceptDocId = 0, orgId = null) {
+  const b = cleanBasis(basis);
+  const org = orgIdOf(userId, orgId);
+  if (!b || normBasis(basisFor(userId, cpId, org)) === normBasis(b)) return false;
+  const row = db.prepare('SELECT since_id FROM cp_basis WHERE user_id = ? AND cp_id = ? AND org_id = ?').get(userId, Number(cpId), org);
+  const rows = db.prepare("SELECT payload FROM documents WHERE user_id = ? AND cp_id = ? AND org_id = ? AND type IN ('torg12', 'upd') AND id > ? AND id <> ?")
+    .all(userId, Number(cpId), org, row ? row.since_id : 0, Number(exceptDocId) || 0);
+  let n = 0;
+  for (const r of rows) {
+    try { if (normBasis(JSON.parse(r.payload || '{}').basis) === normBasis(b)) n += 1; } catch (_) { /* битый payload — не считаем */ }
+  }
+  if (n < BASIS_LEARN_AFTER) return false;
+  setBasisFor(userId, cpId, b, org);
+  return true;
+}
+
+/**
+ * Расписания клиента с накладными и УПД хранят свои копии полей, в том числе
+ * основание. Без этого после смены основания расписание выписывало бы
+ * следующие накладные по-старому.
+ */
+function applyBasisToRules(userId, cpId, basis) {
+  const b = cleanBasis(basis);
+  for (const r of db.prepare("SELECT id, extra FROM recurring WHERE user_id = ? AND cp_id = ? AND type IN ('torg12', 'upd')")
+    .all(userId, Number(cpId))) {
+    let e = {};
+    try { e = JSON.parse(r.extra || '{}'); } catch (_) { e = {}; }
+    if (b) e.basis = b; else delete e.basis;
+    db.prepare('UPDATE recurring SET extra = ? WHERE id = ?').run(JSON.stringify(e), r.id);
+  }
+}
+
+/** Накладные и УПД клиента у текущей фирмы: {id, number, date, type, basis}. */
+function basisDocs(userId, cpId, from = '', to = '') {
+  const org = currentOrgId(userId);
+  const out = [];
+  for (const r of db.prepare("SELECT id, type, number, date, total, payload FROM documents WHERE user_id = ? AND cp_id = ? AND org_id = ? AND type IN ('torg12', 'upd') ORDER BY date, id")
+    .all(userId, Number(cpId), org)) {
+    if ((from && r.date < from) || (to && r.date > to)) continue;
+    let p = {};
+    try { p = JSON.parse(r.payload || '{}'); } catch (_) { p = {}; }
+    out.push({ id: r.id, type: r.type, number: r.number, date: r.date, total: r.total, basis: p.basis || '' });
+  }
+  return out;
+}
+
+/**
+ * Поставить основание выписанным накладным и УПД клиента (весь период или
+ * только from–to). Это только надпись в бланке: суммы, номера, долг и оплата
+ * не меняются. Файлы после этого пересобираются из журнала.
+ * @returns {number[]} id изменённых документов
+ */
+function applyBasis(userId, cpId, basis, from = '', to = '') {
+  const b = cleanBasis(basis);
+  const ids = [];
+  for (const d of basisDocs(userId, cpId, from, to)) {
+    const doc = getDoc(userId, d.id);
+    if (!doc) continue;
+    const payload = { ...(doc.payload || {}) };
+    if (b) payload.basis = b; else delete payload.basis;
+    if (updateDocPayload(userId, d.id, payload)) ids.push(d.id);
+  }
+  return ids;
+}
+
+function listTemplates(userId, limit = 8) {
+  return db.prepare(
+    'SELECT * FROM item_templates WHERE user_id = ? ORDER BY uses DESC, used_at DESC LIMIT ?',
+  ).all(userId, limit);
+}
+
+function getTemplate(userId, id) {
+  return db.prepare('SELECT * FROM item_templates WHERE id = ? AND user_id = ?').get(id, userId);
+}
+
+function forgetTemplate(userId, id) {
+  db.prepare('DELETE FROM item_templates WHERE id = ? AND user_id = ?').run(id, userId);
+}
+
+// ---------- доступ (место под подписку) ----------
+
+// Бесплатно 5 документов в месяц, дальше — подписка. Читаем из окружения
+// при каждом вызове, чтобы число/режим можно было менять без перезапуска
+// и переопределять в прогоне: FREE_DOCS — сколько бесплатных, ENFORCE_LIMIT=0
+// снова открывает всем.
+/**
+ * Сколько организаций входит в тариф. Меняется окружением, чтобы цену можно
+ * было пересмотреть без выкладки кода.
+ */
+const orgsIncluded = () => Math.max(1, Number(process.env.ORGS_INCLUDED || 2));
+
+/**
+ * Можно ли завести ещё одну организацию.
+ *
+ * Упёршемуся не даём завести следующую — так решил владелец, и это самый
+ * честный из вариантов: ничего не отключается задним числом, данные не
+ * зависают в недоступном состоянии, а человек видит предел до того, как
+ * начал заполнять анкету. Разрешать заводить, а потом выставлять счёт значит
+ * однажды запереть чужой учёт за неоплату.
+ */
+function orgQuota(userId) {
+  const u = db.prepare('SELECT orgs_extra FROM bot_users WHERE id = ?').get(userId) || {};
+  const limit = orgsIncluded() + (Number(u.orgs_extra) || 0);
+  const used = db.prepare('SELECT COUNT(*) AS n FROM orgs WHERE user_id = ?').get(userId).n;
+  return { used, limit, canAdd: used < limit, extra: Number(u.orgs_extra) || 0 };
+}
+
+/** Открыть место под ещё одну организацию — после оплаты. */
+function grantOrgSlots(userId, n = 1) {
+  const add = Math.max(1, Math.round(Number(n) || 1));
+  const u = db.prepare('SELECT orgs_extra FROM bot_users WHERE id = ?').get(userId) || {};
+  const next = (Number(u.orgs_extra) || 0) + add;
+  db.prepare('UPDATE bot_users SET orgs_extra = ? WHERE id = ?').run(next, userId);
+  return next;
+}
+
+const freePerMonth = () => Number(process.env.FREE_DOCS || 5);
+const enforceLimit = () => String(process.env.ENFORCE_LIMIT || '1') !== '0';
+
+function docsThisMonth(userId) {
+  /*
+   * Считаем по времени выписки, а не по дате НА документе.
+   *
+   * Дату на документе ставит человек, и раньше квота смотрела именно на неё.
+   * Значит бесплатный лимит снимался в одно действие: поставил в форме
+   * прошлый месяц — и выписывай сколько угодно, счётчик текущего месяца не
+   * шелохнётся. Продавать при таком счётчике нечего.
+   *
+   * created_at пишется в UTC, поэтому переводим в московский календарь
+   * (+3 часа, перевода времени в России нет). Без этого документ, выписанный
+   * первого числа в час ночи, попадал бы в квоту прошлого месяца — с этого
+   * когда-то и начался уход на поле date.
+   */
+  /*
+   * Удалённые тоже в счёт. Файл документа остаётся у человека в переписке,
+   * и считай мы только живые строки, лимит снимался бы так: выписал пять,
+   * убрал их из журнала — и снова пять бесплатных.
+   */
+  const month = todayISO().slice(0, 7);
+  const inMonth = " AND substr(datetime(created_at, '+3 hours'),1,7) = ?";
+  return db.prepare(`SELECT COUNT(*) AS n FROM documents WHERE user_id = ?${inMonth}`).get(userId, month).n
+    + db.prepare(`SELECT COUNT(*) AS n FROM docs_removed WHERE user_id = ?${inMonth}`).get(userId, month).n;
+}
+
+/** @returns {{allowed:boolean, used:number, left:number, limit:number, paid:boolean}} */
+function quota(userId) {
+  const limit = freePerMonth();
+  const u = db.prepare('SELECT access_until FROM bot_users WHERE id = ?').get(userId) || {};
+  const paid = Boolean(u.access_until && u.access_until >= todayISO());
+  const used = docsThisMonth(userId);
+  const left = Math.max(0, limit - used);
+  return {
+    allowed: paid || !enforceLimit() || left > 0,
+    used, left, limit, paid,
+  };
+}
+
+module.exports = {
+  migrate,
+  getOrCreateUser, setState, getState, clearState, isAiEnabled, setAiEnabled, isVoiceReply, setVoiceReply, setSource,
+  saveAiMessage, listAiMessages, getAiDataset,
+  createOrg, updateOrg, saveMyOrg, vatOf, listOrgs, getOrg, orgOfDoc, claimButton, getDefaultOrg, setDefaultOrg,
+  createCp, updateCp, listCps, getCp, openAdvances, updateDocPayload,
+  addOp, listOps, deleteLastOp, deleteOp, balanceOf, openingCovers, debtors, debtBreakdown, periodBalance, cpForPeriod,
+  knownBankKeys, importBankRows,
+  DEBT_DOCS, basisOf, makesDebt, basisMismatch, addOpForDoc, opsOfDoc, deleteOpsOfDoc,
+  debtByDoc, rebuildDebt, restoreDebt,
+  markPaid, unmarkPaid, matchPaymentsToDocs, closeDocsFromBank, docNumbersIn, linkedPaid, dealOf, settleMonthActs,
+  unpaidDocs, unpaidSummary, unpaidBetween, dealTotals, docsBetween, registryDocs,
+  freePaymentsFor, freePaymentQuestion, freePaymentLabel, linkFreePayment,
+  docShort, unpaidLinesFor, debtListText,
+  askBizOnce,
+  markBlocked, markActive, isBlocked, reachableUsers, userById, findUserByUsername,
+  isSeqTaken, guardSeq, numberTakenInOrg, renumberDoc, takePlaceOf, currentOrgId, currentOrg, setActiveOrg,
+  orgQuota, grantOrgSlots,
+  openingFor, setOpeningFor, cpOrgs,
+  prepayFor, setPrepayMode, addPrepay, prepayState, prepayReport, prepayLine, settleFromPrepay,
+  setNoDebt, shipmentsOfMonth, monthActOf, monthActsOf, openShipmentsOfMonth,
+  nextSeqForOrg, saveDoc, listDocs, repeatSources, REPEATABLE, getDoc, deleteDoc, DOC_TITLES,
+  rememberItems, seedItems, listTemplates, getTemplate, forgetTemplate,
+  suggestItems, clientItems, hideItem, unhideItems, basisFor, setBasisFor, learnBasis, basisDocs, applyBasis, applyBasisToRules,
+  quota, docsThisMonth, freePerMonth,
+};

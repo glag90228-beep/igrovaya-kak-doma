@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Первичка — документы</title>
+<!--
+  Знак продукта — тот же, что рисует заставка ниже. Своей иконки у страницы не
+  было вовсе: во вкладке браузера приложение выглядело безымянным серым листом.
+  Внутри Telegram это не видно, а вот когда приложение открывают ссылкой в
+  обычном браузере — видно сразу.
+-->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'><rect width='200' height='200' rx='40' fill='%2316233A'/><g transform='translate(100 100) scale(1.12) translate(-97 -99)'><path fill='%23F5F8FF' d='M46 24H128L156 52V166a8 8 0 0 1-8 8H46a8 8 0 0 1-8-8V32a8 8 0 0 1 8-8Z'/><path fill='%234C9AFF' d='M128 24L156 52H128Z'/><g fill='none' stroke='%234C9AFF' stroke-width='13' stroke-linejoin='round'><path d='M84 132V72a17 17 0 0 1 0 34'/><path d='M72 117H103'/></g></g></svg>">
+<link rel="stylesheet" href="app.css">
+<!--
+  Скрипт Telegram грузим только там, где он нужен. В обычном браузере он не
+  даёт ничего (initData пуст), зато лежит на telegram.org: где этот адрес
+  медленный или закрыт, страница «висела» бы на нём, не показывая даже вход.
+  В самом Telegram запуск всегда оставляет след: tgWebApp... в адресе (все
+  клиенты), сохранённые параметры, TelegramWebviewProxy (Android), рамка
+  веб-версии. Нет ни одного — это обычный сайт.
+
+  Вставляем сами и с async=false: такой скрипт выполняется в порядке вставки,
+  то есть раньше app.js, как и при обычном теге, но без document.write,
+  который Chrome местами отключает. Стоит в <head>, чтобы цвета темы
+  Telegram были готовы до первой отрисовки.
+-->
+<script>
+(function () {
+  var inTg = false;
+  try {
+    inTg = !!(window.Telegram && window.Telegram.WebApp)
+      || /tgWebApp/.test(location.hash + location.search)
+      || !!window.TelegramWebviewProxy
+      || !!sessionStorage.getItem('__telegram__initParams')
+      || window.parent !== window;
+  } catch (e) { inTg = true; }          // не смогли проверить — лучше загрузить, чем потерять Telegram
+  if (!inTg) return;
+  var el = document.createElement('script');
+  el.src = 'https://telegram.org/js/telegram-web-app.js';
+  el.async = false;
+  document.head.appendChild(el);
+})();
+</script>
+</head>
+<body>
+
+<!-- Иконки: один спрайт, обводка 1.75, семейство единое (стиль Lucide).
+     Эмодзи в интерфейсе не используем — они разные на разных телефонах
+     и не поддаются перекраске под тему Telegram. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <g id="i-home"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></g>
+    <g id="i-doc"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h6"/></g>
+    <g id="i-receipt"><path d="M6 3h12v18l-2.4-1.6L13.2 21 12 20l-1.2 1-2.4-1.6L6 21z"/><path d="M9.5 8h5M9.5 12h5"/></g>
+    <g id="i-doc-check"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/><path d="M14 3v5h4"/><path d="m9 13.5 2.2 2.2L16 11"/></g>
+    <g id="i-docs2"><path d="M9 3h6l4 4v10a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M15 3v4h4"/><path d="M4.5 7.5V19a2.5 2.5 0 0 0 2.5 2.5h8"/></g>
+    <g id="i-pen"><path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17z"/><path d="m14.5 7.5 2 2"/><path d="M4 20v-4"/></g>
+    <g id="i-mail"><path d="M3.5 6.5h17v11h-17z"/><path d="m3.8 7 8.2 6 8.2-6"/></g>
+    <g id="i-box"><path d="m12 3 8 4.4v9.2L12 21l-8-4.4V7.4z"/><path d="m4.2 7.5 7.8 4.3 7.8-4.3"/><path d="M12 11.8V21"/></g>
+    <g id="i-users"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M16 5.2a3.2 3.2 0 0 1 0 5.6"/><path d="M17.5 14.4A5.5 5.5 0 0 1 20.5 20"/></g>
+    <g id="i-wallet"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H18a2 2 0 0 1 2 2v1"/><path d="M3 7.5V18a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-2"/><path d="M21 10.5h-4a2.5 2.5 0 0 0 0 5h4z"/></g>
+    <g id="i-bell"><path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 2h-15z"/><path d="M10 21h4"/></g>
+    <g id="i-logout"><path d="M10 4H6.5A2.5 2.5 0 0 0 4 6.5v11A2.5 2.5 0 0 0 6.5 20H10"/><path d="m15.5 8 4 4-4 4"/><path d="M19.5 12H9.5"/></g>
+    <g id="i-more"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></g>
+    <g id="i-plus"><path d="M12 5v14M5 12h14"/></g>
+    <g id="i-minus"><path d="M5 12h14"/></g>
+    <g id="i-trash"><path d="M4 7h16"/><path d="M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/></g>
+    <g id="i-chev"><path d="m9 6 6 6-6 6"/></g>
+    <g id="i-back"><path d="m15 6-6 6 6 6"/></g>
+    <g id="i-check"><path d="m4 12 5 5L20 6"/></g>
+    <g id="i-star"><path d="m12 3.5 2.6 5.4 5.9.8-4.3 4.1 1.1 5.9-5.3-2.9-5.3 2.9 1.1-5.9L3.5 9.7l5.9-.8z"/></g>
+    <g id="i-search"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></g>
+    <g id="i-clock"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></g>
+    <g id="i-repeat"><path d="M4 11V9a4 4 0 0 1 4-4h9"/><path d="m14 2 3 3-3 3"/><path d="M20 13v2a4 4 0 0 1-4 4H7"/><path d="m10 22-3-3 3-3"/></g>
+    <g id="i-send"><path d="M21 3 10.5 13.5"/><path d="M21 3l-6.5 18-4-8-8-4z"/></g>
+    <g id="i-office"><path d="M4 21V6l8-3v18"/><path d="M12 9h6a2 2 0 0 1 2 2v10"/><path d="M2.5 21h19"/><path d="M7 9h1M7 13h1M7 17h1M15.5 13h1M15.5 17h1"/></g>
+    <g id="i-warn"><path d="M12 4.5 2.8 20h18.4z"/><path d="M12 10v4"/><circle cx="12" cy="17" r=".8" fill="currentColor" stroke="none"/></g>
+    <g id="i-help"><circle cx="12" cy="12" r="8.5"/><path d="M9.6 9.5a2.5 2.5 0 1 1 3.2 2.9c-.5.2-.8.7-.8 1.2v.4"/><circle cx="12" cy="17" r=".8" fill="currentColor" stroke="none"/></g>
+    <g id="i-mic"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0"/><path d="M12 18v3"/></g>
+    <g id="i-bot"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01M8 17h8"/></g>
+    <g id="i-menu"><path d="M4 7h16M4 12h16M4 17h16"/></g>
+    <g id="i-close"><path d="m6 6 12 12M18 6 6 18"/></g>
+    <g id="i-speaker"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/></g>
+    <g id="i-speaker-off"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/></g>
+    <g id="i-stop"><rect x="6" y="6" width="12" height="12" rx="2"/></g>
+    <g id="i-upload"><path d="M12 15V4"/><path d="m7 8 5-5 5 5"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></g>
+    <g id="i-bolt"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></g>
+    <g id="i-briefcase"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/><path d="M3 13h18"/></g>
+    <g id="i-person"><circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/></g>
+    <g id="i-list"><path d="M8.5 6.5h11M8.5 12h11M8.5 17.5h11"/><circle cx="4.5" cy="6.5" r="1" fill="currentColor" stroke="none"/><circle cx="4.5" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="4.5" cy="17.5" r="1" fill="currentColor" stroke="none"/></g>
+  </defs>
+</svg>
+
+<!--
+  Заставка при входе.
+
+  Она занимает то время, которое приложение и так тратит на загрузку, а не
+  добавляет своё: пока рисуется знак, уже идут запросы за состоянием. Как
+  только первый экран готов — заставка уходит. Поэтому здесь она отдельным
+  слоем поверх #app, а не внутри него: приложение перерисовывает своё
+  содержимое, и вложенная заставка исчезла бы на первом же кадре.
+
+  Рисуем то, что продукт делает: на листе проявляется знак рубля, будто его
+  выписали. Отсюда и обводка, которая «дописывается», а не появляется.
+
+  Разметка инлайновая и крошечная — заставка обязана показаться раньше, чем
+  загрузится хоть один внешний файл, иначе смысла в ней нет.
+-->
+<div id="splash" aria-hidden="true">
+  <!--
+    Перечисление в начале — это ответ на вопрос «что это вообще такое».
+    Четыре слова сменяются резко, без плавности: смысл в том, чтобы их
+    успели прочитать, а не полюбоваться переходом. Стоят одно на другом в
+    одном месте, поэтому глазу не приходится бегать.
+  -->
+  <div class="splash-words">
+    <b>Акты</b>
+    <b>Счета</b>
+    <b>УПД</b>
+    <b>Договоры</b>
+  </div>
+
+  <svg viewBox="0 0 200 200" width="104" height="104" role="img" aria-label="Первичка">
+    <!-- лист -->
+    <path class="sheet" d="M46 24 H128 L156 52 V166 a8 8 0 0 1 -8 8 H46 a8 8 0 0 1 -8 -8 V32 a8 8 0 0 1 8 -8 Z"/>
+    <!-- загнутый угол -->
+    <path class="fold" d="M128 24 L156 52 H128 Z"/>
+    <!-- знак рубля: стойка с чашей одним контуром, перекладина отдельно -->
+    <g class="ruble" fill="none" stroke-width="9" stroke-linecap="butt" stroke-linejoin="round">
+      <path class="r1" d="M84 132 V72 a17 17 0 0 1 0 34"/>
+      <path class="r2" d="M72 117 H103"/>
+    </g>
+  </svg>
+  <div class="splash-name">Первичка</div>
+</div>
+
+<!--
+  Шапка и боковая панель. Рисует их app.js (buildChrome): здесь только места.
+  Панель — обычный <aside> с навигацией внутри, поэтому скринридер читает её
+  как второй список разделов, а не как всплывашку.
+-->
+<header id="topbar" class="topbar" hidden></header>
+<div id="scrim" class="scrim" hidden></div>
+<aside id="drawer" class="drawer" aria-label="Меню" hidden></aside>
+
+<main id="app" aria-live="polite">
+  <div class="boot" role="status">
+    <span class="spinner" aria-hidden="true"></span>
+    <span>Загружаю…</span>
+  </div>
+</main>
+
+<nav id="tabs" class="tabs" hidden aria-label="Разделы"></nav>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+<script>
+/* Приложение — тоже вставкой с async=false: обычный тег мог бы выполниться раньше
+   скрипта Telegram, вставленного в <head>. */
+(function () {
+  var el = document.createElement('script');
+  el.src = 'app.js';
+  el.async = false;
+  document.body.appendChild(el);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,598 @@
+'use strict';
+
+/**
+ * Доступ по подписке.
+ *
+ * Платежи принимает внешняя площадка (Lava Top), мы только выдаём доступ.
+ * Поэтому здесь два входа: вебхук об оплате и ручная выдача владельцем.
+ *
+ * Каждый платёж записывается: без этого повторная доставка вебхука
+ * (а площадки повторяют, если не получили 200) продлит подписку дважды.
+ */
+
+const crypto = require('node:crypto');
+
+const { db } = require('../db');
+require('./bot-db');       // таблицу bot_users создаёт он, порядок важен
+
+function migrate() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS promo_codes (
+      code       TEXT    PRIMARY KEY,        -- нормализованный, без дефисов
+      pretty     TEXT    NOT NULL,           -- как показываем и диктуем
+      days       INTEGER NOT NULL,
+      max_uses   INTEGER NOT NULL DEFAULT 1,
+      uses       INTEGER NOT NULL DEFAULT 0,
+      note       TEXT    NOT NULL DEFAULT '',
+      expires_at TEXT    NOT NULL DEFAULT '', -- ГГГГ-ММ-ДД, пусто = бессрочно
+      created_at TEXT    NOT NULL,
+      revoked_at TEXT    NOT NULL DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS promo_uses (
+      id      INTEGER PRIMARY KEY AUTOINCREMENT,
+      code    TEXT    NOT NULL,
+      user_id INTEGER NOT NULL,
+      days    INTEGER NOT NULL,
+      used_at TEXT    NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_promo_use ON promo_uses(code, user_id);
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS payments (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      external_id TEXT    NOT NULL,            -- идентификатор платежа у площадки
+      provider    TEXT    NOT NULL DEFAULT 'lava',
+      user_id     INTEGER NOT NULL DEFAULT 0,  -- 0 = пока не привязан к пользователю
+      email       TEXT    NOT NULL DEFAULT '',
+      amount      REAL    NOT NULL DEFAULT 0,
+      currency    TEXT    NOT NULL DEFAULT 'RUB',
+      days        INTEGER NOT NULL DEFAULT 0,
+      status      TEXT    NOT NULL DEFAULT '',
+      raw         TEXT    NOT NULL DEFAULT '',
+      created_at  TEXT    NOT NULL,
+      claimed_at  TEXT    NOT NULL DEFAULT ''
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_pay_ext ON payments(provider, external_id);
+    CREATE INDEX IF NOT EXISTS idx_pay_email ON payments(email);
+  `);
+  /*
+   * Заявка на получение чужой… то есть своей оплаты по почте.
+   *
+   * Зачем отдельная таблица. Lava не возвращает Telegram-id, поэтому КАЖДЫЙ
+   * боевой платёж ложится ничьим, и «Я оплатил» — основная дорога к доступу
+   * для всех, кто платит. Раньше она открывалась одним лишь знанием почты:
+   * назвал адрес с кассы — забрал чужую подписку. Ни кода, ни срока, ни
+   * счётчика попыток, а настоящий плательщик потом видел «оплату не вижу».
+   *
+   * Теперь на адрес из платежа уходит код. Прочитать его может только тот,
+   * у кого этот ящик, — то есть тот, кто платил.
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS pay_claims (
+      user_id    INTEGER PRIMARY KEY,
+      email      TEXT    NOT NULL,
+      code_hash  TEXT    NOT NULL,
+      tries      INTEGER NOT NULL DEFAULT 0,
+      sent_today INTEGER NOT NULL DEFAULT 0,
+      sent_date  TEXT    NOT NULL DEFAULT '',
+      expires_at TEXT    NOT NULL
+    );
+  `);
+}
+migrate();
+
+// «Сегодня» — по Москве, общая реализация в lib/period.js: по UTC доступ
+// заканчивался на день раньше, чем показывали пользователю.
+const { todayISO } = require('./period');
+
+/** 'YYYY-MM-DD' плюс n дней — в календаре, без часовых поясов. */
+function addDays(dateISO, n) {
+  const [y, m, d] = String(dateISO).split('-').map(Number);
+  const at = new Date(y, m - 1, d + n, 12);
+  const pad = (v) => String(v).padStart(2, '0');
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
+}
+const norm = (s) => String(s || '').trim().toLowerCase();
+
+/** Текущий доступ пользователя. */
+function accessInfo(userId) {
+  const u = db.prepare('SELECT access_until FROM bot_users WHERE id = ?').get(userId) || {};
+  const until = u.access_until || '';
+  const active = Boolean(until && until >= todayISO());
+  const left = active
+    ? Math.ceil((new Date(until) - new Date(todayISO())) / 86400000)
+    : 0;
+  return { until, active, left };
+}
+
+/**
+ * Выполнить fn в одной транзакции: либо всё, либо ничего.
+ *
+ * Зачем. Оплата зачисляется в два шага — отметить платёж и продлить срок.
+ * Раньше это были два отдельных запроса: если второй падал (например,
+ * SQLITE_BUSY — на одной базе работают бот, приложение и приёмник), платёж
+ * оставался отмеченным, а срок не продлевался. Повторная доставка вебхука
+ * видела «уже записан» и дней не давала никогда: человек заплатил и остался
+ * без подписки. С промокодом так же — код сгорал, дней не было.
+ *
+ * Теперь при любой ошибке откатываются оба шага, и повтор проходит заново.
+ * Обычный возврат из fn (включая «неверный код») фиксирует всё, что fn
+ * записала, — счётчик попыток, например, должен сохраниться.
+ */
+function inTx(fn) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const out = fn();
+    db.exec('COMMIT');
+    return out;
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch (_) { /* откатывать уже нечего */ }
+    throw e;
+  }
+}
+
+/**
+ * Продлевает доступ. Считаем от большей из двух дат — сегодня и текущего
+ * окончания: если человек продлил заранее, оплаченные дни не должны сгореть.
+ */
+function grantDays(userId, days) {
+  const n = Math.max(1, Math.round(Number(days) || 0));
+  const { until } = accessInfo(userId);
+  // Считаем в датах, а не в миллисекундах: new Date('2026-08-18') — это
+  // полночь UTC, и дальше всё зависело бы от пояса. Здесь день прибавляется
+  // к календарной дате, и результат читается тем же календарём.
+  const next = addDays(until && until > todayISO() ? until : todayISO(), n);
+  db.prepare('UPDATE bot_users SET access_until = ? WHERE id = ?').run(next, userId);
+  return next;
+}
+
+function revokeAccess(userId) {
+  db.prepare("UPDATE bot_users SET access_until = '' WHERE id = ?").run(userId);
+}
+
+/** Кто сейчас с оплаченным доступом — для команды владельца. */
+function paidUsers() {
+  return db.prepare(
+    'SELECT * FROM bot_users WHERE access_until >= ? ORDER BY access_until',
+  ).all(todayISO());
+}
+
+// ---------- коды доступа ----------
+
+/**
+ * Код доступа — способ дать подписку без оплаты: тестировщику, первым
+ * клиентам, за отзыв, взамен сорвавшегося платежа.
+ *
+ * Почему код, а не «выдать по имени»: выдать вручную можно только тому, кто
+ * уже запустил бота и чей номер вы знаете. Код же просто отдаётся человеку —
+ * в переписке, на визитке, в объявлении — и работает сам.
+ *
+ * Алфавит без похожих букв: ноль и «O», единица и «I» неразличимы в чужом
+ * шрифте, а код часто диктуют голосом или переписывают с экрана. Разбор
+ * наоборот терпимый — регистр, пробелы и любые дефисы приводим к одному виду,
+ * так что «prv a3kd 9mqx» тоже сработает.
+ */
+const ALPHABET = 'ACDEFGHJKLMNPQRTUVWXY34679';
+const PREFIX = 'PRV';
+
+const normCode = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+function randomCode() {
+  let body = '';
+  for (let i = 0; i < 8; i += 1) body += ALPHABET[crypto.randomInt(ALPHABET.length)];
+  return `${PREFIX}-${body.slice(0, 4)}-${body.slice(4)}`;
+}
+
+/**
+ * Создаёт коды.
+ * @param {{days?:number, count?:number, maxUses?:number, note?:string, expiresInDays?:number}} o
+ * @returns {Array<object>} строки созданных кодов
+ */
+function createCodes({ days = 30, count = 1, maxUses = 1, note = '', expiresInDays = 0 } = {}) {
+  const d = Math.max(1, Math.min(3650, Math.round(Number(days) || 30)));
+  const n = Math.max(1, Math.min(50, Math.round(Number(count) || 1)));
+  const uses = Math.max(1, Math.min(10000, Math.round(Number(maxUses) || 1)));
+  let expires = '';
+  if (Number(expiresInDays) > 0) {
+    expires = addDays(todayISO(), Number(expiresInDays));
+  }
+  const out = [];
+  for (let i = 0; i < n; i += 1) {
+    let pretty = randomCode();
+    // Совпадение почти невероятно, но «почти» на живой базе случается.
+    while (db.prepare('SELECT 1 FROM promo_codes WHERE code = ?').get(normCode(pretty))) {
+      pretty = randomCode();
+    }
+    db.prepare(`
+      INSERT INTO promo_codes(code, pretty, days, max_uses, note, expires_at, created_at)
+      VALUES(?,?,?,?,?,?,?)`).run(normCode(pretty), pretty, d, uses,
+      String(note || '').slice(0, 200), expires, new Date().toISOString());
+    out.push(getCode(pretty));
+  }
+  return out;
+}
+
+function getCode(raw) {
+  return db.prepare('SELECT * FROM promo_codes WHERE code = ?').get(normCode(raw)) || null;
+}
+
+/** Почему код не сработает — либо '' , если сработает. */
+function codeProblem(c) {
+  if (!c) return 'Такого кода нет. Проверьте, не потерялся ли символ.';
+  if (c.revoked_at) return 'Этот код отключён.';
+  if (c.expires_at && c.expires_at < todayISO()) return 'Срок действия кода истёк.';
+  if (c.uses >= c.max_uses) return 'Код уже использован.';
+  return '';
+}
+
+/**
+ * Активация кода.
+ *
+ * Порядок важен. Сначала отмечаем использование — уникальный индекс не даст
+ * одному человеку активировать код дважды, даже если он нажмёт кнопку два
+ * раза подряд. Потом считаем расход условным UPDATE: если код разобрали
+ * параллельно, changes окажется нулём, и мы честно откатим отметку, а не
+ * подарим лишний месяц.
+ *
+ * @returns {{ok:true, until:string, days:number}|{ok:false, error:string}}
+ */
+function redeemCodeInner(userId, raw) {
+  const c = getCode(raw);
+  if (!c) return { ok: false, error: codeProblem(c) };
+
+  // Свою же активацию проверяем раньше остальных причин: у одноразового
+  // кода она выглядит как «код использован», и человек решает, что код увели.
+  const mine = db.prepare('SELECT * FROM promo_uses WHERE code = ? AND user_id = ?')
+    .get(c.code, userId);
+  if (mine) {
+    const a = accessInfo(userId);
+    return { ok: false, error: `Вы уже активировали этот код${a.active ? `, доступ действует до ${a.until.split('-').reverse().join('.')}` : ''}.` };
+  }
+
+  const problem = codeProblem(c);
+  if (problem) return { ok: false, error: problem };
+
+  let useId;
+  try {
+    useId = Number(db.prepare(
+      'INSERT INTO promo_uses(code, user_id, days, used_at) VALUES(?,?,?,?)',
+    ).run(c.code, userId, c.days, new Date().toISOString()).lastInsertRowid);
+  } catch (_) {
+    return { ok: false, error: 'Вы уже активировали этот код.' };
+  }
+
+  const spent = db.prepare(
+    "UPDATE promo_codes SET uses = uses + 1 WHERE code = ? AND uses < max_uses AND revoked_at = ''",
+  ).run(c.code).changes;
+  if (!spent) {
+    db.prepare('DELETE FROM promo_uses WHERE id = ?').run(useId);
+    return { ok: false, error: 'Код только что закончился.' };
+  }
+
+  return { ok: true, until: grantDays(userId, c.days), days: c.days };
+}
+
+function revokeCode(raw) {
+  return db.prepare("UPDATE promo_codes SET revoked_at = ? WHERE code = ? AND revoked_at = ''")
+    .run(new Date().toISOString(), normCode(raw)).changes > 0;
+}
+
+/** Коды для владельца: сначала живые, внутри — свежие сверху. */
+function listCodes(limit = 30) {
+  return db.prepare(`
+    SELECT * FROM promo_codes
+    ORDER BY (revoked_at = '' AND uses < max_uses) DESC, created_at DESC
+    LIMIT ?`).all(limit)
+    .map((c) => ({ ...c, live: !codeProblem(c) }));
+}
+
+/** Кто активировал код — видно в списке владельца. */
+function codeUsers(code) {
+  return db.prepare(`
+    SELECT p.used_at, p.days, u.tg_id, u.name, u.username
+    FROM promo_uses p LEFT JOIN bot_users u ON u.id = p.user_id
+    WHERE p.code = ? ORDER BY p.id`).all(normCode(code));
+}
+
+/** Активировал ли человек хоть какой-нибудь код — чтобы отличать тест от оплаты. */
+function usedCodes(userId) {
+  return db.prepare('SELECT * FROM promo_uses WHERE user_id = ? ORDER BY id DESC').all(userId);
+}
+
+// ---------- платежи ----------
+
+function findPayment(provider, externalId) {
+  return db.prepare('SELECT * FROM payments WHERE provider = ? AND external_id = ?')
+    .get(provider, String(externalId));
+}
+
+/**
+ * Записывает платёж. Повторный вебхук с тем же идентификатором ничего
+ * не меняет и возвращает duplicate — площадки повторяют доставку,
+ * и второе продление подписки было бы подарком за чужой счёт.
+ *
+ * Вторая проверка — на случай, когда площадка при повторной доставке
+ * проставляет новое время: идентификатор тогда получается другой, а платёж
+ * тот же самый. Считаем повтором одинаковую пару «сумма и статус» от одного
+ * и того же плательщика за четверть часа. Разные статусы (отказ, потом
+ * оплата) и разные суммы (месяц, потом год) сюда не попадают — это ровно те
+ * случаи, ради которых идентификатор и стал точнее.
+ */
+const NEAR_DUP_MS = 15 * 60 * 1000;
+
+function nearDuplicate(p) {
+  const email = norm(p.email);
+  const uid = Number(p.userId) || 0;
+  if (!email && !uid) return null;
+  const since = new Date(Date.now() - NEAR_DUP_MS).toISOString();
+  return db.prepare(`
+    SELECT * FROM payments
+     WHERE provider = ? AND amount = ? AND status = ? AND created_at >= ?
+       AND (${email ? 'email = ?' : 'user_id = ?'})
+     ORDER BY id DESC LIMIT 1`)
+    .get(p.provider || 'lava', Number(p.amount) || 0, p.status || '', since, email || uid) || null;
+}
+
+/** Ответ площадки в текст: объект кодируем, готовую строку оставляем как есть. */
+function rawText(raw) {
+  if (!raw) return '';
+  return (typeof raw === 'string' ? raw : JSON.stringify(raw)).slice(0, 4000);
+}
+
+function recordPayment(p) {
+  const same = findPayment(p.provider || 'lava', p.externalId);
+  if (same) {
+    /*
+     * Тот же идентификатор — ещё не значит тот же платёж.
+     *
+     * У Platega id транзакции одинаков во всех уведомлениях: сначала может
+     * прийти «в обработке», потом «оплачено». Первое пишет строку без дней,
+     * и раньше второе отбрасывалось как повтор — деньги списаны, доступа
+     * нет, и никто об этом не узнаёт.
+     *
+     * Поэтому неоплаченную строку, по которой пришла оплата, дописываем
+     * сроком. Условие `days = 0` в самом UPDATE — не формальность: два
+     * одновременных «оплачено» по одному id оба увидят нулевой срок, но
+     * строку сменит только один, и срок получит только он.
+     *
+     * Отличаем от записанного «похожего платежа» (у него тоже days = 0) по
+     * статусу: там статус уже оплаченный и совпадает с новым, а здесь он
+     * другой.
+     */
+    const payingNow = Number(p.days) > 0;
+    const wasUnpaid = !(Number(same.days) > 0);
+    const statusMoved = String(same.status || '') !== String(p.status || '');
+    if (payingNow && wasUnpaid && statusMoved) {
+      const up = db.prepare(`
+        UPDATE payments
+           SET status = ?, days = ?, amount = ?, raw = ?,
+               user_id = CASE WHEN user_id = 0 THEN ? ELSE user_id END,
+               email = CASE WHEN email = '' THEN ? ELSE email END
+         WHERE id = ? AND days = 0`)
+        .run(p.status || '', Number(p.days), Number(p.amount) || 0, rawText(p.raw),
+          Number(p.userId) || 0, norm(p.email), same.id);
+      if (up.changes === 1) {
+        return { duplicate: false, near: false, upgraded: true, payment: findPayment(same.provider, same.external_id), id: same.id };
+      }
+    }
+    /*
+     * Оплаченный платёж получил другой статус — возврат, отмена, спор.
+     * Доступ здесь сам не отзываем: сколько дней снимать и снимать ли вообще,
+     * решает человек. Но и молчать нельзя — приёмник об этом скажет.
+     */
+    const reversed = !wasUnpaid && statusMoved && !payingNow
+      ? { from: same.status || '', to: p.status || '' } : null;
+    return { duplicate: true, payment: same, reversed };
+  }
+
+  /*
+   * Похожий платёж — не то же самое, что тот же самый.
+   *
+   * Признак «та же почта, та же сумма, тот же статус за четверть часа» ловит
+   * повторную доставку, при которой площадка сменила идентификатор. Но под
+   * него подходит и настоящая вторая покупка: бухгалтер берёт месяц себе и
+   * месяц коллеге с одной кассовой почты подряд. Раньше такая строка не
+   * записывалась вовсе — платёж исчезал бесследно, и разбираться с
+   * претензией было не по чему: ни суммы, ни идентификатора, только лог.
+   *
+   * Теперь она пишется всегда, но с нулевым сроком: денег по ней не выдаётся
+   * (отбор ничьих платежей берёт только строки со сроком), а след остаётся.
+   * Кто это был на самом деле — повтор доставки или вторая покупка — решает
+   * человек, и для этого ему нужно сначала увидеть строку.
+   */
+  /*
+   * Ответ площадки храним ОДИН раз закодированным.
+   *
+   * Поставщики приносят его по-разному: lib/lava.js отдаёт объект,
+   * lib/platega.js — уже готовую строку. Здесь стояло безусловное
+   * JSON.stringify, и строка кодировалась второй раз. В базе оказывалось
+   * "{\"id\":…}" вместо {"id":…}: разобрать такое можно только двумя
+   * JSON.parse подряд, о чём никто не догадается.
+   *
+   * Цена ошибки — не место в базе, а разбор происшествия. Первая же попытка
+   * посмотреть, что прислала площадка, дала «полей: 0, 1, 2, … 202» —
+   * номера символов строки, — и вывод «payload не вернулся», хотя он
+   * вернулся. По такому выводу чинят то, что не сломано.
+   */
+  const near = nearDuplicate(p);
+  const days = near ? 0 : (Number(p.days) || 0);
+
+  const info = db.prepare(`
+    INSERT INTO payments(external_id, provider, user_id, email, amount, currency, days, status, raw, created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+    String(p.externalId), p.provider || 'lava', near ? 0 : (p.userId || 0), norm(p.email),
+    Number(p.amount) || 0, p.currency || 'RUB', days,
+    p.status || '', rawText(p.raw), new Date().toISOString(),
+  );
+  const payment = findPayment(p.provider || 'lava', p.externalId);
+  return {
+    duplicate: Boolean(near), near: Boolean(near), payment, id: Number(info.lastInsertRowid),
+  };
+}
+
+/**
+ * Привязать ничей платёж к человеку. Возвращает true, если привязка удалась.
+ *
+ * Условие `user_id = 0` и возвращаемое значение — одно средство, а не два.
+ * Бот и мини-приложение работают разными процессами на одной базе, и два
+ * почти одновременных «Я оплатил» проходили оба: строка перепривязывалась
+ * второй раз, а дни начислялись дважды за один платёж. Теперь второй
+ * заход не меняет ни строки и получает false — начислять ему нечего.
+ *
+ * @returns {boolean} досталась ли эта оплата вызывающему
+ */
+function attachPayment(paymentId, userId) {
+  const r = db.prepare('UPDATE payments SET user_id = ?, claimed_at = ? WHERE id = ? AND user_id = 0')
+    .run(userId, new Date().toISOString(), paymentId);
+  return r.changes > 0;
+}
+
+/**
+ * Оплаты, которые пришли без привязки к пользователю. По ним человек
+ * потом нажимает «Я оплатил» и вводит почту, указанную на кассе.
+ *
+ * Условие `days > 0` — не украшение, а замок. Срок проставляется только
+ * состоявшейся оплате (см. handlePayment в lava-webhook.js), поэтому ноль
+ * здесь означает «карта не прошла», «отменено» или «деньги возвращены».
+ * Без этого условия отбор возвращал вообще все ничьи строки по почте: за
+ * отклонённый платёж выдавался месяц, а возврат добавлял к оплате вторую
+ * строку с тем же сроком — и одно нажатие «Я оплатил» давало вдвое больше
+ * дней, чем человек когда-либо покупал.
+ */
+function unclaimedByEmail(email) {
+  return db.prepare('SELECT * FROM payments WHERE user_id = 0 AND days > 0 AND email = ? ORDER BY id')
+    .all(norm(email));
+}
+
+// ---------- подтверждение владения почтой ----------
+
+const CLAIM_TTL_MIN = 30;      // столько живёт код
+const CLAIM_TRIES = 5;         // столько раз можно ошибиться
+const CLAIM_SENDS_PER_DAY = 5; // столько раз в сутки можно запросить код
+
+const hashCode = (code) => crypto.createHash('sha256')
+  .update(`${String(code).trim()}|${process.env.BOT_TOKEN || 'нет-токена'}`).digest('hex');
+
+/**
+ * Заводит заявку и возвращает код, который надо отправить на почту.
+ *
+ * Код возвращается ВЫЗЫВАЮЩЕМУ, а не пользователю: отправить письмо — дело
+ * бота и приложения, здесь только учёт. Наружу код не показывать никогда,
+ * иначе весь замок теряет смысл.
+ *
+ * @returns {{ok:boolean, code?:string, count?:number, error?:string}}
+ */
+function startEmailClaim(userId, email) {
+  const clean = norm(email);
+  const found = unclaimedByEmail(clean);
+  // «Оплаты нет» и «оплата есть, но код не выслан» снаружи должны выглядеть
+  // одинаково, иначе форма превращается в проверялку «кто у вас платил».
+  if (!found.length) return { ok: false, error: 'нет-оплаты' };
+
+  const today = todayISO();
+  const prev = db.prepare('SELECT * FROM pay_claims WHERE user_id = ?').get(userId);
+  const sent = (prev && prev.sent_date === today) ? prev.sent_today : 0;
+  if (sent >= CLAIM_SENDS_PER_DAY) return { ok: false, error: 'много-попыток' };
+
+  // Шесть цифр, из crypto, а не из Math.random: подобрать за пять попыток
+  // шанса нет, а угадать закономерность генератора — тем более.
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  const expires = new Date(Date.now() + CLAIM_TTL_MIN * 60000).toISOString();
+  db.prepare(`
+    INSERT INTO pay_claims (user_id, email, code_hash, tries, sent_today, sent_date, expires_at)
+    VALUES (?, ?, ?, 0, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      email = excluded.email, code_hash = excluded.code_hash, tries = 0,
+      sent_today = excluded.sent_today, sent_date = excluded.sent_date,
+      expires_at = excluded.expires_at
+  `).run(userId, clean, hashCode(code), sent + 1, today, expires);
+  return { ok: true, code, count: found.length };
+}
+
+/**
+ * Вернуть попытку отправки, когда письмо с кодом не ушло.
+ *
+ * Пять отправок в сутки — защита от рассылки чужими руками, и тратить их на
+ * письма, которых не было, нечестно: доступ ждёт человек, который уже
+ * заплатил. Саму заявку не трогаем — код в ней ещё живой, и если письмо
+ * всё-таки дошло вторым заходом, он подойдёт.
+ */
+function refundClaimSend(userId) {
+  db.prepare(
+    'UPDATE pay_claims SET sent_today = MAX(0, sent_today - 1) WHERE user_id = ?',
+  ).run(userId);
+}
+
+/**
+ * Проверяет код и, если он верен, привязывает оплаты и начисляет дни.
+ *
+ * @returns {{ok:boolean, until?:string, taken?:number, error?:string, left?:number}}
+ */
+function confirmEmailClaimInner(userId, code) {
+  const row = db.prepare('SELECT * FROM pay_claims WHERE user_id = ?').get(userId);
+  if (!row) return { ok: false, error: 'нет-заявки' };
+  if (Date.parse(row.expires_at) < Date.now()) {
+    db.prepare('DELETE FROM pay_claims WHERE user_id = ?').run(userId);
+    return { ok: false, error: 'просрочен' };
+  }
+  if (row.tries >= CLAIM_TRIES) return { ok: false, error: 'много-ошибок' };
+
+  const given = hashCode(code);
+  const a = Buffer.from(given, 'hex');
+  const b = Buffer.from(String(row.code_hash), 'hex');
+  // Сравнение постоянного времени: длины совпадают всегда (оба sha256), но
+  // проверку оставляем — timingSafeEqual бросает на разной длине.
+  const same = a.length === b.length && crypto.timingSafeEqual(a, b);
+  if (!same) {
+    db.prepare('UPDATE pay_claims SET tries = tries + 1 WHERE user_id = ?').run(userId);
+    return { ok: false, error: 'не-тот-код', left: Math.max(0, CLAIM_TRIES - row.tries - 1) };
+  }
+
+  // Код верен — забираем оплаты той почты, на которую он уходил, а не той,
+  // что пришла сейчас: иначе подтверждение одним адресом открывало бы любой.
+  const found = unclaimedByEmail(row.email);
+  let until = '';
+  let taken = 0;
+  for (const p of found) {
+    if (!attachPayment(p.id, userId)) continue;
+    taken += 1;
+    until = grantDays(userId, p.days || 30);
+  }
+  db.prepare('DELETE FROM pay_claims WHERE user_id = ?').run(userId);
+  if (!taken) return { ok: true, taken: 0, until: accessInfo(userId).until };
+  return { ok: true, taken, until };
+}
+
+/** Ждёт ли этот человек ввода кода — и на какую почту тот ушёл. */
+function pendingClaim(userId) {
+  const row = db.prepare('SELECT * FROM pay_claims WHERE user_id = ?').get(userId);
+  if (!row || Date.parse(row.expires_at) < Date.now()) return null;
+  // sentToday нужен, чтобы видеть возврат сгоревшей впустую отправки.
+  return { email: row.email, left: Math.max(0, CLAIM_TRIES - row.tries), sentToday: row.sent_today };
+}
+
+function paymentsOf(userId, limit = 10) {
+  return db.prepare('SELECT * FROM payments WHERE user_id = ? ORDER BY id DESC LIMIT ?')
+    .all(userId, limit);
+}
+
+/*
+ * Код списывается и срок продлевается в одной транзакции — см. inTx.
+ * Раньше при сбое выдачи код считался использованным, а дней не было.
+ */
+const redeemCode = (userId, raw) => inTx(() => redeemCodeInner(userId, raw));
+
+/*
+ * Оплаты привязываются и срок продлевается в одной транзакции. Раньше
+ * привязанная строка при сбое продления оставалась «чужой», и забрать её
+ * повторно было нельзя: user_id уже не 0.
+ */
+const confirmEmailClaim = (userId, code) => inTx(() => confirmEmailClaimInner(userId, code));
+
+module.exports = {
+  accessInfo, grantDays, revokeAccess, paidUsers, inTx,
+  recordPayment, findPayment, attachPayment, unclaimedByEmail, paymentsOf,
+  startEmailClaim, confirmEmailClaim, pendingClaim, refundClaimSend,
+  createCodes, getCode, redeemCode, revokeCode, listCodes, codeUsers, usedCodes,
+  normCode, looksLikeCode: (s) => new RegExp(`^${PREFIX}[-\\s]?[A-Z0-9]`, 'i').test(String(s || '').trim()),
+};

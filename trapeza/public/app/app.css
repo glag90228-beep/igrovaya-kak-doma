@@ -1,0 +1,1670 @@
+/*
+ * Оформление мини-приложения.
+ *
+ * Цвета берём у Telegram (--tg-theme-*), а не свои: приложение открывается
+ * внутри мессенджера, и человек мгновенно замечает чужой белый прямоугольник
+ * в тёмной теме. Все запасные значения — на случай, если приложение открыли
+ * в обычном браузере (например, при отладке), тогда работает своя пара
+ * светлой и тёмной темы.
+ *
+ * Визуальный язык взят у денежных приложений — Cash App, SoFi, Wabi — и он
+ * держится на трёх вещах, а не на украшениях:
+ *
+ *   1. Сумма — самое крупное на экране. Человек открывает приложение,
+ *      чтобы узнать цифру, и должен прочитать её раньше, чем сфокусирует
+ *      взгляд. Отсюда 44 пикселя, плотный трекинг и табличные цифры.
+ *   2. Одно главное действие. Не восемь равных плиток, а одна большая
+ *      кнопка и всё остальное тише её.
+ *   3. Воздух вместо линий. Крупный радиус, мягкая тень и щедрые отступы
+ *      читаются спокойнее, чем сетка из рамок, — и не спорят с темой.
+ *
+ * Своего у нас только зелёный и красный для денег: «должны нам» и «должны
+ * мы» обязаны различаться мгновенно, а тема Telegram таких цветов не даёт.
+ */
+
+/*
+ * Manrope, переменное начертание: 700 и 800 берутся из одних файлов.
+ * font-display: swap — пока шрифт едет, сумма показана системным и видна
+ * сразу; подменить её позже честнее, чем прятать на полсекунды.
+ */
+@font-face {
+  font-family: Manrope;
+  font-style: normal;
+  font-weight: 700 800;
+  font-display: swap;
+  src: url('fonts/manrope-cyrillic.woff2') format('woff2');
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+@font-face {
+  font-family: Manrope;
+  font-style: normal;
+  font-weight: 700 800;
+  font-display: swap;
+  src: url('fonts/manrope-latin-ext.woff2') format('woff2');
+  /* Знак рубля U+20BD живёт здесь. Без этого блока «118 693 ₽» рисовалось бы
+     цифрами Manrope и системным рублём — разной толщины и не по одной линии. */
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7,
+                 U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F,
+                 U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+                 U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: Manrope;
+  font-style: normal;
+  font-weight: 700 800;
+  font-display: swap;
+  src: url('fonts/manrope-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+                 U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122,
+                 U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+:root {
+  color-scheme: light dark;
+
+  /* Системный шрифт — тот же, которым набран сам Telegram; ничего не грузим.
+     Держим его отдельным токеном: в сокращении «font:» семейство нельзя
+     задать словом inherit, браузер молча отбрасывает такое правило целиком. */
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+
+  /*
+   * Manrope — только на числа и заголовки.
+   *
+   * Текст остаётся системным намеренно: приложение живёт внутри Telegram, и
+   * набранное чужим шрифтом читается как чужая вставка. А вот сумма — это то,
+   * ради чего экран открывают, и у неё своя работа: плотные табличные цифры
+   * одинаковой ширины, которые не пляшут при пересчёте.
+   *
+   * Файлы лежат рядом, а не грузятся с Google: внешний запрос задерживал бы
+   * самое главное на экране и уводил бы адрес каждого пользователя на чужой
+   * сервер при каждом запуске. Подробности и лицензия — fonts/README.md.
+   */
+  --font-num: Manrope, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+              "Helvetica Neue", Arial, sans-serif;
+
+  --bg: var(--tg-theme-bg-color, #ffffff);
+  --surface: var(--tg-theme-section-bg-color, #ffffff);
+  --group: var(--tg-theme-secondary-bg-color, #f4f4f7);
+  --text: var(--tg-theme-text-color, #12171c);
+  /*
+   * Серый подсказочный текст и синий кнопок — плотнее, чем отдаёт тема.
+   *
+   * Серый #7d8b99 из темы Telegram на белом даёт 3,5:1 при норме 4,5:1 для
+   * мелкого текста: подписи 12-14 px читались с трудом. Подмешиваем к нему
+   * цвет основного текста, и серый остаётся серым, но выходит на 5,7:1 в
+   * светлой теме (в тёмной он и так светлый). Тот же приём для кнопок: белый
+   * на #2b7fd4 — 4,1:1, а на чуть темнее — 5,3:1.
+   */
+  --muted: color-mix(in srgb, var(--tg-theme-hint-color, #5f6c7a) 72%, var(--text));
+  --link: color-mix(in srgb, var(--tg-theme-link-color, #2b7fd4) 86%, #000);
+  --primary: color-mix(in srgb, var(--tg-theme-button-color, #2b7fd4) 86%, #000);
+  --on-primary: var(--tg-theme-button-text-color, #ffffff);
+  --danger: var(--tg-theme-destructive-text-color, #d1453b);
+  --section-title: var(--muted);
+  /* Линия под полем ввода: без неё пустое поле не отличить от строки-подписи. */
+  --input-line: color-mix(in srgb, var(--muted) 55%, transparent);
+
+  /* Деньги. Тема Telegram даёт только цвет действия и цвет опасности —
+     этого мало: «нам должны» и «мы должны» человек должен различать
+     боковым зрением, не читая подписи. */
+  --money-in: #0f9d58;
+  /* Ожидание оплаты. Не зелёный (это «получено») и не красный (это «мы
+     должны»): у ожидания свой смысл, и свой цвет ему нужен отдельный. */
+  --wait: #9a5f05;
+  --money-out: #e5484d;
+  --success: #0f9d58;
+  /*
+   * Те же зелёный и красный, но для МЕЛКОГО текста на светлом фоне.
+   *
+   * Фирменные #0f9d58 и #e5484d дают 3,5:1 и 3,9:1 — для крупных сумм (3:1)
+   * этого хватает, а для строки «+5 000 ₽», бейджа «в ЕГРЮЛ» и пометки «ИНН
+   * верный» мелким шрифтом нужно 4,5:1. Тон тот же, только темнее на пятую
+   * часть: 5,4:1 и 5,9:1. В тёмной теме исходные цвета и так светлые — там
+   * значения те же, что у основных.
+   */
+  --money-in-ink: color-mix(in srgb, var(--money-in) 78%, #000);
+  --money-out-ink: color-mix(in srgb, var(--money-out) 78%, #000);
+  --success-ink: color-mix(in srgb, var(--success) 78%, #000);
+
+  --border: color-mix(in srgb, var(--muted) 20%, transparent);
+  --hairline: color-mix(in srgb, var(--muted) 14%, transparent);
+
+  /* Радиусы крупнее прежних: 18 у карточек и 14 у кнопок — то, что делает
+     интерфейс «мягким», не добавляя ни одной лишней детали. */
+  --r-card: 18px;
+  --r-btn: 14px;
+  --r-field: 12px;
+  --r-pill: 999px;
+
+  --pad: 18px;
+  --gap: 14px;
+  --tap: 44px;              /* минимальная цель нажатия */
+
+  /* Одна шкала высоты вместо случайных теней. В тёмной теме тень не видна,
+     поэтому там глубину даёт сама подложка карточки. */
+  --shadow-1: 0 1px 2px rgba(16, 24, 40, .04), 0 1px 3px rgba(16, 24, 40, .06);
+  --shadow-2: 0 4px 12px rgba(16, 24, 40, .07), 0 2px 4px rgba(16, 24, 40, .04);
+
+  --fast: 160ms;
+  --slow: 220ms;
+  --ease: cubic-bezier(.22,.61,.36,1);
+
+  /*
+   * Стекло.
+   *
+   * Матовая поверхность читается стеклом только тогда, когда за ней что-то
+   * есть: размывать ровную заливку бессмысленно — получится та же заливка.
+   * Поэтому под страницей лежит мягкое цветное свечение (body::before), а
+   * карточки пропускают его сквозь себя.
+   *
+   * Плотность держим высокой — 76%, не 40. Это приложение про деньги:
+   * сумма должна читаться на ходу и при солнце, а не «смотреться».
+   * Насыщенность поднимаем: без неё размытие делает цвет под стеклом
+   * блёклым, и зелёный «нам должны» перестаёт отличаться от серого.
+   */
+  --glass: color-mix(in srgb, var(--surface) 76%, transparent);
+  --glass-strong: color-mix(in srgb, var(--surface) 88%, transparent);
+  --glass-blur: saturate(185%) blur(22px);
+  --glass-edge: inset 0 1px 0 rgba(255, 255, 255, .6);
+  --glow-a: color-mix(in srgb, var(--primary) 32%, transparent);
+  --glow-b: color-mix(in srgb, var(--money-in) 16%, transparent);
+  --glow-c: color-mix(in srgb, var(--link) 14%, transparent);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: var(--tg-theme-bg-color, #17212b);
+    --surface: var(--tg-theme-section-bg-color, #1d2733);
+    --group: var(--tg-theme-secondary-bg-color, #131c26);
+    --text: var(--tg-theme-text-color, #f1f4f7);
+    --muted: color-mix(in srgb, var(--tg-theme-hint-color, #8fa1b3) 72%, var(--text));
+    /* В тёмной теме ссылка должна быть светлой, а кнопка — тёмной под белый текст. */
+    --link: var(--tg-theme-link-color, #62a8f0);
+    --money-in: #35d07f;
+    /* На тёмном b8730a почти не читается — берём светлее. */
+    --wait: #f5a524;
+    --money-out: #ff6369;
+    --success: #35d07f;
+    --money-in-ink: var(--money-in);
+    --money-out-ink: var(--money-out);
+    --success-ink: var(--success);
+    --shadow-1: none;
+    --shadow-2: none;
+
+    /* В тёмной теме блик сверху белым выглядит грязным пластиком, а не
+       стеклом: там кромку даёт едва заметная светлая линия. */
+    --glass: color-mix(in srgb, var(--surface) 68%, transparent);
+    --glass-strong: color-mix(in srgb, var(--surface) 84%, transparent);
+    --glass-edge: inset 0 1px 0 rgba(255, 255, 255, .09);
+    --glow-a: color-mix(in srgb, var(--primary) 34%, transparent);
+    --glow-b: color-mix(in srgb, var(--money-in) 16%, transparent);
+    --glow-c: color-mix(in srgb, var(--link) 26%, transparent);
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  color: var(--text);
+}
+
+/* Фон держит только html. Если его продублировать на body, тот закрасит
+   свечение под собой: слой с отрицательным z-index лежит выше фона
+   корня, но ниже фона body, — и всё стекло превращается в ровную
+   заливку. Один раз уже наступили, оставляем комментарий. */
+html { background: var(--group); }
+
+body {
+  background: none;
+  font: 400 16px/1.5 var(--font);
+  min-height: 100dvh;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior-y: none;
+  touch-action: manipulation;         /* убирает задержку 300 мс */
+}
+
+/*
+ * То, что видно сквозь стекло.
+ *
+ * Два мягких пятна в цветах действия и денег — прибиты к окну (fixed), а
+ * не к странице: при прокрутке свечение стоит на месте, и карточки едут
+ * по нему, как по столу. Если прокручивать вместе — эффект пропадает,
+ * стекло начинает выглядеть просто полупрозрачным.
+ *
+ * Пятна бледные намеренно: это подложка, а не рисунок. Заметное пятно за
+ * колонкой сумм мешает их читать, а читают тут в первую очередь суммы.
+ */
+body::before {
+  content: '';
+  position: fixed;
+  inset: -20%;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(40% 26% at 12% 4%, var(--glow-a), transparent 70%),
+    radial-gradient(44% 28% at 92% 20%, var(--glow-b), transparent 72%),
+    radial-gradient(50% 30% at 50% 78%, var(--glow-c), transparent 74%);
+}
+
+#app {
+  padding: 8px 0 calc(96px + env(safe-area-inset-bottom));
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+/* ---------- типографика ---------- */
+
+h1 { font: 700 26px/1.2 var(--font-num); letter-spacing: -.02em; margin: 6px var(--pad) 14px; }
+h2 { font: 600 17px/1.35 var(--font); margin: 0 0 2px; }
+
+/* Заголовок раздела — служебная подпись, а не элемент композиции:
+   он должен читаться, когда его ищут, и не мешать, когда не ищут. */
+.section-title {
+  font: 600 12px/1.4 var(--font);
+  color: var(--section-title);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  margin: 24px var(--pad) 8px;
+}
+
+.muted { color: var(--muted); }
+.small { font-size: 14px; }
+/* Табличные цифры обязательны везде, где есть деньги: без них колонка сумм
+   пляшет, а «1 111» выглядит уже «11 11». */
+.money { font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.nowrap { white-space: nowrap; }
+/* Знак денег в списках: зелёное — нам, красное — мы. Те же два цвета, что
+   в сводке на главной, иначе пришлось бы каждый раз читать заголовок. */
+.money.in { color: var(--money-in-ink); font-weight: 600; }
+.money.out { color: var(--money-out-ink); font-weight: 600; }
+/* Крупная сумма держит фирменный тон: на 44 px 3:1 достаточно, а яркость нужна. */
+.hero .sum.money.in { color: var(--money-in); }
+.hero .sum.money.out { color: var(--money-out); }
+
+/* ---------- секции-карточки (идиома Telegram/iOS) ---------- */
+
+.card {
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-card);
+  margin: 0 12px var(--gap);
+  overflow: hidden;
+  box-shadow: var(--shadow-1), var(--glass-edge);
+}
+
+/*
+ * Запасной путь. backdrop-filter есть не везде: старые вебвью Android и
+ * режим экономии данных его отключают. Тогда полупрозрачная карточка
+ * превращается в мутное пятно поверх свечения, и текст на ней теряется.
+ * В этом случае возвращаем плотную заливку — красиво не будет, читаемо
+ * будет.
+ */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .card, .tile, .tabs, .ask-bar, .stats { background: var(--surface); }
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  min-height: 56px;
+  padding: 13px var(--pad);
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+/* Разделитель начинается после иконки, а не от края: так список читается
+   как один блок, а не как таблица из отдельных ячеек. */
+.row + .row { border-top: 1px solid var(--hairline); }
+button.row, a.row { cursor: pointer; }
+
+button.row:active, a.row:active, .tile:active, .btn:active {
+  transform: scale(.985);
+  transition: transform 90ms var(--ease);
+}
+
+.row .grow { flex: 1; min-width: 0; }
+.row .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Вторая строка: метка состояния и пояснение в одну линию. */
+.sub-line { display: flex; align-items: center; gap: 8px; margin-top: 3px; min-width: 0; }
+/* Пояснение режем многоточием. Без этого длинная подпись не ужималась и
+   выталкивала сумму справа прямо на заголовок строки. */
+.sub-line .small { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+/* Сальдо в карточке контрагента: сумма собственной строкой.
+   Рядом с подписью «Начали с 105 691,30 ₽ на 01.08.2026» шестизначной
+   сумме не хватало места, и она налезала на слова «Должен нам». */
+.balance { align-items: center; }
+.balance .v {
+  font: 700 clamp(24px, 7.5vw, 30px)/1.15 var(--font);
+  letter-spacing: -.025em; font-variant-numeric: tabular-nums; margin-top: 2px;
+}
+.balance .hint { color: var(--muted); font-size: 13px; margin-top: 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Дату не режем: она короткая и всегда нужна целиком. Ужимается метка —
+   её смысл понятен и по первому слову. */
+.sub-line .badge { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+.icon { width: 22px; height: 22px; flex: none; }
+svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+/* Значок внутри строки текста — подписи, кнопки, чипы: по высоте букв, а не плитка 22 px.
+   Эмодзи тут не годятся: на каждом телефоне они свои и не берут цвет темы. */
+.icon.inline { width: 1.15em; height: 1.15em; margin-right: .4em; vertical-align: -.2em; }
+.icon.inline:last-child { margin-right: 0; margin-left: .25em; }
+.icon.inline:first-child { margin-left: 0; margin-right: .4em; }
+.btn .icon.inline, .chip .icon.inline { margin: 0 .1em 0 0; }
+/* Уровень риска договора: цветная точка вместо 🔴🟡🟢. */
+.risk-dot { display: inline-block; width: .65em; height: .65em; border-radius: 50%; margin-right: .5em; background: var(--wait); }
+.risk-dot.high { background: var(--danger); }
+.risk-dot.low { background: var(--success); }
+.icon-box {
+  width: 36px; height: 36px; border-radius: 11px; flex: none;
+  display: grid; place-items: center;
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--primary);
+}
+.icon-box.warn { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
+.icon-box.ok { background: color-mix(in srgb, var(--success) 14%, transparent); color: var(--success); }
+.chev { color: var(--muted); width: 18px; height: 18px; flex: none; opacity: .6; }
+
+/* ---------- шапка: сумма крупнее всего на экране ---------- */
+
+.hero { padding: 10px 12px 2px; }
+
+/* Приветствие и остаток бесплатных — над карточкой, в одну строку:
+   это не про деньги, внутри карточки они бы спорили с числом. */
+.greet-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 6px 8px;
+}
+.greet-row .greet { color: var(--muted); font-size: 15px; flex: 1; min-width: 0; }
+
+/*
+ * Карточка суммы.
+ *
+ * Голое число на фоне, прижатое влево, читалось как заголовок раздела:
+ * взгляд скользил по нему дальше вниз, вместо того чтобы остановиться.
+ * Карточка отделяет главный вопрос — «сколько мне должны» — от остального
+ * экрана, а центр даёт числу вес.
+ */
+.hero-card {
+  background: var(--surface);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-1);
+  padding: 16px var(--pad) 18px;
+  text-align: center;
+}
+.hero-card .cap {
+  color: var(--muted); font-size: 14px; font-weight: 500;
+}
+.hero .sum {
+  font: 800 clamp(34px, 11.5vw, 46px)/1.05 var(--font-num);
+  letter-spacing: -.035em;
+  font-variant-numeric: tabular-nums;
+  margin: 6px 0 0;
+}
+.hero .sub { color: var(--muted); font-size: 15px; margin-top: 6px; }
+/* Сумма нажимается: под ней разбор по источникам. Кнопка выглядит как текст,
+   иначе шапка превратится в панель управления, — но это настоящая кнопка,
+   а не div с обработчиком: по мёртвой на вид цифре никто не тыкает. */
+.hero .tap { display: block; width: 100%; text-align: center; border: 0; padding: 0;
+  background: none; color: inherit; font: inherit; cursor: pointer; }
+.hero .tap:active { opacity: .6; }
+.hero .why { color: var(--primary); font-size: 14px; margin-top: 4px; }
+
+/* Ожидание оплаты — янтарным, и это не вкусовщина.
+   Зелёный в приложении означает «деньги получены» (--money-in), красный —
+   «мы должны». Счёт, который ждут, не то и не другое: если красить его
+   зелёным, полученное и обещанное сливаются в один сигнал. */
+.hero .sub.wait { color: var(--wait); font-weight: 600; }
+
+/* Способ подсчёта — спокойная плашка, а не алый баннер.
+   Раньше расхождение оснований объявлялось красной панелью с восклицательным
+   знаком: она спорила с крупной цифрой за внимание и читалась как поломка,
+   хотя описывает настройку. Разбор с пересчётом открывается по нажатию. */
+.chip-basis {
+  display: inline-block; margin-top: 10px; padding: 5px 12px;
+  border: 0; border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 12%, transparent);
+  color: var(--muted); font: 500 13px/1.2 var(--font); cursor: pointer;
+}
+.chip-basis:active { opacity: .6; }
+
+/* Строка фразы: один вход вместо двух равнозначных карточек.
+   Пример пишем прямо в ней — человек видит, ЧТО говорить, а не гадает. */
+.prompt {
+  display: flex; align-items: center; gap: 12px; width: calc(100% - 24px);
+  /* Снизу — обычный шаг сетки, а не ноль: с нулём карточка фразы слипалась
+     с кнопкой ниже в один блок с двухпиксельным швом. Это читается как
+     ошибка вёрстки, а не как связь между ними. */
+  margin: var(--gap) 12px var(--gap); padding: 12px var(--pad);
+  background: var(--surface); border: 0;
+  /* Именно --r-card. Здесь стояло var(--radius) — такого токена в проекте
+     нет, свойство молча отбрасывалось, и у карточки не было скругления
+     вовсе: единственный острый угол на всём экране. */
+  border-radius: var(--r-card);
+  color: inherit; font: inherit; text-align: left; cursor: pointer;
+  box-shadow: var(--shadow-1);
+}
+.prompt:active { transform: scale(.985); transition: transform 90ms var(--ease); }
+/* flex: 1 — иначе на широком экране стрелка встаёт сразу за текстом, а не у края. */
+.prompt .grow { flex: 1; min-width: 0; }
+.prompt-go {
+  display: flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; flex: none; border-radius: 50%;
+  background: var(--primary); color: #fff;
+}
+.prompt-go .icon { width: 18px; height: 18px; }
+
+/* Пара «нам должны / мы должны» — один взгляд вместо двух экранов. */
+.stats { display: flex; margin: var(--gap) 12px;
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-1), var(--glass-edge); overflow: hidden; }
+.stat { flex: 1; padding: 14px var(--pad); border: 0; background: none;
+  color: inherit; font: inherit; text-align: left; cursor: pointer; min-height: 76px; }
+.stat + .stat { border-left: 1px solid var(--hairline); }
+.stat .k { font: 500 13px/1.3 var(--font); color: var(--muted); }
+.stat .v { font: 700 20px/1.25 var(--font-num); font-variant-numeric: tabular-nums;
+  letter-spacing: -.02em; margin-top: 5px; }
+.stat .v.in { color: var(--money-in); }
+.stat .v.out { color: var(--money-out); }
+.stat:active { transform: scale(.985); transition: transform 90ms var(--ease); }
+
+/* Плитки документов. Иконка сверху, подпись снизу — форма считывается
+   раньше текста, а четыре одинаковых листа бумаги выбрать не помогают. */
+.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: var(--gap) 12px; }
+.tile {
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-1), var(--glass-edge);
+  padding: 16px;
+  min-height: 108px;
+  display: flex; flex-direction: column; gap: 10px;
+  color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.tile .t-title { font-weight: 600; letter-spacing: -.01em; }
+.tile .t-sub { color: var(--muted); font-size: 13px; line-height: 1.35; }
+
+/* ---------- кнопки ---------- */
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: 52px;
+  padding: 0 20px;
+  border: 0; border-radius: var(--r-btn);
+  background: var(--primary); color: var(--on-primary);
+  font: 600 17px/1 var(--font); letter-spacing: -.01em;
+  cursor: pointer;
+  width: 100%;
+  box-shadow: var(--shadow-2);
+}
+.btn[disabled] { opacity: .55; cursor: default; box-shadow: none; }
+/* Фон страницы — это и есть secondary_bg_color темы, поэтому серая кнопка
+   на нём растворяется в обеих темах. Вторичной даём лёгкую заливку цветом
+   действия: она читается как кнопка и не спорит с главной. */
+.btn.secondary {
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--link);
+  box-shadow: none;
+}
+.btn.ghost { background: none; color: var(--link); box-shadow: none; min-height: var(--tap); }
+.btn.danger { background: none; color: var(--danger); box-shadow: none; border: 1.5px solid color-mix(in srgb, var(--danger) 45%, transparent); }
+.btn-wrap { padding: 4px 12px 12px; }
+/* Две кнопки подряд в одной обёртке не слипаются: раньше между ними не было просвета. */
+.btn-wrap > .btn + .btn { margin-top: 8px; }
+
+/*
+ * Главное действие экрана.
+ *
+ * Ровно одно на экран и заметно крупнее всего остального: человек приходит
+ * выписать счёт, а не изучать разделы. Стрелка справа показывает, что это
+ * начало пути, а не переключатель.
+ */
+.cta {
+  display: flex; align-items: center; gap: 14px;
+  width: calc(100% - 24px);
+  margin: 0 12px var(--gap);
+  min-height: 64px;
+  padding: 0 18px;
+  border: 0; border-radius: var(--r-card);
+  background: var(--primary); color: var(--on-primary);
+  font: inherit; text-align: left; cursor: pointer;
+  box-shadow: var(--shadow-2);
+}
+.cta:active { transform: scale(.99); transition: transform 90ms var(--ease); }
+.cta .cta-ico {
+  width: 40px; height: 40px; border-radius: 12px; flex: none;
+  display: grid; place-items: center;
+  background: color-mix(in srgb, #ffffff 20%, transparent);
+}
+.cta .cta-t { font: 600 17px/1.25 var(--font); letter-spacing: -.01em; }
+.cta .cta-s { font-size: 13px; opacity: .85; margin-top: 2px; }
+.cta .chev { color: currentColor; opacity: .7; margin-left: auto; }
+
+.spinner {
+  width: 16px; height: 16px; flex: none;
+  border: 2px solid currentColor; border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- поля ввода ---------- */
+
+.field { padding: 12px var(--pad); }
+.field + .field { border-top: 1px solid var(--hairline); }
+.field label {
+  display: block;
+  font: 500 13px/1.4 var(--font);
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.field .req { color: var(--danger); }
+.field input, .field textarea, .field select {
+  width: 100%;
+  min-height: var(--tap);
+  padding: 6px 0;
+  border: 0;
+  border-bottom: 1.5px solid var(--input-line);   /* поле видно и пустым, а не только заполненным */
+  border-radius: 0;
+  background: none;
+  color: var(--text);
+  font: 500 17px/1.4 var(--font);   /* 16px и больше — иначе iOS увеличивает страницу */
+}
+.field textarea { min-height: 92px; padding: 6px 0; resize: vertical; }
+.field input:focus, .field textarea:focus, .field select:focus { outline: none; border-bottom-color: var(--primary); }
+.field.invalid input, .field.invalid textarea { border-bottom-color: var(--danger); }
+.field.invalid input { color: var(--danger); }
+.field .err {
+  display: flex; gap: 6px; align-items: center;
+  color: var(--danger); font-size: 13px; margin-top: 4px;
+}
+.field .hint { color: var(--muted); font-size: 13px; margin-top: 4px; }
+
+.field:focus-within { box-shadow: inset 3px 0 0 var(--primary); }
+
+/* Выбор клиента прямо в форме счёта.
+   Раньше здесь стоял выпадающий список, а до него — экран-заглушка «сначала
+   добавьте контрагента»: человек шёл выписывать счёт и попадал в справочник.
+   Теперь поле ищет среди своих по названию и ИНН, а по ИНН умеет предложить
+   и того, кого в справочнике ещё нет. */
+.cp-chip {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 6px 0; min-height: var(--tap); border: 0; background: none; color: inherit;
+  font: 500 17px/1.4 var(--font); text-align: left; cursor: pointer;
+}
+.cp-chip:active { opacity: .6; }
+
+.cp-found {
+  margin-top: 8px; border-top: 1px solid var(--hairline);
+  max-height: 260px; overflow-y: auto;
+}
+.cp-opt {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 10px 0; border: 0; border-bottom: 1px solid var(--hairline);
+  background: none; color: inherit; font: 400 16px/1.35 var(--font);
+  text-align: left; cursor: pointer;
+}
+.cp-opt:last-child { border-bottom: 0; }
+.cp-opt:active { opacity: .6; }
+/* Найденное в реестре выделяем: это не «ещё один из списка», а новое имя,
+   которое сейчас появится в справочнике, — и человек должен это заметить. */
+.cp-opt.ok { align-items: flex-start; }
+/* «Добавить «…»» — действие, а не ещё один клиент из списка: цвет ссылки и высота под палец. */
+.cp-opt.add { min-height: var(--tap); color: var(--link); font-weight: 600; }
+
+/* Платёжный QR на карточке документа.
+   Белая подложка обязательна и в тёмной теме: код читается только как
+   тёмное на светлом, инверсия ломает распознавание камерой. */
+.qr-card { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.qr-wrap {
+  background: #fff; padding: 10px; border-radius: 12px; line-height: 0;
+}
+.qr-wrap svg { display: block; width: 200px; height: 200px; }
+.center { text-align: center; }
+
+/* Видимая обводка фокуса обязательна: ей пользуются с клавиатуры. */
+:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; border-radius: 4px; }
+
+/* ---------- позиции документа ---------- */
+
+.item { padding: 10px var(--pad); display: grid; gap: 8px; }
+.item + .item { border-top: 1px solid var(--border); }
+.item .top { display: flex; gap: 10px; align-items: start; }
+.item .name { flex: 1; border: 0; background: none; color: inherit; font: 500 16px/1.4 var(--font); min-width: 0; min-height: var(--tap); }
+.item .nums { display: flex; align-items: flex-end; gap: 8px; }
+.item .nums .num { display: grid; gap: 2px; }
+.item .nums .num .cap { font: 500 12px/1.2 var(--font); color: var(--muted); }
+.item .nums .x { padding-bottom: 12px; }
+.item .nums select.unit {
+  width: 74px; min-height: var(--tap); padding: 0 6px;
+  border: 1px solid var(--border); border-radius: var(--r-field);
+  background: var(--group); color: inherit; font: 400 16px/1 var(--font);
+}
+/* Подсказка у позиции: названа, а цены нет. Янтарный, не красный — это «не дошли», а не «ошиблись». */
+.item-need {
+  display: flex; gap: 6px; align-items: center;
+  font-size: 13px; line-height: 1.35; color: var(--wait);
+  animation: live-in .22s ease-out;
+}
+.item-need[hidden] { display: none; }
+.item-need .icon { width: 16px; height: 16px; flex: none; }
+/* Нет названия — строка позиции подсвечена и «вздрагивает» один раз. */
+.item.item-bad { box-shadow: inset 3px 0 0 var(--danger); }
+.item.item-bad .err { display: flex; gap: 6px; align-items: center; color: var(--danger); font-size: 13px; }
+.item.item-bad .err .icon { width: 16px; height: 16px; flex: none; animation: live-shake .34s ease-out; }
+
+/* Итог вздрагивает при смене числа: transform и opacity, вёрстку не трогает. */
+.total-row .money { display: inline-block; transform-origin: right center; }
+.total-row .money.bump { animation: bump .3s var(--ease); }
+@keyframes bump { 0% { transform: scale(1); } 35% { transform: scale(1.07); } 100% { transform: none; } }
+
+.item .line-sum { display: flex; justify-content: space-between; align-items: baseline; font-size: 14px; }
+.item .nums input {
+  width: 84px; text-align: right;
+  border: 1px solid var(--border); border-radius: var(--r-field);
+  background: var(--group); color: inherit;
+  font: 400 16px/1 var(--font); font-variant-numeric: tabular-nums;
+  min-height: var(--tap); padding: 0 8px;
+}
+.item .nums .x { color: var(--muted); }
+.item .line-total { margin-left: auto; font-weight: 500; font-variant-numeric: tabular-nums; }
+
+.iconbtn {
+  width: var(--tap); min-width: var(--tap); height: var(--tap);
+  display: grid; place-items: center;
+  border: 0; background: none; color: var(--muted);
+  border-radius: var(--r-btn); cursor: pointer; flex: none;
+}
+.iconbtn.danger { color: var(--muted); }
+/* Красной корзина становится в момент нажатия: до этого она не важнее
+   названия позиции, рядом с которым стоит. */
+.iconbtn.danger:active { color: var(--danger); }
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px var(--pad); }
+.chip {
+  min-height: 36px; padding: 0 12px;
+  border: 1px solid var(--border); border-radius: 18px;
+  background: none; color: var(--text); font: 400 14px/1 var(--font);
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+}
+/* Чип-переключатель: им отмечают штампы на копии документа. Нажатое
+   состояние должно читаться само, без подписи «включено» рядом. */
+.chip[aria-pressed="true"] {
+  border-color: var(--primary); color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+}
+
+/* Режимы помощника над перепиской. «Разговор» во время работы дышит —
+   видно, что микрофон и голос включены, даже не глядя на кнопку записи. */
+.ask-modes { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 var(--pad) 10px; }
+.chip.talk[aria-pressed="true"] { animation: talk-breath 1.6s ease-in-out infinite; }
+@keyframes talk-breath {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--primary) 35%, transparent); }
+  50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--primary) 0%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) { .chip.talk[aria-pressed="true"] { animation: none; } }
+
+.total-row {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 16px var(--pad); border-top: 1px solid var(--hairline);
+  font-weight: 600; font-size: 18px;
+}
+.total-row .money { font: 700 22px/1.2 var(--font); letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+
+/* ---------- служебные состояния ---------- */
+
+.boot, .empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 12px; text-align: center;
+  padding: 56px 32px; color: var(--muted);
+}
+.boot { flex-direction: row; }
+.empty .icon-box { width: 56px; height: 56px; border-radius: 18px; }
+.empty .icon-box .icon { width: 30px; height: 30px; }
+.empty h2 { color: var(--text); }
+/*
+ * Пустой экран «собирается»: значок всплывает, текст и кнопки подъезжают по
+ * очереди. Пустота перестаёт выглядеть сломанным экраном: что-то произошло,
+ * и дальше есть куда идти. Один раз, 60 мс между шагами, transform и opacity.
+ */
+.empty > * { animation: rise .32s var(--ease) both; }
+.empty > :nth-child(2) { animation-delay: 60ms; }
+.empty > :nth-child(3) { animation-delay: 120ms; }
+.empty > :nth-child(n+4) { animation-delay: 180ms; }
+.empty > .icon-box { animation: ok-pop .5s cubic-bezier(.3, 1.5, .5, 1) both; }
+
+.skeleton {
+  background: var(--surface);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-1);
+  margin: 0 12px var(--gap);
+  overflow: hidden;
+}
+.skeleton .line, .sk-title .line {
+  height: 14px; margin: 16px;
+  border-radius: 7px;
+  background: linear-gradient(90deg, var(--group) 25%, color-mix(in srgb, var(--muted) 18%, var(--group)) 37%, var(--group) 63%);
+  background-size: 400% 100%;
+  animation: shimmer 1.3s ease-in-out infinite;
+}
+@keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+
+
+.banner {
+  display: flex; gap: 10px; align-items: flex-start;
+  margin: 0 12px var(--gap); padding: 14px 16px;
+  border-radius: var(--r-card);
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+  color: var(--text); font-size: 14px;
+}
+.banner.info { background: color-mix(in srgb, var(--primary) 12%, var(--surface)); }
+.banner .icon { color: var(--danger); }
+.banner.info .icon { color: var(--primary); }
+.banner.ok { background: color-mix(in srgb, var(--success) 12%, var(--surface)); }
+.banner.ok .icon { color: var(--success); }
+
+/*
+ * Итог действия: круглая галочка «всплывает» с лёгким перелётом, а вокруг
+ * неё расходится одно кольцо и гаснет. Только transform и opacity. Кольцо
+ * одно и один раз: праздник тут не нужен, нужна уверенность «получилось».
+ */
+.ok-badge {
+  position: relative; flex: none; width: 28px; height: 28px; border-radius: 50%;
+  display: grid; place-items: center;
+  background: var(--success);
+  animation: ok-pop .5s cubic-bezier(.3, 1.5, .5, 1) both;
+}
+.banner.ok .ok-badge .icon { width: 18px; height: 18px; color: #fff; stroke-width: 3; }
+.ok-badge::after {
+  content: ''; position: absolute; inset: 0; border-radius: 50%;
+  border: 2px solid var(--success);
+  animation: ok-ring .8s .15s ease-out both;
+}
+@keyframes ok-pop { 0% { transform: scale(.3); opacity: 0; } 100% { transform: none; opacity: 1; } }
+@keyframes ok-ring { 0% { transform: scale(1); opacity: .6; } 100% { transform: scale(2.1); opacity: 0; } }
+.icon-box.ok.pop { animation: ok-pop .5s cubic-bezier(.3, 1.5, .5, 1) both; }
+/* Текст баннера занимает всё место справа от значка — иначе кнопки внутри
+   сжимаются по содержимому и перестают быть цельной полосой. */
+.banner > div { flex: 1; min-width: 0; }
+.banner > .icon { flex: none; }
+/* Кнопки столбиком внутри баннера: каждая на всю ширину, не меньше 44 px в высоту. */
+.btn-col { display: flex; flex-direction: column; gap: 8px; }
+.btn-col .btn { min-height: 48px; }
+
+.badge {
+  font-size: 12px; font-weight: 500;
+  padding: 3px 9px; border-radius: var(--r-pill);
+  background: var(--group); color: var(--muted);
+  white-space: nowrap;
+}
+.badge.ok { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success-ink); }
+.badge.warn { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
+
+/* Текст напоминания правят перед отправкой, поэтому поле сразу высокое:
+   письмо, свёрнутое в три строки, никто не перечитает. */
+.remind-text {
+  width: 100%; min-height: 120px; resize: none; overflow: hidden;
+  border: 0; padding: 6px 0; background: none;
+  color: var(--text); font: 400 15px/1.5 var(--font);
+}
+.remind-text:focus { outline: none; }
+
+/* ---------- смахивание влево ---------- */
+
+/* Кнопка лежит под строкой и открывается, когда строка уезжает. Удаляет
+   именно нажатие по ней: смахнуть можно случайно при прокрутке, а документ
+   уходит вместе с проводкой, и вернуть его нечем. */
+.swipe { position: relative; overflow: hidden; }
+.swipe + .swipe { border-top: 1px solid var(--hairline); }
+.swipe-face {
+  position: relative; z-index: 1;
+  background: var(--surface);
+  touch-action: pan-y;              /* вертикальную прокрутку отдаём странице */
+  will-change: transform;
+}
+.swipe-del {
+  position: absolute; top: 0; right: 0; bottom: 0;
+  width: 92px;
+  display: grid; place-items: center;
+  border: 0; padding: 0;
+  background: var(--danger); color: #fff;
+  cursor: pointer;
+}
+.swipe-del .icon { width: 22px; height: 22px; }
+.swipe-del[disabled] { opacity: .6; }
+/* Внутри .swipe строки уже разделены рамкой обёртки — вторая линия удвоила
+   бы её толщину. */
+.swipe .row + .row, .swipe .row { border-top: 0; }
+
+/* Второе действие в строке — например, «перестать напоминать». Отдельная
+   цель нажатия шириной в палец: рядом с ней обычно есть первая, и промах
+   стоит удалённой записи. */
+.row-act {
+  flex: none;
+  width: var(--tap); height: var(--tap);
+  display: grid; place-items: center;
+  border: 0; border-radius: 50%;
+  background: none; color: var(--danger);
+  cursor: pointer;
+}
+.row-act:active { background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.row-act[disabled] { opacity: .5; }
+
+/* Три шага новичка: номер в кружке, у выполненного — галочка, у ближайшего — акцент. */
+.step { align-items: flex-start; }
+.step-n {
+  flex: none; width: 36px; height: 36px; border-radius: 50%;
+  display: grid; place-items: center;
+  background: var(--group); color: var(--muted);
+  font: 700 16px/1 var(--font-num);
+}
+.step-n.ok { background: color-mix(in srgb, var(--money-in) 16%, transparent); color: var(--money-in-ink); }
+.step.now .step-n { background: var(--primary); color: var(--on-primary); }
+.step.part .step-n { background: color-mix(in srgb, var(--wait) 20%, transparent); color: var(--wait); }
+.step.now .grow > div:first-child { font-weight: 700; }
+.step:not(.now):not(.done):not(.part) .grow > div:first-child { color: var(--muted); }
+.step-sub { margin-top: 2px; }
+/* Шаги без «текущего»: все равноправны, как в инструкции, поэтому названия не приглушаем. */
+.step.plain .step-n { background: color-mix(in srgb, var(--primary) 12%, transparent); color: var(--link); }
+.step.plain:not(.now):not(.done):not(.part) .grow > div:first-child { color: var(--text); font-weight: 600; }
+
+/* Строка документа: подпись переносится, а не режется — в ней тип, номер, дата и сумма. */
+.doc-row .doc-sub { white-space: normal; overflow-wrap: anywhere; margin-top: 2px; }
+
+/* Строка со вторым действием: сверху обычная строка, под ней кнопка, выровненная по тексту. */
+.row-block + .row-block, .row-block + .row, .row + .row-block { border-top: 1px solid var(--hairline); }
+.row-block .row + .row-actions { margin-top: -6px; }
+.row-actions { padding: 0 var(--pad) 12px calc(var(--pad) + 36px + 14px); }
+.pill-btn {
+  min-height: var(--tap); padding: 0 16px;
+  border: 0; border-radius: var(--r-btn);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--link); font: 600 15px/1 var(--font);
+  cursor: pointer;
+}
+.pill-btn:active { filter: brightness(.96); }
+
+/* Календарь повторения: что и какого числа произойдёт. Даты выровнены в
+   колонку — по ней читают цикл сверху вниз, не вчитываясь в подписи. */
+.plan { padding: 2px var(--pad) 12px; border-top: 1px solid var(--hairline); }
+.plan-row { display: flex; gap: 10px; align-items: baseline; padding: 4px 0; }
+.plan-when {
+  flex: none; min-width: 68px;
+  font: 600 13px/1.4 var(--font); font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.plan-what { font-size: 13px; line-height: 1.4; color: var(--muted); }
+
+/* ---------- строка банковской выписки ---------- */
+
+/* Сумма и дата сверху, назначение платежа под ними, выбор клиента снизу:
+   человек сначала узнаёт платёж, а потом решает, чей он. Обратный порядок
+   заставлял бы выбирать клиента, ещё не прочитав, за что деньги. */
+.pay + .pay { border-top: 1px solid var(--hairline); }
+.pay .row { padding-bottom: 4px; }
+.pay-note {
+  padding: 0 var(--pad) 8px;
+  /* Назначение платежа длинное, но обрезать его нельзя: как раз в нём
+     стоит номер счёта, по которому платёж и опознают. */
+  overflow-wrap: anywhere;
+}
+.pay-pick { padding: 0 var(--pad) 12px; }
+.pay-pick select {
+  width: 100%;
+  min-height: var(--tap);
+  padding: 0 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-field);
+  background: var(--group);
+  color: var(--text);
+  font: 500 16px/1.4 var(--font);   /* меньше 16px — и iOS увеличит страницу */
+}
+
+/* ---------- нижняя навигация ---------- */
+
+/* Высота вкладок нужна не только им: над ними стоит строка ввода в
+   переписке, и обе должны считать её от одного числа. */
+:root { --tabs-h: calc(57px + env(safe-area-inset-bottom, 0px)); }
+
+.tabs {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+  display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
+  /* Заливка плотная, не стекло: панель стоит поверх прокручиваемых карточек,
+     и при 88% непрозрачности их текст читался сквозь подписи вкладок. Само
+     размытие оставлено — оно только смягчает край. */
+  background: var(--surface);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border-top: 1px solid var(--border);
+  box-shadow: var(--glass-edge);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.tab {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+  min-height: 56px; padding: 6px 4px;
+  border: 0; background: none; color: var(--muted);
+  font: 500 11px/1.2 var(--font); cursor: pointer;
+}
+.tab[aria-current="page"] { color: var(--primary); }
+/* Активная вкладка помечена и цветом, и точкой: только цветом нельзя —
+   его не различают при дальтонизме и на выцветшем экране. */
+.tab[aria-current="page"]::after {
+  content: ''; width: 4px; height: 4px; border-radius: 50%;
+  background: currentColor; margin-top: 1px;
+}
+.tab .icon { width: 24px; height: 24px; }
+.tab { letter-spacing: .01em; }
+/* Счётчик напоминаний: красный кружок на углу значка. Цифра внутри, а не
+   голая точка — «есть что-то» и «горит три дела» человеку не одно и то же. */
+.tab-ico { position: relative; display: inline-flex; }
+.tab-badge {
+  position: absolute; top: -5px; left: 55%;
+  min-width: 17px; height: 17px; padding: 0 4px; box-sizing: border-box;
+  border-radius: 9px; background: var(--danger); color: #fff;
+  font: 700 11px/17px var(--font); text-align: center;
+  box-shadow: 0 0 0 2px var(--bg);
+}
+.tab-badge[hidden] { display: none; }
+.drawer-item .tab-badge { position: static; margin-left: auto; box-shadow: none; }
+
+
+/* ---------- шапка и боковая панель ---------- */
+
+/*
+ * Шапка держит четыре вещи: панель, дом, название раздела и человека. Название
+ * нужно потому, что вкладок пять, а экранов — больше тридцати: внутри
+ * карточки клиента иначе не понять, где ты.
+ */
+:root { --top-h: calc(52px + env(safe-area-inset-top, 0px)); --drawer-w: 264px; }
+
+.topbar {
+  position: sticky; top: 0; z-index: 45;
+  display: flex; align-items: center; gap: 4px;
+  height: var(--top-h); padding: env(safe-area-inset-top, 0px) 8px 0;
+  background: var(--surface); /* плотная: под верхней полосой тоже просвечивали заголовки */
+  -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+  border-bottom: 1px solid var(--border);
+}
+.topbar[hidden], .drawer[hidden], .scrim[hidden], .tabs[hidden] { display: none; }
+.tb-btn {
+  display: grid; place-items: center; flex: none;
+  width: var(--tap); height: var(--tap); border: 0; border-radius: var(--r-btn);
+  background: none; color: var(--text); cursor: pointer;
+  transition: background var(--fast) var(--ease);
+}
+.tb-btn:hover { background: var(--group); }
+.tb-btn:focus-visible, .drawer-item:focus-visible, .menu-item:focus-visible {
+  outline: 2px solid var(--primary); outline-offset: -2px;
+}
+.tb-btn .icon { width: 24px; height: 24px; }
+.tb-title {
+  flex: 1; min-width: 0; padding: 0 6px;
+  font: 700 17px/1.2 var(--font-num); letter-spacing: -.01em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tb-user { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.tb-name { max-width: 120px; font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.avatar {
+  display: grid; place-items: center; flex: none;
+  width: 32px; height: 32px; border-radius: 50%; object-fit: cover;
+  background: var(--primary); color: var(--on-primary);
+  font: 700 14px/1 var(--font-num);
+}
+.tb-actions { position: relative; }
+.menu {
+  position: absolute; right: 0; top: calc(100% + 6px); min-width: 200px; padding: 6px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-card);
+  box-shadow: var(--shadow-2); animation: enter var(--fast) var(--ease);
+}
+.menu[hidden] { display: none; }
+.menu-item, .drawer-item {
+  display: flex; align-items: center; gap: 12px; width: 100%; min-height: var(--tap);
+  padding: 0 12px; border: 0; border-radius: var(--r-field);
+  background: none; color: var(--text); font: 500 15px/1.3 var(--font); text-align: left; cursor: pointer;
+}
+.menu-item:hover, .drawer-item:hover { background: var(--group); }
+.menu-item .icon, .drawer-item .icon { width: 22px; height: 22px; color: var(--muted); }
+
+.scrim {
+  position: fixed; inset: 0; z-index: 60; background: rgba(8, 12, 20, .45);
+  animation: fade var(--slow) var(--ease);
+}
+@keyframes fade { from { opacity: 0; } }
+.drawer {
+  position: fixed; top: 0; bottom: 0; left: 0; z-index: 61;
+  width: min(var(--drawer-w), 84vw); padding: env(safe-area-inset-top, 0px) 10px 10px;
+  background: var(--surface); border-right: 1px solid var(--border);
+  box-shadow: var(--shadow-2);
+  transform: translateX(-102%); visibility: hidden;
+  transition: transform var(--slow) var(--ease), visibility 0s linear var(--slow);
+}
+.drawer.open { transform: none; visibility: visible; transition-delay: 0s; }
+.drawer-head { display: flex; align-items: center; gap: 12px; padding: 12px 6px 14px; }
+.drawer-head > div { flex: 1; min-width: 0; }
+.drawer-head .avatar { width: 40px; height: 40px; font-size: 17px; }
+.drawer-item { margin-bottom: 2px; }
+.drawer-item[aria-current="page"] {
+  background: color-mix(in srgb, var(--primary) 12%, transparent); color: var(--primary);
+}
+.drawer-item[aria-current="page"] .icon { color: currentColor; }
+body.drawer-open { overflow: hidden; }
+
+/* Скелетон под настоящую вёрстку: строка с кружком вместо голых полос. */
+.skeleton .line.big, .sk-title .line.big { height: 26px; border-radius: 9px; }
+.skeleton .line.short { width: 40%; height: 11px; margin-top: 0; }
+.sk-row { display: flex; align-items: center; gap: 12px; padding: 4px 16px; }
+
+/* Заглушка появляется через 150 мс: ответ быстрее — и серые полосы не мигнут вовсе. */
+.sk-wrap { animation: sk-in 200ms 150ms var(--ease) both; }
+@keyframes sk-in { from { opacity: 0; } }
+.sk-sum { padding: 12px 0 6px; text-align: center; }
+.sk-sum .line { margin-left: auto; margin-right: auto; }
+.sk-sum .line.short { width: 38%; }
+.sk-sum .line.huge { width: 64%; height: 40px; border-radius: 12px; }
+.sk-title { padding: 6px 0 2px; }
+.sk-title .line.big { margin-top: 10px; margin-bottom: 14px; }
+.sk-field .line { margin-top: 12px; margin-bottom: 12px; }
+.sk-field .line.short { width: 28%; height: 11px; margin-bottom: 4px; }
+.sk-row .line { margin-left: 0; margin-right: 0; }
+.sk-col { flex: 1; }
+.sk-dot {
+  width: 40px; height: 40px; border-radius: 12px; flex: none;
+  background: var(--group); animation: shimmer 1.3s ease-in-out infinite;
+}
+
+/* Планшет: вкладки внизу не нужны — есть панель, а контент можно расширить. */
+@media (min-width: 700px) {
+  .tabs { display: none; }
+  :root { --tabs-h: 0px; }
+  #app { max-width: 820px; padding-bottom: 48px; }
+  .tb-name { max-width: 200px; }
+}
+/* Компьютер: панель стоит всегда, шапка и контент сдвинуты вправо. */
+@media (min-width: 1024px) {
+  .burger, #burger, .drawer-close { display: none; }
+  .drawer { transform: none; visibility: visible; box-shadow: none; padding-top: 16px; }
+  .topbar, #app, .ask-bar { margin-left: var(--drawer-w); }
+  .topbar { margin-left: var(--drawer-w); }
+  .ask-bar { left: 0; right: 0; padding-left: calc(var(--drawer-w) + var(--pad)); }
+  #app { margin-left: calc(var(--drawer-w) + max(0px, (100vw - var(--drawer-w) - 820px) / 2)); margin-right: 0; }
+}
+@media (max-width: 699px) { .tb-name { display: none; } }
+
+/* ---------- всплывающее сообщение ---------- */
+
+.toast {
+  position: fixed; left: 50%; bottom: calc(76px + env(safe-area-inset-bottom));
+  transform: translate(-50%, 8px);
+  z-index: 100;
+  max-width: min(92vw, 420px);
+  padding: 11px 16px;
+  border-radius: var(--r-btn);
+  background: #23262b; color: #fff;
+  box-shadow: 0 8px 24px rgba(0,0,0,.22);
+  font-size: 14px; text-align: center;
+  opacity: 0;
+  transition: opacity var(--fast) var(--ease), transform var(--fast) var(--ease);
+}
+.toast[hidden] { display: none; }
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+.toast.err { background: #8c2b23; }
+/* Подсказка с кнопкой: её надо нажимать, поэтому она принимает касания. */
+.toast.has-act { pointer-events: auto; }
+.toast-act {
+  display: block; width: 100%; margin-top: 8px; min-height: var(--tap);
+  border: 0; border-radius: var(--r-field);
+  background: rgba(255, 255, 255, .18); color: #fff;
+  font: 600 15px/1 var(--font); cursor: pointer;
+}
+
+/* Цена в строке тарифа: крупнее обычного текста, но не как сальдо —
+   выбирают между двумя числами, и их надо сравнить одним взглядом. */
+.price { font: 700 19px/1.2 var(--font); letter-spacing: -.02em; }
+.small.ok { color: var(--money-in-ink); }
+
+/* ---------- переписка с агентом ---------- */
+
+/* Место под строку ввода: она приклеена к низу над вкладками, и без
+   отступа последний ответ прячется под ней. */
+/* Отступ снизу считаем от того, что реально стоит над лентой: вкладки
+   (56px + безопасная зона) и строка ввода поверх них. Без этого последний
+   ответ прятался под строкой — а именно его и читают. */
+.chat {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 0 var(--pad);
+  padding-bottom: calc(var(--tabs-h) + 76px);
+}
+.bubble {
+  max-width: 88%; padding: 11px 14px; border-radius: 16px;
+  font-size: 15px; line-height: 1.45; white-space: pre-line;
+  background: var(--surface); box-shadow: var(--shadow-1);
+}
+.bubble.me { align-self: flex-end; background: var(--primary); color: #fff; }
+.bubble .btn-wrap { margin: 10px 0 0; padding: 0; }
+
+.ask-bar {
+  position: fixed; left: 0; right: 0; bottom: var(--tabs-h); z-index: 41;
+  display: flex; gap: 8px; align-items: center;
+  padding: 10px var(--pad);
+  background: var(--surface); /* плотная, как и сами вкладки под ней */
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border-top: 1px solid var(--hairline);
+}
+.ask-input {
+  flex: 1; min-width: 0; min-height: 44px;
+  padding: 10px 14px; border-radius: 22px;
+  border: 1px solid var(--hairline); background: var(--surface);
+  color: inherit; font: inherit;
+}
+.mic {
+  width: 44px; height: 44px; flex: none; border: 0; border-radius: 50%;
+  display: grid; place-items: center; cursor: pointer;
+  background: var(--surface); color: var(--primary); box-shadow: var(--shadow-1);
+}
+.mic.send { background: var(--primary); color: #fff; }
+/* Идёт запись: кнопка красная и считает секунды вслух — иначе непонятно,
+   слышит ли она вообще. */
+.mic.on { background: var(--money-out); color: #fff; }
+.mic .rec-sec { font: 600 15px/1 var(--font); font-variant-numeric: tabular-nums; }
+
+/* ---------- появление экрана ---------- */
+
+.screen { animation: enter var(--slow) var(--ease); }
+@keyframes enter { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/*
+ * Вглубь — справа, назад — слева. Сдвиг небольшой (14 px): это подсказка
+ * направления, а не карусель, и ждать её окончания не приходится. Только
+ * transform и opacity — их считает видеокарта, без перерасчёта вёрстки.
+ * overflow-x: clip у #app, чтобы сдвиг не рисовал полосу прокрутки.
+ */
+#app { overflow-x: clip; }
+.screen.nav-fwd { animation-name: enter-fwd; }
+.screen.nav-back { animation-name: enter-back; }
+@keyframes enter-fwd { from { opacity: 0; transform: translateX(14px); } to { opacity: 1; transform: none; } }
+@keyframes enter-back { from { opacity: 0; transform: translateX(-14px); } to { opacity: 1; transform: none; } }
+
+/*
+ * Появление по очереди.
+ *
+ * Карточки выезжают не разом, а через 40 мс друг за другом — глаз успевает
+ * пройти сверху вниз в том же порядке, в каком экран задуман. Задержки
+ * короткие и конечные: пять шагов, дальше все появляются сразу. Ждать
+ * полсекунды, пока доедет восьмая карточка, — это уже не оформление, а
+ * задержка перед работой.
+ */
+.screen > .card,
+.screen > .hero,
+.screen > .tiles,
+.screen > .stats,
+.screen > .btn-wrap,
+.screen > .section-title { animation: rise var(--slow) var(--ease) both; }
+
+.screen > *:nth-child(1) { animation-delay: 0ms; }
+.screen > *:nth-child(2) { animation-delay: 40ms; }
+.screen > *:nth-child(3) { animation-delay: 80ms; }
+.screen > *:nth-child(4) { animation-delay: 120ms; }
+.screen > *:nth-child(5) { animation-delay: 160ms; }
+.screen > *:nth-child(n+6) { animation-delay: 180ms; }
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* Крупная сумма приходит чуть позже и чуть иначе: она главная на экране,
+   и взгляд должен закончить на ней, а не начать с неё. */
+.hero .sum { animation: sum-in 420ms var(--ease) both; animation-delay: 80ms; }
+@keyframes sum-in {
+  from { opacity: 0; transform: translateY(8px) scale(.97); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* Нажатие: стекло на миг «прижимается» — отклик, который чувствуется
+   пальцем раньше, чем успевает отрисоваться следующий экран. */
+.card .row:active, .tile:active, .stat:active, .btn:active, .mic:active {
+  transform: scale(.978);
+  transition: transform 90ms var(--ease);
+}
+.btn:active { filter: brightness(.96); }
+
+/* Запись голоса: пульс вокруг кнопки, пока идёт звук. */
+.mic.on { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--money-out) 45%, transparent); }
+  50%      { box-shadow: 0 0 0 10px color-mix(in srgb, var(--money-out) 0%, transparent); }
+}
+
+/* ---------- заставка при входе ---------- */
+
+/*
+ * Что здесь происходит по кадрам:
+ *
+ *   0—380 мс   резко сменяются четыре слова: акты, счета, УПД, договоры;
+ *   380—600 мс лист поднимается и проявляется;
+ *   500—880 мс знак рубля дописывается обводкой, будто его выписывают;
+ *   540—760 мс загибается угол листа;
+ *   680 мс     проступает название;
+ *   1080 мс    весь знак чуть подаётся вперёд и растворяется.
+ *
+ * Всё вместе — около 1,4 секунды. Это верхняя граница: заставку человек
+ * видит каждый раз и ждать её не хочет. Если покажется долгой, режется в
+ * одном месте — --w ниже.
+ *
+ * Цвета взяты у аватара бота (brand/avatar-blue.svg), а не подобраны
+ * заново: человек видит один и тот же знак в списке чатов и при входе, и
+ * это единственное, что делает заставку узнаванием, а не задержкой.
+ *
+ * Фон свой, тёмный, независимо от темы Telegram. Заставка живёт полсекунды,
+ * и мигать белым в тёмной теме — худшее, что она может сделать.
+ */
+#splash {
+  /* Сколько длится показ одного слова и всё перечисление целиком.
+     Меняется только здесь: остальные задержки считаются от --words. */
+  --w: 95ms;
+  --words: calc(var(--w) * 4);
+
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  background: radial-gradient(120% 90% at 50% 40%, #1E2E4C 0%, #16233A 62%, #101A2C 100%);
+  animation: splash-out 320ms var(--ease) calc(var(--words) + 700ms) both;
+  /*
+   * Нажатия сквозь заставку проходят насквозь.
+   *
+   * Это не мелочь: слой лежит поверх всего экрана целую секунду, и без
+   * этой строки он съедает первые касания. Человек открывает приложение,
+   * тычет в «Выписать счёт», ничего не происходит — и он решает, что оно
+   * зависло. Поймано прогоном жестов: смахивание переставало работать.
+   */
+  pointer-events: none;
+}
+/* И совсем убираем из потока после ухода — прозрачный слой поверх экрана
+   не нужен ни браузеру, ни программе чтения с экрана. */
+#splash.gone { display: none; }
+
+/*
+ * Перечисление документов.
+ *
+ * Слова лежат друг на друге в одной точке и сменяются мгновенно —
+ * steps(1) вместо плавности. Плавный переход здесь читался бы как
+ * «загрузка», а нужно противоположное: четыре быстрых утверждения о том,
+ * что продукт умеет.
+ *
+ * Слой выведен из потока и растянут на весь экран: место под слова не
+ * резервируется вовсе. Иначе они стояли бы над знаком, а в момент, когда
+ * перечисление кончится, вся картинка подпрыгивала бы вверх на их высоту.
+ * Так последнее слово уступает место листу ровно там же, где стояло.
+ */
+#splash .splash-words {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  /*
+   * Общий рубильник на весь слой.
+   *
+   * Не украшение, а страховка. На iPhone последнее слово оставалось висеть
+   * поверх знака: WebKit при steps() вместе с forwards держит значение
+   * последнего шага, а не конечное, и «Договоры» не гасли. Здесь слой
+   * убирается целиком и не зависит от того, как отработало каждое слово.
+   */
+  animation: words-gone 1ms linear var(--words) forwards;
+}
+#splash .splash-words b {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font: 700 22px/1 var(--font);
+  letter-spacing: -.01em;
+  color: #E7EEFC;
+  opacity: 0;
+  /*
+   * Смена мгновенная, но сделана обычными ключевыми кадрами, а не steps():
+   * 98% времени слово видно, последние 2% — уже нет. При 95 мс это два
+   * миллисекунды на переход, глаз его не увидит, зато конечное значение
+   * однозначно и одинаково во всех браузерах.
+   */
+  animation: word var(--w) linear forwards;
+}
+#splash .splash-words b:nth-child(2) { animation-delay: var(--w); color: #9FC4FF; }
+#splash .splash-words b:nth-child(3) { animation-delay: calc(var(--w) * 2); }
+#splash .splash-words b:nth-child(4) { animation-delay: calc(var(--w) * 3); color: #9FC4FF; }
+
+#splash .sheet {
+  fill: #F5F8FF;
+  transform-origin: 50% 50%;
+  animation: sheet-in 220ms var(--ease) var(--words) both;
+}
+#splash .fold {
+  fill: #4C9AFF;
+  transform-origin: 128px 24px;
+  animation: fold-in 220ms var(--ease) calc(var(--words) + 160ms) both;
+}
+#splash .ruble { stroke: #4C9AFF; }
+/* Длина обводки заведомо больше самой линии: точное значение зависит от
+   браузера, а всё, что нам нужно, — чтобы штрих сначала был спрятан. */
+#splash .r1 { stroke-dasharray: 200; animation: draw 320ms var(--ease) calc(var(--words) + 120ms) both; }
+#splash .r2 { stroke-dasharray: 40;  animation: draw 180ms var(--ease) calc(var(--words) + 380ms) both; }
+
+#splash .splash-name {
+  font: 600 17px/1 var(--font);
+  letter-spacing: .04em;
+  color: #C9D8F5;
+  animation: name-in 260ms var(--ease) calc(var(--words) + 300ms) both;
+}
+
+@keyframes word {
+  0%, 98% { opacity: 1; }
+  100%    { opacity: 0; }
+}
+/* Слой со словами уходит целиком. visibility, а не только opacity: нулевая
+   прозрачность оставляет элемент на экране для программ чтения. */
+@keyframes words-gone {
+  to { opacity: 0; visibility: hidden; }
+}
+@keyframes sheet-in {
+  from { opacity: 0; transform: translateY(10px) scale(.94); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes fold-in {
+  from { opacity: 0; transform: scale(.2); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes draw {
+  from { stroke-dashoffset: 200; }
+  to   { stroke-dashoffset: 0; }
+}
+@keyframes name-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes splash-out {
+  from { opacity: 1; transform: scale(1); }
+  to   { opacity: 0; transform: scale(1.06); }
+}
+
+/* ---------- помощник реквизитов ---------- */
+
+/*
+ * Полоска набранных знаков под полем. Нужна не для красоты: у ИНН, БИК и
+ * счёта длина известна заранее, и «7 из 10» читается быстрее любого текста.
+ * Вся анимация — transform/opacity: на слабом телефоне внутри Telegram
+ * ничего не пересчитывает раскладку.
+ */
+.live-bar {
+  height: 2px; margin-top: -1.5px; border-radius: 2px; overflow: hidden;
+  background: transparent; pointer-events: none;
+}
+.live-bar i {
+  display: block; height: 100%; width: 100%;
+  background: var(--primary);
+  transform-origin: left; transform: scaleX(var(--p, 0));
+  transition: transform .28s cubic-bezier(.2, .8, .2, 1), background-color .2s;
+}
+.field[data-live="ok"] .live-bar i { background: var(--success); }
+.field[data-live="bad"] .live-bar i { background: var(--danger); }
+.field[data-live="ok"] input { border-bottom-color: color-mix(in srgb, var(--success) 70%, transparent); }
+.field[data-live="bad"] input { border-bottom-color: var(--danger); }
+
+.live-msg {
+  display: flex; gap: 6px; align-items: flex-start;
+  font-size: 13px; line-height: 1.35; margin-top: 6px;
+  color: var(--muted);
+  animation: live-in .22s ease-out;
+}
+.live-msg .icon { width: 16px; height: 16px; flex: none; margin-top: 1px; }
+.field[data-live="ok"] .live-msg { color: var(--success-ink); }
+.field[data-live="ok"] .live-msg .icon { animation: live-pop .38s cubic-bezier(.3, 1.6, .5, 1); }
+.field[data-live="bad"] .live-msg { color: var(--danger); }
+.field[data-live="bad"] .live-msg .icon { animation: live-shake .34s ease-out; }
+@keyframes live-in { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+@keyframes live-pop { 0% { transform: scale(.2); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+@keyframes live-shake {
+  20% { transform: translateX(-3px); } 45% { transform: translateX(3px); }
+  70% { transform: translateX(-2px); } 100% { transform: none; }
+}
+
+/* Подставили автоматически — поле коротко подсвечивается: «вот что поменялось». */
+.field.auto-filled { animation: auto-fill 1.5s ease-out; }
+@keyframes auto-fill {
+  0%   { background: color-mix(in srgb, var(--primary) 20%, transparent); }
+  100% { background: transparent; }
+}
+
+/* «Где это взять» — раскрывается плавно, без прыжка списка. */
+.field.has-how { position: relative; }
+.how-btn {
+  position: absolute; top: 4px; right: calc(var(--pad) - 12px);
+  width: 44px; height: 44px; padding: 0; border: 0; background: none;
+  display: grid; place-items: center; cursor: pointer;
+  color: var(--muted); border-radius: 50%;
+  -webkit-tap-highlight-color: transparent;
+}
+.how-btn .icon { width: 20px; height: 20px; transition: transform .2s, color .2s; }
+.how-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: -4px; }
+.field.how-open .how-btn .icon { color: var(--primary); transform: rotate(12deg) scale(1.1); }
+.how {
+  display: grid; grid-template-rows: 0fr;
+  transition: grid-template-rows .26s cubic-bezier(.2, .8, .2, 1);
+}
+.how > div { overflow: hidden; min-height: 0; }
+.field.how-open .how { grid-template-rows: 1fr; }
+.how-in {
+  margin-top: 8px; padding: 10px 12px; border-radius: 10px;
+  font-size: 13px; line-height: 1.45; color: var(--text);
+  background: color-mix(in srgb, var(--primary) 9%, var(--surface));
+  opacity: 0; transform: translateY(-4px);
+  transition: opacity .2s .05s, transform .2s .05s;
+}
+.field.how-open .how-in { opacity: 1; transform: none; }
+.field.has-how label { padding-right: 40px; }
+
+/* Кольцо «заполнено N из M». */
+.rp {
+  display: flex; gap: 14px; align-items: center;
+  margin: 0 0 12px; padding: 12px 14px;
+  border-radius: 14px; border: 1px solid var(--hairline);
+  background: var(--surface);
+}
+.rp-ringbox { position: relative; width: 52px; height: 52px; flex: none; }
+.rp-ring { width: 100%; height: 100%; transform: rotate(-90deg); }
+.rp-track { stroke: color-mix(in srgb, var(--muted) 22%, transparent); }
+.rp-arc {
+  stroke: var(--primary);
+  transition: stroke-dashoffset .6s cubic-bezier(.2, .8, .2, 1), stroke .3s;
+}
+.rp.complete .rp-arc { stroke: var(--success); }
+.rp-pct {
+  position: absolute; inset: 0; display: grid; place-items: center;
+  font: 700 12px/1 var(--font-num); color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.rp.complete { animation: rp-done .5s cubic-bezier(.3, 1.4, .5, 1); }
+@keyframes rp-done { 0% { transform: scale(.97); } 60% { transform: scale(1.015); } 100% { transform: none; } }
+.rp-text { min-width: 0; flex: 1; }
+.rp-count { font: 700 15px/1.3 var(--font); }
+.rp-next {
+  display: block; width: 100%; margin-top: 2px; padding: 4px 0; border: 0; background: none;
+  text-align: left; font: 500 13px/1.35 var(--font); color: var(--link); cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.rp-next:disabled { color: var(--muted); cursor: default; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+  /* Человеку, который просил не двигать картинку, заставка не нужна вовсе:
+     без движения это просто лишняя секунда тёмного экрана. */
+  #splash { display: none; }
+}
+
+/* Мини-CRM: напоминания и лента клиента */
+.fu-row { align-items: flex-start; }
+.fu-late { color: var(--danger); }
+.fu-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.small-btn { width: auto; min-height: 36px; padding: 6px 12px; font-size: 14px; white-space: nowrap; }
+
+/*
+ * Цель нажатия не меньше 44 px (Apple HIG и WCAG 2.5.8), а вид прежний.
+ *
+ * Чипы, мелкие кнопки и плашка способа подсчёта по высоте 26–36 px: пальцем в
+ * них попадали с трудом, особенно в списках, где они стоят рядом. Увеличивать
+ * сами кнопки значило бы раздуть экран, поэтому расширяем невидимую зону
+ * нажатия — псевдоэлементом, который целиком принадлежит кнопке.
+ */
+.chip, .small-btn, .chip-basis { position: relative; }
+.chip::after, .small-btn::after, .chip-basis::after {
+  content: ''; position: absolute; left: -2px; right: -2px; top: 50%;
+  height: var(--tap); transform: translateY(-50%);
+}
+.crm-form .field + .field { margin-top: 14px; }
+.crm-form textarea { width: 100%; margin-bottom: 8px; }
+.crm-hint { margin: -4px var(--pad) 8px; }
+.crm-form[hidden] { display: none; }
+.feed-text { overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.crm-form select { width: 100%; }
+.tl-row { align-items: flex-start; }
+.tl-ico { width: 28px; text-align: center; flex: none; }
+
+/* ---------- вход с сайта (вне Telegram) ---------- */
+
+/*
+ * Панели и вкладок на экране входа нет, поэтому отступ под боковую панель,
+ * который на компьютере стоит у #app, здесь лишний: карточка встаёт строго по
+ * центру окна.
+ */
+body.is-login #app {
+  max-width: none; margin: 0; padding: 24px var(--pad);
+  min-height: 100dvh; display: flex; align-items: center; justify-content: center;
+}
+.login { width: 100%; display: flex; justify-content: center; }
+.login-card {
+  width: 100%; max-width: 440px; text-align: center;
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-card, 20px);
+  box-shadow: var(--shadow-2);
+  padding: 32px 20px 20px;
+}
+.login-card h1 { margin: 0 0 12px; font-size: 24px; }
+.login-mark {
+  width: 56px; height: 56px; margin: 0 auto 16px; border-radius: 18px;
+  display: flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--primary) 12%, transparent); color: var(--primary);
+}
+.login-mark .icon { width: 30px; height: 30px; }
+.login-text { margin: 0 auto 18px; max-width: 34ch; color: var(--muted); }
+.login-note { margin: 0 0 14px; padding: 10px 12px; border-radius: 12px; font-size: 14px;
+  background: color-mix(in srgb, var(--primary) 10%, transparent); }
+.login-note.err {
+  background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger);
+}
+.login-card .btn-wrap { padding: 4px 0 12px; }
+.login-card a.btn { text-decoration: none; }
+.login-card .btn.secondary { margin-top: 4px; }
+.login-foot { margin: 8px 0 12px; }
+.login-qr {
+  width: 168px; height: 168px; margin: 0 auto 4px; border-radius: 14px; overflow: hidden;
+  background: #fff; line-height: 0;
+  box-shadow: 0 0 0 1px var(--hairline);       /* на светлой теме белое на белом иначе теряет край */
+}
+.login-qr svg { width: 100%; height: 100%; display: block; }
+/* На телефоне наводить камеру на собственный экран некуда — там работает кнопка. */
+@media (max-width: 699px) { .login-qr, .login-qr-cap { display: none; } }
+.login-wait {
+  display: flex; align-items: center; justify-content: center; gap: 8px; flex-wrap: wrap;
+  margin: 6px 0 4px; color: var(--text); font-weight: 500;
+}
+.login-left { color: var(--muted); font-weight: 400; font-variant-numeric: tabular-nums; }
+
+/* Число для сверки: главное на экране ожидания, его читают с другого устройства. */
+.login-code {
+  margin: 0 0 14px; padding: 14px 12px 10px; border-radius: 16px;
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+}
+.login-code-lead { display: block; font: 600 15px/1.3 var(--font); color: var(--muted); }
+.login-code-num {
+  display: block; margin-top: 2px; color: var(--primary);
+  font: 800 64px/1.1 var(--font-num); letter-spacing: .04em; font-variant-numeric: tabular-nums;
+}
+
+/* Раскрывающийся блок «Текст письма»: у нескольких должников письма не заслоняют кнопки. */
+details.letter > summary {
+  list-style: none; cursor: pointer; min-height: var(--tap);
+  display: flex; align-items: center; gap: 6px; padding: 0 var(--pad);
+  color: var(--link); font: 600 15px/1.2 var(--font);
+  border-top: 1px solid var(--hairline);
+}
+details.letter > summary::-webkit-details-marker { display: none; }
+details.letter > summary::after {
+  content: ''; margin-left: auto; width: 8px; height: 8px; flex: none;
+  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  transform: rotate(45deg); transition: transform var(--fast) var(--ease);
+}
+details.letter[open] > summary::after { transform: rotate(-135deg); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* «Дополнительно»: то, что нужно не всем, сворачиваем — по виду как заголовок раздела, но нажимается. */
+details.more-fields > summary {
+  list-style: none; cursor: pointer; min-height: var(--tap);
+  display: flex; align-items: center; margin: 12px var(--pad) 0;
+  font: 600 12px/1.4 var(--font); color: var(--section-title);
+  text-transform: uppercase; letter-spacing: .06em;
+}
+details.more-fields > summary::-webkit-details-marker { display: none; }
+details.more-fields > summary::after {
+  content: ''; margin-left: auto; width: 8px; height: 8px; flex: none;
+  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  transform: rotate(45deg); transition: transform var(--fast) var(--ease);
+}
+details.more-fields[open] > summary::after { transform: rotate(-135deg); }
+
+/* Ссылки внизу экранов (оферта, поддержка) — мелкий шрифт, но палец должен попадать. */
+.legal-links a { display: inline-block; padding: 13px 6px; }
+
+/* ---------- предоплата в карточке клиента ---------- */
+
+.prepay .pp-top { padding: 14px var(--pad) 6px; }
+.prepay .pp-left { font: 700 clamp(22px, 7vw, 28px)/1.15 var(--font); letter-spacing: -.025em; margin: 2px 0 10px; }
+/* Полоса — остаток от внесённого. Жёлтеет, когда денег осталось мало, и краснеет, когда они кончились. */
+.pp-bar { height: 8px; border-radius: 99px; overflow: hidden;
+  background: color-mix(in srgb, var(--muted) 20%, transparent); }
+.pp-bar i { display: block; height: 100%; border-radius: 99px; background: var(--success); }
+.pp-bar.low i { background: var(--wait); }
+.pp-warn { color: var(--wait); margin-top: 8px; }
+.prepay .pp-sum { color: var(--text); margin-bottom: 10px; font-size: 15px; }
+.balance .v.money { font-variant-numeric: tabular-nums; }
+.pp-top > .small + .small { margin-top: 6px; }
+.pp-list { border-top: 1px solid var(--hairline); }
+.pp-list summary { padding: 12px var(--pad); cursor: pointer; font-size: 14px; color: var(--muted); }
+.pp-actions { display: flex; gap: 10px; padding-top: 12px; }
+.pp-actions .btn { flex: 1; min-width: 0; }
+#pp-over b { color: var(--danger); }

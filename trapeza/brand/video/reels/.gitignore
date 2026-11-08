@@ -1,0 +1,9 @@
+# Собранное и скачанное: пересоздаётся командами из README
+out/
+events.json
+*.wav
+*.mp4
+work-*/
+.*hf-transaction*/
+.hyperframes/
+render.log

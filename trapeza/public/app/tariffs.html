@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Тарифы и цены — Первичка</title>
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --text: #0f172a;
+      --text-muted: #475569;
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --border: #e2e8f0;
+      --success: #16a34a;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b1120;
+        --card-bg: #1e293b;
+        --text: #f8fafc;
+        --text-muted: #94a3b8;
+        --primary: #3b82f6;
+        --primary-hover: #2563eb;
+        --border: #334155;
+        --success: #22c55e;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      padding: 32px 16px 60px;
+    }
+    .container {
+      max-width: 860px;
+      margin: 0 auto;
+    }
+    .header-block {
+      text-align: center;
+      margin-bottom: 36px;
+    }
+    h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; color: var(--text); }
+    .subtitle { font-size: 16px; color: var(--text-muted); }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 20px;
+      margin-bottom: 32px;
+    }
+    .card {
+      background: var(--card-bg);
+      border-radius: 16px;
+      border: 1px solid var(--border);
+      padding: 28px 24px;
+      box-shadow: 0 4px 18px rgba(0, 0, 0, 0.04);
+      display: flex;
+      flex-direction: column;
+      position: relative;
+    }
+    .card.featured {
+      border: 2px solid var(--primary);
+    }
+    .badge {
+      position: absolute;
+      top: -12px;
+      right: 20px;
+      background: var(--primary);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .plan-name { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+    .plan-price { font-size: 32px; font-weight: 800; color: var(--text); margin-bottom: 4px; }
+    .plan-period { font-size: 13px; color: var(--text-muted); margin-bottom: 20px; }
+    .features { list-style: none; margin-bottom: 24px; flex-grow: 1; }
+    .features li { font-size: 14px; margin-bottom: 10px; display: flex; align-items: flex-start; gap: 8px; }
+    .features li::before { content: "✓"; color: var(--success); font-weight: 800; }
+    .btn {
+      display: block;
+      width: 100%;
+      text-align: center;
+      background: var(--primary);
+      color: #ffffff;
+      padding: 12px 16px;
+      border-radius: 10px;
+      font-weight: 600;
+      font-size: 15px;
+      text-decoration: none;
+      transition: background 0.15s ease;
+    }
+    .btn:hover { background: var(--primary-hover); }
+    .btn.secondary {
+      background: transparent;
+      color: var(--primary);
+      border: 1px solid var(--border);
+    }
+    .btn.secondary:hover { background: rgba(37, 99, 235, 0.06); }
+    .info-section {
+      background: var(--card-bg);
+      border-radius: 16px;
+      border: 1px solid var(--border);
+      padding: 24px 28px;
+      margin-bottom: 24px;
+    }
+    .info-section h3 { font-size: 18px; margin-bottom: 12px; color: var(--primary); }
+    .info-section p { font-size: 14px; color: var(--text-muted); margin-bottom: 8px; }
+    .info-section ul { margin-left: 20px; font-size: 14px; color: var(--text-muted); margin-bottom: 12px; }
+    .footer-box {
+      text-align: center;
+      font-size: 14px;
+      color: var(--text-muted);
+      margin-top: 32px;
+    }
+    .code-badge {
+      display: inline-block;
+      background: rgba(37, 99, 235, 0.1);
+      color: var(--primary);
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+      font-family: monospace;
+      margin-top: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header-block">
+      <h1>Тарифные планы сервиса «Первичка»</h1>
+      <div class="subtitle">Прозрачные тарифы без скрытых списаний и комиссий</div>
+    </div>
+
+    <div class="cards">
+      <!-- Бесплатный -->
+      <div class="card">
+        <div class="plan-name">Старт (Бесплатно)</div>
+        <div class="plan-price">0 ₽</div>
+        <div class="plan-period">навсегда</div>
+        <ul class="features">
+          <li>5 документов в месяц (счета, акты, УПД)</li>
+          <li>Формирование PDF бланков</li>
+          <li>Платёжный QR-код по ГОСТ для расчётных счетов</li>
+          <li>Журнал операций и долгов</li>
+        </ul>
+        <a href="https://t.me/pervichka_app_bot" class="btn secondary">Открыть в боте</a>
+      </div>
+
+      <!-- 1 месяц -->
+      <div class="card">
+        <div class="plan-name">Подписка на 1 месяц</div>
+        <div class="plan-price">349 ₽</div>
+        <div class="plan-period">за 30 календарных дней</div>
+        <ul class="features">
+          <li><strong>Неограниченное количество</strong> документов в месяц</li>
+          <li>Счета, акты услуг, УПД, ТОРГ-12, договоры</li>
+          <li>Печать и факсимиле подписи на бланках</li>
+          <li>Распознавание сканов и фото счетов нейросетью</li>
+          <li>Сверка расчётов и акты сверки (Excel / PDF)</li>
+          <li>Приоритетная поддержка</li>
+        </ul>
+        <a href="https://t.me/pervichka_app_bot?start=billing" class="btn">Оформить на 1 месяц</a>
+      </div>
+
+      <!-- 1 год -->
+      <div class="card featured">
+        <div class="badge">Выгода 700 ₽</div>
+        <div class="plan-name">Подписка на 1 год</div>
+        <div class="plan-price">3 490 ₽</div>
+        <div class="plan-period">за 365 календарных дней (~290 ₽/мес)</div>
+        <ul class="features">
+          <li>Все функции безлимитно на целый год</li>
+          <li>Максимальная экономия (2 месяца в подарок)</li>
+          <li>Полная бухгалтерская чистота первичных документов</li>
+          <li>Бесперебойный доступ 24/7 без ежемесячных продлений</li>
+          <li>Персональная линия поддержки</li>
+        </ul>
+        <a href="https://t.me/pervichka_app_bot?start=billing" class="btn">Оформить на 1 год</a>
+      </div>
+    </div>
+
+    <div class="info-section">
+      <h3>Способы оплаты и безопасность</h3>
+      <p>Оплата подписки производится в безналичном порядке через аккредитованные платёжные шлюзы:</p>
+      <ul>
+        <li><strong>Система быстрых платежей (СБП)</strong> — мгновенная оплата по QR-коду любого банка РФ без ввода данных карты;</li>
+        <li><strong>Банковские карты</strong> платежной системы «МИР», а также Visa и Mastercard российских банков;</li>
+        <li>Безопасное соединение защищено протоколом TLS 1.3 с шифрованием данных. Данные карт не сохраняются и не обрабатываются на серверах сервиса.</li>
+      </ul>
+      <p>Активация подписки происходит автоматически сразу после завершения платежа.</p>
+    </div>
+
+    <div class="info-section">
+      <h3>Документы и контакты поддержки</h3>
+      <p>Ознакомьтесь с официальными документами сервиса:</p>
+      <ul>
+        <li><a href="/terms">Пользовательское соглашение (публичная оферта)</a></li>
+        <li><a href="/privacy">Политика конфиденциальности</a></li>
+      </ul>
+      <p>Служба поддержки пользователей:</p>
+      <ul>
+        <li>Telegram: <a href="https://t.me/flowcraft_agent">@flowcraft_agent</a> (кнопка «Поддержка» в боте)</li>
+        <li>Email: <a href="mailto:support@pervichkaru.ru">support@pervichkaru.ru</a></li>
+      </ul>
+    </div>
+
+    <div class="footer-box">
+      <div>Сервис «Первичка» (Telegram: @pervichka_app_bot). Все права защищены. Тарифы действуют с 09 сентября 2026 г.</div>
+      <div>Проверочный код: <span class="code-badge">plat chek</span></div>
+    </div>
+  </div>
+</body>
+</html>

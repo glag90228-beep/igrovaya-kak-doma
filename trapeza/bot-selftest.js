@@ -1,0 +1,10233 @@
+'use strict';
+
+/**
+ * Прогон бота без живого токена: подставляем вместо Telegram заглушку и
+ * проводим пользователя по сценарию — организация, контрагент, операции,
+ * все четыре документа. Файлы складываем в папку и рендерим в PNG,
+ * чтобы посмотреть глазами.
+ *
+ *   TRAPEZA_DB=/tmp/selftest.db node bot-selftest.js [папка-для-файлов]
+ */
+
+require('./selftest-db');   // своя база на прогон — до всего, что тянет db.js
+const fs = require('node:fs');
+const path = require('node:path');
+
+const OUT = path.resolve(process.argv[2] || path.join(__dirname, 'selftest-out'));
+fs.mkdirSync(OUT, { recursive: true });
+
+/*
+ * Пределы задаёт прогон, а не окружение запускающего.
+ *
+ * Основной сценарий выписывает больше пяти документов, поэтому порог здесь
+ * высокий; блокировку проверяет отдельный блок ниже, он ставит свои числа
+ * сам.
+ *
+ * Раньше стояло `process.env.FREE_DOCS || '1000'` — «взять из окружения,
+ * если задано». На машине разработки не задано, и прогон был зелёный. А на
+ * боевом сервере в .env лежит FREE_DOCS=5, и стоит запустить обновление в
+ * оболочке, куда этот .env загружен (`set -a && . ./.env`), как шестой
+ * документ упирался в настоящий платный предел. Прогон падал на обращении к
+ * невыписанному файлу, и выглядело это как поломка кода, хотя код был цел.
+ *
+ * Та же беда, что описана ниже про WEBAPP_URL, и лечится так же: значение
+ * ставим силой. Прогон должен давать один и тот же ответ на любой машине —
+ * иначе он проверяет не продукт, а окружение.
+ */
+process.env.FREE_DOCS = '1000';
+process.env.ENFORCE_LIMIT = '1';   // блок про лимит рассчитывает, что он включён
+
+/*
+ * Ключи провайдеров убираем — по той же причине и с той же историей.
+ *
+ * Проверка «без провайдера бот честно говорит об этом» гасит VISION_PROVIDER
+ * и ждёт отказа. Но провайдер распознавания по умолчанию — gemini, и одного
+ * GEMINI_API_KEY в окружении довольно, чтобы бот счёл себя настроенным.
+ * Проверка падала, а бот при этом ходил в сеть за настоящим ответом: на
+ * боевом сервере прогон получал «Gemini 400» вместо ожидаемого отказа.
+ *
+ * Ключи, которые блоку нужны, блок ставит себе сам — так уже сделано для
+ * grok, yandexgpt и openrouter.
+ */
+for (const k of ['GEMINI_API_KEY', 'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY', 'XAI_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
+  'VISION_PROVIDER', 'SPEECH_PROVIDER', 'AI_PROVIDER', 'AI_ENABLED', 'AI_MODEL',
+  'AI_MOCK', 'AI_MOCK_USAGE', 'DADATA_TOKEN', 'TTS_PROVIDER', 'TTS_MODEL', 'TTS_VOICE',
+  'CONSULT_MOCK', 'CONSULT_ENABLED', 'CONSULT_MODEL']) {
+  delete process.env[k];
+}
+
+// Пароли от почты хранятся зашифрованными, и без ключа блок про ящик
+// падает не по своей вине. Задаём тестовый ключ, чтобы прогон не зависел
+// от того, что оказалось в окружении запускающего.
+process.env.MAIL_KEY = process.env.MAIL_KEY || 'selftest-mail-key';
+// Игрушечный SMTP этого прогона слушает 127.0.0.1 на случайном порту, а
+// обычно ящик на внутреннем адресе заводить нельзя — иначе поле «сервер»
+// превращается в сканер нашей же сети. Сам запрет проверяется в mail-selftest.
+process.env.MAIL_ALLOW_LOCAL = '1';
+
+const { handleUpdate, parseOp, parseItemLine } = require('./bot');
+const { htmlToPng } = require('./lib/pdf');
+
+let bad = 0;
+const ok = (c, m, extra) => {
+  console.log((c ? '  ✅ ' : '  ❌ ') + m + (c || extra === undefined ? '' : ' → ' + extra));
+  if (!c) bad += 1;
+};
+
+// ---------- заглушка Telegram ----------
+
+const sent = [];   // все сообщения боту→пользователю
+const files = [];  // все отправленные документы
+
+const tg = {
+  async sendMessage(chatId, text, opts = {}) {
+    sent.push({ text, kb: (opts.reply_markup || {}).inline_keyboard || [] });
+    return { message_id: sent.length };
+  },
+  async sendDocument(chatId, { filename, buffer, caption, buttons }) {
+    fs.writeFileSync(path.join(OUT, filename), Buffer.from(buffer));
+    files.push({ filename, caption, size: buffer.length, buttons: buttons || [] });
+    return { message_id: sent.length };
+  },
+  async sendChatAction() {},
+  async answerCallbackQuery() {},
+  // Настоящий PNG 1×1: приём подписи проверяет байты, а не заявленный тип.
+  async downloadFile() {
+    return Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+  },
+  async editMessageText() {},
+  async call() { return {}; },
+};
+
+const USER = { id: 777001, first_name: 'Мария', last_name: 'Сарычева', username: 'trapeza_test' };
+const CHAT = { id: 777001 };
+
+const say = (text) => handleUpdate(tg, { message: { chat: CHAT, from: USER, text } });
+const tap = (data) => handleUpdate(tg,
+  { callback_query: { id: 'cb', from: USER, data, message: { chat: CHAT } } });
+
+const last = () => (sent[sent.length - 1] || {}).text || '';
+/** Деньги печатаются с неразрывными пробелами — для сравнений выравниваем. */
+const norm = (s) => String(s).replace(/\s/g, ' ');
+/**
+ * Ищем кнопку по подстроке текста НА ПОСЛЕДНЕМ экране и возвращаем её
+ * callback_data.
+ *
+ * Раньше поиск шёл по всей истории прогона снизу вверх, и это тихо
+ * обесценивало проверки: кнопка, найденная в сообщении, нарисованном сотней
+ * шагов раньше, засчитывалась как кнопка текущего экрана. Ревизия показала
+ * цену — шесть проверок про новые ставки НДС остались зелёными после того,
+ * как эти кнопки из экранов убрали: «22%» находилась на соседнем экране,
+ * получившем те же кнопки, а «5%» вообще матчилась подстрокой в «5% УСН».
+ *
+ * Экран, нарисованный раньше, — это не то, что человек видит сейчас, и
+ * проверять по нему нельзя. Там, где экран состоит из нескольких сообщений
+ * (список должников — по сообщению на каждого), берут buttonSince: она
+ * смотрит только то, что нарисовало само действие, а не всю историю.
+ */
+function buttonIn(msg, sub) {
+  for (const row of (msg && msg.kb) || []) {
+    for (const b of row) if (b.text.includes(sub)) return b.callback_data;
+  }
+  return null;
+}
+
+function button(sub) {
+  return buttonIn(sent[sent.length - 1], sub);
+}
+
+/**
+ * Кнопка среди сообщений, нарисованных после отметки mark = sent.length.
+ * Для экранов из нескольких сообщений — и только для них.
+ */
+function buttonSince(mark, sub) {
+  for (let i = sent.length - 1; i >= mark; i--) {
+    const got = buttonIn(sent[i], sub);
+    if (got != null) return got;
+  }
+  return null;
+}
+
+/** id пользователя прогона в базе (а не его Telegram-id). */
+const fxUserId = () => require('./lib/bot-db').getOrCreateUser(USER.id).id;
+
+// ---------- сценарий ----------
+
+(async () => {
+  /*
+   * Сторож на боевую базу. На сервере приложение живёт в /opt/trapeza, и
+   * путь по умолчанию — `<папка>/data/trapeza.db` — это и есть база клиентов.
+   * Запуск `npm test` там залил бы в неё тестовые данные, а README прямо
+   * советует «cd trapeza && npm test». Отсюда selftest-db.js и эта проверка.
+   */
+  {
+    const dflt = require('node:path').join(__dirname, 'data', 'trapeza.db');
+    const used = require('node:path').resolve(process.env.TRAPEZA_DB || dflt);
+    ok(used !== dflt, 'тесты пишут не в рабочую базу приложения', used);
+  }
+
+  console.log('\n── разбор текста ──');
+  const op1 = parseOp('15.05 приход 94193');
+  ok(op1 && op1.credit === 94193 && op1.date === '2026-05-15', 'операция «15.05 приход 94193»', JSON.stringify(op1));
+  const op2 = parseOp('02.07 оплата 50000 №79000');
+  ok(op2 && op2.debit === 50000 && op2.doc.includes('79000'), 'операция с номером документа', op2 && op2.doc);
+  ok(parseOp('привет') === null, 'мусор не превращается в операцию');
+  const it = parseItemLine('Канапе ассорти; 20; 650');
+  ok(it && it.qty === 20 && it.price === 650, 'позиция «Наименование; кол-во; цена»', JSON.stringify(it));
+  ok(parseItemLine('Фуршет 10 1500').name === 'Фуршет', 'позиция без разделителей тоже читается');
+
+  // Предприниматель пишет позицию так, как говорит. Требовать точки с
+  // запятой нельзя — на живом сервере на этом застряли в первый же день.
+  const line = (s) => parseItemLine(s) || {};
+  const same = (s, name, qty, price, unit) => {
+    const r = line(s);
+    ok(r.name === name && r.qty === qty && r.price === price && (!unit || r.unit === unit),
+      `«${s}»`, `${r.name} · ${r.qty} ${r.unit || ''} × ${r.price}`);
+  };
+  same('Аренда 30 кВм 1 30.000', 'Аренда 30 кВм', 1, 30000);      // точка = тысячи
+  same('Аренда помещения 1 30 000', 'Аренда помещения', 1, 30000); // пробел = тысячи
+  same('Фуршет 10 1500', 'Фуршет', 10, 1500);                      // и не «10 150» + «0»
+  same('Бумага 10 пачек по 300', 'Бумага', 10, 300, 'уп.');
+  same('Услуга 2 х 1500', 'Услуга', 2, 1500);
+  same('Разработка 2*15000', 'Разработка', 2, 15000);
+  same('Молоко 3 л 89,50', 'Молоко', 3, 89.5, 'л');
+  same('Работы 1 30000 руб.', 'Работы', 1, 30000);
+  same('Консультация 5000', 'Консультация', 1, 5000);              // одно число — цена
+  same('Аренда 30 м2 1 30000', 'Аренда 30 м2', 1, 30000);          // число внутри названия
+
+  // Суммы словами: «30 тысяч», «30к», «1,5 млн» — так говорят, а не пишут нулями.
+  const pa = require('./bot').parseAmount;
+  ok(pa('30 тысяч') === 30000 && pa('30 тыс.') === 30000 && pa('30к') === 30000, 'сумма: тысячи словами и «к»');
+  ok(pa('1,5 млн') === 1500000 && pa('полтора миллиона') === 1500000, 'сумма: миллионы и «полтора миллиона»');
+  ok(pa('30 000') === 30000 && pa('1 500,50') === 1500.5, 'сумма: обычные числа читаются как раньше');
+  same('Монтаж 30 тысяч', 'Монтаж', 1, 30000);
+  same('Монтаж 30к', 'Монтаж', 1, 30000);
+  same('Монтаж 2 по 15 тысяч', 'Монтаж', 2, 15000);
+  same('Аренда 1,5 млн', 'Аренда', 1, 1500000);
+
+  // А это строгий разбор понять не может — и не должен выдумывать:
+  // «30» здесь площадь, а не цена. Такие уходят в дозапрос.
+  ok(parseItemLine('Аренда 30 м²') === null, 'число с единицей не принимается за цену');
+  const partial = require('./bot').readItemLine('Аренда 30 м²');
+  ok(partial.partial && partial.name === 'Аренда 30 м²', 'зато название сохраняется для дозапроса',
+    partial.name);
+
+  console.log('\n── старт и организация ──');
+  await say('/start');
+  ok(last().includes('Первичка'), 'бот поздоровался и показал меню');
+
+  /*
+   * Переход по рекламной ссылке — тоже /start.
+   *
+   * Telegram присылает t.me/бот?start=МЕТКА обычным сообщением «/start МЕТКА».
+   * Точное сравнение его не ловило: приветствие не показывалось, фраза
+   * проваливалась в разбор ИИ и человек с объявления первым делом получал
+   * «не понял», а источник мы не узнавали вовсе.
+   */
+  {
+    const bdbS = require('./lib/bot-db');
+    const uS = bdbS.getOrCreateUser(USER.id);
+    require('./db').db.prepare("UPDATE bot_users SET source = '' WHERE id = ?").run(uS.id);
+    await say('/start reels_qr');
+    ok(last().includes('Первичка'), 'по ссылке с меткой бот тоже здоровается', last().slice(0, 40));
+    const withLabel = require('./db').db.prepare('SELECT source FROM bot_users WHERE id = ?').get(uS.id);
+    ok(withLabel.source === 'reels_qr', 'метка источника запомнена', withLabel.source);
+
+    // Второй переход по другой ссылке источник не перебивает: интересно,
+    // откуда человек пришёл изначально, а не что открыл последним.
+    await say('/start kwork_sellers');
+    const after = require('./db').db.prepare('SELECT source FROM bot_users WHERE id = ?').get(uS.id);
+    ok(after.source === 'reels_qr', 'повторный переход первую метку не затирает', after.source);
+    ok(!last().includes('не понял'), 'и в разбор ИИ команда больше не проваливается');
+  }
+  await tap('org.new');
+  /*
+   * Ручной путь: ИНН вводим (справочник в прогоне не подключён — автозаполнения
+   * нет), остальное набираем сами. Шаги:
+   * инн → название → полное → адрес → подписант → БИК → банк → к/с → р/с.
+   *
+   * КПП в списке нет намеренно: ИНН здесь двенадцатизначный, то есть это
+   * предприниматель, а у него КПП не бывает — вопрос пропускается. Если он
+   * вернётся, ответы сдвинутся и прогон это заметит.
+   */
+  const ORG = ['183112345637', 'ИП Сарычева М. В.',
+    'Индивидуальный предприниматель Сарычева Мария Витальевна',
+    'г. Ижевск, ул. Пушкинская, 214', 'М. В. Сарычева',
+    '049401601', 'ПАО Сбербанк', '30101810400000000601', '40802810168000012341'];
+  for (const v of ORG) await say(v);
+  ok(last().includes('сохранена'), 'организация заведена', last().slice(0, 60));
+  ok(!sent.some((m) => /КПП/.test(m.text || '')), 'у предпринимателя КПП не спрашивали');
+  await tap('org');
+  ok(last().includes('049401601'), 'реквизиты организации показываются');
+
+  console.log('\n── контрагент ──');
+  await tap('cps');
+  await tap('cp.new');
+  // Порядок: инн → название → полное → КПП → адрес → тип → договор →
+  // сальдо → дата → БИК → банк → к/с → р/с.
+  await say('1832012345');                                   // инн (без автозаполнения в прогоне)
+  await say('ООО «Заря»');
+  await say('Общество с ограниченной ответственностью «Заря»');
+  await say('183201001');
+  await say('г. Ижевск, ул. Ленина, 1');
+  await tap('fb:customer');
+  await say('Договор № 5 от 01.02.2026');
+  await say('0');
+  await say('01.01.2026');
+  await say('049401601');
+  await say('ПАО Сбербанк');
+  await say('30101810400000000601');
+  await say('40702810100000098766');
+  ok(last().includes('Заря'), 'контрагент создан и показана карточка');
+
+  const cpBtn = button('Внести операцию');
+  ok(Boolean(cpBtn), 'в карточке есть кнопка «Внести операцию»', cpBtn);
+  const cpId = Number(String(cpBtn).split(':')[1]);
+
+  console.log('\n── операции ──');
+  await tap(`op:${cpId}`);
+  await say('15.05 приход 94193');
+  await say('20.05 оплата 40000');
+  await say('02.07 приход 26496,42');
+  await say('10.07 оплата 26496,42');
+  ok(last().includes('Баланс'), 'бот считает сальдо после каждой операции');
+  const saldo = /Баланс: <b>([^<]+)<\/b>/.exec(last());
+  ok(saldo && saldo[1].replace(/\s/g, '').startsWith('54193'),
+    'сальдо посчитано верно (94193 − 40000 = 54 193)', saldo && saldo[1]);
+
+  console.log('\n── документы ──');
+  await tap(`d.akt:${cpId}`);
+  ok(files.length === 0, 'акт сверки сперва спрашивает период, а не шлёт файл сразу');
+  ok(last().includes('За какой период'), 'спрошен период акта', last().slice(0, 60));
+  const aktKb = ((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.callback_data);
+  ok(aktKb.includes(`akt.p:${cpId}:pm`) && aktKb.includes(`akt.own:${cpId}`),
+    'в выборе периода есть и «Прошлый месяц», и «Свой период»', aktKb.join(' '));
+  await tap(`akt.p:${cpId}:all`);
+  ok(files.some((f) => f.filename.endsWith('.xlsx')), 'акт сверки пришёл файлом Excel',
+    (files[files.length - 1] || {}).filename);
+
+  await tap(`d.usl:${cpId}`);
+  await say('Фуршетное обслуживание, 30 персон; 1; 54193');
+  await tap('items.done');
+  ok(last().includes('Итого'), 'перед выпуском показана сводка с итогом');
+  await tap('doc.make');
+  ok(files.length === 2, 'акт об оказании услуг сформирован', (files[1] || {}).filename);
+
+  await tap(`d.sch:${cpId}`);
+  ok(last().includes('Счёт на оплату № 1'), 'номер счёта присвоен сам', last().slice(0, 44));
+  await say('Канапе ассорти; 20; 650');
+  await say('Брускетты ассорти; 15; 780');
+  await tap('items.undo');
+  ok(last().includes('Убрал'), 'последнюю позицию можно убрать');
+  await say('Брускетты ассорти; 15; 780');
+
+  // Позиция, у которой понятно только название: бот обязан доспросить
+  // недостающее, а не отказать. Раньше он отвечал «Не разобрал», и на
+  // этом человек с арендой упирался в стену.
+  await say('Аренда 30 м²');
+  ok(last().includes('Сколько и по какой цене'), 'непонятную позицию бот доспрашивает',
+    norm(last()).replace(/<[^>]+>/g, '').slice(0, 40));
+  await say('2');
+  ok(last().includes('По какой цене'), 'приняв количество, спрашивает цену');
+  await say('30 000');
+  ok(norm(last()).includes('Аренда 30 м²') && norm(last()).includes('30 000,00'),
+    'позиция собрана из ответов', norm(last()).replace(/<[^>]+>/g, '').slice(0, 50));
+  await tap('items.undo');   // для дальнейших проверок сумма должна остаться прежней
+
+  await tap('items.done');
+  await tap('doc.make');
+  ok(files.length === 3, 'счёт на оплату сформирован', (files[2] || {}).filename);
+  ok(files[2].filename.includes('_1_'), 'номер попал в имя файла', files[2].filename);
+  ok(files[2].caption.includes('QR'), 'в подписи сказано про оплату по QR');
+
+  console.log('\n── нумерация, номер и дата вручную ──');
+  await tap(`d.sch:${cpId}`);
+  ok(last().includes('№ 2'), 'следующий счёт получил номер 2', last().slice(0, 40));
+  await say('Доставка; 1; 1000');
+  await tap('items.done');
+  ok(!button('Основание') && !last().includes('Основание:'),
+    'у счёта основания нет — в его бланке такой графы нет');
+  await tap('doc.num');
+  await say('СЧ-2026/007');
+  ok(last().includes('СЧ-2026/007'), 'номер можно задать свой', last().slice(0, 40));
+  await tap('doc.date');
+  await say('05.08.2026');
+  ok(last().includes('05.08.2026'), 'дату можно поправить');
+  await tap('doc.make');
+  ok(files.length === 4 && String((files[3] || {}).filename).includes('СЧ-2026_007'),
+    'счёт вышел со своим номером', (files[3] || {}).filename || last().slice(0, 120));
+
+  console.log('\n── шаблоны позиций ──');
+  await tap(`d.sch:${cpId}`);
+  const tplBtn = button('Канапе ассорти');
+  ok(Boolean(tplBtn), 'частая позиция предложена кнопкой', tplBtn);
+  await tap(tplBtn);
+  ok(last().includes('Сколько'), 'бот спросил количество');
+  await say('30');
+  ok(last().includes('30'), 'позиция из шаблона добавлена', last().slice(0, 60));
+  await tap('items.done');
+  await tap('doc.make');
+  ok(files.length === 5, 'счёт из шаблона сформирован', files[4].filename);
+
+  console.log('\n── журнал и повтор ──');
+  await tap('docs');
+  ok(last().includes('Последние документы'), 'журнал открывается');
+  const docBtn = button('СЧ-2026/007');
+  ok(Boolean(docBtn), 'документ со своим номером виден в журнале', docBtn);
+  await tap(docBtn);
+  ok(last().includes('Доставка'), 'в карточке документа видны позиции');
+  await tap(`doc.get:${docBtn.split(':')[1]}`);
+  ok(files.length === 6 && files[5].caption.includes('копия'), 'файл высылается заново', files[5].filename);
+
+  {
+    /*
+     * Ссылка для клиента. Без адреса сайта её не бывает — и кнопки тоже
+     * быть не должно: обещать то, чего нет, хуже, чем не обещать.
+     */
+    const docId = Number(docBtn.split(':')[1]);
+    const wasPublic = process.env.PUBLIC_URL;
+    /*
+     * Убираем оба адреса, а не один.
+     *
+     * Адрес ссылки берётся из PUBLIC_URL, а если его нет — из WEBAPP_URL:
+     * приложение и так живёт на том же домене. Первая версия этой проверки
+     * гасила только PUBLIC_URL и потому проходила лишь на машине разработки,
+     * где не задано ни то, ни другое. На боевом сервере WEBAPP_URL задан
+     * всегда, кнопка честно оставалась на месте — и падала проверка, а не код.
+     */
+    const wasApp = process.env.WEBAPP_URL;
+    // button() ищет по всей переписке, поэтому перед каждой проверкой
+    // очищаем её: иначе кнопка находится в карточке, показанной шагом раньше.
+    delete process.env.PUBLIC_URL;
+    delete process.env.WEBAPP_URL;
+    sent.length = 0;
+    await tap(`doc:${docId}`);
+    ok(!button('Ссылка для клиента'), 'без адреса сайта кнопки ссылки нет');
+
+    process.env.PUBLIC_URL = 'https://pervichkaru.ru';
+    sent.length = 0;
+    await tap(`doc:${docId}`);
+    ok(Boolean(button('Ссылка для клиента')), 'с адресом кнопка появилась');
+    await tap(`doc.link:${docId}`);
+    ok(/https:\/\/pervichkaru\.ru\/d\/[A-Za-z0-9_-]{20,}/.test(last()),
+      'бот прислал ссылку на документ', last().slice(0, 80));
+    sent.length = 0;
+    await tap(`doc:${docId}`);
+    ok(Boolean(button('Отозвать ссылку')),
+      'в карточке теперь предлагают отозвать, а не выдать ещё одну');
+    ok(last().includes('ещё не открывали'), 'и видно, открывал ли её клиент');
+    await tap(`doc.unlink:${docId}`);
+    sent.length = 0;
+    await tap(`doc:${docId}`);
+    ok(!button('Отозвать ссылку'), 'после отзыва карточка снова предлагает выдать');
+    ok(Boolean(button('Ссылка для клиента')), 'и снова предлагает выдать новую');
+
+    if (wasPublic === undefined) delete process.env.PUBLIC_URL;
+    else process.env.PUBLIC_URL = wasPublic;
+    if (wasApp === undefined) delete process.env.WEBAPP_URL;
+    else process.env.WEBAPP_URL = wasApp;
+  }
+  await tap(`d.rep:${docBtn.split(':')[1]}`);
+  ok(last().includes('Итого'), 'повтор открыл сводку с теми же позициями');
+  await tap('doc.make');
+  ok(files.length === 7, 'повторный документ выписан', files[6].filename);
+  ok(!files[6].filename.includes('СЧ-2026'), 'у повтора новый номер, не старый', files[6].filename);
+
+
+  await tap(`d.pp:${cpId}`);
+  await say('26496,42');
+  await say('Оплата по счёту № 1 от 10.08.2026');
+  ok(files.length === 8, 'платёжное поручение сформировано', (files[7] || {}).filename);
+
+  console.log('\n── УПД, накладная, договор ──');
+  await tap(`d.upd:${cpId}`);
+  ok(last().includes('Статус 2') && last().includes('Статус 1'),
+    'бот спрашивает статус УПД и объясняет разницу');
+  await tap(`upd.s2:${cpId}`);
+  ok(last().includes('УПД № 1'), 'у УПД своя нумерация', last().slice(0, 40));
+  await say('Продукты для фуршета; 1; 24700');
+  await tap('items.done');
+  await tap('doc.make');
+  ok(files.length === 9 && files[8].filename.startsWith('УПД'), 'УПД статуса 2 сформирован', files[8].filename);
+
+  console.log('\n── УПД статус 1: счёт-фактура с НДС ──');
+  const { vatSplit, okei } = require('./lib/upd');
+  const g = vatSplit({ qty: 2, price: 600 }, 20, true);   // цены с НДС
+  ok(g.net === 1000 && g.vat === 200 && g.total === 1200,
+    'НДС выделен из суммы: 1200 = 1000 + 200', JSON.stringify(g));
+  const n = vatSplit({ qty: 2, price: 500 }, 20, false);  // НДС сверху
+  ok(n.net === 1000 && n.vat === 200 && n.total === 1200,
+    'НДС начислен сверху: 1000 + 200 = 1200', JSON.stringify(n));
+  const z = vatSplit({ qty: 3, price: 100 }, null, false);
+  ok(z.vat === null && z.total === 300, 'без НДС налог не считается');
+  ok(okei('шт.') === '796' && okei('кг') === '166' && okei('бочка') === '',
+    'коды ОКЕИ подставляются, неизвестные не выдумываются');
+
+  await tap(`d.upd:${cpId}`);
+  await tap(`upd.s1:${cpId}`);
+  ok(last().includes('Ставка НДС'), 'бот спросил ставку');
+  await tap(`upd.r:${cpId}:20`);
+  ok(last().includes('с налогом или без'), 'бот уточнил, включён ли налог в цену');
+  await tap(`upd.g:${cpId}:20:1`);
+  await say('Обслуживание банкета; 1; 120000');
+  await tap('items.done');
+  ok(last().includes('статус 1') && last().includes('НДС 20%') && last().includes('цены с НДС'),
+    'в сводке видно статус и режим НДС', last().slice(0, 90));
+  await tap('doc.make');
+  const updHtml = require('./lib/upd').buildUpdHtml({
+    org: { name: 'ИП', full_name: 'ИП Сарычева М. В.', inn: '183112345637', address: 'Ижевск' },
+    cp: { name: 'ООО «Заря»', full_name: 'ООО «Заря»', inn: '1832012345', kpp: '183201001' },
+    doc: { number: '1', date: '2026-08-11', status: 1, vatRate: 20, priceIncludesVat: true,
+      items: [{ name: 'Обслуживание банкета', qty: 1, unit: 'усл.', price: 120000 }] },
+  });
+  ok(updHtml.includes('Счёт-фактура №'), 'в статусе 1 есть строка счёта-фактуры');
+  ok(updHtml.includes('ИНН/КПП покупателя'), 'заполнены строки шапки счёта-фактуры');
+  ok(updHtml.includes('Главный бухгалтер'), 'подписи руководителя и бухгалтера на месте');
+  ok(norm(updHtml).includes('20 000,00'), 'НДС 20% из 120 000 выделен как 20 000',
+    (norm(updHtml).match(/20 000,00/g) || []).length + ' совпадений');
+  ok(norm(updHtml).includes('100 000,00'), 'стоимость без налога — 100 000');
+  const upd2 = require('./lib/upd').buildUpdHtml({
+    org: { name: 'ИП', full_name: 'ИП Сарычева М. В.' }, cp: { name: 'ООО «Заря»' },
+    doc: { number: '2', date: '2026-08-11', status: 2, items: [{ name: 'Услуга', qty: 1, price: 100 }] },
+  });
+  ok(!upd2.includes('Счёт-фактура №') && upd2.includes('не является'),
+    'в статусе 2 счёта-фактуры нет и указана упрощёнка');
+
+  await tap(`d.torg12:${cpId}`);
+  await say('Пирожки с мясом; 100; 45');
+  await say('Морсы, 1 л; 10; 250');
+  await tap('items.done');
+  ok(/Основание: <b>[^<]+<\/b>/.test(last()), 'в сводке накладной видно, какое основание напечатается',
+    last().slice(0, 160));
+  ok(button('Основание') === 'doc.basis', 'и его можно поменять кнопкой');
+  await tap('doc.basis');
+  await say('Договор поставки № 7 от 01.09.2026');
+  ok(last().includes('Основание: <b>Договор поставки № 7 от 01.09.2026</b>'),
+    'своё основание принято и показано в сводке', last().slice(0, 160));
+  await tap('doc.basis');
+  await say('-');
+  ok(!last().includes('Договор поставки № 7') && last().includes('Основание:'),
+    '«-» возвращает основание из карточки', last().slice(0, 160));
+  await tap('doc.basis');
+  await say('Заказ № 45 от 01.10.2026');
+  await tap('doc.make');
+  ok(files.length === 11 && files[10].filename.startsWith('ТОРГ-12'), 'накладная сформирована', files[10].filename);
+  {
+    const b = require('./lib/bot-db');
+    const t12 = b.listDocs(fxUserId(), 20).find((x) => x.type === 'torg12');
+    const basis = ((t12 && b.getDoc(fxUserId(), t12.id)) || {}).payload || {};
+    ok(basis.basis === 'Заказ № 45 от 01.10.2026', 'основание из бота дошло до документа', basis.basis);
+  }
+  // formatRub ставит неразрывный пробел — сравниваем по обычному
+  const cap9 = norm(files[10].caption);
+  ok(cap9.includes('7 000,00'), 'сумма накладной посчитана', cap9.slice(0, 80));
+
+  await tap(`d.dog:${cpId}`);
+  await say('услуги по организации фуршетного обслуживания');
+  await say('150000');
+  await say('31.12.2026');
+  ok(files.length === 12 && files[11].filename.startsWith('Договор'), 'договор сформирован', files[11].filename);
+  ok(files[11].caption.includes('юристу'), 'в подписи есть оговорка про юриста');
+
+  // все три пересобираются из журнала
+  await tap('docs');
+  const updBtn = button('УПД № 1');
+  ok(Boolean(updBtn), 'УПД виден в журнале', updBtn);
+  await tap(`doc.get:${updBtn.split(':')[1]}`);
+  ok(files.length === 13 && files[12].filename.startsWith('УПД'), 'УПД пересобирается из журнала', files[12].filename);
+
+  /*
+   * Бот начал договор, а приложение за время трёх вопросов выписало свой.
+   * Раньше номер резервировался в начале диалога, и на последнем ответе
+   * запись падала на занятом номере — файл человек уже получил, а в журнале
+   * его не было.
+   */
+  {
+    const bdbR = require('./lib/bot-db');
+    const uidR = fxUserId();
+    const dogsBefore = bdbR.listDocs(uidR, 500).filter((d) => d.type === 'dog').length;
+    const filesBefore = files.length;
+    await tap(`d.dog:${cpId}`);
+    await say('аренда зала');
+    // Договор «из приложения» — прямо записью в журнал со следующим номером:
+    // так тест одинаково работает и на старом коде, и на новом.
+    const orgR = bdbR.currentOrg(uidR);
+    const today = require('./lib/period').todayISO();
+    const seqR = bdbR.nextSeqForOrg(orgR.id, 'dog', Number(today.slice(0, 4)));
+    bdbR.saveDoc(uidR, {
+      orgId: orgR.id, cpId, type: 'dog', number: String(seqR), seq: seqR, date: today, total: 1,
+      payload: { subject: 'из приложения', price: 1, term: '' },
+    });
+    let threw = null;
+    try { await say('0'); await say('-'); } catch (e) { threw = e; }
+    const dogs = bdbR.listDocs(uidR, 500).filter((d) => d.type === 'dog');
+    ok(!threw && dogs.length === dogsBefore + 2, 'оба договора в журнале, бот не упал',
+      threw ? threw.message : dogs.length - dogsBefore);
+    ok(new Set(dogs.map((d) => d.number)).size === dogs.length, 'и номера у них разные',
+      dogs.map((d) => d.number).join(', '));
+    ok(files.length === filesBefore + 1 && files[files.length - 1].caption.includes(`№ ${seqR + 1} `),
+      'в подписи файла — номер, под которым договор записан', (files[files.length - 1] || {}).caption);
+  }
+
+  console.log('\n── свой договор и разбор договора ──');
+  {
+    const zipM = require('./lib/zip');
+    const cai = require('./lib/contract-ai');
+    const mcM = require('./lib/my-contract');
+    const bdbC = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uidC = fxUserId();
+
+    // Word без зависимостей: текст, таблица и автонумерация пунктов.
+    const wp = (t, num) => `<w:p>${num ? `<w:pPr><w:numPr><w:ilvl w:val="${num[1]}"/><w:numId w:val="7"/></w:numPr></w:pPr>` : ''}<w:r><w:t xml:space="preserve">${t}</w:t></w:r></w:p>`;
+    const docXml = `<w:document><w:body>${wp('ДОГОВОР НА БАНКЕТНОЕ ОБСЛУЖИВАНИЕ')}<w:p/>`
+      + `${wp('Исполнитель оказывает услуги ООО «Ромашка» (Заказчик).')}`
+      + `${wp('Предмет договора', [7, 0])}${wp('Банкет 12 мая 2026 г. в помещении: кафе «Берёзка», ул. Ленина, 1.', [7, 1])}`
+      + `${wp('Цена', [7, 0])}${wp('Стоимость услуг 150 000 (сто пятьдесят тысяч рублей).', [7, 1])}`
+      + `<w:tbl><w:tr><w:tc>${wp('Гостей')}</w:tc><w:tc>${wp('40')}</w:tc></w:tr></w:tbl></w:body></w:document>`;
+    const numXml = '<w:numbering><w:abstractNum w:abstractNumId="3"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>'
+      + '<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2."/></w:lvl></w:abstractNum><w:num w:numId="7"><w:abstractNumId w:val="3"/></w:num></w:numbering>';
+    const docx = zipM.makeZip({ '[Content_Types].xml': '<Types/>', 'word/document.xml': docXml, 'word/numbering.xml': numXml });
+    const plain = zipM.docxText(docx);
+    ok(/^ДОГОВОР НА БАНКЕТНОЕ/.test(plain) && /1\.1\. Банкет 12 мая/.test(plain) && /2\.1\. Стоимость/.test(plain)
+      && /Гостей\t40/.test(plain), 'DOCX прочитан: пункты пронумерованы как в Word, таблица — через табуляцию', plain.slice(0, 160));
+    let broken = '';
+    try { zipM.docxText(Buffer.from('не архив')); } catch (e) { broken = e.message; }
+    ok(/не ZIP/.test(broken), 'битый файл — понятная ошибка, а не падение', broken);
+
+    // Находки безопасника ECC: подделанный Word не должен вешать бота.
+    const tEvil = Date.now();
+    const evilText = zipM.docxText(zipM.makeZip({
+      'word/document.xml': `<w:body>${'<w:p>'.repeat(150000)}${'<w:p '.repeat(150000)}</w:body>`,
+      'word/numbering.xml': '<w:abstractNum w:abstractNumId="1">'.repeat(30000),
+    }));
+    ok(Date.now() - tEvil < 1500 && evilText === '', 'незакрытые абзацы и списки разбираются за один проход, а не минутами',
+      `${Date.now() - tEvil} мс`);
+    const dupZip = zipM.makeZip({ 'word/document.xml': 'a', 'word/document.xmX': 'b' });
+    dupZip.write('word/document.xml', dupZip.lastIndexOf(Buffer.from('word/document.xmX')));
+    let dupErr = '';
+    try { zipM.readZip(dupZip); } catch (e) { dupErr = e.message; }
+    ok(/повреждён/.test(dupErr), 'один файл дважды в каталоге архива — отказ, а не распаковка бомбы по кругу', dupErr);
+    const aiM = require('./lib/ai-agent');
+    const rel = aiM.aiLock(uidC);
+    ok(rel && aiM.aiLock(uidC) === null, 'второй дорогой запрос того же человека ждёт первого');
+    rel();
+    const rel2 = aiM.aiLock(uidC);
+    ok(Boolean(rel2), 'после ответа запросы снова принимаются');
+    rel2();
+
+    // Подстановка: длинное раньше короткого, мусорные ключи и ненайденное — мимо.
+    const rep = cai.applyReplacements('Клиент ООО «Ромашка-Плюс» и ООО «Ромашка». Сумма 5 руб. (пять рублей).', [
+      { find: 'ООО «Ромашка»', key: 'them' }, { find: 'ООО «Ромашка-Плюс»', key: 'partner', label: 'Партнёр' },
+      { find: 'пять рублей', key: 'price_words' }, { find: 'нет такого', key: 'ghost' }, { find: 'Сумма', key: 'BAD KEY' },
+    ]);
+    ok(rep.body === 'Клиент {{partner}} и {{them}}. Сумма 5 руб. ({{price_words}}).'
+      && rep.fields.map((f) => f.key).join(',') === 'partner,price',
+    'метки по точному тексту; сумма прописью — спросим цифры', `${rep.body} | ${rep.fields.map((f) => f.key)}`);
+
+    // Весь путь в боте: «Свой договор» → файл → образец → сохранить → выписка по полям.
+    const keepDlC = tg.downloadFile;
+    process.env.MYCON_PROVIDER = 'mock';
+    process.env.MYCON_MOCK = JSON.stringify({
+      title: 'Договор на банкет', us_role: 'Исполнитель', them_role: 'Заказчик',
+      replacements: [
+        { find: 'ООО «Ромашка»', key: 'them' },
+        { find: '12 мая 2026 г.', key: 'event_date', label: 'Дата мероприятия', type: 'date' },
+        { find: 'кафе «Берёзка», ул. Ленина, 1', key: 'venue', label: 'Место проведения' },
+        { find: '150 000', key: 'price', label: 'Сумма договора', type: 'money' },
+        { find: 'сто пятьдесят тысяч рублей', key: 'price_words' },
+        { find: 'такого текста нет', key: 'ghost', label: 'Призрак' },
+      ],
+    });
+    await tap(`mc.menu:${cpId}`);
+    ok(Boolean(button('для всех клиентов')), 'в карточке клиента — «Свой договор» с загрузкой для всех');
+    await tap('mc.up:0');
+    tg.downloadFile = async () => docx;
+    const filesB = files.length;
+    sent.length = 0;
+    await handleUpdate(tg, { message: { chat: CHAT, from: USER,
+      document: { file_id: 'my-dog', file_name: 'Мой договор.docx', file_size: docx.length } } });
+    const seenC = norm(sent.map((m) => m.text || '').join(' | '));
+    ok(/Дата мероприятия/.test(seenC) && /Место проведения/.test(seenC) && !/Призрак/.test(seenC),
+      'бот показал, что будет спрашивать, — ненайденное отброшено', seenC.slice(0, 200));
+    const sample = files[files.length - 1] || {};
+    ok(files.length === filesB + 1 && /Образец/.test(sample.filename || '')
+      && (sample.buttons || []).flat().some((b) => b.data === 'mc.save:0'),
+    'прислал образец с кнопкой «Сохранить»', sample.filename);
+    await tap('mc.save:0');
+    ok(/Сохранил/.test(last()) && mcM.getTemplate(uidC, cpId) && mcM.getTemplate(uidC, cpId).title === 'Договор на банкет',
+      'шаблон сохранён для всех клиентов', last());
+
+    const dogsBeforeC = bdbC.listDocs(uidC, 500).filter((d) => d.type === 'dog');
+    await tap(`d.dog:${cpId}`);
+    ok(/по вашему шаблону/.test(norm(sent.slice(-2).map((m) => m.text).join(' '))), 'договор выписывается по своему шаблону');
+    ok(/Дата мероприятия/.test(last()), 'первый вопрос — первое поле шаблона', last());
+    await say('20 июня 2026 г.');
+    ok(/Место проведения/.test(last()), 'дальше — место', last());
+    await say('ресторан «Волна»');
+    await say('200000');
+    const issued = files[files.length - 1] || {};
+    ok(/^Договор/.test(issued.filename || '') && /по вашему шаблону/.test(issued.caption || ''),
+      'договор по шаблону выписан', issued.filename);
+    const dogsAfterC = bdbC.listDocs(uidC, 500).filter((d) => d.type === 'dog');
+    const newDog = bdbC.getDoc(uidC, dogsAfterC.find((d) => !dogsBeforeC.some((x) => x.id === d.id)).id);
+    ok(newDog.payload.body.includes('{{venue}}') && newDog.payload.values.venue === 'ресторан «Волна»'
+      && newDog.payload.values.price === 200000, 'в журнале — текст шаблона и ответы', JSON.stringify(newDog.payload.values));
+    ok(new Set(dogsAfterC.map((d) => d.number)).size === dogsAfterC.length, 'нумерация общая с типовым, без повторов');
+    const cpC = bdbC.getCp(uidC, cpId);
+    const html = mcM.buildHtml({ org: bdbC.currentOrg(uidC), cp: cpC, doc: { ...newDog.payload, number: newDog.number, date: newDog.date } });
+    const escName = (cpC.full_name || cpC.name).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    const checksC = [html.includes('ресторан «Волна»'), html.includes(escName), /двести тысяч/i.test(html),
+      html.includes('20 июня 2026 г.'), !html.includes('{{')];
+    ok(checksC.every(Boolean), 'в договоре — ответы, клиент и сумма прописью, ни одной пустой метки',
+      `${JSON.stringify(checksC)} ${cpC.name}`);
+    const reb = await docSvc.rebuildDocument(uidC, newDog.id);
+    ok(reb.ok && /^Договор/.test(reb.file.filename), 'копия пересобирается своим договором, а не типовым');
+
+    /*
+     * Сумма из фразы. «Договор Ромашке на 180 000» — сумму человек уже назвал,
+     * и спрашивать её второй раз незачем: подставляется в своё денежное поле,
+     * спрашиваются только дата и место.
+     */
+    const dogsBeforeP = bdbC.listDocs(uidC, 500).filter((d) => d.type === 'dog');
+    await say(`договор ${cpC.name.replace(/[«»"]/g, '')} на 180000`);
+    ok(/180[\s ]000/.test(norm(sent.slice(-3).map((m) => m.text).join(' '))) && /Дата мероприятия/.test(last()),
+      'сумма из фразы подставлена, первый вопрос — дата, а не сумма', last());
+    await say('1 июля 2026 г.');
+    await say('банкетный зал «Север»');
+    const dogsAfterP = bdbC.listDocs(uidC, 500).filter((d) => d.type === 'dog');
+    const madeP = dogsAfterP.find((d) => !dogsBeforeP.some((x) => x.id === d.id));
+    const vP = madeP ? bdbC.getDoc(uidC, madeP.id).payload.values : {};
+    ok(madeP && vP.price === 180000 && vP.venue === 'банкетный зал «Север»',
+      'договор выписан после двух ответов, сумма — из фразы', JSON.stringify(vP));
+
+    // Договор на середине вопросов, а человек просит счёт: счёт и выходит, а не договор.
+    await say(`договор ${cpC.name.replace(/[«»"]/g, '')} на 90000`);
+    ok(/Дата мероприятия/.test(last()), 'договор начат и ждёт дату', last());
+    const dogsMid = bdbC.listDocs(uidC, 500).filter((d) => d.type === 'dog').length;
+    await say(`счёт ${cpC.name.replace(/[«»"]/g, '')} на 45000`);
+    const stMid = bdbC.getState(uidC);
+    ok(bdbC.listDocs(uidC, 500).filter((d) => d.type === 'dog').length === dogsMid && !(stMid && /^dogx:/.test(stMid.state)),
+      'просьба о счёте бросает недоделанный договор, а не уходит в него ответом', stMid && stMid.state);
+
+    // Заменили шаблон — старый договор остаётся прежним.
+    mcM.saveTemplate(uidC, 0, { title: 'Совсем другой', body: 'ДРУГОЙ ТЕКСТ {{them}}', fields: [] });
+    ok(bdbC.getDoc(uidC, newDog.id).payload.body.includes('{{venue}}'), 'замена шаблона не трогает выписанные договоры');
+
+    // Приоритет: свой у клиента → общий → типовой; чужой человек шаблонов не видит.
+    mcM.saveTemplate(uidC, cpId, { title: 'Особый для клиента', body: 'ОСОБЫЙ {{them}}', fields: [] });
+    const otherCp = bdbC.createCp(uidC, { name: 'ООО «Другой клиент»', kind: 'customer', opening_date: '2026-01-01' });
+    ok(mcM.getTemplate(uidC, cpId).title === 'Особый для клиента' && mcM.getTemplate(uidC, otherCp).title === 'Совсем другой',
+      'шаблон клиента важнее общего');
+    const strangerC = bdbC.getOrCreateUser(990777, 'Чужой', 'stranger').id;
+    ok(mcM.getTemplate(strangerC, 0) === null && mcM.getTemplateById(strangerC, newDog.payload.tplId) === null,
+      'чужой человек шаблонов не видит');
+    const forged = await docSvc.issuePlain(strangerC, { type: 'dog', cpId, fields: { tplId: newDog.payload.tplId, values: {} } });
+    ok(!forged.ok, 'и выписать по чужому шаблону не может', forged.reason);
+    await tap(`d.dogstd:${cpId}`);
+    ok(/Предмет договора/.test(last()), '«Типовой вместо своего» ведёт в типовой договор', last());
+    await tap('mc.cancel');
+    await tap(`mc.del:${cpId}`);
+    await tap('mc.del:0');
+    ok(mcM.getTemplate(uidC, cpId) === null, 'шаблоны убираются кнопкой');
+
+    // Чужой договор: PDF без контекста → «Разобрать» → риски, кнопки, память для помощника.
+    process.env.MYCON_REVIEW_MOCK = JSON.stringify({
+      title: 'Договор поставки', ref: 'Договор № 17 от 01.10.2026',
+      summary: 'Поставка продуктов с отсрочкой 30 дней; штраф только для вас.',
+      parties: [{ role: 'Покупатель', name: 'ООО «Новый партнёр»', inn: '7701234567' }, { role: 'Поставщик', name: bdbC.currentOrg(uidC).name, inn: bdbC.currentOrg(uidC).inn }],
+      subject: 'поставка', amount: '500 000 руб.', payment: 'отсрочка 30 дней', dates: 'до 31.12.2026',
+      penalties: '0,5% в день только с поставщика', termination: 'покупатель — в любой момент',
+      risks: [{ level: 'high', text: 'Штраф односторонний', fix: 'Сделать неустойку взаимной' }, { level: 'weird', text: 'Нет срока приёмки' }],
+      questions: ['Кто платит за доставку?'],
+    });
+    tg.downloadFile = async () => Buffer.from('%PDF-1.7 договор');
+    await handleUpdate(tg, { message: { chat: CHAT, from: USER,
+      document: { file_id: 'their-dog', file_name: 'Договор поставки.pdf', mime_type: 'application/pdf', file_size: 20 } } });
+    ok(Boolean(button('Разобрать')) && Boolean(button('моим шаблоном')), 'на PDF-договор — выбор: разобрать или сделать шаблоном');
+    await tap('ct.rev');
+    const rv = norm(last());
+    ok(/Разбор: Договор поставки/.test(rv) && /🔴 Штраф односторонний/.test(rv) && /🟡 Нет срока приёмки/.test(rv)
+      && /юристу/.test(rv), 'разбор: риски с уровнем, неизвестный уровень — средний, оговорка про юриста', rv.slice(0, 160));
+    ok(Boolean(button('Завести')), 'вторая сторона новая — кнопка «Завести»');
+    const lastC = mcM.getLastContract(uidC);
+    ok(lastC && /Штраф односторонний/.test(lastC.text) && /Последний присланный договор/.test(require('./lib/consult').userContext(uidC)),
+      'помощник видит разобранный договор и ответит на вопросы по нему');
+    await tap('ct.addcp');
+    const added = bdbC.listCps(uidC).find((c) => c.inn === '7701234567');
+    ok(added && added.contract === 'Договор № 17 от 01.10.2026', 'контрагент заведён с ИНН и договором в карточке',
+      added ? added.contract : 'нет');
+
+    // Старый Word и исчерпанный кошелёк — честные ответы без обращения к модели.
+    const oldWord = await cai.reviewContract(uidC, { buffer: Buffer.from('xx'), name: 'старый.doc', mime: 'application/msword' });
+    ok(!oldWord.ok && /DOCX или PDF/.test(oldWord.error), 'старый .doc — просьба пересохранить', oldWord.error);
+    process.env.AI_FREE_KOPECKS = '0'; process.env.AI_USER_KOPECKS = '0';
+    const noMoney = await cai.detectTemplate(uidC, { buffer: docx, name: 'a.docx', mime: '' });
+    ok(!noMoney.ok && noMoney.reason === 'limit', 'кончился предел — модель не зовём', noMoney.reason);
+    delete process.env.AI_FREE_KOPECKS; delete process.env.AI_USER_KOPECKS;
+
+    tg.downloadFile = keepDlC;
+    delete process.env.MYCON_PROVIDER; delete process.env.MYCON_MOCK; delete process.env.MYCON_REVIEW_MOCK;
+    bdbC.clearState(uidC);
+  }
+
+  console.log('\n── разбор текста счёта ──');
+  const { parseInvoiceText } = require('./lib/vision');
+  const SCAN = `ООО «Ромашка»
+Счет на оплату № 148 от 03.08.2026
+Поставщик: ООО «Ромашка», ИНН 1832012345
+1  Кофе зерновой   5 кг   870,00   4 350,00
+2  Стаканы 300 мл  200 шт   9,50    1 900,00
+Итого: 6 250,00
+Всего к оплате: 6 250,00`;
+  const scan = parseInvoiceText(SCAN);
+  ok(scan.amount === 6250, 'сумма взята из «всего к оплате», а не самая большая цифра', String(scan.amount));
+  ok(scan.date === '2026-08-03', 'дата разобрана', scan.date);
+  ok(scan.docNo === '148', 'номер счёта найден', scan.docNo);
+  ok(scan.inn === '1832012345', 'ИНН найден', scan.inn);
+  const wordDate = parseInvoiceText('Акт от 11 августа 2026 г. Итого 1 200,50');
+  ok(wordDate.date === '2026-08-11' && wordDate.amount === 1200.5,
+    'дата словами и сумма с копейками', `${wordDate.date} / ${wordDate.amount}`);
+
+  /*
+   * Даты, которых не бывает, со снимка не берутся.
+   *
+   * ISO-строка собиралась из того, что попалось в тексте, и существование дня
+   * не проверялось ни разу. Распознавание ошибается именно так — «31.02.2026»,
+   * день с месяцем местами, — и эта дата уходила в операцию и в шапку акта
+   * сверки: «по 31.02.2026». Такой документ клиенту не подпишешь. Пусто здесь
+   * лучше выдумки: бот подставит сегодняшнюю и скажет об этом.
+   */
+  {
+    const { findDate } = require('./lib/vision');
+    ok(findDate('Счёт № 5 от 31.02.2026') === null,
+      '31 февраля со снимка не берётся', findDate('Счёт № 5 от 31.02.2026'));
+    ok(findDate('Счёт № 5 от 11.13.2026') === null,
+      'тринадцатый месяц тоже', findDate('Счёт № 5 от 11.13.2026'));
+    ok(findDate('Счёт № 5 от 29 февраля 2026') === null,
+      '29 февраля в невисокосный год — тоже нет', findDate('Счёт № 5 от 29 февраля 2026'));
+    ok(findDate('Счёт № 5 от 29 февраля 2024') === '2024-02-29',
+      'а в високосный принимается', findDate('Счёт № 5 от 29 февраля 2024'));
+    ok(parseInvoiceText('Счёт от 31.02.2026 Всего к оплате: 100,00').date === null,
+      'и разбор счёта целиком отдаёт пустую дату, а не выдуманную',
+      parseInvoiceText('Счёт от 31.02.2026 Всего к оплате: 100,00').date);
+  }
+
+  console.log('\n── фото счёта ──');
+  const photoMsg = {
+    chat: CHAT, from: USER,
+    photo: [{ file_id: 'small' }, { file_id: 'big' }],
+  };
+  // без провайдера бот честно отказывается
+  delete process.env.VISION_PROVIDER;
+  await handleUpdate(tg, { message: photoMsg });
+  ok(last().includes('не подключено'), 'без провайдера бот честно говорит об этом', last().slice(0, 50));
+
+  // с заглушкой — распознаёт и предлагает выбрать контрагента
+  process.env.VISION_PROVIDER = 'mock';
+  process.env.VISION_MOCK = JSON.stringify({
+    date: '2026-08-03', amount: 6250, docNo: '148', inn: '1832012345', name: 'ООО «Заря»', text: SCAN,
+  });
+  tg.downloadFile = async () => Buffer.from('фото');
+  const aiPh = require('./lib/ai-agent');
+  process.env.AI_KOP_PHOTO = '90';          // 90 копеек за снимок
+  const phKopBefore = aiPh.budget(fxUserId()).kopecks;
+  await handleUpdate(tg, { message: photoMsg });
+  /*
+   * Снимок стоит денег, и они должны лечь в тот же кошелёк, что и фразы.
+   * Раньше он весил в бюджете одну «штуку» — столько же, сколько «кто мне
+   * должен», которую бот разбирает своими силами и бесплатно.
+   */
+  ok(aiPh.budget(fxUserId()).kopecks - phKopBefore === 90,
+    'снимок записан в расход', aiPh.budget(fxUserId()).kopecks - phKopBefore);
+  delete process.env.AI_KOP_PHOTO;
+  ok(norm(last()).includes('6 250,00'), 'сумма со снимка показана', norm(last()).slice(0, 60));
+  ok(last().includes('узнал'), 'контрагент опознан по ИНН');
+  const phBtn = button('✅ ООО «Заря»');
+  ok(Boolean(phBtn), 'узнанный контрагент предложен первым', phBtn);
+  await tap(phBtn);
+  ok(last().includes('Что это за операция'), 'бот спрашивает приход или оплата');
+  await tap('ph.k:credit');
+  ok(last().includes('Баланс'), 'операция занесена со снимка');
+  ok(last().includes('занёс со снимка') || sent[sent.length - 2].text.includes('занёс со снимка'),
+    'в подтверждении сказано, что это с фотографии');
+
+  /*
+   * Провайдер ответил ошибкой. Раньше человеку уходило её тело целиком —
+   * «Gemini 400: {…}» с внутренними сообщениями сервиса.
+   */
+  {
+    const keepFetch = global.fetch;
+    const keepKey = process.env.GEMINI_API_KEY;
+    process.env.VISION_PROVIDER = 'gemini';
+    process.env.GEMINI_API_KEY = 'тестовый-ключ';
+    global.fetch = async () => new Response('{"error":{"message":"internal quota bucket 7f3a exceeded"}}',
+      { status: 400 });
+    const keepErr = console.error;
+    console.error = () => {};
+    try {
+      await handleUpdate(tg, { message: photoMsg });
+    } finally {
+      console.error = keepErr;
+      global.fetch = keepFetch;
+      if (keepKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = keepKey;
+    }
+    ok(/Распознать не вышло/.test(last()) && !/Gemini|quota|7f3a|400/.test(last()),
+      'ошибка провайдера не показывается человеку дословно', last().slice(0, 90));
+  }
+  delete process.env.VISION_PROVIDER;
+
+  console.log('\n── разбор вставленных реквизитов ──');
+  const { parseRequisites, looksLikeBlock } = require('./lib/reqs');
+  ok(!looksLikeBlock('7707083893') && looksLikeBlock('ООО Х ИНН 7707083893 р/с 40702810900000012345 БИК 044525225'),
+    'блок реквизитов отличается от чистого ИНН');
+  {
+    // Д29: фраза-просьба из приветствия не блок реквизитов, а «Выставочный центр» — не просьба.
+    const { looksLikeAsk } = require('./lib/reqs');
+    const phrase = 'Выставь счёт ООО Заря на 50 000 руб за оказание услуг';
+    ok(!looksLikeBlock(phrase), 'Д29: «Выставь счёт …» не принимается за блок реквизитов (в нём нет ни ИНН, ни счёта, ни БИК)');
+    ok(looksLikeAsk(phrase) && looksLikeAsk('Сделайте счёт на 5000', { numeric: true }) && looksLikeAsk('счёт на 5000 руб', { numeric: true }),
+      'Д29: просьбу узнаём — по глаголу, а в числовом поле ещё и по «счёт … 5000 руб»');
+    ok(!looksLikeAsk('Выставочный центр') && !looksLikeAsk('ИП Нужный') && !looksLikeAsk('7707083893', { numeric: true })
+      && !looksLikeAsk('счёт 40702810900000012345 в Сбере'),
+    'Д29: название, ИНН и строка с длинным счётом просьбой не считаются');
+  }
+  const blob = 'ИНДИВИДУАЛЬНЫЙ ПРЕДПРИНИМАТЕЛЬ САРЫЧЕВА МАРИЯ ВИТАЛЬЕВНА ИНН: 183111485159 '
+    + 'ОГРНИП: 325180000069852 Расчётный счёт: 40802810468710003890 '
+    + 'Банк: БАШКИРСКОЕ ОТДЕЛЕНИЕ N8598 ПАО СБЕРБАНК БИК банка: 048073601 '
+    + 'Корсчёт: 30101810300000000601 ИНН банка: 7707083893 КПП банка: 183502001';
+  const pr = parseRequisites(blob);
+  ok(pr.inn === '183111485159', 'ИНН организации взят, а не ИНН банка', pr.inn);
+  ok(pr.kpp === '', 'КПП банка не подставлен как КПП организации', pr.kpp || 'пусто');
+  ok(pr.acc === '40802810468710003890', 'расчётный счёт разобран', pr.acc);
+  ok(pr.corr_acc === '30101810300000000601', 'корр. счёт разобран (по метке и префиксу 301)', pr.corr_acc);
+  ok(pr.bik === '048073601', 'БИК разобран', pr.bik);
+  ok(pr.bank_name.includes('СБЕРБАНК'), 'банк не перепутан с «к/с»', pr.bank_name);
+  ok(pr.name.startsWith('ИП ') && pr.full_name.startsWith('ИНДИВИДУАЛЬНЫЙ'),
+    'наименование отделено от реквизитов и сокращено в «ИП»', pr.name);
+
+  // «ИНН/КПП» одной меткой — так пишут в шапке счёта и в УПД. Раньше ИНН не
+  // находился, а КПП брался из первых девяти цифр ИНН.
+  const slash = parseRequisites('ООО «Ромашка» ИНН/КПП 7707083893/770701001 р/с 40702810900000012345');
+  ok(slash.inn === '7707083893' && slash.kpp === '770701001', '«ИНН/КПП» через косую разобран',
+    `${slash.inn} | ${slash.kpp}`);
+  const slashIp = parseRequisites('ИП Петров ИНН/КПП 183114389446 р/с 40802810900000012345');
+  ok(slashIp.inn === '183114389446' && slashIp.kpp === '', 'у ИП после «ИНН/КПП» один ИНН, КПП пустой',
+    `${slashIp.inn} | ${slashIp.kpp}`);
+
+  // вставка блока прямо в бота на шаге ИНН — поля должны разложиться, QR появиться
+  await tap('cp.new');
+  await say(blob);
+  ok(last().includes('Кто это'), 'после вставки блока бот пропустил название/адрес/счета');
+  const notedBlock = sent.slice(-3).some((m) => m.text.includes('Разобрал реквизиты'));
+  ok(notedBlock, 'бот отчитался, что разобрал реквизиты');
+  await tap('fb:supplier');
+  await say('-'); await say('0'); await say('01.01.2026');
+  const pasted = require('./lib/bot-db').listCps(require('./lib/bot-db').getOrCreateUser(USER.id).id)
+    .find((c) => c.inn === '183111485159');
+  ok(pasted && pasted.acc === '40802810468710003890' && pasted.bik === '048073601',
+    'из блока сохранены р/с и БИК — теперь в счёте будет QR', pasted && pasted.acc);
+
+  console.log('\n── автозаполнение по ИНН и БИК ──');
+  process.env.DADATA_MOCK = JSON.stringify({
+    7707083893: {
+      type: 'LEGAL',
+      name: { short_with_opf: 'ООО «Ромашка»', full_with_opf: 'Общество с ограниченной ответственностью «Ромашка»' },
+      inn: '7707083893', kpp: '770701001',
+      address: { unrestricted_value: 'г. Москва, ул. Тверская, 1' },
+      management: { name: 'Иванов Иван Иванович' },
+      state: { status: 'ACTIVE' },
+    },
+    '044525225': { name: { payment: 'ПАО Сбербанк' }, correspondent_account: '30101810400000000225', bic: '044525225' },
+  });
+  const { partyByInn, bankByBik } = require('./lib/dadata');
+  const party = await partyByInn('7707083893');
+  ok(party.ok && party.fields.name === 'ООО «Ромашка»', 'по ИНН нашлось название', party.ok && party.fields.name);
+  ok(party.fields.signer === 'И. И. Иванов', 'директор сокращён в подписанта', party.fields.signer);
+  const bank = await bankByBik('044525225');
+  ok(bank.ok && bank.fields.corr_acc === '30101810400000000225', 'по БИК подставился корр. счёт');
+
+  await tap('cp.new');
+  await say('7707083893');   // ИНН — дальше название/адрес/КПП должны подставиться
+  ok(last().includes('Ромашка') || sent[sent.length - 2].text.includes('Ромашка'),
+    'бот показал найденную организацию');
+  ok(last().includes('Кто это'), 'название, адрес и КПП пропущены — сразу спросил тип');
+  await tap('fb:customer');
+  await say('-');            // договор
+  await say('0');            // сальдо
+  await say('05.05.2026');   // дата
+  await say('044525225');    // БИК — банк и корр. счёт должны подставиться
+  ok(last().includes('счёт контрагента') || last().includes('Расчётный счёт'),
+    'банк и корр. счёт пропущены — сразу спросил расчётный счёт', last().slice(0, 50));
+  await say('40702810900000099998');
+  const roma = require('./lib/bot-db').listCps(require('./lib/bot-db').getOrCreateUser(USER.id).id)
+    .find((c) => c.name === 'ООО «Ромашка»');
+  ok(roma && roma.kpp === '770701001' && roma.address.includes('Тверская'),
+    'контрагент сохранён с подставленными реквизитами', roma && roma.kpp);
+  ok(roma && roma.bank_name === 'ПАО Сбербанк' && roma.corr_acc === '30101810400000000225',
+    'банк подставился по БИК');
+  delete process.env.DADATA_MOCK;
+
+  console.log('\n── дебиторка ──');
+  // второй контрагент-поставщик, которому должны мы
+  await tap('cp.new');
+  await say('1832055557');   // инн (контрольная цифра сходится — бот проверяет)
+  await say('ООО «Поставка»');
+  await say('-'); await say('-'); await say('-'); // полное, КПП, адрес
+  await tap('fb:supplier');
+  await say('-'); await say('0'); await say('01.02.2026'); // договор, сальдо, дата
+  await say('-'); await say('-'); await say('-'); await say('-'); // БИК, банк, к/с, р/с
+  const supBtn = button('Внести операцию');
+  const supId = Number(String(supBtn).split(':')[1]);
+  await tap(`op:${supId}`);
+  await say('01.03 приход 30000');
+
+  await tap('debts');
+  ok(last().includes('Нам должны') && last().includes('Мы должны'),
+    'долги разделены на наши и чужие', last().slice(0, 60));
+  // Теперь долг складывается из внесённых руками операций И из выписанных
+  // закрывающих документов: акт, УПД и накладная создают его сами.
+  // 94 193 − 40 000 + 6 250 со снимка = 60 443 руками, остальное — документы.
+  const zaryaDebt = require('./lib/bot-db').balanceOf(fxUserId(), cpId).closing;
+  const byDocs = require('./lib/bot-db').listDocs(fxUserId(), 50)
+    .filter((d) => ['usl', 'upd', 'torg12'].includes(d.type) && d.cp_id === cpId)
+    .reduce((a2, d) => a2 + d.total, 0);
+  ok(Math.abs(zaryaDebt - (60443 + byDocs)) < 0.01,
+    'долг = операции руками плюс выписанные закрывающие документы',
+    `${zaryaDebt} = 60443 + ${byDocs}`);
+  ok(norm(last()).includes('Нам должны'), 'заказчик показан в должниках',
+    norm(last()).slice(0, 90));
+  ok(last().includes('без движения'), 'показано, сколько дней тишины');
+  ok(last().includes('⚠️'), 'застарелый долг помечен');
+
+  const before = files.length;
+  await tap('debt.akts');
+  ok(files.length === before + 1, 'акт сверки собран по каждому должнику', String(files.length - before));
+  // Прежняя формулировка — «бот не пишет вашим контрагентам, у него нет их
+  // контактов» — перестала быть правдой: письмо должнику отправляется по
+  // кнопке. Осталось главное: без нажатия человека не уходит ничего.
+  ok(Boolean(button('Напомнить о долге')), 'отсюда можно перейти к отправке напоминаний');
+  ok(files.length > before, 'файлы отданы пользователю, а не отправлены за него');
+
+  await tap('debt.remind');
+  ok(last().includes('задолженность') && last().includes('Р/с'),
+    'готовый текст напоминания с реквизитами', last().slice(0, 60));
+
+  console.log('\n── лимит бесплатных документов ──');
+  // отдельный пользователь и низкий лимит: 2 бесплатных, третий блокируется
+  const LIM = { id: 778001, first_name: 'Лимит', username: 'lim' };
+  const limChat = { id: 778001 };
+  const limSay = (t) => handleUpdate(tg, { message: { chat: limChat, from: LIM, text: t } });
+  const limTap = (d) => handleUpdate(tg, { callback_query: { id: 'l', from: LIM, data: d, message: { chat: limChat } } });
+  const limLast = () => {
+    for (let i = sent.length - 1; i >= 0; i--) return sent[i].text; return '';
+  };
+  process.env.FREE_DOCS = '2';
+  await limSay('/start');
+  await limTap('org.new');
+  await limSay('-'); await limSay('ИП Лимит'); await limSay('-'); await limSay('-'); await limSay('-'); await limSay('-');
+  await limSay('-'); await limSay('-'); await limSay('-'); await limSay('-'); // БИК, банк, к/с, р/с
+  await limTap('cps'); await limTap('cp.new');
+  await limSay('-'); await limSay('ООО Клиент'); await limSay('-'); await limSay('-'); await limSay('-');
+  await limTap('fb:customer');
+  await limSay('-'); await limSay('0'); await limSay('01.01.2026');
+  await limSay('-'); await limSay('-'); await limSay('-'); await limSay('-');
+  const limCp = Number(String(button('Внести операцию')).split(':')[1]);
+  const mk = async () => { await limTap(`d.sch:${limCp}`); await limSay('Услуга; 1; 100'); await limTap('items.done'); await limTap('doc.make'); };
+  await mk(); await mk(); // два бесплатных
+  const filesBefore = files.length;
+  await limTap(`d.sch:${limCp}`); // третий — должен упереться в лимит
+  ok(limLast().includes('бесплатных'), 'на третьем документе бот показал лимит', limLast().slice(0, 50));
+  ok(files.length === filesBefore, 'третий документ не выпущен без подписки');
+  // выдаём подписку — лимит снимается
+  /*
+   * Задним числом лимит не обходится.
+   *
+   * Квота раньше считала документы по дате НА документе, а её ставит человек.
+   * Значит бесплатный порог снимался одним движением: поставил в форме
+   * прошлый месяц — и выписывай сколько угодно, счётчик текущего месяца не
+   * шелохнётся. Продавать при таком счётчике нечего.
+   */
+  {
+    const bdbQ = require('./lib/bot-db');
+    const uq = bdbQ.getOrCreateUser(LIM.id);
+    const wasUsed = bdbQ.quota(uq.id).used;
+    const orgQ = bdbQ.getDefaultOrg(uq.id);
+    bdbQ.saveDoc(uq.id, { orgId: orgQ.id, cpId: limCp, type: 'sch',
+      number: 'ЗАД-1', seq: 90001, date: '2020-01-15', total: 100, payload: {} });
+    ok(bdbQ.quota(uq.id).used === wasUsed + 1,
+      'документ прошлым числом всё равно съедает бесплатный лимит',
+      `${wasUsed} → ${bdbQ.quota(uq.id).used}`);
+    // Удаление лимит не возвращает: файл остался у человека, документ выписан.
+    const gone = bdbQ.saveDoc(uq.id, { orgId: orgQ.id, cpId: limCp, type: 'sch',
+      number: 'УД-1', seq: 90002, date: '2025-03-10', total: 100, payload: {} });
+    const before = bdbQ.quota(uq.id).used;
+    bdbQ.deleteDoc(uq.id, gone);
+    ok(bdbQ.quota(uq.id).used === before,
+      'удалённый документ из бесплатного лимита не выпадает', `${before} → ${bdbQ.quota(uq.id).used}`);
+
+    /*
+     * Пример владельца. Октябрь: предоплата 148 000, отгрузили на 182 600 —
+     * на конец месяца долг 34 600. В ноябре вписал «Долг на начало 34 600 на
+     * 01.11», а октябрь уже в журнале — долг считался дважды. Ноябрь:
+     * предоплата 154 000, две отгрузки на 110 000 → аванс 9 400.
+     */
+    const dc = bdbQ.createCp(uq.id, { name: 'ООО Пример долга', kind: 'customer' });
+    bdbQ.addOp(uq.id, dc, { date: '2026-10-05', kind: 'Оплата', debit: 148000 });
+    bdbQ.addOp(uq.id, dc, { date: '2026-10-20', kind: 'Реализация', credit: 182600 });
+    ok(bdbQ.balanceOf(uq.id, dc).closing === 34600, 'конец октября: долг 34 600', bdbQ.balanceOf(uq.id, dc).closing);
+    bdbQ.updateCp(uq.id, dc, { opening_balance: 34600, opening_date: '2026-11-01' });
+    ok(bdbQ.balanceOf(uq.id, dc).closing === 34600, 'долг на начало ноября не удвоил октябрь', bdbQ.balanceOf(uq.id, dc).closing);
+    ok((bdbQ.openingCovers(uq.id, dc) || {}).count === 2, 'и человеку сказано, что две октябрьские записи вошли в сальдо');
+    bdbQ.addOp(uq.id, dc, { date: '2026-11-02', kind: 'Оплата', debit: 154000 });
+    bdbQ.addOp(uq.id, dc, { date: '2026-11-03', kind: 'Реализация', credit: 60000 });
+    bdbQ.addOp(uq.id, dc, { date: '2026-11-04', kind: 'Реализация', credit: 50000 });
+    ok(bdbQ.balanceOf(uq.id, dc).closing === -9400, 'ноябрь: аванс клиента 9 400', bdbQ.balanceOf(uq.id, dc).closing);
+    const nov = bdbQ.periodBalance(uq.id, dc, '2026-11-01', '2026-11-30');
+    ok(nov.opening === 34600 && nov.closing === -9400, 'акт сверки за ноябрь: на начало 34 600, на конец −9 400', `${nov.opening} → ${nov.closing}`);
+    const all = bdbQ.periodBalance(uq.id, dc, '', '');
+    ok(all.opening === 34600 && all.closing === -9400 && all.from === '2026-11-01',
+      'акт сверки без периода начинается с долга на начало, а не с нуля', `${all.from} ${all.opening} → ${all.closing}`);
+    const oct = bdbQ.periodBalance(uq.id, dc, '2026-10-01', '2026-10-31');
+    ok(oct.opening === 0 && oct.closing === 34600, 'и за октябрь акт по-прежнему сходится: 0 → 34 600', `${oct.opening} → ${oct.closing}`);
+    // Новый клиент с нулём «с сегодня»: счёт задним числом в долг попадает.
+    const nc = bdbQ.createCp(uq.id, { name: 'ООО Задним числом', kind: 'customer', opening_date: '2026-11-05' });
+    bdbQ.addOp(uq.id, nc, { date: '2026-10-28', kind: 'Реализация', credit: 5000 });
+    ok(bdbQ.balanceOf(uq.id, nc).closing === 5000, 'нулевое сальдо не прячет документы задним числом', bdbQ.balanceOf(uq.id, nc).closing);
+  }
+
+  require('./lib/billing').grantDays(require('./lib/bot-db').getOrCreateUser(LIM.id).id, 30);
+  await mk();
+  ok(files.length === filesBefore + 1, 'с подпиской документ выписывается сверх лимита');
+  delete process.env.FREE_DOCS;
+  process.env.FREE_DOCS = '1000'; // возвращаем высокий порог для остального прогона
+
+  console.log('\n── разбор вебхука Lava ──');
+  const lava = require('./lib/lava');
+  const flat = lava.parseWebhook({ id: 'inv-1', status: 'paid', amount: '349,00',
+    currency: 'RUB', email: 'Ivan@Mail.RU', clientUtm: '777001' });
+  ok(flat.ok && flat.payment.amount === 349 && flat.payment.paid, 'плоское тело разобрано',
+    JSON.stringify(flat.payment && { a: flat.payment.amount, p: flat.payment.paid }));
+  ok(flat.payment.email === 'ivan@mail.ru', 'почта приведена к нижнему регистру');
+  ok(flat.payment.tgId === 777001, 'Telegram-id вытащен из параметра ссылки');
+
+  const nested = lava.parseWebhook({ event: 'payment.success',
+    data: { invoiceId: 'inv-2', sum: 3490, buyer: { email: 'a@b.ru' }, clientUtm: 'tg777002' } });
+  ok(nested.ok && nested.payment.externalId === 'inv-2' && nested.payment.tgId === 777002,
+    'вложенное тело и id внутри строки', nested.ok ? nested.payment.externalId : nested.reason);
+
+  // Точный формат Lava Top (сверен по официальному SDK lava-top-sdk).
+  const real = lava.parseWebhook({
+    eventType: 'payment.success', contractId: 'c-42', status: 'completed',
+    amount: 390, currency: 'RUB', buyer: { email: 'Buyer@Mail.RU' },
+    product: { title: 'Первичка — месяц' },
+  });
+  // Ключ платежа собран из договора: своего id в этом теле нет, а по одному
+  // договору списывают каждый месяц (пояснение в lib/lava.js).
+  ok(real.ok && real.payment.externalId.startsWith('c-42:') && real.payment.paid
+    && real.payment.email === 'buyer@mail.ru' && real.payment.amount === 390
+    && real.payment.product === 'Первичка — месяц',
+    'реальный формат Lava Top (eventType/contractId/buyer.email)',
+    real.ok ? `${real.payment.status} ${real.payment.amount}` : real.reason);
+  const recur = lava.parseWebhook({
+    eventType: 'subscription.recurring.payment.success', contractId: 'c-43',
+    amount: 2990, buyer: { email: 'x@y.ru' } });
+  ok(recur.ok && recur.payment.paid, 'автопродление подписки Lava — оплачено');
+
+  /*
+   * Подписка списывает деньги каждый месяц по одному договору. Если ключом
+   * платежа взять contractId, второе списание выглядит повтором первого:
+   * деньги пришли, доступ не продлён. Поэтому при отсутствии собственного
+   * id ключ собирается из договора, момента, статуса и суммы.
+   */
+  const wh = (extra) => lava.parseWebhook({
+    eventType: 'payment.success', contractId: 'c-77', amount: 390,
+    buyer: { email: 'x@y.ru' }, ...extra }).payment.externalId;
+  const m1 = wh({ timestamp: '2026-08-22T10:00:00Z' });
+  ok(m1 === wh({ timestamp: '2026-08-22T10:00:00Z' }),
+    'повторная доставка того же вебхука — тот же платёж', m1);
+  ok(m1 !== wh({ timestamp: '2026-09-22T10:00:00Z' }),
+    'а списание в следующем месяце — новый платёж', m1);
+
+  /*
+   * Отказ и удачная оплата по одному договору в один день — разные платежи.
+   * Раньше ключом были договор и дата: отказ записывался первым и занимал
+   * место, а оплата через пять минут отбрасывалась как повтор. Человек,
+   * заплативший со второй попытки, оставался без доступа.
+   */
+  ok(wh({ eventType: 'payment.failed', timestamp: '2026-08-22T10:00:00Z' })
+    !== wh({ timestamp: '2026-08-22T10:05:00Z' }),
+    'отказ не занимает место удачной оплаты того же дня');
+  ok(wh({ timestamp: '2026-08-22T10:00:00Z' })
+    !== wh({ amount: 2990, timestamp: '2026-08-22T10:00:00Z' }),
+    'месяц и год в один день — два платежа, а не один');
+
+  // Время площадки приходит в трёх видах, и все три означают один момент.
+  ok(wh({ timestamp: 1755950000 }) === wh({ timestamp: 1755950000000 }),
+    'unix-время в секундах и в миллисекундах — один платёж');
+  ok(wh({ timestamp: '2026-08-22T23:30:00Z' }) === wh({ timestamp: '2026-08-23T02:30:00+03:00' }),
+    'один момент в разных поясах через полночь — тоже один');
+  // Времени может не быть вовсе: тогда ключ берём с отпечатка тела, иначе
+  // каждая повторная доставка продлевала бы доступ ещё раз.
+  ok(wh({}) === wh({}), 'без времени ключ всё равно повторяем');
+  /*
+   * Telegram-id берём только из своего параметра и только целиком. Раньше
+   * годилось любое число из пяти-пятнадцати цифр в любом поле, включая
+   * свободный комментарий плательщика: из «оплата по счёту 1234567890»
+   * доставался номер счёта, платёж уходил постороннему — и настоящий
+   * плательщик уже не мог забрать его по почте, потому что ищем только ничьи.
+   */
+  const byParam = lava.parseWebhook({
+    eventType: 'payment.success', contractId: 'c-90', amount: 390, clientUtm: '717171' });
+  ok(byParam.payment.tgId === 717171, 'Telegram-id из нашего параметра', byParam.payment.tgId);
+  const byComment = lava.parseWebhook({
+    eventType: 'payment.success', contractId: 'c-91', amount: 390,
+    comment: 'оплата по счёту 1234567890' });
+  ok(byComment.payment.tgId === null,
+    'а из комментария плательщика — не берём', byComment.payment.tgId);
+
+  const own = lava.parseWebhook({
+    eventType: 'payment.success', id: 'pay-1', contractId: 'c-77', amount: 390 });
+  ok(own.payment.externalId === 'pay-1',
+    'когда у платежа есть свой id — берём его, а не договор', own.payment.externalId);
+  const declined = lava.parseWebhook({
+    eventType: 'payment.failed', contractId: 'c-44', amount: 390, buyer: { email: 'x@y.ru' } });
+  ok(declined.ok && !declined.payment.paid, 'событие payment.failed — доступ не выдан');
+
+  const failed = lava.parseWebhook({ id: 'inv-3', status: 'failed', amount: 349 });
+  ok(failed.ok && !failed.payment.paid, 'неуспешный платёж помечен как неоплаченный');
+  const junk = lava.parseWebhook({ hello: 'world' });
+  ok(!junk.ok, 'непонятное тело не выдаёт доступ', junk.reason);
+
+  process.env.LAVA_PLAN_DAYS = '349:30,3490:365';
+  ok(lava.daysFor({ amount: 3490 }) === 365 && lava.daysFor({ amount: 349 }) === 30,
+    'дни подбираются по сумме');
+  ok(lava.daysFor({ amount: 111 }) === 30, 'незнакомая сумма — срок по умолчанию');
+
+  process.env.LAVA_WEBHOOK_SECRET = 'sekret';
+  ok(lava.secretOk('sekret') && !lava.secretOk('sekret1') && !lava.secretOk(''),
+    'секрет сверяется точно');
+  ok(lava.secretOk(' sekret\n'), 'края ключа обрезаются — висящий перевод строки в .env не отвергает верный ключ');
+
+  /*
+   * Второй способ подтверждения: площадка подписывает тело секретом.
+   *
+   * Тогда в заголовке лежит не ключ, а шестнадцатеричная строка, и побайтное
+   * сравнение с ключом её отвергает. В журнале это выглядит как «неверный
+   * секрет» — то есть неотличимо от чужого запроса, хотя искать надо совсем
+   * в другом месте.
+   */
+  {
+    const cryptoL = require('node:crypto');
+    const telo = '{"eventType":"payment.success","amount":390}';
+    const podpis = (key, text) => cryptoL.createHmac('sha256', key).update(text).digest('hex');
+    ok(lava.hmacOk(podpis('sekret', telo), telo), 'подпись тела принимается');
+    ok(lava.hmacOk(`sha256=${podpis('sekret', telo)}`, telo),
+      'и с пометкой алгоритма впереди — её ставят некоторые площадки');
+    ok(lava.hmacOk(podpis('sekret', telo).toUpperCase(), telo), 'регистр подписи не важен');
+    ok(!lava.hmacOk(podpis('chuzhoy', telo), telo), 'подпись чужим ключом отвергается');
+    ok(!lava.hmacOk(podpis('sekret', '{}'), telo),
+      'подпись от другого тела отвергается — иначе её можно было бы переставить на любой платёж');
+    ok(!lava.hmacOk('', telo) && !lava.hmacOk(podpis('sekret', telo), ''),
+      'пустая подпись и пустое тело ничего не открывают');
+
+    /*
+     * Секрет в строке адреса больше не принимается.
+     *
+     * Адреса оседают в access-логе nginx, который читают и ротируют как
+     * обычный лог: ключ, дающий выдачу подписок, лежал бы там открытым
+     * текстом. Lava присылает его заголовком, так что рабочему пути это не
+     * мешает. Проверяем по-настоящему, через HTTP, а не по коду.
+     */
+    const { server: hookServer } = require('./lava-webhook');
+    await new Promise((r) => hookServer.listen(0, '127.0.0.1', r));
+    const hookPort = hookServer.address().port;
+    const post = async (path2, headers) => {
+      const res = await fetch(`http://127.0.0.1:${hookPort}${path2}`, {
+        method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: telo,
+      });
+      return res.status;
+    };
+    delete process.env.LAVA_ALLOW_URL_SECRET;
+    ok(await post('/lava?secret=sekret', {}) === 401,
+      'верный ключ в адресе не пускает — он утёк бы в лог nginx');
+    ok(await post('/lava?token=sekret', {}) === 401, 'и через token тоже');
+    ok(await post('/lava', { 'x-api-key': 'sekret' }) !== 401,
+      'а заголовком тот же ключ работает — рабочий путь цел');
+    process.env.LAVA_ALLOW_URL_SECRET = '1';
+    ok(await post('/lava?secret=sekret', {}) !== 401,
+      'старый способ доступен, только если его включили явно');
+    delete process.env.LAVA_ALLOW_URL_SECRET;
+
+    /*
+     * Тело с кириллицей, разрезанное посреди буквы.
+     *
+     * nginx передаёт тело кусками, и граница может прийти на середину
+     * двухбайтовой буквы. Приёмник склеивал куски как строки, буква
+     * превращалась в «�», и подпись, посчитанная по байтам, не сходилась:
+     * оплата с русским названием товара отвергалась как «неверный секрет»
+     * на каждом повторе. Шлём настоящими байтами через сокет, двумя кусками.
+     */
+    const net = require('node:net');
+    const ruBody = Buffer.from('{"eventType":"payment.success","amount":390,"product":{"title":"Подписка на Первичку"}}');
+    const cut = ruBody.indexOf(Buffer.from('П')) + 1;   // ровно между байтами буквы «П»
+    const sig = podpis('sekret', ruBody);
+    const splitStatus = await new Promise((resolve, reject) => {
+      const sock = net.connect(hookPort, '127.0.0.1', () => {
+        sock.write(`POST /lava HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n`
+          + `x-api-key: ${sig}\r\nContent-Length: ${ruBody.length}\r\nConnection: close\r\n\r\n`);
+        sock.write(ruBody.subarray(0, cut));
+        setTimeout(() => sock.end(ruBody.subarray(cut)), 30);
+      });
+      let resp = '';
+      sock.on('data', (d) => { resp += d; });
+      sock.on('end', () => resolve(Number((/^HTTP\/1\.1 (\d+)/.exec(resp) || [])[1])));
+      sock.on('error', reject);
+    });
+    ok(splitStatus !== 401, 'подпись тела с разрезанной буквой сходится', splitStatus);
+
+    /*
+     * Адрес «//[» URL читает как хост и бросает исключение, а обработчик
+     * приёмника синхронный — один такой запрос ронял весь процесс. fetch
+     * такой адрес не отправит, поэтому пишем в сокет сами.
+     */
+    const rawStatus = (line) => new Promise((resolve, reject) => {
+      const sock = net.connect(hookPort, '127.0.0.1', () => {
+        sock.end(`${line}\r\nHost: x\r\nConnection: close\r\n\r\n`);
+      });
+      let resp = '';
+      sock.on('data', (d) => { resp += d; });
+      sock.on('end', () => resolve(Number((/^HTTP\/1\.1 (\d+)/.exec(resp) || [])[1])));
+      sock.on('error', reject);
+    });
+    const crooked = await rawStatus('GET //[ HTTP/1.1');
+    ok(crooked === 400, 'кривой адрес получает отказ, а не роняет приёмник', crooked);
+    ok(await rawStatus('GET /health HTTP/1.1') === 200, 'и после него приёмник жив');
+
+    await new Promise((r) => hookServer.close(r));
+  }
+  process.env.LAVA_OFFER_URL = 'https://lava.top/x?a=1';
+  ok(lava.payLink(777001).includes('clientUtm=777001'), 'ссылка на оплату несёт Telegram-id',
+    lava.payLink(777001));
+
+  console.log('\n── тарифы и цена ──');
+  {
+    /*
+     * Цена и срок доступа должны браться из одного списка.
+     *
+     * Раньше список сумм жил отдельно, а цену не показывали нигде. При смене
+     * цены список оставался старым: платёж на новую сумму не совпадал ни с
+     * одной строкой, срок брался запасной — и оплативший год получал месяц.
+     */
+    const lava = require('./lib/lava');
+    const was = process.env.LAVA_PLAN_DAYS;
+    process.env.LAVA_PLAN_DAYS = '390:30,2990:365';
+
+    ok(lava.daysFor({ amount: 2990 }) === 365, 'годовой платёж даёт год',
+      lava.daysFor({ amount: 2990 }));
+    ok(lava.daysFor({ amount: 390 }) === 30, 'месячный — месяц', lava.daysFor({ amount: 390 }));
+    ok(lava.priceText() === '390 ₽ в месяц или 2990 ₽ в год',
+      'цена собирается из тех же тарифов', lava.priceText());
+    ok(lava.yearSaving() === 1690, 'выгода годового считается, а не выдумывается',
+      lava.yearSaving());
+
+    // Тарифы поменяли, а цену забыли — так больше не выйдет: она одна и та же.
+    process.env.LAVA_PLAN_DAYS = '490:30,4900:365';
+    ok(lava.priceText() === '490 ₽ в месяц или 4900 ₽ в год',
+      'смена тарифа сразу меняет и показанную цену', lava.priceText());
+    ok(lava.daysFor({ amount: 4900 }) === 365, 'и срок за новую годовую сумму');
+
+    // Тарифов нет — цену не выдумываем.
+    process.env.LAVA_PLAN_DAYS = '';
+    ok(lava.priceText() === '', 'без тарифов цена не показывается');
+    ok(lava.yearSaving() === 0, 'и выгода тоже');
+
+    process.env.LAVA_PLAN_DAYS = was === undefined ? '' : was;
+  }
+
+  console.log('\n── одна цена: кнопки, касса, сайт ──');
+  {
+    /*
+     * Кнопка года в боте стояла числом «3 490 ₽», а касса брала из сетки
+     * 2 990. В оферте и тарифах на сайте — 349 и 3 490. Человек видел одну
+     * цену и платил другую. Проверяем по нажатию, а не по исходнику.
+     */
+    const pl = require('./lib/platega');
+    const keep = ['PLATEGA_MERCHANT_ID', 'PLATEGA_SECRET', 'PLATEGA_PLAN_DAYS', 'LAVA_PLAN_DAYS']
+      .map((k) => [k, process.env[k]]);
+    process.env.PLATEGA_MERCHANT_ID = 'm-test';
+    process.env.PLATEGA_SECRET = 's-test';
+    process.env.LAVA_PLAN_DAYS = '';
+    const kbText = () => ((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.text).join(' | ');
+
+    process.env.PLATEGA_PLAN_DAYS = '450:30,3990:365';
+    await tap('billing');
+    ok(/Год \(3990 ₽\)/.test(kbText()) && /СБП \(450 ₽\)/.test(kbText()),
+      'обе кнопки оплаты показывают цену из сетки', kbText());
+
+    /*
+     * Без годового тарифа «Год» раньше создавал платёж на МЕСЯЧНУЮ сумму:
+     * человек платил за «год» и получал тридцать дней.
+     */
+    process.env.PLATEGA_PLAN_DAYS = '450:30';
+    await tap('billing');
+    ok(!/Год/.test(kbText()), 'нет годового тарифа — нет и кнопки года', kbText());
+    ok(pl.planByName('year') === null, 'за «год» месяц не подсовывается');
+
+    // Запасная сетка — те цены, что утвердил владелец, а не прежние 349/3490.
+    delete process.env.PLATEGA_PLAN_DAYS;
+    const f = pl.priceFacts();
+    ok(f && f.month === 390 && f.year === 2990, 'запасная сетка — 390 и 2 990', JSON.stringify(f));
+    ok(f && f.save === 1690 && f.permonth === 249, 'выгода и цена месяца в году считаются', JSON.stringify(f));
+
+    /*
+     * Страницы сайта. Числа в вёрстке помечены классами, при публикации
+     * site.sh подставляет их из сетки бота. Но и сами файлы в репозитории
+     * должны быть верными — их видно до первой публикации и в предпросмотре.
+     */
+    const fsP = require('node:fs');
+    for (const page of ['index', 'tariffs', 'terms']) {
+      const html = fsP.readFileSync(`${__dirname}/public/landing/${page}.html`, 'utf8');
+      const marked = (k) => [...html.matchAll(new RegExp(`class="[^"]*price-${k}[^"]*">([0-9 ]+)<`, 'g'))]
+        .map((m) => Number(m[1].replace(/\s/g, '')));
+      ok(marked('month').length > 0 && marked('month').every((v) => v === f.month)
+        && marked('year').length > 0 && marked('year').every((v) => v === f.year),
+      `${page}: цены помечены и совпадают с сеткой`, `месяц ${marked('month')}, год ${marked('year')}`);
+      ok(!/\b349 ₽|3 490 ₽|700 ₽|2 месяца в подарок/.test(html), `${page}: старых цен и «выгод» не осталось`);
+    }
+
+    for (const [k, v] of keep) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+
+  console.log('\n── доступ и оплата ──');
+  const bill = require('./lib/billing');
+  const meUser = require('./lib/bot-db').getOrCreateUser(USER.id);
+  ok(!bill.accessInfo(meUser.id).active, 'по умолчанию доступ не оплачен');
+  const until1 = bill.grantDays(meUser.id, 30);
+  ok(bill.accessInfo(meUser.id).active && bill.accessInfo(meUser.id).left >= 29,
+    'доступ выдан на 30 дней', until1);
+  const until2 = bill.grantDays(meUser.id, 30);
+  ok(until2 > until1, 'продление добавляется к остатку, а не сгорает', `${until1} → ${until2}`);
+  // Ровно 30 дней, а не 29 и не 31: раньше дни прибавлялись к полуночи UTC,
+  // и в зависимости от пояса результат уезжал на сутки.
+  {
+    const pr = require('./lib/period');
+    const days = Math.round(
+      (new Date(`${until1}T12:00:00Z`) - new Date(`${pr.todayISO()}T12:00:00Z`)) / 86400000,
+    );
+    ok(days === 30, 'выдано ровно 30 календарных дней', `${pr.todayISO()} → ${until1} = ${days}`);
+    ok(until2.slice(0, 4).length === 4 && until2 > until1, 'и продление считается от той же даты');
+  }
+  /*
+   * Подписка КОНЧАЕТСЯ. Проверяем именно это, а не только выдачу.
+   *
+   * Дыру нашла мутационная проверка: если убрать из accessInfo сравнение
+   * с сегодняшней датой (`until >= todayISO()`), весь прогон оставался
+   * зелёным. То есть каждый, кто когда-либо платил, пользовался бы продуктом
+   * вечно, а платить перестал бы — и ни один тест об этом не сказал бы.
+   * Проверялись выдача и продление, а окончание срока — нет.
+   */
+  {
+    const rawDb2 = require('./db').db;
+    const yesterday = (n) => {
+      const d = new Date(Date.now() - n * 86400000);
+      return d.toISOString().slice(0, 10);
+    };
+    const setUntil = (v) => rawDb2.prepare('UPDATE bot_users SET access_until = ? WHERE id = ?')
+      .run(v, meUser.id);
+
+    setUntil(yesterday(1));
+    const past = bill.accessInfo(meUser.id);
+    ok(!past.active, 'вчерашняя дата окончания — доступа нет', JSON.stringify(past));
+    ok(past.left === 0, 'и дней не осталось', String(past.left));
+
+    setUntil(yesterday(0));
+    const today2 = bill.accessInfo(meUser.id);
+    ok(today2.active, 'последний день подписки ещё рабочий', JSON.stringify(today2));
+
+    setUntil(yesterday(-3));
+    const soon = bill.accessInfo(meUser.id);
+    ok(soon.active && soon.left === 3, 'до конца трое суток', JSON.stringify(soon));
+
+    setUntil('');
+    ok(!bill.accessInfo(meUser.id).active, 'без даты доступа нет вовсе');
+  }
+  bill.revokeAccess(meUser.id);
+
+  const { handlePayment } = require('./lava-webhook');
+  const pay = { externalId: 'inv-10', amount: 349, currency: 'RUB', status: 'paid',
+    email: 'k@l.ru', tgId: USER.id, paid: true, raw: {} };
+  await handlePayment(pay);
+  ok(bill.accessInfo(meUser.id).active, 'вебхук выдал доступ');
+  const untilOnce = bill.accessInfo(meUser.id).until;
+  await handlePayment(pay);
+  ok(bill.accessInfo(meUser.id).until === untilOnce, 'повторная доставка вебхука не продлевает дважды');
+
+  // платёж без Telegram-id забирается по почте
+  await handlePayment({ externalId: 'inv-11', amount: 349, currency: 'RUB', status: 'paid',
+    email: 'nobody@mail.ru', tgId: null, paid: true, raw: {} });
+  ok(bill.unclaimedByEmail('nobody@mail.ru').length === 1, 'ничей платёж ждёт владельца');
+  await tap('billing');
+  ok(last().includes('Подписка'), 'экран подписки открывается');
+  await tap('pay.claim');
+  await say('не-почта');
+  ok(last().includes('не похоже на почту'), 'кривой адрес отклоняется');
+
+  /*
+   * Одной почты мало — нужен код из письма.
+   *
+   * Раньше доступ выдавался сразу по названному адресу. А ничьим приходит
+   * КАЖДЫЙ боевой платёж (Lava не возвращает Telegram-id), так что знания
+   * чужой почты с кассы хватало, чтобы забрать чужую подписку: ни кода, ни
+   * срока, ни счётчика попыток. Проверяем весь путь и саму дыру.
+   */
+  const mailerMod = require('./lib/mail');
+  const realSend = mailerMod.sendMail;
+  let sentTo = '';
+  let sentText = '';
+  mailerMod.sendMail = async (letter) => { sentTo = letter.to; sentText = letter.text || ''; return { ok: true }; };
+  process.env.SMTP_HOST = 'smtp.test';
+  process.env.SMTP_FROM = 'bot@test';
+
+  await tap('pay.claim');
+  await say('nobody@mail.ru');
+  ok(last().includes('код'), 'на почту обещан код, а не мгновенный доступ', last().slice(0, 50));
+  ok(sentTo === 'nobody@mail.ru', 'код ушёл на адрес из платежа', sentTo);
+  const claimCode = ((sentText.match(/(\d{6})/) || [])[1]) || '';
+  ok(claimCode.length === 6, 'в письме шесть цифр', claimCode);
+  ok(!last().includes(claimCode), 'кода в чате нет — иначе он бессмысленен');
+  ok(bill.unclaimedByEmail('nobody@mail.ru').length === 1, 'до ввода кода платёж ещё ничей');
+
+  // Не тот код — доступа нет, и попытки считаются.
+  const wrong = String((Number(claimCode) + 1) % 1000000).padStart(6, '0');
+  await say(wrong);
+  ok(last().includes('не подошёл'), 'неверный код отклоняется', last().slice(0, 40));
+  ok(bill.unclaimedByEmail('nobody@mail.ru').length === 1, 'и платёж по-прежнему ничей');
+
+  // Правильный код — доступ.
+  await say(claimCode);
+  ok(last().includes('Нашёл'), 'по верному коду оплата привязана', last().slice(0, 40));
+  ok(bill.unclaimedByEmail('nobody@mail.ru').length === 0, 'платёж больше не ничей');
+
+  /*
+   * Собственно та дыра, из-за которой всё затевалось: посторонний, знающий
+   * чужую почту, не должен получить ничего.
+   */
+  await handlePayment({ externalId: 'inv-12', amount: 349, currency: 'RUB', status: 'paid',
+    email: 'victim@mail.ru', tgId: null, paid: true, raw: {} });
+  const bdbClaim = require('./lib/bot-db');
+  const thief = bdbClaim.getOrCreateUser(777044, 'Посторонний', 'thief');
+  bill.revokeAccess(thief.id);
+  const started = bill.startEmailClaim(thief.id, 'victim@mail.ru');
+  ok(started.ok, 'заявка заводится — по ответу не понять, есть ли такая оплата');
+  ok(!bill.accessInfo(thief.id).active, 'но доступа без кода посторонний не получил');
+  ok(bill.unclaimedByEmail('victim@mail.ru').length === 1, 'и оплата жертвы осталась ничьей');
+  for (let i = 0; i < 5; i += 1) bill.confirmEmailClaim(thief.id, '000000');
+  const sixth = bill.confirmEmailClaim(thief.id, started.code);
+  ok(!sixth.ok && sixth.error === 'много-ошибок', 'после пяти ошибок код перестаёт приниматься', sixth.error);
+  ok(bill.unclaimedByEmail('victim@mail.ru').length === 1, 'перебором оплату не увели');
+
+  /*
+   * Упавшая отправка не должна теряться.
+   *
+   * Раньше стоял .catch(() => {}): почта легла — человек, который уже
+   * заплатил, слышал «код выслан», ждал письма, которого не было, и на
+   * каждый заход сжигал одну из пяти суточных попыток. В журнале при этом не
+   * оставалось ничего, так что поддержке было не за что зацепиться.
+   * Сказать ему прямо нельзя: такой ответ приходил бы только на адрес
+   * плательщика и выдавал бы, кто у нас платил.
+   */
+  {
+    await handlePayment({ externalId: 'inv-13', amount: 349, currency: 'RUB', status: 'paid',
+      email: 'smtpdown@mail.ru', tgId: null, paid: true, raw: {} });
+    const officeMod = require('./lib/office');
+    const wasEvents = officeMod.list('claim-mail').length;
+    mailerMod.sendMail = async () => { throw new Error('SMTP 421'); };
+
+    const faller = bdbClaim.getOrCreateUser(777045, 'Плательщик', 'payer');
+    await handleUpdate(tg, { callback_query: { id: 'f', from: { id: 777045, first_name: 'Плательщик' },
+      data: 'pay.claim', message: { chat: { id: 777045 } } } });
+    await handleUpdate(tg, { message: { chat: { id: 777045 },
+      from: { id: 777045, first_name: 'Плательщик' }, text: 'smtpdown@mail.ru' } });
+
+    const events = officeMod.list('claim-mail');
+    ok(events.length > wasEvents && events[0].text === 'smtpdown@mail.ru',
+      'упавшая отправка кода записана в журнал офиса',
+      `${events.length} шт., первое: ${events[0] && events[0].text}`);
+    ok(last().includes('код'), 'а человеку ответ прежний — иначе форма выдаст, кто платил',
+      last().slice(0, 40));
+    const claimRow = bill.pendingClaim(faller.id);
+    ok(claimRow && claimRow.sentToday === 0,
+      'сгоревшая впустую попытка возвращена', claimRow && claimRow.sentToday);
+    mailerMod.sendMail = async (letter) => { sentTo = letter.to; sentText = letter.text || ''; return { ok: true }; };
+  }
+
+  mailerMod.sendMail = realSend;
+  delete process.env.SMTP_HOST;
+  delete process.env.SMTP_FROM;
+
+  console.log('\n── команды владельца ──');
+  process.env.SUPPORT_CHAT_ID = String(CHAT.id);
+  await say('/who');
+  ok(last().includes('С доступом') || last().includes('Доступов нет'), 'сводка по доступам');
+  await say('/admin');
+  ok(last().includes('/grant') && last().includes('/code'), 'подсказка по командам владельца');
+  const gBefore = sent.length;
+  await say(`/grant ${USER.id} 90`);
+  const gMsgs = sent.slice(gBefore).map((m) => m.text);
+  // владелец в тесте — тот же чат, поэтому приходят оба сообщения:
+  // отчёт владельцу и уведомление пользователю
+  ok(gMsgs.some((t) => t.includes('Выдал 90')), 'доступ выдаётся вручную', gMsgs.join(' | ').slice(0, 70));
+  ok(gMsgs.some((t) => t.includes('Доступ продлён')), 'пользователя уведомили о продлении');
+  delete process.env.SUPPORT_CHAT_ID;
+  const nBefore = sent.length;
+  await say('/grant 777002 90');
+  ok(sent[nBefore] && !sent[nBefore].text.includes('Выдал'),
+    'посторонний не может выдать доступ себе', (sent[nBefore] || {}).text?.slice(0, 40));
+
+  console.log('\n── коды доступа (выдать подписку бесплатно) ──');
+  {
+    const OWNER = { id: 999001, first_name: 'Владелец', username: 'owner' };
+    process.env.SUPPORT_CHAT_ID = String(OWNER.id);
+    const ownerSay = (t) => handleUpdate(tg,
+      { message: { chat: { id: OWNER.id }, from: OWNER, text: t } });
+    /** Отдельный тестировщик: как раз тот случай, ради которого всё это. */
+    const person = (id, username) => {
+      const who = { id, first_name: `Тестер ${id}`, username };
+      return {
+        say: (t) => handleUpdate(tg, { message: { chat: { id }, from: who, text: t } }),
+        tap: (d) => handleUpdate(tg,
+          { callback_query: { id: 'cb', from: who, data: d, message: { chat: { id } } } }),
+        row: () => require('./lib/bot-db').getOrCreateUser(id),
+      };
+    };
+    const CODE_RE = /PRV-[A-Z0-9]{4}-[A-Z0-9]{4}/g;
+
+    await ownerSay('/code 30 2 бета-тест');
+    const codes = last().match(CODE_RE) || [];
+    ok(codes.length === 2, 'владелец получил сразу два кода', codes.join(' '));
+    ok(last().includes('бета-тест'), 'пометка видна в ответе');
+
+    const t1 = person(999002, 'tester_one');
+    await t1.say('/start');
+    ok(!bill.accessInfo(t1.row().id).active, 'у тестировщика доступа ещё нет');
+
+    // Код прислан как есть — в нижнем регистре и с пробелами вместо дефисов.
+    await t1.say(codes[0].toLowerCase().replace(/-/g, ' '));
+    const a1 = bill.accessInfo(t1.row().id);
+    ok(a1.active && a1.left >= 29, 'код открыл доступ на месяц', `до ${a1.until}`);
+    ok(require('./lib/bot-db').quota(t1.row().id).paid, 'лимит бесплатных документов снят');
+    ok(last().includes('Код принят'), 'бот подтвердил активацию', last().slice(0, 40));
+
+    await t1.say(codes[0]);
+    ok(last().includes('уже активировали'), 'повторно тот же код не проходит', last().slice(0, 40));
+
+    const t2 = person(999003, 'tester_two');
+    await t2.say('/start');
+    await t2.say(codes[0]);
+    ok(last().includes('уже использован'), 'одноразовый код не работает у второго',
+      last().slice(0, 40));
+    ok(!bill.accessInfo(t2.row().id).active, 'доступ второму не выдан');
+
+    // Кнопка в меню подписки — для тех, кто не станет присылать код текстом.
+    await t2.tap('billing');
+    ok(Boolean(button('У меня есть код')), 'на экране подписки есть кнопка кода');
+    await t2.tap('promo');
+    ok(last().includes('PRV-'), 'бот показал, как выглядит код');
+    await t2.say('PRV-ZZZZ-ZZZZ');
+    ok(last().includes('Такого кода нет'), 'выдуманный код отклонён');
+    await t2.tap('promo');
+    await t2.say(codes[1]);
+    ok(bill.accessInfo(t2.row().id).active, 'второй код открыл доступ второму человеку');
+
+    // Один код на несколько активаций — для вебинара или чата с клиентами.
+    await ownerSay('/code 7 1x2 общий');
+    const shared = (last().match(CODE_RE) || [])[0];
+    ok(Boolean(shared) && last().includes('до 2 активаций'), 'создан код на две активации',
+      last().slice(0, 60));
+    const t3 = person(999004, 'tester_three');
+    const t4 = person(999005, 'tester_four');
+    await t3.say('/start'); await t3.say(shared);
+    await t4.say('/start'); await t4.say(shared);
+    ok(bill.accessInfo(t3.row().id).active && bill.accessInfo(t4.row().id).active,
+      'общий код сработал у обоих');
+    const t5 = person(999006, 'tester_five');
+    await t5.say('/start'); await t5.say(shared);
+    ok(!bill.accessInfo(t5.row().id).active, 'третьему общего кода не хватило');
+    ok(bill.accessInfo(t3.row().id).left <= 7, 'срок именно тот, что задали', bill.accessInfo(t3.row().id).left);
+
+    // Отключение кода: уже выданный доступ при этом не трогаем.
+    await ownerSay('/code 30 1 на отзыв');
+    const doomed = (last().match(CODE_RE) || [])[0];
+    await ownerSay(`/revoke ${doomed}`);
+    ok(last().includes('отключён'), 'код отключается');
+    const t6 = person(999007, 'tester_six');
+    await t6.say('/start'); await t6.say(doomed);
+    ok(last().includes('отключён') && !bill.accessInfo(t6.row().id).active,
+      'отключённый код не работает');
+
+    await ownerSay('/codes');
+    ok(last().includes('Коды доступа') && last().includes('tester_one'),
+      'в списке видно, кто активировал код', last().slice(0, 60));
+
+    // Снятие доступа — чтобы посмотреть на бота глазами неоплатившего.
+    await ownerSay(`/ungrant ${999002}`);
+    ok(!bill.accessInfo(t1.row().id).active, 'доступ снимается по номеру');
+    await ownerSay('/ungrant @tester_two');
+    ok(!bill.accessInfo(t2.row().id).active, 'доступ снимается по @имени');
+    await ownerSay('/ungrant @никого_нет');
+    ok(last().includes('Не нашёл'), 'неизвестное имя — понятный ответ');
+
+    // Свой номер человек узнаёт сам: без него владельцу нечего вводить.
+    await t1.say('/id');
+    ok(last().includes('999002'), 'команда /id показывает номер', last().slice(0, 30));
+
+    // Посторонний кодов не печатает.
+    delete process.env.SUPPORT_CHAT_ID;
+    const madeBefore = bill.listCodes(100).length;
+    await t1.say('/code 3650 50');
+    ok(bill.listCodes(100).length === madeBefore, 'посторонний не может выпустить себе коды');
+  }
+
+  delete process.env.LAVA_OFFER_URL;
+  delete process.env.LAVA_WEBHOOK_SECRET;
+  delete process.env.LAVA_PLAN_DAYS;
+
+  console.log('\n── поддержка и правовые страницы ──');
+  const legal = require('./lib/legal');
+  ok(legal.missing().length > 0, 'сборка правовых страниц требует заполнить реквизиты',
+    legal.missing().join(', '));
+  const pol = legal.buildPolicyHtml({ ...legal.CONFIG, inn: '1', ogrnip: '2', address: 'a',
+    email: 'x@y.z', botLink: 'https://t.me/x' });
+  ok(pol.includes('152') || pol.includes('персональных данных'), 'политика собирается');
+  ok(pol.includes('удаляется целиком') && pol.includes('отозвать согласие'),
+    'в политике есть удаление и отзыв согласия');
+  const of = legal.buildOfertaHtml({ ...legal.CONFIG, inn: '1', ogrnip: '2', address: 'a',
+    email: 'x@y.z', botLink: 'https://t.me/x' });
+  ok(of.includes('не оказывает бухгалтерских'), 'оферта прямо говорит, что это не бухгалтерия');
+  ok(of.includes('Ответственность за содержание'), 'ответственность за документ на пользователе');
+
+  /*
+   * Три дыры, которые нашлись при разборе правовой части.
+   *
+   * 1. Политика называла Telegram и сервис распознавания получателями, но ни
+   *    словом не говорила, что оба за границей, — то есть о трансграничной
+   *    передаче (ст. 12 152-ФЗ) человек узнавал ниоткуда.
+   * 2. Раздел про контрагентов говорил «действует по вашему поручению», а
+   *    самого поручения не содержал: по ч. 3 ст. 6 152-ФЗ в нём должны быть
+   *    перечень действий, цель и обязанность соблюдать конфиденциальность.
+   * 3. Оферта в описании страницы обещала рассказать, «как вернуть деньги», а
+   *    раздела о возврате не имела вовсе — и при этом уверяла, что Сервис
+   *    бесплатный, хотя подписку он уже продаёт.
+   */
+  // В вёрстке фразы переносятся, поэтому сравниваем по «схлопнутому» тексту.
+  const flatDoc = (h) => h.replace(/\s+/g, ' ');
+  const polFlat = flatDoc(pol);
+  const ofFlat = flatDoc(of);
+  ok(polFlat.includes('Трансграничная передача') && polFlat.includes('статья 12'),
+    'политика говорит о трансграничной передаче прямо');
+  ok(polFlat.includes('за пределами Российской Федерации'),
+    'и называет причину: получатели за границей');
+  ok(polFlat.includes('части 3 статьи 6') && polFlat.includes('Перечень действий')
+    && polFlat.includes('Цель:') && polFlat.includes('конфиденциальность'),
+    'поручение на обработку содержит то, чего требует закон');
+
+  ok(ofFlat.includes('Возврат денег') && ofFlat.includes('782'),
+    'в оферте есть раздел о возврате — тот самый, что обещан в описании страницы');
+  ok(ofFlat.includes('неиспользованных дней'),
+    'и сказано, что именно возвращается');
+  ok(!ofFlat.includes('Сервис предоставляется бесплатно'),
+    'а обещание вечной бесплатности убрано: подписку продают уже сейчас');
+  ok(ofFlat.includes('Действующие тарифы'), 'вместо него — куда смотреть цену');
+
+  // Нумерация разделов после вставки новых не должна разъезжаться: на них
+  // ссылаются и сами тексты, и человек в переписке.
+  for (const [doc, name] of [[pol, 'политика'], [of, 'оферта']]) {
+    // Цифру берём из группы, а не первую в куске: в «<h2>» она своя.
+    const nums = [...doc.matchAll(/<h2>(\d+)\./g)].map((m) => Number(m[1]));
+    const ok2 = nums.every((n, i) => n === i + 1);
+    ok(ok2 && nums.length >= 9, `разделы ${name} пронумерованы подряд`, nums.join(','));
+  }
+
+  process.env.SUPPORT_CHAT_ID = '999';
+  process.env.LEGAL_OFERTA_URL = 'https://example.test/oferta.html';
+  await tap('support');
+  ok(last().includes('Поддержка'), 'экран поддержки открывается');
+  ok(last().includes('оферту'), 'на экране есть ссылка на оферту');
+  await tap('sup.write');
+  ok(last().includes('Опишите'), 'бот ждёт текст обращения');
+  const beforeSup = sent.length;
+  await say('Не приходит счёт, кнопка не реагирует');
+  const forwarded = sent.slice(beforeSup).find((m) => m.text.includes('Обращение в поддержку'));
+  ok(Boolean(forwarded), 'обращение ушло владельцу');
+  ok(forwarded && forwarded.text.includes('Не приходит счёт'), 'текст обращения передан целиком');
+  ok(last().includes('Отправил'), 'пользователю подтвердили отправку');
+  delete process.env.SUPPORT_CHAT_ID;
+  await tap('support');
+  // Смотрим на кнопки, а не на текст: «Написать в поддержку» — надпись на
+  // кнопке, в тексте сообщения её не бывает, и прежняя проверка «текст её не
+  // содержит» проходила всегда.
+  const supKb = ((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.callback_data);
+  ok(!supKb.includes('sup.write'), 'без настройки бот не обещает того, чего не может',
+    supKb.join(' '));
+  delete process.env.LEGAL_OFERTA_URL;
+
+  console.log('\n── блокировка бота ──');
+  const blockErr = Object.assign(new Error('Forbidden: bot was blocked by the user'),
+    { code: 403, blocked: true });
+  const dead = { ...tg, sendMessage: async () => { throw blockErr; } };
+  await handleUpdate(dead, { message: { chat: CHAT, from: USER, text: '/start' } });
+  const bdb2 = require('./lib/bot-db');
+  const me = bdb2.getOrCreateUser(USER.id);
+  ok(bdb2.isBlocked(me.id), 'заблокировавший помечен в базе');
+  ok(!bdb2.reachableUsers().some((u) => u.tg_id === USER.id), 'в списке для рассылки его нет');
+  await say('/start');
+  ok(!bdb2.isBlocked(me.id), 'вернулся и написал — пометка снята');
+
+  console.log('\n── оформление бота ──');
+  const setup = require('./lib/bot-setup');
+  ok(setup.checkSetup().length === 0, 'тексты и команды укладываются в лимиты Telegram',
+    setup.checkSetup().join('; '));
+  ok(setup.SHORT.length <= 120 && setup.DESCRIPTION.length <= 512,
+    `короткое ${setup.SHORT.length}/120, полное ${setup.DESCRIPTION.length}/512`);
+  const menuCmds = setup.COMMANDS.map((c) => c.command);
+  ok(menuCmds.includes('start') && menuCmds.includes('help'), 'в меню есть /start и /help');
+
+  // каждая команда из меню должна что-то открывать, а не молчать
+  for (const c of menuCmds) {
+    if (c === 'cancel') continue;
+    const before = sent.length;
+    await say('/' + c);
+    ok(sent.length > before, `команда /${c} отвечает`);
+  }
+  // применение оформления: собираем вызовы, живой сети не нужно
+  const calls = [];
+  await setup.applySetup({ call: async (m, p) => { calls.push({ m, p }); } }, { log: () => {} });
+  ok(calls.map((c) => c.m).join(',')
+    === 'setMyName,setMyShortDescription,setMyDescription,setMyCommands,setChatMenuButton',
+    'оформление накатывается пятью вызовами', calls.map((c) => c.m).join(','));
+  // один упавший шаг не должен ронять остальные
+  let tries = 0;
+  const flaky = { call: async () => { tries += 1; if (tries === 1) throw new Error('Too Many Requests'); } };
+  const r = await setup.applySetup(flaky, { log: () => {} });
+  ok(tries === 5 && r.failed.length === 1, 'сбой на одном шаге не отменяет остальные', `${tries} вызовов`);
+
+  console.log('\n── вход в мини-приложение ──');
+  const { keyboard: kb } = require('./lib/tg');
+  const wa = kb([[{ text: 'Открыть', webApp: 'https://app.example.ru' }]]).reply_markup.inline_keyboard[0][0];
+  ok(wa.web_app && wa.web_app.url === 'https://app.example.ru' && !wa.callback_data,
+    'кнопка мини-приложения собирается как web_app', JSON.stringify(wa));
+
+  const keepUrl = process.env.WEBAPP_URL;
+  // Telegram открывает мини-приложения только по https: http-адрес не должен
+  // превращаться в кнопку, иначе она у всех выдаёт ошибку.
+  process.env.WEBAPP_URL = 'http://app.example.ru';
+  await say('/start');
+  ok(!JSON.stringify(sent[sent.length - 1].kb).includes('web_app'),
+    'по http кнопка приложения не появляется');
+
+  process.env.WEBAPP_URL = 'https://app.example.ru';
+  await say('/start');
+  ok(JSON.stringify(sent[sent.length - 1].kb).includes('https://app.example.ru'),
+    'по https кнопка приложения появляется в меню');
+
+  const menuCalls = [];
+  await setup.applySetup({ call: async (m, p) => { menuCalls.push({ m, p }); } }, { log: () => {} });
+  const btn = (menuCalls.find((c) => c.m === 'setChatMenuButton') || {}).p;
+  ok(btn && btn.menu_button.type === 'web_app' && btn.menu_button.web_app.url === 'https://app.example.ru',
+    'кнопка возле поля ввода ведёт в приложение', btn && btn.menu_button.type);
+
+  delete process.env.WEBAPP_URL;
+  const plainCalls = [];
+  await setup.applySetup({ call: async (m, p) => { plainCalls.push({ m, p }); } }, { log: () => {} });
+  const plainBtn = (plainCalls.find((c) => c.m === 'setChatMenuButton') || {}).p;
+  ok(plainBtn && plainBtn.menu_button.type === 'commands',
+    'без адреса приложения остаётся список команд', plainBtn && plainBtn.menu_button.type);
+  if (keepUrl) process.env.WEBAPP_URL = keepUrl;
+
+  console.log('\n── счёт-договор ──');
+  {
+    const bdb5 = require('./lib/bot-db');
+    const uid5 = fxUserId();
+    await tap(`cp:${cpId}`);
+    const sdBtn = button('Счёт-договор');
+    ok(Boolean(sdBtn), 'в карточке контрагента есть счёт-договор', sdBtn);
+
+    const beforeSd = files.length;
+    await tap(sdBtn);
+    await say('Фуршет на 40 персон; 1; 78000');
+    await tap('items.done');
+    await tap('doc.make');
+    ok(files.length === beforeSd + 1, 'счёт-договор выписан');
+    const sdFile = files[files.length - 1];
+    ok(sdFile.filename.startsWith('Счет-договор_'), 'имя файла говорит, что это за документ',
+      sdFile.filename);
+
+    const saved = bdb5.listDocs(uid5, 1)[0];
+    ok(saved.type === 'schdog' && saved.title === 'Счёт-договор',
+      'в журнале записан отдельный тип', `${saved.type} / ${saved.title}`);
+
+    // Своя нумерация: счёт-договор № 1 и счёт № 1 — разные документы,
+    // их ряды путать нельзя.
+    ok(saved.number === '1', 'нумерация у счёта-договора своя, с единицы', saved.number);
+    const schCount = bdb5.listDocs(uid5, 99).filter((d) => d.type === 'sch').length;
+    ok(schCount > 1, 'при этом обычных счетов уже несколько', schCount);
+
+    const html = require('./lib/schet-dogovor').buildSchetDogovorHtml({
+      org: bdb5.getDefaultOrg(uid5), cp: bdb5.getCp(uid5, cpId),
+      doc: { number: '1', date: '2026-08-15', items: [{ name: 'Услуга', qty: 1, price: 1000 }] },
+    });
+    ok(html.includes('акцепт оферты') && html.includes('438'),
+      'в документе есть оговорка об акцепте — без неё оплата договором не станет');
+    ok((html.match(/<img class="fx fx-sign/g) || []).length <= 1,
+      'факсимиле стоит только за нас — за заказчика расписываться нельзя');
+    ok(html.includes('Заказчик') && html.includes('подпись / расшифровка'),
+      'место для подписи заказчика оставлено');
+  }
+
+  console.log('\n── реестр документов ──');
+  {
+    const ExcelJS = require('exceljs');
+    const bdb4 = require('./lib/bot-db');
+    const uid4 = fxUserId();
+
+    await tap('docs');
+    ok(Boolean(button('Реестр за период')), 'в журнале есть кнопка реестра');
+    await tap('reg');
+    ok(last().includes('за какой период'), 'бот спрашивает период');
+
+    const beforeReg = files.length;
+    await tap('reg.p:year');
+    ok(files.length === beforeReg + 1, 'реестр пришёл файлом');
+    const regFile = files[files.length - 1];
+    ok(regFile.filename.startsWith('Реестр_') && regFile.filename.endsWith('.xlsx'),
+      'это Excel с говорящим именем', regFile.filename);
+    ok(regFile.caption.includes('Документов:'), 'в подписи есть количество и сумма',
+      regFile.caption.slice(0, 60));
+
+    // Файлы за период архивом: те же документы, что в реестре, — одним ZIP.
+    await tap('reg');
+    ok(Boolean(button('архивом')), 'рядом с реестром — «Файлы документов архивом»');
+    await tap('arch');
+    await tap('arch.p:quarter');
+    ok(Boolean(button('ТОРГ-12')), 'бот спрашивает, какие документы');
+    const beforeArch = files.length;
+    const quotaArch = require('./lib/bot-db').quota(fxUserId()).used;
+    await tap('arch.k:quarter:all');
+    // Архив собирается без ожидания (не держит бота) — даём ему дособраться.
+    for (let i = 0; i < 100 && files.length === beforeArch; i += 1) await new Promise((r) => setTimeout(r, 100));
+    const arch = files[files.length - 1] || {};
+    const inZip = arch.filename && arch.filename.endsWith('.zip')
+      ? [...require('./lib/zip').readZip(fs.readFileSync(path.join(OUT, arch.filename))).keys()] : [];
+    ok(files.length === beforeArch + 1 && inZip.length > 1 && inZip.every((n) => /\.(pdf|html|xlsx)$/.test(n)),
+      'архив пришёл, в нём файлы документов', `${arch.filename} ${inZip.length}: ${inZip.slice(0, 3).join(', ')}`);
+    ok(require('./lib/bot-db').quota(fxUserId()).used === quotaArch, 'архив не тратит бесплатный лимит');
+
+    /*
+     * Исправить под тем же номером и сменить номер. Случай владельца: в накладной
+     * ошибка — удалил, выписал заново, а она вышла № 22 вместо 7.
+     */
+    {
+      const bdbF = require('./lib/bot-db');
+      const uidF = fxUserId();
+      const src = bdbF.listDocs(uidF, 500).find((d) => d.type === 'sch' && !d.paid_at);
+      const srcNum = src.number;
+      const qF = bdbF.quota(uidF).used;
+      await tap(`doc:${src.id}`);
+      ok(Boolean(button('номер тот же')) && Boolean(button('Изменить номер')), 'у документа есть «Исправить» и «Изменить номер»');
+      await tap(`d.fix:${src.id}`);
+      const stF = bdbF.getState(uidF);
+      ok(stF && stF.data.replaceId === src.id && stF.data.number === String(srcNum), 'исправление открыто с прежним номером', stF && stF.state);
+      stF.data.items = [{ name: 'Исправленная позиция', unit: 'шт.', qty: 2, price: 1500 }];
+      bdbF.setState(uidF, stF.state, stF.data);
+      await tap('doc.make');
+      const same = bdbF.listDocs(uidF, 500).filter((d) => d.type === 'sch' && String(d.number) === String(srcNum));
+      ok(!bdbF.getDoc(uidF, src.id) && same.length === 1 && Number(same[0].total) === 3000,
+        'исправленный встал на место прежнего с тем же номером', `${same.length} ${same[0] && same[0].total}`);
+      ok(bdbF.quota(uidF).used === qF, 'исправление не тратит бесплатный лимит', `${qF} → ${bdbF.quota(uidF).used}`);
+      ok(/Исправлен прежний/.test((files[files.length - 1] || {}).caption || ''), 'в подписи сказано, что прежний заменён');
+
+      const fixed = same[0];
+      const other = bdbF.listDocs(uidF, 500).find((d) => d.type === 'sch' && d.id !== fixed.id);
+      await tap(`d.num:${fixed.id}`);
+      await say(String(other.number));
+      ok(/уже есть/.test(last()) && bdbF.getDoc(uidF, fixed.id).number === String(srcNum), 'занятый номер не даётся', last());
+      await say('7777');
+      ok(bdbF.getDoc(uidF, fixed.id).number === '7777' && /стало/.test((files[files.length - 1] || {}).caption || ''),
+        'номер изменён, файл пришёл с новым номером', bdbF.getDoc(uidF, fixed.id).number);
+      const opF = bdbF.opsOfDoc ? bdbF.opsOfDoc(uidF, fixed.id) : [];
+      ok(!opF.length || opF.every((o) => !o.doc || o.doc.includes('7777')), 'и в журнале операций номер новый', JSON.stringify(opF.map((o) => o.doc)));
+    }
+
+    /*
+     * Основание накладных и подсказки позиций — по клиенту.
+     * Владелец: одно и то же основание в накладную вписывается раз за разом;
+     * на ТОРГ-12 предлагались позиции из чужих счетов (канапе, брускетта), а
+     * свои — нет.
+     */
+    {
+      const bdbB = require('./lib/bot-db');
+      const uidB = fxUserId();
+      const cpB = bdbB.createCp(uidB, { name: 'ООО Основание', kind: 'customer', opening_date: '2026-01-01' });
+      const cpOther = bdbB.createCp(uidB, { name: 'ООО Соседи', kind: 'customer', opening_date: '2026-01-01' });
+      const BASIS = 'Договор № 12 от 01.03.2026';
+      const docSvc = require('./lib/doc-service');
+      const mkT = (cp, extra, items = [{ name: 'Обед', unit: 'чел.', qty: 5, price: 450 }], type = 'torg12') =>
+        docSvc.issueDocument(uidB, { type, cpId: cp, items, date: '2026-10-05', skipQuota: true, extra });
+      let r1 = await mkT(cpB, { basis: BASIS });
+      let r2 = await mkT(cpB, { basis: '  договор №  12 от 01.03.2026 ' });
+      ok(!r1.basisLearned && !r2.basisLearned && bdbB.basisFor(uidB, cpB) === '', 'после двух вводов основание ещё не запоминается');
+      const r3 = await mkT(cpB, { basis: BASIS });
+      ok(r3.basisLearned === BASIS && bdbB.basisFor(uidB, cpB) === BASIS, 'в третий раз запоминается за клиентом', r3.basisLearned);
+      ok(bdbB.basisFor(uidB, cpOther) === '', 'другому клиенту оно не достаётся');
+      const r4 = await mkT(cpB, {});
+      ok(bdbB.getDoc(uidB, r4.doc.id).payload.basis === BASIS, 'не вписали основание — подставилось запомненное');
+      const r5 = await mkT(cpB, { basis: 'Заказ-наряд № 5' });
+      ok(bdbB.getDoc(uidB, r5.doc.id).payload.basis === 'Заказ-наряд № 5' && bdbB.basisFor(uidB, cpB) === BASIS,
+        'вписали другое — печатается оно, запомненное не сбито');
+      const r6 = await mkT(cpOther, {});
+      ok(!bdbB.getDoc(uidB, r6.doc.id).payload.basis, 'у клиента без запомненного основания поле пустое, как раньше');
+
+      // Подсказки позиций: накладная клиента видит свои позиции из накладных, не из счетов.
+      await mkT(cpB, {}, [{ name: 'Канапе ассорти', unit: 'шт.', qty: 20, price: 650 }, { name: 'Брускетта', unit: 'шт.', qty: 15, price: 780 }], 'sch');
+      const sugT = bdbB.suggestItems(uidB, cpB, 'torg12', 6);
+      ok(sugT.length === 1 && sugT[0].name === 'Обед' && sugT[0].price === 450,
+        'на накладную — только то, что выписывали этому клиенту в накладных', JSON.stringify(sugT.map((x) => x.name)));
+      const sugS = bdbB.suggestItems(uidB, cpB, 'sch', 6);
+      ok(sugS.length === 2 && sugS[0].name === 'Канапе ассорти', 'на счёт — позиции из его счетов', JSON.stringify(sugS.map((x) => x.name)));
+      const cpFresh = bdbB.createCp(uidB, { name: 'ООО Новичок', kind: 'customer', opening_date: '2026-01-01' });
+      const sugNew = bdbB.suggestItems(uidB, cpFresh, 'torg12', 6);
+      ok(sugNew.length >= 1 && sugNew.every((x) => x.tplId), 'у клиента без истории — общие частые, как раньше');
+      bdbB.hideItem(uidB, cpB, 'Обед');
+      ok(!bdbB.suggestItems(uidB, cpB, 'torg12', 6).some((x) => x.name === 'Обед'), 'убранная подсказка не предлагается');
+      ok(bdbB.suggestItems(uidB, cpB, 'torg12', 6).length === 0, 'убрали последнюю — пусто, а не общий список с лишним');
+      await mkT(cpB, {});
+      ok(bdbB.suggestItems(uidB, cpB, 'torg12', 6).some((x) => x.name === 'Обед'), 'а выписал снова — подсказка вернулась');
+
+      // Кнопки в боте: подсказка по клиенту, а не общий список.
+      await tap(`d.torg12:${cpB}`);
+      ok(Boolean(button('Обед')) && !button('Канапе') , 'в боте на ТОРГ-12 клиента кнопка «Обед» без канапе', last());
+      await tap(button('Обед'));
+      ok(/Сколько\?/.test(last()) && /450/.test(last()), 'нажатие подсказки спрашивает количество, цена — клиентская', last());
+      await say('7');
+      const stB = bdbB.getState(uidB);
+      ok(stB && stB.data.items.length === 1 && stB.data.items[0].qty === 7 && stB.data.items[0].price === 450, 'позиция добавлена: 7 × 450');
+      await tap('ci.hide');
+      ok(Boolean(button('Обед')) && /Какую позицию убрать/.test(last()), 'можно убрать лишнюю подсказку кнопкой');
+      // Нажатие по метке, а не по номеру: порядок подсказок меняется, позиция та же.
+      const hideTag = button('Обед');
+      ok(/^ci\.x:[0-9a-f]{6}$/.test(hideTag), 'кнопка «убрать» несёт метку позиции, а не номер', hideTag);
+      await tap('menu');
+
+      // Связи основания: сброс не отменяется повтором, замена не «вводит» основание,
+      // основание принадлежит паре «фирма — клиент», расписание берёт новое.
+      {
+        const cpR = bdbB.createCp(uidB, { name: 'ООО Связи', kind: 'customer', opening_date: '2026-01-01' });
+        const X = 'Договор № 1 от 01.01.2026';
+        for (let i = 0; i < 3; i += 1) await mkT(cpR, { basis: X });
+        ok(bdbB.basisFor(uidB, cpR) === X, 'связи: основание запомнено');
+        bdbB.setBasisFor(uidB, cpR, '');
+        const rep1 = await mkT(cpR, { basis: X });   // повтор старой накладной несёт прежнее основание
+        ok(bdbB.basisFor(uidB, cpR) === '' && !rep1.basisLearned, 'после сброса повтор старой накладной основание не возвращает');
+        for (let i = 0; i < 2; i += 1) await mkT(cpR, { basis: X });
+        ok(bdbB.basisFor(uidB, cpR) === X, 'а три новых с тем же — запоминают заново');
+        const old = bdbB.basisDocs(uidB, cpR).slice(-1)[0];
+        const replaced = await docSvc.replaceDocument(uidB, old.id, { items: [{ name: 'Обед', unit: 'чел.', qty: 1, price: 100 }], extra: { basis: 'Другое' } });
+        ok(replaced.ok && !replaced.basisLearned, 'исправление документа основание не запоминает');
+        bdbB.setBasisFor(uidB, cpR, 'Фирма А', 901);
+        ok(bdbB.basisFor(uidB, cpR, 901) === 'Фирма А' && bdbB.basisFor(uidB, cpR, 902) === '', 'основание принадлежит паре «фирма — клиент»');
+        const rec = require('./lib/recurring');
+        const ruleId = rec.add(uidB, { cpId: cpR, type: 'torg12', items: [{ name: 'Обед', unit: 'чел.', qty: 1, price: 100 }], extra: { basis: X }, day: 5 });
+        bdbB.applyBasisToRules(uidB, cpR, 'Новое для расписания');
+        ok((rec.get(uidB, ruleId) || {}).extra.basis === 'Новое для расписания', 'расписание накладных получило новое основание');
+        bdbB.applyBasisToRules(uidB, cpR, '');
+        ok(!(rec.get(uidB, ruleId) || {}).extra.basis, 'а при сбросе — потеряло его');
+      }
+
+      // Основание всем накладным клиента: только надпись, суммы и долг не меняются.
+      const before = bdbB.basisDocs(uidB, cpB);
+      const balB = bdbB.balanceOf(uidB, cpB).closing;
+      await tap(`cb:${cpB}`);
+      ok(/Подставляю/.test(last()) && Boolean(button('Задать основание')), 'карточка основания: что подставляется и как задать', last());
+      await tap(`cb.set:${cpB}`);
+      await say('Договор № 99 от 15.10.2026');
+      ok(Boolean(button('Всем выписанным')), 'бот спрашивает, к каким накладным применить', last());
+      const filesBeforeZ = files.length;
+      await tap(`cb.all:${cpB}`);
+      for (let i = 0; i < 100 && files.length === filesBeforeZ; i += 1) await new Promise((r) => setTimeout(r, 100));
+      const after = bdbB.basisDocs(uidB, cpB);
+      ok(after.length === before.length && after.every((d) => d.basis === 'Договор № 99 от 15.10.2026'),
+        'основание стоит у всех накладных и УПД клиента', JSON.stringify(after.map((d) => d.basis)));
+      ok(bdbB.basisFor(uidB, cpB) === 'Договор № 99 от 15.10.2026', 'и запомнено для новых');
+      ok(bdbB.balanceOf(uidB, cpB).closing === balB, 'долг не изменился');
+      const zB = files[files.length - 1] || {};
+      ok(/\.zip$/.test(zB.filename || ''), 'исправленные файлы пришли архивом', zB.filename);
+    }
+
+    // Читаем файл обратно: важно, что суммы — числа, а не текст,
+    // иначе реестр не складывается и им нельзя пользоваться.
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(path.join(OUT, regFile.filename));
+    const sheet = wb.getWorksheet('Реестр');
+    ok(Boolean(sheet), 'лист «Реестр» на месте');
+    ok(sheet.getCell('A5').value === 'Дата' && sheet.getCell('G5').value === 'Всего',
+      'шапка таблицы на месте');
+    ok(typeof sheet.getCell('G6').value === 'number', 'суммы записаны числами, а не строками',
+      typeof sheet.getCell('G6').value);
+    const totalCell = sheet.getCell(`G${sheet.rowCount}`).value;
+    ok(totalCell && totalCell.formula && totalCell.formula.startsWith('SUM('),
+      'итог — живая формула, пересчитается после фильтрации',
+      totalCell && totalCell.formula);
+    ok(Boolean(sheet.autoFilter), 'включён автофильтр для сортировки');
+
+    const yearDocs = bdb4.docsBetween(uid4, '2026-01-01', '2026-12-31');
+    ok(yearDocs.length > 0 && yearDocs.every((d) => 'cpName' in d),
+      'в выборку попали документы с именами контрагентов', yearDocs.length);
+    const other = bdb4.docsBetween(uid4, '2020-01-01', '2020-12-31');
+    ok(other.length === 0, 'за пустой период документов нет');
+
+    /*
+     * Аванс и корректировочный раскладываются по графам, а не валятся в «Без
+     * НДС» целиком.
+     *
+     * У них нет позиций, и общий на всех vatTotals(items) отдавал нули: графа
+     * «Без НДС» падала на запасной total, а в графе НДС печатался прочерк.
+     * Предоплата в 100 000 попадала в реестр как 100 000 без налога, хотя по
+     * расчётной ставке 22/122 внутри неё 18 032,79. Этим файлом закрывают
+     * месяц и сверяются с декларацией — база завышалась на весь налог.
+     */
+    const { buildRegistry } = require('./lib/xlsx-registry');
+    const { round2: r2 } = require('./lib/money');
+    const flat = [
+      { type: 'avans', date: '2026-09-01', number: '5', title: 'Счёт-фактура на аванс',
+        cpName: 'ООО «Заря»', total: 100000,
+        payload: { sum: 100000, vatRate: 22, payDoc: '№ 1 от 01.09.2026' } },
+      { type: 'ksf', date: '2026-09-02', number: '2', title: 'Корректировочный',
+        cpName: 'ООО «Заря»', total: 12200,
+        payload: { vatRate: 22, priceIncludesVat: false,
+          lines: [{ before: { qty: 1, price: 10000 }, after: { qty: 1, price: 20000 } }] } },
+    ];
+    const wbF = new ExcelJS.Workbook();
+    await wbF.xlsx.load(await buildRegistry({
+      org: { name: 'ООО «Тест»' }, docs: flat, from: '2026-09-01', to: '2026-09-30',
+    }));
+    const sf = wbF.getWorksheet('Реестр');
+    const cell = (row, c) => sf.getRow(row).getCell(c).value;
+    ok(cell(6, 5) === 81967.21 && cell(6, 6) === 18032.79,
+      'налог в авансе берётся по расчётной ставке, а не теряется',
+      `${cell(6, 5)} + ${cell(6, 6)}`);
+    ok(cell(7, 5) === 10000 && cell(7, 6) === 2200,
+      'корректировочный тоже разложен, а не показан одним числом',
+      `${cell(7, 5)} + ${cell(7, 6)}`);
+    // Без этого равенства реестром нельзя сверяться: столбцы не сойдутся.
+    for (const rw of [6, 7]) {
+      ok(r2(cell(rw, 5) + cell(rw, 6)) === cell(rw, 7),
+        `строка ${rw}: «Без НДС» и «НДС» дают «Всего»`,
+        `${cell(rw, 5)} + ${cell(rw, 6)} ≠ ${cell(rw, 7)}`);
+    }
+  }
+
+  console.log('\n── путь новичка: от «Старт» до файла ──');
+  {
+    // Человек, который ничего не знает и ничего не заполнял заранее. Он
+    // должен получить документ, ни разу не догадавшись, где что лежит.
+    const N = { id: 979001, first_name: 'Новичок' };
+    const nSay = (t) => handleUpdate(tg, { message: { chat: { id: N.id }, from: N, text: t } });
+    const nTap = (d) => handleUpdate(tg,
+      { callback_query: { id: 'c', from: N, data: d, message: { chat: { id: N.id } } } });
+    const nLast = () => (sent[sent.length - 1] || {}).text || '';
+    /** Кнопка ищется только в последнем сообщении — как её видит человек. */
+    const nBtn = (sub) => {
+      const m = sent[sent.length - 1] || { kb: [] };
+      for (const row of m.kb) for (const b of row) if (b.text.includes(sub)) return b.callback_data;
+      return null;
+    };
+    const filesWas = files.length;
+
+    await nSay('/start');
+    ok(nBtn('Выписать счёт') === 'go.sch', 'на первом экране есть кнопка «Выписать счёт»');
+
+    await nTap('go.sch');
+    ok(nLast().includes('Ваш ИНН') && nLast().includes('Шаг 1 из 4'),
+      'проводник спрашивает ИНН первым и показывает, сколько шагов', nLast().slice(0, 40));
+    ok(nBtn('Отмена'), 'из формы есть выход');
+
+    /*
+     * Д29: просьба из приветствия на шаге «Ваш ИНН» — не реквизиты и не ИНН.
+     * Приветствие советует написать «Выставь счёт ООО Заря на 50 000 руб», и
+     * новичок так и делает — на первом же вопросе формы.
+     */
+    const askedAt = sent.length;
+    await nSay('Выставь счёт ООО Заря на 50 000 руб за оказание услуг');
+    const askedSaid = sent.slice(askedAt).map((m) => m.text || '').join('\n');
+    ok(askedSaid.includes('Сначала закончим реквизиты, потом выпишем счёт'),
+      'Д29: фраза-просьба на шаге ИНН — «сначала закончим реквизиты»', askedSaid.slice(0, 120));
+    ok(!askedSaid.includes('Разобрал реквизиты') && !askedSaid.includes('В ИНН должно быть'),
+      'Д29: фраза не принята ни за блок реквизитов, ни за ИНН', askedSaid.slice(0, 120));
+    ok(nLast().includes('Ваш ИНН') && nLast().includes('Шаг 1 из 4'),
+      'Д29: вопрос про ИНН повторён тем же шагом', nLast().slice(0, 40));
+
+    // Реестр не подключён (в прогоне ключа нет) — тогда, и только тогда, название спрашиваем сами.
+    await nTap(nBtn('Пропустить'));
+    ok(nLast().includes('Как называется ваша'), 'реестр не ответил — спросили название', nLast().slice(0, 40));
+    await nSay('ИП Петров П. П.');
+    ok(Boolean(nBtn('Пропустить')), 'необязательное поле можно пропустить кнопкой');
+    // Каждый раз читаем кнопку заново — как человек, который жмёт последнюю.
+    const nSkip = async () => { const b = nBtn('Пропустить'); if (b) await nTap(b); return b; };
+    await nSkip(); await nSkip();
+    ok(nLast().includes('ИНН клиента'), 'дошли до анкеты клиента', nLast().slice(0, 30));
+
+    // Сообщения в чате остаются, и кнопка из прошлого вопроса живёт вечно.
+    // Нажатие на неё не должно пропускать текущее — тем более обязательное.
+    const stale = await nSkip();                       // пропустили ИНН клиента
+    ok(nLast().includes('Как называется клиент'), 'спросили имя клиента');
+    await nTap(stale);
+    ok(nLast().includes('Как называется клиент'),
+      'старой кнопкой обязательное поле не пропускается', nLast().slice(0, 30));
+
+    await nSay('ООО Ромашка');
+    await nTap('fb:customer');
+    ok(nLast().includes('Счёт на оплату'), 'сразу перешли к позициям счёта', nLast().slice(0, 30));
+
+    await nSay('Ремонт компьютера 1 3500');
+    await nTap('doc.make');
+    ok(files.length === filesWas + 1, 'новичок получил файл', files.length - filesWas);
+    const caption = (files[files.length - 1] || {}).caption || '';
+    ok(caption.includes('нет реквизитов для оплаты'),
+      'бот честно предупредил, что платить некуда', caption.slice(-60));
+    ok(!caption.includes('есть QR'), 'и не обещал QR, которого нет');
+    ok(sent.some((m) => (m.text || '').includes('Что дальше')),
+      'после файла показан короткий выбор, а не стена кнопок');
+    ok(nLast().includes('Чем занимаетесь'),
+      'после первого документа спросили про дело, а не про основание долга',
+      nLast().slice(0, 40));
+
+    // Д4: в «Что дальше» — оплата, а не только «выписать ещё».
+    const next1 = [...sent].reverse().find((m) => (m.text || '').includes('Что дальше'));
+    ok(next1 && buttonIn(next1, 'Отметить оплату'), 'Д4: после выписки есть кнопка «Отметить оплату»');
+
+    // Д4: вопрос «чем занимаетесь» — один раз за всё время. Человек ответа не дал —
+    // второй документ его не возвращает.
+    const uidN = require('./lib/bot-db').getOrCreateUser(N.id).id;
+    const cpN = require('./lib/bot-db').listCps(uidN)[0].id;
+    const mark2 = sent.length;
+    await nTap(`d.sch:${cpN}`);
+    await nSay('Ремонт принтера 1 2000');
+    await nTap('doc.make');
+    ok(sent.slice(mark2).some((m) => (m.text || '').includes('Что дальше')), 'второй документ выписан');
+    ok(!sent.slice(mark2).some((m) => (m.text || '').includes('Чем занимаетесь')),
+      'Д4: про дело второй раз не спрашиваем', nLast().slice(0, 40));
+
+    // Д29: длинное приветствие — только новому. У вернувшегося — одна строка и кнопки.
+    await nSay('/start');
+    ok(nLast().includes('С возвращением') && !nLast().includes('Первые 5 документов'),
+      'Д29: вернувшемуся — короткое приветствие, без оферты и рекламы', nLast().slice(0, 60));
+    ok(Boolean(nBtn('Выписать счёт')), 'и кнопки меню на месте');
+  }
+
+  console.log('\n── выпуск одним нажатием: «Сформировать — итог» ──');
+  {
+    // Раньше после позиции было «Готово», потом «Сформировать». Теперь итог и
+    // выпуск — на одной кнопке; сводка с номером/датой/НДС осталась рядом.
+    const lastKb = () => ((sent[sent.length - 1] || {}).kb || []).flat();
+    for (const type of ['sch', 'usl', 'torg12', 'upd']) {
+      const before = files.length;
+      await tap(`d.${type}:${cpId}`);
+      if (type === 'upd') await tap(`upd.s2:${cpId}`);   // у УПД сначала спрашивают статус
+      ok(!lastKb().some((b) => b.callback_data === 'doc.make'), `${type}: пока нет позиций, кнопки выпуска нет`);
+      await say('Ремонт 2 по 1500');
+      const make = lastKb().find((b) => b.callback_data === 'doc.make');
+      ok(make && make.text.includes('Сформировать') && /3\s?000/.test(make.text),
+        `${type}: после позиции сразу кнопка с итогом`, make && make.text);
+      ok(lastKb().some((b) => b.callback_data === 'items.done') && lastKb().some((b) => b.callback_data === 'menu'),
+        `${type}: сводка и отмена остались рядом`);
+      await tap('doc.make');
+      ok(files.length === before + 1, `${type}: файл пришёл с одного нажатия`, files.length - before);
+    }
+  }
+
+  console.log('\n── просьба посреди набора позиций ──');
+  {
+    // «выставь счёт ООО Заря на 50 000» посреди набора — просьба, а не позиция.
+    const { looksLikeRequest } = require('./bot');
+    const cpsR = require('./lib/bot-db').listCps(fxUserId());
+    ok(looksLikeRequest('выставь счёт ООО Заря на 50000', cpsR), 'просьба с клиентом узнаётся');
+    ok(looksLikeRequest('Акт Заре на 30 тысяч', cpsR), 'и без «ООО» — по списку клиентов');
+    ok(!looksLikeRequest('Акт приёмки 1 3000', cpsR), 'позиция с «акт» в начале остаётся позицией');
+    ok(!looksLikeRequest('Монтаж 1 30000', cpsR), 'обычная позиция — не просьба');
+
+    await tap(`d.sch:${cpId}`);
+    await say('Ремонт 1 1000');
+    const withTail = sent.length;
+    await say('выставь счёт ООО Заря на 50000');
+    const st = require('./lib/bot-db').getState(fxUserId());
+    const d = st.data || {};
+    ok(!(d.items || []).some((it) => /выстав/i.test(it.name)),
+      'фраза не стала названием позиции', JSON.stringify((d.items || []).map((it) => it.name)));
+    ok(sent.length > withTail, 'бот ответил на просьбу');
+    require('./lib/bot-db').clearState(fxUserId());
+  }
+
+  console.log('\n── непонятная фраза: не тупик ──');
+  {
+    require('./lib/bot-db').clearState(fxUserId());
+    await say('помощь');
+    ok(last().includes('кто мне должен') && !last().includes('Выберите действие'),
+      'на «помощь» бот подсказывает, что сказать', last().slice(0, 60));
+    const kbU = ((sent[sent.length - 1] || {}).kb || []).flat();
+    ok(kbU.length > 0, 'и показывает кнопки меню');
+    ok(!sent.slice(-3).some((m) => (m.text || '').includes('Выберите действие')), 'старого «Выберите действие» нет');
+    // Сам тупик (разбор вернул «не знаю»): подсказка с примерами и кнопки меню.
+    const aiU = require('./lib/ai-agent');
+    const wasU = aiU.understand;
+    aiU.understand = async () => ({ action: 'unknown', source: 'model' });
+    try { await say('фывапролдж'); } finally { aiU.understand = wasU; }
+    ok(last().includes('Не понял. Попробуйте') && last().includes('счёт Заре на 30 000'),
+      'на непонятное — «Не понял» с примерами', last().slice(0, 60));
+  }
+
+  console.log('\n── проводник: реестр ответил по ИНН ──');
+  {
+    // Если реестр знает ИНН, название не спрашиваем — человек его не печатает.
+    const R = { id: 979002, first_name: 'Реестр' };
+    const rSay = (t) => handleUpdate(tg, { message: { chat: { id: R.id }, from: R, text: t } });
+    const rTap = (d) => handleUpdate(tg,
+      { callback_query: { id: 'c', from: R, data: d, message: { chat: { id: R.id } } } });
+    const rLast = () => (sent[sent.length - 1] || {}).text || '';
+    process.env.DADATA_MOCK = JSON.stringify({
+      183114389446: {
+        type: 'INDIVIDUAL',
+        name: { full_with_opf: 'Индивидуальный предприниматель Тестов Тест Тестович' },
+        inn: '183114389446', ogrn: '318183200012345',
+        address: { value: 'г Ижевск, ул Тестовая, д 1' },
+        fio: { surname: 'Тестов', name: 'Тест', patronymic: 'Тестович' },
+        state: { status: 'ACTIVE' },
+      },
+    });
+    await rSay('/start');
+    await rTap('go.sch');
+    await rSay('183114389446');
+    delete process.env.DADATA_MOCK;
+    ok(rLast().includes('БИК'), 'название из реестра подставлено — про него не спросили', rLast().slice(0, 40));
+    ok(!rLast().includes('Как называется ваша'), 'вопроса про название нет');
+  }
+
+  console.log('\n── платёжный QR: длина строки ──');
+  {
+    /*
+     * По ГОСТ Р 56042 строка платежа — не длиннее 300 байт. Мы про это знали
+     * и даже написали в комментарии «влезает с запасом», а не мерили ни разу:
+     * обычное ООО с полным наименованием и банк с полным наименованием давали
+     * 493 байта. Кириллица в UTF-8 — два байта на букву, запаса нет вовсе.
+     *
+     * Ужимаемся по очереди: сначала имя плательщика (он и так знает, кто он),
+     * потом КПП (платёж идёт по счёту и БИК), потом полное наименование
+     * получателя меняем на короткое, потом форму пишем сокращением. Назначение
+     * не режем никогда: обрезанное «Оплата по счёту № 148 от 03.09.20» —
+     * платёж, который получатель не разнесёт, то есть ровно та работа, ради
+     * которой всё затевалось.
+     */
+    const { payString } = require('./lib/qr-pay');
+    const size = (s) => Buffer.byteLength(s, 'utf8');
+    const bank = {
+      acc: '40702810900000012344', bik: '044525225', corr_acc: '30101810145250000411',
+      inn: '7707083893', kpp: '773601001',
+    };
+
+    const small = payString({
+      org: { ...bank, full_name: 'ИП Иванов И. И.', bank_name: 'АО «ТБанк»' },
+      sum: 50000, purpose: 'Оплата по счёту № 4', payer: 'ООО «Заря»',
+    });
+    ok(size(small) <= 300, 'короткая строка укладывается в предел ГОСТ', `${size(small)} байт`);
+    ok(small.includes('PayerName=ООО «Заря»'),
+      'и имя плательщика в ней остаётся — место есть');
+
+    const big = {
+      ...bank,
+      name: 'ООО «Ромашка-Инжиниринг Плюс»',
+      full_name: 'Общество с ограниченной ответственностью «Ромашка-Инжиниринг Плюс»',
+      bank_name: 'Филиал «Центральный» Публичного акционерного общества «Совкомбанк»',
+    };
+    const long = payString({
+      org: big, sum: 152300.55,
+      purpose: 'Оплата по счёту № 148 от 03.09.2026',
+      payer: 'Общество с ограниченной ответственностью «Заря-Ижевск»',
+    });
+    ok(!long.includes('PayerName='), 'при нехватке места имя плательщика уходит первым');
+    ok(!long.includes('KPP='), 'следом КПП');
+    ok(long.includes('Name=ООО «Ромашка-Инжиниринг Плюс»'),
+      'полное наименование меняется на короткое', (long.match(/Name=[^|]*/) || [])[0]);
+    ok(long.includes('ПАО «Совкомбанк»') && !long.includes('Публичного акционерного'),
+      'а форма в названии банка пишется сокращением — иначе его не укоротить',
+      (long.match(/BankName=[^|]*/) || [])[0]);
+    ok(long.includes('Purpose=Оплата по счёту № 148 от 03.09.2026'),
+      'назначение при этом целое, ни одной буквы не срезано',
+      (long.match(/Purpose=[^|]*/) || [])[0]);
+    ok(size(long) < 400, 'и строка стала заметно короче', `${size(long)} байт вместо 493`);
+
+    // Обязательные поля не выбрасываются никогда: без них банк строку не примет.
+    for (const k of ['Name=', 'PersonalAcc=', 'BankName=', 'BIC=', 'CorrespAcc=']) {
+      ok(long.includes(k), `обязательное поле ${k.slice(0, -1)} на месте`);
+    }
+  }
+
+  console.log('\n── помощь и другой документ ──');
+  {
+    await say('/start');
+    await tap('help');
+    ok(last().includes('Выписать счёт'), 'помощь ведёт в wizard, а не в 1С-путь');
+    ok(!last().includes('15.06 приход'), 'старый путь с операциями из help убран');
+    ok(last().includes('бесплатных') || last().includes('выписано'), 'в помощи виден лимит');
+
+    await tap('go.any');
+    const lastKb = ((sent[sent.length - 1] || {}).kb || [])
+      .flat().map((b) => b.text).join('|');
+    ok(lastKb.includes('Договор'), 'в «Другой документ» есть договор', lastKb);
+    ok(lastKb.includes('Платёжка'), 'есть платёжка', lastKb);
+    ok(lastKb.includes('сверки') || lastKb.includes('Сверки'), 'есть акт сверки', lastKb);
+  }
+
+  console.log('\n── подписи: ИП и организация ──');
+  {
+    const { buildSchetHtml } = require('./lib/schet');
+    const { buildUpdHtml } = require('./lib/upd');
+    const { signRows, isIp } = require('./lib/doc-html');
+
+    // Различаем по длине ИНН: у ИП он двенадцатизначный, у организации — из десяти.
+    ok(isIp({ inn: '183114389446' }) === true, 'ИНН из 12 цифр — это предприниматель');
+    ok(isIp({ inn: '7707083893' }) === false, 'ИНН из 10 цифр — организация');
+    ok(isIp({}) === false, 'без ИНН считаем организацией');
+    ok(signRows({ inn: '183114389446', signer: 'И. Н. Сарычев' }).length === 1,
+      'у предпринимателя одна строка подписи');
+    ok(signRows({ inn: '7707083893', signer: 'И. Иванов' }).length === 2,
+      'у организации две: руководитель и бухгалтер');
+
+    const ipOrg = {
+      name: 'ИП Сарычев И. Н.', inn: '183114389446', signer: 'И.Н. Сарычев',
+      bank_name: 'Сбербанк', bik: '049401601', acc: '40802810668000008020',
+      corr_acc: '30101810400000000601',
+    };
+    const ooo = { ...ipOrg, name: 'ООО «Ромашка»', inn: '7707083893' };
+    const cp = { name: 'ООО «Инженер-Д»', inn: '1800047200' };
+    const doc = { number: '1', date: '2026-08-17', items: [{ name: 'Аренда', qty: 1, price: 125000 }] };
+
+    const ipHtml = buildSchetHtml({ org: ipOrg, cp, doc });
+    ok(ipHtml.includes('Индивидуальный предприниматель'), 'в счёте ИП подпись названа верно');
+    ok(!ipHtml.includes('>Руководитель<') && !ipHtml.includes('Бухгалтер'),
+      'у ИП в счёте нет ни руководителя, ни бухгалтера — таких должностей у него не бывает');
+
+    const oooHtml = buildSchetHtml({ org: ooo, cp, doc });
+    ok(oooHtml.includes('Руководитель') && oooHtml.includes('Бухгалтер'),
+      'у организации подписи на месте');
+    ok(!oooHtml.includes('Индивидуальный предприниматель'), 'и лишней строки ИП нет');
+
+    // УПД: бланк 1137 содержит все три строки, но заполняется одна.
+    const updIp = buildUpdHtml({ org: ipOrg, cp, doc: { ...doc, status: 1, vatRate: 20 } });
+    // Берём ровно одну строку подписи: окно «столько-то символов от
+    // заголовка» перехлёстывало на соседнюю и находило имя не там.
+    const line = (html, title) => {
+      const i = html.indexOf(title);
+      if (i < 0) return '';
+      const end = html.indexOf('</div>', html.indexOf('<div class="line">', i));
+      return html.slice(i, end < 0 ? i : end);
+    };
+    ok(!line(updIp, 'Руководитель организации').includes('Сарычев'),
+      'в УПД предприниматель не подписывается за руководителя организации');
+    ok(line(updIp, 'Индивидуальный предприниматель или иное').includes('Сарычев'),
+      'он подписывается в своей строке');
+    const updOoo = buildUpdHtml({ org: ooo, cp, doc: { ...doc, status: 1, vatRate: 20 } });
+    ok(line(updOoo, 'Руководитель организации').includes('Сарычев'),
+      'у организации подпись стоит у руководителя');
+    ok(!line(updOoo, 'Индивидуальный предприниматель или иное').includes('Сарычев'),
+      'и не дублируется в строке ИП');
+    // Имя директора в строке бухгалтера утверждало, что учёт ведёт он сам, —
+    // а этого мы не знаем. Строка остаётся под подпись от руки.
+    ok(!line(updOoo, 'Главный бухгалтер').includes('Сарычев'),
+      'в строке главного бухгалтера УПД не печатается директор', line(updOoo, 'Главный бухгалтер'));
+    ok(!line(oooHtml, 'Бухгалтер').includes('Сарычев'),
+      'и в счёте строка бухгалтера пустая', line(oooHtml, 'Бухгалтер'));
+
+    /*
+     * Строка 5а «Документ об отгрузке».
+     *
+     * В бланке она с 1 июля 2021 года (постановление Правительства № 534 от
+     * 02.04.2021, меняющее № 1137), а мы её не печатали вовсе — то есть форма
+     * не соблюдена. Придираться будет не наш пользователь, а инспекция его
+     * покупателя, когда тот заявит вычет. У УПД строка заполняется им же
+     * самим: документ об отгрузке и есть этот бланк, отдельной накладной к
+     * нему не бывает (письмо ФНС от 17.06.2021 № ЗГ-3-3/4368@).
+     */
+    ok(updOoo.includes('Документ об отгрузке') && updOoo.includes('(5а)'),
+      'строка 5а в бланке УПД есть');
+    const flat5a = (html) => (html.match(/Документ об отгрузке[\s\S]{0,200}/) || [''])[0]
+      .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+    ok(flat5a(updOoo).includes(`№ п/п 1 № ${doc.number} от 17.08.2026`),
+      'и ссылается на сам УПД — его номер и дату', flat5a(updOoo).slice(0, 70));
+
+    // Позиций несколько — перечисляем диапазон строк таблицы.
+    const many = buildUpdHtml({
+      org: ooo,
+      cp,
+      doc: { ...doc, status: 1, vatRate: 20,
+        items: [{ name: 'А', qty: 1, price: 100 }, { name: 'Б', qty: 2, price: 200 },
+          { name: 'В', qty: 3, price: 300 }] },
+    });
+    ok(many.includes('№ п/п 1-3'), 'при трёх позициях в 5а стоит диапазон 1-3',
+      (many.match(/№ п\/п [^<\s]+/) || [])[0]);
+
+    // У статуса 2 шапки счёта-фактуры нет вовсе — и строки 5а тоже.
+    const st2 = buildUpdHtml({ org: ooo, cp, doc: { ...doc, status: 2 } });
+    ok(!st2.includes('Документ об отгрузке'),
+      'у передаточного документа без счёта-фактуры этой строки нет');
+  }
+
+  console.log('\n── акт сверки за период ──');
+  {
+    const bdbP = require('./lib/bot-db');
+    const uid = fxUserId();
+    const cpP = bdbP.createCp(uid, {
+      name: 'ООО «Долгий»', kind: 'customer',
+      opening_balance: 10000, opening_date: '2026-01-01',
+    });
+    bdbP.addOp(uid, cpP, { date: '2026-01-15', kind: 'Приход', doc: 'Счёт 1', credit: 5000 });
+    bdbP.addOp(uid, cpP, { date: '2026-02-10', kind: 'Оплата', doc: 'п/п 5', debit: 3000 });
+    bdbP.addOp(uid, cpP, { date: '2026-03-05', kind: 'Приход', doc: 'Счёт 2', credit: 2000 });
+
+    // Начальное сальдо — то, ради чего акт вообще подписывают: клиент
+    // с долгом с прошлого года не примет акт, открывающийся нулём.
+    const all = bdbP.periodBalance(uid, cpP, '', '2026-12-31');
+    ok(all.opening === 10000, 'акт с начала расчётов открывается начальным сальдо', all.opening);
+    ok(all.ops.length === 3 && all.closing === 14000, 'и сходится к текущему сальдо',
+      `${all.ops.length} оп., ${all.closing}`);
+
+    // Входящее сальдо периода считается, а не берётся из карточки.
+    const feb = bdbP.periodBalance(uid, cpP, '2026-02-01', '2026-02-28');
+    ok(feb.opening === 15000, 'входящее сальдо февраля = начальное плюс январь', feb.opening);
+    ok(feb.ops.length === 1, 'в февральский акт попала одна операция', feb.ops.length);
+    ok(feb.totalDebit === 3000 && feb.totalCredit === 0, 'обороты только февральские',
+      `${feb.totalDebit}/${feb.totalCredit}`);
+    ok(feb.closing === 12000, 'исходящее сальдо февраля', feb.closing);
+
+    // Границы включительные: операция в первый и последний день периода — внутри.
+    const day = bdbP.periodBalance(uid, cpP, '2026-02-10', '2026-02-10');
+    ok(day.ops.length === 1 && day.opening === 15000, 'границы периода включительные',
+      `${day.ops.length} оп., вход ${day.opening}`);
+
+    // Шапка Excel должна совпадать с таблицей, а не жить своей жизнью.
+    const { buildAkt } = require('./lib/xlsx-akt');
+    const ExcelJS = require('exceljs');
+    const p = bdbP.cpForPeriod(uid, cpP, '2026-02-01', '2026-02-28');
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(await buildAkt({
+      org: { brand: 'ИП Тест', org_short: 'ИП Тест', org_full: 'ИП Тест', org_inn: '183114389446', signer: 'И. Т.' },
+      cp: p.view, ops: p.ops,
+    }));
+    const j = wb.getWorksheet('Журнал операций');
+    ok(String(j.getCell('D9').value).includes('01.02.2026'),
+      'в шапке акта дата начала выбранного периода', String(j.getCell('D9').value).trim());
+    ok(j.getCell('G9').value === 15000, 'и входящее сальдо этого периода', j.getCell('G9').value);
+
+    /*
+     * Акт за месяц без операций. Раньше итог вставал в первую строку таблицы,
+     * и SUM(E10:E9) — это E9:E10, то есть формула включала саму себя: Excel
+     * ругался на циклическую ссылку и показывал нули.
+     */
+    const empty = bdbP.cpForPeriod(uid, cpP, '2026-04-01', '2026-04-30');
+    const wbE = new ExcelJS.Workbook();
+    await wbE.xlsx.load(await buildAkt({
+      org: { brand: 'ИП Тест', org_short: 'ИП Тест', org_full: 'ИП Тест', org_inn: '183114389446', signer: 'И. Т.' },
+      cp: empty.view, ops: empty.ops,
+    }));
+    const col = (s) => [...s].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0);
+    const loops = [];
+    wbE.eachSheet((ws) => ws.eachRow((row) => row.eachCell((cell) => {
+      const f = cell.formula || (cell.value && cell.value.formula);
+      if (!f) return;
+      // Ссылки на другой лист циклом на этом не бывают — выкидываем их.
+      const local = String(f).replace(/'[^']*'!\$?[A-Z]+\$?\d+/g, '');
+      for (const m of local.matchAll(/([A-Z]{1,2})(\d+)(?::([A-Z]{1,2})(\d+))?/g)) {
+        const [c1, r1] = [col(m[1]), Number(m[2])];
+        const [c2, r2] = m[3] ? [col(m[3]), Number(m[4])] : [c1, r1];
+        const inside = cell.col >= Math.min(c1, c2) && cell.col <= Math.max(c1, c2)
+          && cell.row >= Math.min(r1, r2) && cell.row <= Math.max(r1, r2);
+        if (inside) loops.push(`${ws.name}!${cell.address}=${f}`);
+      }
+    })));
+    ok(empty.ops.length === 0 && loops.length === 0, 'в акте за пустой период нет циклических ссылок',
+      loops.join('; '));
+    const aE = wbE.getWorksheet('Акт сверки');
+    const closeE = [...Array(30).keys()].map((i) => aE.getCell(`G${i + 12}`).value)
+      .find((v) => v && v.formula && /G11/.test(v.formula));
+    ok(closeE && closeE.result === empty.opening && empty.opening === 14000,
+      'у стороны контрагента конечное сальдо считается от её же начального',
+      JSON.stringify(closeE));
+
+    // Карточку акт не портит: там своё значение — начало отношений.
+    ok(bdbP.getCp(uid, cpP).opening_date === '2026-01-01',
+      'начало расчётов в карточке не подменяется периодом акта',
+      bdbP.getCp(uid, cpP).opening_date);
+    ok(!bdbP.getCp(uid, cpP).period_end,
+      'и конец периода в карточке не замерзает после первого акта');
+  }
+
+  console.log('\n── выбор периода ──');
+  {
+    const period = require('./lib/period');
+    // 15 мая 2026 — середина месяца и второго квартала, чтобы границы были видны.
+    const day = new Date(2026, 4, 15);
+    const p = (code) => period.presetRange(code, day);
+    ok(p('m').from === '2026-05-01' && p('m').to === '2026-05-15',
+      'этот месяц — с первого числа по сегодня', `${p('m').from}—${p('m').to}`);
+    ok(p('pm').from === '2026-04-01' && p('pm').to === '2026-04-30',
+      'прошлый месяц — целиком, а не по сегодня', `${p('pm').from}—${p('pm').to}`);
+    ok(p('q').from === '2026-04-01', 'квартал начинается с апреля', p('q').from);
+    ok(p('pq').from === '2026-01-01' && p('pq').to === '2026-03-31',
+      'прошлый квартал — январь-март', `${p('pq').from}—${p('pq').to}`);
+    ok(p('y').from === '2026-01-01', 'год — с первого января', p('y').from);
+    ok(p('all').from === '' && p('all').to === '2026-05-15',
+      'за всё время — пустое начало, чтобы взять начальное сальдо', JSON.stringify(p('all')));
+
+    // Январь: прошлый месяц и прошлый квартал уезжают в прошлый год.
+    const jan = period.presetRange('pm', new Date(2026, 0, 10));
+    ok(jan.from === '2025-12-01' && jan.to === '2025-12-31',
+      'в январе прошлый месяц — декабрь прошлого года', `${jan.from}—${jan.to}`);
+    const janQ = period.presetRange('pq', new Date(2026, 0, 10));
+    ok(janQ.from === '2025-10-01' && janQ.to === '2025-12-31',
+      'и прошлый квартал — четвёртый прошлого года', `${janQ.from}—${janQ.to}`);
+
+    // Свободный текст: человек пишет как привык.
+    const t = (s) => period.parsePeriodText(s, day);
+    ok(t('01.01.2026 - 31.03.2026').from === '2026-01-01'
+      && t('01.01.2026 - 31.03.2026').to === '2026-03-31', 'две даты через тире');
+    ok(t('с 1.2.26 по 28.2.26').from === '2026-02-01', 'даты с «с» и «по» и коротким годом',
+      JSON.stringify(t('с 1.2.26 по 28.2.26')));
+    ok(t('31.03.2026 01.01.2026').from === '2026-01-01', 'даты задом наперёд разворачиваются');
+    ok(t('март').from === '2026-03-01' && t('март').to === '2026-03-31', 'месяц словом');
+    ok(t('за апрель 2025').from === '2025-04-01' && t('за апрель 2025').to === '2025-04-30',
+      'месяц с годом', JSON.stringify(t('за апрель 2025')));
+    ok(t('мае').from === '2026-05-01', 'месяц в косвенном падеже — не путается с мартом',
+      JSON.stringify(t('мае')));
+    ok(t('2 квартал').from === '2026-04-01' && t('2 квартал').to === '2026-06-30', 'квартал цифрой');
+    ok(t('III квартал 2025').from === '2025-07-01', 'квартал римской цифрой',
+      JSON.stringify(t('III квартал 2025')));
+    ok(t('2025').from === '2025-01-01' && t('2025').to === '2025-12-31', 'только год');
+    ok(t('за всё время').from === '', 'за всё время');
+    ok(t('01.03.2026').from === '2026-03-01' && t('01.03.2026').to === '2026-05-15',
+      'одна дата — от неё по сегодня', JSON.stringify(t('01.03.2026')));
+    ok(t('когда-нибудь') === null, 'непонятный текст честно не разбирается');
+
+    // Диапазон месяцев. Раньше брался только первый названный месяц, и на
+    // «с марта по май» приходил акт за один март — молча, без всякой ошибки.
+    ok(t('с марта по май').from === '2026-03-01' && t('с марта по май').to === '2026-05-31',
+      'диапазон месяцев словами берётся целиком', JSON.stringify(t('с марта по май')));
+    ok(t('март-май').to === '2026-05-31', 'месяцы через дефис — тоже диапазон');
+    ok(t('апрель-июнь 2025').from === '2025-04-01' && t('апрель-июнь 2025').to === '2025-06-30',
+      'диапазон месяцев с годом', JSON.stringify(t('апрель-июнь 2025')));
+    // В мае «ноябрь-февраль» — прошедшая зима, а не будущая.
+    ok(t('ноябрь-февраль').from === '2025-11-01' && t('ноябрь-февраль').to === '2026-02-28',
+      'диапазон через новый год не сворачивается в пустой', JSON.stringify(t('ноябрь-февраль')));
+
+    /*
+     * Год не назван, а период впереди — значит, прошлогодний. Раньше «акт за
+     * декабрь», попрошенный в январе, приходил за декабрь, который наступит
+     * через год: пустой, с одним начальным сальдо.
+     */
+    const inJan = (s) => period.parsePeriodText(s, new Date(2027, 0, 10));
+    ok(inJan('за декабрь').from === '2026-12-01' && inJan('за декабрь').to === '2026-12-31',
+      'в январе «за декабрь» — только что закончившийся декабрь', JSON.stringify(inJan('за декабрь')));
+    ok(inJan('4 квартал').from === '2026-10-01', 'и «4 квартал» — прошлогодний',
+      JSON.stringify(inJan('4 квартал')));
+    ok(inJan('01.12 - 31.12').from === '2026-12-01', 'и даты без года тоже',
+      JSON.stringify(inJan('01.12 - 31.12')));
+    ok(inJan('январь').from === '2027-01-01', 'а текущий месяц остаётся текущим',
+      JSON.stringify(inJan('январь')));
+    ok(inJan('декабрь 2027').from === '2027-12-01', 'названный год не трогаем',
+      JSON.stringify(inJan('декабрь 2027')));
+
+    // Несуществующие даты. «31.02.2026» проходило и печаталось в шапке акта.
+    ok(t('31.02.2026') === null, 'тридцать первого февраля не бывает');
+    ok(t('31.04.2026 - 30.06.2026') === null, 'и тридцать первого апреля тоже');
+    ok(t('29.02.2026') === null, 'в невисокосном году 29 февраля нет');
+    ok(t('29.02.2024').from === '2024-02-29', 'а в високосном — есть',
+      JSON.stringify(t('29.02.2024')));
+
+    // Слово должно быть месяцем целиком, а не начинаться как месяц.
+    ok(t('максимум') === null, '«максимум» — не май');
+    ok(t('декада') === null, '«декада» — не декабрь');
+    ok(t('маркетинг') === null, '«маркетинг» — не март');
+    // Год здесь прошлый (в мае август ещё впереди), проверяем само слово.
+    ok(t('августе').from.slice(5) === '08-01', 'а склонённый месяц по-прежнему понятен',
+      JSON.stringify(t('августе')));
+    ok(t('сен').from.slice(5) === '09-01', 'и сокращение тоже', JSON.stringify(t('сен')));
+
+    // Дата документа — по Москве, а не по часовому поясу сервера.
+    // Сервер стоит в UTC: в 01:00 первого сентября по Москве документ
+    // получал дату 31 августа, то есть уезжал в прошлый месяц.
+    const night = new Date('2026-08-31T22:30:00Z');   // 01:30 первого сентября в Москве
+    ok(period.todayISO(night) === '2026-09-01',
+      'ночью после полуночи по Москве сегодня — уже новое число', period.todayISO(night));
+    ok(period.todayDate(night).getMonth() === 8,
+      'и «этот месяц» считается от него же', period.todayDate(night).getMonth());
+    const ny = new Date('2026-12-31T22:00:00Z');      // 01:00 первого января в Москве
+    ok(period.currentYear(ny) === 2027,
+      'в новогоднюю ночь номер документа берёт новый год', period.currentYear(ny));
+    ok(period.todayISO(new Date('2026-08-18T05:00:00Z')) === '2026-08-18',
+      'а днём московская дата совпадает с обычной');
+
+    // Реестр берёт период целиком, акт сверки — по сегодня. Разница
+    // осознанная, поэтому она флагом, а не вторым набором периодов.
+    const whole = (code) => period.presetRange(code, day, { whole: true });
+    ok(whole('m').to === '2026-05-31' && p('m').to === '2026-05-15',
+      'реестр берёт месяц целиком, акт сверки — по сегодня',
+      `${whole('m').to} / ${p('m').to}`);
+    ok(whole('q').to === '2026-06-30', 'квартал для реестра тоже целиком', whole('q').to);
+    ok(whole('y').to === '2026-12-31', 'и год', whole('y').to);
+    ok(whole('pm').to === p('pm').to, 'а закрытые периоды от флага не зависят');
+
+    // И то же самое живьём: кнопка «Свой период» → текст → файл.
+    // Операции сценария внесены без года, то есть текущим.
+    const Y = new Date().getFullYear();
+    const before = files.length;
+    await tap(`d.akt:${cpId}`);
+    await tap(`akt.own:${cpId}`);
+    ok(last().includes('Напишите период'), 'бот просит написать период', last().slice(0, 40));
+    await say('какая-то ерунда');
+    ok(last().includes('Не понял период'), 'непонятный ответ не роняет бота');
+    ok(files.length === before, 'и файла при этом не шлёт');
+    await say(`15.05.${Y} - 20.05.${Y}`);
+    ok(files.length === before + 1, 'по своему периоду акт пришёл', files.length - before);
+    const cap = norm((files[files.length - 1] || {}).caption || '');
+    ok(cap.includes(`период 15.05.${Y}—20.05.${Y}`),
+      'и подписан выбранным периодом, а не всем сроком', cap.slice(0, 140));
+    ok(/на конец — 54 193/.test(cap),
+      'сальдо на конец периода — только по операциям внутри него', cap.slice(0, 200));
+  }
+
+  console.log('\n── НДС в накладной и оговорка про УСН ──');
+  {
+    const { buildTorg12Html } = require('./lib/torg12');
+    const { buildUpdHtml } = require('./lib/upd');
+    const { usnNote } = require('./lib/doc-html');
+
+    const usn = { name: 'ИП Тест', inn: '183114389446', signer: 'И. Т.', vat_rate: '' };
+    const nds = { ...usn, name: 'ООО Тест', inn: '7707083893', vat_rate: '20' };
+    const cp2 = { name: 'ООО «Покупатель»', inn: '1800047200' };
+    const items = [{ name: 'Товар', unit: 'шт.', qty: 10, price: 1200 }];
+
+    ok(usnNote(usn).includes('не является плательщиком НДС'),
+      'у неплательщика оговорка печатается');
+    ok(usnNote(nds) === '', 'у плательщика НДС её нет — это была бы неправда');
+
+    /*
+     * Режим называем, только когда знаем его.
+     *
+     * Раньше любому неплательщику печаталось «применяет упрощённую систему
+     * (гл. 26.2 НК РФ)». Но «Без НДС» в самом приложении — это «упрощёнка до
+     * 20 млн, патент, самозанятость», три разных режима. Самозанятому строка
+     * приписывала чужую главу кодекса, хотя про НПД мы знаем точно: галочка
+     * стоит отдельно. Документ живёт в учёте у контрагента, и выдумывать в
+     * нём налоговый режим продавца нельзя.
+     */
+    ok(!usnNote(usn).includes('упрощённую'),
+      'но чужой режим ему не приписывается', usnNote(usn).replace(/<[^>]+>/g, '').trim().slice(0, 60));
+    const samo = { ...usn, npd: 1 };
+    ok(usnNote(samo).includes('профессиональный доход') && usnNote(samo).includes('422-ФЗ'),
+      'самозанятому назван его настоящий режим',
+      usnNote(samo).replace(/<[^>]+>/g, '').trim().slice(0, 70));
+    ok(!usnNote(samo).includes('упрощённую'),
+      'а УСН у самозанятого не упоминается — этого режима у него нет');
+
+    const t0 = buildTorg12Html({ org: usn, cp: cp2, doc: { number: '1', date: '2026-08-17', items } });
+    ok(t0.includes('без НДС') && t0.includes('не является плательщиком НДС'),
+      'накладная неплательщика по-прежнему объясняет, почему налога нет');
+
+    const t1 = buildTorg12Html({
+      org: nds, cp: cp2, doc: { number: '1', date: '2026-08-17', items, vatRate: 20 },
+    });
+    ok(!t1.includes('упрощённую'), 'у плательщика накладная не заявляет УСН');
+    ok(norm(t1).includes('2 400,00'), 'НДС 20% с 12 000 посчитан');
+    ok(norm(t1).includes('14 400,00'), 'сумма с налогом отличается от суммы без него');
+
+    const u2 = buildUpdHtml({ org: nds, cp: cp2, doc: { number: '1', date: '2026-08-17', items, status: 2 } });
+    ok(!u2.includes('упрощённую'), 'УПД плательщика тоже не заявляет УСН');
+    const u2usn = buildUpdHtml({ org: usn, cp: cp2, doc: { number: '1', date: '2026-08-17', items, status: 2 } });
+    ok(u2usn.includes('не является плательщиком НДС') && !u2usn.includes('упрощённую'),
+      'а у неплательщика объясняет отсутствие налога, не выдумывая режим');
+  }
+
+  console.log('\n── автозаполнение реквизитов ──');
+  {
+    const dd = require('./lib/dadata');
+    const bdbA = require('./lib/bot-db');
+    const uid = fxUserId();
+
+    // Ответ реестра для предпринимателя: ОГРНИП в нём есть всегда.
+    process.env.DADATA_MOCK = JSON.stringify({
+      183114389446: {
+        type: 'INDIVIDUAL',
+        name: { full_with_opf: 'Индивидуальный предприниматель Тестов Тест Тестович' },
+        inn: '183114389446',
+        ogrn: '318183200012345',
+        address: { value: 'г Ижевск, ул Тестовая, д 1' },
+        fio: { surname: 'Тестов', name: 'Тест', patronymic: 'Тестович' },
+        state: { status: 'ACTIVE' },
+      },
+    });
+    const r = await dd.partyByInn('183114389446');
+    ok(r.ok, 'справочник ответил', r.error);
+    ok(r.fields.ogrnip === '318183200012345',
+      'ОГРНИП взят из реестра — раньше его теряли', r.fields.ogrnip);
+    ok(r.fields.kpp === '', 'у предпринимателя КПП пустой');
+    ok(r.fields.signer === 'Т. Т. Тестов', 'подписант собран из ФИО', r.fields.signer);
+    delete process.env.DADATA_MOCK;
+
+    const isIpInn = (inn) => String(inn || '').replace(/\D/g, '').length === 12;
+    ok(isIpInn('183114389446') && !isIpInn('7707083893'),
+      'предприниматель определяется по длине ИНН и в анкете');
+
+    bdbA.saveMyOrg(uid, { ...bdbA.getDefaultOrg(uid), ogrnip: '318183200012345' });
+    ok(bdbA.getDefaultOrg(uid).ogrnip === '318183200012345', 'ОГРНИП сохраняется',
+      bdbA.getDefaultOrg(uid).ogrnip);
+  }
+
+  console.log('\n── разбор вставленных реквизитов ──');
+  {
+    const { parseRequisites } = require('./lib/reqs');
+    // Ровно та беда, что видна в живом счёте: в адрес затекло соседнее поле.
+    const block = 'ИП Сарычев Иван Николаевич\n'
+      + 'ИНН 183114389446\n'
+      + 'Адрес 426054, Удмуртская Респ, Ижевск г, Тарасова ул, дом №6\n'
+      + 'Свидетельство о государственной регистрации 18 №003286312\n'
+      + 'Р/с 40802810668000008020 в ПАО Сбербанк БИК 049401601';
+    const p = parseRequisites(block);
+    ok(p.address === '426054, Удмуртская Респ, Ижевск г, Тарасова ул, дом №6',
+      'адрес заканчивается там, где кончается адрес', p.address);
+    ok(p.inn === '183114389446' && p.bik === '049401601', 'ИНН и БИК разобраны',
+      `${p.inn} / ${p.bik}`);
+
+    const withMail = parseRequisites('Адрес 426054, Ижевск, Ленина 1 Email buh@mail.ru');
+    ok(withMail.address === '426054, Ижевск, Ленина 1', 'почта в адрес не затекает', withMail.address);
+  }
+
+  console.log('\n── контрольные суммы реквизитов ──');
+  {
+    const rc = require('./lib/requisites-check');
+    // Настоящие открытые реквизиты: если алгоритм врёт, это видно сразу.
+    ok(rc.checkInn('7707083893').ok, 'ИНН из десяти цифр сходится');
+    ok(!rc.checkInn('7707083894').ok, 'одна изменённая цифра в ИНН ловится');
+    ok(rc.checkInn('500100732259').ok, 'ИНН предпринимателя из двенадцати цифр сходится');
+    ok(!rc.checkInn('500100732250').ok, 'опечатка в ИНН предпринимателя ловится');
+    ok(!rc.checkInn('12345').ok, 'ИНН неправильной длины отклонён', rc.checkInn('12345').error);
+    ok(rc.checkInn('').ok, 'пустой ИНН — не ошибка: у иностранца его нет');
+
+    ok(rc.checkBik('044525225').ok, 'БИК сходится');
+    ok(!rc.checkBik('123456789').ok, 'не российский БИК отклонён');
+
+    // Корр. счёт Сбербанка — проверяется вместе с его же БИК.
+    ok(rc.checkAccount('30101810400000000225', '044525225', true).ok, 'корр. счёт сходится с БИК');
+    ok(!rc.checkAccount('30101810400000000255', '044525225', true).ok,
+      'переставленные цифры в корр. счёте ловятся');
+    ok(!rc.checkAccount('40702810900000012345', '044525225').ok,
+      'расчётный счёт с опечаткой не пройдёт — по нему бы не заплатили');
+    ok(rc.checkAccount('40702810900000012344', '044525225').ok, 'верный расчётный счёт принимается');
+    ok(rc.checkAccount('40702810900000012345', '').ok, 'без БИК счёт не проверяем — нечем');
+
+    // И то же самое живьём: бот обязан переспросить, а не записать мусор.
+    await tap('cps'); await tap('cp.new');
+    await say('7707083894');
+    ok(last().includes('контрольной цифре'), 'бот переспрашивает кривой ИНН', last().slice(0, 40));
+    await say('7707083893');
+    ok(!last().includes('контрольной'), 'верный ИНН принят');
+    await say('ООО Проверка'); await say('-'); await say('-'); await say('-');
+    await tap('fb:customer');
+    await say('-'); await say('0'); await say('01.01.2026');
+    await say('044525225');
+    await say('-'); await say('-');
+    await say('40702810900000012345');
+    ok(last().includes('не сходится с БИК'), 'бот не принял счёт, не сходящийся с банком',
+      last().slice(0, 45));
+    await say('40702810900000012344');
+    ok(!last().includes('не сходится'), 'верный счёт принят');
+
+    /*
+     * Реквизит запоминается цифрами, как его набрали.
+     *
+     * Контрольная сумма сама выбрасывает нецифровое, поэтому счёт,
+     * скопированный из банка по четыре цифры, проверку проходил — и в этом
+     * же виде печатался в счёте и уезжал в платёжный QR. А по ГОСТ Р 56042 в
+     * поле PersonalAcc ровно двадцать цифр, пробелам там места нет.
+     */
+    const bdbR = require('./lib/bot-db');
+    const uidR = fxUserId();
+    await tap('cps'); await tap('cp.new');
+    await say('7707083893');
+    await say('ООО Пробелы'); await say('-'); await say('-'); await say('-');
+    await tap('fb:customer');
+    await say('-'); await say('0'); await say('01.01.2026');
+    await say('БИК 044525225');
+    await say('-'); await say('-');
+    await say('4070 2810 9000 0001 2344');
+    const spaced = bdbR.listCps(uidR).find((c) => c.name === 'ООО Пробелы');
+    ok(spaced && spaced.acc === '40702810900000012344',
+      'счёт с пробелами лёг двадцатью цифрами', spaced && spaced.acc);
+    ok(spaced && spaced.bik === '044525225',
+      'и БИК без слова «БИК» перед ним', spaced && spaced.bik);
+  }
+
+  console.log('\n── две организации не смешивают деньги ──');
+  {
+    /*
+     * Контрагенты общие на аккаунт, а деньги — нет.
+     *
+     * Решение владельца: один список клиентов, с пометкой, кто с кем работал.
+     * Но зачесть долг клиента перед ООО «А» его оплатой в ООО «Б» нельзя —
+     * это разные юрлица, и каждое в акте сверки показывает только своё. До
+     * появления org_id у операций два бизнеса на одном аккаунте видели бы
+     * одно перемешанное сальдо, и человек сверял бы с клиентом сумму, которой
+     * нет ни у одной из его фирм.
+     */
+    const bdbO = require('./lib/bot-db');
+    const uO = bdbO.getOrCreateUser(779080, 'Двефирмы');
+    bdbO.saveMyOrg(uO.id, { name: 'ООО «Первая»', inn: '7701234567' });
+    const orgA = bdbO.getDefaultOrg(uO.id).id;
+    const orgB = bdbO.createOrg(uO.id, { name: 'ООО «Вторая»', inn: '7707083893' });
+    const cpO = bdbO.createCp(uO.id, { name: 'ООО «Общий клиент»', kind: 'customer', opening_date: '2026-01-01' });
+
+    // Клиент должен первой фирме 30 000 и заплатил второй 12 000.
+    bdbO.addOp(uO.id, cpO, { date: '2026-09-01', kind: 'Приход', credit: 30000 }, orgA);
+    bdbO.addOp(uO.id, cpO, { date: '2026-09-02', kind: 'Оплата', debit: 12000 }, orgB);
+
+    const inA = bdbO.listOps(uO.id, cpO, orgA);
+    const inB = bdbO.listOps(uO.id, cpO, orgB);
+    ok(inA.length === 1 && Number(inA[0].credit) === 30000,
+      'первая фирма видит только свою отгрузку', `${inA.length} оп.`);
+    ok(inB.length === 1 && Number(inB[0].debit) === 12000,
+      'вторая — только свою оплату', `${inB.length} оп.`);
+
+    /*
+     * Главная проверка блока. Если сложить всё вместе, выйдет 18 000 —
+     * сумма, которой не должен ни один из двух клиентов: первой он должен
+     * тридцать, у второй переплатил двенадцать.
+     */
+    const { round2: r2o } = require('./lib/money');
+    const sumA = r2o(inA.reduce((s, o) => s + (o.credit || 0) - (o.debit || 0), 0));
+    const sumB = r2o(inB.reduce((s, o) => s + (o.credit || 0) - (o.debit || 0), 0));
+    ok(sumA === 30000 && sumB === -12000,
+      'долги считаются раздельно, а не в одну кучу', `${sumA} и ${sumB}`);
+    ok(sumA + sumB === 18000,
+      'а «в одну кучу» дало бы 18 000 — сумму, которой не должен никто');
+
+    // Проводка из документа принадлежит фирме документа, даже если человек
+    // к этому моменту работает от другой.
+    const dsO = require('./lib/doc-service');
+    const docO = await dsO.issueDocument(uO.id, {
+      type: 'usl', cpId: cpO, items: [{ name: 'Работа', qty: 1, price: 5000 }], skipQuota: true,
+    });
+    ok(docO.ok !== false, 'акт от первой фирмы выписан', docO.message);
+    const afterA = bdbO.listOps(uO.id, cpO, orgA);
+    const afterB = bdbO.listOps(uO.id, cpO, orgB);
+    ok(afterA.length === 2 && afterB.length === 1,
+      'проводка по документу легла в журнал его фирмы, а не соседней',
+      `${afterA.length} и ${afterB.length}`);
+
+    /*
+     * Начальное сальдо не задваивается — самая тихая ошибка из всех.
+     *
+     * Оно лежало на контрагенте, а не на паре. Клиент, который на начало
+     * работы был должен 15 000, показал бы эти 15 000 обеим фирмам сразу:
+     * сумма правдоподобная, и человек ничего бы не заподозрил, пока не
+     * сверился бы с клиентом.
+     */
+    const cpOpen = bdbO.createCp(uO.id, {
+      name: 'ООО «С долгом»', kind: 'customer',
+      opening_balance: 15000, opening_date: '2026-01-01',
+    });
+    const openA = bdbO.balanceOf(uO.id, cpOpen, orgA);
+    const openB = bdbO.balanceOf(uO.id, cpOpen, orgB);
+    ok(r2o(openA.closing) === 15000,
+      'начальный долг засчитан фирме, которая клиента завела', openA.closing);
+    ok(r2o(openB.closing) === 0,
+      'а соседней не достался: она с этим клиентом начинает с нуля', openB.closing);
+    ok(r2o(openA.closing + openB.closing) === 15000,
+      'вместе это по-прежнему пятнадцать тысяч, а не тридцать');
+
+    /*
+     * Пометка «чей это клиент».
+     *
+     * Список общий — так удобнее, один клиент обслуживается от обеих фирм и
+     * заводить его дважды не надо. Но без пометки выписать документ не от
+     * той организации становится делом одного промаха, а замечают это уже у
+     * контрагента.
+     */
+    const seenA = bdbO.listCps(uO.id, orgA);
+    const seenB = bdbO.listCps(uO.id, orgB);
+    const findIn = (list, name) => list.find((c) => c.name === name) || {};
+    ok(findIn(seenA, 'ООО «С долгом»').mine === true,
+      'клиент, заведённый первой фирмой, у неё свой');
+    ok(findIn(seenB, 'ООО «С долгом»').mine === false,
+      'а у второй помечен как чужой — она с ним не работала');
+    ok(findIn(seenB, 'ООО «Общий клиент»').mine === true,
+      'общий клиент свой для обеих: у второй по нему есть оплата');
+
+    // Свои идут первыми: в выборе по умолчанию человек попадает в них.
+    ok(seenB[0].mine === true, 'свои стоят выше чужих в списке',
+      seenB.map((c) => `${c.name}:${c.mine ? 'свой' : 'чужой'}`).join(', '));
+
+    // И самое важное для сегодняшнего дня: пока фирма одна, чужих нет вовсе,
+    // а значит метка нигде не показывается и не мозолит глаза.
+    const single = bdbO.listCps(fxUserId());
+    ok(single.every((c) => c.mine), 'при одной организации чужих не бывает — метки не видно',
+      single.filter((c) => !c.mine).length);
+
+    /*
+     * Переключатель: выбор запоминается и переживает перезапуск.
+     *
+     * Хранится он у человека, а не в состоянии экрана: иначе тот, кто ведёт
+     * две фирмы, каждое утро начинал бы с чужой и замечал это уже по
+     * выписанному документу.
+     */
+    ok(bdbO.currentOrgId(uO.id) === orgA, 'по умолчанию работаем от первой фирмы');
+    ok(bdbO.setActiveOrg(uO.id, orgB), 'переключение принято');
+    ok(bdbO.currentOrgId(uO.id) === orgB, 'и запомнилось', bdbO.currentOrgId(uO.id));
+    ok(bdbO.currentOrg(uO.id).name === 'ООО «Вторая»',
+      'currentOrg отдаёт именно её', bdbO.currentOrg(uO.id).name);
+
+    // Чужую организацию не подсунуть: id приходит из кнопки, а кнопку видно.
+    const alien = bdbO.getOrCreateUser(779081, 'Чужой');
+    bdbO.saveMyOrg(alien.id, { name: 'ООО «Чужая»', inn: '7701234567' });
+    const alienOrg = bdbO.getDefaultOrg(alien.id).id;
+    ok(!bdbO.setActiveOrg(uO.id, alienOrg), 'на чужую организацию переключиться нельзя');
+    ok(bdbO.currentOrgId(uO.id) === orgB, 'и текущая от этого не сменилась');
+
+    /*
+     * Правка реквизитов НЕ удаляет остальные организации.
+     *
+     * В saveMyOrg стояло «обновить умолчание и удалить все прочие» — наследие
+     * старой беды, когда каждая правка заводила ещё одну организацию. С двумя
+     * фирмами это стало прямой потерей: зашёл поправить реквизиты — и второй
+     * фирмы больше нет, а её документы ссылаются на несуществующую строку.
+     */
+    const before = bdbO.listOrgs(uO.id).length;
+    bdbO.saveMyOrg(uO.id, { name: 'ООО «Вторая»', inn: '7707083893', address: 'Ижевск' });
+    const after = bdbO.listOrgs(uO.id);
+    ok(after.length === before, 'правка реквизитов не убила соседнюю организацию',
+      `${before} → ${after.length}`);
+    ok(after.some((o) => o.id === orgA), 'первая фирма на месте');
+    ok((after.find((o) => o.id === orgB) || {}).address === 'Ижевск',
+      'а правка легла именно в текущую');
+
+    // Указатель на удалённую организацию не роняет экран, а тихо возвращает
+    // к умолчанию: иначе человек упёрся бы в ошибку на ровном месте.
+    bdbO.setActiveOrg(uO.id, orgB);
+    require('./db').db.prepare('DELETE FROM orgs WHERE id = ?').run(orgB);
+    ok(bdbO.currentOrgId(uO.id) === orgA,
+      'выбор удалённой фирмы возвращается к умолчанию, а не ломается',
+      bdbO.currentOrgId(uO.id));
+
+    /*
+     * Основание долга — у каждой фирмы своё.
+     *
+     * Пересчёт брал основание текущей организации и применял ко всем
+     * документам человека. У подрядчика долг возникает по акту, у
+     * арендодателя по счёту; ведущий обе фирмы получил бы пересчёт, где у
+     * одной долг задвоился, а у другой исчез.
+     */
+    const uB = bdbO.getOrCreateUser(779082, 'Двабазиса');
+    bdbO.saveMyOrg(uB.id, { name: 'ООО «По акту»', inn: '7701234567' });
+    const bA = bdbO.getDefaultOrg(uB.id).id;
+    bdbO.updateOrg(uB.id, bA, { debt_basis: 'closing' });   // долг с акта
+    const bB = bdbO.createOrg(uB.id, { name: 'ООО «По счёту»', inn: '7707083893' });
+    bdbO.updateOrg(uB.id, bB, { debt_basis: 'invoice' });   // долг со счёта
+    const cpB = bdbO.createCp(uB.id, { name: 'ООО «Клиент»', kind: 'customer', opening_date: '2026-01-01' });
+
+    // Счёт от «По счёту» долг создаёт, счёт от «По акту» — нет.
+    bdbO.setActiveOrg(uB.id, bB);
+    await dsO.issueDocument(uB.id, {
+      type: 'sch', cpId: cpB, items: [{ name: 'Аренда', qty: 1, price: 1000 }], skipQuota: true,
+    });
+    bdbO.setActiveOrg(uB.id, bA);
+    await dsO.issueDocument(uB.id, {
+      type: 'sch', cpId: cpB, items: [{ name: 'Работа', qty: 1, price: 2000 }], skipQuota: true,
+    });
+    bdbO.rebuildDebt(uB.id);
+    const debtInvoice = bdbO.listOps(uB.id, cpB, bB).filter((o) => o.kind === 'Реализация');
+    const debtClosing = bdbO.listOps(uB.id, cpB, bA).filter((o) => o.kind === 'Реализация');
+    ok(debtInvoice.length === 1,
+      'у фирмы «долг по счёту» счёт создал проводку', debtInvoice.length);
+    ok(debtClosing.length === 0,
+      'а у фирмы «долг по акту» тот же счёт проводки не создал — правило её, а не соседкино',
+      debtClosing.length);
+
+    /*
+     * Начальное сальдо в карточке показывается от текущей фирмы.
+     *
+     * Считается оно уже по паре, и если рисовать поле контрагента, экран
+     * разошёлся бы с цифрой долга: карточка показывала бы 15 000, а сальдо
+     * начиналось бы с нуля.
+     */
+    const shown = (orgId) => bdbO.openingFor(cpOpen, orgId).opening_balance;
+    ok(shown(orgA) === 15000 && shown(orgB) === 0,
+      'карточка покажет разное начальное сальдо разным фирмам',
+      `${shown(orgA)} и ${shown(orgB)}`);
+
+    /*
+     * Клиента завели от лица второй фирмы — начальное сальдо только у неё.
+     * Перенос старых сальдо при загрузке (fillOpOrgs) раньше досоздавал пару
+     * ещё и основной фирме, и после каждого перезапуска долг клиента
+     * удваивался. Перезапуск здесь настоящий: модуль грузится заново в
+     * отдельном процессе на той же базе.
+     */
+    const uR = bdbO.getOrCreateUser(779083, 'Перезапуск');
+    bdbO.saveMyOrg(uR.id, { name: 'ООО «Главная»', inn: '7701234567' });
+    const reA = bdbO.getDefaultOrg(uR.id).id;
+    const reB = bdbO.createOrg(uR.id, { name: 'ООО «Вторая»', inn: '7707083893' });
+    bdbO.setActiveOrg(uR.id, reB);
+    const cpR = bdbO.createCp(uR.id, {
+      name: 'ООО «Старый долг»', kind: 'customer', opening_balance: 8000, opening_date: '2026-01-01',
+    });
+    require('node:child_process').execFileSync(process.execPath,
+      ['-e', "require('./lib/bot-db')"], { cwd: __dirname, env: process.env, stdio: 'ignore' });
+    ok(bdbO.openingFor(cpR, reA).opening_balance === 0,
+      'после перезапуска чужое начальное сальдо основной фирме не досталось',
+      bdbO.openingFor(cpR, reA).opening_balance);
+    ok(bdbO.openingFor(cpR, reB).opening_balance === 8000, 'а у своей фирмы осталось как было');
+
+    /*
+     * Сводная проверка блока: две фирмы не смешиваются нигде.
+     *
+     * Проходим путь целиком на чистом человеке — завести две фирмы, выписать
+     * от каждой, посмотреть журнал, отчёт и долги. Проверки выше ловят каждую
+     * часть по отдельности; эта ловит то, что между ними: место, где одна
+     * правильная функция зовётся с чужой организацией.
+     */
+    const uS = bdbO.getOrCreateUser(779090, 'Сводный');
+    bdbO.saveMyOrg(uS.id, { name: 'ООО «Альфа»', inn: '7701234567' });
+    const sA = bdbO.getDefaultOrg(uS.id).id;
+    const sB = bdbO.createOrg(uS.id, { name: 'ООО «Бета»', inn: '7707083893' });
+    const cpS = bdbO.createCp(uS.id, { name: 'ООО «Покупатель»', kind: 'customer', opening_date: '2026-01-01' });
+
+    const issueFrom = async (orgId, price) => {
+      bdbO.setActiveOrg(uS.id, orgId);
+      return dsO.issueDocument(uS.id, {
+        type: 'sch', cpId: cpS, date: '2026-09-20',
+        items: [{ name: 'Работа', qty: 1, price }], skipQuota: true,
+      });
+    };
+    const d1 = await issueFrom(sA, 10000);
+    const d2 = await issueFrom(sB, 20000);
+    const d3 = await issueFrom(sA, 30000);
+
+    // 1. Номера: у каждой фирмы свой ряд с единицы.
+    ok(d1.doc.number === '1' && d2.doc.number === '1' && d3.doc.number === '2',
+      'номера идут своим рядом у каждой фирмы',
+      `Альфа: ${d1.doc.number}, ${d3.doc.number} | Бета: ${d2.doc.number}`);
+
+    // 2. Журнал: видно только свои документы.
+    bdbO.setActiveOrg(uS.id, sA);
+    const jA = bdbO.listDocs(uS.id, 50);
+    bdbO.setActiveOrg(uS.id, sB);
+    const jB = bdbO.listDocs(uS.id, 50);
+    ok(jA.length === 2 && jB.length === 1,
+      'в журнале у каждой фирмы только её документы', `${jA.length} и ${jB.length}`);
+
+    // 3. Отчёт за период: то же самое.
+    bdbO.setActiveOrg(uS.id, sA);
+    const rA = bdbO.docsBetween(uS.id, '2026-09-01', '2026-09-30');
+    bdbO.setActiveOrg(uS.id, sB);
+    const rB = bdbO.docsBetween(uS.id, '2026-09-01', '2026-09-30');
+    ok(rA.length === 2 && rB.length === 1,
+      'реестр собирается по одной фирме, а не по обеим сразу', `${rA.length} и ${rB.length}`);
+    ok(rA.reduce((x, d) => x + d.total, 0) === 40000
+      && rB.reduce((x, d) => x + d.total, 0) === 20000,
+      'и суммы в отчётах не сложились в одну',
+      `${rA.reduce((x, d) => x + d.total, 0)} и ${rB.reduce((x, d) => x + d.total, 0)}`);
+
+    /*
+     * 4. Долги. Ставим обеим фирмам основание «долг по счёту» — тогда
+     * выписанные счета создают проводки, и есть что складывать. С основанием
+     * по умолчанию («по акту») счета долга не создают вовсе, и проверка
+     * получилась бы пустой: два нуля совпадают и при полностью сломанном
+     * разделении.
+     */
+    bdbO.updateOrg(uS.id, sA, { debt_basis: 'invoice' });
+    bdbO.updateOrg(uS.id, sB, { debt_basis: 'invoice' });
+    bdbO.rebuildDebt(uS.id);
+    const balA = r2o(bdbO.balanceOf(uS.id, cpS, sA).closing);
+    const balB = r2o(bdbO.balanceOf(uS.id, cpS, sB).closing);
+    ok(balA === 40000, 'Альфе должны ровно её 10 000 и 30 000', balA);
+    ok(balB === 20000, 'Бете — ровно её 20 000', balB);
+    ok(balA !== 60000 && balB !== 60000,
+      'и ни одна не видит общие 60 000 — а увидела бы, будь журнал общим',
+      `${balA} и ${balB}`);
+
+    /*
+     * Предел организаций: две в тарифе, дальше по доплате.
+     *
+     * Две даём и тем, кто не платит: разница между бесплатным и платным в
+     * числе документов, а не в числе фирм. Иначе главное отличие продукта —
+     * что он не путает два юрлица — человек увидел бы только после оплаты.
+     *
+     * Упёршемуся не даём завести следующую, а не пускаем с обещанием счёта:
+     * заведённое потом пришлось бы отключать за неоплату, то есть запирать
+     * чужой учёт.
+     */
+    const qS = bdbO.orgQuota(uS.id);
+    ok(qS.used === 2 && qS.limit === 2 && !qS.canAdd,
+      'две организации заведены — предел достигнут', JSON.stringify(qS));
+
+    const uFree = bdbO.getOrCreateUser(779091, 'Бесплатный');
+    bdbO.saveMyOrg(uFree.id, { name: 'ООО «Одна»', inn: '7701234567' });
+    const qFree = bdbO.orgQuota(uFree.id);
+    ok(qFree.limit === 2 && qFree.canAdd,
+      'неплатящему тоже положены две — иначе он не увидит, ради чего платить',
+      JSON.stringify(qFree));
+
+    bdbO.grantOrgSlots(uS.id, 1);
+    const qMore = bdbO.orgQuota(uS.id);
+    ok(qMore.limit === 3 && qMore.canAdd,
+      'после доплаты место открылось', JSON.stringify(qMore));
+    ok(qMore.used === 2, 'а уже заведённое никуда не делось', qMore.used);
+  }
+
+  console.log('\n── платёжный QR читается сканером ──');
+  {
+    /*
+     * Наш QR-кодировщик написан без сторонних библиотек, и проверялся он
+     * только собственным декодером того же автора. Оба путали строку и
+     * столбец в битах формата — и хвалили друг друга, а код в счёте не
+     * читал ни один банк. Поэтому сверяем не с собой: ниже матрицы, собранные
+     * независимым кодировщиком (npm-пакет qrcode, режим «байты», та же маска)
+     * и прочитанные настоящим сканером (jsQR). Совпасть должно до модуля.
+     *
+     * Версии выбраны так, чтобы задеть всё: 3 — выравнивающий узор, 13 —
+     * информация о версии, несколько блоков и 16-битная длина, 14 — уровень L.
+     */
+    const { encodeQr } = require('./lib/qr');
+    const pack = (qr) => {
+      const out = Buffer.alloc(Math.ceil((qr.size * qr.size) / 8));
+      for (let i = 0; i < qr.size * qr.size; i++) if (qr.modules[i]) out[i >> 3] |= 0x80 >> (i & 7);
+      return out.toString('base64');
+    };
+    const REF = [
+      { v: 3, ecc: 'M', mask: 3, text: 'ST00012|Name=ООО «Ромашка»',
+        bits: '/tmL/BU6kG6SMLt1C+XbolWuwQjBB/qqr+ASAwC3BDJeA6xUe61XiKhzrp6qrid2yZ4firfNIDpvos6y89FpEbrmpYzwahwWdGj9+oBgrEP6b6pQU9kQugGf5dTnPm6249MERuiv7kgLAA==' },
+      { v: 13, ecc: 'M', mask: 5, text: `ST00012|${'Назначение платежа '.repeat(8)}`,
+        bits: '/nzqIgaegfv8FHIoXRtmsBBuoIoQ6i9C6Lt1vPxjVEREFdulZp3P8GsCrsEoajBGI3IxB/qqqqqqqqqv4B93RLEmPuEAgvzkZPj9Vd5x47JNt8Xu7qeqsT54xf5150K4x+5nL3IG4YA22GpVFzd0+4aGv/YLAVgxGvmBlMkVE9E0/pf05Ul/97Vjv9pIxQz7Dh3RxAzX8Mq7KIHyt3JtuIqu5vypRD5PYHE7EkIhbyEDCsWMCBxeg6FoBMZVDE4Xv46bCkm46rlB/B16uqE9997CSb8iAmc65rTn8PL3rxEnlL681Vwzw8IJas4WF1amX7Ms4ICai8OtLhyQvlZRBXAXlbsrN2BmB+br6rsfjB+S+m0yP4MsdP05a5/ARIxflF5upkeGrQkWqppRgrpxf271E303EY//FkhP90d2+8gQRXZvAxAUGHg9S8dVFdCM8zaORaR/e/ewal7Kxej9TdlS6OK2+1G/K0/ls3XzulCujdSaJNMkH7IGB4B9IPKD+ICtBjbVUPI2ZEBBnAnSuE10k7Dc+TGMkHousqGCnsOhKOYgYi8NjSZp8hq7IEH74b2W9bx14MsYBckdSmVlTV4uTqMKusW/6H4w7UVnAdBmW7wXA7u+Z+BngRau9AJqumOF8yr4pPF5b84n4RZBvq6m2klrnwlkzVwzwfMCZXrEwkI3MumrTO5f53d2+4BnpRbFCVAUW/l8xFq9C9Aq8E1oXfHDt3kRulzORf0hS4/F0F3A/0q8488ujzZhzy6K6c8E7K4fM3I3AI/uQAQtGsGt9wA=' },
+      { v: 14, ecc: 'L', mask: 6, text: `ST00012|${'Оплата по счёту № 17 '.repeat(12)}`,
+        bits: '/tdD8cnM+66/wQ0le8UdV8EQbo+xnr9JkhoLt0GPCMZuh9Zl26MUT88X/TGa7BB/zHI0RCGxB/qqqqqqqqqq/gHbcxW+ceP8ANpAYPrAP7adoOrsYHSUjIdXl6D6f+xbhb8kU1SQXUHlPEiGxX97e59mQ5LmjpsvlIQVrAwfSckt0FlEVN/fPzli+Ud0dFU4IMFbpj5S4wmh7AmmKVtibbsk/8FKi/Y7jrF1HWGDKwbUX94ZPI7Q+3gyjF08IV8tBLUHoWl2s7pt/hM2y/0eKdRrCqxEm3EmeSB4P4q5+XMf/mf77E5QRsCsUujE3qdNq8J+vvcryR7F8XrvE0NxU/sif+M4+30/v8lrsYrUJqIkJv7XH87u+o3rEfoiTcQjcZM7noLX/Z/nosoF6mYii15G5H9eXR/V5Tav1B6mimaQw3HFHHeHagt9Is62N/buJm6H8MKHaiAWVc/sNNKMt9d+kt+b2Qt3R0l1NjHXpiL3BuMzT5MwvDgSXepqLn2roAM+B+c83W3xnhodU2ZaUxAe+lcvr2b8wi+PxKgsSFhHR1Rb6ps2puLqSf61UVXXHlLR1TETT7gL+mffguf5orCVjAoPAsS0i5KMcrDoHEnvND/FgnR0ICgVsSaVj5GO5HocnmWLA3Ayk5LsYvtvG/eurRVbtbP8sZWMjgJIM/8xMbOPBqr93KIoOeZa1XOndaWyG9C/0KYdo0m8XPgCLHTRWHr82yKR82Zn9h4n10Qncgj3VL9c9jicr4kBmsQzhufOaO9DQdqLniD4VW+mS/gAdOnELyxlx8U/naFq7q6s76vwQHgRQssYFdFbq5dPutH8vy+N1ATVZs5Of1aW6dme0nT0yny3BebX3nPpWBMr/v/R0nJ26n4agA==' },
+    ];
+    for (const ref of REF) {
+      const qr = encodeQr(ref.text, { ecc: ref.ecc, mask: ref.mask });
+      ok(qr.version === ref.v && pack(qr) === ref.bits,
+        `QR версии ${ref.v}-${ref.ecc} совпадает с эталонным до модуля`, `версия ${qr.version}`);
+    }
+  }
+
+  console.log('\n── документ живёт в своей фирме, а не в текущей ──');
+  {
+    /*
+     * Во всех проверках ниже документ выписан фирмой Б, а человек потом
+     * переключился на фирму А. Раньше в нескольких местах брали текущую
+     * фирму — и выходили: QR на чужой расчётный счёт, «оплачен» без
+     * погашения долга, акт с шапкой одной фирмы и строками другой.
+     */
+    const bdbF = require('./lib/bot-db');
+    const dsF = require('./lib/doc-service');
+    const { payQrSvg } = require('./lib/qr-pay');
+    const uF = bdbF.getOrCreateUser(779120, 'Двефирмы');
+    const bank = { bank_name: 'ПАО Сбербанк', bik: '044525225', corr_acc: '30101810400000000225' };
+    bdbF.saveMyOrg(uF.id, { name: 'ООО «Альфа»', inn: '7701234567', acc: '40702810900000000001', ...bank });
+    const fA = bdbF.getDefaultOrg(uF.id).id;
+    bdbF.updateOrg(uF.id, fA, { debt_basis: 'manual' });     // А: журнал ведёт человек
+    const fB = bdbF.createOrg(uF.id, { name: 'ООО «Бета»', inn: '7707083893', acc: '40702810900000000002', ...bank });
+    bdbF.updateOrg(uF.id, fB, { debt_basis: 'invoice' });    // Б: долг по счёту
+    const cpF = bdbF.createCp(uF.id, { name: 'ООО «Клиент»', kind: 'customer', opening_date: '2026-01-01' });
+
+    bdbF.setActiveOrg(uF.id, fB);
+    const sch = await dsF.issueDocument(uF.id, {
+      type: 'sch', cpId: cpF, items: [{ name: 'Аренда', qty: 1, price: 30000 }], skipQuota: true,
+    });
+    const docB = bdbF.getDoc(uF.id, sch.doc.id);
+    bdbF.setActiveOrg(uF.id, fA);                            // переключились на А
+
+    // 1. Платёжный QR счёта — на расчётный счёт ФИРМЫ СЧЁТА.
+    ok(bdbF.orgOfDoc(uF.id, docB).id === fB, 'фирма документа находится по документу, а не по выбору');
+    const { api: miniApi } = require('./miniapp');
+    const qr = await miniApi['GET /api/doc/qr']({
+      user: uF, url: new URL(`http://x/api/doc/qr?id=${docB.id}`),
+    });
+    const expect = (orgId) => payQrSvg({
+      org: bdbF.getOrg(uF.id, orgId), sum: docB.total, payer: 'ООО «Клиент»',
+      purpose: `Оплата по счёту № ${docB.number} от ${docB.date.split('-').reverse().join('.')}`,
+    }, { size: 200 });
+    ok(qr.svg && qr.svg === expect(fB), 'QR счёта ведёт на счёт фирмы Б, выписавшей его');
+    ok(qr.svg !== expect(fA), 'а не на счёт текущей фирмы А');
+
+    // 2. «Оплачен» гасит долг в фирме документа, по её правилам.
+    const debtBefore = bdbF.balanceOf(uF.id, cpF, fB).closing;
+    bdbF.markPaid(uF.id, docB.id);
+    const debtAfter = bdbF.balanceOf(uF.id, cpF, fB).closing;
+    ok(debtBefore === 30000 && debtAfter === 0,
+      'отметка «оплачен» погасила долг в фирме Б, хотя выбрана А', `${debtBefore} → ${debtAfter}`);
+
+    // 3. Акт сверки фирмы Б берёт журнал фирмы Б.
+    const actB = bdbF.cpForPeriod(uF.id, cpF, '', '', fB);
+    const actA = bdbF.cpForPeriod(uF.id, cpF, '', '');
+    ok(actB.ops.length > 0 && actA.ops.length === 0,
+      'акт по фирме Б строится из её операций, а не текущей', `${actB.ops.length} и ${actA.ops.length}`);
+  }
+
+  console.log('\n── бот не падает и не проводит дважды ──');
+  {
+    const bdbX = require('./lib/bot-db');
+    const recX = require('./lib/recurring');
+    const whoX = { id: 779130, first_name: 'Двойнойтап', username: 'dbl' };
+    const sayX = (t) => handleUpdate(tg, { message: { chat: { id: whoX.id }, from: whoX, text: t } });
+    const tapX = (d) => handleUpdate(tg,
+      { callback_query: { id: 'cb', from: whoX, data: d, message: { chat: { id: whoX.id } } } });
+    const uX = bdbX.getOrCreateUser(whoX.id, 'Двойнойтап');
+    bdbX.saveMyOrg(uX.id, { name: 'ИП Тапов', inn: '183112345678', acc: '40802810900000000009',
+      bank_name: 'ПАО Сбербанк', bik: '044525225', corr_acc: '30101810400000000225' });
+    bdbX.updateOrg(uX.id, bdbX.getDefaultOrg(uX.id).id, { debt_basis: 'invoice' });
+    const cpX = bdbX.createCp(uX.id, { name: 'ООО «Заря»', kind: 'customer', opening_date: '2026-01-01' });
+    const opsOf = () => bdbX.listOps(uX.id, cpX).filter((o) => o.kind === 'Оплата').length;
+    const keepEnv = ['AI_ENABLED', 'AI_MOCK', 'AI_PROVIDER'].map((k) => [k, process.env[k]]);
+
+    // 1. «Выпиши платёжку» от ассистента: раньше TypeError и тишина.
+    process.env.AI_ENABLED = '1';
+    process.env.AI_PROVIDER = process.env.AI_PROVIDER || 'gemini';
+    process.env.AI_MOCK = JSON.stringify({ action: 'draft', docType: 'pp', who: 'Заря', items: [{ name: 'Оплата', qty: 1, price: 5000 }] });
+    let crashed = '';
+    const mark = sent.length;
+    try { await sayX('выпиши платёжку Заре на 5000'); } catch (e) { crashed = e.message; }
+    ok(!crashed, 'просьба о платёжке не роняет бота', crashed);
+    ok(sent.length > mark, 'и человек получает ответ, а не тишину');
+    ok(!String(bdbX.getState(uX.id).state || '').startsWith('items:pp'),
+      'и сценарий позиций для платёжки не заводится', bdbX.getState(uX.id).state);
+    await tapX('menu');
+
+    // 2. Оплата по фразе с незнакомым плательщиком не уходит единственному клиенту.
+    process.env.AI_MOCK = JSON.stringify({ action: 'pay', who: 'Ромашка', amount: 50000, kind: 'Оплата' });
+    const opsBefore = opsOf();
+    await sayX('Ромашка заплатила 50000');
+    ok(opsOf() === opsBefore, 'оплата «Ромашки» не записана на «Зарю» только потому, что клиент один');
+
+    // 3. «✅ Внести» дважды — одна оплата. Ассистент выключен: бот готовит кнопку.
+    await require('./lib/doc-service').issueDocument(uX.id, {
+      type: 'sch', cpId: cpX, items: [{ name: 'Аренда', qty: 1, price: 50000 }], skipQuota: true,
+    });
+    bdbX.setAiEnabled(uX.id, false);
+    process.env.AI_MOCK = JSON.stringify({ action: 'pay', who: 'Заря', amount: 0, kind: 'Оплата' });
+    await sayX('Заря оплатила');
+    const payBtn = ((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.callback_data)
+      .find((d) => /^pay\.cp:/.test(d || ''));
+    const before3 = opsOf();
+    if (payBtn) { await tapX(payBtn); await tapX(payBtn); }
+    ok(Boolean(payBtn), 'кнопка внесения оплаты нарисована', ((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.text).join('|'));
+    ok(opsOf() === before3 + 1, 'двойное нажатие «внести» провело оплату один раз', opsOf() - before3);
+
+    // 4. Переплата не предлагается к внесению как долг.
+    bdbX.addOp(uX.id, cpX, { date: '2026-02-01', kind: 'Оплата', debit: 30000 });   // переплатили
+    ok(bdbX.balanceOf(uX.id, cpX).closing < 0, 'у клиента переплата');
+    await sayX('Заря оплатила снова');
+    ok(!/Внести|Да, /.test(((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.text).join('|')),
+      'переплату внести «как оплату» бот не предлагает', last().slice(0, 60));
+    for (const [k, v] of keepEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+
+    // 4а. Ассистент и накладная на два наименования: жалоба «сказал два наименования,
+    // а сумма совсем другая». Включённый ассистент, фраза с перечислением.
+    {
+      bdbX.setAiEnabled(uX.id, true);
+      process.env.AI_ENABLED = '1';
+      process.env.AI_PROVIDER = process.env.AI_PROVIDER || 'gemini';
+      const nowDocs = () => bdbX.listDocs(uX.id, 5000).filter((d) => d.type === 'torg12');
+      const take = () => nowDocs().map((d) => d.id);
+      // правила разбирают сами: «два наименования» — не позиция за 2 ₽
+      process.env.AI_MOCK = JSON.stringify({ action: 'unknown' });
+      const b0 = take();
+      await sayX('выпиши накладную Заре на два наименования: кабель два по полторы тысячи и розетки пять по триста');
+      const made = nowDocs().filter((d) => !b0.includes(d.id));
+      ok(made.length === 1 && Math.round(made[0].total) === 4500,
+        'А1: «два наименования» — накладная на две позиции, 4 500 ₽, а не 4 502', made.map((d) => d.total).join(','));
+      ok(made[0] && (made[0].payload.items || []).length === 2 && !(made[0].payload.items || []).some((i) => /наименован/i.test(i.name)),
+        'А1: слово «наименования» в позиции не попало', JSON.stringify((made[0] || {}).payload));
+
+      // фраза, которую правила не берут: отвечает модель. Верный ответ — только со сводкой.
+      const phrase = 'выпиши торг 12 Заре кабель 2 штуки 1500 розетка 5 штук 300';
+      process.env.AI_MOCK = JSON.stringify({ action: 'draft', docType: 'torg12', who: 'Заря', items: [
+        { name: 'Кабель', qty: 2, price: 1500 }, { name: 'Розетка', qty: 5, price: 300 }] });
+      const b1 = take();
+      await sayX(phrase);
+      ok(take().length === b1.length, 'А2: позиции от модели сразу не выписываются — сначала сводка',
+        take().length - b1.length);
+      ok(String(bdbX.getState(uX.id).state || '').startsWith('items:torg12'),
+        'А2: и человек видит сводку «Всё верно?»', bdbX.getState(uX.id).state);
+      await tapX('menu');
+
+      // модель перепутала цены местами: числа все названы, но не в том порядке
+      process.env.AI_MOCK = JSON.stringify({ action: 'draft', docType: 'torg12', who: 'Заря', items: [
+        { name: 'Кабель', qty: 2, price: 300 }, { name: 'Розетка', qty: 5, price: 1500 }] });
+      const b2 = take();
+      await sayX(phrase);
+      const st2 = bdbX.getState(uX.id);
+      ok(take().length === b2.length && !((st2.data || {}).items || []).length,
+        'А3: перепутанные цены модели не принимаются — ни документа, ни позиций',
+        JSON.stringify((st2.data || {}).items));
+      await tapX('menu');
+
+      // итог во фразе не сходится с позициями
+      process.env.AI_MOCK = JSON.stringify({ action: 'draft', docType: 'torg12', who: 'Заря', items: [
+        { name: 'Кабель', qty: 2, price: 1500 }, { name: 'Розетка', qty: 5, price: 300 }] });
+      const b3 = take();
+      await sayX('выпиши торг 12 Заре кабель 2 штуки 1500 розетка 5 штук 300 итого 5000');
+      const st3 = bdbX.getState(uX.id);
+      ok(take().length === b3.length && !((st3.data || {}).items || []).length,
+        'А4: «итого 5000» при позициях на 4 500 — не выписываем, спрашиваем', JSON.stringify((st3.data || {}).items));
+      await tapX('menu');
+      bdbX.setAiEnabled(uX.id, false);
+      for (const [k, v] of keepEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    }
+
+    // 5. «✅ Выписать» по напоминанию дважды — один документ.
+    const rid = recX.add(uX.id, { cpId: cpX, type: 'sch', day: 1, items: [{ name: 'Аренда', qty: 1, price: 1000 }] });
+    const docs0 = bdbX.listDocs(uX.id, 100).length;
+    await tapX(`rec.go:${rid}:2026-09`);
+    await tapX(`rec.go:${rid}:2026-09`);
+    ok(bdbX.listDocs(uX.id, 100).length === docs0 + 1, 'два нажатия «Выписать» — один документ',
+      bdbX.listDocs(uX.id, 100).length - docs0);
+    await tapX(`rec.go:${rid}:2026-10`);
+    ok(bdbX.listDocs(uX.id, 100).length === docs0 + 2, 'а напоминание за следующий месяц выписывает');
+
+    // 6. Догонялка «последнего дня» не съедает текущий месяц.
+    const lastRid = recX.add(uX.id, { cpId: cpX, type: 'usl', day: recX.LAST_DAY, items: [{ name: 'Акт', qty: 1, price: 1 }] });
+    const sep5 = new Date(2026, 8, 5, 12);
+    const sep30 = new Date(2026, 8, 30, 12);
+    recX.markOffered(uX.id, lastRid, undefined, '2026-07');   // конец августа пропущен
+    const r6 = () => recX.list(uX.id).find((r) => r.id === lastRid);
+    ok(recX.isDue(r6(), sep5) && recX.offerMonth(r6(), sep5) === '2026-08',
+      'пятого сентября догоняется август', recX.offerMonth(r6(), sep5));
+    recX.markOffered(uX.id, lastRid, sep5, recX.offerMonth(r6(), sep5));
+    ok(recX.isDue(r6(), sep30), 'и тридцатого сентября сентябрь всё равно предлагается', r6().last_offer);
+    recX.off(uX.id, lastRid);
+    recX.off(uX.id, rid);
+  }
+
+  console.log('\n── ассистент: напомнить, повторить, период и дата из фразы ──');
+  {
+    /*
+     * Фраза превращается в действие бота: «напомни Вектору» — текст и кнопка
+     * (письмо только по нажатию), «повтори» — сводка на проверку, период и
+     * дата из фразы не переспрашиваются. Время — настоящее: «вчера» и
+     * «прошлый месяц» считаем теми же функциями, что и разбор.
+     */
+    const bdbW = require('./lib/bot-db');
+    const dsW = require('./lib/doc-service');
+    const perW = require('./lib/period');
+    const mailerW = require('./lib/mail');
+    const mailboxW = require('./lib/mailbox');
+    const whoW = { id: 779150, first_name: 'Ассистент', username: 'asst' };
+    const sayW = (t) => handleUpdate(tg, { message: { chat: { id: whoW.id }, from: whoW, text: t } });
+    const tapW = (d) => handleUpdate(tg,
+      { callback_query: { id: 'cb', from: whoW, data: d, message: { chat: { id: whoW.id } } } });
+    const uW = bdbW.getOrCreateUser(whoW.id, 'Ассистент');
+    bdbW.saveMyOrg(uW.id, { name: 'ИП Помощников', inn: '183112345678', acc: '40802810900000000009',
+      bank_name: 'ПАО Сбербанк', bik: '044525225', corr_acc: '30101810400000000225' });
+    bdbW.updateOrg(uW.id, bdbW.getDefaultOrg(uW.id).id, { debt_basis: 'invoice' });
+    const cpZ = bdbW.createCp(uW.id, { name: 'ООО «Заря»', kind: 'customer', opening_date: '2026-01-01' });
+    const cpV = bdbW.createCp(uW.id, { name: 'ООО «Вектор»', kind: 'customer', opening_date: '2026-01-01', email: 'buh@vektor.ru' });
+    const cpL = bdbW.createCp(uW.id, { name: 'ООО «Лотос»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbW.createCp(uW.id, { name: 'ООО «Лотос-Опт»', kind: 'customer', opening_date: '2026-01-01' });
+    const yest = perW.iso(new Date(perW.todayDate().getTime() - 86400000));
+    const today = perW.todayISO();
+    const pm = perW.presetRange('pm');
+    const inPm = `${pm.from.slice(0, 8)}10`;                    // 10-е число прошлого месяца
+    const issue = (type, cpId, price, date) => dsW.issueDocument(uW.id, {
+      type, cpId, items: [{ name: 'Работа', qty: 1, price }], date, skipQuota: true });
+
+    // Письма не уходят нигде, кроме нажатой кнопки: считаем обращения к почте.
+    let mails = 0;
+    const realSend = mailerW.sendMail;
+    mailerW.sendMail = async () => { mails += 1; return { ok: true }; };
+    await mailboxW.save(uW.id, { preset: 'custom', login: 'ip@pomoshnikov.ru', pass: 'пароль',
+      host: '127.0.0.1', port: 2525 });
+
+    const schZ = await issue('sch', cpZ, 30000, yest);
+    bdbW.markPaid(uW.id, schZ.doc.id);                          // счёт Заре вчера, уже оплачен
+    const schV = await issue('sch', cpV, 12000, inPm);          // Вектор должен с прошлого месяца
+    const tnV = await issue('torg12', cpV, 5000, yest);         // единственная накладная «вчера»
+
+    // ---------- напомнить ----------
+    let mark = sent.length;
+    await sayW('напомни Вектору про долг');
+    const remText = sent.slice(mark).map((m) => m.text).join('\n');
+    ok(/Напоминание: ООО «Вектор»/.test(remText), '«напомни Вектору про долг» → напоминание именно ему', remText.slice(0, 80));
+    ok(/числится задолженность|не отмечена оплата|не погашена/.test(remText), 'текст письма показан');
+    const sendBtnW = buttonSince(mark, 'Отправить на buh@vektor.ru');
+    ok(Boolean(sendBtnW) && /^rm\.mail:/.test(sendBtnW), 'и кнопка отправки на почту клиента', sendBtnW);
+    ok(mails === 0, 'сама фраза письмо не отправила', mails);
+    bdbW.setAiEnabled(uW.id, false);
+    await sayW('пни вектора по оплате');
+    ok(mails === 0, 'и при выключенном ассистенте тоже', mails);
+    bdbW.setAiEnabled(uW.id, true);
+    await sayW('напомни Вектору про долг');
+    ok(mails === 0, 'и при включённом — письмо только по кнопке', mails);
+    await tapW(sendBtnW);
+    ok(mails === 1 && last().includes('Отправлено на'), 'нажатие отправило ровно одно письмо', `${mails} · ${last().slice(0, 40)}`);
+
+    mark = sent.length;
+    await sayW('напомни заре об оплате');
+    ok(/долга нет/.test(last()), 'клиенту без долга напоминать не о чем — так и сказано', last().slice(0, 60));
+    mark = sent.length;
+    await sayW('напомни лотосу про долг');
+    ok(last().includes('Кого именно') && Boolean(button('Лотос-Опт')) && Boolean(button('ООО «Лотос»')),
+      'два похожих клиента — переспрос с обоими', last().slice(0, 60));
+    ok(/^rm\.one:/.test(button('Лотос-Опт')) && mails === 1, 'кнопки ведут к напоминанию, письмо не ушло', mails);
+    await sayW('напомни ромашке про долг');
+    ok(last().includes('у вас нет') && Boolean(button('Вектор')), 'незнакомый клиент — сказано, и предложены должники', last().slice(0, 60));
+    await sayW('отправь напоминание');
+    ok(last().includes('Кому напомнить') && Boolean(button('Вектор')), 'кому — не названо: бот спрашивает', last().slice(0, 60));
+    mark = sent.length;
+    await sayW('напомни всем должникам');
+    ok(sent.slice(mark).some((m) => /числится задолженность|не отмечена оплата|не погашена/.test(m.text || '')) && mails === 1,
+      '«всем должникам» — тексты на каждого, писем нет', mails);
+    await sayW('напомни мне завтра позвонить');
+    ok(!/Напоминание:/.test(last()), '«напомни мне» — не про клиентов, должнику не пишем', last().slice(0, 50));
+
+    // ---------- повторить ----------
+    const docsBefore = () => bdbW.listDocs(uW.id, 200).length;
+    const n0 = docsBefore();
+    await sayW('повтори последний счёт Заре');
+    let stR = bdbW.getState(uW.id);
+    ok(/Повторяю/.test(sent.slice(-2).map((m) => m.text).join(' ')) && stR.state === `items:sch:${cpZ}`,
+      '«повтори последний счёт Заре» → сводка повтора счёта Заре', stR.state);
+    ok(stR.data.date === today && Number(stR.data.number) > Number(schZ.doc.number),
+      'дата сегодняшняя, номер новый', `${stR.data.date} № ${stR.data.number}`);
+    ok(docsBefore() === n0, 'документ показан на проверку, а не выписан', docsBefore() - n0);
+    ok(Boolean(button('Сформировать')), 'выпускает кнопка «Сформировать»', sent[sent.length - 1].kb.flat().map((b) => b.text).join('|'));
+    await tapW('doc.make');
+    const fresh = bdbW.listDocs(uW.id, 1)[0];
+    ok(docsBefore() === n0 + 1 && fresh.type === 'sch' && fresh.cp_id === cpZ && fresh.id !== schZ.doc.id,
+      'после нажатия выписан новый счёт тому же клиенту', JSON.stringify([fresh.type, fresh.cp_id]));
+    ok(fresh.date === today && !fresh.paid_at, 'с сегодняшней датой и без отметки об оплате (у исходного она есть)',
+      `${fresh.date} paid=${fresh.paid_at}`);
+    ok(Boolean(bdbW.getDoc(uW.id, schZ.doc.id).paid_at), 'исходный счёт остался оплаченным');
+    ok(bdbW.listOps(uW.id, cpZ).filter((o) => o.kind === 'Оплата').length === 1,
+      'оплата не скопировалась: проводка «Оплата» по-прежнему одна');
+    bdbW.clearState(uW.id);
+
+    await sayW('повтори вчерашнюю накладную');
+    stR = bdbW.getState(uW.id);
+    ok(stR.state === `items:torg12:${cpV}` && stR.data.items.length === 1 && stR.data.items[0].price === 5000,
+      '«повтори вчерашнюю накладную» → накладная Вектору с теми же позициями', stR.state);
+    bdbW.clearState(uW.id);
+
+    mark = sent.length;
+    await sayW('повтори вчерашний счёт Вектору');
+    ok(!bdbW.getState(uW.id).state && /Последний — /.test(last()) && Boolean(button('Повторить №')),
+      'вчера у Вектора счёта не было — выбранный другой не подсовывается, он предложен кнопкой', last().slice(0, 90));
+    ok(button('Повторить №') === `d.rep:${schV.doc.id}`, 'и это его последний счёт', button('Повторить №'));
+
+    await issue('torg12', cpZ, 7000, yest);                     // теперь накладных «вчера» две
+    await sayW('повтори вчерашнюю накладную');
+    ok(last().includes('несколько') && Boolean(button('Вектор')) && Boolean(button('Заря')) && !bdbW.getState(uW.id).state,
+      'две накладные за вчера — человек выбирает, какую', last().slice(0, 60));
+    await tapW(button('Заря'));
+    ok(bdbW.getState(uW.id).state === `items:torg12:${cpZ}`, 'выбор открывает сводку этой накладной');
+    bdbW.clearState(uW.id);
+
+    await sayW('повтори последний счёт лотосу');
+    ok(last().includes('Кого именно') && Boolean(button('Лотос-Опт')), 'неоднозначный клиент — переспрос', last().slice(0, 50));
+    await sayW('повтори счёт Ромашке');
+    ok(last().includes('у вас нет') && !bdbW.getState(uW.id).state, 'незнакомый клиент — повторять нечего', last().slice(0, 50));
+    await sayW('повтори платёжку заре');
+    ok(/не получится/.test(last()), 'платёжку и договор повторить нельзя — сказано словами', last().slice(0, 50));
+    mark = sent.length;
+    await sayW('повтори');
+    ok(last().includes('Последние документы') && sent.slice(mark).some((m) => /Какой документ повторить/.test(m.text)),
+      '«повтори» без слов о том, что — журнал с кнопками 🔁', last().slice(0, 50));
+    bdbW.clearState(uW.id);
+
+    // ---------- период ----------
+    bdbW.setAiEnabled(uW.id, true);
+    const fCount = () => files.filter((f) => /Акт_сверки/.test(f.filename)).length;
+    const f0 = fCount();
+    mark = sent.length;
+    await sayW('акт сверки с зарёй за прошлый месяц');
+    ok(fCount() === f0 + 1, 'период назван — акт собран сразу, без вопроса «за какой период»', fCount() - f0);
+    ok(!sent.slice(mark).some((m) => /За какой период/.test(m.text || '')), 'вопроса о периоде не было');
+    const akt = files[files.length - 1];
+    ok((akt.caption || '').includes(`${pm.from.slice(8)}.${pm.from.slice(5, 7)}.${pm.from.slice(0, 4)}`)
+      && (akt.caption || '').includes(`${pm.to.slice(8)}.${pm.to.slice(5, 7)}.${pm.to.slice(0, 4)}`),
+    'в акте период из фразы — прошлый месяц', akt.caption);
+    ok(button('Другой период') === `d.akt:${cpZ}`, 'под актом есть «Другой период»', button('Другой период'));
+    await tapW(button('Другой период'));
+    ok(last().includes('За какой период') && Boolean(button('Этот квартал')), '«Другой период» открывает выбор периодов');
+
+    bdbW.setAiEnabled(uW.id, false);
+    const f1 = fCount();
+    await sayW('акт сверки с вектором за прошлый месяц');
+    ok(fCount() === f1 && Boolean(button('Собрать акт')), 'ассистент выключен: акт предложен кнопкой, не собран', fCount() - f1);
+    await tapW(button('Собрать акт'));
+    ok(fCount() === f1 + 1 && /Вектор/.test((files[files.length - 1].caption || '')), 'нажатие собирает акт за названный период');
+    bdbW.setAiEnabled(uW.id, true);
+
+    await sayW('акт сверки за прошлый месяц');
+    ok(last().includes('С кем сверяемся') && last().includes('за прошлый месяц'.replace('прошлый месяц', perW.periodTitle(pm.from, pm.to))),
+      'клиент не назван — спрашиваем только его, период помним', last().slice(0, 70));
+    const f2 = fCount();
+    await tapW(button('Вектор'));
+    ok(fCount() === f2 + 1 && !/За какой период/.test(last()), 'выбор клиента сразу собирает акт за этот период');
+    await sayW('акт сверки с лотосом за прошлый месяц');
+    ok(last().includes('Кого именно') && /^akt\.r:/.test(button('Лотос-Опт')), 'похожие клиенты — переспрос, кнопки несут период', button('Лотос-Опт'));
+    await sayW('акт сверки с зарёй');
+    ok(last().includes('За какой период'), 'период не назван — спрашиваем, как и раньше');
+
+    // журнал и неоплаченные за период
+    await sayW('покажи документы за прошлый месяц');
+    ok(last().includes('Документы за') && last().includes(perW.periodTitle(pm.from, pm.to)) && Boolean(button(`№ ${schV.doc.number}`)),
+      '«документы за прошлый месяц» → журнал за этот месяц, без вопросов', last().slice(0, 60));
+    ok(!sent[sent.length - 1].kb.flat().some((b) => b.callback_data === `doc:${schZ.doc.id}`),
+      'документ другого месяца в нём не показан');
+    ok(Boolean(button('Другой период')) && /^reg\.r:/.test(button('Реестр за эти даты')), 'есть «Другой период» и реестр за эти даты');
+    mark = sent.length;
+    await tapW(button('Реестр за эти даты'));
+    ok(files[files.length - 1].filename.startsWith('Реестр_') && files[files.length - 1].filename.includes(pm.from),
+      'реестр собран за те же даты', files[files.length - 1].filename);
+    await sayW('покажи неоплаченные счета за прошлый месяц');
+    ok(last().includes('Ждут оплаты за') && /12\s?000/.test(last()), '«неоплаченные за прошлый месяц» → только его счёт на 12 000', last().slice(0, 80));
+    ok(Boolean(button(`№ ${schV.doc.number}`)) && !sent[sent.length - 1].kb.flat().some((b) => b.callback_data === `doc:${tnV.doc.id}`),
+      'накладная этого месяца в списке за прошлый не показана');
+    await sayW('документы за 2020 год');
+    ok(last().includes('документов нет'), 'за пустой период честно сказано, что пусто', last().slice(0, 50));
+    await tapW('lp.pick:docs');
+    ok(Boolean(button('Свой период')) && Boolean(button('Этот год')), '«Другой период» для списка — те же кнопки');
+    await tapW(button('Этот год'));
+    ok(last().includes('Документы за') && Boolean(button(`№ ${tnV.doc.number}`)), 'и год показывает документы этого года');
+    await tapW('lp.own:docs');
+    await sayW('не период');
+    ok(last().includes('Не понял период') && bdbW.getState(uW.id).state === 'lp:docs', 'свой период: мусор отклонён, состояние ждёт');
+    await sayW('сентябрь 2025');
+    ok(/За сентябрь 2025/.test(last()) && !bdbW.getState(uW.id).state, 'свой период текстом принят и показан', last().slice(0, 50));
+
+    // ---------- дата ----------
+    const opsOfZ = () => bdbW.listOps(uW.id, cpZ);
+    await issue('sch', cpZ, 9000, yest);
+    await sayW('вчера Заря оплатила 5000');
+    const opZ = opsOfZ().find((o) => o.kind === 'Оплата' && Number(o.debit) === 5000);
+    ok(opZ && opZ.date === yest, '«вчера Заря оплатила 5000» → оплата внесена вчерашним числом',
+      JSON.stringify(opZ));
+    ok(last().includes(yest.split('-').reverse().join('.')), 'и в ответе стоит эта дата', last().slice(0, 70));
+    bdbW.setAiEnabled(uW.id, false);
+    const opsN = opsOfZ().length;
+    await sayW('вчера Заря оплатила 1000');
+    ok(opsOfZ().length === opsN && last().includes(yest.split('-').reverse().join('.')),
+      'ассистент выключен: оплата с датой готовится, но не вносится', last().slice(0, 70));
+    const payB = button('Внести');
+    ok(/:\d{8}$/.test(payB), 'дата едет в кнопке', payB);
+    await tapW(payB);
+    const opZ2 = opsOfZ().find((o) => o.kind === 'Оплата' && Number(o.debit) === 1000);
+    ok(opsOfZ().length === opsN + 1 && opZ2 && opZ2.date === yest, 'нажатие вносит оплату вчерашним числом', JSON.stringify(opZ2));
+    bdbW.setAiEnabled(uW.id, true);
+    const opsF = opsOfZ().length;
+    await sayW('Заря оплатила пять тысяч завтра');
+    ok(opsOfZ().length === opsF && last().includes('ещё впереди'),
+      'дата из будущего: даже включённый ассистент не вносит сам, а просит проверить', last().slice(0, 80));
+    ok(/:\d{8}$/.test(button('Внести')), 'кнопка с датой на месте');
+
+    const nD = docsBefore();
+    await sayW('выставь счёт заре на пять тысяч вчерашним числом');
+    const dd = bdbW.listDocs(uW.id, 1)[0];
+    ok(docsBefore() === nD + 1 && dd.date === yest && dd.total === 5000,
+      'дата документа из фразы: счёт выписан вчерашним числом', `${dd.date} ${dd.total}`);
+    await sayW('выставь счёт заре на пять тысяч завтрашним числом');
+    ok(docsBefore() === nD + 1 && bdbW.getState(uW.id).state === `items:sch:${cpZ}`
+      && bdbW.getState(uW.id).data.date > today,
+    'дата документа из будущего: показан на проверку, сам не выписан');
+    bdbW.clearState(uW.id);
+
+    mailerW.sendMail = realSend;
+    mailboxW.remove(uW.id);
+    ok(mails === 1, 'за весь блок ушло ровно одно письмо — то, что подтвердили кнопкой', mails);
+  }
+
+  console.log('\n── обрыв ответа Telegram не вешает бота ──');
+  {
+    /*
+     * Заголовки пришли, тело оборвалось. Раньше промис не завершался никогда:
+     * ни 'end', ни 'error' — цикл опроса вставал, бот молчал до перезапуска.
+     */
+    const httpT = require('node:http');
+    const { Telegram } = require('./lib/tg');
+    const srv = httpT.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '1000' });
+      res.write('{"ok":true,"result":[');
+      setTimeout(() => req.socket.destroy(), 50);
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const tgT = new Telegram('x');
+    tgT.base = `http://127.0.0.1:${srv.address().port}/botx`;
+    const outcome = await Promise.race([
+      tgT.call('getMe').then(() => 'ответ', (e) => `ошибка: ${e.message}`),
+      new Promise((r) => setTimeout(() => r('ЗАВИС'), 5000)),
+    ]);
+    ok(outcome !== 'ЗАВИС', 'оборванный ответ заканчивается ошибкой, а не вечным ожиданием', outcome);
+    await new Promise((r) => srv.close(r));
+  }
+
+  console.log('\n── номера документов не задваиваются ──');
+  {
+    const dbx = require('./db').db;
+    const bdb = require('./lib/bot-db');
+    const uidN = fxUserId();
+    // Ряд номеров принадлежит организации, поэтому вставляем с её id.
+    const orgN = bdb.getDefaultOrg(uidN);
+    const doc = (seq, orgId = orgN.id) => dbx.prepare(`
+      INSERT INTO documents(user_id, org_id, cp_id, type, number, seq, year, date, total, payload, created_at)
+      VALUES(?,?,0,'sch',?,?,2031,'2031-03-01',100,'','2031-03-01')`).run(uidN, orgId, String(seq), seq);
+
+    doc(1);
+    let blocked = false;
+    try { doc(1); } catch (e) { blocked = require('./lib/bot-db').isSeqTaken(e); }
+    ok(blocked, 'второй документ с тем же номером база не принимает');
+    doc(2);
+    ok(bdb.nextSeqForOrg(orgN.id, 'sch', 2031) === 3, 'следующий номер считается от занятых',
+      bdb.nextSeqForOrg(orgN.id, 'sch', 2031));
+
+    /*
+     * Вторая организация ведёт СВОЙ ряд и начинает с единицы.
+     *
+     * Раньше ряд был общий на человека: MAX(seq) WHERE user_id, а уникальность
+     * стояла на (user_id, type, year, seq). Значит вторая фирма не могла иметь
+     * свой счёт № 1 — база его не принимала, — а её первый счёт продолжал
+     * чужой ряд и выходил, скажем, третьим. Куда делись первые два, объяснять
+     * инспекции пришлось бы владельцу: сквозная нумерация ведётся юрлицом, и
+     * дыра в ней — это вопрос к нему, а не к нам.
+     */
+    const org2 = bdb.createOrg(uidN, { name: 'ООО «Вторая»', inn: '7707083893' });
+    ok(bdb.nextSeqForOrg(org2, 'sch', 2031) === 1,
+      'у второй организации свой ряд — начинается с единицы',
+      bdb.nextSeqForOrg(org2, 'sch', 2031));
+    let secondOk = true;
+    try { doc(1, org2); } catch (_) { secondOk = false; }
+    ok(secondOk, 'и её счёт № 1 база принимает, хотя единица у первой уже занята');
+    ok(bdb.nextSeqForOrg(orgN.id, 'sch', 2031) === 3,
+      'при этом ряд первой организации не сдвинулся',
+      bdb.nextSeqForOrg(orgN.id, 'sch', 2031));
+
+    // Занятость номера тоже спрашивается по организации: «счёт № 2» у одной
+    // фирмы ничем не мешает счёту № 2 у другой.
+    ok(bdb.numberTakenInOrg(orgN.id, 'sch', 2031, '2'), 'номер занят у той, кто его выписал');
+    ok(!bdb.numberTakenInOrg(org2, 'sch', 2031, '2'), 'и свободен у соседней организации');
+
+    // Выписка двух документов одновременно: номер берётся до сборки файла,
+    // и раньше оба получали одинаковый. Теперь второй пересобирается.
+    const ds = require('./lib/doc-service');
+    const cpN = bdb.listCps(uidN)[0];
+    const two = await Promise.all([
+      ds.issueDocument(uidN, { type: 'sch', cpId: cpN.id, items: [{ name: 'Раз', qty: 1, price: 10 }], skipQuota: true }),
+      ds.issueDocument(uidN, { type: 'sch', cpId: cpN.id, items: [{ name: 'Два', qty: 1, price: 20 }], skipQuota: true }),
+    ]);
+    ok(two.every((r) => r.ok), 'оба документа выписались', two.map((r) => r.ok).join());
+    const nums = two.map((r) => (r.doc || {}).number);
+    ok(nums[0] !== nums[1], 'и номера у них разные', nums.join(' и '));
+
+    dbx.prepare("DELETE FROM documents WHERE user_id = ? AND year = 2031").run(uidN);
+  }
+
+  console.log('\n── резервные копии ──');
+  {
+    const os = require('node:os');
+    const dir = path.join(os.tmpdir(), `bk-${process.pid}`);
+    process.env.BACKUP_DIR = dir;
+    delete require.cache[require.resolve('./backup')];
+    const backup = require('./backup');
+
+    const r1 = await backup.makeBackup();
+    ok(fs.existsSync(r1.file) && r1.size > 0, 'копия создана', `${Math.round(r1.size / 1024)} КБ`);
+    ok(r1.file.endsWith('.db.gz'), 'копия сжата', path.basename(r1.file));
+    // В копии вся база — читать её может только владелец.
+    ok((fs.statSync(r1.file).mode & 0o077) === 0 && (fs.statSync(dir).mode & 0o077) === 0,
+      'копия и каталог закрыты от остальных пользователей сервера',
+      `${(fs.statSync(r1.file).mode & 0o777).toString(8)} / ${(fs.statSync(dir).mode & 0o777).toString(8)}`);
+    ok(!fs.readdirSync(dir).some((f) => f.startsWith('.tmp-')), 'временных файлов не осталось');
+
+    /*
+     * Оборванная запись не выдаёт себя за копию. Ломаем сжатие посередине —
+     * раньше под итоговым именем оставался обрезок, и список считал его
+     * копией.
+     */
+    {
+      const keepWs = fs.createWriteStream;
+      const { Writable } = require('node:stream');
+      // Первый же кусок архива — «кончилось место»; файл при этом уже создан.
+      fs.createWriteStream = (f, o) => {
+        fs.writeFileSync(f, 'обрезок', o);
+        return new Writable({ write(c, e, cb) { cb(new Error('кончилось место')); } });
+      };
+      const listBefore = backup.list().length;
+      let failed = '';
+      try { await backup.makeBackup(); } catch (e) { failed = e.message; } finally { fs.createWriteStream = keepWs; }
+      ok(failed && backup.list().length === listBefore, 'оборванная копия в список не попала',
+        `${failed || 'не упала'}; копий ${backup.list().length}`);
+      ok(!fs.readdirSync(dir).some((f) => f.startsWith('.tmp-')), 'и обрезков не осталось',
+        fs.readdirSync(dir).join(', '));
+    }
+
+    // Главное: из копии должна открываться рабочая база с теми же данными.
+    const zlib = require('node:zlib');
+    const restored = path.join(dir, 'restored.db');
+    fs.writeFileSync(restored, zlib.gunzipSync(fs.readFileSync(r1.file)));
+    const { DatabaseSync } = require('node:sqlite');
+    const d = new DatabaseSync(restored);
+    ok(d.prepare('PRAGMA integrity_check').get().integrity_check === 'ok',
+      'восстановленная база цела');
+    const docsIn = d.prepare('SELECT COUNT(*) AS n FROM documents').get().n;
+    const cpsIn = d.prepare('SELECT COUNT(*) AS n FROM counterparties').get().n;
+    ok(docsIn > 0 && cpsIn > 0, 'в копии есть документы и контрагенты', `${docsIn} и ${cpsIn}`);
+    ok(d.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table'").get().n > 5,
+      'схема перенеслась целиком');
+
+    ok(backup.list().length === 1, 'копия видна в списке');
+
+    // Проверяем не только количество: «node backup.js --list» печатает дату,
+    // и однажды она потерялась по дороге — список падал на живом сервере,
+    // хотя сами копии снимались нормально.
+    const row = backup.list()[0];
+    ok(row.mtime instanceof Date && Number.isFinite(row.mtime.getTime()),
+      'у копии в списке есть дата', row.mtime && row.mtime.toISOString());
+    ok(row.size > 0 && Number.isFinite(row.mtimeMs), 'размер и время читаются');
+    const line = backup.listLine(row);
+    ok(line.includes(row.name) && /\d{2}\.\d{2}\.\d{4}/.test(line),
+      'строка списка печатается целиком', line.trim());
+
+    // Старые копии удаляются, но последние три остаются при любой настройке:
+    // если бот молчал месяц, они — единственное, что есть.
+    process.env.BACKUP_KEEP = '0';
+    for (let i = 0; i < 4; i += 1) {
+      const f = path.join(dir, `trapeza-2020-01-0${i + 1}-1200.db.gz`);
+      fs.writeFileSync(f, 'старьё');
+      fs.utimesSync(f, new Date('2020-01-01'), new Date('2020-01-01'));
+    }
+    const before = backup.list().length;
+    const removed = backup.prune();
+    ok(removed.length > 0, 'старые копии удаляются', `убрано ${removed.length} из ${before}`);
+    ok(backup.list().length === 3, 'последние три копии сохраняются всегда',
+      backup.list().length);
+
+    fs.rmSync(dir, { recursive: true, force: true });
+    delete process.env.BACKUP_DIR;
+    delete process.env.BACKUP_KEEP;
+  }
+
+  console.log('\n── клиент Telegram не вешается ──');
+  {
+    // Поднимаем свой «Telegram»: настоящий отвечает по-разному, а нам нужно
+    // проверить именно поведение клиента на 429 и на молчание.
+    const http = require('node:http');
+    const { Telegram } = require('./lib/tg');
+    let mode = 'slow';
+    const fake = http.createServer((req, res) => {
+      if (mode === 'silent') return;                       // не отвечаем вовсе
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error_code: 429,
+        description: 'Too Many Requests', parameters: { retry_after: mode === 'slow' ? 3600 : 1 } }));
+    });
+    await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+    const tgc = new Telegram('test-token');
+    tgc.base = `http://127.0.0.1:${fake.address().port}/bot`;
+
+    // Смена имени бота ограничена сутками: Telegram отвечает «подождите час».
+    // Раньше клиент честно засыпал — и установка вставала намертво.
+    const started = Date.now();
+    const err = await tgc.call('setMyName', { name: 'X' }).then(() => null, (e) => e);
+    ok(err && err.code === 429 && Date.now() - started < 2000,
+      'на «подождите час» клиент не засыпает, а сдаётся сразу', `${Date.now() - started} мс`);
+    ok(err && /подождать 60 мин/.test(err.message), 'в ошибке видно, сколько ждать', err.message);
+
+    // Молчащий сервер: без таймаута вызов висел бы вечно.
+    mode = 'silent';
+    const t0 = Date.now();
+    const hung = await tgc.call('getMe', { timeout: 0 }, 3).then(() => null, (e) => e);
+    fake.close();
+    ok(hung && hung.network, 'молчание сервера — ошибка, а не бесконечное ожидание', hung && hung.message);
+    ok(Date.now() - t0 < 60000, 'ожидание ограничено', `${Math.round((Date.now() - t0) / 1000)} с`);
+
+    /*
+     * Скачивание файла. Шло встроенным fetch без повторов, и на боевом
+     * сервере первая же оборванная попытка давала «fetch failed»: выписка,
+     * присланная в чат, роняла обработку. Первое соединение за файлом здесь
+     * рвём — клиент обязан повторить и получить файл целиком.
+     */
+    let fileHits = 0;
+    const files2 = http.createServer((req, res) => {
+      if (req.url.includes('/getFile')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, result: { file_path: 'documents/v.xlsx', file_size: 11 } }));
+        return;
+      }
+      if (req.url.startsWith('/file/bottest-token/documents/v.xlsx')) {
+        fileHits += 1;
+        if (fileHits === 1) { req.socket.destroy(); return; }
+        res.writeHead(200);
+        res.end('байты файла');
+        return;
+      }
+      res.writeHead(404); res.end();
+    });
+    await new Promise((r) => files2.listen(0, '127.0.0.1', r));
+    const tgf = new Telegram('test-token');
+    tgf.base = `http://127.0.0.1:${files2.address().port}/bottest-token`;
+    const got = await tgf.downloadFile('f1').then((b) => b, (e) => e);
+    ok(Buffer.isBuffer(got) && got.toString() === 'байты файла' && fileHits === 2,
+      'оборванное скачивание повторяется, и файл приходит целиком', Buffer.isBuffer(got) ? `попыток ${fileHits}` : got.message);
+    files2.close();
+  }
+
+  console.log('\n── защита от второго экземпляра ──');
+  {
+    const { acquire, alive } = require('./lib/lock');
+    const dir = require('node:path').join(require('node:os').tmpdir(), `lock-${process.pid}`);
+    const first = acquire('bot-test', dir);
+    ok(first.ok, 'первый экземпляр занимает замок');
+    const second = acquire('bot-test', dir);
+    ok(!second.ok && second.pid === process.pid,
+      'второй экземпляр не запускается и знает, кто занял место', second.pid);
+    first.release();
+    const third = acquire('bot-test', dir);
+    ok(third.ok, 'после остановки первого замок свободен');
+    third.release();
+
+    // Замок от процесса, которого больше нет, не должен блокировать запуск:
+    // иначе после падения бот не поднимется без ручного вмешательства.
+    require('node:fs').writeFileSync(require('node:path').join(dir, 'bot-test.lock'), '999999');
+    const fourth = acquire('bot-test', dir);
+    ok(fourth.ok, 'замок упавшего процесса перехватывается сам');
+    fourth.release();
+    ok(alive(process.pid) && !alive(999999), 'живой и мёртвый процессы различаются');
+    require('node:fs').rmSync(dir, { recursive: true, force: true });
+  }
+
+  console.log('\n── счёт, долг и оплата ──');
+  {
+    const bdb3 = require('./lib/bot-db');
+    const uid = fxUserId();
+    const org3 = bdb3.getDefaultOrg(uid);
+    ok(bdb3.basisOf(org3) === 'closing', 'по умолчанию долг возникает по акту', bdb3.basisOf(org3));
+
+    await tap('org');
+    ok(Boolean(button('Долг:')), 'в карточке организации есть настройка основания долга');
+    await tap('basis');
+    ok(last().includes('становится должен'), 'экран основания долга открывается');
+
+    // Заводим отдельного контрагента, чтобы не мешать прежним подсчётам.
+    const before = bdb3.listCps(uid).length;
+    const rentId = bdb3.createCp(uid, { name: 'Арендатор ООО «Луч»', kind: 'customer', opening_date: '2026-01-01' });
+    ok(bdb3.listCps(uid).length === before + 1, 'контрагент для проверки аренды заведён');
+
+    // Режим «по акту»: счёт долг не создаёт.
+    await tap(`d.sch:${rentId}`);
+    await say('Аренда, август; 1; 60000');
+    await tap('items.done');
+    await tap('doc.make');
+    ok(bdb3.balanceOf(uid, rentId).closing === 0,
+      'в режиме «по акту» счёт долг не создаёт', bdb3.balanceOf(uid, rentId).closing);
+    // Счёт при «по отгрузке» долга не создаёт у всех — это порядок, а не
+    // сюрприз, и пугать человека подписью под каждым счётом незачем.
+    const fileBtn = (f, data) => ((f || {}).buttons || []).flat().some((b) => b.data === data);
+    ok(!fileBtn(files[files.length - 1], 'basis.set:closing')
+      && !/в долг клиента не попал/.test((files[files.length - 1] || {}).caption || ''),
+    'под счётом при «по отгрузке» нет предупреждения про долг');
+
+    // Режим «по счёту» — субаренда.
+    //
+    // Переключение теперь пересчитывает и уже выписанное: августовский счёт
+    // на 60 000 при основании «по акту» долга не создавал, а при «по счёту»
+    // создаёт. Раньше переключение меняло строчку в настройках и больше
+    // ничего — человек не видел никакой разницы и считал цифру сломанной.
+    await tap('basis.set:invoice');
+    ok(bdb3.basisOf(bdb3.getDefaultOrg(uid)) === 'invoice', 'режим «долг по счёту» сохранён');
+    ok(bdb3.balanceOf(uid, rentId).closing === 60000,
+      'переключение подхватило уже выписанный счёт', bdb3.balanceOf(uid, rentId).closing);
+    await tap(`d.sch:${rentId}`);
+    await say('Аренда, сентябрь; 1; 60000');
+    await tap('items.done');
+    await tap('doc.make');
+    ok(bdb3.balanceOf(uid, rentId).closing === 120000,
+      'второй счёт добавил свой долг: 60 000 + 60 000', bdb3.balanceOf(uid, rentId).closing);
+    // Сообщение о проводке уходит подписью к файлу, а не отдельным письмом.
+    ok(String((files[files.length - 1] || {}).caption || '').includes('внесён в журнал'),
+      'бот сказал, что внёс долг в журнал',
+      String((files[files.length - 1] || {}).caption || '').slice(-70));
+
+    const rentDoc = bdb3.listDocs(uid, 1)[0];
+    await tap(`doc:${rentDoc.id}`);
+    ok(last().includes('не отмечена'), 'в карточке видно, что оплата не отмечена');
+    const payBtn = button('Отметить оплаченным');
+    ok(Boolean(payBtn), 'есть кнопка отметки оплаты', payBtn);
+
+    await tap(payBtn);
+    ok(bdb3.balanceOf(uid, rentId).closing === 60000,
+      'отметка оплаты закрыла долг именно этого счёта', bdb3.balanceOf(uid, rentId).closing);
+    ok(bdb3.getDoc(uid, rentDoc.id).paid_at, 'дата оплаты записана', bdb3.getDoc(uid, rentDoc.id).paid_at);
+
+    await tap(`doc.unpaid:${rentDoc.id}`);
+    ok(bdb3.balanceOf(uid, rentId).closing === 120000, 'отмена оплаты вернула долг',
+      bdb3.balanceOf(uid, rentId).closing);
+
+    // Повторная отметка не должна задваивать проводку.
+    await tap(`doc.paid:${rentDoc.id}`);
+    await tap(`doc.paid:${rentDoc.id}`);
+    ok(bdb3.balanceOf(uid, rentId).closing === 60000,
+      'повторная отметка оплаты не задваивает проводку', bdb3.balanceOf(uid, rentId).closing);
+
+    await tap('unpaid');
+    ok(last().includes('Ждут оплаты') || last().includes('Неоплаченных'),
+      'экран неоплаченных открывается', last().slice(0, 40));
+
+    /*
+     * Накладная при «долге по счёту» в долг не попадает — и бот обязан
+     * сказать это сразу, а не оставить человека гадать над нулём в карточке
+     * клиента. Это и была жалоба: «ТОРГ-12 выписал, а долга нет».
+     */
+    const shipId = bdb3.createCp(uid, { name: 'ООО «Отгрузка»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.torg12:${shipId}`);
+    await say('Кабель; 2; 1500');
+    await tap('items.done');
+    await tap('doc.make');
+    const shipFile = files[files.length - 1] || {};
+    ok(bdb3.balanceOf(uid, shipId).closing === 0, 'при «долге по счёту» накладная долга не создаёт',
+      bdb3.balanceOf(uid, shipId).closing);
+    ok(/считается по счетам/.test(shipFile.caption || '') && /в долг клиента не попал/.test(shipFile.caption || ''),
+      'и бот говорит об этом в подписи к накладной', (shipFile.caption || '').slice(-200));
+    ok(fileBtn(shipFile, 'basis.set:closing'), 'а под файлом — кнопка «считать по актам и накладным»');
+
+    // Жалоба: «выписал ТОРГ-12, а выписался ещё и счёт». Накладная — один документ,
+    // а кнопка «ещё» после неё ведёт в накладную, не в счёт.
+    {
+      const docsOfCp = bdb3.listDocs(uid, 5000).filter((d) => d.cp_id === shipId);
+      ok(docsOfCp.length === 1 && docsOfCp[0].type === 'torg12',
+        'после ТОРГ-12 в журнале ровно один документ — накладная, счёта нет',
+        docsOfCp.map((d) => d.type).join(','));
+      const after = [...sent].reverse().find((m) => (m.text || '').includes('Что дальше'));
+      const flat = JSON.stringify((after && (after.keyboard || after.reply_markup || after.markup)) || after || {});
+      ok(flat.includes('go.torg12') && !flat.includes('go.sch'),
+        'под накладной «ещё» ведёт в накладную, а не в счёт', flat.slice(0, 200));
+    }
+
+    // Режим «вручную» — бот в журнал не лезет.
+    await tap('basis.set:manual');
+    const manId = bdb3.createCp(uid, { name: 'ООО «Ручной учёт»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.usl:${manId}`);
+    await say('Услуга; 1; 5000');
+    await tap('items.done');
+    await tap('doc.make');
+    ok(bdb3.balanceOf(uid, manId).closing === 0, 'в режиме «вручную» проводок не появляется',
+      bdb3.balanceOf(uid, manId).closing);
+    const manFile = files[files.length - 1] || {};
+    ok(/журнал веду сам/.test(manFile.caption || '') && fileBtn(manFile, 'basis.set:closing'),
+      'в ручном режиме акт тоже говорит, почему не попал в долг, и даёт кнопку',
+      (manFile.caption || '').slice(-200));
+
+    // «Все рассчитались» при невнесённых документах — неправда.
+    await tap('debts');
+    ok(/журнал веду сам/.test(sent.slice(-3).map((m) => m.text).join('\n')),
+      'список долгов в ручном режиме называет режим, а не молчит',
+      sent.slice(-3).map((m) => m.text).join(' | ').slice(-200));
+
+    // Та самая кнопка из-под файла: переключает и подтягивает выписанное раньше.
+    await tap('basis.set:closing');   // возвращаем как было
+    ok(bdb3.balanceOf(uid, shipId).closing === 3000,
+      'после переключения накладная попала в долг клиента', bdb3.balanceOf(uid, shipId).closing);
+    ok(bdb3.balanceOf(uid, manId).closing === 5000,
+      'и акт, выписанный в ручном режиме, тоже', bdb3.balanceOf(uid, manId).closing);
+
+    // «Оплачено» — прямо под свежей накладной, без похода в карточку документа.
+    const paidCp = bdb3.createCp(uid, { name: 'ООО «Сразу заплатил»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.torg12:${paidCp}`);
+    await say('Плитка; 4; 1000');
+    await tap('items.done');
+    await tap('doc.make');
+    const paidFile = files[files.length - 1] || {};
+    const paidBtn = (paidFile.buttons || []).flat().find((b) => /Оплачено/.test(b.text));
+    ok(paidBtn && /^doc\.paid:\d+$/.test(paidBtn.data), 'под накладной, попавшей в долг, есть «Оплачено»',
+      JSON.stringify(paidFile.buttons));
+    ok(bdb3.balanceOf(uid, paidCp).closing === 4000, 'до нажатия долг висит',
+      bdb3.balanceOf(uid, paidCp).closing);
+    if (paidBtn) await tap(paidBtn.data);
+    ok(bdb3.balanceOf(uid, paidCp).closing === 0, 'одно нажатие закрывает долг',
+      bdb3.balanceOf(uid, paidCp).closing);
+
+    /*
+     * ТОРГ-12 на 0 ₽ (позиция из быстрых, цена не проставлена): долга нет, и
+     * причина не в основании. Бот обязан сказать про цены, а не про настройку
+     * и не звать переключать основание — переключать нечего.
+     */
+    const zeroCp = bdb3.createCp(uid, { name: 'ООО «Без цены»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.torg12:${zeroCp}`);
+    await say('Кабель; 2; 0');
+    await tap('items.done');
+    await tap('doc.make');
+    const zeroFile = files[files.length - 1] || {};
+    ok(bdb3.balanceOf(uid, zeroCp).closing === 0, 'накладная на 0 ₽ долга не создаёт',
+      bdb3.balanceOf(uid, zeroCp).closing);
+    ok(/0 ₽ — долг клиента не записан/.test(zeroFile.caption || '') && /цена/.test(zeroFile.caption || ''),
+      'и бот объясняет: сумма нулевая, нужны цены', (zeroFile.caption || '').slice(-200));
+    ok(!fileBtn(zeroFile, 'basis.set:closing'), 'кнопки смены основания при нулевой сумме нет');
+
+    // Чистая организация: ТОРГ-12 на 4000 ₽ сразу даёт долг 4000 (основание по умолчанию).
+    const ds4 = require('./lib/doc-service');
+    const cleanCp = bdb3.createCp(uid, { name: 'ООО «Чистый»', kind: 'customer', opening_date: '2026-01-01' });
+    const made4 = await ds4.issueDocument(uid, {
+      type: 'torg12', cpId: cleanCp, items: [{ name: 'Кабель', qty: 2, price: 2000 }],
+    });
+    ok(made4.ok && made4.debt === true && bdb3.balanceOf(uid, cleanCp).closing === 4000,
+      'ТОРГ-12 на 4000 ₽ даёт долг 4000', bdb3.balanceOf(uid, cleanCp).closing);
+
+    // «Оплатил» рядом с должником в «Кто должен».
+    const owesCp = bdb3.createCp(uid, { name: 'ООО «Должник»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.usl:${owesCp}`);
+    await say('Монтаж; 1; 7000');
+    await tap('items.done');
+    await tap('doc.make');
+    await tap('debts');
+    const debtsMsg = sent.slice(-3).find((m) => (m.kb || []).flat().some((b) => /Оплатил/.test(b.text))) || {};
+    // «Оплатил» и «Напомнить» — отдельной строкой под карточкой должника (в одну строку три кнопки не влезают).
+    const owesRow = (debtsMsg.kb || []).find((row) => row.some((b) => b.callback_data.startsWith(`pay.cp:${owesCp}:`))) || [];
+    const owesBtn = owesRow.find((b) => /Оплатил/.test(b.text));
+    ok(owesBtn && owesBtn.callback_data.startsWith(`pay.cp:${owesCp}:7000:o:`),
+      'в списке долгов рядом с должником — «Оплатил» на весь долг', JSON.stringify(owesRow));
+    ok(owesRow.some((b) => b.callback_data === `rm.one:${owesCp}` && /Напомнить/.test(b.text)),
+      'и «Напомнить» — текст письма именно этому должнику', JSON.stringify(owesRow));
+    if (owesBtn) {
+      await tap(owesBtn.callback_data);
+      ok(bdb3.balanceOf(uid, owesCp).closing === 0, 'нажатие вносит оплату и закрывает долг',
+        bdb3.balanceOf(uid, owesCp).closing);
+      ok(Boolean(button('Отменить запись')), 'и оплату можно тут же отменить');
+      // Долг закрыт — значит, и сам документ больше не «ждёт оплаты».
+      ok(!bdb3.unpaidDocs(uid).some((d) => d.cp_id === owesCp),
+        'после «Оплатил» акт пропадает из списка «Не оплачено»',
+        JSON.stringify(bdb3.unpaidDocs(uid).filter((d) => d.cp_id === owesCp).map((d) => d.number)));
+      const undoBtn = button('Отменить запись');
+      await tap(owesBtn.callback_data);
+      ok(/уже внесена/.test(last()) && bdb3.balanceOf(uid, owesCp).closing === 0,
+        'второе нажатие той же кнопки деньги не проводит', last());
+      await tap(undoBtn);
+      ok(bdb3.balanceOf(uid, owesCp).closing === 7000 && bdb3.unpaidDocs(uid).some((d) => d.cp_id === owesCp),
+        'отмена возвращает и долг, и «не оплачено»', bdb3.balanceOf(uid, owesCp).closing);
+    }
+  }
+
+  console.log('\n── НДС в счёте ──');
+  {
+    const { vatTotals } = require('./lib/money');
+    const bdb2 = require('./lib/bot-db');
+    ok(vatTotals([{ qty: 1, price: 100 }], 20, false).total === 120,
+      'НДС сверху: 100 + 20% = 120', vatTotals([{ qty: 1, price: 100 }], 20, false).total);
+    const inc = vatTotals([{ qty: 1, price: 100 }], 20, true);
+    ok(inc.total === 100 && inc.net === 83.33 && inc.vat === 16.67,
+      'НДС в том числе: 100 = 83,33 + 16,67', JSON.stringify(inc));
+    ok(vatTotals([{ qty: 2, price: 50 }], null, false).vat === null, 'без НДС налог не считается');
+
+    /*
+     * Расчётные ставки — по каждой новой отдельно.
+     *
+     * Мутационная ревизия показала дыру: во всех восьми прогонах налог по
+     * новым ставкам проверялся ровно в одном месте и только для 22% «сверху».
+     * Испорченный vatSplit (налог всегда 20%) семь прогонов из восьми не
+     * замечали, а 5% и 7% не проверял никто — только запись в базу.
+     *
+     * Числа не выдуманы: 5/105 и 7/107 — расчётные ставки из п. 4 ст. 164 НК.
+     */
+    for (const [rate, net, vat] of [[22, 81.97, 18.03], [5, 95.24, 4.76], [7, 93.46, 6.54]]) {
+      const inc2 = vatTotals([{ qty: 1, price: 100 }], rate, true);
+      ok(inc2.net === net && inc2.vat === vat && inc2.total === 100,
+        `${rate}% в том числе: 100 = ${net} + ${vat}`, JSON.stringify(inc2));
+      const over = vatTotals([{ qty: 1, price: 100 }], rate, false);
+      ok(over.net === 100 && over.vat === rate && over.total === 100 + rate,
+        `${rate}% сверху: 100 + ${rate} = ${100 + rate}`, JSON.stringify(over));
+    }
+
+    await tap('org');
+    const vatBtn = button('НДС:');
+    ok(Boolean(vatBtn), 'в карточке организации есть настройка НДС', vatBtn);
+    await tap('vat');
+    ok(last().includes('НДС в счетах'), 'экран НДС открывается');
+
+    await tap('vat.set:20:0');
+    const orgNow = bdb2.getDefaultOrg(fxUserId());
+    ok(bdb2.vatOf(orgNow).rate === 20 && bdb2.vatOf(orgNow).gross === false,
+      'режим «20% сверху» сохранён', JSON.stringify(bdb2.vatOf(orgNow)));
+
+    // Счёт должен взять ставку сам и посчитать итог с налогом.
+    await tap(`d.sch:${cpId}`);
+    await say('Услуга с НДС; 1; 1000');
+    await tap('items.done');
+    ok(norm(last()).includes('НДС 20%: 200,00'), 'в сводке показан налог', norm(last()).slice(-120));
+    ok(norm(last()).includes('Всего к оплате: 1 200,00'), 'итог посчитан с налогом сверху');
+
+    const beforeVat = files.length;
+    await tap('doc.make');
+    ok(files.length === beforeVat + 1, 'счёт с НДС выписан');
+    const savedVat = bdb2.listDocs(fxUserId(), 1)[0];
+    ok(savedVat.total === 1200, 'в журнал записана сумма с налогом, а не без', savedVat.total);
+
+    // Переопределение ставки для одного документа.
+    await tap(`d.sch:${cpId}`);
+    await say('Разовая услуга; 1; 500');
+    await tap('items.done');
+    await tap('doc.vat');
+    ok(last().includes('НДС для этого счёта'), 'ставку можно поменять для одного счёта');
+    await tap('doc.vat.set:none:0');
+    ok(norm(last()).includes('(без НДС)') && norm(last()).includes('500,00'),
+      'переопределение сработало — налога в сводке больше нет', norm(last()).slice(-60));
+    await tap('doc.make');
+
+    // Реформа НДС с 2026 года: общая ставка выросла до 22%, а для УСН
+    // появились пониженные ставки без права на вычет — 5% и 7%. Экраны
+    // выбора ставки (у организации, у отдельного документа и у УПД) до этой
+    // правки предлагали только 0, 10 и 20 — новые ставки выбрать было
+    // нельзя, хотя lib/money.js их считает без проблем: ограничение было
+    // только в списке кнопок и в защите /api/vat мини-приложения.
+    await tap('vat');
+    // Сверяем не подстроку в тексте, а callback_data: «5%» матчилось на
+    // «5% УСН», «22%» — на ярлык режима «🧾 НДС: 22%» с соседнего экрана, и
+    // проверка проходила даже когда кнопки удаляли.
+    const vatKb = (sent[sent.length - 1].kb || []).flat().map((b) => b.callback_data);
+    for (const want of ['vat.set:22:1', 'vat.set:22:0', 'vat.set:5:1', 'vat.set:5:0',
+      'vat.set:7:1', 'vat.set:7:0']) {
+      ok(vatKb.includes(want), `в экране НДС организации есть ${want}`, vatKb.join(' '));
+    }
+
+    await tap('vat.set:22:0');
+    ok(bdb2.vatOf(bdb2.getDefaultOrg(fxUserId())).rate === 22, 'ставка 22% сохранена организации');
+
+    await tap(`d.sch:${cpId}`);
+    await say('Услуга по новой ставке; 1; 1000');
+    await tap('items.done');
+    ok(norm(last()).includes('НДС 22%: 220,00'), 'налог по ставке 22% посчитан верно', norm(last()).slice(-120));
+    ok(norm(last()).includes('Всего к оплате: 1 220,00'), 'итог с 22% сверху верен');
+    await tap('doc.make');
+
+    await tap('vat.set:5:0');
+    ok(bdb2.vatOf(bdb2.getDefaultOrg(fxUserId())).rate === 5, 'пониженная ставка УСН 5% сохранена');
+    await tap('vat.set:7:0');
+    ok(bdb2.vatOf(bdb2.getDefaultOrg(fxUserId())).rate === 7, 'пониженная ставка УСН 7% сохранена');
+
+    // Тот же набор ставок — в УПД со статусом 1 (счёт-фактура).
+    await tap(`d.upd:${cpId}`);
+    await tap(`upd.s1:${cpId}`);
+    const updKb = (sent[sent.length - 1].kb || []).flat().map((b) => b.callback_data);
+    for (const want of [`upd.r:${cpId}:22`, `upd.r:${cpId}:5`, `upd.r:${cpId}:7`]) {
+      ok(updKb.includes(want), `при выписке УПД есть ${want}`, updKb.join(' '));
+    }
+    await tap(`cp:${cpId}`);   // отменяем начатый УПД, чтобы не мешал следующим тестам
+
+    await tap('vat.set:none:0');   // возвращаем как было
+  }
+
+  console.log('\n── свой почтовый ящик и отправка ──');
+  {
+    const net = require('node:net');
+    const mailbox = require('./lib/mailbox');
+    const uidM = fxUserId();
+    // Настоящий SMTP-сервер на localhost: проверяем, что письмо реально
+    // уходит с вложением, а не что мы позвали функцию.
+    const got = { rcpt: [], data: '', auth: null };
+    const smtp = net.createServer((sock) => {
+      let inData = false; let body = ''; let expect = null;
+      sock.setEncoding('utf8');
+      sock.write('220 local ESMTP\r\n');
+      sock.on('data', (chunk) => {
+        if (inData) {
+          body += chunk;
+          const end2 = body.indexOf('\r\n.\r\n');
+          if (end2 === -1) return;
+          got.data = body.slice(0, end2); inData = false; body = '';
+          sock.write('250 Ok: queued\r\n');
+          return;
+        }
+        for (const line of chunk.split('\r\n').filter(Boolean)) {
+          if (expect) {
+            const v = Buffer.from(line, 'base64').toString('utf8');
+            if (expect === 'user') { got.auth = { user: v }; expect = 'pass'; sock.write('334 UA==\r\n'); } else {
+              got.auth.pass = v; expect = null; sock.write('235 ok\r\n');
+            }
+            continue;
+          }
+          if (/^EHLO/i.test(line)) sock.write('250-local\r\n250-AUTH LOGIN\r\n250 HELP\r\n');
+          else if (/^AUTH LOGIN/i.test(line)) { expect = 'user'; sock.write('334 VQ==\r\n'); }
+          else if (/^RCPT TO:/i.test(line)) { got.rcpt.push(line.slice(8).replace(/[<>]/g, '').trim()); sock.write('250 Ok\r\n'); }
+          else if (/^DATA/i.test(line)) { inData = true; sock.write('354 go\r\n'); }
+          else if (/^QUIT/i.test(line)) { sock.write('221 bye\r\n'); sock.end(); }
+          else sock.write('250 Ok\r\n');
+        }
+      });
+      sock.on('error', () => {});
+    });
+    await new Promise((res2) => smtp.listen(0, '127.0.0.1', res2));
+    const smtpPort = smtp.address().port;
+
+    /*
+     * Почта должна находиться из меню. Раньше эта кнопка зависела от
+     * аргумента, который не передавал ни один вызов, — и не показывалась
+     * никогда и никому, хотя вся почта была написана и работала.
+     *
+     * Теперь главное меню — четыре строки, а редкое живёт в «Ещё». Проверяем
+     * весь путь целиком: из меню в «Ещё», оттуда в почту. Заодно следим, что
+     * при сжатии меню ничего не потерялось совсем: у каждого раздела должен
+     * остаться хоть один вход.
+     */
+    await say('/menu');
+    ok(button('Ещё') === 'more', 'в главном меню есть «Ещё»', button('Ещё'));
+    ok(button('Выписать счёт') === 'go.sch', 'и главное действие на месте');
+    ok(button('Долги') === 'debts' && button('Ждут оплаты') === 'unpaid',
+      'долги остались на первом уровне — это ежедневная работа');
+    await tap('more');
+    for (const [label, data] of [['Почта', 'mb'], ['Моя организация', 'org'],
+      ['Клиенты', 'cps'], ['Подписка', 'billing'], ['Помощь', 'help'],
+      ['Поддержка', 'support'], ['Другой документ', 'go.any']]) {
+      ok(button(label) === data, `«${label}» не потерялась при сжатии меню`, button(label));
+    }
+    await tap('mb');
+    ok(last().includes('Почта для отправки'), 'кнопка открывает экран почты', last().slice(0, 40));
+
+    const schDoc = require('./lib/bot-db').listDocs(uidM, 30).find((x) => x.type === 'sch');
+    ok(Boolean(schDoc), 'в журнале есть счёт для отправки');
+
+    // Пока ящик не подключён — кнопки отправки нет.
+    await tap(`doc:${schDoc.id}`);
+    ok(!button('Отправить на почту') && !button('Отправить на '),
+      'без подключённого ящика кнопки отправки нет');
+
+    // Подключение своей корпоративной почты: бот обязан спросить сервер.
+    await tap('org');
+    ok(Boolean(button('Подключить почту')), 'в организации есть вход в настройку почты');
+    await tap('mb.new');
+    ok(last().includes('С какого адреса'), 'бот спрашивает адрес');
+    await say('не-адрес');
+    ok(last().includes('не похоже на адрес'), 'кривой адрес отклонён');
+    await say('buh@своядомен.рф');
+    ok(last().includes('SMTP-сервера'), 'для своего домена бот спрашивает сервер', last().slice(0, 60));
+    await say('не сервер!!');
+    ok(last().includes('Не разобрал адрес сервера'), 'мусор вместо сервера отклонён');
+    await say(`127.0.0.1:${smtpPort}`);
+    ok(last().includes('пришлите пароль'.toLowerCase()) || last().includes('пароль'),
+      'бот просит пароль', last().slice(0, 60));
+    await say('секретный-пароль');
+    // Успех сообщается отдельным письмом, а следом бот показывает экран
+    // почты — поэтому смотрим не последнее сообщение, а несколько последних.
+    ok(sent.slice(-3).some((m) => m.text.includes('Письмо ушло')),
+      'после сохранения бот сам отправил проверочное письмо',
+      sent.slice(-3).map((m) => m.text.slice(0, 30)).join(' | '));
+    ok(got.rcpt.includes('buh@своядомен.рф'), 'проверочное письмо ушло на свой же адрес', got.rcpt.join());
+    ok(got.auth && got.auth.pass === 'секретный-пароль', 'пароль дошёл до сервера');
+    ok(Boolean(mailbox.info(uidM).checkedAt), 'ящик помечен проверенным');
+
+    // Пароль не должен светиться ни в интерфейсе, ни в базе.
+    ok(!JSON.stringify(mailbox.info(uidM)).includes('секретный-пароль'),
+      'пароль не отдаётся наружу');
+    ok(!fs.readFileSync(process.env.TRAPEZA_DB || 'data/trapeza.db').includes('секретный-пароль'),
+      'пароль в базе хранится зашифрованным');
+
+    // Теперь отправка документа клиенту.
+    got.rcpt.length = 0;
+    await tap(`doc:${schDoc.id}`);
+    const mailBtn = button('Отправить на почту');
+    ok(Boolean(mailBtn), 'с подключённым ящиком кнопка появилась', mailBtn);
+    await tap(mailBtn);
+    ok(last().includes('На какую почту'), 'бот спрашивает адрес получателя');
+    await say('buh@zarya.ru');
+    ok(last().includes('Отправил'), 'документ отправлен', last().slice(0, 50));
+    ok(got.rcpt.includes('buh@zarya.ru'), 'сервер получил адрес клиента', got.rcpt.join());
+    ok(/Content-Disposition: attachment/.test(got.data), 'во вложении есть файл');
+    ok(/^From: .*своядомен/m.test(got.data) || got.data.includes('buh@'),
+      'письмо ушло с адреса клиента, а не с нашего', (/^From:.*/m.exec(got.data) || [''])[0].slice(0, 60));
+
+    const cpNow = require('./lib/bot-db').getCp(uidM, schDoc.cp_id);
+    ok(cpNow.email === 'buh@zarya.ru', 'адрес запомнился у контрагента', cpNow.email);
+
+    /*
+     * Напоминание должнику письмом. Раньше здесь был только текст
+     * «скопируйте и отправьте сами» — при том что счёт тому же клиенту
+     * уходит с того же ящика по кнопке. Разницы между ними нет.
+     */
+    got.rcpt.length = 0; got.data = '';
+    const bdbR = require('./lib/bot-db');
+    const cpDebt = bdbR.createCp(uidM, {
+      name: 'ООО «Забывчивый»', kind: 'customer', opening_date: '2026-01-01', email: 'buh@zabyv.ru',
+    });
+    bdbR.addOp(uidM, cpDebt, { date: '2026-07-01', kind: 'Приход', doc: 'Акт 3', credit: 31000 });
+
+    // Экран напоминаний — сообщение на каждого должника, и наш не обязательно
+    // последний: порядок задаёт выборка. Ищем среди того, что нарисовал
+    // именно этот вызов, а не по всему прогону.
+    const remindMark = sent.length;
+    await tap('debt.remind');
+    const sendBtn = buttonSince(remindMark, 'Отправить на buh@zabyv.ru');
+    ok(Boolean(sendBtn), 'у должника с известной почтой есть кнопка отправки', sendBtn);
+    ok(sent.some((m) => /числится задолженность/.test(m.text || '')), 'текст напоминания показан');
+
+    await tap(sendBtn);
+    ok(last().includes('Отправлено на'), 'напоминание отправлено', last().slice(0, 60));
+    ok(got.rcpt.includes('buh@zabyv.ru'), 'сервер получил адрес должника', got.rcpt.join());
+    ok(/Content-Disposition: attachment/.test(got.data), 'акт сверки приложен к письму');
+    ok(/xlsx/i.test(got.data), 'вложение — именно Excel с актом сверки');
+    ok(last().includes('вместе с актом сверки'), 'бот сказал, что приложил акт');
+
+    // Должнику без почты — сначала спрашиваем адрес, потом отправляем.
+    got.rcpt.length = 0;
+    const cpNoMail = bdbR.createCp(uidM, {
+      name: 'ООО «Безадресный»', kind: 'customer', opening_date: '2026-01-01',
+    });
+    bdbR.addOp(uidM, cpNoMail, { date: '2026-07-01', kind: 'Приход', doc: 'Акт 4', credit: 5000 });
+    await tap(`rm.ask:${cpNoMail}`);
+    ok(last().includes('Куда отправить'), 'бот спрашивает адрес', last().slice(0, 40));
+    await say('не-почта');
+    ok(last().includes('выглядит неправильно'), 'кривой адрес отклонён');
+    await tap(`rm.ask:${cpNoMail}`);
+    await say('buh@bezadres.ru');
+    ok(got.rcpt.includes('buh@bezadres.ru'), 'письмо ушло на указанный адрес', got.rcpt.join());
+    ok(bdbR.getCp(uidM, cpNoMail).email === 'buh@bezadres.ru', 'адрес запомнился в карточке');
+
+    /*
+     * Акт сверки контрагенту.
+     *
+     * Его отправляют почтой чаще всех остальных документов: сверка нужна не
+     * себе, а другой стороне — согласиться или возразить. Кнопки у него
+     * долго не было, потому что акт не хранится файлом и не умел
+     * пересобираться: он строится из журнала операций, а не из позиций.
+     */
+    got.rcpt.length = 0; got.data = '';
+    const cpAkt = bdbR.createCp(uidM, {
+      name: 'ООО «Сверимся»', kind: 'customer', opening_date: '2026-01-01', email: 'buh@sverim.ru',
+    });
+    bdbR.addOp(uidM, cpAkt, { date: '2026-07-01', kind: 'Приход', doc: 'Акт 7', credit: 44000 });
+    bdbR.addOp(uidM, cpAkt, { date: '2026-07-20', kind: 'Оплата', doc: 'п/п 3', debit: 14000 });
+
+    sent.length = 0;
+    await tap(`d.akt:${cpAkt}`);
+    await tap(`akt.p:${cpAkt}:all`);
+    ok(files.some((f) => /Акт_сверки/.test(f.filename)), 'акт сверки выписан файлом',
+      (files[files.length - 1] || {}).filename);
+    const offer = button('Отправить на buh@sverim.ru');
+    ok(Boolean(offer), 'сразу после выписки предложено отправить контрагенту', offer);
+
+    await tap(offer);
+    ok(last().includes('Отправил'), 'акт сверки ушёл письмом', last().slice(0, 60));
+    ok(got.rcpt.includes('buh@sverim.ru'), 'на адрес контрагента', got.rcpt.join());
+    ok(/Content-Disposition: attachment/.test(got.data), 'файл приложен');
+    ok(/xlsx/i.test(got.data), 'и это Excel, а не пустое письмо');
+    /*
+     * В письме должна быть просьба сверить. Без неё акт кладут в папку, и
+     * расхождение всплывает через полгода — то есть документ отправлен, а
+     * работа не сделана.
+     */
+    const body = Buffer.from((/\r\n\r\n([A-Za-z0-9+/=\r\n]+)/.exec(got.data) || [, ''])[1] || '', 'base64')
+      .toString('utf8');
+    ok(/сверить/i.test(body) || /сверить/i.test(got.data),
+      'в письме есть просьба сверить и ответить');
+
+    await tap('mb.del');
+    ok(!mailbox.has(uidM), 'почту можно отключить');
+
+    // Без ящика кнопки отправки быть не должно — только текст.
+    // Смотрим лишь сообщения после нажатия: button() ищет по всей переписке
+    // и нашёл бы кнопку, показанную до отключения почты.
+    const mark = sent.length;
+    await tap('debt.remind');
+    const fresh = sent.slice(mark);
+    ok(!fresh.some((m) => (m.kb || []).flat().some((b) => /Отправить на/.test(b.text))),
+      'без почты кнопка отправки не показывается');
+    ok(fresh.some((m) => /Подключите свою почту/.test(m.text || '')),
+      'и сказано, что почту можно подключить');
+    smtp.close();
+  }
+
+  console.log('\n── подпись и печать ──');
+  const fxLib = require('./lib/facsimile');
+  const fxUser = require('./lib/bot-db').getOrCreateUser(USER.id);
+  await tap('org');
+  ok(Boolean(button('Подпись и печать')), 'в карточке организации есть вход в факсимиле');
+
+  await tap('fx');
+  ok(last().includes('Подпись и печать'), 'экран факсимиле открывается');
+  ok(last().includes('Ставим'), 'на экране написано, куда ставится факсимиле');
+
+  await tap('fx.add:sign');
+  ok(last().includes('Пришлите снимок'), 'бот просит прислать снимок', last().slice(0, 40));
+  await say('вот подпись словами');
+  ok(last().includes('Жду картинку'), 'на текст вместо картинки бот напоминает, чего ждёт');
+
+  // Блок распознавания счёта выше подменил загрузку на мусорные байты —
+  // возвращаем настоящую картинку, иначе проверять нечего.
+  tg.downloadFile = async () => Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64',
+  );
+  await handleUpdate(tg, { message: { chat: CHAT, from: USER, photo: [{ file_id: 'sign-1' }] } });
+  ok(Boolean(fxLib.get(fxUser.id, 'sign')), 'подпись сохранилась после фото');
+  ok(last().includes('Подпись и печать'), 'после загрузки снова показан экран факсимиле');
+
+  const st = require('./lib/bot-db').getState(fxUser.id);
+  ok(!st || !st.state, 'состояние ожидания снято — следующее фото пойдёт на распознавание');
+
+  await tap('fx.scope:closing');
+  ok(fxLib.scopeOf(fxUser.id) === 'closing', 'режим переключается кнопкой', fxLib.scopeOf(fxUser.id));
+  await tap('fx.scope:all');
+
+  // Подпись должна дойти до документа, который выписывает именно бот.
+  const beforeFiles = files.length;
+  await tap(`d.sch:${cpId}`);
+  await say('Проверка факсимиле; 1; 100');
+  await tap('items.done');
+  await tap('doc.make');
+  ok(files.length === beforeFiles + 1, 'счёт с факсимиле выписан', files.length - beforeFiles);
+
+  /*
+   * На счёт-фактуру факсимиле не ставится ни при каких настройках.
+   *
+   * По п. 6 ст. 169 НК счёт-фактуру подписывают руководитель и главный
+   * бухгалтер либо уполномоченные лица. Минфин последовательно считает, что
+   * факсимиле этому не отвечает (письма от 10.04.2019 № 03-07-14/25364, от
+   * 27.08.2015 № 03-07-09/49478), и Президиум ВАС согласился (постановление
+   * от 27.09.2011 № 4134/11). Платит за это не тот, кто поставил печатку, а
+   * покупатель: ему откажут в вычете, и узнает он от своей инспекции.
+   */
+  {
+    const on = (type, doc) => fxLib.appliesTo('all', type, doc);
+    ok(!on('avans'), 'на авансовый счёт-фактуру факсимиле не идёт');
+    ok(!on('ksf'), 'и на корректировочный тоже');
+    ok(!on('upd', { status: 1 }),
+      'и на УПД со статусом 1 — это тот же счёт-фактура, только в общем бланке');
+    ok(on('upd', { status: 2 }),
+      'а на УПД со статусом 2 идёт: это передаточный документ, тут выбор за человеком');
+    ok(on('sch') && on('usl') && on('torg12'),
+      'счёт, акт и накладная факсимиле по-прежнему принимают');
+    // Настройка «только закрывающие» и выключенное факсимиле не сломались.
+    ok(!fxLib.appliesTo('closing', 'sch') && fxLib.appliesTo('closing', 'usl'),
+      '«только закрывающие» по-прежнему различает счёт и акт');
+    ok(!fxLib.appliesTo('off', 'usl'), 'а выключенное факсимиле выключено везде');
+  }
+
+  await tap('fx.del:sign');
+  ok(!fxLib.get(fxUser.id, 'sign'), 'подпись убирается кнопкой');
+
+  console.log('\n── свободный ввод ──');
+  {
+    const ai = require('./lib/ai-agent');
+    const bdbA = require('./lib/bot-db');
+    const uid = fxUserId();
+
+    /*
+     * Фраза, которую правила разбора НЕ берут сами, — чтобы проверки ниже шли
+     * через модель. Раньше для этого годилось «надо бы выставить Заре за аренду
+     * тридцать тысяч», но правила научились и ей (числа словами, разговорные
+     * обороты), и проверка защиты от выдуманного НДС стала бы проверкой правил.
+     */
+    const MODEL_PHRASE = 'Заре за аренду тридцать тысяч, как обычно';
+
+    // По умолчанию модуль выключен: ключ в .env лежит ради распознавания
+    // счетов и сам по себе не должен запускать расходы.
+    delete process.env.AI_ENABLED;
+    process.env.AI_PROVIDER = 'mock';
+    ok(ai.aiAvailable() === false, 'без AI_ENABLED модуль выключен');
+    ok(ai.aiHint().includes('AI_ENABLED'), 'подсказка объясняет, чего не хватает', ai.aiHint());
+
+    // Местный разбор работает всегда и бесплатно.
+    ok(ai.quickParse('кто мне должен').action === 'debts', 'долги узнаются без модели');
+    ok(ai.quickParse('выставь счёт Заре').docType === 'sch', 'счёт узнаётся без модели');
+    ok(ai.quickParse('оформи акт для ООО Ромашка').who === 'ООО Ромашка', 'имя клиента вырезано',
+      ai.quickParse('оформи акт для ООО Ромашка').who);
+    ok(ai.quickParse('привет как дела') === null, 'болтовня местным разбором не ловится');
+
+    /*
+     * Чему агент обучен. Каждое намерение здесь ведёт на настоящий экран
+     * бота — намерение без экрана хуже, чем «не понял»: человек слышит
+     * «сейчас сделаю» и не получает ничего.
+     */
+    const q = (s) => (ai.quickParse(s) || {}).action;
+    ok(q('акт сверки с Ромашкой') === 'akt', 'сверка не путается с актом услуг', q('акт сверки с Ромашкой'));
+    ok(ai.quickParse('выставь акт Ромашке').docType === 'usl', 'а акт услуг остался актом услуг');
+    ok(q('документы за август') === 'docs', 'журнал документов', q('документы за август'));
+    ok(q('мои реквизиты') === 'org', 'свои реквизиты', q('мои реквизиты'));
+    ok(q('контрагенты') === 'cps', 'контрагенты', q('контрагенты'));
+    ok(q('сколько стоит') === 'billing', 'подписка', q('сколько стоит'));
+    ok(q('повторять каждый месяц') === 'recurring', 'повторения', q('повторять каждый месяц'));
+    ok(ai.quickParse('выпиши платёжку Заре').docType === 'pp', 'платёжка узнаётся',
+      (ai.quickParse('выпиши платёжку Заре') || {}).docType);
+    ok(ai.quickParse('сделай счёт-договор Заре').docType === 'schdog', 'счёт-договор узнаётся',
+      (ai.quickParse('сделай счёт-договор Заре') || {}).docType);
+
+    /*
+     * Чужая работа. Налоговый учёт обязателен независимо от режима, и
+     * вопросов к нему у предпринимателя много — но бот не видит ни банка,
+     * ни кассы. Ответ по памяти стоит человеку штрафа, поэтому такие
+     * фразы должны опознаваться и отбиваться, а не разбираться моделью.
+     */
+    for (const s of ['когда платить взносы за себя', 'какой налог на УСН',
+      'сдать декларацию', 'посчитай НДФЛ', 'зарплата сотруднику', 'нужна ли касса',
+      'как считать НДС к уплате в бюджет']) {
+      ok(q(s) === 'outofscope', `не берётся за чужое: «${s}»`, q(s));
+    }
+
+    /*
+     * ...но слово «НДС» само по себе чужой работой фразу не делает.
+     *
+     * Правило про налоги стояло в списке выше правил про документы и
+     * перебивало их: ЛЮБАЯ фраза с «НДС» получала отказ «налоги я не веду»,
+     * включая просьбу выписать счёт — то есть ровно то, что бот и умеет.
+     * Пока ставка была одна и подразумевалась, вслух её не называли; со
+     * ставками 22/20/10/7/5 называть стали, и дыра открылась.
+     */
+    ok(ai.quickParse('выставь Заре счёт на 100 тысяч с НДС 22%').action === 'draft',
+      'счёт со ставкой во фразе — это счёт, а не «чужая работа»',
+      JSON.stringify(ai.quickParse('выставь Заре счёт на 100 тысяч с НДС 22%')));
+    ok(ai.quickParse('выпиши счёт Ромашке, НДС 5 процентов').who === 'Ромашке',
+      'хвост со ставкой не уезжает в имя контрагента',
+      (ai.quickParse('выпиши счёт Ромашке, НДС 5 процентов') || {}).who);
+    ok(q('смени НДС на 5%') === 'vat', 'смена своей ставки — наша настройка, а не отказ',
+      q('смени НДС на 5%'));
+    ok(q('какой у меня НДС') === 'vat', 'и вопрос про свою ставку тоже', q('какой у меня НДС'));
+
+    /*
+     * Разбор фразы целиком — взят из ветки, собранной на сервере.
+     *
+     * Раньше из «выставь Заре счёт на 100 тысяч за монтаж с НДС 22%» бот брал
+     * только вид документа и имя: сумма, назначение и ставка терялись молча,
+     * и человек получал пустой мастер, не понимая, куда всё делось.
+     */
+    const draft22 = ai.quickParse('выставь Заре счёт на 100 тысяч с НДС 22%');
+    ok(draft22.vatRate === 22 && draft22.priceIncludesVat === false
+      && draft22.items.length === 1 && draft22.items[0].price === 100000,
+      'из фразы вынимаются и сумма, и ставка', JSON.stringify(draft22));
+
+    const draftInc = ai.quickParse('сделай Ромашке акт на 5000 с НДС 22 в том числе');
+    ok(draftInc.docType === 'usl' && draftInc.vatRate === 22 && draftInc.priceIncludesVat === true,
+      '«в том числе» отличается от «сверху»', JSON.stringify(draftInc));
+
+    const draftFor = ai.quickParse('выпиши Заре счёт за аренду склада на 50000');
+    ok(draftFor.items[0] && draftFor.items[0].name === 'Аренду склада' && draftFor.items[0].price === 50000,
+      'назначение из «за …» становится позицией', JSON.stringify(draftFor.items));
+
+    /*
+     * А вот это — ловушка, на которой проект уже обжигался в CUT_WHO: с
+     * флагом /i шаблон [Зз]а перестаёт различать регистр, и «ООО За Рулём»
+     * отдаёт назначение «Рулём». Название с большой буквы — часть имени.
+     */
+    const draftName = ai.quickParse('выставь ООО За Рулём счёт на 1000');
+    ok(draftName.who === 'ООО За Рулём' && draftName.items[0].name === 'Оказание услуг',
+      '«За» в названии фирмы не путается с назначением', JSON.stringify(draftName));
+
+    /*
+     * Номер договора — не сумма. Раньше побеждало первое число во фразе, и
+     * «по договору 5 на 30000» уходило в счёт на пять рублей: с номером в
+     * сквозном ряду, с печатью и платёжным QR. Ассистент доводит дело до
+     * файла сам, так что человек узнавал о цене ошибки уже из готового
+     * документа, а выкинуть занятый номер нельзя — останется дыра.
+     */
+    // Когда сумму не доказали, позиций нет вовсе — считаем это нулём.
+    const sum = (s) => ((((ai.quickParse(s) || {}).items || [])[0]) || {}).price || 0;
+    ok(sum('выставь счёт Заре по договору 5 на 30000') === 30000,
+      'номер договора не становится суммой', sum('выставь счёт Заре по договору 5 на 30000'));
+    ok(sum('выпиши счёт Ромашке за 2 квартал на 120000') === 120000,
+      'номер квартала не становится суммой', sum('выпиши счёт Ромашке за 2 квартал на 120000'));
+    ok(sum('выпиши акт Ромашке за январь 2026 на 50000') === 50000,
+      'год не становится суммой', sum('выпиши акт Ромашке за январь 2026 на 50000'));
+    ok(sum('выставь счёт Заре на 50 тысяч по договору 7') === 50000,
+      'сумма берётся по «тысяч», а не по последнему числу',
+      sum('выставь счёт Заре на 50 тысяч по договору 7'));
+    // Единственное число без признака денег — всё-таки сумма: так короче всего
+    // и просят, и другого кандидата тут нет.
+    ok(sum('выставь счёт Заре 30000') === 30000,
+      'одинокое число считается суммой', sum('выставь счёт Заре 30000'));
+    /*
+     * А вот когда признака нет ни у одного числа, а чисел несколько —
+     * выдумывать нельзя. Ноль здесь значит «спроси у человека», и это дешевле
+     * молчаливой ошибки в сумме документа.
+     */
+    ok(sum('выставь счёт Заре по счёту 105') === 0,
+      'без доказательства сумма не выдумывается', sum('выставь счёт Заре по счёту 105'));
+
+    // То же правило и для отметки оплаты: платёж лёг бы на сто пять рублей.
+    const pay = ai.quickParse('отметь оплату по счёту 105 от Зари на 50000');
+    ok(pay && pay.amount === 50000, 'номер счёта не становится суммой оплаты',
+      JSON.stringify(pay));
+
+    // Стемминг: «Ромашке» должно находить «ООО Ромашка».
+    const cpsStem = [{ id: 1, name: 'ООО «Ромашка»' }, { id: 2, name: 'ИП Сидоров' }];
+    ok((ai.matchCp(cpsStem, 'Ромашке').cp || {}).id === 1,
+      'имя в другом падеже находит контрагента', JSON.stringify(ai.matchCp(cpsStem, 'Ромашке')));
+
+    // Придуманное моделью действие экраном не станет.
+    ok(ai.sanitize({ action: 'переведи деньги' }).action === 'unknown',
+      'действие вне списка отбито');
+    ok(ai.sanitize({ action: 'outofscope' }).action === 'outofscope',
+      'а известное — пропущено');
+
+    let intent = await ai.understand('привет как дела', uid);
+    ok(intent.action === 'unknown' && intent.source === 'off',
+      'выключенный модуль к модели не ходит', intent.source);
+
+    // Включаем с заглушкой вместо сети.
+    process.env.AI_ENABLED = '1';
+    ok(ai.aiAvailable() === true, 'с AI_ENABLED и провайдером модуль готов');
+
+    process.env.AI_MOCK = JSON.stringify({
+      action: 'draft', docType: 'sch', who: 'Заря',
+      items: [{ name: 'Аренда', qty: 1, price: 30000 }],
+    });
+    intent = await ai.understand(MODEL_PHRASE, uid);
+    ok(intent.action === 'draft' && intent.items[0].price === 30000, 'ответ модели разобран',
+      JSON.stringify(intent).slice(0, 80));
+
+    // Всё, что пришло от модели, — данные из ненадёжного источника.
+    ok(ai.sanitize({ action: 'delete_everything' }).action === 'unknown', 'чужое действие отброшено');
+    ok(ai.sanitize({ action: 'draft', docType: 'вирус' }).action === 'unknown', 'чужой тип документа отброшен');
+    const dirty = ai.sanitize({
+      action: 'draft', docType: 'sch', who: 'x',
+      items: [{ name: 'Товар', qty: -5, price: -100 }, { name: '', qty: 1, price: 1 }],
+    });
+    ok(dirty.items.length === 1 && dirty.items[0].qty === 1 && dirty.items[0].price === 0,
+      'отрицательные количество и цена обезврежены', JSON.stringify(dirty.items));
+
+    // Контрагент — только однозначный.
+    const cps = [{ id: 1, name: 'ООО «Заря»' }, { id: 2, name: 'Заря-Строй' }, { id: 3, name: 'Ромашка' }];
+    ok(ai.matchCp(cps, 'Ромашка').cp.id === 3, 'однозначное имя найдено');
+    ok(ai.matchCp(cps, 'Заря').cp.id === 1, 'точное совпадение сильнее частичного',
+      JSON.stringify(ai.matchCp(cps, 'Заря')));
+    ok((ai.matchCp(cps, 'Зар').choices || []).length === 2, 'двусмысленное имя — это вопрос, а не выбор',
+      JSON.stringify(ai.matchCp(cps, 'Зар').choices || []));
+    ok(!ai.matchCp(cps, 'Никого').cp, 'незнакомое имя не подставляется');
+
+    // Деньги: счётчик и предел.
+    const before = ai.budget(uid);
+    await ai.understand('какая-то фраза для модели', uid);
+    ok(ai.budget(uid).mine === before.mine + 1, 'обращение к модели посчитано', ai.budget(uid).mine);
+    ok(ai.quickParse('кто должен') && (await ai.understand('кто должен', uid)).source === 'local',
+      'местный разбор расход не тратит');
+    const afterLocal = ai.budget(uid).mine;
+    ok(afterLocal === before.mine + 1, 'счётчик не вырос от местного разбора', afterLocal);
+
+    process.env.AI_USER_LIMIT = String(afterLocal);
+    intent = await ai.understand('ещё одна фраза для модели', uid);
+    ok(intent.source === 'limit', 'личный предел останавливает расход', intent.source);
+    delete process.env.AI_USER_LIMIT;
+
+    /*
+     * ── модель не решает за человека, какой НДС ──
+     *
+     * На боевом замере фраза «надо бы выставить Заре за аренду тридцать
+     * тысяч» — где про налог ни слова — вернула "vatRate": null. А null в
+     * нашем коде значит не «не знаю», а «без НДС», и отменяет ставку
+     * организации: плательщик НДС получил бы счёт без НДС. Такую ошибку
+     * первым замечает покупатель, а не тот, кто выписал.
+     */
+    const vatMock = JSON.stringify({
+      action: 'draft', docType: 'sch', who: 'Заря',
+      items: [{ name: 'Аренда', qty: 1, price: 30000 }],
+      vatRate: null, priceIncludesVat: false,
+    });
+    process.env.AI_MOCK = vatMock;
+    const silent = await ai.understand(MODEL_PHRASE, uid);
+    ok(silent.action === 'draft', 'документ всё равно разобран', silent.action);
+    ok(silent.vatRate === undefined && silent.priceIncludesVat === undefined,
+      'про НДС не говорили — выдуманная ставка отброшена', JSON.stringify(silent.vatRate));
+
+    /*
+     * А когда сказали — уважаем сказанное. Фразы здесь нарочно такие, что
+     * местный разбор их не берёт: иначе проверялся бы он, а не защита.
+     * Первая версия этой проверки на том и обожглась. Клиента «Лилия» у
+     * человека нет, и без названного клиента, суммы и глагола правила молчат.
+     */
+    process.env.AI_MOCK = JSON.stringify({
+      action: 'draft', docType: 'sch', who: 'Заря', items: [],
+      vatRate: 22, priceIncludesVat: true,
+    });
+    const rate = await ai.understand('счёт Лилии, в т.ч. НДС 22', uid);
+    ok(rate.source === 'model', 'фраза дошла до модели, а не осела в regex', rate.source);
+    ok(rate.vatRate === 22 && rate.priceIncludesVat === true,
+      'названную ставку не трогаем', JSON.stringify(rate.vatRate));
+
+    process.env.AI_MOCK = vatMock;      // тот же ответ с vatRate: null
+    const said = await ai.understand('счёт Заре на 30000, НДС сверху не нужен', uid);
+    ok(said.vatRate === null, 'сказали про НДС — null сохранён как «без НДС»',
+      JSON.stringify(said.vatRate));
+
+    /*
+     * ── «счёт с НДС» — это документ, а не вопрос про налоги ──
+     *
+     * Правила выписки ловят фразу с глаголом. Без глагола — «счёт Заре, в
+     * т.ч. НДС 22» — черновик собрать не из чего, и фраза доезжала до отказа
+     * «налоги и отчётность не веду»: и документ не выписали, и обвинили в
+     * постороннем вопросе. Такие должны уходить в модель, у неё в подсказке
+     * это записано прямо.
+     */
+    const route = (phrase) => { const q = ai.quickParse(phrase); return q ? q.action : 'в модель'; };
+    for (const [phrase, want] of [
+      ['выставь счёт Заре с НДС 22%', 'draft'],
+      ['счёт Заре, в т.ч. НДС 22', 'в модель'],
+      ['счёт на 15000 НДС сверху', 'в модель'],
+      ['когда платить НДС', 'outofscope'],
+      ['сколько НДС по счетам за квартал', 'outofscope'],
+      ['как платить НДС со счёта', 'outofscope'],
+      ['надо ли сдавать КУДиР по счетам', 'outofscope'],
+      // Книгу бот собирает сам — просьба собрать её больше не отказ.
+      ['собери КУДиР', 'kudir'],
+      ['сформируй книгу учёта доходов за год', 'kudir'],
+      ['сделай мне книгу учета', 'kudir'],
+      ['когда платить взносы за себя', 'outofscope'],
+      ['зарплата по акту', 'outofscope'],
+      ['смени НДС на 5 процентов', 'vat'],
+    ]) {
+      ok(route(phrase) === want, `«${phrase}» → ${want}`, route(phrase));
+    }
+
+    /*
+     * ── живая речь: числа словами, падежи, переспрос вместо догадки ──
+     *
+     * Голосовое приходит текстом без знаков и заглавных, с «ну» и «эээ», с
+     * числами словами и клиентом в любом падеже. Прежние правила брали только
+     * аккуратные «выставь счёт Заре на 30000»; остальное уходило к модели —
+     * платному разбору, который к тому же иногда сочиняет сумму.
+     */
+    {
+      const { wordsToDigits: words2num } = require('./lib/ru-num');
+      const w2 = words2num;
+      ok(w2('двадцать две тысячи пятьсот') === '22500', 'число словами: 22 500', w2('двадцать две тысячи пятьсот'));
+      ok(w2('сто двадцать пять тысяч триста') === '125300', 'число словами: 125 300', w2('сто двадцать пять тысяч триста'));
+      ok(w2('полторы тысячи') === '1500' && w2('полтора миллиона') === '1500000', '«полторы тысячи», «полтора миллиона»');
+      ok(w2('двенадцать с половиной тысяч') === '12500', '«с половиной»', w2('двенадцать с половиной тысяч'));
+      // Порядок разрядов нарушен — это два числа, а не одно выдуманное.
+      ok(w2('два по сто') === '2 по 100', '«два по сто» не склеивается в двести', w2('два по сто'));
+      ok(w2('двести') === '200', 'а «двести» — это двести');
+      ok(/‖/.test(w2('три сто')), '«три сто» остаётся двумя числами, а не 103', w2('три сто'));
+      ok(w2('ООО Три медведя оплатили двести') === 'ООО Три медведя оплатили 200',
+        'название фирмы с числительным не трогается', w2('ООО Три медведя оплатили двести'));
+      ok(w2('ещё одну такую же') === 'ещё одну такую же', 'одинокое «одну» цифрой не становится');
+
+      const nm = ['ООО «Заря»', 'ООО «Ромашка»', 'ООО «Три медведя»', 'ООО «Север»', 'ООО «Северный ветер»',
+        'ООО «Лотос»', 'ООО «Лотос-Опт»'];
+      const P = (s) => ai.parseLocal(s, { today: '2026-10-19', clients: nm });
+      const d1 = P('накладная заре сорок обедов по триста пятьдесят');
+      ok(d1 && d1.docType === 'torg12' && d1.who === 'Заре' && d1.items.length === 1
+        && d1.items[0].qty === 40 && d1.items[0].price === 350,
+      'накладная без глагола, числа словами, падеж', JSON.stringify(d1));
+      const d2 = P('выставь счёт заре два по сто рублей');
+      ok(d2.items.length === 1 && d2.items[0].qty === 2 && d2.items[0].price === 100,
+        '«два по сто» — два по сто', JSON.stringify(d2.items));
+      const d3 = P('выставь счёт заре три сто');
+      ok(d3.items.length === 0 && d3.weak === true,
+        '«три сто» — сумма не выдумывается, бот переспросит', JSON.stringify(d3));
+      const d4 = P('накладная северу сорок обедов на четырнадцать тысяч');
+      ok(d4.items[0].qty === 40 && d4.items[0].price === 350, 'сумма и количество дают цену', JSON.stringify(d4.items));
+      const d5 = P('накладная вектору краска пять по восемьсот и кисти десять по сто пятьдесят');
+      ok(d5.items.length === 2 && d5.items[1].price === 150, 'две позиции в одной фразе', JSON.stringify(d5.items));
+      const d6 = P('выставь счёт три медведя на пять тысяч');
+      ok(d6.who === 'три медведя' || d6.who === 'Три медведя', 'фирма «Три медведя» — не число',
+        JSON.stringify(d6));
+      ok(d6.items[0].price === 5000, 'сумма при этом найдена', JSON.stringify(d6.items));
+
+      // Оплата: «оплатил» — деньги пришли, «оплати» — платить самому.
+      const p1 = P('север оплатил пятьдесят тысяч');
+      ok(p1.action === 'pay' && p1.who === 'Север' && p1.amount === 50000, 'оплата голосом', JSON.stringify(p1));
+      const p2 = P('ромашка оплатила часть двадцать тысяч из ста');
+      ok(p2.amount === 20000, '«20 тысяч из ста» — оплачено двадцать', JSON.stringify(p2));
+      const p3 = P('Заря оплатила счёт № 105');
+      ok(p3.action === 'pay' && !p3.amount, 'номер счёта — не сумма оплаты', JSON.stringify(p3));
+      ok(P('я оплатил поставщику пятьдесят тысяч').action === 'unknown', 'свои платежи ассистент не проводит');
+      const p4 = P('оплати счёт северу на двадцать тысяч');
+      ok(p4.action === 'draft' && p4.docType === 'pp', '«оплати» — платёжка, а не оплата от клиента', JSON.stringify(p4));
+      ok(P('вчера север оплатил пятьдесят тысяч').date === '2026-10-18', '«вчера» → дата');
+
+      // Акт сверки с периодом.
+      const k1 = P('акт сверки с зарёй за сентябрь');
+      ok(k1.action === 'akt' && k1.period.from === '2026-09-01' && k1.period.to === '2026-09-30',
+        'акт сверки: период «за сентябрь»', JSON.stringify(k1));
+      ok(P('акт сверки с севером за ноябрь').period.from === '2025-11-01',
+        'ноябрь, которого ещё не было, — прошлогодний');
+
+      // Что НЕ является поручением, хотя слова те же.
+      for (const s of ['как выставить счёт заре на 5000', 'выставлен ли счёт заре', 'не выставляй счёт заре',
+        'если заря оплатит 30000 выставь ей акт', 'выставила заре счёт на 5000', 'счёт за свет пришёл большой',
+        'хочу чтобы заря оплатила 5000']) {
+        ok(P(s) === null, `не принимается за поручение: «${s}»`, JSON.stringify(P(s)));
+      }
+      // «напомни» и «повтори» теперь выполняются (aiRemind, aiRepeat) — разбор отдаёт их наружу.
+      ok(P('напомни вектору про долг').action === 'remind' && ai.quickParse('напомни вектору про долг').action === 'remind',
+        '«напомни» узнаётся и уходит в бота');
+      ok(ai.quickParse('повтори вчерашнюю накладную').action === 'repeat', '«повтори» — тоже');
+      ok(ai.quickParse('напомни всем должникам').all === true && !ai.quickParse('напомни всем должникам').who,
+        '«напомни всем должникам» — всем, а не клиенту по имени «Должникам»');
+      ok(!ai.quickParse('напомни клиенту про долг').who, '«напомни клиенту» — имени нет, бот спросит кому');
+      // Ответ модели проходит ту же проверку: лишнего не пропускаем, нужное оставляем.
+      const sRem = ai.sanitize({ action: 'remind', who: 'Заря', docType: 'выдумка', amount: 5 });
+      ok(sRem.action === 'remind' && sRem.who === 'Заря' && sRem.docType === undefined && sRem.amount === undefined,
+        'sanitize: «напомни» — клиент остаётся, выдуманный вид документа и сумма — нет', JSON.stringify(sRem));
+      const sRep = ai.sanitize({ action: 'repeat', who: 'Заря', docType: 'torg12', date: '2026-10-18' });
+      ok(sRep.docType === 'torg12' && sRep.date === '2026-10-18', 'sanitize: «повтори» держит вид бумаги и число');
+      ok(ai.sanitize({ action: 'repeat', date: '2026-02-31' }).date === undefined, 'и несуществующее число отбрасывает');
+      const sUn = ai.sanitize({ action: 'unpaid', period: { from: '2026-09-01', to: '2026-09-30' } });
+      ok(sUn.period && sUn.period.to === '2026-09-30', 'sanitize: у «неоплаченных» период сохраняется', JSON.stringify(sUn));
+
+      // Клиент: уверенное совпадение только по корню слова, остальное — вопрос.
+      const cpsM = nm.map((n, i) => ({ id: i + 1, name: n }));
+      ok((ai.matchCp(cpsM, 'зарёй').cp || {}).id === 1, '«зарёй» → «Заря»');
+      ok((ai.matchCp(cpsM, 'северу').cp || {}).id === 4, '«Север» не путается с «Северным ветром»');
+      ok((ai.matchCp(cpsM, 'лотосу').choices || []).length === 2, '«лотосу» при «Лотос» и «Лотос-Опт» — вопрос');
+      ok((ai.matchCp(cpsM, 'лотос опту').cp || {}).id === 7, 'а «лотос опту» — однозначно «Лотос-Опт»');
+      const typo = ai.matchCp(cpsM, 'зоре');
+      ok(!typo.cp && (typo.choices || []).length === 1,
+        'ошибка распознавания («зоре») — предложение подтвердить, а не выбор за человека', JSON.stringify(typo));
+
+      // Расшифровка голоса: модель иногда оборачивает ответ в кавычки и заголовок.
+      const speechM = require('./lib/speech');
+      ok(speechM.cleanTranscript('Расшифровка: «Выставь счёт Заре»') === 'Выставь счёт Заре', 'обёртка расшифровки снимается',
+        speechM.cleanTranscript('Расшифровка: «Выставь счёт Заре»'));
+      ok(speechM.cleanTranscript('[тишина]') === '' && speechM.cleanTranscript('(неразборчиво).') === '',
+        'пометки вместо речи — это пустая расшифровка');
+
+      // Ответ модели проверяется по самой фразе: выдуманную сумму и клиента отбрасываем.
+      const keepMock = process.env.AI_MOCK;
+      process.env.AI_MOCK = JSON.stringify({
+        action: 'draft', docType: 'sch', who: 'Заря', items: [{ name: 'Аренда', qty: 1, price: 77777 }],
+      });
+      const inv = await ai.understand('Заре за аренду тридцать тысяч, как обычно', uid);
+      ok(inv.action === 'draft' && inv.items.length === 0 && inv.weak === true,
+        'модель назвала сумму, которой не было во фразе, — позиции убраны, бот переспросит', JSON.stringify(inv));
+      process.env.AI_MOCK = JSON.stringify({ action: 'pay', who: 'Вектор', amount: 12345, kind: 'Оплата' });
+      const inv2 = await ai.understand('ну там кто-то оплатил пятнадцать тысяч, не помню кто', uid);
+      ok(inv2.action === 'pay' && inv2.amount === 0 && inv2.who === '',
+        'выдуманные сумма и клиент оплаты отброшены', JSON.stringify(inv2));
+      process.env.AI_MOCK = JSON.stringify({ action: 'pay', who: 'Заря', amount: 15000, kind: 'Оплата' });
+      const okPay = await ai.understand('ну там заре пришли пятнадцать тысяч, не помню от кого', uid);
+      ok(okPay.action === 'pay' && okPay.amount === 15000 && okPay.who === 'Заря',
+        'а названные во фразе — сохранены (раньше sanitize оставлял одно слово action)', JSON.stringify(okPay));
+      process.env.AI_MOCK = keepMock;
+
+      /*
+       * Точность на наборе фраз (ai-phrases.json) не должна падать. Пороги — в
+       * ai-eval.js. Подняли точность — поднимите и пороги, иначе они перестанут
+       * что-либо охранять. Роняет их, как правило, правка регулярки, которая
+       * чинит одну фразу и ломает три; список промахов покажет `node ai-eval.js`.
+       */
+      const evalMod = require('./ai-eval');
+      const ev = await evalMod.evaluate({ mode: 'rules', ai });
+      ok(ev.n >= 200, 'набор фраз на месте', ev.n);
+      ok(ev.intent >= evalMod.FLOOR.intent, `точность намерений на наборе ≥ ${evalMod.FLOOR.intent}%`, `${ev.intent}%`);
+      ok(ev.full >= evalMod.FLOOR.full, `фраз разобрано безупречно ≥ ${evalMod.FLOOR.full}%`, `${ev.full}%`);
+      ok(ev.sum >= evalMod.FLOOR.sum, `сумма верна ≥ ${evalMod.FLOOR.sum}%`, `${ev.sum}%`);
+      ok(ev.client >= evalMod.FLOOR.client, `клиент найден верно ≥ ${evalMod.FLOOR.client}%`, `${ev.client}%`);
+      ok(ev.dangerPhrases <= evalMod.FLOOR.dangerMax,
+        'опасных ошибок (неверная сумма, клиент или документ без переспроса) нет',
+        `${ev.dangerPhrases} ${JSON.stringify(ev.danger)}`);
+    }
+
+    /*
+     * Подсказка и код должны знать об одних и тех же действиях. Раньше
+     * «pay» было в SHOW_ACTIONS, но в списке ответов для модели его не было
+     * вовсе: про «клиент заплатил» модель просто не знала и отвечала unknown.
+     */
+    const named = [...ai.SYSTEM.matchAll(/"action":"(\w+)"/g)].map((m) => m[1]);
+    const forgotten = ai.SHOW_ACTIONS.filter((a2) => !named.includes(a2));
+    ok(forgotten.length === 0, 'каждое действие из кода названо в подсказке',
+      forgotten.join(' '));
+
+    /*
+     * И обратное: действие, которое понимает разбор, должно уметь выполнить
+     * бот. Однажды в разбор добавили «облако» и «расходы» без обработчиков,
+     * а шаблоны у них были такие широкие («файл», «загруз», «скачать»), что
+     * «загрузи выписку» и «скачать счёт» уходили в никуда.
+     */
+    const botSrc = fs.readFileSync(path.join(__dirname, 'bot.js'), 'utf8');
+    const orphan = [...new Set([...named, ...ai.SHOW_ACTIONS])]
+      .filter((a2) => !['draft', 'unknown'].includes(a2))
+      .filter((a2) => !botSrc.includes(`'${a2}'`));
+    ok(orphan.length === 0, 'у каждого действия разбора есть обработчик в боте', orphan.join(' '));
+    for (const phrase of ['загрузи выписку', 'скачать счёт', 'расходы за месяц']) {
+      const act = route(phrase);
+      ok(act === 'в модель' || botSrc.includes(`'${act}'`), `«${phrase}» не уходит в пустоту`, act);
+    }
+
+    /*
+     * Длина подсказки — это деньги. Ниже 1024 токенов Gemini Flash не
+     * кэширует её вовсе, и мы платим полную цену при каждом обращении.
+     * Считаем по замеру с боевого сервера: 2922 символа дали 1008 токенов.
+     */
+    const perToken = 2922 / 1008;
+    const tokens = Math.round(ai.SYSTEM.length / perToken);
+    ok(tokens > 1024, 'подсказка длиннее порога кэширования Gemini Flash',
+      `${tokens} токенов при пороге 1024`);
+
+    /*
+     * ── счёт в копейках ──
+     *
+     * Предел в штуках держал расход случайно: фраза стоит сотые доли
+     * копейки, снимок счёта — в полсотни раз больше, минута речи — почти в
+     * восемьдесят, а в счётчике все трое шли по единице. Тридцать обращений
+     * значили то полрубля, то двадцать семь.
+     *
+     * Поэтому считаем не обращения, а деньги, и берём расход из ответа
+     * провайдера, а не из прикидки «символы делить на два с половиной»: на
+     * кириллице такая прикидка врёт в полтора раза.
+     */
+    const kuid = uid + 900001;               // отдельный кошелёк, чужого не заденем
+    const envWas = {};
+    for (const k of ['AI_KOP_IN', 'AI_KOP_OUT', 'AI_KOP_CACHED', 'AI_KOP_PHOTO',
+      'AI_KOP_VOICE', 'AI_USER_KOPECKS', 'AI_MONTHLY_KOPECKS', 'AI_MOCK_USAGE',
+      'AI_FREE_KOPECKS', 'AI_FREE_LIMIT']) {
+      envWas[k] = process.env[k];
+    }
+    // Цены задаём руками: умолчания меняются, а числа в проверках — нет.
+    process.env.AI_KOP_IN = '1200';          // 12 ₽ за миллион входных
+    process.env.AI_KOP_OUT = '4800';         // 48 ₽ за миллион исходящих
+    process.env.AI_KOP_CACHED = '120';       // 1,2 ₽ за миллион из кэша — вдесятеро дешевле
+    process.env.AI_KOP_PHOTO = '90';         // 90 копеек за снимок
+    process.env.AI_KOP_VOICE = '120';        // 1,2 ₽ за минуту речи
+    process.env.AI_MONTHLY_KOPECKS = '100000000';
+    process.env.AI_USER_KOPECKS = '100000000';
+    // Кошелёк kuid без подписки, значит действует бесплатная доля — её тоже
+    // поднимаем: этот блок про арифметику расхода, а не про пределы.
+    process.env.AI_FREE_KOPECKS = '100000000';
+    process.env.AI_FREE_LIMIT = '100000';
+    process.env.AI_MOCK = '{"action":"debts"}';
+
+    // Миллион входных и сто тысяч исходящих: 1200 + 480 копеек.
+    process.env.AI_MOCK_USAGE = '1000000,100000,0';
+    await ai.understand('какая-то фраза для модели', kuid);
+    let bk = ai.budget(kuid);
+    ok(bk.kopecks === 1680, 'расход посчитан по ответу провайдера, а не по прикидке', bk.kopecks);
+    ok(bk.tokensIn === 1000000 && bk.tokensOut === 100000,
+      'токены записаны как есть', `${bk.tokensIn}/${bk.tokensOut}`);
+    ok(bk.mine === 1, 'два вызова spend — одно обращение, а не два', bk.mine);
+
+    /*
+     * Кэш подсказки: те же токены на входе, но девять десятых прочитаны из
+     * кэша — и счёт падает больше чем вдвое. Ради этого в запрос Anthropic и
+     * добавлена пометка cache_control.
+     */
+    const wasKop = bk.kopecks;
+    process.env.AI_MOCK_USAGE = '1000000,100000,900000';
+    await ai.understand('другая фраза для модели', kuid);
+    const cachedKop = ai.budget(kuid).kopecks - wasKop;
+    // 100000 не из кэша × 1200 + 100000 исх. × 4800 + 900000 из кэша × 120 = 708
+    ok(cachedKop === 708, 'прочитанное из кэша считается по своей цене', cachedKop);
+    ok(cachedKop < 1680, 'с кэшем подсказки обращение дешевле', `${cachedKop} против 1680`);
+
+    /*
+     * Провайдеры расходятся в том, входит ли кэш в input. Вычитать вслепую
+     * нельзя: у одних получится отрицательный расход, то есть возврат денег
+     * за обращение.
+     */
+    const wasKop2 = ai.budget(kuid).kopecks;
+    process.env.AI_MOCK_USAGE = '100,0,1000000';
+    await ai.understand('третья фраза для модели', kuid);
+    const oddKop = ai.budget(kuid).kopecks - wasKop2;
+    ok(oddKop === 120, 'кэша больше, чем входа, — расход не уходит в минус', oddKop);
+
+    // Снимок и голос: своя цена, потому что провайдер расход не возвращает.
+    process.env.AI_MOCK_USAGE = '1171,48,0';    // настоящая длина подсказки и ответа
+    const wasKop3 = ai.budget(kuid).kopecks;
+    await ai.understand('четвёртая фраза для модели', kuid);
+    const phraseKop = ai.budget(kuid).kopecks - wasKop3;
+    const photoKop = ai.spend(kuid, { photos: 1 });
+    const voiceKop = ai.spend(kuid, { voiceSeconds: 30 });
+    ok(photoKop === 90, 'снимок считается по своей цене', photoKop);
+    ok(voiceKop === 60, 'полминуты речи — половина цены минуты', voiceKop);
+    ok(photoKop > phraseKop * 20, 'снимок дороже фразы в десятки раз, а не равен ей',
+      `${photoKop} против ${phraseKop}`);
+
+    /*
+     * Главное: предел по деньгам останавливает, даже когда обращений
+     * осталось сколько угодно. Без этого снимки выедали бы счёт, не
+     * приближаясь к потолку в штуках.
+     */
+    bk = ai.budget(kuid);
+    process.env.AI_USER_KOPECKS = String(bk.kopecks);
+    process.env.AI_FREE_KOPECKS = String(bk.kopecks);   // kuid без подписки
+    process.env.AI_USER_LIMIT = '100000';
+    const stopped = await ai.understand('пятая фраза для модели', kuid);
+    ok(stopped.source === 'limit', 'предел по деньгам останавливает при свободных обращениях',
+      stopped.source);
+    ok(ai.budget(kuid).left === 0 && ai.budget(kuid).leftKopecks === 0,
+      'и это видно в бюджете', JSON.stringify({ left: ai.budget(kuid).left }));
+    delete process.env.AI_USER_LIMIT;
+
+    for (const [k, v] of Object.entries(envWas)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+
+    /*
+     * ── предел зависит от подписки ──
+     *
+     * Документы подписка различала давно, а обращения к модели — самое
+     * дорогое в продукте — раздавались всем поровну: бесплатному ровно
+     * столько же, сколько заплатившему. То есть за ассистента платил
+     * владелец бота, а не тот, кто им пользуется.
+     */
+    {
+      const bill = require('./lib/billing');
+      const freeUid = uid + 910001;
+      const paidUid = uid + 910002;
+      const keep2 = {};
+      for (const k of ['AI_USER_KOPECKS', 'AI_FREE_KOPECKS', 'AI_USER_LIMIT', 'AI_FREE_LIMIT']) {
+        keep2[k] = process.env[k];
+      }
+      process.env.AI_USER_KOPECKS = '5000';
+      process.env.AI_FREE_KOPECKS = '500';
+      process.env.AI_USER_LIMIT = '30';
+      process.env.AI_FREE_LIMIT = '10';
+
+      // Пользователи должны существовать: подписка живёт в их карточке.
+      const bdbB = require('./lib/bot-db');
+      const freeId = bdbB.getOrCreateUser(freeUid).id;
+      const paidId = bdbB.getOrCreateUser(paidUid).id;
+
+      const free = ai.budget(freeId);
+      ok(free.paid === false, 'без подписки так и помечено', String(free.paid));
+      ok(free.limitKopecks === 500 && free.limitUser === 10,
+        'без подписки доля меньше', `${free.limitKopecks} коп., ${free.limitUser} обращений`);
+
+      bill.grantDays(paidId, 30);
+      const paid = ai.budget(paidId);
+      ok(paid.paid === true, 'с подпиской так и помечено', String(paid.paid));
+      ok(paid.limitKopecks === 5000 && paid.limitUser === 30,
+        'подписка поднимает предел', `${paid.limitKopecks} коп., ${paid.limitUser} обращений`);
+      ok(paid.limitKopecks === free.limitKopecks * 10,
+        'разница между долей и подпиской не на словах',
+        `${free.limitKopecks} против ${paid.limitKopecks}`);
+
+      /*
+       * Бесплатная доля кончается раньше — и на этом обращения к модели
+       * прекращаются. Проверяем не число в объекте, а поведение understand.
+       */
+      process.env.AI_MOCK = '{"action":"debts"}';
+      ai.spend(freeId, { usage: { in: 0, out: 0, cached: 0 }, photos: 6 }); // 6 × 90 = 540 коп.
+      const stop = await ai.understand('какая-то фраза для модели', freeId);
+      ok(stop.source === 'limit', 'бесплатная доля исчерпана — к модели не идём', stop.source);
+
+      // А у подписчика тот же расход предела не достигает.
+      ai.spend(paidId, { usage: { in: 0, out: 0, cached: 0 }, photos: 6 });
+      const still = await ai.understand('какая-то фраза для модели', paidId);
+      ok(still.source === 'model', 'у подписчика тот же расход ещё в пределах', still.source);
+
+      for (const [k, v] of Object.entries(keep2)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+
+    /*
+     * Через бота — и здесь всё решает тумблер.
+     *
+     * Выключен: фраза разбирается, мастер открывается с подставленными
+     * позициями, но документ не выписывается — «я подготовил, выпускайте вы».
+     * Включён: ассистент доводит до файла сам.
+     */
+    const cpA = bdbA.createCp(uid, { name: 'ООО «Тюльпан»', kind: 'customer', opening_date: '2026-01-01' });
+    process.env.AI_MOCK = JSON.stringify({
+      action: 'draft', docType: 'sch', who: 'Тюльпан',
+      items: [{ name: 'Обслуживание', qty: 1, price: 12000 }],
+    });
+
+    bdbA.setAiEnabled(uid, false);
+    const docsBefore = bdbA.listDocs(uid, 99).length;
+    await say('Тюльпану за обслуживание двенадцать тысяч');
+    ok(bdbA.listDocs(uid, 99).length === docsBefore, 'с выключенным тумблером документ сам не выписался',
+      bdbA.listDocs(uid, 99).length - docsBefore);
+    const st = bdbA.getState(uid);
+    ok(st.state === `items:sch:${cpA}`, 'открыт обычный мастер с этим клиентом', st.state);
+    ok(st.data.items.length === 1 && st.data.items[0].price === 12000, 'позиции подставлены',
+      JSON.stringify(st.data.items));
+    ok(norm(last()).includes('Проверьте'), 'бот просит проверить, а не отчитывается о выписке',
+      norm(last()).slice(0, 60));
+    await tap('menu');
+
+    bdbA.setAiEnabled(uid, true);
+    const docsOn = bdbA.listDocs(uid, 99).length;
+    await say('Тюльпану за обслуживание двенадцать тысяч');
+    ok(bdbA.listDocs(uid, 99).length === docsOn + 1,
+      'с включённым — выписал сам, без второго нажатия',
+      `${docsOn} → ${bdbA.listDocs(uid, 99).length}`);
+
+    delete process.env.AI_ENABLED;
+    delete process.env.AI_PROVIDER;
+    delete process.env.AI_MOCK;
+  }
+
+  console.log('\n── голосовое сообщение ──');
+  {
+    /*
+     * Голос — это ввод, а не действие: расшифровка идёт тем же путём, что и
+     * напечатанная фраза. Проверяем весь путь с заглушкой вместо сети: бот
+     * должен сперва показать услышанное и только потом отвечать.
+     */
+    const sp = require('./lib/speech');
+    ok(sp.speechAvailable() === false, 'без провайдера речи модуль молчит');
+    ok(/не подключено/i.test(sp.speechHint()), 'и объясняет почему', sp.speechHint());
+
+    // Определение формата по сигнатуре, а не по слову отправителя.
+    ok(sp.sniff(Buffer.from('OggS\0\0\0\0')) === 'oggopus', 'OGG узнаётся по сигнатуре');
+    ok(sp.sniff(Buffer.concat([Buffer.alloc(4), Buffer.from('ftypisom')])) === 'mp4',
+      'MP4 узнаётся по сигнатуре');
+    ok(sp.sniff(Buffer.from('что-то не то')) === '', 'мусор не выдаёт себя за звук');
+
+    // WAV из приложения: заголовок снимается, частота читается.
+    const wav = Buffer.alloc(44 + 200);
+    wav.write('RIFF', 0); wav.writeUInt32LE(36 + 200, 4); wav.write('WAVE', 8);
+    wav.write('fmt ', 12); wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20);
+    wav.writeUInt16LE(1, 22); wav.writeUInt32LE(16000, 24); wav.writeUInt32LE(32000, 28);
+    wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34);
+    wav.write('data', 36); wav.writeUInt32LE(200, 40);
+    const parsed = sp.parseWav(wav);
+    ok(parsed && parsed.rate === 16000 && parsed.pcm.length === 200,
+      'WAV разобран: частота и звук отдельно', parsed && `${parsed.rate}/${parsed.pcm.length}`);
+    ok(sp.parseWav(Buffer.from('не wav совсем')) === null, 'не-WAV честно отвергнут');
+
+    /*
+     * Склейка при копировании. С боевого сервера пришёл ключ, к которому
+     * прилипло время сообщения, — SpeechKit ответил «Unknown api key», и по
+     * такому ответу человек идёт перевыпускать совершенно рабочий ключ.
+     * Видно это, не отправляя запрос.
+     */
+    ok(/лишний текст/.test(sp.badKey('AQVN-kluch-iz-testa16:49')),
+      'ключ со слипшимся временем распознан', sp.badKey('AQVN-kluch-iz-testa16:49'));
+    ok(/начинается не с AQVN/.test(sp.badKey('YCAJEabcdef')), 'не тот тип ключа распознан');
+    ok(sp.badKey('AQVN-kluch-iz-testa') === '', 'нормальный ключ пропущен');
+    ok(sp.badKey('') === '', 'пустой ключ здесь не ругаем — про него скажет speechHint');
+    {
+      {
+        // Без SPEECH_PROVIDER, но с ключом Gemini голос включается сам.
+        const sp = require('./lib/speech');
+        const wasP = process.env.SPEECH_PROVIDER; const wasK = process.env.GEMINI_API_KEY;
+        delete process.env.SPEECH_PROVIDER; process.env.GEMINI_API_KEY = 'AIza-test';
+        ok(sp.speechAvailable(), 'ключ Gemini есть — распознавание голоса включено без лишних настроек');
+        process.env.SPEECH_PROVIDER = 'off';
+        ok(!sp.speechAvailable(), 'SPEECH_PROVIDER=off выключает его явно');
+        delete process.env.GEMINI_API_KEY; delete process.env.SPEECH_PROVIDER;
+        ok(!sp.speechAvailable(), 'нет ключа и провайдера — выключено');
+        if (wasP !== undefined) process.env.SPEECH_PROVIDER = wasP;
+        if (wasK !== undefined) process.env.GEMINI_API_KEY = wasK;
+      }
+      const was = { p: process.env.SPEECH_PROVIDER, k: process.env.GEMINI_API_KEY };
+      process.env.SPEECH_PROVIDER = 'gemini';
+      process.env.GEMINI_API_KEY = 'AIzaSy-kluch-iz-testa';
+      ok(!/YANDEX|AQVN/.test(sp.speechHint()),
+        'ключ Gemini не проверяется по правилам Яндекса', sp.speechHint());
+      for (const [name, v] of [['SPEECH_PROVIDER', was.p], ['GEMINI_API_KEY', was.k]]) {
+        if (v === undefined) delete process.env[name]; else process.env[name] = v;
+      }
+    }
+    {
+      /*
+       * Модель для голоса. AI_MODEL — модель основного ИИ, и на сервере там
+       * стоит Claude. Голос брал её же и слал в Gemini чужое имя — Gemini
+       * отвечал 404, а человек видел «не разобрал запись» на любой фразе.
+       */
+      const keep = { m: process.env.AI_MODEL, s: process.env.SPEECH_MODEL, k: process.env.GEMINI_API_KEY, f: global.fetch };
+      const urls = [];
+      global.fetch = async (url) => { urls.push(String(url)); return { ok: false, status: 404, headers: new Map(), text: async () => '', json: async () => ({}) }; };
+      process.env.GEMINI_API_KEY = 'AIza-test'; delete process.env.SPEECH_MODEL;
+      process.env.AI_MODEL = 'claude-haiku-4-5-20251001';
+      await sp.viaGemini(Buffer.from('OggS'), 'oggopus').catch(() => {});
+      ok(urls.length && !/claude/.test(urls[0]) && /models\/gemini/.test(urls[0]),
+        'основной ИИ — Claude, а голос всё равно идёт в модель Gemini', urls[0]);
+      urls.length = 0; process.env.AI_MODEL = 'gemini-3.6-pro';
+      await sp.viaGemini(Buffer.from('OggS'), 'oggopus').catch(() => {});
+      ok(/models\/gemini-3\.6-pro:/.test(urls[0] || ''), 'основной ИИ — Gemini: голос берёт ту же модель', urls[0]);
+      global.fetch = keep.f;
+      for (const [name, v] of [['AI_MODEL', keep.m], ['SPEECH_MODEL', keep.s], ['GEMINI_API_KEY', keep.k]]) {
+        if (v === undefined) delete process.env[name]; else process.env[name] = v;
+      }
+    }
+
+    /*
+     * Ответ асинхронного распознавания — склеенные подряд объекты, а не
+     * массив. Наивный JSON.parse на таком падает, поэтому разбираем сами —
+     * и скобка внутри строки не должна нас сбить.
+     */
+    const stream = sp.splitJsonStream('{"a":1}{"b":{"c":"}"}}{битый');
+    ok(stream.length === 2 && stream[1].b.c === '}',
+      'поток JSON разобран, скобка в строке не сбила', JSON.stringify(stream));
+
+    process.env.SPEECH_PROVIDER = 'mock';
+    tg.downloadFile = async () => Buffer.from('OggS запись');
+    ok(sp.speechAvailable() === true, 'с заглушкой модуль готов');
+    process.env.SPEECH_MOCK = 'кто мне должен';
+    const heard = await sp.transcribe(Buffer.from('OggS звук'), 5);
+    ok(heard.ok && heard.text === 'кто мне должен', 'заглушка расшифровала', JSON.stringify(heard));
+    ok((await sp.transcribe(Buffer.alloc(0))).ok === false, 'пустая запись отвергнута');
+
+    // Весь путь: пришло голосовое — бот показал услышанное и ответил долгами.
+    sent.length = 0;
+    const aiMod = require('./lib/ai-agent');
+    const vuid = fxUserId();
+    process.env.AI_KOP_VOICE = '120';       // 1,2 ₽ за минуту
+    const kopBefore = aiMod.budget(vuid).kopecks;
+    await handleUpdate(tg, {
+      message: {
+        message_id: 900, chat: CHAT, from: USER,
+        voice: { file_id: 'voice-1', duration: 4, mime_type: 'audio/ogg' },
+      },
+    });
+    const texts = sent.map((m) => norm(m.text || ''));
+    ok(texts.some((t) => t.includes('Услышал')), 'бот показал, что услышал', texts.join(' | ').slice(0, 120));
+    ok(texts.some((t) => /должен|долг/i.test(t)), 'и выполнил услышанное');
+    /*
+     * И записал расход. Четыре секунды звука по 1,2 ₽ за минуту — восемь
+     * копеек. Тут проверяется не арифметика (она проверена выше), а то, что
+     * обработчик голоса вообще дошёл до кошелька: раньше секунды звука не
+     * стоили ничего, и запись на двадцать мегабайт весила в бюджете столько
+     * же, сколько фраза «кто мне должен», которую разбирает местный код.
+     */
+    ok(aiMod.budget(vuid).kopecks - kopBefore === 8,
+      'секунды звука записаны в расход', aiMod.budget(vuid).kopecks - kopBefore);
+    delete process.env.AI_KOP_VOICE;
+
+    /*
+     * ── Gemini как провайдер речи ──
+     *
+     * Появился не от хорошей жизни: на боевом сервере SpeechKit молчит из-за
+     * невыданной роли, а Gemini на той же машине работает. Заодно он считает
+     * звук токенами и возвращает их — значит расход по голосу перестаёт быть
+     * прикидкой «минута стоит столько-то».
+     *
+     * Ходим на поддельный адрес: сеть в прогонах не нужна.
+     */
+    {
+      const http3 = require('node:http');
+      const got3 = [];
+      const fakeG = http3.createServer((q, res3) => {
+        let b = '';
+        q.on('data', (c) => { b += c; });
+        q.on('end', () => {
+          try { got3.push(JSON.parse(b)); } catch (_) { got3.push({}); }
+          res3.writeHead(200, { 'content-type': 'application/json' });
+          res3.end(JSON.stringify({
+            candidates: [{ content: { parts: [{ text: 'кто мне должен' }] } }],
+            usageMetadata: { promptTokenCount: 770, candidatesTokenCount: 12 },
+          }));
+        });
+      });
+      await new Promise((r3) => fakeG.listen(0, '127.0.0.1', r3));
+      const keepG = {};
+      for (const k of ['SPEECH_PROVIDER', 'GEMINI_API_KEY', 'GEMINI_BASE_URL', 'AI_KOP_IN', 'AI_KOP_VOICE']) {
+        keepG[k] = process.env[k];
+      }
+      process.env.SPEECH_PROVIDER = 'gemini';
+      process.env.GEMINI_API_KEY = 'test-key';
+      process.env.GEMINI_BASE_URL = `http://127.0.0.1:${fakeG.address().port}`;
+      process.env.AI_KOP_IN = '1200';
+      process.env.AI_KOP_VOICE = '120';
+
+      const spG = require('./lib/speech');
+      ok(spG.speechAvailable() === true, 'с ключом Gemini речь доступна');
+
+      const ogg = Buffer.concat([Buffer.from('OggS'), Buffer.alloc(300)]);
+      const heardG = await spG.transcribe(ogg, 5);
+      ok(heardG.ok && heardG.text === 'кто мне должен', 'Gemini расшифровал',
+        JSON.stringify(heardG).slice(0, 80));
+      ok(heardG.via === 'gemini', 'и это видно в ответе', heardG.via);
+      ok(heardG.usage && heardG.usage.in === 770,
+        'расход вернулся токенами, а не прикидкой', JSON.stringify(heardG.usage));
+
+      // Запись уходит в том виде, в каком пришла: контейнер определяется по
+      // сигнатуре файла, а не по словам отправителя.
+      const part = ((got3[0] || {}).contents || [{}])[0].parts || [];
+      ok((part[1] || {}).inline_data && part[1].inline_data.mime_type === 'audio/ogg',
+        'OGG уехал как audio/ogg', JSON.stringify((part[1] || {}).inline_data || {}).slice(0, 60));
+      ok(/Только сами слова/.test((part[0] || {}).text || ''),
+        'подсказка запрещает добавлять от себя', ((part[0] || {}).text || '').slice(0, 40));
+
+      // WAV из приложения — тем же путём, но своим типом.
+      got3.length = 0;
+      const wav = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVE'), Buffer.alloc(200)]);
+      await spG.transcribe(wav, 3);
+      const partW = ((got3[0] || {}).contents || [{}])[0].parts || [];
+      ok((partW[1] || {}).inline_data.mime_type === 'audio/wav', 'WAV уехал как audio/wav',
+        (partW[1] || {}).inline_data.mime_type);
+
+      // Слишком длинная запись до сети не доходит вовсе.
+      got3.length = 0;
+      const huge = Buffer.concat([Buffer.from('OggS'), Buffer.alloc(21 * 1024 * 1024)]);
+      const big = await spG.transcribe(huge, 600);
+      ok(big.ok === false && /слишком длинная/.test(big.error), 'запись больше 20 МБ отклонена',
+        big.error);
+      ok(got3.length === 0, 'и в сеть за ней не ходили', String(got3.length));
+
+      fakeG.close();
+      for (const [k, v] of Object.entries(keepG)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+
+    delete process.env.SPEECH_PROVIDER;
+    delete process.env.SPEECH_MOCK;
+    sent.length = 0;
+    await handleUpdate(tg, {
+      message: {
+        message_id: 901, chat: CHAT, from: USER,
+        voice: { file_id: 'voice-2', duration: 4 },
+      },
+    });
+    ok(norm(sent.map((m) => m.text).join(' ')).includes('не разбираю'),
+      'без провайдера бот честно говорит, что голос не разбирает',
+      norm(sent.map((m) => m.text).join(' ')).slice(0, 80));
+  }
+
+  console.log('\n── помощник отвечает голосом и помнит разговор ──');
+  {
+    const tts = require('./lib/tts');
+    const oggMod = require('./lib/ogg-opus');
+    const consultMod = require('./lib/consult');
+    const aiMod = require('./lib/ai-agent');
+    const bdbV = require('./lib/bot-db');
+    const http = require('node:http');
+
+    // Текст для глаз — не текст для голоса.
+    const said = tts.speakable('<b>Нам должны — 120 000 ₽</b>\n• Заря — 50 000 ₽ ⚠️\nГотово!\nСчёт № 5');
+    ok(!/[<>₽⚠•]/.test(said) && /120 000 руб\./.test(said) && /номер 5/.test(said) && !/!\./.test(said),
+      'разметка, эмодзи и знаки убраны, «₽» и «№» читаются словами', said);
+    const long = tts.speakable('Раз. '.repeat(400), 100);
+    ok(long.length <= 101 && /\.$/.test(long), 'длинное режется по концу фразы', long.length);
+
+    // Контейнер OGG: CRC страниц — свой, не zlib.
+    const fakeOgg = oggMod.muxOggOpus([Buffer.alloc(80, 1), Buffer.alloc(300, 2)], [20000, 20000],
+      { inputRate: 24000, samples: 960 });
+    ok(fakeOgg.toString('latin1', 0, 4) === 'OggS' && fakeOgg.includes(Buffer.from('OpusHead'))
+      && fakeOgg.includes(Buffer.from('OpusTags')), 'OGG собран: заголовки Opus на месте');
+    const firstLen = 27 + fakeOgg[26] + fakeOgg.slice(27, 27 + fakeOgg[26]).reduce((a, b) => a + b, 0);
+    const page1 = Buffer.from(fakeOgg.subarray(0, firstLen));
+    const crc = page1.readUInt32LE(22);
+    page1.writeUInt32LE(0, 22);
+    ok(oggMod.oggCrc(page1) === crc, 'контрольная сумма страницы сходится');
+
+    // Настоящее кодирование в Chromium — там, где он есть (на сервере есть: он же печатает PDF).
+    if (require('./lib/pdf').pdfAvailable()) {
+      const pcm = Buffer.alloc(24000 * 2);
+      for (let i = 0; i < 24000; i += 1) pcm.writeInt16LE(Math.round(6000 * Math.sin(i / 8)), i * 2);
+      const ogg = await oggMod.pcmToOggOpus(pcm, 24000).catch((e) => ({ err: e.message }));
+      ok(Buffer.isBuffer(ogg) && ogg.toString('latin1', 0, 4) === 'OggS' && ogg.length > 1000,
+        'секунда звука закодирована в OGG/Opus через Chromium', Buffer.isBuffer(ogg) ? ogg.length : ogg.err);
+    }
+
+    // Синтез через Gemini: модель — самая свежая flash-tts из списка, расход — по факту.
+    const seenT = [];
+    const pcmBack = Buffer.alloc(4800 * 2, 0);
+    const fakeT = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        seenT.push({ url: req.url, key: req.headers['x-goog-api-key'], body });
+        res.setHeader('content-type', 'application/json');
+        if (req.method === 'GET') {
+          res.end(JSON.stringify({ models: [
+            { name: 'models/gemini-2.5-flash-preview-tts', supportedGenerationMethods: ['generateContent'] },
+            { name: 'models/gemini-3.1-flash-tts', supportedGenerationMethods: ['generateContent'] },
+            { name: 'models/gemini-3.1-pro-tts', supportedGenerationMethods: ['generateContent'] },
+            { name: 'models/gemini-3.6-flash', supportedGenerationMethods: ['generateContent'] },
+          ] }));
+          return;
+        }
+        res.end(JSON.stringify({
+          candidates: [{ content: { parts: [{ inlineData: { mimeType: 'audio/L16;codec=pcm;rate=24000', data: pcmBack.toString('base64') } }] } }],
+          usageMetadata: { promptTokenCount: 30, candidatesTokenCount: 5000 },
+        }));
+      });
+    });
+    await new Promise((r) => fakeT.listen(0, '127.0.0.1', r));
+    const keepT = { TTS_PROVIDER: process.env.TTS_PROVIDER, GEMINI_API_KEY: process.env.GEMINI_API_KEY, GEMINI_BASE_URL: process.env.GEMINI_BASE_URL };
+    process.env.TTS_PROVIDER = 'gemini';
+    process.env.GEMINI_API_KEY = 'test-key';
+    process.env.GEMINI_BASE_URL = `http://127.0.0.1:${fakeT.address().port}`;
+    tts._resetModelCache();
+    const wav = await tts.synthesize('Вам должны тридцать тысяч.', { format: 'wav' });
+    const asked = seenT.find((x) => x.url.includes(':generateContent')) || { body: '{}', url: '' };
+    const askedBody = JSON.parse(asked.body);
+    ok(wav.ok && wav.format === 'wav' && wav.buffer.toString('latin1', 0, 4) === 'RIFF',
+      'Gemini вернул PCM — браузеру отдаём WAV', JSON.stringify({ ok: wav.ok, f: wav.format, e: wav.error }));
+    ok(asked.url.includes('gemini-3.1-flash-tts'), 'выбрана самая свежая flash-модель речи', asked.url);
+    ok(asked.key === 'test-key' && !asked.url.includes('test-key'), 'ключ — заголовком, не в адресе');
+    ok(JSON.stringify(askedBody.generationConfig.responseModalities) === '["AUDIO"]'
+      && /дружелюбно/.test(askedBody.contents[0].parts[0].text),
+      'просим звук и задаём интонацию словами', asked.body.slice(0, 160));
+    ok(wav.spent && wav.spent.ttsTokens === 5000 && Math.abs(wav.seconds - 0.2) < 0.01,
+      'звуковые токены и длительность — по ответу', JSON.stringify(wav.spent));
+    process.env.AI_KOP_TTS_OUT = '82000';
+    process.env.AI_KOP_IN = '1200';
+    const tuid = fxUserId();
+    const k0 = aiMod.budget(tuid).kopecks;
+    aiMod.spend(tuid, wav.spent);
+    ok(aiMod.budget(tuid).kopecks - k0 === 411,
+      'синтез записан в общий кошелёк: 5000 звуковых токенов ≈ 4,1 ₽', aiMod.budget(tuid).kopecks - k0);
+    delete process.env.AI_KOP_TTS_OUT;
+    delete process.env.AI_KOP_IN;
+    fakeT.close();
+    for (const [k, v] of Object.entries(keepT)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    tts._resetModelCache();
+
+    // Голосовое в Telegram — multipart с полем voice и длительностью.
+    const { Telegram } = require('./lib/tg');
+    let voiceReq = '';
+    const fakeTg = http.createServer((req, res) => {
+      let body = '';
+      req.setEncoding('latin1');
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        voiceReq = `${req.url}\n${body}`;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ ok: true, result: { message_id: 1 } }));
+      });
+    });
+    await new Promise((r) => fakeTg.listen(0, '127.0.0.1', r));
+    const tgv = new Telegram('test-token');
+    tgv.base = `http://127.0.0.1:${fakeTg.address().port}/bottest-token`;
+    await tgv.sendVoice(42, { buffer: Buffer.from('OggS голос'), duration: 3.4, buttons: [[{ text: 'x', data: 'voice.off' }]] });
+    ok(/\/sendVoice/.test(voiceReq) && /name="voice"/.test(voiceReq) && /name="duration"\r\n\r\n3/.test(voiceReq)
+      && /voice\.off/.test(voiceReq), 'sendVoice: поле voice, длительность и кнопка ушли', voiceReq.slice(0, 120));
+    fakeTg.close();
+
+    // Помощник: память разговора и данные человека.
+    process.env.AI_ENABLED = '1';
+    process.env.AI_PROVIDER = 'mock';
+    process.env.AI_MOCK = '{"action":"unknown"}';
+    process.env.CONSULT_MOCK = 'Акт подтверждает услугу, УПД — ещё и счёт-фактура. Для товаров берите УПД или накладную.';
+    process.env.TTS_PROVIDER = 'mock';
+    const cuid = fxUserId();
+    const zarya = bdbV.createCp(cuid, { name: 'ООО «Заря-Голос»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbV.addOp(cuid, zarya, { date: '2026-02-01', kind: 'Реализация', credit: 45000 });
+    const ctx = consultMod.userContext(cuid);
+    ok(/Заря-Голос/.test(ctx) && /45\s000 руб\./.test(norm(ctx)), 'помощник видит должников с суммами', ctx.slice(0, 200));
+
+    const voiceCalls = [];
+    tg.sendVoice = async (chatId, p) => { voiceCalls.push(p); return { message_id: 1 }; };
+    tg.downloadFile = async () => Buffer.from('OggS запись');
+    process.env.SPEECH_PROVIDER = 'mock';
+    process.env.SPEECH_MOCK = 'чем акт отличается от упд';
+    bdbV.setVoiceReply(cuid, true);
+    sent.length = 0;
+    await handleUpdate(tg, { message: { message_id: 950, chat: CHAT, from: USER, voice: { file_id: 'v-c', duration: 3 } } });
+    const allText = norm(sent.map((m) => m.text || '').join(' | '));
+    ok(/Акт подтверждает услугу/.test(allText) && !/Не понял/.test(allText),
+      'на вопрос голосом отвечает помощник, а не «не понял»', allText.slice(-200));
+    ok(voiceCalls.length === 1 && String(voiceCalls[0].buffer).startsWith('OggS')
+      && (voiceCalls[0].buttons || []).flat().some((b) => b.data === 'voice.off'),
+      'и отвечает голосом, с кнопкой «Отвечать текстом»', String(voiceCalls.length));
+    const hist = bdbV.listAiMessages(cuid, 5);
+    ok(hist.some((m) => m.role === 'assistant' && /Акт подтверждает/.test(m.text || '')),
+      'в историю записан настоящий ответ, а не метка');
+    const contents = consultMod.historyContents(cuid, 'а для услуг?');
+    ok(contents.length >= 2 && contents[0].role === 'user'
+      && contents.every((c, i) => i === 0 || c.role !== contents[i - 1].role),
+      'история для модели: с человека и с чередованием ролей', JSON.stringify(contents.map((c) => c.role)));
+
+    // Кнопка «Отвечать текстом» — дальше без голоса.
+    await tap('voice.off');
+    ok(!bdbV.isVoiceReply(cuid), 'кнопка выключила голос');
+    voiceCalls.length = 0;
+    await handleUpdate(tg, { message: { message_id: 951, chat: CHAT, from: USER, voice: { file_id: 'v-d', duration: 3 } } });
+    ok(voiceCalls.length === 0, 'после неё отвечаю только текстом');
+    await say('отвечай голосом');
+    ok(bdbV.isVoiceReply(cuid) && /голосом/.test(last()), 'фраза «отвечай голосом» возвращает голос', last());
+
+    // Напечатанный вопрос — ответ текстом, без голоса.
+    voiceCalls.length = 0;
+    await say('как вежливо напомнить клиенту про оплату');
+    ok(/Акт подтверждает/.test(last()) && voiceCalls.length === 0, 'на текст — текстом');
+
+    // «Кто мне должен» голосом — сводка вслух.
+    process.env.SPEECH_MOCK = 'кто мне должен';
+    voiceCalls.length = 0;
+    await handleUpdate(tg, { message: { message_id: 952, chat: CHAT, from: USER, voice: { file_id: 'v-e', duration: 2 } } });
+    const topDebtor = bdbV.debtors(cuid).filter((r) => r.theyOwe).sort((a, b) => b.amount - a.amount)[0];
+    const spokenDebt = String((voiceCalls[0] || {}).buffer || '');
+    ok(voiceCalls.length === 1 && /Вам должны \d+ клиент/.test(spokenDebt) && spokenDebt.includes(topDebtor.cp.name),
+      'долги голосом: сколько должны и кто больше всех', spokenDebt.slice(0, 120));
+
+    // Предел кончился — помощник не зовёт модель.
+    // Предел и подписчика, и бесплатный: у тестового человека бывает подписка из соседних проверок.
+    process.env.AI_FREE_KOPECKS = '0';
+    process.env.AI_USER_KOPECKS = '0';
+    const lim = await consultMod.reply(cuid, 'ещё вопрос');
+    ok(!lim.ok && lim.from === 'limit', 'кончился предел — помощник молчит, денег не тратит', JSON.stringify(lim).slice(0, 120));
+    delete process.env.AI_FREE_KOPECKS;
+    delete process.env.AI_USER_KOPECKS;
+
+    delete tg.sendVoice;
+    for (const k of ['AI_ENABLED', 'AI_PROVIDER', 'AI_MOCK', 'CONSULT_MOCK', 'TTS_PROVIDER', 'SPEECH_PROVIDER', 'SPEECH_MOCK']) {
+      delete process.env[k];
+    }
+  }
+
+  console.log('\n── утренняя сводка, напоминания в трёх тонах, позиции под профессию ──');
+  {
+    const dg = require('./lib/digest');
+    const bdbD = require('./lib/bot-db');
+    const uidD = fxUserId();
+    const dcp = bdbD.createCp(uidD, { name: 'ООО «Тянет с оплатой»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbD.addOp(uidD, dcp, { date: '2026-03-01', kind: 'Реализация', credit: 88000 });
+    const { db: rawD } = require('./db');
+    rawD.prepare("UPDATE bot_users SET digest_at = '', digest_total = -1, digest_on = 1 WHERE id = ?").run(uidD);
+
+    const d1 = dg.build(uidD, { today: '2026-10-16' });
+    ok(d1 && /Доброе утро/.test(d1.text) && /Тянет с оплатой/.test(norm(d1.text)),
+      'сводка: сколько должны и кто', d1 && norm(d1.text).slice(0, 120));
+    const btns = d1 ? d1.rows.flat() : [];
+    ok(btns.some((b) => b.data.startsWith('rm.one:')) && btns.some((b) => b.data.startsWith('pay.cp:'))
+      && btns.some((b) => b.data === 'dg.off'), 'под сводкой — «Напомнить», «Оплатил» и «Не присылать»');
+
+    const outD = [];
+    const tgD = { async sendMessage(chatId, text, opts) { outD.push({ chatId, text, opts }); return {}; } };
+    const kbD = (rows) => ({ reply_markup: { inline_keyboard: rows } });
+    const n1 = await dg.run(tgD, kbD, { today: '2026-10-16' });
+    ok(n1 >= 1 && outD.some((m) => m.chatId === USER.id), 'сводка разослана тем, у кого есть должники', n1);
+    const was = outD.length;
+    const n2 = await dg.run(tgD, kbD, { today: '2026-10-16' });
+    ok(n2 === 0 && outD.length === was, 'второй раз за день — тишина (перезапуск бота не дублирует)');
+    ok(dg.build(uidD, { today: '2026-10-17' }) === null, 'сумма не изменилась — назавтра не беспокоим');
+    ok(Boolean(dg.build(uidD, { today: '2026-10-19' })), 'через три дня напомним снова');
+    ok(dg.isMorning(new Date('2026-10-16T06:30:00Z')) && !dg.isMorning(new Date('2026-10-16T04:00:00Z')),
+      'время — по Москве: 9:30 пора, 7:00 рано');
+    await tap('dg.off');
+    ok(!dg.isOn(uidD) && !dg.candidates('2026-10-20').some((u) => u.id === uidD), '«Не присылать» выключает сводку');
+    await tap('dg.on');
+    ok(dg.isOn(uidD), 'и включается обратно');
+
+    // Напоминание одному должнику: первый раз — мягко, после «Отправил сам» — по делу, строго — со ст. 395.
+    await tap(`rm.one:${dcp}`);
+    ok(/Небольшое напоминание/.test(last()) && Boolean(button('• Мягко')), 'первое напоминание — мягким тоном', norm(last()).slice(0, 80));
+    await tap(`rm.one:${dcp}:firm`);
+    ok(/ст\. 395 ГК РФ/.test(last()) && /претензию/.test(last()) && Boolean(button('• Строго')),
+      'строгий тон: претензия и проценты по закону, без выдуманных штрафов');
+    // «Переслать клиенту»: ссылка-шеринг Telegram с готовым текстом в выбранном тоне;
+    // бот сам клиенту не пишет, чат выбирает человек.
+    const shareBtn = ((sent[sent.length - 1] || {}).kb || []).flat().find((b) => b.text.includes('Переслать клиенту'));
+    ok(shareBtn && shareBtn.url.startsWith('https://t.me/share/url?'), 'у напоминания есть «Переслать клиенту»', shareBtn && shareBtn.url.slice(0, 40));
+    ok(shareBtn && decodeURIComponent(shareBtn.url.split('text=')[1]).includes('ст. 395 ГК РФ'),
+      'в ссылке текст именно выбранного (строгого) тона');
+    ok(shareBtn && shareBtn.url.length <= 2000, 'ссылка укладывается в предел Telegram', shareBtn && shareBtn.url.length);
+    await tap(`rm.done:${dcp}:firm`);
+    ok(dg.lastReminded(uidD, dcp) === 0, 'отмечено, что напомнили');
+    await tap(`rm.one:${dcp}`);
+    ok(/числится задолженность/.test(last()) && Boolean(button('• По делу')), 'после напоминания — тон «по делу»');
+    await tap('debts');
+    ok(/напомнили сегодня/.test(norm(sent.slice(-2).map((m) => m.text).join(' '))), 'в списке долгов видно, что напоминали');
+
+    // Вид деятельности — готовые позиции; позиция без цены спрашивает цену.
+    await tap('biz.set:catering');
+    ok(/Банкетное обслуживание/.test(norm(sent.slice(-3).map((m) => m.text).join(' '))), 'кейтеринг: добавлены готовые позиции');
+    const preset = bdbD.listTemplates(uidD, 50).find((t) => t.name === 'Банкетное обслуживание');
+    ok(preset && preset.price === 0 && preset.uses === 0, 'позиция без цены и ниже своих', JSON.stringify(preset));
+    await tap(`d.sch:${dcp}`);
+    await tap(`tpl:${preset.id}`);
+    ok(/Сколько и по какой цене/.test(last()), 'позиция из набора спрашивает количество и цену', last());
+    await say('40 2500');
+    ok(/Банкетное обслуживание — 40/.test(norm(last())) && /100 000/.test(norm(last())) === false && /2 500/.test(norm(last())),
+      'позиция добавлена с ценой', norm(last()).slice(0, 100));
+
+    // Мини-CRM: история по датам, заметка, «напомнить мне» утром.
+    const crmM = require('./lib/crm');
+    await tap(`crm.n:${dcp}`);
+    await say('договорились: оплатят до пятницы');
+    ok(/Записал/.test(last()), 'заметка записана');
+    await tap(`crm.fd:${dcp}:3`);
+    await say('позвонить насчёт оплаты');
+    ok(/Напомню/.test(last()), 'напоминание себе поставлено', last());
+    await tap(`crm.h:${dcp}`);
+    const histT = norm(last());
+    ok(/История: ООО «Тянет с оплатой»/.test(histT) && /📝 .*оплатят до пятницы/.test(histT)
+      && /⏰ .*позвонить насчёт оплаты/.test(histT) && /✉️ .*Напоминание об оплате/.test(histT) && /💰/.test(histT),
+    'в истории — заметка, напоминание себе, напоминание должнику и деньги', histT.slice(0, 200));
+    const outF = [];
+    const tgF = { async sendMessage(chatId, text, opts) { outF.push({ chatId, text, opts }); return {}; } };
+    const inThree = crmM.plusDays(require('./lib/period').todayISO(), 3);
+    ok(await require('./bot').sendFollowups(tgF, inThree) >= 1 && outF.some((m) => /позвонить насчёт оплаты/.test(m.text)),
+      'в срок напоминание пришло');
+    ok(await require('./bot').sendFollowups(tgF, inThree) === 0, 'и второй раз не приходит');
+    const fuId = crmM.openFollowups(uidD, dcp)[0].id;
+    await tap(`crm.snz:${fuId}`);
+    ok(crmM.openFollowups(uidD, dcp)[0].due > inThree, '«Через 3 дня» откладывает');
+    await tap(`crm.done:${fuId}`);
+    ok(crmM.openFollowups(uidD, dcp).length === 0, '«Сделано» закрывает');
+    await tap('menu');
+  }
+
+  console.log('\n── проводка не переживает свой документ ──');
+  {
+    const bdbO = require('./lib/bot-db');
+    const { db: rawDb } = require('./db');
+    const docSvc = require('./lib/doc-service');
+    const uid = fxUserId();
+    const org = bdbO.getDefaultOrg(uid);
+    const was = bdbO.basisOf(org);
+    bdbO.updateOrg(uid, org.id, { debt_basis: 'invoice' });
+    const cpO = bdbO.createCp(uid, { name: 'ООО «Сирота»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cpO, items: [{ name: 'Работа', qty: 1, price: 9000 }], skipQuota: true,
+    });
+    ok(bdbO.balanceOf(uid, cpO).closing === 9000, 'счёт создал долг', bdbO.balanceOf(uid, cpO).closing);
+
+    // Штатное удаление забирает проводку с собой.
+    const doc = bdbO.listDocs(uid, 5, cpO)[0];
+    bdbO.deleteDoc(uid, doc.id);
+    ok(bdbO.balanceOf(uid, cpO).closing === 0,
+      'удаление документа убрало и его проводку', bdbO.balanceOf(uid, cpO).closing);
+
+    /*
+     * А теперь беда с боевого сервера: документ удалён мимо deleteDoc —
+     * так делали старые версии бота. Проводка остаётся, долг держится
+     * вечно, и убрать его из приложения нельзя: карточки документа нет.
+     * Ровно на этот случай есть tools/debt-audit.js, и schema-check
+     * теперь про такие проводки предупреждает.
+     */
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cpO, items: [{ name: 'Ещё', qty: 1, price: 4000 }], skipQuota: true,
+    });
+    const doc2 = bdbO.listDocs(uid, 5, cpO)[0];
+    rawDb.prepare('DELETE FROM documents WHERE id = ?').run(doc2.id);
+    ok(bdbO.balanceOf(uid, cpO).closing === 4000,
+      'проводка пережила документ — долг держится', bdbO.balanceOf(uid, cpO).closing);
+
+    const lost = rawDb.prepare(`
+      SELECT COUNT(*) AS n FROM operations o
+       WHERE o.doc_id > 0 AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = o.doc_id)`).get().n;
+    ok(lost >= 1, 'такую проводку видно запросом — на нём стоит schema-check', lost);
+
+    rawDb.prepare(`
+      DELETE FROM operations
+       WHERE doc_id > 0 AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = doc_id)`).run();
+    ok(bdbO.balanceOf(uid, cpO).closing === 0,
+      'после уборки сирот долг сошёлся к нулю', bdbO.balanceOf(uid, cpO).closing);
+
+    bdbO.updateOrg(uid, org.id, { debt_basis: was });
+    bdbO.rebuildDebt(uid);
+  }
+
+  console.log('\n── из чего складывается сумма на главной ──');
+  {
+    /*
+     * Жалоба звучит так: «удалил документы, а сумма прежняя». Почти всегда
+     * её держат не документы, и человеку это нужно показать. Проверяем, что
+     * разбор сходится к самой цифре и что каждое слагаемое попало в свою
+     * графу — иначе экран будет врать убедительнее, чем молчащая цифра.
+     */
+    const bdbW = require('./lib/bot-db');
+    const { db: rawDb } = require('./db');
+    const docSvc = require('./lib/doc-service');
+    const uidW = bdbW.getOrCreateUser(778899001, 'Разбор суммы').id;
+    const orgW = bdbW.createOrg(uidW, { name: 'ИП Разбор', inn: '123456789012' });
+    bdbW.updateOrg(uidW, orgW, { debt_basis: 'invoice' });
+    const cpW = bdbW.createCp(uidW, {
+      name: 'ООО «Слагаемые»', kind: 'customer',
+      opening_balance: 5000, opening_date: '2026-01-01',
+    });
+    await docSvc.issueDocument(uidW, {
+      type: 'sch', cpId: cpW, items: [{ name: 'Работа', qty: 1, price: 10000 }], skipQuota: true,
+    });
+    bdbW.addOp(uidW, cpW, { date: '2026-03-01', kind: 'Оплата', doc: 'п/п 7', debit: 3000 });
+
+    const b1 = bdbW.debtBreakdown(uidW);
+    ok(b1.total === 12000, 'сумма долга — 12 000', b1.total);
+    ok(b1.opening === 5000, 'начальное сальдо в своей графе', b1.opening);
+    ok(b1.docs === 10000, 'документ в своей графе', b1.docs);
+    ok(b1.manual === -3000, 'ручная оплата в своей графе', b1.manual);
+    ok(b1.orphan === 0, 'строк без документа нет', b1.orphan);
+    ok(b1.opening + b1.docs + b1.manual + b1.orphan === b1.total,
+      'слагаемые сходятся к самой цифре');
+
+    // Документ удалён мимо deleteDoc — его проводка переезжает в «сироты»,
+    // а не растворяется в графе документов: иначе поломку не увидеть.
+    const docW = bdbW.listDocs(uidW, 5, cpW)[0];
+    rawDb.prepare('DELETE FROM documents WHERE id = ?').run(docW.id);
+    const b2 = bdbW.debtBreakdown(uidW);
+    ok(b2.total === 12000, 'сумма не изменилась — документа нет, а долг держится', b2.total);
+    ok(b2.docs === 0 && b2.orphan === 10000, 'строка ушла в «без документа»', `${b2.docs}/${b2.orphan}`);
+    ok(b2.orphanCount === 1, 'и посчитана штучно', b2.orphanCount);
+
+    // Долг поставщику в «должны вам» не попадает — там другая сторона.
+    bdbW.createCp(uidW, {
+      name: 'ООО «Поставщик»', kind: 'supplier',
+      opening_balance: 7000, opening_date: '2026-01-01',
+    });
+    const b3 = bdbW.debtBreakdown(uidW);
+    ok(b3.total === 12000, 'наш долг поставщику сюда не приплюсовался', b3.total);
+    ok(b3.opening === 5000, 'и его начальное сальдо тоже', b3.opening);
+
+    /*
+     * Сироты у контрагента, который в сумму не входит. Считать их вместе с
+     * теми, что сумму держат, нельзя: экран сказал бы «три операции держат
+     * 3 000», хотя держит одна, а две другие гасят друг друга.
+     */
+    const cpQ = bdbW.createCp(uidW, { name: 'ООО «Тишина»', kind: 'customer', opening_date: '2026-01-01' });
+    for (const [credit, debit] of [[8000, 0], [0, 8000]]) {
+      // eslint-disable-next-line no-await-in-loop
+      await docSvc.issueDocument(uidW, {
+        type: 'sch', cpId: cpQ, items: [{ name: 'Туда-обратно', qty: 1, price: 8000 }], skipQuota: true,
+      });
+      const dq = bdbW.listDocs(uidW, 5, cpQ)[0];
+      rawDb.prepare('UPDATE operations SET credit = ?, debit = ? WHERE doc_id = ?').run(credit, debit, dq.id);
+      rawDb.prepare('DELETE FROM documents WHERE id = ?').run(dq.id);
+    }
+    const b4 = bdbW.debtBreakdown(uidW);
+    ok(b4.orphanCount === 1 && b4.orphan === 10000,
+      'в сумме сидит одна сирота, и это видно', `${b4.orphanCount} шт. на ${b4.orphan}`);
+    ok(b4.orphanOther === 2, 'а про остальных сказано отдельно', b4.orphanOther);
+    ok(bdbW.debtBreakdown(uidW).total === 12000, 'сумма от их появления не поехала');
+
+    /*
+     * Полукопейки. computeBalance округляет после каждой операции, и разбор
+     * обязан считать так же: иначе слагаемые не сойдутся с самой цифрой —
+     * ровно то, ради чего этот экран и сделан.
+     */
+    const cpK = bdbW.createCp(uidW, { name: 'ООО «Копейка»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbW.addOp(uidW, cpK, { date: '2026-04-01', kind: 'Реализация', credit: 0.005 });
+    bdbW.addOp(uidW, cpK, { date: '2026-04-02', kind: 'Реализация', credit: 0.005 });
+    const b5 = bdbW.debtBreakdown(uidW);
+    ok(b5.opening + b5.docs + b5.manual + b5.orphan === b5.total,
+      'на полукопейках слагаемые тоже сходятся', JSON.stringify(b5));
+  }
+
+  console.log('\n── напоминание по виду деятельности ──');
+  {
+    /*
+     * Безопасная автоматизация: шаблон подсказывает, повторение предлагает,
+     * выписывает человек. Проверяем и то, что предлагается, и — главное —
+     * что само ничего не выписывается.
+     */
+    const bdbR = require('./lib/bot-db');
+    const recur = require('./lib/recurring');
+    const bizT = require('./lib/biz-types');
+
+    /*
+     * Напоминание есть у каждого дела, про которое мы хоть что-то знаем.
+     * Раньше подряд, торговля и производство были без него — из ошибочного
+     * рассуждения, будто напоминание выпишет лишний документ. Оно не
+     * выписывает: правило заводится пустым, кнопка ведёт в мастер.
+     */
+    ok(bizT.routineOf('rent').type === 'sch' && bizT.routineOf('rent').day === 1,
+      'аренда: счёт 1-го числа, вперёд за наступающий месяц');
+    ok(bizT.routineOf('services').type === 'usl', 'обслуживание: акт');
+    ok(bizT.routineOf('contractor').type === 'usl', 'подряд: акт за выполненные работы');
+    ok(bizT.routineOf('trade').type === 'upd', 'торговля: УПД по отгрузкам');
+    ok(bizT.routineOf('manufacturing').type === 'upd', 'производство: УПД по отгрузкам');
+    for (const k of ['services', 'contractor', 'trade', 'manufacturing']) {
+      ok(bizT.routineOf(k).day === 25, `${k}: закрывающий документ 25-го`, bizT.routineOf(k).day);
+    }
+    ok(bizT.routineOf('other') === null,
+      'у «другого» ничего: про это дело мы не знаем ничего, советовать нечего');
+    // Тип документа обязан быть настоящим, иначе напоминание приведёт в никуда.
+    for (const k of ['rent', 'services', 'contractor', 'trade', 'manufacturing']) {
+      ok(Boolean(require('./lib/doc-service').ITEM_DOCS[bizT.routineOf(k).type]),
+        `${k}: тип документа существует`, bizT.routineOf(k).type);
+    }
+
+    const uid = fxUserId();
+    const org = bdbR.getDefaultOrg(uid);
+    const was = bdbR.basisOf(org);
+    for (const r of recur.list(uid)) recur.off(uid, r.id);   // начинаем с чистого
+    const cpR = bdbR.createCp(uid, { name: 'ООО «Арендатор Р»', kind: 'customer', opening_date: '2026-01-01' });
+
+    sent.length = 0;
+    await tap('biz.set:rent');
+    const offer = sent.map((m) => norm(m.text || '')).join(' ');
+    ok(offer.includes('счёт за аренду'), 'после выбора дела предложено напоминание', offer.slice(-80));
+    ok(offer.includes('Выписывать буду не сам'), 'и сразу сказано, что сам не выпишет');
+
+    const docsWas = bdbR.listDocs(uid, 100).length;
+    sent.length = 0;
+    await tap('rt.new:rent');
+    ok(norm(last()).includes('Кому напоминать'), 'спросил клиента', norm(last()));
+    await tap(`rt.cp:rent:${cpR}`);
+    ok(norm(last()).includes('Какого числа'), 'спросил число', norm(last()));
+    await tap(`rt.day:rent:${cpR}:5`);
+    ok(norm(last()).includes('5-го числа'), 'напоминание заведено', norm(last()));
+
+    const rules = recur.list(uid).filter((r) => r.cp_id === cpR);
+    ok(rules.length === 1 && rules[0].type === 'sch' && rules[0].day === 5,
+      'правило легло в повторения', JSON.stringify(rules.map((r) => `${r.type}:${r.day}`)));
+    ok(rules[0].items.length === 0, 'без позиций — их назовёт человек');
+    ok(bdbR.listDocs(uid, 100).length === docsWas,
+      'и ни одного документа при этом не выписано',
+      `${docsWas} → ${bdbR.listDocs(uid, 100).length}`);
+
+    // Второй раз тот же вопрос не задаётся.
+    sent.length = 0;
+    await tap('biz.set:rent');
+    ok(!sent.map((m) => m.text || '').join(' ').includes('Напоминать каждый месяц'),
+      'повторно не навязывается — правило уже есть');
+
+    /*
+     * Сообщение с кнопками в чате не гаснет после нажатия, и по нему можно
+     * нажать ещё раз — хоть завтра. Без проверки заводилось второе такое же
+     * правило, и в свой день приходили два одинаковых напоминания.
+     */
+    await tap(`rt.day:rent:${cpR}:5`);
+    await tap(`rt.day:rent:${cpR}:20`);
+    ok(recur.list(uid).filter((r) => r.cp_id === cpR).length === 1,
+      'повторное нажатие не заводит второе такое же правило',
+      String(recur.list(uid).filter((r) => r.cp_id === cpR).length));
+    ok(norm(last()).includes('уже настроено'), 'и человеку сказано почему', norm(last()));
+
+    /*
+     * Обещание про этот месяц надо держать. Заводя напоминание с нуля,
+     * документа не выписывают — значит, отмечать месяц отработанным нельзя,
+     * иначе бот говорит «напомню 25-го» и молчит до следующего месяца.
+     * Отмечаем только когда день уже прошёл.
+     */
+    /*
+     * Само пороговое правило проверяем на явных датах, а не на сегодняшнем
+     * числе. Первая версия этого теста брала «завтра» как today + 1 и
+     * ломалась сама собой 28-го: дни 29–31 наступают не каждый месяц,
+     * normalizeDay режет их до 28, и «завтра» оказывалось сегодня.
+     */
+    const aug = (day) => new Date(2026, 7, day);
+    ok(recur.dayPassed(10, aug(15)) === true, 'день уже прошёл — месяц считаем отработанным');
+    ok(recur.dayPassed(20, aug(15)) === false, 'день ещё впереди — месяц оставляем открытым');
+    ok(recur.dayPassed(15, aug(15)) === true,
+      'в свой же день заново не напоминаем — человек как раз его и настраивает');
+
+    // А через мастер проверяем, что эта развилка вообще доходит до правила.
+    const cpPast = bdbR.createCp(uid, { name: 'ООО «Позади»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`rt.day:rent:${cpPast}:1`);
+    // Первое число уже наступило в любой день месяца, поэтому здесь развилка
+    // всегда даёт «месяц отработан» — и это не зависит от того, когда прогон.
+    const rulePast = recur.list(uid).find((r) => r.cp_id === cpPast);
+    ok(rulePast && rulePast.last_offer === recur.monthKey(),
+      'на уже прошедшее число месяц сразу помечен отработанным',
+      rulePast && `last_offer=«${rulePast.last_offer}»`);
+    ok(rulePast && !recur.isDue(rulePast),
+      'то есть напомним только в следующем месяце');
+    const x = recur.list(uid).find((v) => v.cp_id === cpPast);
+    if (x) recur.off(uid, x.id);
+
+    /*
+     * Наступил день. Главное здесь — что бот пришёл с предложением, а
+     * документ не выписался сам: у правила нет ни позиций, ни суммы, и
+     * «выписать как есть» дало бы документ на ноль рублей с номером из
+     * сквозного ряда.
+     */
+    const { db: rawR } = require('./db');
+    rawR.prepare("UPDATE recurring SET last_offer = '2000-01', day = ? WHERE id = ?")
+      .run(new Date().getDate(), rules[0].id);
+    sent.length = 0;
+    const before2 = bdbR.listDocs(uid, 100).length;
+    await require('./bot').runDaily(tg);
+    const daily = sent.map((m) => norm(m.text || '')).join(' ');
+    const kb = sent.flatMap((m) => (m.kb || []).flat()).map((b) => b.text).join('|');
+    ok(daily.includes('Пора выставить'), 'в свой день бот напомнил', daily.slice(0, 60));
+    ok(kb.includes('Заполнить и выписать'),
+      'кнопка ведёт в мастер, а не выписывает пустой документ', kb);
+    ok(bdbR.listDocs(uid, 100).length === before2,
+      'и сам ничего не выписал', `${before2} → ${bdbR.listDocs(uid, 100).length}`);
+
+    bdbR.updateOrg(uid, org.id, { debt_basis: was });
+    bdbR.rebuildDebt(uid);
+  }
+
+  console.log('\n── счёт и акт на одну сделку ──');
+  {
+    /*
+     * Жалоба: «акт об оказанных и счёт от одного контрагента считает как два
+     * счёта». Так и было — в сумму шли оба. Дубль определяется основанием
+     * долга: главный тот документ, который долг создаёт, второй его повторяет.
+     */
+    const bdbD = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = bdbD.getOrCreateUser(556677, 'Одна сделка').id;
+    const orgD = bdbD.createOrg(uid, { name: 'ИП Сделка', inn: '183209316100' });
+    const cpD = bdbD.createCp(uid, { name: 'ООО «Пара»', kind: 'customer', opening_date: '2026-01-01' });
+    for (const type of ['sch', 'usl']) {
+      // eslint-disable-next-line no-await-in-loop
+      await docSvc.issueDocument(uid, {
+        type, cpId: cpD, items: [{ name: 'Работа', qty: 1, price: 30000 }], skipQuota: true,
+      });
+    }
+
+    bdbD.updateOrg(uid, orgD, { debt_basis: 'closing' });
+    let s = bdbD.unpaidSummary(uid);
+    ok(s.sum === 30000 && s.count === 1, 'одна сделка, а не две', `${s.sum} / ${s.count}`);
+    ok(s.docs.length === 2, 'но оба документа видны в списке', s.docs.length);
+    ok(s.docs.find((d) => d.pair).type === 'sch',
+      'при долге по отгрузке дубль — счёт, главный акт', (s.docs.find((d) => d.pair) || {}).type);
+
+    bdbD.updateOrg(uid, orgD, { debt_basis: 'invoice' });
+    s = bdbD.unpaidSummary(uid);
+    ok(s.docs.find((d) => d.pair).type === 'usl',
+      'при долге по счёту наоборот — дубль акт', (s.docs.find((d) => d.pair) || {}).type);
+    ok(s.sum === 30000, 'сумма от смены основания не поехала', s.sum);
+
+    // Разные суммы — это разные сделки, склеивать их нельзя.
+    await docSvc.issueDocument(uid, {
+      type: 'usl', cpId: cpD, items: [{ name: 'Другое', qty: 1, price: 5000 }], skipQuota: true,
+    });
+    s = bdbD.unpaidSummary(uid);
+    ok(s.sum === 35000 && s.count === 2, 'акт на другую сумму — отдельная сделка', `${s.sum} / ${s.count}`);
+
+    bdbD.updateOrg(uid, orgD, { debt_basis: 'manual' });
+    s = bdbD.unpaidSummary(uid);
+    ok(s.count === 3 && s.sum === 65000,
+      'в ручном режиме правила нет — считаем всё как есть', `${s.sum} / ${s.count}`);
+
+    /*
+     * Одинаковая сумма сама по себе сделку не делает. У аренды и
+     * обслуживания счёт каждый месяц один и тот же, и без окна по датам
+     * неоплаченный январский акт склеивался с августовским счётом: два
+     * разных долга показывались как один, и человек видел половину того,
+     * что ему должны.
+     */
+    const uidW = bdbD.getOrCreateUser(556678, 'Разные месяцы').id;
+    const orgW = bdbD.createOrg(uidW, { name: 'ИП Аренда', inn: '183209316100' });
+    bdbD.updateOrg(uidW, orgW, { debt_basis: 'closing' });
+    const cpW = bdbD.createCp(uidW, { name: 'ООО «Клиент»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uidW, {
+      type: 'usl', cpId: cpW, date: '2026-01-31',
+      items: [{ name: 'Аренда', qty: 1, price: 50000 }], skipQuota: true });
+    await docSvc.issueDocument(uidW, {
+      type: 'sch', cpId: cpW, date: '2026-08-01',
+      items: [{ name: 'Аренда', qty: 1, price: 50000 }], skipQuota: true });
+    let w = bdbD.unpaidSummary(uidW);
+    ok(w.count === 2 && w.sum === 100000,
+      'акт за январь и счёт за август — два долга, а не один', `${w.sum} / ${w.count}`);
+    ok(!w.docs.some((d) => d.pair), 'и ни один не помечен «та же сделка»');
+
+    // А счёт в конце месяца и закрывающий его акт в начале следующего —
+    // всё ещё одна сделка: это обычный порядок, а не два долга.
+    await docSvc.issueDocument(uidW, {
+      type: 'sch', cpId: cpW, date: '2026-01-28',
+      items: [{ name: 'Аренда', qty: 1, price: 50000 }], skipQuota: true });
+    w = bdbD.unpaidSummary(uidW);
+    ok(w.count === 2 && w.sum === 100000,
+      'счёт 28 января и акт 31 января — одна сделка', `${w.sum} / ${w.count}`);
+    ok(w.docs.filter((d) => d.pair).length === 1 && w.docs.find((d) => d.pair).date === '2026-01-28',
+      'парой отмечен именно ближайший по дате счёт',
+      (w.docs.find((d) => d.pair) || {}).date);
+  }
+
+  console.log('\n── отменённую руками проводку пересчёт не воскрешает ──');
+  {
+    /*
+     * Человек выписал акт, увидел, что долга по нему нет, и отменил проводку
+     * кнопкой. Любая последующая смена основания возвращала её: пересчёт
+     * видел документ без проводки и считал это упущением. Выходило, что
+     * приложение спорит с человеком и всегда выигрывает.
+     */
+    const bdbN = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = fxUserId();
+    const org = bdbN.getDefaultOrg(uid);
+    const was = bdbN.basisOf(org);
+    bdbN.updateOrg(uid, org.id, { debt_basis: 'closing' });
+    const cpN = bdbN.createCp(uid, { name: 'ООО «Отменяю»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uid, {
+      type: 'usl', cpId: cpN, items: [{ name: 'Работа', qty: 1, price: 20000 }], skipQuota: true,
+    });
+    ok(bdbN.balanceOf(uid, cpN).closing === 20000, 'акт создал долг', bdbN.balanceOf(uid, cpN).closing);
+
+    bdbN.deleteLastOp(uid, cpN);
+    ok(bdbN.balanceOf(uid, cpN).closing === 0, 'человек отменил проводку', bdbN.balanceOf(uid, cpN).closing);
+
+    bdbN.updateOrg(uid, org.id, { debt_basis: 'invoice' });
+    bdbN.rebuildDebt(uid);
+    bdbN.updateOrg(uid, org.id, { debt_basis: 'closing' });
+    bdbN.rebuildDebt(uid);
+    ok(bdbN.balanceOf(uid, cpN).closing === 0,
+      'и после двух смен основания долг не вернулся', bdbN.balanceOf(uid, cpN).closing);
+
+    bdbN.updateOrg(uid, org.id, { debt_basis: was });
+    bdbN.rebuildDebt(uid);
+  }
+
+  console.log('\n── оплата и реализация ходят парой ──');
+  {
+    /*
+     * Пара живёт по одному правилу: есть долг по документу — есть и оплата
+     * по нему; нет долга — нет и оплаты. Разорвать её можно четырьмя
+     * способами, и каждый однажды показывал человеку, что это он должен
+     * клиенту, который просто заплатил.
+     */
+    const bdbP = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = bdbP.getOrCreateUser(778899002, 'Пара').id;
+    const orgP = bdbP.createOrg(uid, { name: 'ИП Пара', inn: '183209316100' });
+    bdbP.updateOrg(uid, orgP, { debt_basis: 'invoice' });
+    const bal = (cp) => bdbP.balanceOf(uid, cp).closing;
+
+    // 1. Убрали оплату руками — отметка снимается, пересчёт её не возвращает.
+    const cp1 = bdbP.createCp(uid, { name: 'ООО «Первый»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cp1, items: [{ name: 'Работа', qty: 1, price: 40000 }], skipQuota: true,
+    });
+    const d1 = bdbP.listDocs(uid, 5, cp1)[0];
+    bdbP.markPaid(uid, d1.id, '2026-12-31');       // позже счёта, значит последняя
+    bdbP.deleteLastOp(uid, cp1);
+    ok(bal(cp1) === 40000 && !bdbP.getDoc(uid, d1.id).paid_at,
+      'убрали оплату руками — отметка снялась вместе с ней', `${bal(cp1)} / ${bdbP.getDoc(uid, d1.id).paid_at}`);
+    bdbP.rebuildDebt(uid);
+    ok(bal(cp1) === 40000, 'и пересчёт её не вернул', bal(cp1));
+
+    // 2. Убрали реализацию — оплата уходит с ней, минуса не остаётся.
+    const cp2 = bdbP.createCp(uid, { name: 'ООО «Второй»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cp2, items: [{ name: 'Работа', qty: 1, price: 40000 }], skipQuota: true,
+    });
+    const d2 = bdbP.listDocs(uid, 5, cp2)[0];
+    bdbP.markPaid(uid, d2.id, '2026-01-05');       // раньше счёта, значит последней будет реализация
+    bdbP.deleteLastOp(uid, cp2);
+    ok(bal(cp2) === 0, 'убрали реализацию — оплата ушла с ней, а не оставила минус', bal(cp2));
+    bdbP.rebuildDebt(uid);
+    ok(bal(cp2) === 0, 'и после пересчёта минуса нет', bal(cp2));
+    bdbP.restoreDebt(uid, d2.id);
+    ok(bal(cp2) === 0 && bdbP.opsOfDoc(uid, d2.id).length === 2,
+      '«вернуть в долг» возвращает пару целиком', `${bal(cp2)} / ${bdbP.opsOfDoc(uid, d2.id).length}`);
+
+    // 3. Отметка оплаты на отменённом документе не уводит сальдо в минус.
+    const cp3 = bdbP.createCp(uid, { name: 'ООО «Третий»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cp3, items: [{ name: 'Работа', qty: 1, price: 25000 }], skipQuota: true,
+    });
+    const d3 = bdbP.listDocs(uid, 5, cp3)[0];
+    bdbP.deleteLastOp(uid, cp3);
+    bdbP.markPaid(uid, d3.id, '2026-03-01');
+    ok(bal(cp3) === 0, 'оплата отменённого документа не уводит в минус', bal(cp3));
+
+    // 4. Частичную оплату отметка не задваивает.
+    const cp4 = bdbP.createCp(uid, { name: 'ООО «Четвёртый»', kind: 'customer', opening_date: '2026-01-01' });
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cp4, items: [{ name: 'Работа', qty: 1, price: 50000 }], skipQuota: true,
+    });
+    const d4 = bdbP.listDocs(uid, 5, cp4)[0];
+    bdbP.addOp(uid, cp4, { date: '2026-03-01', kind: 'Оплата', doc: 'п/п 1', debit: 20000 });
+    bdbP.markPaid(uid, d4.id, '2026-03-05');
+    ok(bal(cp4) === 0, 'отметка после частичной оплаты закрывает только остаток', bal(cp4));
+    bdbP.updateOrg(uid, orgP, { debt_basis: 'closing' });
+    bdbP.rebuildDebt(uid);
+    bdbP.updateOrg(uid, orgP, { debt_basis: 'invoice' });
+    bdbP.rebuildDebt(uid);
+    ok(bal(cp4) === 0, 'и пересчёт возвращает ту же сумму, а не полную', bal(cp4));
+
+    // Пересчёт рассказывает и про строки оплаты: раньше он мог снять оплату
+    // на 30 000 и отчитаться «ничего не менял».
+    bdbP.updateOrg(uid, orgP, { debt_basis: 'closing' });
+    const rep = bdbP.rebuildDebt(uid);
+    ok(rep.paid >= 1, 'пересчёт отчитывается и о строках оплаты', JSON.stringify(rep));
+    bdbP.updateOrg(uid, orgP, { debt_basis: 'invoice' });
+    bdbP.rebuildDebt(uid);
+  }
+
+  console.log('\n── сколько денег ждём ──');
+  {
+    // Считаем сделками, а не документами: счёт и закрывающий его акт на одну
+    // сделку — это одни деньги. Но разные сделки складываться обязаны.
+    const bdbU = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = bdbU.getOrCreateUser(778899003, 'Ожидание').id;
+    bdbU.createOrg(uid, { name: 'ИП Ожидание', inn: '183209316100' });
+    const cpA = bdbU.createCp(uid, { name: 'ООО «А»', kind: 'customer', opening_date: '2026-01-01' });
+    const cpB = bdbU.createCp(uid, { name: 'ООО «Б»', kind: 'customer', opening_date: '2026-01-01' });
+    for (const t of ['sch', 'usl']) {
+      // eslint-disable-next-line no-await-in-loop
+      await docSvc.issueDocument(uid, {
+        type: t, cpId: cpA, items: [{ name: 'Сделка', qty: 1, price: 30000 }], skipQuota: true,
+      });
+    }
+    let s = bdbU.unpaidSummary(uid);
+    ok(s.sum === 30000 && s.count === 1, 'счёт и закрывающий его акт — одна сделка', `${s.sum} / ${s.count}`);
+    ok(s.docs.length === 2, 'но в списке оба документа: прятать их нельзя', s.docs.length);
+
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cpB, items: [{ name: 'Другое', qty: 1, price: 90000 }], skipQuota: true,
+    });
+    s = bdbU.unpaidSummary(uid);
+    ok(s.sum === 120000 && s.count === 2, 'а разные сделки складываются', `${s.sum} / ${s.count}`);
+  }
+
+  console.log('\n── смена основания пересчитывает прошлое ──');
+  {
+    const bdbR = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = fxUserId();
+    const org = bdbR.getDefaultOrg(uid);
+    const was = bdbR.basisOf(org);
+    const cpR = bdbR.createCp(uid, { name: 'ООО «Пересчёт»', kind: 'customer', opening_date: '2026-01-01' });
+
+    bdbR.updateOrg(uid, org.id, { debt_basis: 'closing' });
+    bdbR.rebuildDebt(uid);
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cpR, items: [{ name: 'Работа', qty: 1, price: 10000 }], skipQuota: true,
+    });
+    ok(bdbR.balanceOf(uid, cpR).closing === 0,
+      'при «долге по отгрузке» счёт долга не создаёт', bdbR.balanceOf(uid, cpR).closing);
+
+    /*
+     * Главная жалоба владельца: «счета удаляю, а сумма на главной не
+     * меняется». Так и было: при основании «по отгрузке» счёт долга не
+     * создаёт, крупная цифра «должны вам» стоит нулём и не шевелится, что
+     * ни делай. Переключение на «долг по счёту» не помогало — проводки
+     * создаются при выписке, а уже выписанное оставалось как было.
+     */
+    bdbR.updateOrg(uid, org.id, { debt_basis: 'invoice' });
+    const fixed = bdbR.rebuildDebt(uid);
+    // Пересчёт идёт по всем документам пользователя, а их к этому месту в
+    // прогоне уже много — проверяем не число, а результат для этой карточки.
+    ok(fixed.added >= 1, 'переключение досоздало проводки прошлым счетам', JSON.stringify(fixed));
+    ok(bdbR.balanceOf(uid, cpR).closing === 10000,
+      'и долг наконец появился', bdbR.balanceOf(uid, cpR).closing);
+
+    // И теперь удаление счёта наконец двигает цифру.
+    const doc = bdbR.listDocs(uid, 5, cpR)[0];
+    bdbR.deleteDoc(uid, doc.id);
+    ok(bdbR.balanceOf(uid, cpR).closing === 0,
+      'удаление счёта уменьшило долг — то, чего и ждал человек',
+      bdbR.balanceOf(uid, cpR).closing);
+
+    /*
+     * Обратный ход. Проводка оплаты ходит с реализацией в паре: снять одну
+     * и оставить другую — значит увести сальдо в минус и объявить, что это
+     * мы должны клиенту, который просто заплатил. Отметка «оплачено» на
+     * самом документе при этом остаётся: её ставил человек, и она значит
+     * факт, а не правило учёта.
+     */
+    await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cpR, items: [{ name: 'Ещё', qty: 1, price: 5000 }], skipQuota: true,
+    });
+    const doc2 = bdbR.listDocs(uid, 5, cpR)[0];
+    bdbR.markPaid(uid, doc2.id, '2026-08-18');
+    const payOps = () => bdbR.listOps(uid, cpR).filter((o) => o.kind === 'Оплата' && o.doc_id === doc2.id).length;
+    ok(payOps() === 1 && bdbR.balanceOf(uid, cpR).closing === 0,
+      'оплаченный счёт даёт пару проводок и нулевое сальдо', bdbR.balanceOf(uid, cpR).closing);
+
+    bdbR.updateOrg(uid, org.id, { debt_basis: 'closing' });
+    const back = bdbR.rebuildDebt(uid);
+    ok(back.removed >= 1, 'обратное переключение убрало проводки долга', JSON.stringify(back));
+    ok(payOps() === 0, 'и оплату убрало вместе с ней — иначе сальдо ушло бы в минус', payOps());
+    ok(bdbR.balanceOf(uid, cpR).closing === 0,
+      'сальдо осталось нулём, а не минус пять тысяч', bdbR.balanceOf(uid, cpR).closing);
+    ok(bdbR.getDoc(uid, doc2.id).paid_at === '2026-08-18',
+      'отметка «оплачено» на документе не тронута: её ставил человек',
+      bdbR.getDoc(uid, doc2.id).paid_at);
+
+    // И обратно: вернулись к «долгу по счёту» — пара восстановилась целиком.
+    bdbR.updateOrg(uid, org.id, { debt_basis: 'invoice' });
+    bdbR.rebuildDebt(uid);
+    ok(payOps() === 1 && bdbR.balanceOf(uid, cpR).closing === 0,
+      'возврат основания восстановил пару, сальдо снова ноль',
+      `${payOps()} / ${bdbR.balanceOf(uid, cpR).closing}`);
+
+    bdbR.updateOrg(uid, org.id, { debt_basis: was });
+    bdbR.rebuildDebt(uid);
+  }
+
+  console.log('\n── брошенный сценарий ──');
+  {
+    const bdbS = require('./lib/bot-db');
+    const uid = fxUserId();
+    const st = () => bdbS.getState(uid).state;
+
+    // Ушёл в другой раздел — недописанное отменяется. Раньше состояние
+    // жило дальше, и «Спасибо» в чате бот принимал за позицию счёта.
+    await tap(`d.sch:${cpId}`);
+    ok(st().startsWith('items:'), 'счёт начат', st());
+    await say('Аренда помещения; 1; 30000');
+    await tap('docs');
+    ok(st() === '', 'уход в «Мои документы» отменяет незаконченный счёт', st());
+    ok(/Незаконченный документ отменил/.test(sent[sent.length - 2].text || ''),
+      'и об отмене сказано, а не потеряно молча',
+      (sent[sent.length - 2].text || '').slice(0, 60));
+
+    const mark = sent.length;
+    await say('Спасибо');
+    ok(!/по какой цене/.test(last()), 'обычное слово больше не уходит в брошенный счёт',
+      last().slice(0, 60));
+    ok(sent.length > mark, 'бот всё равно отвечает, а не молчит');
+
+    // А кнопки самого сценария состояние сохраняют — иначе его не пройти.
+    await tap(`d.sch:${cpId}`);
+    await say('Канапе; 20; 650');
+    await tap('items.undo');
+    ok(st().startsWith('items:'), 'кнопка внутри сценария его не сбрасывает', st());
+    await tap('menu');
+    ok(st() === '', 'а «Меню» сбрасывает', st());
+  }
+
+  console.log('\n── регулярные документы ──');
+  {
+    const rec = require('./lib/recurring');
+    const bdbR = require('./lib/bot-db');
+    const uid = fxUserId();
+
+    // Правила дней проверяем отдельно от бота: ошибка здесь незаметна до
+    // конца месяца, а потом счёт уходит не тем числом.
+    ok(rec.normalizeDay(31) === 28, '31-е сводится к 28-му: такого дня нет в феврале', rec.normalizeDay(31));
+    ok(rec.normalizeDay(0) === 0, '0 — это «последний день месяца», а не ошибка');
+    ok(rec.normalizeDay('пятое') === 1, 'мусор превращается в 1-е, а не в NaN', rec.normalizeDay('пятое'));
+
+    // Часы у повторений и у документов должны быть одни.
+    //
+    // Ежедневный обход просыпается по московской дате. Пока месяц здесь
+    // считался по UTC, в промежутке с 21:00 до полуночи по Гринвичу обход
+    // уже видел новый день, а месяц — ещё старый: предложение выписать
+    // документ считалось сделанным и пропадало на весь месяц. Молча.
+    {
+      const pr = require('./lib/period');
+      ok(rec.monthKey() === pr.todayISO().slice(0, 7),
+        'месяц повторений и дата документов идут по одним часам',
+        `${rec.monthKey()} vs ${pr.todayISO().slice(0, 7)}`);
+      const night = pr.todayDate(new Date('2026-08-31T22:30:00Z')); // 01:30 первого сентября в Москве
+      ok(rec.monthKey(night) === '2026-09',
+        'ночью первого числа месяц уже новый', rec.monthKey(night));
+      ok(rec.isDue({ active: 1, day: 1, last_offer: '2026-08' }, night),
+        'и предложение за новый месяц не пропадает');
+      ok(!rec.isDue({ active: 1, day: 1, last_offer: '2026-09' }, night),
+        'а дважды за один месяц не предлагается');
+    }
+    const on = (day, iso2, lastOffer = '') => rec.isDue(
+      { active: 1, day, last_offer: lastOffer }, new Date(`${iso2}T12:00:00Z`),
+    );
+    ok(on(5, '2026-08-05') === true, 'в свой день предложение положено');
+    ok(on(5, '2026-08-04') === false, 'накануне — рано');
+    ok(on(5, '2026-08-09') === true, 'бот молчал четыре дня — предложение всё равно придёт');
+    ok(on(5, '2026-08-09', '2026-08') === false, 'за этот месяц уже предлагали');
+    ok(on(5, '2026-09-01', '2026-08') === false, 'первого сентября пятое ещё не наступило');
+    ok(on(0, '2026-08-31') === true, 'последний день августа');
+    ok(on(0, '2026-08-30') === false, 'предпоследний — ещё нет');
+    ok(on(0, '2026-02-28') === true, 'в невисокосном феврале последний день — 28-е');
+
+    // Цикл аренды: счёт за 3 дня до числа договора, срок оплаты, просрочка.
+    const rent = { active: 1, day: 1, pay_day: 5, lead_days: 3, last_offer: '', last_due: '' };
+    ok(rec.offerDay(rent) === 2, 'счёт за 3 дня до 5-го — это 2-е', rec.offerDay(rent));
+    ok(rec.offerDay({ ...rent, pay_day: 2, lead_days: 5 }) === 1,
+      'за 5 дней до 2-го — не «минус третье», а 1-е', rec.offerDay({ ...rent, pay_day: 2, lead_days: 5 }));
+    ok(rec.offerDay({ active: 1, day: 15, pay_day: 0 }) === 15, 'без срока оплаты работает обычный день');
+
+    const at = (iso2, over) => {
+      const d = new Date(`${iso2}T12:00:00Z`);
+      return over ? rec.isOverdue(rent, d) : rec.isDue(rent, d);
+    };
+    ok(at('2026-09-02') === true, 'второго сентября пора выставлять счёт');
+    ok(at('2026-09-01') === false, 'первого — ещё рано');
+    ok(at('2026-09-05', true) === false, 'в день оплаты просрочки ещё нет');
+    ok(at('2026-09-06', true) === true, 'шестого — первый день просрочки');
+    ok(rec.isOverdue({ ...rent, last_due: rec.monthKey(new Date('2026-09-06T12:00:00Z')) },
+      new Date('2026-09-06T12:00:00Z')) === false, 'о просрочке сообщаем раз в месяц');
+    ok(rec.isOverdue({ ...rent, pay_day: 0 }, new Date('2026-09-28T12:00:00Z')) === false,
+      'без срока оплаты просрочки не бывает');
+    ok(rec.dueDate(rent, new Date('2026-09-10T12:00:00Z')) === '2026-09-05', 'срок оплаты за месяц',
+      rec.dueDate(rent, new Date('2026-09-10T12:00:00Z')));
+
+    // Заводим повторение из настоящего выписанного документа.
+    const cpR = bdbR.createCp(uid, { name: 'Арендатор ООО «Тихий»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.sch:${cpR}`);
+    await say('Аренда, сентябрь; 1; 45000');
+    await tap('items.done');
+    await tap('doc.make');
+    ok(Boolean(button('Повторять по расписанию')), 'после выписки предложено повторять');
+
+    await tap(button('Повторять по расписанию'));
+    ok(norm(last()).includes('какого числа клиент должен платить'),
+      'у счёта спрашивают число из договора, а не «когда напомнить»', norm(last()).slice(0, 50));
+    await tap(button('5-го'));
+    ok(last().includes('За сколько дней выставлять счёт'), 'второй шаг — насколько заранее',
+      last().slice(0, 50));
+    await tap(button('За 3 дня'));
+
+    ok(norm(last()).includes('2-го — предложу выписать'), 'счёт за 3 дня до 5-го → 2-го числа',
+      norm(last()).slice(0, 120));
+    ok(norm(last()).includes('5-го — срок оплаты'), 'срок оплаты показан');
+    ok(norm(last()).includes('6-го — напомню'), 'обещан сигнал в первый день просрочки');
+    ok(last().includes('клиенту не напишу'), 'обещано не писать контрагенту самому');
+    ok(last().includes('начну со следующего'), 'сказано, что за этот месяц документ уже выписан');
+
+    const mine = rec.list(uid);
+    const one = mine.find((r) => r.cp_id === cpR);
+    ok(Boolean(one), 'повторение в списке');
+    ok(one.pay_day === 5 && one.lead_days === 3 && one.offerDay === 2,
+      'срок оплаты и упреждение сохранены', `${one.pay_day}/${one.lead_days}/${one.offerDay}`);
+    ok(one.items.length === 1 && one.items[0].price === 45000, 'позиции сохранены', JSON.stringify(one.items));
+    ok(one.last_offer === rec.monthKey(), 'текущий месяц сразу отмечен как отработанный', one.last_offer);
+    ok(rec.isDue(one, new Date()) === false, 'сегодня повторение не сработает');
+
+    // Акт в конце месяца — вторая половина цикла аренды, одной кнопкой.
+    await tap(`rec.akt:${cpR}`);
+    const akt = rec.list(uid).find((r) => r.cp_id === cpR && r.type === 'usl');
+    ok(Boolean(akt) && akt.day === rec.LAST_DAY, 'акт заведён на конец месяца', akt && akt.day);
+    ok(akt.items.length === 1 && akt.items[0].price === 45000, 'позиции акта взяты из счёта');
+    await tap(`rec.akt:${cpR}`);
+    ok(last().includes('уже повторяется'), 'второй такой же акт не заводится', last().slice(0, 40));
+    rec.off(uid, akt.id);
+
+    // Наступил следующий месяц — предложение должно прийти.
+    const nextMonth = new Date();
+    nextMonth.setMonth(nextMonth.getMonth() + 1);
+    nextMonth.setDate(6);
+    ok(rec.isDue(one, nextMonth) === true, 'в следующем месяце предложение положено');
+
+    // Предложение и выписка по кнопке.
+    // Предел с запасом: журнал успел вырасти, и «последние 50» уже не растут на одну запись.
+    const before = bdbR.listDocs(uid, 5000).length;
+    await tap(`rec.go:${one.id}`);
+    ok(bdbR.listDocs(uid, 5000).length === before + 1, 'по кнопке документ выписан',
+      bdbR.listDocs(uid, 50).length - before);
+    const madeDoc = bdbR.listDocs(uid, 1)[0];
+    ok(madeDoc.total === 45000 && madeDoc.cp_id === cpR, 'тот же клиент и та же сумма',
+      `${madeDoc.total} / ${madeDoc.cp_id}`);
+
+    await tap(`rec.skip:${one.id}`);
+    ok(last().includes('Пропустил'), 'месяц можно пропустить');
+
+    await tap(`rec.off:${one.id}`);
+    ok(!rec.list(uid).some((r) => r.id === one.id), 'повторение выключается');
+    ok(rec.due(nextMonth).every((r) => r.id !== one.id), 'выключенное больше не предлагается');
+
+    // Чужое повторение недоступно по прямому id.
+    const other = bdbR.getOrCreateUser(880042, 'Чужой', 'alien');
+    const otherCp = bdbR.createCp(other.id, { name: 'Их клиент', kind: 'customer', opening_date: '2026-01-01' });
+    const alien = rec.add(other.id, { cpId: otherCp, type: 'sch', items: [{ name: 'x', qty: 1, price: 1 }] });
+    rec.off(uid, alien);
+    ok(Boolean(require('./db').db.prepare('SELECT active FROM recurring WHERE id = ?').get(alien).active),
+      'чужое повторение выключить нельзя');
+    ok(rec.get(uid, alien) === null, 'чужое повторение не отдаётся по прямому id');
+    ok(!rec.list(uid).some((r) => r.id === alien), 'чужого нет в своём списке');
+
+    /*
+     * «Пропустить» — тоже действие над чужим правилом, и раньше оно было
+     * единственным среди rec.*, где владельца не проверяли. Посторонний
+     * отключал чужое напоминание на месяц: счёт за аренду не выставлялся, и
+     * человек не понимал почему.
+     */
+    require('./db').db.prepare("UPDATE recurring SET last_offer = '2000-01' WHERE id = ?").run(alien);
+    await tap(`rec.skip:${alien}`);
+    const alienRow = require('./db').db.prepare('SELECT last_offer FROM recurring WHERE id = ?').get(alien);
+    ok(alienRow.last_offer === '2000-01',
+      'чужое напоминание нельзя пропустить за владельца', `last_offer=«${alienRow.last_offer}»`);
+  }
+
+  console.log('\n── расписания: каждый день, по будням, раз в неделю ──');
+  {
+    /*
+     * ИП, который каждый день возит обеды одному клиенту, не станет выписывать
+     * накладные руками. Бот утром присылает ту же накладную на проверку. Правила:
+     * выписывается только по «Всё верно» (иначе «пропустить» оставляло бы дыру в
+     * нумерации), клиенту ничего не уходит, долг считается обычным путём и не
+     * задваивается, вчерашнюю кнопку нажать нельзя.
+     */
+    const rec = require('./lib/recurring');
+    const bdbP = require('./lib/bot-db');
+    const { runPeriodic, runDaily } = require('./bot.js');
+    const { db: rawP } = require('./db');
+    const uid = fxUserId();
+    const msk = (iso, hh = '09') => new Date(`${iso}T${hh}:00:00+03:00`);   // «сейчас» в Москве
+    const proposals = () => sent.filter((m) => /на сегодня/.test(m.text || ''));
+    const resetRules = () => { for (const r of rec.list(uid)) rec.off(uid, r.id); };
+
+    // --- календарь: чистая арифметика на неподвижных датах (2026-10-19 — понедельник) ---
+    const D = (iso) => new Date(`${iso}T12:00:00`);
+    const R = (period, weekday = 0, last = '') => ({ active: 1, period, weekday, last_offer: last, day: 1 });
+    ok(rec.isDue(R('day'), D('2026-10-17')) && rec.isDue(R('day'), D('2026-10-18')), 'каждый день — и по выходным');
+    ok(!rec.isDue(R('weekdays'), D('2026-10-17')) && !rec.isDue(R('weekdays'), D('2026-10-18')), 'по будням: суббота и воскресенье пропущены');
+    ok(rec.isDue(R('weekdays'), D('2026-10-19')) && rec.isDue(R('weekdays'), D('2026-10-23')), 'по будням: понедельник и пятница — на месте');
+    ok(!rec.isDue(R('week', 3), D('2026-10-19')) && rec.isDue(R('week', 3), D('2026-10-21')), 'раз в неделю (ср): в понедельник рано, в среду пора');
+    ok(rec.isDue(R('week', 3), D('2026-10-22')), 'пропущенную среду догоняем в четверг той же недели');
+    ok(!rec.isDue(R('week', 3, '2026-10-19'), D('2026-10-22')), 'но если за эту неделю уже предлагали — второй раз нет');
+    ok(rec.isDue(R('week', 3, '2026-10-19'), D('2026-10-28')), 'на следующей неделе — снова');
+    ok(rec.nextDate(R('weekdays'), D('2026-10-23')) === '2026-10-26', 'после пятницы будни продолжаются в понедельник');
+    ok(rec.nextDate(R('week', 3), D('2026-10-21')) === '2026-10-28', 'раз в неделю — через семь дней');
+    ok(rec.nextDate(R('day'), D('2026-10-17')) === '2026-10-18', 'каждый день — завтра');
+    ok(rec.periodText({ period: 'week', weekday: 2 }) === 'раз в неделю, во вторник' && rec.periodText(R('weekdays')) === 'по будням (пн–пт)',
+      'расписание называется словами');
+    ok(rec.dayCaption('2026-10-19') === 'пн, 19.10', 'подпись дня в предложении: «пн, 19.10»');
+
+    // --- заведение из бота ---
+    resetRules();
+    const cpL = bdbP.createCp(uid, { name: 'ООО «Обеды»', kind: 'customer', opening_date: '2026-01-01' });
+    const items = [{ name: 'Обед комплексный', unit: 'шт.', qty: 20, price: 350 }];   // 7 000 ₽
+    const src = await require('./lib/doc-service').issueDocument(uid, {
+      type: 'torg12', cpId: cpL, date: '2026-10-12', items, skipQuota: true,
+    });
+    sent.length = 0;
+    await tap(`rec.new:${src.doc.id}`);
+    ok(Boolean(button('Каждый день')) && Boolean(button('По будням')) && Boolean(button('Раз в неделю')) && Boolean(button('5-го')),
+      'выбор: каждый день, по будням, раз в неделю — и месячные числа рядом');
+    await tap(`rec.per:${src.doc.id}:d`);
+    const day1 = rec.list(uid).find((r) => r.cp_id === cpL);
+    ok(day1 && day1.period === 'day' && day1.dayText === 'каждый день' && day1.pay_day === 0, 'расписание «каждый день» заведено');
+    ok(day1.last_offer === '', 'документ исходный не сегодняшний — сегодняшняя доставка не съедена');
+    ok(norm(last()).includes('Всё верно') && last().includes('не отправлю'), 'бот объясняет порядок: проверка, и клиенту ничего не уходит');
+    await tap(`rec.per:${src.doc.id}:d`);
+    ok(last().includes('уже есть') && rec.list(uid).filter((r) => r.cp_id === cpL).length === 1, 'повторное нажатие второе такое же не заводит');
+    await tap(`rec.per:${src.doc.id}:k`);
+    ok(['Пн', 'Ср', 'Вс'].every((w) => Boolean(button(w))), 'раз в неделю: выбор дня недели');
+    await tap(`rec.pw:${src.doc.id}:3`);
+    const wk = rec.list(uid).find((r) => r.period === 'week');
+    ok(wk && wk.weekday === 3 && wk.dayText === 'раз в неделю, в среду', 'раз в неделю — в среду');
+    rec.off(uid, wk.id);
+    await tap(`rec.per:${src.doc.id}:w`);
+    const wd = rec.list(uid).find((r) => r.period === 'weekdays');
+    ok(Boolean(wd) && wd.dayText === 'по будням (пн–пт)', 'по будням заведено');
+    rec.off(uid, wd.id);
+    // Месячное по-прежнему рядом и ни с чем не путается.
+    await tap(`rec.add:${src.doc.id}:5`);
+    const mo = rec.list(uid).find((r) => r.period === 'month');
+    ok(mo && mo.day === 5 && !mo.periodic, 'месячное расписание работает как раньше');
+    rec.off(uid, mo.id);
+
+    // --- обход: что и когда предлагается ---
+    const docsCount = () => bdbP.listDocs(uid, 500, cpL).length;
+    const makeRule = (period, weekday = 0) => rec.add(uid, { cpId: cpL, type: 'torg12', items, period, weekday, offeredThisMonth: false });
+    const only = (id) => { for (const r of rec.list(uid)) if (r.id !== id) rec.off(uid, r.id); };
+
+    let id = makeRule('day'); only(id);
+    sent.length = 0;
+    const docs0 = docsCount();
+    ok(await runPeriodic(tg, msk('2026-10-19')) === 1, 'каждый день: в понедельник одно предложение');
+    const p1 = proposals()[0];
+    ok(p1 && p1.text.includes('ТОРГ-12') && p1.text.includes('пн, 19.10') && p1.text.includes('ООО «Обеды»') && norm(p1.text).includes('7 000'),
+      'в предложении: что за документ, день, клиент и сумма', p1 && norm(p1.text).slice(0, 80));
+    const btns = p1.kb.flat().map((b) => b.callback_data);
+    ok(btns.includes(`rec.go:${id}:2026-10-19`) && btns.includes(`rec.fix:${id}:2026-10-19`) && btns.includes(`rec.skip:${id}:2026-10-19`),
+      'кнопки «Всё верно», «Поправить», «Пропустить сегодня» несут день предложения');
+    ok(p1.kb.flat().some((b) => b.text.includes('Всё верно')) && p1.kb.flat().some((b) => b.text.includes('Пропустить сегодня')),
+      'и подписаны так, как просили');
+    ok(docsCount() === docs0, 'предложение ничего не выписало — номер не занят');
+    ok(await runPeriodic(tg, msk('2026-10-19', '15')) === 0, 'тот же день ещё раз — ничего (перезапуск не задваивает)');
+    ok(await runPeriodic(tg, msk('2026-10-24')) === 1, 'каждый день: суббота тоже');
+    await runDaily(tg, msk('2026-10-26'));
+    ok(proposals().length === 2, 'ночной обход месячных коротких расписаний не трогает');
+    rec.off(uid, id);
+
+    id = makeRule('weekdays'); only(id);
+    sent.length = 0;
+    ok(await runPeriodic(tg, msk('2026-10-24')) === 0 && await runPeriodic(tg, msk('2026-10-25')) === 0, 'по будням: суббота и воскресенье без предложений');
+    ok(await runPeriodic(tg, msk('2026-10-26')) === 1 && await runPeriodic(tg, msk('2026-10-30')) === 1, 'по будням: понедельник и пятница — предложения');
+    rec.off(uid, id);
+
+    id = makeRule('week', 3); only(id);
+    sent.length = 0;
+    ok(await runPeriodic(tg, msk('2026-10-26')) === 0, 'раз в неделю (ср): в понедельник тихо');
+    ok(await runPeriodic(tg, msk('2026-10-28')) === 1 && proposals()[0].text.includes('ср, 28.10'), 'в среду — предложение с подписью дня');
+    ok(await runPeriodic(tg, msk('2026-10-29')) === 0, 'в четверг той же недели — уже было');
+    ok(await runPeriodic(tg, msk('2026-11-04')) === 1, 'на следующей неделе — снова');
+    rec.off(uid, id);
+    id = makeRule('week', 1); only(id);
+    ok(await runPeriodic(tg, msk('2026-11-11')) === 1, 'пропущенный понедельник догоняется в среду той же недели');
+    rec.off(uid, id);
+
+    // --- «Всё верно»: выпуск, долг, повторное нажатие ---
+    const todayIso = require('./lib/period').todayISO();
+    const balOf = () => (bdbP.balanceOf(uid, cpL) || { closing: 0 }).closing;
+    id = makeRule('day'); only(id);
+    sent.length = 0;
+    await runPeriodic(tg);
+    const keyNow = rec.periodKey(rec.get(uid, id), require('./lib/period').todayDate());
+    ok(keyNow === todayIso && Boolean(proposals()[0]), 'сегодняшнее предложение пришло и ключ — сегодняшняя дата');
+    const bal0 = balOf();
+    const n0 = docsCount();
+    await tap(`rec.go:${id}:${keyNow}`);
+    ok(docsCount() === n0 + 1, '«Всё верно» выписывает ровно один документ');
+    const made = bdbP.listDocs(uid, 1, cpL)[0];
+    ok(made.type === 'torg12' && made.date === todayIso && made.total === 7000 && made.number !== src.doc.number,
+      'новый номер, сегодняшняя дата, те же позиции', `${made.number}/${made.date}/${made.total}`);
+    ok(balOf() === bal0 + 7000, 'долг вырос на сумму накладной один раз', `${bal0} → ${balOf()}`);
+    ok(sent.some((m) => m.document || m.filename || /Следующее предложение/.test(m.text || '')), 'владельцу пришёл файл и дата следующего предложения');
+    await tap(`rec.go:${id}:${keyNow}`);
+    ok(docsCount() === n0 + 1 && balOf() === bal0 + 7000 && norm(last()).includes('уже выписан'),
+      'второе нажатие документа не добавляет, долг не задваивается');
+    bdbP.rebuildDebt(uid);
+    ok(balOf() === bal0 + 7000, 'и пересчёт долга ничего не меняет');
+    rec.off(uid, id);
+
+    // --- «Пропустить сегодня»: ни документа, ни следа в долге ---
+    id = makeRule('day'); only(id);
+    rawP.prepare("UPDATE recurring SET last_offer = '' WHERE id = ?").run(id);
+    await runPeriodic(tg);
+    const balS = balOf(); const nS = docsCount();
+    const opsS = bdbP.listOps(uid, cpL).length;
+    const seqS = bdbP.nextSeqForOrg(bdbP.currentOrg(uid).id, 'torg12', require('./lib/period').currentYear());
+    await tap(`rec.skip:${id}:${keyNow}`);
+    ok(docsCount() === nS && balOf() === balS && bdbP.listOps(uid, cpL).length === opsS, 'пропуск: документа нет, долг и журнал не тронуты');
+    ok(bdbP.nextSeqForOrg(bdbP.currentOrg(uid).id, 'torg12', require('./lib/period').currentYear()) === seqS, 'номер не занят — дыры в нумерации нет');
+    ok(norm(last()).includes('Следующее предложение'), 'бот называет, когда придёт следующее');
+    await tap(`rec.go:${id}:${keyNow}`);
+    ok(docsCount() === nS && norm(last()).includes('пропустили'), 'после пропуска старой кнопкой «Всё верно» выписать нельзя');
+    ok(await runPeriodic(tg) === 0, 'и в тот же день предложение второй раз не приходит');
+    rec.off(uid, id);
+
+    // --- «Поправить»: те же позиции в мастере, день закрыт ---
+    id = makeRule('day'); only(id);
+    sent.length = 0;
+    await runPeriodic(tg);
+    const nF = docsCount(); const balF = balOf();
+    await tap(`rec.fix:${id}:${keyNow}`);
+    ok(norm(last()).includes('Обед комплексный') || norm(sent.map((m) => m.text).join(' ')).includes('Обед комплексный'), 'мастер открыт с позициями расписания');
+    ok(bdbP.getState(uid).state === `items:torg12:${cpL}`, 'состояние — обычный мастер накладной');
+    await tap('doc.make');
+    ok(docsCount() === nF + 1 && balOf() === balF + 7000, 'после выпуска из мастера — один документ и долг один раз');
+    await tap(`rec.go:${id}:${keyNow}`);
+    ok(docsCount() === nF + 1 && balOf() === balF + 7000 && norm(last()).includes('уже выписан'),
+      '«Всё верно» по тому же предложению после правки второй документ не выпишет');
+    rec.off(uid, id);
+
+    // --- устаревшая кнопка и чужое правило ---
+    id = makeRule('day'); only(id);
+    const nOld = docsCount();
+    await tap(`rec.go:${id}:2020-01-01`);
+    ok(docsCount() === nOld && norm(last()).includes('устарело'), 'вчерашняя кнопка документ не выпишет');
+    const other2 = bdbP.getOrCreateUser(880077, 'Чужой2', 'alien2');
+    const otherCp2 = bdbP.createCp(other2.id, { name: 'Их клиент', kind: 'customer', opening_date: '2026-01-01' });
+    const alien2 = rec.add(other2.id, { cpId: otherCp2, type: 'torg12', items, period: 'day', offeredThisMonth: false });
+    await tap(`rec.go:${alien2}:${todayIso}`);
+    await tap(`rec.skip:${alien2}:${todayIso}`);
+    const alRow = rawP.prepare('SELECT last_skip, last_issued FROM recurring WHERE id = ?').get(alien2);
+    ok(alRow.last_skip === '' && alRow.last_issued === '' && bdbP.listDocs(other2.id, 5).length === 0, 'чужое расписание ни выписать, ни пропустить нельзя');
+
+    // --- список и остановка ---
+    sent.length = 0;
+    await tap('rec');
+    ok(norm(last()).includes('каждый день') && Boolean(button('Остановить')), 'в списке расписание названо словами, у него кнопка «Остановить»');
+    await tap(button('Остановить'));
+    ok(!rec.list(uid).some((r) => r.id === id), 'остановленное расписание больше не предлагается');
+    rec.off(other2.id, alien2);   // чужое — выключаем его владельцем, чтобы не мешало обходу
+    ok(await runPeriodic(tg) === 0, 'и обход его не видит');
+    resetRules();
+  }
+
+  console.log('\n── деньги: количество, цена, даты, УПД, сумма в расписании ──');
+  {
+    /*
+     * Находки ревизора (партия 1). Каждая проверка — воспроизведение того, что
+     * он видел своими глазами: дробное количество, выдуманная дата, «0 штук»,
+     * УПД самозанятому, предложение по расписанию без НДС.
+     */
+    const bdbQ = require('./lib/bot-db');
+    const dsQ = require('./lib/doc-service');
+    const moneyQ = require('./lib/money');
+    const recQ = require('./lib/recurring');
+    const { runPeriodic } = require('./bot.js');
+    const uQ = bdbQ.getOrCreateUser(781001, 'Деньги');
+    bdbQ.saveMyOrg(uQ.id, { name: 'ИП Деньги', inn: '183209316100' });
+    const orgQ = bdbQ.getDefaultOrg(uQ.id);
+    const cpQ = bdbQ.createCp(uQ.id, { name: 'ООО «Весы»', kind: 'customer', opening_date: '2026-01-01' });
+    const issue = (items, more = {}) => dsQ.issueDocument(uQ.id, {
+      type: 'torg12', cpId: cpQ, items, skipQuota: true, ...more,
+    });
+
+    // Р1: 0,333 кг по 10,01 — это 3,33, а не «0,33 кг → 3,30».
+    const r1 = await issue([{ name: 'Мясо', unit: 'кг', qty: 0.333, price: 10.01 }]);
+    const it1 = bdbQ.getDoc(uQ.id, r1.doc.id).payload.items[0];
+    ok(r1.total === 3.33 && it1.qty === 0.333, 'Р1: количество 0,333 хранится с тремя знаками, сумма 3,33',
+      `${r1.total} / ${it1.qty}`);
+    const r1b = await issue([{ name: 'Крупа', unit: 'кг', qty: 3, price: 33.3333 }]);
+    const it1b = bdbQ.getDoc(uQ.id, r1b.doc.id).payload.items[0];
+    ok(it1b.price === 33.3333 && r1b.total === 100, 'Р1: цена хранится с четырьмя знаками, до копеек округляется только сумма',
+      `${it1b.price} / ${r1b.total}`);
+    ok(/33,3333/.test(require('./lib/torg12').buildTorg12Html({
+      org: bdbQ.getDefaultOrg(uQ.id), cp: bdbQ.getCp(uQ.id, cpQ), doc: { number: '1', date: '2026-10-01', items: [it1b] },
+    })), 'Р1: в бланке цена напечатана со всеми знаками, иначе графы не перемножить');
+    ok(moneyQ.round3(1.0005) === 1.001 && moneyQ.round4(2.00005) === 2.0001, 'Р1: округление «половина вверх» без сдвига двоичной дроби');
+    ok(dsQ.cleanItems([{ name: 'х', qty: '0,125', price: '99,5' }]).every((x) => x.qty === 0.125 && x.price === 99.5),
+      'Р12: запятая как разделитель читается');
+
+    // Р12: количество «0», «−2», «abc» и цена «abc» — отказ словами, а не молчаливая единица.
+    for (const [qty, price] of [[0, 100], [-2, 100], ['abc', 100], [1, 'abc'], [1, -5], [0.0001, 100]]) {
+      // eslint-disable-next-line no-await-in-loop
+      const bad = await issue([{ name: 'Мусор', qty, price }]);
+      ok(!bad.ok && bad.reason === 'items' && /Мусор/.test(bad.message),
+        `Р12: qty=${JSON.stringify(qty)} price=${JSON.stringify(price)} — отказ с названием позиции`, bad.message);
+    }
+    const noQty = await issue([{ name: 'Услуга', price: 500 }]);
+    ok(noQty.ok && noQty.total === 500, 'Р12: не указанное количество по-прежнему единица');
+
+    // Р11: выдуманная календарная дата — отказ во всех трёх выпусках.
+    for (const d of ['2026-02-30', '2026-04-31', '2026-13-01']) {
+      // eslint-disable-next-line no-await-in-loop
+      const bad = await issue([{ name: 'Х', qty: 1, price: 1 }], { date: d });
+      ok(!bad.ok && bad.reason === 'date' && bad.message.includes(d), `Р11: дата ${d} отвергается`, bad.message);
+    }
+    const badPp = await dsQ.issuePlain(uQ.id, { type: 'pp', cpId: cpQ, date: '2026-02-30', fields: { amount: 100, purpose: 'Оплата' }, skipQuota: true });
+    ok(!badPp.ok && badPp.reason === 'date', 'Р11: платёжка с выдуманной датой не выписывается', badPp.message);
+    bdbQ.updateOrg(uQ.id, orgQ.id, { vat_rate: '22' });
+    const badAv = await dsQ.issueFlat(uQ.id, { type: 'avans', cpId: cpQ, date: '2026-02-30', total: 1000, payload: { sum: 1000, vatRate: 22, payDoc: '№ 1' }, skipQuota: true });
+    ok(!badAv.ok && badAv.reason === 'date', 'Р11: счёт-фактура на аванс с выдуманной датой не выписывается', badAv.message);
+    bdbQ.updateOrg(uQ.id, orgQ.id, { vat_rate: '' });
+    const goodLeap = await issue([{ name: 'Х', qty: 1, price: 1 }], { date: '2028-02-29' });
+    ok(goodLeap.ok && bdbQ.getDoc(uQ.id, goodLeap.doc.id).date === '2028-02-29', 'Р11: 29 февраля високосного года принимается');
+    const noDate = await issue([{ name: 'Х', qty: 1, price: 1 }], { date: '' });
+    ok(noDate.ok && bdbQ.getDoc(uQ.id, noDate.doc.id).date === dsQ.todayISO(), 'Р11: пустая дата — сегодня');
+
+    // Р20: УПД самозанятому не выписывается.
+    bdbQ.updateOrg(uQ.id, orgQ.id, { npd: 1 });
+    const npdUpd = await dsQ.issueDocument(uQ.id, { type: 'upd', cpId: cpQ, items: [{ name: 'Х', qty: 1, price: 1 }], skipQuota: true });
+    ok(!npdUpd.ok && npdUpd.reason === 'npd' && /УПД/.test(npdUpd.message), 'Р20: УПД самозанятому — отказ', npdUpd.message);
+    bdbQ.updateOrg(uQ.id, orgQ.id, { npd: 0 });
+
+    // Р8: предложение по расписанию называет сумму с НДС, как у будущего документа.
+    bdbQ.updateOrg(uQ.id, orgQ.id, { vat_rate: '22', vat_gross: 0 });
+    const ruleItems = [{ name: 'Обед', unit: 'шт.', qty: 20, price: 350 }];   // 7 000 без НДС → 8 540
+    ok(dsQ.plannedTotal(uQ.id, { type: 'torg12', items: ruleItems, extra: {} }) === 8540, 'Р8: сумма будущего документа — 8 540 с НДС 22%');
+    ok(dsQ.plannedTotal(uQ.id, { type: 'torg12', items: ruleItems, extra: { vatRate: null } }) === 7000, 'Р8: «этот документ без НДС» — 7 000');
+    const ruleQ = recQ.add(uQ.id, { cpId: cpQ, type: 'torg12', items: ruleItems, period: 'day', weekday: 0, offeredThisMonth: false });
+    const before = sent.length;
+    await runPeriodic(tg, new Date('2026-10-21T09:00:00+03:00'));
+    const prop = sent.slice(before).filter((m) => /на сегодня/.test(m.text || '') && /Весы/.test(m.text || ''));
+    ok(prop.length === 1 && norm(prop[0].text).includes('8 540'), 'Р8: в предложении по расписанию сумма с НДС — 8 540',
+      prop[0] && norm(prop[0].text).slice(0, 120));
+    recQ.off(uQ.id, ruleQ);
+    bdbQ.updateOrg(uQ.id, orgQ.id, { vat_rate: '' });
+  }
+
+  console.log('\n── деньги: «Оплатил», сделка, выписка по номеру, частичные оплаты ──');
+  {
+    /*
+     * Находки ревизора Р2, Р4, Р5, Р6: «Оплатил» дважды, смена основания,
+     * оживляющая оплаченную сделку, подбор по сумме вместо номера и счёт,
+     * оплаченный двумя платежами, но висящий «неоплаченным».
+     */
+    const bdbM = require('./lib/bot-db');
+    const dsM = require('./lib/doc-service');
+    let keyN = 0;
+    const world = async (tg, basis = 'closing') => {
+      const u = bdbM.getOrCreateUser(tg, 'Сделка');
+      bdbM.saveMyOrg(u.id, { name: `ИП Сделка ${tg}`, inn: '183209316100' });
+      const org = bdbM.getDefaultOrg(u.id);
+      bdbM.updateOrg(u.id, org.id, { debt_basis: basis });
+      const cp = bdbM.createCp(u.id, { name: 'ООО «Заря»', kind: 'customer', inn: '7701234567', opening_date: '2026-01-01' });
+      const mk = async (type, price, date = '2026-10-01') => (await dsM.issueDocument(u.id, {
+        type, cpId: cp, date, items: [{ name: 'Обед', qty: 1, price }], skipQuota: true,
+      })).doc;
+      const bal = () => bdbM.balanceOf(u.id, cp).closing;
+      const setBasis = (b) => { bdbM.updateOrg(u.id, org.id, { debt_basis: b }); bdbM.rebuildDebt(u.id); };
+      // Платёж из выписки: занести, подобрать документы, подтвердить (как делает человек двумя нажатиями).
+      const bank = (amount, purpose = '', confirm = true) => {
+        keyN += 1;
+        const res = bdbM.importBankRows(u.id, [{ key: `m${tg}-${keyN}`, cpId: cp, amount, date: '2026-10-05', doc: `п/п ${keyN}`, purpose }]);
+        const m = bdbM.matchPaymentsToDocs(u.id, res.addedRows);
+        const done = confirm && m.deals.length ? bdbM.closeDocsFromBank(u.id, m.deals) : null;
+        return { ...m, done };
+      };
+      return { u, org, cp, mk, bal, setBasis, bank };
+    };
+
+    // --- Р2: «Оплатил» вносит только остаток по документу и только один раз ---
+    {
+      const w = await world(781010);
+      const d1 = await w.mk('torg12', 3000);
+      await w.mk('torg12', 4000);
+      bdbM.markPaid(w.u.id, d1.id, '2026-10-05');
+      bdbM.markPaid(w.u.id, d1.id, '2026-10-09');
+      ok(w.bal() === 4000 && bdbM.linkedPaid(d1.id) === 3000,
+        'Р2: «Оплатил» дважды подряд вносит оплату один раз', `${w.bal()} / ${bdbM.linkedPaid(d1.id)}`);
+      ok(bdbM.getDoc(w.u.id, d1.id).paid_at === '2026-10-05', 'и дату первой отметки не сдвигает');
+
+      // Частичная оплата уже лежит на документе: «Оплатил» добавляет только остаток.
+      const w2 = await world(781011);
+      const big = await w2.mk('torg12', 50000);
+      w2.bank(20000, 'Оплата по накладной № 1 частично');
+      ok(bdbM.linkedPaid(big.id) === 20000 && !bdbM.getDoc(w2.u.id, big.id).paid_at,
+        'Р2/Р6: частичная оплата из выписки привязана к документу, он остаётся неоплаченным');
+      bdbM.markPaid(w2.u.id, big.id, '2026-10-06');
+      ok(w2.bal() === 0 && bdbM.linkedPaid(big.id) === 50000,
+        'Р2: «Оплатил» после частичной вносит остаток 30 000, а не 50 000', `${w2.bal()} / ${bdbM.linkedPaid(big.id)}`);
+      w2.setBasis('invoice'); w2.setBasis('closing');
+      ok(w2.bal() === 0, 'Р2: туда-обратно по основаниям сальдо не меняет', w2.bal());
+      // При смене основания привязка из выписки отпускается: деньги остаются в журнале свободной строкой.
+      const un = bdbM.unmarkPaid(w2.u.id, big.id);
+      ok(w2.bal() === 30000 && un.kept === 0,
+        'Р2: снятие отметки возвращает долг на внесённое «Оплатил»; деньги из выписки остаются', `${w2.bal()} / ${un.kept}`);
+      const w2b = await world(781013);
+      const big2 = await w2b.mk('torg12', 50000);
+      w2b.bank(20000, 'Оплата по накладной № 1 частично');
+      bdbM.markPaid(w2b.u.id, big2.id, '2026-10-06');
+      const un2 = bdbM.unmarkPaid(w2b.u.id, big2.id);
+      ok(w2b.bal() === 30000 && un2.kept === 20000,
+        'Р2: снятие без смены основания — деньги из выписки (20 000) остаются, «Оплатил» (30 000) возвращается в долг', `${w2b.bal()} / ${un2.kept}`);
+
+      // Свободная оплата, как и прежде, не уводит сальдо в минус.
+      const w3 = await world(781012);
+      const solo = await w3.mk('sch', 50000);
+      bdbM.updateOrg(w3.u.id, w3.org.id, { debt_basis: 'invoice' }); bdbM.rebuildDebt(w3.u.id);
+      bdbM.addOp(w3.u.id, w3.cp, { date: '2026-10-02', kind: 'Оплата', doc: 'п/п 1', debit: 20000 });
+      bdbM.markPaid(w3.u.id, solo.id, '2026-10-03');
+      ok(w3.bal() === 0, 'Р2: «Оплатил» после свободной частичной оплаты закрывает только остаток', w3.bal());
+    }
+
+    // --- Р4: оплата сделки отмечает и парный документ, смена основания её не оживляет ---
+    {
+      const w = await world(781020);
+      const act = await w.mk('usl', 3000);
+      const inv = await w.mk('sch', 3000);
+      ok(w.bal() === 3000 && bdbM.unpaidSummary(w.u.id).sum === 3000, 'Р4: акт и счёт на 3 000 — одна сделка, долг 3 000');
+      bdbM.markPaid(w.u.id, act.id, '2026-10-05');
+      ok(bdbM.getDoc(w.u.id, inv.id).paid_at && Number(bdbM.getDoc(w.u.id, inv.id).paid_with) === act.id,
+        'Р4: «Оплатил» на акте отметил и парный счёт (paid_with)');
+      ok(w.bal() === 0 && bdbM.unpaidSummary(w.u.id).sum === 0 && bdbM.unpaidDocs(w.u.id).length === 0,
+        'Р4: сделка закрыта целиком — ни долга, ни «ждут оплаты»');
+      w.setBasis('invoice');
+      ok(w.bal() === 0 && bdbM.unpaidSummary(w.u.id).sum === 0, 'Р4: смена основания на «по счёту» оплаченную сделку не оживила', w.bal());
+      w.setBasis('closing');
+      ok(w.bal() === 0, 'Р4: и обратно тоже', w.bal());
+      // Нажали на парный документ: деньги всё равно кладутся на главный, оба отмечены.
+      const w2 = await world(781021);
+      const act2 = await w2.mk('usl', 3000);
+      const inv2 = await w2.mk('sch', 3000);
+      bdbM.markPaid(w2.u.id, inv2.id, '2026-10-05');
+      ok(w2.bal() === 0 && bdbM.getDoc(w2.u.id, act2.id).paid_at, 'Р4: «Оплатил» на счёте оплачивает сделку и закрывает акт', w2.bal());
+      w2.setBasis('invoice');
+      ok(w2.bal() === 0, 'Р4: переключение при отметке с парного документа тоже ничего не оживляет', w2.bal());
+      bdbM.unmarkPaid(w2.u.id, act2.id);
+      ok(w2.bal() === 3000 && !bdbM.getDoc(w2.u.id, inv2.id).paid_at, 'Р4: снятие отметки с одного документа возвращает сделку целиком', w2.bal());
+      // Удалили главный документ оплаченной сделки: оплата ушла с ним, парный снова не оплачен
+      // (и смена основания не «восстанавливает» оплату, которой уже нет).
+      const w2b = await world(781023);
+      const actB = await w2b.mk('usl', 3000);
+      const invB = await w2b.mk('sch', 3000);
+      bdbM.markPaid(w2b.u.id, actB.id, '2026-10-05');
+      bdbM.deleteDoc(w2b.u.id, actB.id);
+      ok(!bdbM.getDoc(w2b.u.id, invB.id).paid_at && w2b.bal() === 0, 'Р4: удалили главный документ сделки — парный снова неоплачен', w2b.bal());
+      w2b.setBasis('invoice');
+      ok(w2b.bal() === 3000, 'Р4: и счёт при долге «по счёту» честно висит долгом, а не «оплачен призраком»', w2b.bal());
+      // Закрытая из выписки сделка: туда-обратно оплату не задваивает.
+      const w3 = await world(781022);
+      await w3.mk('usl', 3000); await w3.mk('sch', 3000);
+      const b3 = w3.bank(3000);
+      ok(b3.done && b3.done.docs === 2 && w3.bal() === 0, 'Р4: выписка закрыла сделку из двух документов', JSON.stringify(b3.done));
+      w3.setBasis('invoice'); w3.setBasis('closing');
+      ok(w3.bal() === 0, 'Р4: сделка, закрытая выпиской, после смены основания туда-обратно остаётся закрытой', w3.bal());
+    }
+
+    // --- Р5: документ ищем по номеру из назначения, потом по сумме ---
+    {
+      const nums = bdbM.docNumbersIn('Оплата по накладной № 3 от 03.10.2026. Без НДС');
+      ok(nums.length === 1 && nums[0].num === '3' && nums[0].types.includes('torg12'), 'Р5: номер читается из «по накладной № 3 от …»', JSON.stringify(nums));
+      ok(bdbM.docNumbersIn('Оплата по договору № 17, счёт 5').map((x) => x.num).join() === '5', 'Р5: номер договора за номер документа не принимается');
+      ok(bdbM.docNumbersIn('Аванс. НДС не облагается').length === 0, 'Р5: без номера — ничего');
+
+      const w = await world(781030);
+      await w.mk('torg12', 3000, '2026-10-01');
+      await w.mk('torg12', 3000, '2026-10-02');
+      const d3 = await w.mk('torg12', 8000, '2026-10-03');
+      let m = w.bank(8000, 'Оплата по накладной № 3 от 03.10.2026', false);
+      ok(m.deals.length === 1 && m.deals[0].leadId === d3.id, 'Р5: платёж 8 000 «по накладной № 3» закрывает № 3, а не № 1 и № 2',
+        m.deals.map((d) => d.title).join());
+      const w2 = await world(781031);
+      await w2.mk('torg12', 3000, '2026-10-01');
+      const n2 = await w2.mk('torg12', 3000, '2026-10-02');
+      m = w2.bank(3000, 'Оплата по накладной № 2', false);
+      ok(m.deals.length === 1 && m.deals[0].leadId === n2.id, 'Р5: при двух накладных на 3 000 «по № 2» закрывает именно № 2, а не старшую');
+      const w3 = await world(781032);
+      const e1 = await w3.mk('torg12', 3000, '2026-10-01');
+      await w3.mk('torg12', 3000, '2026-10-02');
+      m = w3.bank(3000, 'Оплата по договору № 2', false);
+      ok(m.deals.length === 1 && m.deals[0].leadId === e1.id, 'Р5: «по договору № 2» к документам не относится — подбор по сумме, как раньше');
+      m = w3.bank(3000, '', false);
+      ok(m.deals.length === 1 && m.deals[0].leadId === e1.id, 'Р5: без номера всё как раньше — по сумме, старые первыми');
+      // Счёт № 3 и накладная № 3 — без слова, которое их различает, номер не угадываем.
+      const w4 = await world(781033);
+      await w4.mk('usl', 1000, '2026-10-01'); await w4.mk('usl', 1000, '2026-10-02');
+      const t3 = await w4.mk('usl', 2000, '2026-10-03');
+      await w4.setBasis('closing');
+      m = w4.bank(2000, 'Оплата по акту №3', false);
+      ok(m.deals.length === 1 && m.deals[0].leadId === t3.id, 'Р5: «по акту №3» без пробела после знака читается');
+    }
+
+    // --- Р6: частичные оплаты считаем по привязанным проводкам ---
+    {
+      const w = await world(781040);
+      const d = await w.mk('torg12', 50000);
+      const first = w.bank(20000, 'Оплата по накладной № 1 частично', false);
+      ok(first.deals.length === 1 && first.deals[0].partial && first.deals[0].total === 20000 && first.deals[0].left === 30000,
+        'Р6: платёж меньше остатка по названному документу предлагается как частичный', JSON.stringify(first.deals[0]));
+      ok(bdbM.linkedPaid(d.id) === 0, 'Р6: пока человек не подтвердил, ничего не привязано');
+      const closed = bdbM.closeDocsFromBank(w.u.id, first.deals);
+      ok(closed.docs === 0 && closed.partial === 1 && bdbM.linkedPaid(d.id) === 20000 && w.bal() === 30000,
+        'Р6: подтвердили — 20 000 привязаны к документу, он не закрыт', JSON.stringify(closed));
+      ok(bdbM.unpaidSummary(w.u.id).sum === 30000 && bdbM.unpaidDocs(w.u.id)[0].left === 30000,
+        'Р6: «Ждут оплаты» = 30 000 = долгу клиента, а не полная сумма документа');
+      bdbM.rebuildDebt(w.u.id);
+      ok(bdbM.linkedPaid(d.id) === 20000 && w.bal() === 30000, 'Р6: пересчёт частичную привязку не теряет');
+      const second = w.bank(30000, 'Доплата по накладной № 1');
+      ok(second.done.docs === 1 && bdbM.getDoc(w.u.id, d.id).paid_at && bdbM.linkedPaid(d.id) === 50000 && w.bal() === 0,
+        'Р6: второй платёж довёл привязанное до суммы — документ закрыт', JSON.stringify(second.done));
+      ok(bdbM.unpaidDocs(w.u.id).length === 0 && bdbM.unpaidSummary(w.u.id).sum === 0, 'Р6: оплаченный двумя платежами документ из «Ждут оплаты» ушёл');
+      w.setBasis('invoice'); w.setBasis('closing');
+      ok(w.bal() === 0, 'Р6: смена основания туда-обратно сальдо не меняет', w.bal());
+      // Платёж без номера и меньше документа ничего не предлагает (как раньше).
+      const w2 = await world(781041);
+      await w2.mk('torg12', 50000);
+      const none = w2.bank(20000, 'Оплата частично', false);
+      ok(none.deals.length === 0 && none.leftovers[0].amount === 20000, 'Р6: частичная оплата без номера документа по-прежнему только остаток, без привязки');
+      // «Ждут оплаты» не больше долга: свободная оплата уменьшает итог, документы остаются в списке.
+      ok(bdbM.unpaidSummary(w2.u.id).sum === 30000 && bdbM.unpaidSummary(w2.u.id).docs.length === 1,
+        'Р6: свободная оплата 20 000 уменьшает итог «ждут» до долга 30 000, документ в списке остаётся');
+    }
+  }
+
+  console.log('\n── деньги: чек самозанятого на каждое поступление ──');
+  {
+    /*
+     * Находка Р3: чек заводился один на документ и на всю его сумму, поэтому
+     * частичная оплата, оплата частями, аванс и платёж из выписки чеков не
+     * давали, а «Оплатил» после частичной называл полную сумму. Теперь запись —
+     * на каждую приходную проводку, на её сумму.
+     */
+    const bdbC = require('./lib/bot-db');
+    const dsC = require('./lib/doc-service');
+    const chqC = require('./lib/cheques');
+    const rawC = require('./db').db;
+    let seq = 0;
+    const world = async (basis = 'invoice') => {
+      seq += 1;
+      const u = bdbC.getOrCreateUser(781100 + seq, 'Чек');
+      bdbC.saveMyOrg(u.id, { name: `Иванов И. И. ${seq}`, inn: '183200000011' });
+      const org = bdbC.getDefaultOrg(u.id);
+      bdbC.updateOrg(u.id, org.id, { npd: 1, debt_basis: basis });
+      const cp = bdbC.createCp(u.id, { name: 'Петров П. П.', kind: 'customer', inn: '183100000099', opening_date: '2026-01-01' });
+      const mk = async (price, date = '2026-10-01', type = 'sch') => (await dsC.issueDocument(u.id, {
+        type, cpId: cp, date, items: [{ name: 'Консультация', qty: 1, price }], skipQuota: true,
+      })).doc;
+      const all = () => rawC.prepare('SELECT * FROM npd_cheques WHERE user_id = ? ORDER BY id').all(u.id);
+      const sum = () => Math.round(all().reduce((a, c) => a + c.amount, 0) * 100) / 100;
+      return { u, org, cp, mk, all, sum };
+    };
+
+    // Частичная оплата, затем «Оплатил»: два чека — на 20 000 и на 30 000, а не 50 000 и ничего.
+    {
+      const w = await world();
+      const inv = await w.mk(50000);
+      bdbC.addOp(w.u.id, w.cp, { date: '2026-10-02', kind: 'Оплата', doc: 'п/п 1', debit: 20000 });
+      ok(w.all().length === 1 && w.all()[0].amount === 20000 && w.all()[0].status === 'open',
+        'Р3: свободная частичная оплата 20 000 сразу даёт чек на 20 000', JSON.stringify(w.all().map((c) => c.amount)));
+      bdbC.markPaid(w.u.id, inv.id, '2026-10-03');
+      ok(w.all().length === 2 && w.sum() === 50000 && w.all()[1].amount === 30000 && w.all()[1].doc_id === inv.id,
+        'Р3: «Оплатил» после частичной — чек на остаток 30 000, всего 50 000 (по полученным деньгам)', JSON.stringify(w.all().map((c) => c.amount)));
+      bdbC.markPaid(w.u.id, inv.id, '2026-10-04');
+      ok(w.all().length === 2, 'Р3: повторное «Оплатил» чек не задваивает');
+      // Снятие отметки снимает ожидание чека по этой проводке, а чек за свободную оплату остаётся.
+      bdbC.unmarkPaid(w.u.id, inv.id);
+      ok(w.all().length === 1 && w.all()[0].amount === 20000, 'Р3: снятие оплаты убрало ожидание чека на 30 000; чек на 20 000 остался', JSON.stringify(w.all().map((c) => c.amount)));
+      // Пробитый чек оплата не стирает.
+      chqC.markDone(w.u.id, w.all()[0].id);
+      const op = bdbC.listOps(w.u.id, w.cp).find((o) => o.kind === 'Оплата');
+      bdbC.deleteOp(w.u.id, op.id);
+      ok(w.all().length === 1 && w.all()[0].status === 'done', 'Р3: пробитый чек при снятии проводки не трогаем');
+    }
+
+    // Оплата частями, аванс и накладные, закрытые авансом.
+    {
+      const w = await world('closing');
+      bdbC.addOp(w.u.id, w.cp, { date: '2026-10-02', kind: 'Оплата', doc: 'п/п 1', debit: 20000 });
+      bdbC.addOp(w.u.id, w.cp, { date: '2026-10-09', kind: 'Оплата', doc: 'п/п 2', debit: 30000 });
+      ok(w.all().length === 2 && w.sum() === 50000, 'Р3: оплата частями 20 000 + 30 000 — два чека, в сумме 50 000', JSON.stringify(w.all().map((c) => c.amount)));
+      ok(w.all()[0].due === '2026-11-09', 'Р3: срок — 9-е число следующего месяца от даты поступления');
+
+      const p = await world('closing');
+      bdbC.addPrepay(p.u.id, p.cp, 140000, '2026-10-01');
+      ok(p.all().length === 1 && p.all()[0].amount === 140000 && /предоплат/i.test(p.all()[0].service),
+        'Р3: аванс 140 000 — чек на аванс', JSON.stringify(p.all().map((c) => [c.amount, c.service])));
+      const a1 = await p.mk(50000, '2026-10-05', 'torg12');
+      const a2 = await p.mk(50000, '2026-10-06', 'torg12');
+      ok(bdbC.getDoc(p.u.id, a1.id).paid_at && bdbC.getDoc(p.u.id, a2.id).paid_at, 'накладные закрыты из аванса');
+      ok(p.all().length === 1 && p.sum() === 140000, 'Р3: накладные, закрытые авансом, новых чеков не дают — деньги пришли один раз', JSON.stringify(p.all().map((c) => c.amount)));
+      // Отмена аванса снимает ожидание чека.
+      const advOp = bdbC.listOps(p.u.id, p.cp).find((o) => o.note === 'Предоплата');
+      bdbC.deleteOp(p.u.id, advOp.id);
+      ok(p.all().length === 0, 'Р3: отменили аванс — ожидание чека на него снято');
+    }
+
+    // Выписка: чек — в момент занесения; закрытие документов его переносит, а не задваивает.
+    {
+      const w = await world('closing');
+      const d = await w.mk(50000, '2026-10-01', 'torg12');
+      const res = bdbC.importBankRows(w.u.id, [{ key: 'chq-1', cpId: w.cp, amount: 80000, date: '2026-10-05', doc: 'п/п 7', purpose: `Оплата по накладной № ${d.number}` }]);
+      ok(w.all().length === 1 && w.all()[0].amount === 80000 && w.all()[0].doc_id === 0 && w.all()[0].notified === 0,
+        'Р3: платёж из выписки сразу даёт чек на всю сумму поступления', JSON.stringify(w.all()));
+      const m = bdbC.matchPaymentsToDocs(w.u.id, res.addedRows);
+      bdbC.closeDocsFromBank(w.u.id, m.deals);
+      ok(w.sum() === 80000 && w.all().length === 2, 'Р3: платёж 80 000 разошёлся на документ (50 000) и остаток (30 000) — чеки делятся, сумма та же',
+        JSON.stringify(w.all().map((c) => [c.amount, c.doc_id])));
+      const linked = w.all().find((c) => c.doc_id === d.id);
+      ok(linked && linked.amount === 50000, 'и чек на 50 000 теперь «за документ»', JSON.stringify(linked));
+      // Платёж целиком — чек просто переезжает.
+      const w2 = await world('closing');
+      const d2 = await w2.mk(50000, '2026-10-01', 'torg12');
+      const res2 = bdbC.importBankRows(w2.u.id, [{ key: 'chq-2', cpId: w2.cp, amount: 50000, date: '2026-10-05', doc: 'п/п 8' }]);
+      bdbC.closeDocsFromBank(w2.u.id, bdbC.matchPaymentsToDocs(w2.u.id, res2.addedRows).deals);
+      ok(w2.all().length === 1 && w2.all()[0].doc_id === d2.id, 'Р3: платёж ровно на документ — тот же чек, привязанный к документу', JSON.stringify(w2.all().map((c) => [c.amount, c.doc_id])));
+      // Туда-обратно по основаниям чеки не множит.
+      bdbC.updateOrg(w2.u.id, w2.org.id, { debt_basis: 'invoice' }); bdbC.rebuildDebt(w2.u.id);
+      bdbC.updateOrg(w2.u.id, w2.org.id, { debt_basis: 'closing' }); bdbC.rebuildDebt(w2.u.id);
+      ok(w2.all().length === 1, 'Р3: смена основания туда-обратно чеков не множит и не теряет');
+    }
+
+    // Оплата сделки отмечена, основание сменили: чек остаётся один и едет за деньгами.
+    {
+      const w = await world('closing');
+      const act = await w.mk(3000, '2026-10-01', 'usl');
+      await w.mk(3000, '2026-10-01', 'sch');
+      bdbC.markPaid(w.u.id, act.id, '2026-10-05');
+      ok(w.all().length === 1 && w.all()[0].amount === 3000, 'Р3: «Оплатил» на сделке из счёта и акта — один чек на 3 000');
+      bdbC.updateOrg(w.u.id, w.org.id, { debt_basis: 'invoice' }); bdbC.rebuildDebt(w.u.id);
+      const op = bdbC.listOps(w.u.id, w.cp).find((o) => o.kind === 'Оплата');
+      ok(w.all().length === 1 && w.all()[0].op_id === op.id, 'Р3: после смены основания чек привязан к восстановленной проводке', JSON.stringify(w.all().map((c) => c.op_id)));
+      bdbC.unmarkPaid(w.u.id, act.id);
+      ok(w.all().length === 0, 'Р3: снятие оплаты сделки снимает ожидание чека');
+    }
+
+    // Документ долга не создаёт: денег в журнале нет, но «Оплатил» — получены; чек по документу, один.
+    {
+      const w = await world('closing');
+      const inv = await w.mk(7000, '2026-10-01', 'sch');
+      bdbC.markPaid(w.u.id, inv.id, '2026-10-05');
+      bdbC.markPaid(w.u.id, inv.id, '2026-10-06');
+      ok(w.all().length === 1 && w.all()[0].amount === 7000 && w.all()[0].doc_id === inv.id, 'Р3: счёт при долге «по акту» — «Оплатил» даёт один чек по документу');
+    }
+
+    // Не самозанятый и поставщик чеков не получают.
+    {
+      const w = await world('closing');
+      bdbC.updateOrg(w.u.id, w.org.id, { npd: 0 });
+      bdbC.addOp(w.u.id, w.cp, { date: '2026-10-02', kind: 'Оплата', doc: 'п/п 1', debit: 1000 });
+      ok(w.all().length === 0, 'Р3: не самозанятому чеки не заводятся');
+      bdbC.updateOrg(w.u.id, w.org.id, { npd: 1 });
+      const sup = bdbC.createCp(w.u.id, { name: 'ООО «Поставщик»', kind: 'supplier', opening_date: '2026-01-01' });
+      bdbC.addOp(w.u.id, sup, { date: '2026-10-02', kind: 'Оплата', doc: 'наша оплата', debit: 5000 });
+      ok(w.all().length === 0, 'Р3: оплата поставщику — не доход, чек не нужен');
+    }
+
+    // Бот: «оплата 20000», затем «оплата 30000» — по каждой своё напоминание.
+    {
+      const uid = fxUserId();
+      const org = bdbC.getDefaultOrg(uid);
+      const wasNpd = org.npd; const wasBasis = org.debt_basis;
+      bdbC.updateOrg(uid, org.id, { npd: 1, debt_basis: 'invoice' });
+      const cpB = bdbC.createCp(uid, { name: 'ООО «Частями»', kind: 'customer', inn: '7707083893', opening_date: '2026-01-01' });
+      await dsC.issueDocument(uid, { type: 'sch', cpId: cpB, date: '2026-10-01', items: [{ name: 'Работа', qty: 1, price: 50000 }], skipQuota: true });
+      sent.length = 0;
+      await tap(`pay.cp:${cpB}:20000:o:chqtok1`);
+      ok(norm(sent.map((m) => m.text || '').join(' ')).includes('Пробейте чек в «Мой налог» на 20 000 ₽'),
+        'Р3: бот после «оплата 20000» напоминает про чек на 20 000', norm(sent.map((m) => m.text || '').join(' ')).slice(-160));
+      sent.length = 0;
+      await tap(`pay.cp:${cpB}:30000:o:chqtok2`);
+      ok(norm(sent.map((m) => m.text || '').join(' ')).includes('Пробейте чек в «Мой налог» на 30 000 ₽'),
+        'Р3: и после второй части — на 30 000', norm(sent.map((m) => m.text || '').join(' ')).slice(-160));
+      const mine = rawC.prepare('SELECT amount FROM npd_cheques WHERE user_id = ? AND cp_id = ? ORDER BY id').all(uid, cpB).map((c) => c.amount);
+      ok(mine.join() === '20000,30000', 'Р3: в списке чеков два: 20 000 и 30 000', mine.join());
+      bdbC.updateOrg(uid, org.id, { npd: wasNpd, debt_basis: wasBasis });
+    }
+  }
+
+  console.log('\n── напоминания подряду, торговле и производству ──');
+  {
+    /*
+     * Три вида дела, у которых напоминания раньше не было. Проходим весь
+     * путь до конца, и главное здесь то же, что у аренды: в свой день бот
+     * приходит с предложением, а документ сам не выписывается. У торговли и
+     * производства это УПД — у него свой мастер, со статусом документа.
+     */
+    const rec = require('./lib/recurring');
+    const bdbN = require('./lib/bot-db');
+    const { db: rawN } = require('./db');
+    const { runDaily } = require('./bot.js');
+    const uid = fxUserId();
+
+    for (const [biz, docType, word] of [
+      ['contractor', 'usl', 'акт за выполненные работы'],
+      ['trade', 'upd', 'УПД по отгрузкам'],
+      ['manufacturing', 'upd', 'УПД по отгрузкам'],
+    ]) {
+      for (const r of rec.list(uid)) rec.off(uid, r.id);
+      const cpN = bdbN.createCp(uid, {
+        name: `ООО «${biz}»`, kind: 'customer', opening_date: '2026-01-01',
+      });
+
+      sent.length = 0;
+      // eslint-disable-next-line no-await-in-loop
+      await tap(`biz.set:${biz}`);
+      ok(norm(sent.map((m) => m.text || '').join(' ')).includes(word),
+        `${biz}: после выбора дела предложено напоминание про «${word}»`);
+
+      const docsWas = bdbN.listDocs(uid, 300).length;
+      // eslint-disable-next-line no-await-in-loop
+      await tap(`rt.new:${biz}`);
+      // eslint-disable-next-line no-await-in-loop
+      await tap(`rt.cp:${biz}:${cpN}`);
+      // eslint-disable-next-line no-await-in-loop
+      await tap(`rt.day:${biz}:${cpN}:25`);
+      const rule = rec.list(uid).find((r) => r.cp_id === cpN);
+      ok(rule && rule.type === docType && rule.day === 25,
+        `${biz}: правило заведено на ${docType} 25-го`, rule && `${rule.type}/${rule.day}`);
+      ok(rule && rule.items.length === 0, `${biz}: без позиций — их назовёт человек`);
+
+      // Наступил день. Документ обязан НЕ выписаться сам.
+      rawN.prepare("UPDATE recurring SET last_offer = '2000-01', day = ? WHERE id = ?")
+        .run(new Date().getDate(), rule.id);
+      sent.length = 0;
+      // eslint-disable-next-line no-await-in-loop
+      await runDaily(tg);
+      ok(bdbN.listDocs(uid, 300).length === docsWas,
+        `${biz}: в свой день ничего не выписалось само`,
+        `${docsWas} → ${bdbN.listDocs(uid, 300).length}`);
+      // Ищем кнопку во всех сообщениях обхода, а не только в последнем:
+      // тот же обход шлёт ещё и сигналы о просрочке, и предложение может
+      // оказаться не крайним.
+      const go = sent.flatMap((m) => (m.kb || []).flat())
+        .find((b) => /Заполнить и выписать/.test(b.text));
+      ok(Boolean(go), `${biz}: пришло предложение с кнопкой`);
+
+      // Кнопка ведёт в живой мастер, а не в никуда.
+      // eslint-disable-next-line no-await-in-loop
+      if (go) await tap(go.callback_data);
+      ok(!/не найден|Что-то пошло не так/i.test(last()),
+        `${biz}: кнопка открывает мастер`, norm(last()).slice(0, 60));
+    }
+    for (const r of rec.list(uid)) rec.off(uid, r.id);
+  }
+
+  console.log('\n── сигнал о просрочке ──');
+  {
+    const rec = require('./lib/recurring');
+    const bdbO = require('./lib/bot-db');
+    const { runDaily } = require('./bot.js');
+    const uid = fxUserId();
+
+    const cpO = bdbO.createCp(uid, { name: 'ООО «Должник»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.sch:${cpO}`);
+    await say('Аренда за месяц; 1; 20000');
+    await tap('items.done');
+    await tap('doc.make');
+    const bill = bdbO.listDocs(uid, 1)[0];
+
+    // Срок оплаты был вчера, о просрочке ещё не сообщали.
+    //
+    // День задаём, а не берём из календаря. Раньше он считался от «вчера», и
+    // первого числа проверка становилась неисполнимой: просрочка наступает со
+    // дня после срока оплаты, а первого числа такого дня в месяце ещё не было.
+    // Проверка при этом падала, хотя бот вёл себя правильно.
+    //
+    // Месяц остаётся настоящим: счёт выписан сегодня, а ищут его по текущему
+    // месяцу — подменять пришлось бы ещё и это.
+    const id = rec.add(uid, { cpId: cpO, type: 'sch', items: [{ name: 'Аренда', qty: 1, price: 20000 }] });
+    // Сдвиг берём наименьший из возможных — второе число при сроке первого.
+    // Чем дальше уехать по календарю, тем больше чужих правил в общей базе
+    // окажутся «наступившими»: на шестнадцатом числе они принялись выписывать
+    // документы и сломали проверки лимита и журнала в других разделах.
+    const now = new Date();
+    const on = new Date(now.getFullYear(), now.getMonth(), 2, 12);
+    rec.setSchedule(uid, id, { payDay: 1, leadDays: 3 });
+
+    const before = sent.length;
+    await runDaily(tg, on);
+    const warned = sent.slice(before).map((m) => norm(m.text)).join('\n');
+    ok(/Просрочка: ООО «Должник»/.test(warned), 'бот сообщил о просрочке', warned.slice(0, 60));
+    ok(/20 000,00/.test(warned), 'в сообщении сумма неоплаченного');
+    ok(!/отправил|написал клиенту/i.test(warned), 'контрагенту бот ничего не отправлял');
+
+    // Второй раз в том же месяце — молчим.
+    const after = sent.length;
+    await runDaily(tg);
+    ok(sent.length === after, 'повторно за тот же месяц не напоминает', sent.length - after);
+
+    // Отметили оплату — на следующий месяц сигнала быть не должно.
+    bdbO.markPaid(uid, bill.id);
+    require('./db').db.prepare("UPDATE recurring SET last_due = '' WHERE id = ?").run(id);
+    const paidBefore = sent.length;
+    await runDaily(tg);
+    const said = sent.slice(paidBefore).map((m) => norm(m.text)).join('\n');
+    ok(!/Просрочка: ООО «Должник»/.test(said), 'после отметки оплаты не напоминает', said.slice(0, 60));
+
+    rec.off(uid, id);
+  }
+
+  console.log('\n── чем занимается бизнес ──');
+  {
+    const bdbZ = require('./lib/bot-db');
+    const biz = require('./lib/biz-types');
+    const uid = fxUserId();
+
+    await tap('basis');
+    ok(Boolean(button('Не знаю')), 'на экране основания долга есть выход для новичка');
+    await tap('biz');
+    ok(last().includes('Чем занимаетесь'), 'бот спрашивает про дело, а не про бухгалтерию');
+
+    await tap('biz.set:rent');
+    ok(bdbZ.getDefaultOrg(uid).biz_type === 'rent', 'тип бизнеса сохранён',
+      bdbZ.getDefaultOrg(uid).biz_type);
+    ok(bdbZ.basisOf(bdbZ.getDefaultOrg(uid)) === 'invoice', 'аренда → долг по счёту',
+      bdbZ.basisOf(bdbZ.getDefaultOrg(uid)));
+
+    await tap('biz.set:trade');
+    ok(bdbZ.basisOf(bdbZ.getDefaultOrg(uid)) === 'closing', 'торговля → долг по отгрузке');
+    ok(biz.list().every((t) => ['closing', 'invoice', 'manual'].includes(t.basis)),
+      'каждый вид бизнеса ведёт к существующему основанию долга');
+
+    await tap('basis.set:closing');
+  }
+
+  console.log('\n── выписка файлом в чат ──');
+  {
+    const bdbB = require('./lib/bot-db');
+    const uid = fxUserId();
+    const cpB = bdbB.createCp(uid, {
+      name: 'ООО «Ветер»', inn: '7701234560', kind: 'customer', opening_date: '2026-01-01',
+    });
+    bdbB.addOp(uid, cpB, { date: '2026-08-01', kind: 'Приход', doc: 'Акт 9', credit: 31000 });
+
+    const csv = [
+      'Дата;ИНН плательщика;Плательщик;Приход;Назначение платежа',
+      '05.08.2026;7701234560;ООО "Ветер";31 000,00;Оплата по акту 9',
+      '06.08.2026;;Неизвестный;700,00;Возврат',
+    ].join('\n');
+    tg.downloadFile = async () => Buffer.from(csv, 'utf8');
+    const statement = (name) => handleUpdate(tg, {
+      message: { chat: CHAT, from: USER, document: { file_id: 'st-1', file_name: name, file_size: csv.length } },
+    });
+
+    // Кнопки ищем только в последнем сообщении: button() смотрит всю
+    // переписку и нашёл бы кнопку из прошлого разбора.
+    const lastButtons = () => ((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.text).join(' | ');
+
+    await statement('vypiska.csv');
+    ok(norm(last()).includes('Узнал уверенно (1)'), 'бот разобрал выписку и узнал плательщика',
+      norm(last()).slice(0, 80));
+    ok(norm(last()).includes('ООО «Ветер»') && norm(last()).includes('31 000,00'),
+      'в сводке видно кто и сколько', norm(last()).slice(-60));
+    ok(norm(last()).includes('Ещё 1 поступление'), 'про непривязанные строки сказано отдельно');
+    ok(lastButtons().includes('Занести 1 оплату'), 'есть кнопка занести уверенные', lastButtons());
+
+    await tap('bank:take');
+    ok(last().includes('Занёс 1 оплату'), 'оплата занесена по кнопке', last().slice(0, 60));
+    ok(bdbB.balanceOf(uid, cpB).closing === 0, 'долг закрылся',
+      bdbB.balanceOf(uid, cpB).closing);
+
+    // Тот же файл второй раз: в учёте задвоенная оплата хуже ненайденной.
+    await statement('vypiska.csv');
+    ok(norm(last()).includes('Уже занесено раньше: 1'), 'повтор узнан', norm(last()).slice(0, 80));
+    ok(!lastButtons().includes('Занести'), 'кнопки занести уже занесённое нет', lastButtons());
+    ok(bdbB.balanceOf(uid, cpB).closing === 0, 'сальдо после повтора не изменилось',
+      bdbB.balanceOf(uid, cpB).closing);
+
+    tg.downloadFile = async () => Buffer.from('это не выписка, а записка', 'utf8');
+    await statement('zametki.txt');
+    ok(last().includes('ни одной операции'), 'на посторонний файл понятный ответ', last().slice(0, 60));
+  }
+
+  console.log('\n── книга учёта: от файла до таблицы ──');
+  {
+    /*
+     * Путь целиком, как у человека: файл выписки в чат → кнопка под разбором
+     * → таблица, которую открываем и читаем. Раньше проверка книги искала в
+     * bot.js строчку «data === 'kudir'» и была зелёной, пока сама кнопка
+     * сбрасывала выписку, и книга отвечала «пришлите выписку файлом».
+     */
+    const bdbK = require('./lib/bot-db');
+    const ExcelJS = require('exceljs');
+    const who = { id: 779140, first_name: 'Книга', username: 'kniga' };
+    const chat = { id: who.id };
+    const sayK = (t) => handleUpdate(tg, { message: { chat, from: who, text: t } });
+    const tapK = (d) => handleUpdate(tg,
+      { callback_query: { id: 'cb', from: who, data: d, message: { chat } } });
+    const uK = bdbK.getOrCreateUser(who.id, 'Книга');
+    bdbK.saveMyOrg(uK.id, { name: 'ИП Книгин', inn: '183112345670', acc: '40802810900000000077',
+      bank_name: 'ПАО Сбербанк', bik: '044525225', corr_acc: '30101810400000000225' });
+    const orgK = bdbK.getDefaultOrg(uK.id);
+    bdbK.updateOrg(uK.id, orgK.id, { vat_rate: '', npd: 0, tax_mode: '' });
+    bdbK.createCp(uK.id, { name: 'ООО «Ветер»', inn: '7701234560', kind: 'customer', opening_date: '2025-01-01' });
+    const csvK = [
+      'Дата;ИНН плательщика;Плательщик;Приход;Назначение платежа',
+      '29.12.2025;7701234560;ООО "Ветер";10 000,00;Оплата по счету 1',
+      '15.01.2026;7701234560;ООО "Ветер";20 000,00;Оплата по счету 2',
+      '16.01.2026;;ИП Книгин;50 000,00;Внесение собственных средств',
+      '17.01.2026;7707083893;ООО "Бриз";3 000,00;Возврат аванса по договору 5',
+    ].join('\n');
+    const keepDl = tg.downloadFile;
+    tg.downloadFile = async () => Buffer.from(csvK, 'utf8');
+    const sendFile = () => handleUpdate(tg, { message: { chat, from: who,
+      document: { file_id: 'k-1', file_name: 'vypiska.csv', file_size: csvK.length } } });
+    const lastKb = () => ((sent[sent.length - 1] || {}).kb || []).flat();
+    const bookBtn = () => lastKb().find((b) => /книг/i.test(b.text));
+    const readBook = async (f) => {
+      const wb = new ExcelJS.Workbook();
+      await wb.xlsx.readFile(path.join(OUT, f.filename));
+      return wb;
+    };
+    const yearTotal = (wb) => {
+      const out = [];
+      wb.getWorksheet('Раздел I').eachRow((r) => {
+        if (String(r.getCell(3).value || '') === 'Итого за год') out.push(r.getCell(4).value);
+      });
+      return out[0];
+    };
+
+    await sendFile();
+    ok(bookBtn() && bookBtn().callback_data === 'bank:kudir', 'под разбором выписки есть кнопка книги',
+      JSON.stringify(bookBtn()));
+
+    // Режим не указан: книга спрашивает его — и выбор режима НЕ теряет выписку.
+    await tapK('bank:kudir');
+    ok(/режим/i.test(last()), 'без режима книга спрашивает режим', last().slice(0, 60));
+    await tapK('taxmode');
+    ok(lastKb().some((b) => b.callback_data === 'tax.set:psn'), 'предпринимателю патент предложен');
+    await tapK('tax.set:usn_income');
+    ok(lastKb().some((b) => b.callback_data === 'bank:kudir'),
+      'после выбора режима книгу можно собрать сразу, не присылая файл заново',
+      lastKb().map((b) => b.callback_data).join(' '));
+
+    let before = files.length;
+    await tapK('bank:kudir');
+    let books = files.slice(before);
+    ok(books.length === 2 && books.every((f) => /^Книга_учета_доходов_/.test(f.filename)),
+      'выписка через Новый год — две книги, по одной на год',
+      books.map((f) => f.filename).join(', ') || norm(last()).slice(0, 80));
+    const b26 = books.find((f) => f.filename.includes('_2026-'));
+    const b25 = books.find((f) => f.filename.includes('_2025-'));
+    ok(Boolean(b26 && b25), 'обе книги нашлись по году в имени', books.map((f) => f.filename).join(', '));
+    if (b26 && b25) {
+      const wb26 = await readBook(b26);
+      ok(yearTotal(wb26) === 20000,
+        'в книге 2026 года только январская выручка: свои деньги и возврат аванса — не доход',
+        yearTotal(wb26));
+      ok(wb26.worksheets[0].name === 'Не разнесено', 'возврат аванса ушёл в вопросы, а не в доход',
+        wb26.worksheets.map((w) => w.name).join(' | '));
+      const wb25 = await readBook(b25);
+      ok(yearTotal(wb25) === 10000, 'декабрьская оплата — в книге 2025 года', yearTotal(wb25));
+    }
+
+    // Занесли оплаты — книгу всё равно можно собрать из той же выписки.
+    await sendFile();
+    ok(lastKb().some((b) => b.callback_data === 'bank:take'), 'есть что занести');
+    await tapK('bank:take');
+    before = files.length;
+    await tapK('bank:kudir');
+    ok(files.length - before === 2, 'после «Занести» книга собирается', norm(last()).slice(0, 80));
+
+    // Всё уже занесено: выписку присылают второй раз ровно ради книги.
+    const csvKnown = csvK.split('\n').slice(0, 3).join('\n');
+    tg.downloadFile = async () => Buffer.from(csvKnown, 'utf8');
+    await sendFile();
+    ok(norm(last()).includes('Новых поступлений нет') && bookBtn() && bookBtn().callback_data === 'bank:kudir',
+      'уже занесённая выписка тоже даёт кнопку книги', lastKb().map((b) => b.text).join(' | '));
+    before = files.length;
+    await tapK('bank:kudir');
+    ok(files.length - before === 2, 'и книга собирается', norm(last()).slice(0, 80));
+    tg.downloadFile = async () => Buffer.from(csvK, 'utf8');
+
+    // Ассистент больше не отказывается: «собери КУДиР» — это работа.
+    before = files.length;
+    await sayK('собери КУДиР');
+    ok(files.length - before === 2,
+      'на «собери КУДиР» ассистент собирает книгу, а не отказывает', norm(last()).slice(0, 80));
+    ok(!/не веду/.test(last()), 'и слов «КУДиР я не веду» больше нет');
+
+    // Режим можно сменить из настроек, а не только из отказа.
+    await tapK('org');
+    ok(lastKb().some((b) => b.callback_data === 'taxmode'), 'в настройках организации есть режим налогов',
+      lastKb().map((b) => b.text).join(' | '));
+
+    /*
+     * Выписка из Сбера приходит Excel-файлом «Выписка_по_счёту_№_….xlsx».
+     * Бот знал только .txt, .csv и .ofx и такой файл молча пропускал —
+     * человек присылал выписку с подписью «собрать книгу» и ждал ответа.
+     */
+    const xw = new ExcelJS.Workbook();
+    const xs = xw.addWorksheet('Выписка');
+    xs.addRow(['Дата проводки', 'Счет', '', 'Сумма по дебету', 'Сумма по кредиту', '№ документа', 'Назначение платежа']);
+    xs.addRow(['', 'Дебет', 'Кредит', '', '', '', '']);
+    xs.addRow([new Date(Date.UTC(2026, 1, 3)), '40702810900000012345\n7701234560\nООО "Ветер"',
+      '40802810900000000077\n183112345670\nИП Книгин', null, 15000, '31', 'Оплата по счету 7']);
+    const xlsxBuf = Buffer.from(await xw.xlsx.writeBuffer());
+    tg.downloadFile = async () => xlsxBuf;
+    const sentBefore = sent.length;
+    await handleUpdate(tg, { message: { chat, from: who,
+      document: { file_id: 'k-x', file_name: 'Выписка_по_счёту_№_40802_810_9_0000_0000077.xlsx', file_size: xlsxBuf.length } } });
+    ok(sent.length > sentBefore && /Выписка Excel/.test(last()) && bookBtn() && bookBtn().callback_data === 'bank:kudir',
+      'Excel-выписка разобрана, под ней кнопка книги', norm(last()).slice(0, 80));
+    before = files.length;
+    await tapK('bank:kudir');
+    ok(files.length - before === 1, 'и книга из неё собирается', norm(last()).slice(0, 80));
+
+    // Связь оборвалась при скачивании — ответ человеку, а не падение.
+    tg.downloadFile = async () => { throw new TypeError('fetch failed'); };
+    let crashed = null;
+    const beforeDl = sent.length;
+    try {
+      await handleUpdate(tg, { message: { chat, from: who,
+        document: { file_id: 'k-e', file_name: 'vypiska.xlsx', file_size: 100 } } });
+    } catch (e) { crashed = e; }
+    ok(!crashed && sent.length > beforeDl && /Не смог забрать файл/.test(last()),
+      'выписка не скачалась — бот говорит об этом, а не падает', crashed ? crashed.message : norm(last()).slice(0, 60));
+
+    // PDF и прочие файлы — ответ, а не тишина.
+    tg.downloadFile = async () => Buffer.from('%PDF-1.7');
+    const beforePdf = sent.length;
+    await handleUpdate(tg, { message: { chat, from: who,
+      document: { file_id: 'k-p', file_name: 'Выписка_по_счёту.pdf', mime_type: 'application/pdf', file_size: 8 } } });
+    ok(sent.length > beforePdf && /PDF/.test(last()) && /1С/.test(last()),
+      'на PDF-выписку бот отвечает, в каком виде её прислать', norm(last()).slice(0, 80));
+    const beforeDoc = sent.length;
+    await handleUpdate(tg, { message: { chat, from: who,
+      document: { file_id: 'k-d', file_name: 'договор.docx', file_size: 100 } } });
+    ok(sent.length > beforeDoc, 'на любой другой файл тоже есть ответ', norm(last()).slice(0, 60));
+    tg.downloadFile = keepDl;
+  }
+
+  console.log('\n── выписка закрывает счета ──');
+  {
+    /*
+     * Занести оплату в журнал — половина дела: документы после этого всё
+     * равно висят в «не оплачено», и человек шёл отмечать их по одному.
+     * Бот говорит вслух то, что следует из сумм, и предлагает отметить всё
+     * разом — но отмечает по-прежнему человек.
+     */
+    const bdbC = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const u = bdbC.getOrCreateUser(661100, 'Сверка').id;
+    const orgC = bdbC.createOrg(u, { name: 'ИП Сверка', inn: '183209316100' });
+    bdbC.updateOrg(u, orgC, { debt_basis: 'closing' });
+    const zarya = bdbC.createCp(u, { name: 'ООО «Заря С»', kind: 'customer', opening_date: '2026-01-01' });
+    const tihiy = bdbC.createCp(u, { name: 'ООО «Тихий С»', kind: 'customer', opening_date: '2026-01-01' });
+
+    // Заря: счёт и закрывающий акт на 30 000 — одна сделка; плюс акт на 12 500.
+    await docSvc.issueDocument(u, { type: 'sch', cpId: zarya, date: '2026-08-01', items: [{ name: 'Работа', qty: 1, price: 30000 }], skipQuota: true });
+    await docSvc.issueDocument(u, { type: 'usl', cpId: zarya, date: '2026-08-05', items: [{ name: 'Работа', qty: 1, price: 30000 }], skipQuota: true });
+    await docSvc.issueDocument(u, { type: 'usl', cpId: zarya, date: '2026-08-10', items: [{ name: 'Ещё', qty: 1, price: 12500 }], skipQuota: true });
+    // Тихий: акт на 50 000, а придёт только 20 000.
+    await docSvc.issueDocument(u, { type: 'usl', cpId: tihiy, date: '2026-08-02', items: [{ name: 'Аренда', qty: 1, price: 50000 }], skipQuota: true });
+
+    const rows = [
+      { key: 'c1', cpId: zarya, amount: 30000, date: '2026-08-20', doc: 'п/п 1' },
+      { key: 'c2', cpId: tihiy, amount: 20000, date: '2026-08-21', doc: 'п/п 2' },
+    ];
+    const imported = bdbC.importBankRows(u, rows);
+    ok(imported.added === 2 && imported.addedRows.length === 2,
+      'выписка занесена и вернула, что именно легло', `${imported.added} / ${imported.addedRows.length}`);
+
+    const m = bdbC.matchPaymentsToDocs(u, imported.addedRows);
+    ok(m.deals.length === 1, 'закрыть предложено одну сделку, а не три документа',
+      m.deals.map((d) => d.title).join(', '));
+    ok(m.deals[0].twinId > 0 && m.deals[0].alsoTitle.includes('Счёт'),
+      'счёт и закрывающий его акт закрываются вместе', m.deals[0].alsoTitle);
+    /*
+     * Частичная оплата не закрывает счёт. Пометка «оплачен» означала бы, что
+     * пришли все деньги; сумму пришлось бы дописать в журнал — то есть
+     * выдумать платёж, которого не было.
+     */
+    ok(m.leftovers.some((l) => l.cpId === tihiy && l.amount === 20000),
+      '20 000 из 50 000 названы остатком, а счёт не закрыт',
+      JSON.stringify(m.leftovers));
+
+    const was = bdbC.balanceOf(u, zarya).closing;
+    const done = bdbC.closeDocsFromBank(u, m.deals);
+    ok(done.deals === 1 && done.docs === 2, 'закрыто два документа одной сделки',
+      `${done.deals} / ${done.docs}`);
+    /*
+     * Деньги уже были в журнале строкой выписки. Здесь они не добавляются, а
+     * переставляются на документ — сальдо обязано остаться прежним.
+     */
+    ok(bdbC.balanceOf(u, zarya).closing === was,
+      'сальдо от отметки не поехало — оплату не задвоили',
+      `${was} → ${bdbC.balanceOf(u, zarya).closing}`);
+    ok(bdbC.balanceOf(u, zarya).closing === 12500,
+      'у Зари остался только неоплаченный акт', bdbC.balanceOf(u, zarya).closing);
+    const opsZ = bdbC.listOps(u, zarya).filter((o) => o.kind === 'Оплата');
+    ok(opsZ.length === 1 && opsZ[0].doc === 'п/п 1',
+      'номер платёжки сохранён — иначе при сверке не найти, чем закрыт счёт',
+      opsZ.map((o) => o.doc).join(', '));
+
+    /*
+     * Пересчёт долга видит документ с отметкой и без проводки — и создаёт
+     * вторую. Проводка привязана к документу как раз для того, чтобы этого
+     * не случилось.
+     */
+    bdbC.updateOrg(u, orgC, { debt_basis: 'invoice' });
+    bdbC.updateOrg(u, orgC, { debt_basis: 'closing' });
+    ok(bdbC.balanceOf(u, zarya).closing === 12500,
+      'смена основания туда-обратно оплату не задвоила', bdbC.balanceOf(u, zarya).closing);
+
+    // Отмена возвращает всё: и долг, и возможность загрузить выписку заново.
+    bdbC.deleteOp(u, opsZ[0].id);
+    ok(bdbC.balanceOf(u, zarya).closing === 42500,
+      'отмена оплаты вернула долг', bdbC.balanceOf(u, zarya).closing);
+    ok(bdbC.unpaidDocs(u).filter((d) => d.cp_id === zarya).length === 3,
+      'и оба документа сделки снова в «не оплачено»');
+    ok(bdbC.importBankRows(u, [rows[0]]).added === 1,
+      'ту же строку выписки после отмены можно загрузить снова');
+
+    // Повторный вызов ничего не портит: документ уже отмечен.
+    const twice = bdbC.closeDocsFromBank(u, m.deals);
+    ok(twice.deals <= 1, 'повторное нажатие не закрывает второй раз', twice.deals);
+  }
+
+  console.log('\n── повторяющаяся операция журнала ──');
+  {
+    /*
+     * Взаимозачёт, списание задолженности частями, фиксированное начисление —
+     * всё это двигает сальдо, но в банковской выписке не появляется никогда:
+     * денег-то не было. Значит, человек обязан помнить об этом сам — и
+     * однажды забудет.
+     *
+     * Здесь бот вносит строку сам, в отличие от документов. Разница
+     * намеренная: документ забирает номер в сквозном ряду и уходит
+     * контрагенту, а строка журнала внутренняя и отменяется бесследно.
+     */
+    const rec = require('./lib/recurring');
+    const bdbR = require('./lib/bot-db');
+    const { runDaily } = require('./bot.js');
+    const uid = fxUserId();
+    for (const r of rec.list(uid)) rec.off(uid, r.id);
+    const cpF = bdbR.createCp(uid, { name: 'ООО «Фабрика»', kind: 'supplier', opening_date: '2026-01-01' });
+    bdbR.addOp(uid, cpF, { date: '2026-01-01', kind: 'Приход', doc: 'Товар', credit: 138400 });
+    const startBal = bdbR.balanceOf(uid, cpF).closing;
+
+    sent.length = 0;
+    await tap(`ro.new:${cpF}`);
+    ok(norm(last()).includes('Что повторять'), 'спросил тип операции', norm(last()).slice(0, 60));
+    await tap(`ro.kind:${cpF}:pay`);
+    ok(norm(last()).includes('Какая сумма'), 'спросил сумму');
+    await say('27 680');
+    ok(norm(last()).includes('27 680,00'), 'сумму разобрал с пробелом в разрядах', norm(last()).slice(0, 60));
+    await say('Зачёт встречных требований по акту № 1 от 01.07.2026');
+    ok(norm(last()).includes('Какого числа'), 'спросил число');
+    await tap(`ro.day:${cpF}:1`);
+    ok(norm(last()).includes('Сколько раз'), 'спросил, сколько раз — правило должно кончиться');
+    await tap(`ro.times:${cpF}:5`);
+    ok(norm(last()).includes('акт сверки на почту'), 'спросил про почту себе');
+    await tap(`ro.save:${cpF}:0`);
+    ok(norm(last()).includes('Готово'), 'правило заведено', norm(last()).slice(0, 50));
+
+    const rule = rec.list(uid).find((r) => r.cp_id === cpF && rec.isOp(r));
+    ok(Boolean(rule), 'правило легло в повторения');
+    ok(rule.op.amount === 27680 && rule.op.kind === 'Оплата' && rule.op.times === 5,
+      'сумма, тип и счётчик сохранены', JSON.stringify(rule.op));
+    ok(rule.op.note.includes('Зачёт встречных требований'),
+      'подпись сохранена — она попадёт в акт сверки', rule.op.note);
+    ok(bdbR.balanceOf(uid, cpF).closing === startBal,
+      'настройка сама по себе ничего не внесла в журнал');
+
+    // Наступил день.
+    const { db: rawO } = require('./db');
+    rawO.prepare("UPDATE recurring SET last_offer = '2000-01', day = ? WHERE id = ?")
+      .run(new Date().getDate(), rule.id);
+    sent.length = 0;
+    await runDaily(tg);
+    const msg = norm(sent.map((m) => m.text || '').join('\n'));
+    ok(msg.includes('Внёс по вашему правилу'), 'бот внёс операцию и сказал об этом', msg.slice(0, 70));
+    ok(msg.includes('1 из 5'), 'и показал счётчик', msg.slice(0, 90));
+    const ops = bdbR.listOps(uid, cpF).filter((o) => o.kind === 'Оплата');
+    ok(ops.length === 1 && ops[0].debit === 27680, 'строка легла в журнал', JSON.stringify(ops.map((o) => o.debit)));
+    ok(ops[0].doc.includes('Зачёт встречных требований'),
+      'в журнале стоит подпись, а не «оплата»', ops[0].doc);
+
+    // Отмена возвращает и строку, и счётчик.
+    const undo = ((sent[sent.length - 1] || {}).kb || []).flat().find((b) => /Отменить/.test(b.text));
+    ok(Boolean(undo && undo.callback_data), 'рядом есть кнопка отмены');
+    await tap(undo.callback_data);
+    ok(bdbR.balanceOf(uid, cpF).closing === startBal, 'отмена вернула сальдо',
+      bdbR.balanceOf(uid, cpF).closing);
+    ok(rec.get(uid, rule.id).op.done === 0, 'и счётчик вернулся назад',
+      rec.get(uid, rule.id).op.done);
+
+    /*
+     * Дважды в один месяц операция не вносится: сальдо человек показывает
+     * контрагенту, и лишняя строка обнаружится на сверке, а не сразу.
+     */
+    sent.length = 0;
+    await runDaily(tg);
+    const before = bdbR.listOps(uid, cpF).length;
+    await runDaily(tg);
+    ok(bdbR.listOps(uid, cpF).length === before, 'второй обход в тот же месяц ничего не добавил',
+      `${before} → ${bdbR.listOps(uid, cpF).length}`);
+
+    // Правило выключается само, когда счётчик кончился.
+    for (let i = 0; i < 6; i += 1) {
+      rawO.prepare("UPDATE recurring SET last_offer = '2000-01' WHERE id = ?").run(rule.id);
+      // eslint-disable-next-line no-await-in-loop
+      await runDaily(tg);
+    }
+    const after = rec.get(uid, rule.id);
+    ok(after === null || after.active === 0, 'после пятого раза правило выключилось само');
+    const total = bdbR.listOps(uid, cpF).filter((o) => o.kind === 'Оплата').length;
+    ok(total === 5, 'ровно пять списаний, а не шесть и не бесконечно', total);
+    ok(Math.abs(bdbR.balanceOf(uid, cpF).closing - (startBal - 27680 * 5)) < 0.01,
+      'долг погашен ровно на пять частей', bdbR.balanceOf(uid, cpF).closing);
+
+    // Второе такое же правило по тому же клиенту не заводится.
+    /*
+     * Вторая половина прежней проверки («правил не больше одного») была
+     * истинна всегда: нажатие ro.new только открывает диалог, правило
+     * заводится в конце. Проверяем то, что бот действительно решает: есть
+     * правило по клиенту — отказ, нет — начало диалога.
+     */
+    const hasRule = rec.list(uid).some((r) => r.cp_id === cpF && rec.isOp(r));
+    await tap(`ro.new:${cpF}`);
+    ok(hasRule ? norm(last()).includes('уже настроено') : norm(last()).includes('Повторять операцию'),
+      'второе правило по тому же клиенту не заводится, пока есть первое', norm(last()).slice(0, 50));
+  }
+
+  console.log('\n── тот же путь кнопками в чате ──');
+  {
+    /*
+     * Главное здесь — что бот ничего не закрыл сам. После разбора выписки
+     * документы обязаны остаться в «не оплачено» до тех пор, пока человек не
+     * нажмёт кнопку: закрытый по ошибке долг обнаруживают через месяц, когда
+     * клиент не платит, а счёт уже помечен оплаченным.
+     */
+    const bdbD = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = fxUserId();
+    const org = bdbD.getDefaultOrg(uid);
+    const was = bdbD.basisOf(org);
+    bdbD.updateOrg(uid, org.id, { debt_basis: 'closing' });
+    const cpD = bdbD.createCp(uid, {
+      name: 'ООО «Платёж»', inn: '7712345678', kind: 'customer', opening_date: '2026-01-01',
+    });
+    await docSvc.issueDocument(uid, {
+      type: 'usl', cpId: cpD, date: '2026-08-03',
+      items: [{ name: 'Работа', qty: 1, price: 44000 }], skipQuota: true });
+
+    const csv = [
+      'Дата;ИНН плательщика;Плательщик;Приход;Назначение платежа',
+      '25.08.2026;7712345678;ООО "Платёж";44 000,00;Оплата по счёту',
+    ].join('\n');
+    tg.downloadFile = async () => Buffer.from(csv, 'utf8');
+    await handleUpdate(tg, {
+      message: { chat: CHAT, from: USER, document: { file_id: 'st-9', file_name: 'v.csv', file_size: csv.length } },
+    });
+    ok(bdbD.unpaidDocs(uid).some((d) => d.cp_id === cpD),
+      'после разбора документ ещё не оплачен — бот сам ничего не закрыл');
+
+    sent.length = 0;
+    await tap('bank:take');
+    const offer = norm(sent.map((m) => m.text || '').join('\n'));
+    ok(offer.includes('Эти документы закрыты'), 'бот предложил закрыть счета', offer.slice(0, 90));
+    ok(offer.includes('44 000,00'), 'и назвал сумму', offer.slice(-70));
+    ok(bdbD.unpaidDocs(uid).some((d) => d.cp_id === cpD),
+      'но до нажатия документ по-прежнему не оплачен');
+    const btns = ((sent[sent.length - 1] || {}).kb || []).flat().map((b) => b.text).join(' | ');
+    ok(btns.includes('Отметить оплаченными'), 'есть кнопка подтверждения', btns);
+    ok(btns.includes('Не надо'), 'и отказаться можно, не выходя из разговора', btns);
+
+    await tap('bank:paid');
+    ok(last().includes('Отметил оплаченными'), 'по нажатию отметил', last().slice(0, 60));
+    ok(!bdbD.unpaidDocs(uid).some((d) => d.cp_id === cpD),
+      'документ ушёл из «не оплачено»');
+    ok(bdbD.balanceOf(uid, cpD).closing === 0, 'и долг закрылся ровно',
+      bdbD.balanceOf(uid, cpD).closing);
+
+    // Кнопку можно нажать второй раз — список к тому времени уже снят.
+    await tap('bank:paid');
+    ok(last().includes('уже не в работе'), 'второе нажатие ничего не портит', last().slice(0, 60));
+    bdbD.updateOrg(uid, org.id, { debt_basis: was });
+  }
+
+  console.log('\n── штампы «Оплачено» и «Копия» ──');
+  {
+    /*
+     * Штамп — это утверждение о деньгах, напечатанное на бумаге, которая
+     * уходит контрагенту. Поэтому проверяем не столько вёрстку, сколько
+     * запрет: галочка в приложении не должна уметь напечатать «Оплачено»
+     * на документе, оплата которого в журнале не отмечена.
+     */
+    const bdbS = require('./lib/bot-db');
+    const docSvc = require('./lib/doc-service');
+    const uid = bdbS.getOrCreateUser(556699, 'Штампы').id;
+    bdbS.createOrg(uid, { name: 'ИП Штамп', inn: '183209316101', signer: 'Штампов Ш.Ш.' });
+    const cpS = bdbS.createCp(uid, { name: 'ООО «Оттиск»', kind: 'customer', opening_date: '2026-01-01' });
+    const res = await docSvc.issueDocument(uid, {
+      type: 'sch', cpId: cpS, date: '2026-08-01',
+      items: [{ name: 'Работа', qty: 1, price: 1000 }], skipQuota: true,
+    });
+    const docId = res.doc.id;
+
+    ok(docSvc.stampFor({ paid_at: '' }, { paid: true }) === null,
+      'на неоплаченном документе штампа «Оплачено» не будет');
+    ok(docSvc.stampFor({ paid_at: '' }, { copy: true }).copy === true,
+      '«Копия» ставится и на неоплаченном — это не про деньги');
+    ok(docSvc.stampFor({ paid_at: '2026-08-20' }, { paid: true }).paidAt === '2026-08-20',
+      'дата в штампе берётся из журнала, а не из запроса');
+    ok(docSvc.stampFor({ paid_at: '2026-08-20' }, null) === null,
+      'без запроса штампов нет даже у оплаченного');
+
+    const plain = await docSvc.rebuildDocument(uid, docId);
+    ok(plain.ok && plain.stamp === null, 'обычная копия собирается без штампов');
+
+    const faked = await docSvc.rebuildDocument(uid, docId, { stamp: { paid: true } });
+    const fakedHtml = faked.file.pdf ? '' : faked.file.buffer.toString('utf8');
+    ok(faked.ok && faked.stamp === null,
+      'просьба проштамповать неоплаченный счёт молча отклонена');
+    /*
+     * Ищем разметку штампа, а не слово «ОПЛАЧЕНО».
+     *
+     * Слово встречается в комментарии внутри CSS, а стиль вшит в каждый
+     * документ — так что поиск по слову находил комментарий и объявлял штамп
+     * там, где его нет. Вылезало это только без Chromium, когда документ
+     * уходит HTML: в PDF текста стилей нет, и проверка молчала.
+     */
+    /*
+     * Проверка шла только без Chromium (когда файл — HTML), а с ним молча
+     * пропускалась. Берём разметку всегда: пересборка с forView отдаёт тот
+     * же шаблон, а штамп вклеивается до выбора формата.
+     */
+    const fakedMarkup = fakedHtml || require('./lib/doc-html').withStamps('<div class="doc">x</div>', faked.stamp);
+    ok(!fakedMarkup.includes('<div class="stamps">'), 'и штампа в файле нет');
+    ok(!fakedMarkup.includes('class="doc has-stamps"'), 'и места под него не отведено');
+
+    bdbS.markPaid(uid, docId, '2026-08-20');
+    const stamped = await docSvc.rebuildDocument(uid, docId, { stamp: { paid: true, copy: true } });
+    ok(stamped.stamp.paid && stamped.stamp.copy && stamped.stamp.paidAt === '2026-08-20',
+      'после отметки оплаты оба штампа разрешены');
+
+    // Разметку проверяем на самом шаблоне: PDF читать нечем, а вклейка
+    // штампа от типа файла не зависит.
+    const { withStamps } = require('./lib/doc-html');
+    const { buildSchetHtml } = require('./lib/schet');
+    const html = buildSchetHtml({
+      org: { name: 'ИП Штамп', inn: '183209316101', signer: 'Штампов Ш.Ш.' },
+      cp: { name: 'ООО «Оттиск»' },
+      doc: { number: '1', date: '2026-08-01', items: [{ name: 'Работа', qty: 1, price: 1000 }] },
+    });
+    const marked = withStamps(html, { paid: true, copy: true, paidAt: '2026-08-20' });
+    ok(marked.includes('ОПЛАЧЕНО'), 'штамп «Оплачено» попал в бланк');
+    ok(marked.includes('20.08.2026'), 'и дата в нём человеческая, а не ISO');
+    ok(marked.includes('КОПИЯ'), 'штамп «Копия» тоже');
+    ok(marked.includes('class="doc has-stamps"'),
+      'под штампы отведено место внизу листа — иначе они лягут на факсимиле');
+    ok(withStamps(html, null) === html, 'без штампов бланк не трогаем вовсе');
+  }
+
+  console.log('\n── самозанятость: напоминание про чек ──');
+  {
+    /*
+     * Самозанятому счёт и акт доход не закрывают — его закрывает чек из
+     * «Моего налога» (ФЗ № 422-ФЗ, ст. 14). Забывают об этом на безналичной
+     * оплате: деньги пришли молча, документ выписан, всё выглядит готовым.
+     * Проверяем, что напоминание приходит ровно в момент отметки оплаты и
+     * не приходит тем, кто НПД не применяет.
+     */
+    const bdbN = require('./lib/bot-db');
+    const npdLib = require('./lib/npd');
+
+    ok(npdLib.chequeDue('2026-08-20') === '2026-09-09',
+      'срок чека по переводу — 9-е число следующего месяца', npdLib.chequeDue('2026-08-20'));
+    ok(npdLib.chequeDue('2026-12-31') === '2027-01-09',
+      'декабрь переносит срок на январь следующего года', npdLib.chequeDue('2026-12-31'));
+    ok(npdLib.chequeReminder({ npd: 0 }, { paidAt: '2026-08-20' }) === null,
+      'не применяющему НПД про чек не напоминаем');
+
+    const uid = fxUserId();
+    const org = bdbN.getDefaultOrg(uid);
+    const cpN = bdbN.createCp(uid, { name: 'ООО «Чек»', kind: 'customer', opening_date: '2026-01-01' });
+    const made = await require('./lib/doc-service').issueDocument(uid, {
+      type: 'sch', cpId: cpN, date: '2026-08-01',
+      items: [{ name: 'Работа', qty: 1, price: 5000 }], skipQuota: true,
+    });
+
+    sent.length = 0;
+    await tap(`doc.paid:${made.doc.id}`);
+    ok(!norm(sent.map((m) => m.text || '').join(' ')).includes('Мой налог'),
+      'без галочки про чек молчим');
+
+    bdbN.updateOrg(uid, org.id, { npd: 1 });
+    bdbN.unmarkPaid(uid, made.doc.id);
+    sent.length = 0;
+    await tap(`doc.paid:${made.doc.id}`);
+    const said = norm(sent.map((m) => m.text || '').join(' '));
+    ok(said.includes('Пробейте чек в «Мой налог» на 5 000 ₽ для ООО «Чек»'),
+      'с галочкой — напомнил про чек: сумма и клиент названы', said.slice(0, 120));
+    ok(said.includes('Наименование: Работа') && said.includes('Покупатель: физическое лицо'),
+      'и дал данные для чека: наименование и тип покупателя');
+    /*
+     * Срок считается от настоящей даты отметки об оплате, поэтому зашивать
+     * сюда конкретное число нельзя: раньше здесь стояло «09.09.2026», и
+     * проверка проходила только в августе. Саму арифметику — что это 9-е
+     * число следующего месяца, с переходом через декабрь — проверяют
+     * отдельные вызовы chequeDue выше, на неподвижных датах.
+     */
+    const dueIso = npdLib.chequeDue(require('./lib/period').todayISO());
+    const chequesLib = require('./lib/cheques');
+    const chqRow = chequesLib.forDoc(uid, made.doc.id);
+    ok(chqRow && chqRow.status === 'open' && chqRow.amount === 5000 && chqRow.due === dueIso,
+      'ожидание чека записано: открыто, 5 000 ₽, срок — 9-е следующего месяца', JSON.stringify(chqRow));
+    ok(buttonSince(0, 'Чек пробил') === `chq.ok:${chqRow.id}` && buttonSince(0, 'Позже') === `chq.later:${chqRow.id}`,
+      'кнопки «Чек пробил» и «Позже» под напоминанием');
+    const dueRu = `${dueIso.slice(8)}.${dueIso.slice(5, 7)}.${dueIso.slice(0, 4)}`;
+    ok(said.includes(dueRu), 'и назвал срок — 9-е число следующего месяца', said.slice(-120));
+    const btns = sent.flatMap((m) => (m.kb || []).flat());
+    ok(btns.some((b) => b.url === 'https://lknpd.nalog.ru/'),
+      'кнопка открывает «Мой налог», а не выдуманную схему',
+      JSON.stringify(btns.map((b) => b.url || b.data)));
+
+    // Галочку надо уметь снять — иначе включивший её по ошибке получает
+    // напоминание после каждой оплаты и выключить не может.
+    sent.length = 0;
+    await tap('npd.set:0');
+    ok(!Number(bdbN.getDefaultOrg(uid).npd), 'галочку можно снять');
+    ok(norm(last()).includes('не применяю'), 'и экран говорит текущее состояние', norm(last()).slice(0, 80));
+  }
+
+  console.log('\n── самозанятость: учёт чеков ──');
+  {
+    /*
+     * Напоминание, которое уехало вверх по чату, ничего не гарантирует, а срок
+     * по закону жёсткий. Поэтому «ждёт чека» живёт в базе, пока человек не
+     * отметил его, и всплывает в утренней сводке, в карточке документа и в
+     * приложении. Чек сам не пробивается и в «Мой налог» мы не ходим.
+     */
+    const bdbN = require('./lib/bot-db');
+    const chq = require('./lib/cheques');
+    const digestN = require('./lib/digest');
+    const uid = fxUserId();
+    const org = bdbN.getDefaultOrg(uid);
+    bdbN.updateOrg(uid, org.id, { npd: 1 });
+    for (const c of chq.open(uid)) chq.markDone(uid, c.id);   // чистый счёт: считаем только свои
+    const cpIp = bdbN.createCp(uid, { name: 'ИП Покупатель', inn: '770123456789', kind: 'customer', opening_date: '2026-01-01' });
+    const cpOrg = bdbN.createCp(uid, { name: 'ООО «Покупатель»', inn: '7707083893', kind: 'customer', opening_date: '2026-01-01' });
+    const mk = (cp, items, date = '2026-09-01') => require('./lib/doc-service').issueDocument(uid, {
+      type: 'sch', cpId: cp, date, items, skipQuota: true,
+    });
+    const d1 = await mk(cpOrg, [{ name: 'Уборка помещения', qty: 1, price: 12000 }]);
+    const d2 = await mk(cpIp, [{ name: 'Консультация', qty: 1, price: 3000 }, { name: 'Выезд', qty: 1, price: 500 }]);
+
+    // Чеков до оплаты нет: чек нужен на поступление, а не на выставленный счёт.
+    ok(chq.forDoc(uid, d1.doc.id) === null, 'пока оплаты нет, ждать чека не от чего');
+
+    sent.length = 0;
+    await tap(`doc.paid:${d1.doc.id}`);
+    const said = norm(sent.map((m) => m.text || '').join(' '));
+    ok(said.includes('Покупатель: организация, ИНН 7707083893') && said.includes('Название покупателя: ООО «Покупатель»'),
+      'у организации в данных для чека — ИНН и название', said.slice(-260));
+    ok(said.includes('Наименование: Уборка помещения'), 'одна позиция — её название идёт в чек как есть');
+    const c1 = chq.forDoc(uid, d1.doc.id);
+
+    // Второе «Оплатил» на том же документе чек не задваивает.
+    await tap(`doc.unpaid:${d1.doc.id}`);
+    ok(chq.forDoc(uid, d1.doc.id) === null, 'сняли отметку оплаты — ждать чека больше не от чего');
+    await tap(`doc.paid:${d1.doc.id}`);
+    await tap(`doc.paid:${d1.doc.id}`);
+    ok(chq.open(uid).filter((c) => c.doc_id === d1.doc.id).length === 1, 'повторное «Оплатил» второй чек не заводит');
+    const c1b = chq.forDoc(uid, d1.doc.id);
+
+    sent.length = 0;
+    await tap(`doc.paid:${d2.doc.id}`);
+    const said2 = norm(sent.map((m) => m.text || '').join(' '));
+    ok(said2.includes('Покупатель: ИП, ИНН 770123456789') && said2.includes('Консультация и др. по документу'),
+      'у ИП тип покупателя назван, а несколько позиций сведены в одно наименование', said2.slice(-300));
+
+    // «Позже» ничего не закрывает.
+    sent.length = 0;
+    await tap(`chq.later:${c1b.id}`);
+    ok(chq.get(uid, c1b.id).status === 'open' && norm(last()).includes('утренней сводке'),
+      '«Позже»: чек остаётся открытым, бот обещает сводку');
+    ok(chq.openCount(uid) === 2, 'непробитых чеков два');
+
+    // Утренняя сводка: строка про чеки, даже когда должников нет.
+    const dg = digestN.build(uid, { force: true });
+    ok(dg && norm(dg.text).includes('Чеки не пробиты: 2'), 'в утренней сводке — «Чеки не пробиты: 2»', dg && dg.text.slice(0, 120));
+    ok(dg.rows.flat().some((b) => b.data === 'chq.list'), 'и кнопка к списку чеков');
+
+    // Список чеков.
+    sent.length = 0;
+    await tap('chq.list');
+    ok(norm(last()).includes('Чеки не пробиты: 2'), 'список чеков показывает счётчик');
+    ok(sent[sent.length - 1].kb.flat().some((b) => b.callback_data === `chq.show:${c1b.id}`), 'в списке — строка каждого чека');
+
+    // «Чек пробил» без ссылки, затем ссылка.
+    sent.length = 0;
+    await tap(`chq.ok:${c1b.id}`);
+    ok(chq.get(uid, c1b.id).status === 'done' && norm(last()).replace(/<[^>]+>/g, '').includes('Ещё не пробито: 1'),
+      '«Чек пробил»: отмечено, осталось ещё один');
+    ok(button('Приложить ссылку') === `chq.link:${c1b.id}`, 'после отметки предложено приложить ссылку');
+    await tap(`chq.link:${c1b.id}`);
+    await say('http://evil.example/receipt/1');
+    ok(chq.get(uid, c1b.id).link === '' && norm(last()).includes('не похоже на ссылку'),
+      'чужая ссылка не принимается, бот объясняет почему');
+    const url = 'https://lknpd.nalog.ru/api/v1/receipt/770123456789/203bg8kzx9/print';
+    await say(`вот: ${url}.`);
+    const got = chq.get(uid, c1b.id);
+    ok(got.link === url && got.number === '203bg8kzx9', 'ссылка из «Мой налог» принята, номер чека выделен', JSON.stringify(got));
+    ok(!bdbN.getState(uid).state, 'ожидание ссылки снято');
+
+    // Карточка документа показывает пробитый чек и ссылку.
+    sent.length = 0;
+    await tap(`doc:${d1.doc.id}`);
+    const card = norm(sent.map((m) => m.text || '').join(' ')).replace(/<[^>]+>/g, '');
+    ok(card.includes('Чек «Мой налог»: пробит') && card.includes(url), 'в карточке документа — чек пробит и ссылка', card.slice(0, 200));
+
+    // Пробитый чек оплата не стирает, непробитый — снимает.
+    bdbN.unmarkPaid(uid, d1.doc.id);
+    ok(chq.forDoc(uid, d1.doc.id) !== null, 'снятая оплата не стирает уже пробитый чек');
+    bdbN.unmarkPaid(uid, d2.doc.id);
+    ok(chq.forDoc(uid, d2.doc.id) === null && chq.openCount(uid) === 0, 'а у непробитого — снимает ожидание');
+    const dgNone = digestN.build(uid, { force: true });
+    ok(!dgNone || !norm(dgNone.text).includes('Чеки не пробиты'), 'нет непробитых чеков — строки про них в сводке нет');
+
+    // Выписка закрывает пачкой: чеки появляются по всем закрытым документам.
+    const d3 = await mk(cpOrg, [{ name: 'Окна', qty: 1, price: 7000 }], '2026-09-02');
+    const d4 = await mk(cpIp, [{ name: 'Двери', qty: 1, price: 9000 }], '2026-09-03');
+    const closed = bdbN.closeDocsFromBank(uid, [
+      { opId: 0, cpId: cpOrg, leadId: d3.doc.id, twinId: 0, total: 7000, date: '2026-09-05', doc: '' },
+      { opId: 0, cpId: cpIp, leadId: d4.doc.id, twinId: 0, total: 9000, date: '2026-09-05', doc: '' },
+    ]);
+    ok(closed.leads.length === 2, 'закрытие по выписке называет документы сделок', JSON.stringify(closed));
+    // Чек заводится сам, в момент появления проводки оплаты (а не отдельным вызовом после закрытия).
+    const made = chq.open(uid).filter((c) => closed.leads.includes(c.doc_id));
+    ok(made.length === 2 && made.every((c) => c.due === '2026-10-09'), 'по каждому — ожидание чека со сроком 09.10', JSON.stringify(made.map((c) => c.due)));
+    ok(chq.oweMany(uid, closed.leads, '2026-09-05').length === 0, 'повторная загрузка той же выписки чеков не плодит');
+    for (const c of chq.open(uid)) chq.markDone(uid, c.id);
+
+    // Документы самозанятого.
+    const docH = require('./lib/doc-html');
+    const orgNow = bdbN.getDefaultOrg(uid);
+    ok(docH.isSelfEmployed({ ...orgNow, name: 'Иванов Иван', full_name: '', ogrnip: '' }), 'гражданин на НПД — не ИП');
+    ok(!docH.isSelfEmployed({ ...orgNow, name: 'Иванов Иван', full_name: '', ogrnip: '318183200012345' }), 'а с ОГРНИП — ИП, как бы ни назвали');
+    ok(!docH.isSelfEmployed({ ...orgNow, name: 'ИП Петров' }), 'ИП на НПД остаётся ИП');
+    const selfOrg = { ...orgNow, name: 'Иванов Иван', full_name: 'Иванов Иван Иванович', signer: 'И. И. Иванов', inn: '770123456789', npd: 1, ogrnip: '' };
+    const rows = docH.signRows(selfOrg);
+    ok(rows.length === 1 && rows[0].title === 'Исполнитель', 'у самозанятого одна подпись «Исполнитель» — без руководителя и бухгалтера');
+    ok(docH.signRows({ ...selfOrg, name: 'ИП Иванов' })[0].title === 'Индивидуальный предприниматель', 'у ИП на НПД подпись прежняя');
+    const cpDoc = { name: 'ООО «Заказчик»', inn: '7707083893' };
+    const mkHtml = (b, o, extra = {}) => b({ org: o, cp: cpDoc, doc: { number: '1', date: '2026-09-01', items: [{ name: 'Работа', qty: 1, price: 1000 }], vatRate: null, ...extra } });
+    const plain = { ...selfOrg, npd: 0, name: 'ООО «Обычное»', inn: '7707083893' };
+    for (const [title, build] of [['счёт', require('./lib/schet').buildSchetHtml], ['акт', require('./lib/akt-uslug').buildAktUslugHtml],
+      ['счёт-договор', require('./lib/schet-dogovor').buildSchetDogovorHtml]]) {
+      ok(/Без НДС, применяется НПД/.test(mkHtml(build, selfOrg)), `${title} самозанятого: «Без НДС, применяется НПД»`);
+      ok(!/применяется НПД/.test(mkHtml(build, plain)), `${title} обычной фирмы без пометки про НПД`);
+    }
+    ok(!/Бухгалтер/.test(mkHtml(require('./lib/schet').buildSchetHtml, selfOrg)), 'в счёте самозанятого нет строки бухгалтера');
+    const dogS = require('./lib/schet-dogovor').buildSchetDogovorHtml;
+    ok(/в\s+суде по месту нахождения Исполнителя/.test(mkHtml(dogS, selfOrg)) && /арбитражном суде/.test(mkHtml(dogS, plain)),
+      'спор самозанятого подсуден обычному суду, а не арбитражному');
+
+    // УПД самозанятому не предлагается: ни в карточке клиента, ни в списке документов.
+    sent.length = 0;
+    await tap(`cp:${cpOrg}`);
+    ok(!button('УПД') && Boolean(button('ТОРГ-12')), 'в карточке клиента самозанятого нет УПД, ТОРГ-12 остаётся');
+    await tap('go.any');
+    ok(!button('УПД') && Boolean(button('ТОРГ-12')), 'в списке документов самозанятого нет УПД');
+    bdbN.updateOrg(uid, org.id, { npd: 0 });
+    await tap(`cp:${cpOrg}`);
+    ok(Boolean(button('УПД')), 'у остальных УПД на месте');
+  }
+
+  console.log('\n── фразы через Grok (xAI) ──');
+  {
+    /*
+     * Провайдер добавлен на случай, если xAI отвечает с нашего адреса — в
+     * отличие от Anthropic и OpenRouter, которые отвечают 403. Проверяем
+     * форму запроса подставным сервером: она у xAI как у OpenAI, но ключ и
+     * адрес свои.
+     *
+     * Отдельно проверяем требование имени модели. Умолчания у нас нет
+     * намеренно: набор моделей у xAI меняется, и угаданное имя дало бы 404
+     * в бою — там, где человек ждёт ответа бота, а не в прогоне.
+     */
+    const http = require('node:http');
+    let got = null; let hdr = null;
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c) => { b += c; });
+      req.on('end', () => {
+        got = JSON.parse(b); hdr = req.headers;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: {
+          content: '{"action":"draft","docType":"sch","who":"Заря"}',
+        } }] }));
+      });
+    });
+    await new Promise((r) => srv.listen(0, r));
+
+    const was = { p: process.env.AI_PROVIDER, k: process.env.XAI_API_KEY, m: process.env.AI_MODEL };
+    process.env.AI_ENABLED = '1';
+    process.env.AI_PROVIDER = 'grok';
+    process.env.XAI_API_KEY = 'xai-test';
+    delete process.env.AI_MODEL;
+
+    const aiG = require('./lib/ai-agent');
+    ok(!aiG.aiAvailable() && aiG.aiHint().includes('AI_MODEL'),
+      'без имени модели не работаем и говорим почему', aiG.aiHint());
+
+    process.env.AI_MODEL = 'grok-проверочный';
+    ok(aiG.aiAvailable(), 'с ключом и моделью — готов');
+
+    const realFetch = global.fetch;
+    global.fetch = (u, o) => realFetch(
+      String(u).replace('https://api.x.ai', `http://127.0.0.1:${srv.address().port}`), o,
+    );
+    const intent = await aiG.understand('Заре за аренду тридцать тысяч, как обычно', 4343);
+    ok(intent.action === 'draft' && intent.who === 'Заря', 'фраза разобрана', JSON.stringify(intent));
+    ok(got.model === 'grok-проверочный', 'модель взята из AI_MODEL', got.model);
+    ok(hdr.authorization === 'Bearer xai-test', 'ключ ушёл в Bearer', hdr.authorization);
+    ok(got.messages[0].role === 'system' && typeof got.messages[1].content === 'string',
+      'формат сообщений как у OpenAI: role + content');
+
+    global.fetch = realFetch;
+    srv.close();
+    for (const [k, v] of [['AI_PROVIDER', was.p], ['XAI_API_KEY', was.k], ['AI_MODEL', was.m]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+
+  console.log('\n── акт сверки: печатная форма ──');
+  {
+    /*
+     * У акта сверки два вида: таблица Excel — тому, кто будет считать, и
+     * печатная форма — тому, кто откроет ссылку. Расходиться в цифрах они
+     * не имеют права: спорить стороны будут по разным бумагам, и выяснится
+     * это в самый неудобный момент.
+     *
+     * Поэтому проверяем не вёрстку, а числа и главную фразу — в чью пользу
+     * долг. У поставщика знак обратный, и перепутать его значит написать в
+     * документе, что должны вам, когда должны вы.
+     */
+    const { buildAktHtml } = require('./lib/akt-html');
+    const base = {
+      org: { org_short: 'ИП Тест', org_full: 'ИП Тестов Тест', org_inn: '183209316101', signer: 'Т. Т.' },
+      ops: [
+        { date: '2026-02-14', doc: 'Счёт № 3', credit: 48500 },
+        { date: '2026-02-28', doc: 'Оплата', debit: 20000 },
+      ],
+    };
+    const cpBase = {
+      name: 'ООО «Заря»', full_name: 'ООО «Заря»', inn: '7712345678',
+      opening_balance: 12000, opening_date: '2026-01-01', period_end: '2026-08-28',
+    };
+
+    // 12 000 + 48 500 − 20 000 = 40 500
+    const h = buildAktHtml({ ...base, cp: { ...cpBase, kind: 'customer' } });
+    // norm: деньги печатаются с неразрывным пробелом, глазами не отличить.
+    const n = norm(h);
+    ok(n.includes('40 500,00'), 'сальдо конечное посчитано',
+      (n.match(/[\d ]+,\d\d/g) || []).join(' | ').slice(0, 60));
+    ok(n.includes('48 500,00') && n.includes('20 000,00'), 'обороты за период на месте');
+    ok(h.includes('Сорок тысяч пятьсот рублей 00 копеек'), 'сумма прописью',
+      (h.match(/\(([^)]*рубл[^)]*)\)/) || [])[1]);
+    ok(/задолженность в пользу\s*ИП Тестов Тест/.test(h.replace(/\s+/g, ' ')),
+      'у покупателя долг в нашу пользу');
+
+    // У поставщика тот же плюс означает обратное: должны мы.
+    const hs = buildAktHtml({ ...base, cp: { ...cpBase, kind: 'supplier' } });
+    ok(/задолженность в пользу\s*ООО «Заря»/.test(hs.replace(/\s+/g, ' ')),
+      'у поставщика — в пользу контрагента');
+
+    // Строка сальдо не должна потеряться из-за чередования строк: белый
+    // текст на белом фоне уже случался, и заметить это можно только глазами.
+    ok(/tbody tr\.close td \{[^}]*background: #2e3a8c/.test(h),
+      'у строки сальдо селектор сильнее правила чередования');
+
+    // Ноль в графе — это операция на нулевую сумму, которой не было.
+    ok(!/>0,00</.test(h), 'нулей в пустых графах нет');
+  }
+
+  console.log('\n── фразы через YandexGPT ──');
+  {
+    /*
+     * Провайдер выбран не по качеству, а по достижимости: с боевого сервера
+     * (адрес российский) и Anthropic, и OpenRouter отвечают 403 — одинаково с
+     * ключом и без, так что дело в адресе. Yandex Cloud с той же машины
+     * отвечает.
+     *
+     * Форма запроса у него своя, и именно её тут и проверяем: модель адресом
+     * gpt://, настройки в completionOptions, текст в поле text. Ошибка в любом
+     * из трёх мест — это 400 на боевом, а не «модель не поняла».
+     */
+    const http = require('node:http');
+    let got = null; let hdr = null;
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c) => { b += c; });
+      req.on('end', () => {
+        got = JSON.parse(b); hdr = req.headers;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ result: { alternatives: [{ message: {
+          role: 'assistant',
+          text: '{"action":"draft","docType":"sch","who":"Заря"}',
+        } }] } }));
+      });
+    });
+    await new Promise((r) => srv.listen(0, r));
+
+    const was = {
+      p: process.env.AI_PROVIDER, k: process.env.YANDEX_API_KEY,
+      f: process.env.YANDEX_FOLDER_ID, m: process.env.AI_MODEL, e: process.env.AI_ENABLED,
+    };
+    process.env.AI_ENABLED = '1';
+    process.env.AI_PROVIDER = 'yandexgpt';
+    process.env.YANDEX_API_KEY = 'AQVN-test';
+    process.env.YANDEX_FOLDER_ID = 'b1gtest';
+    delete process.env.AI_MODEL;
+    const realFetch = global.fetch;
+    global.fetch = (u, o) => realFetch(
+      String(u).replace('https://llm.api.cloud.yandex.net', `http://127.0.0.1:${srv.address().port}`), o,
+    );
+
+    const aiY = require('./lib/ai-agent');
+    ok(aiY.aiAvailable(), 'с ключом и каталогом Яндекса разбор фраз доступен');
+    // Ключа мало — без каталога адрес модели не собрать, и это надо сказать.
+    delete process.env.YANDEX_FOLDER_ID;
+    ok(!aiY.aiAvailable() && aiY.aiHint().includes('YANDEX_FOLDER_ID'),
+      'без каталога честно говорим, чего не хватает', aiY.aiHint());
+    process.env.YANDEX_FOLDER_ID = 'b1gtest';
+
+    const intent = await aiY.understand('Заре за аренду тридцать тысяч, как обычно', 4242);
+    ok(intent.action === 'draft' && intent.who === 'Заря', 'фраза разобрана моделью',
+      JSON.stringify(intent));
+    ok(got.modelUri === 'gpt://b1gtest/yandexgpt-lite/latest',
+      'каталог подставлен в адрес модели — вписывать его дважды не нужно', got.modelUri);
+    ok(got.completionOptions.maxTokens === '400',
+      'потолок ответа ушёл строкой — числом их API его не принимает',
+      JSON.stringify(got.completionOptions.maxTokens));
+    ok(Object.prototype.hasOwnProperty.call(got.messages[1], 'text'),
+      'текст лежит в поле text, а не content');
+    ok(hdr.authorization === 'Api-Key AQVN-test' && hdr['x-folder-id'] === 'b1gtest',
+      'ключ и каталог ушли в заголовках');
+    ok(hdr['x-data-logging-enabled'] === 'false',
+      'просим не сохранять содержимое: через бота идут чужие реквизиты и суммы');
+
+    global.fetch = realFetch;
+    srv.close();
+    for (const [k, v] of [['AI_PROVIDER', was.p], ['YANDEX_API_KEY', was.k],
+      ['YANDEX_FOLDER_ID', was.f], ['AI_MODEL', was.m], ['AI_ENABLED', was.e]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+
+  console.log('\n── фото через OpenRouter ──');
+  {
+    /*
+     * Провайдер добавлен, потому что Яндекс остаётся только под звук, а
+     * Anthropic из России отвечает 403. Проверяем не «есть ли ветка в коде»,
+     * а весь путь: что уходит в запросе и что получается на выходе.
+     *
+     * Настоящий OpenRouter в прогоне не дёргаем — платно и требует сети.
+     * Поднимаем свой сервер и подменяем ему адрес: запрос собирается тем же
+     * кодом, что в бою, и мы видим его целиком.
+     */
+    const http = require('node:http');
+    let got = null;
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c) => { b += c; });
+      req.on('end', () => {
+        got = JSON.parse(b);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+          date: '2026-08-11', amount: 26496.42, docNo: '148',
+          inn: '7712345678', name: 'ООО «Заря»', text: 'Счёт № 148 от 11.08.2026',
+        }) } }] }));
+      });
+    });
+    await new Promise((r) => srv.listen(0, r));
+
+    const was = { p: process.env.VISION_PROVIDER, k: process.env.OPENROUTER_API_KEY, m: process.env.VISION_MODEL };
+    process.env.VISION_PROVIDER = 'openrouter';
+    process.env.OPENROUTER_API_KEY = 'sk-or-test';
+    process.env.VISION_MODEL = 'anthropic/claude-sonnet-4.5';
+    const realFetch = global.fetch;
+    global.fetch = (url, opts) => realFetch(
+      String(url).replace('https://openrouter.ai', `http://127.0.0.1:${srv.address().port}`), opts,
+    );
+
+    const vision = require('./lib/vision');
+    ok(vision.visionAvailable(), 'с ключом OpenRouter распознавание считается доступным');
+    const r = await vision.readInvoice(Buffer.from('фото'), 'image/jpeg');
+    ok(r.ok && r.fields.amount === 26496.42, 'сумма со снимка разобрана', r.fields && r.fields.amount);
+    ok(r.fields.inn === '7712345678', 'и ИНН поставщика');
+
+    const img = (((got.messages || [])[0] || {}).content || []).find((c) => c.type === 'image_url');
+    ok(Boolean(img) && img.image_url.url.startsWith('data:image/jpeg;base64,'),
+      'картинка ушла ссылкой data: — как ждёт OpenRouter');
+    ok(got.model === 'anthropic/claude-sonnet-4.5', 'модель взята из VISION_MODEL', got.model);
+
+    global.fetch = realFetch;
+    srv.close();
+    for (const [k, v] of [['VISION_PROVIDER', was.p], ['OPENROUTER_API_KEY', was.k], ['VISION_MODEL', was.m]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+
+  console.log('\n── обещание на лендинге ──');
+  {
+    /*
+     * Страница обещает столько-то бесплатных документов в месяц, а выдаёт их
+     * бот. Разъезжались они молча: число в вёрстке правится руками, FREE_DOCS
+     * на сервере — переменной окружения, и ничто их не сверяло. Так и вышло —
+     * в вёрстке 5, на сервере 50. Обещать в рекламе не то, что даёшь, нельзя
+     * (ФЗ «О рекламе», ст. 5).
+     *
+     * Здесь проверяем то, что видно из репозитория: все обещания размечены и
+     * называют одно число, и это число — умолчание бота. Расхождение с живым
+     * сервером ловится при публикации (deploy/site.sh подставляет туда
+     * настоящее значение), отсюда до него не дотянуться.
+     */
+    const html = fs.readFileSync(path.join(__dirname, 'public/landing/index.html'), 'utf8');
+    const nums = [...html.matchAll(/class="[^"]*free-docs[^"]*">(\d+)</g)].map((m) => Number(m[1]));
+    ok(nums.length >= 4, 'обещания на странице размечены и находятся', nums.length);
+    ok(new Set(nums).size === 1, 'и все называют одно число', nums.join(', '));
+
+    // Сколько бот даёт по умолчанию — без переменной окружения.
+    const wasFree = process.env.FREE_DOCS;
+    delete process.env.FREE_DOCS;
+    const def = require('./lib/bot-db').quota(fxUserId()).limit;
+    if (wasFree === undefined) delete process.env.FREE_DOCS; else process.env.FREE_DOCS = wasFree;
+
+    ok(nums[0] === def, 'страница обещает ровно столько, сколько даёт бот',
+      `страница ${nums[0]}, бот ${def}`);
+
+    // Число внутри разметки, а не рядом с ней: иначе подстановка при
+    // публикации промахнётся и оставит на странице прежнее обещание.
+    ok(!/free-docs[^>]*>\s*<|free-docs[^>]*>\D/.test(html),
+      'число стоит прямо внутри разметки — подстановке есть за что взяться');
+  }
+
+  console.log('\n── изоляция пользователей ──');
+  const OTHER = { id: 777002, first_name: 'Чужой', username: 'other' };
+  await handleUpdate(tg, { message: { chat: { id: 777002 }, from: OTHER, text: '/start' } });
+  await handleUpdate(tg, { callback_query: { id: 'c2', from: OTHER, data: 'cps', message: { chat: { id: 777002 } } } });
+  ok(last().includes('Клиентов пока нет'), 'чужой пользователь не видит наших контрагентов', last().slice(0, 50));
+  await handleUpdate(tg, { callback_query: { id: 'c3', from: OTHER, data: `cp:${cpId}`, message: { chat: { id: 777002 } } } });
+  ok(last().includes('Такого клиента нет в вашем списке'), 'по прямой ссылке чужого контрагента тоже не отдаёт');
+
+  /*
+   * Ниже — проверки на дыры, найденные ревизией.
+   *
+   * Все они прошли мимо прогона, хотя он был зелёным: в нём не было ни чисел
+   * за пределом разумного, ни чужого пользователя в поле идентификатора, ни
+   * денег в нештатных статусах, ни календаря на границе месяца. Каждая
+   * проверка ниже падала на коде до правки — иначе она бесполезна.
+   */
+
+  console.log('\n── деньги: отказ, возврат, повтор ──');
+  {
+    const billing = require('./lib/billing');
+    const bdbP = require('./lib/bot-db');
+    const uid = bdbP.getOrCreateUser(779001).id;
+
+    // Срок проставляется только состоявшейся оплате, а отбор ничьих берёт
+    // лишь строки со сроком. Раньше отклонённый платёж давал полный месяц.
+    billing.recordPayment({ externalId: 'rev-f1', provider: 'lava', userId: 0,
+      email: 'otkaz@x.ru', amount: 390, currency: 'RUB', days: 0, status: 'payment.failed' });
+    ok(billing.unclaimedByEmail('otkaz@x.ru').length === 0,
+      'по отклонённой оплате доступ не забрать');
+
+    const good = billing.recordPayment({ externalId: 'rev-g1', provider: 'lava', userId: 0,
+      email: 'chestno@x.ru', amount: 390, currency: 'RUB', days: 30, status: 'payment.success' });
+    ok(billing.unclaimedByEmail('chestno@x.ru').length === 1, 'настоящая оплата ждёт владельца');
+
+    ok(billing.attachPayment(good.id, uid) === true, 'первый забрал оплату');
+    ok(billing.attachPayment(good.id, bdbP.getOrCreateUser(779002).id) === false,
+      'второму она уже не достанется — иначе один платёж давал бы два срока');
+
+    // Похожий платёж: записан со следом, но доступа не даёт. Раньше он не
+    // записывался вовсе, и разбираться с претензией было не по чему.
+    billing.recordPayment({ externalId: 'rev-n1', provider: 'lava', userId: 0,
+      email: 'dvazhdy@x.ru', amount: 390, currency: 'RUB', days: 30, status: 'payment.success' });
+    const near = billing.recordPayment({ externalId: 'rev-n2', provider: 'lava', userId: 0,
+      email: 'dvazhdy@x.ru', amount: 390, currency: 'RUB', days: 30, status: 'payment.success' });
+    ok(near.near === true, 'второй похожий платёж помечен как повтор');
+    ok(Boolean(billing.findPayment('lava', 'rev-n2')), 'но записан, а не потерян');
+    ok(billing.unclaimedByEmail('dvazhdy@x.ru').length === 1, 'и доступа по нему нет');
+  }
+
+  console.log('\n── одно число больше не вешает продукт ──');
+  {
+    const money = require('./lib/money');
+    const dsx = require('./lib/doc-service');
+    ok(money.round2(Infinity) === 0, 'бесконечность приводится к нулю, а не остаётся числом');
+    // Если бы застава не сработала, цикл деления на тысячу шёл бы вечно и
+    // прогон отсюда уже не вернулся.
+    ok(typeof money.amountInWords(Infinity) === 'string',
+      'сумма прописью от бесконечности возвращается, а не считается вечно');
+    const it = dsx.cleanItems([{ name: 'Космос', qty: 1e200, price: 1e200 }])[0];
+    ok(Number.isFinite(it.qty * it.price),
+      'произведение количества на цену остаётся конечным', it.qty * it.price);
+  }
+
+  console.log('\n── пересчёт долга не задваивает оплату ──');
+  {
+    const bdbD = require('./lib/bot-db');
+    const dsd = require('./lib/doc-service');
+    const u = bdbD.getOrCreateUser(779010);
+    bdbD.saveMyOrg(u.id, { name: 'ИП Проверка', inn: '183209316119' });
+    const orgD = bdbD.getDefaultOrg(u.id);
+    const cpD = bdbD.createCp(u.id, { name: 'ООО «Заплатил»', kind: 'customer', opening_date: '2026-01-01' });
+    const made = await dsd.issueDocument(u.id, {
+      type: 'usl', cpId: cpD, items: [{ name: 'Работа', qty: 1, price: 50000 }], skipQuota: true,
+    });
+    // Человек вносит оплату строкой в журнал, и только потом жмёт «Оплачен».
+    bdbD.addOp(u.id, cpD, { date: '2026-09-01', kind: 'Оплата', doc: 'п/п 7', debit: 50000 });
+    bdbD.markPaid(u.id, made.doc.id);
+    ok(Number(bdbD.getDoc(u.id, made.doc.id).paid_sum) === 0,
+      'отметка записала ноль: проводки не было, долг уже закрыт');
+    bdbD.rebuildDebt(u.id, orgD);
+    ok(bdbD.balanceOf(u.id, cpD).closing === 0,
+      'после пересчёта сальдо не уехало в минус', bdbD.balanceOf(u.id, cpD).closing);
+  }
+
+  console.log('\n── чужую операцию через выписку не удалить ──');
+  {
+    const bdbO = require('./lib/bot-db');
+    const dso = require('./lib/doc-service');
+    const a = bdbO.getOrCreateUser(779020);
+    const b = bdbO.getOrCreateUser(779021);
+    bdbO.saveMyOrg(a.id, { name: 'ИП Первый', inn: '183209316119' });
+    bdbO.saveMyOrg(b.id, { name: 'ИП Второй', inn: '183209316118' });
+    const cpA = bdbO.createCp(a.id, { name: 'Клиент А', kind: 'customer', opening_date: '2026-01-01' });
+    const cpB = bdbO.createCp(b.id, { name: 'Клиент Б', kind: 'customer', opening_date: '2026-01-01' });
+    const opB = bdbO.addOp(b.id, cpB, { date: '2026-09-01', kind: 'Оплата', doc: 'чужая строка', debit: 100000 });
+    const docA = await dso.issueDocument(a.id, {
+      type: 'usl', cpId: cpA, items: [{ name: 'Работа', qty: 1, price: 100000 }], skipQuota: true,
+    });
+    const beforeB = bdbO.balanceOf(b.id, cpB).closing;
+    bdbO.closeDocsFromBank(a.id, [{
+      opId: opB, cpId: cpA, leadId: docA.doc.id, total: 100000, date: '2026-09-01', doc: 'п/п 1',
+    }]);
+    ok(bdbO.balanceOf(b.id, cpB).closing === beforeB,
+      'сальдо чужого пользователя не изменилось', `${beforeB} → ${bdbO.balanceOf(b.id, cpB).closing}`);
+  }
+
+  console.log('\n── документы: НДС, упрощёнка, чужое имя, номера ──');
+  {
+    const { buildAktUslugHtml } = require('./lib/akt-uslug');
+    const { buildDogovorHtml } = require('./lib/dogovor');
+    const { vatTotals } = require('./lib/money');
+    const items20 = [{ name: 'Работа', qty: 1, price: 100000, unit: 'шт.' }];
+
+    // Бланк акта услуг считал свою сумму мимо ставки: контрагент подписывал
+    // 100 000, а в журнале и в долге стояло 120 000.
+    const aktHtml = buildAktUslugHtml({
+      org: { name: 'ООО «Мы»', inn: '7701234567' }, cp: { name: 'ООО «Они»', inn: '7809876543' },
+      doc: { number: '1', date: '2026-09-01', items: items20, vatRate: 20, priceIncludesVat: false },
+    });
+    const want = vatTotals(items20, 20, false).total;
+    // Пробел в денежном формате неразрывный — сравнивать надо после замены,
+    // иначе проверка спорит с типографикой, а не с суммой.
+    const flat = aktHtml.replace(/ /g, ' ');
+    ok(flat.includes('120 000,00') && want === 120000,
+      'акт услуг печатает ту же сумму, что уходит в журнал', want);
+
+    // Оговорка про упрощёнку — только тому, кто на упрощёнке.
+    const dogVat = buildDogovorHtml({
+      org: { name: 'ООО «Мы»', inn: '7701234567', vat_rate: '20' },
+      cp: { name: 'ООО «Они»' }, doc: { number: '1', date: '2026-09-01', price: 50000 },
+    });
+    ok(!/упрощённой системы налогообложения/.test(dogVat),
+      'договор не объявляет упрощёнку плательщику НДС');
+    const dogUsn = buildDogovorHtml({
+      org: { name: 'ИП Мы', inn: '183209316119', vat_rate: '' },
+      cp: { name: 'ООО «Они»' }, doc: { number: '1', date: '2026-09-01', price: 50000 },
+    });
+    ok(/не является плательщиком НДС/.test(dogUsn),
+      'а неплательщику объявляет, что налога нет');
+    ok(!/упрощённой системы налогообложения/.test(dogUsn),
+      'но чужой режим ему не приписывает: «без НДС» — это и патент, и НПД');
+
+    /*
+     * И у плательщика договор обязан сказать про налог прямо.
+     *
+     * Оговорки не было вовсе: «Стоимость услуг составляет 100 000 руб.» — и
+     * всё. Молчание тут не нейтрально: по п. 17 постановления Пленума ВАС
+     * № 33 от 30.05.2014 налог считается ВКЛЮЧЁННЫМ в названную цену, если из
+     * договора не следует иного. Исполнитель, имевший в виду «плюс налог»,
+     * платит НДС из своего кармана, и спор решается не в его пользу — из-за
+     * пропущенной строчки.
+     */
+    const dogNds = (gross) => buildDogovorHtml({
+      org: { name: 'ООО «Мы»', inn: '7701234567', vat_rate: '22', vat_gross: gross ? 1 : 0 },
+      cp: { name: 'ООО «Они»' }, doc: { number: '1', date: '2026-09-01', price: 100000 },
+      // Пробел в деньгах неразрывный: сравнивать надо после замены, иначе
+      // проверка спорит с типографикой, а не с суммой.
+    }).replace(/[\u00a0\u202f\u2009]/g, ' ');
+    const sverhu = dogNds(false);
+    ok(/кроме того НДС 22%/.test(sverhu) && /22 000,00/.test(sverhu),
+      'при ставке «сверху» договор называет и налог, и его сумму');
+    ok(/итого к оплате[^<]*<b>122 000,00/.test(sverhu),
+      'и итог к оплате, чтобы спорить было не о чем',
+      (sverhu.match(/итого к оплате[\s\S]{0,40}/) || [])[0]);
+    const vnutri = dogNds(true);
+    ok(/в том числе НДС 22%/.test(vnutri) && /18 032,79/.test(vnutri),
+      'а при ценах с налогом — что он уже внутри, и сколько его',
+      (vnutri.match(/в том числе НДС[\s\S]{0,40}/) || [])[0]);
+
+    // Цена не названа — платим по счетам, но ставку договор всё равно объявляет.
+    const dogBill = buildDogovorHtml({
+      org: { name: 'ООО «Мы»', inn: '7701234567', vat_rate: '22' },
+      cp: { name: 'ООО «Они»' }, doc: { number: '1', date: '2026-09-01', price: 0 },
+    });
+    ok(/Ставка НДС — 22%/.test(dogBill),
+      'без названной цены договор всё равно называет ставку');
+
+    // Имя из разработки уходило контрагенту в акте сверки.
+    // Ищем имя именно как запасное ЗНАЧЕНИЕ: в комментарии рядом оно стоит
+    // законно — там объясняется, почему его убрали.
+    const aktSrc = require('node:fs').readFileSync(require('node:path')
+      .join(__dirname, 'lib', 'xlsx-akt.js'), 'utf8');
+    ok(!/\|\|\s*'[^']*Сарычева/.test(aktSrc),
+      'чужое имя больше не подставляется запасным значением в акт сверки');
+  }
+
+  console.log('\n── номера документов не повторяются ──');
+  {
+    const bdbN = require('./lib/bot-db');
+    const dsn = require('./lib/doc-service');
+    const u = bdbN.getOrCreateUser(779030);
+    bdbN.saveMyOrg(u.id, { name: 'ООО «Нумерация»', inn: '7701234567' });
+    const cpN = bdbN.createCp(u.id, { name: 'ООО «Клиент»', kind: 'customer', opening_date: '2026-01-01' });
+    const mk = (number) => dsn.issueDocument(u.id, {
+      type: 'sch', cpId: cpN, number, items: [{ name: 'Работа', qty: 1, price: 100 }], skipQuota: true,
+    });
+    const hand = await mk('3');
+    ok(hand.ok !== false && hand.doc.number === '3', 'номер, заданный рукой, принят');
+    await mk();
+    const third = await mk();
+    ok(third.doc.number !== '3',
+      'присвоенный сам номер обошёл занятый рукой', third.doc.number);
+    const again = await mk('3');
+    ok(again.ok === false && again.reason === 'number',
+      'повторно задать тот же номер рукой нельзя', again.message);
+  }
+
+  console.log('\n── УПД: статус и ставка по режиму налога ──');
+  {
+    const bdbU = require('./lib/bot-db');
+    const dsu = require('./lib/doc-service');
+    const one = async (tgId, vat, npdOn = 0) => {
+      const u = bdbU.getOrCreateUser(tgId);
+      bdbU.saveMyOrg(u.id, { name: 'ООО «УПД»', inn: '7701234567' });
+      bdbU.updateOrg(u.id, bdbU.getDefaultOrg(u.id).id, { vat_rate: vat, npd: npdOn });
+      const cpU = bdbU.createCp(u.id, { name: 'ООО «Покупатель»', kind: 'customer', opening_date: '2026-01-01' });
+      const r = await dsu.issueDocument(u.id, {
+        type: 'upd', cpId: cpU, items: [{ name: 'Товар', qty: 1, price: 10000 }], skipQuota: true,
+      });
+      if (!r.ok) return { refused: r };
+      return { total: r.total, saved: bdbU.getDoc(u.id, r.doc.id).payload || {} };
+    };
+    const vat = await one(779040, '20');
+    ok(vat.total === 12000 && Number(vat.saved.status) === 1 && Number(vat.saved.vatRate) === 20,
+      'плательщику НДС — статус 1 и ставка, иначе покупателю нечего принять к вычету',
+      `${vat.total} ст.${vat.saved.status} ${vat.saved.vatRate}`);
+    const usn = await one(779041, '');
+    ok(usn.total === 10000 && Number(usn.saved.status) === 2,
+      'на упрощёнке — статус 2 без счёта-фактуры', `${usn.total} ст.${usn.saved.status}`);
+
+    // Упрощенец со ставкой 5% — с 2026 года плательщик НДС, счёт-фактура ему
+    // нужна: покупателю иначе нечего принять к вычету.
+    const usn5 = await one(779042, '5');
+    ok(usn5.total === 10500 && Number(usn5.saved.status) === 1 && Number(usn5.saved.vatRate) === 5,
+      'на УСН со ставкой 5% — статус 1 со счётом-фактурой',
+      `${usn5.total} ст.${usn5.saved.status} ${usn5.saved.vatRate}`);
+
+    /*
+     * Самозанятому счёт-фактуру не выписываем, даже если у него проставлена
+     * ставка.
+     *
+     * Экраны «Самозанятость» и «НДС» независимы, и поставить ставку поверх
+     * включённого НПД ничто не мешает. Прежнее правило «есть ставка → статус
+     * 1» молча выдавало такому человеку счёт-фактуру с выделенным налогом, а
+     * по п. 5 ст. 173 НК неплательщик, выставивший её, обязан уплатить весь
+     * этот НДС в бюджет и подать декларацию. Заказчик вычет при этом всё
+     * равно не получит.
+     */
+    // Р20: теперь УПД самозанятому не выписывается вовсе — ни кнопкой, ни запросом мимо неё.
+    const npdVat = await one(779043, '22', 1);
+    ok(npdVat.refused && npdVat.refused.reason === 'npd' && /УПД/.test(npdVat.refused.message),
+      'самозанятому УПД не выписывается совсем — отказ со словами, а не документ',
+      npdVat.refused && npdVat.refused.message);
+  }
+
+  console.log('\n── акт услуг: бот и приложение считают одинаково ──');
+  {
+    /*
+     * Один и тот же акт выходил из бота на 122 000, а из приложения на
+     * 100 000: в боте `usl` попадал в список умолчания ставки, в
+     * doc-service — нет. Заказчик подписывал документ, заниженный ровно на
+     * налог, долг в журнале занижался тоже, а пустая ставка уезжала в
+     * payload — и «Повторить» с ежемесячным повторением оставались без
+     * налога навсегда.
+     */
+    const bdbA = require('./lib/bot-db');
+    const dsa = require('./lib/doc-service');
+    const u = bdbA.getOrCreateUser(779060);
+    bdbA.saveMyOrg(u.id, { name: 'ООО «Акт»', inn: '7701234567' });
+    bdbA.updateOrg(u.id, bdbA.getDefaultOrg(u.id).id, { vat_rate: '22' });
+    const cpA = bdbA.createCp(u.id, { name: 'ООО «Покупатель»', kind: 'customer', opening_date: '2026-01-01' });
+    const act = await dsa.issueDocument(u.id, {
+      type: 'usl', cpId: cpA, items: [{ name: 'Услуга', qty: 1, price: 100000 }], skipQuota: true,
+    });
+    ok(act.total === 122000, 'акт услуг из приложения выходит со ставкой организации', act.total);
+    const savedA = bdbA.getDoc(u.id, act.doc.id).payload || {};
+    ok(Number(savedA.vatRate) === 22,
+      'и ставка сохранена, иначе повтор акта уйдёт без налога', savedA.vatRate);
+
+    // Явный отказ от налога в конкретном акте сильнее умолчания.
+    const noVat = await dsa.issueDocument(u.id, {
+      type: 'usl', cpId: cpA, items: [{ name: 'Услуга', qty: 1, price: 100000 }],
+      extra: { vatRate: null }, skipQuota: true,
+    });
+    ok(noVat.total === 100000, 'но «этот акт без НДС» умолчание перебивает', noVat.total);
+  }
+
+  console.log('\n── оплата словами: путь целиком ──');
+  {
+    /*
+     * Проверка идёт по всей цепочке, а не по кускам.
+     *
+     * Владелец написал «проведи оплату по этому контрагенту» и не получил
+     * ничего: действия «внести оплату» в разборе не существовало вовсе, и
+     * фраза уходила в пустоту. Куски при этом были все — и разбор, и addOp, и
+     * сальдо. Поэтому здесь проверяется именно путь: фраза внутрь, изменённый
+     * журнал наружу, отмена возвращает как было.
+     */
+    const bdbP = require('./lib/bot-db');
+    const { round2 } = require('./lib/money');
+    const uidP = fxUserId();
+    const cpP = bdbP.createCp(uidP, { name: 'ООО «Платёжкин»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbP.addOp(uidP, cpP, { date: '2026-08-01', kind: 'Приход', doc: 'Акт 9', credit: 80000 });
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 80000, 'за клиентом числится 80 000');
+
+    await say('проведи оплату по Платёжкин 30000');
+    ok(/Внёс/.test(last()) && norm(last()).includes('30 000,00'),
+      'бот отчитался, что внёс оплату', norm(last()).slice(0, 80));
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 50000,
+      'и сальдо действительно изменилось: 80 000 − 30 000',
+      bdbP.balanceOf(uidP, cpP).closing);
+    ok(norm(last()).includes('50 000,00'), 'остаток долга назван в ответе', norm(last()).slice(-60));
+
+    // Отмена одним нажатием — раз проводку сделал бот, убрать её должно быть
+    // так же просто, как она появилась.
+    const undo = button('Отменить запись');
+    ok(Boolean(undo), 'есть кнопка отмены', undo);
+    await tap(undo);
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 80000,
+      'отмена вернула сальдо как было', bdbP.balanceOf(uidP, cpP).closing);
+
+    // Сумму не назвали — бот берёт её из журнала и спрашивает, а не гадает.
+    await say('проведи оплату по Платёжкин, я всё получил');
+    ok(norm(last()).includes('80 000,00') && /Внести эту сумму/.test(last()),
+      'без суммы бот показывает долг из журнала и предлагает его', norm(last()).slice(0, 90));
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 80000,
+      'и НИЧЕГО не вносит, пока не нажали', bdbP.balanceOf(uidP, cpP).closing);
+
+    const yes = button('Да,');
+    ok(Boolean(yes), 'кнопка подтверждения есть', yes);
+    await tap(yes);
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 0,
+      'после нажатия расчёты закрыты', bdbP.balanceOf(uidP, cpP).closing);
+
+    // Приход — вторая сторона: он увеличивает долг, а не гасит его.
+    await say('проведи приход по Платёжкин 15000');
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 15000,
+      '«приход» двигает сальдо в другую сторону, чем «оплата»',
+      bdbP.balanceOf(uidP, cpP).closing);
+
+    // При выключенном ассистенте фраза не делает ничего.
+    bdbP.setAiEnabled(uidP, false);
+    await say('проведи оплату по Платёжкин 15000');
+    ok(round2(bdbP.balanceOf(uidP, cpP).closing) === 15000,
+      'выключенный ассистент в журнал не лезет', bdbP.balanceOf(uidP, cpP).closing);
+    bdbP.setAiEnabled(uidP, true);
+  }
+
+  console.log('\n── переписка с ассистентом пишется в журнал ──');
+  {
+    /*
+     * Проверка стоит здесь не ради истории чата, а ради того, что без неё
+     * бот молчит вовсе.
+     *
+     * saveAiMessage зовётся ПЕРВОЙ строкой handleFreeText, и когда функции в
+     * bot-db не было, на этой строке падало каждое текстовое сообщение. Ловил
+     * падение catch наверху цикла опроса — записывал в журнал и шёл дальше,
+     * так что снаружи это выглядело как «бот перестал отвечать»: ни ошибки,
+     * ни подсказки, ни следа для человека. Свободный ввод — главное, ради
+     * чего продукт открывают, и сломаться он умеет вот так, молча.
+     */
+    const bdbA = require('./lib/bot-db');
+    const uidA = fxUserId();
+    const was = bdbA.listAiMessages(uidA, 200).length;
+
+    await say('кто мне должен');
+    const after = bdbA.listAiMessages(uidA, 200);
+    ok(after.length > was, 'фраза человеку не потерялась — бот ответил, а не упал',
+      `${was} → ${after.length}`);
+    ok(after.some((m) => m.role === 'user' && m.text === 'кто мне должен'),
+      'в журнале записано, что именно спросили',
+      after.slice(-2).map((m) => `${m.role}:${m.text}`).join(' | '));
+    ok(after.some((m) => m.role === 'assistant'),
+      'и что ответил ассистент');
+
+    // История отдаётся старыми сверху: приложение рисует её сверху вниз, и
+    // при обратном порядке человек увидит позапрошлый разговор вместо вчерашнего.
+    const ids = after.map((m) => m.id);
+    ok(ids.every((v, i) => i === 0 || ids[i - 1] < v), 'история идёт по возрастанию',
+      ids.slice(0, 5).join(','));
+
+    // Выгрузка для разбора: только реплики человека и без чьих-либо имён.
+    const ds = bdbA.getAiDataset({ limit: 50 });
+    ok(ds.length > 0 && ds.every((d) => !('userId' in d) && !('user_id' in d)),
+      'в выгрузке нет привязки к человеку — смотреть надо на формулировки', ds.length);
+
+    // Служебная запись не имеет права уронить ответ человеку.
+    let threw = false;
+    try { bdbA.saveAiMessage({ userId: uidA, text: { плохое: 'не строка' } }); } catch (_) { threw = true; }
+    ok(!threw, 'кривой аргумент не роняет запись, а значит и ответ');
+    ok(bdbA.saveAiMessage({}) === 0, 'без пользователя запись просто не делается');
+  }
+
+  console.log('\n── тумблер: включён делает, выключен готовит ──');
+  {
+    /*
+     * Ради этого тумблер и заводился, и проверять надо именно переключение.
+     *
+     * Включён — ассистент доводит дело до файла: человек попросил словами, и
+     * это его нажатие. Выключен — тот же разбор, но в конце предпросмотр и
+     * кнопка. Первая редакция обещала «сам я ничего не выписываю» в обоих
+     * режимах, то есть тумблер не переключал ничего.
+     */
+    const bdbT = require('./lib/bot-db');
+    const { round2 } = require('./lib/money');
+    const uidT = fxUserId();
+    const cpT = bdbT.createCp(uidT, { name: 'ООО «Тумблер»', kind: 'customer', opening_date: '2026-01-01' });
+
+    // --- включён: документ выписывается сам ---
+    bdbT.setAiEnabled(uidT, true);
+    const wasOn = bdbT.listDocs(uidT, 200).length;
+    files.length = 0;
+    await say('выставь Тумблер счёт на 12000 за монтаж');
+    ok(bdbT.listDocs(uidT, 200).length === wasOn + 1,
+      'включённый ассистент выписал документ сам',
+      `${wasOn} → ${bdbT.listDocs(uidT, 200).length}`);
+    ok(files.length === 1, 'и отдал файл человеку', files.length);
+    ok(!/сам я ничего не выписываю/i.test(last()),
+      'и не обещает обратного', last().slice(0, 70));
+
+    // --- выключен: только подготовка ---
+    bdbT.setAiEnabled(uidT, false);
+    const wasOff = bdbT.listDocs(uidT, 200).length;
+    files.length = 0;
+    await say('выставь Тумблер счёт на 7000 за монтаж');
+    ok(bdbT.listDocs(uidT, 200).length === wasOff,
+      'выключенный — ничего не выписал', bdbT.listDocs(uidT, 200).length);
+    ok(files.length === 0, 'и файла не прислал', files.length);
+    ok(button('Сформировать') === 'doc.make',
+      'но показал предпросмотр с кнопкой выпуска', button('Сформировать'));
+
+    // и фразу он по-прежнему понимает — выключали выписку, а не слух
+    ok(norm(last()).includes('7 000,00') || norm(last()).includes('Монтаж'),
+      'разбор фразы работает и с выключенным тумблером', norm(last()).slice(0, 90));
+    // Незакрытый черновик перехватывает следующие фразы как позиции — это
+    // верное поведение бота, но дальше мы проверяем другое.
+    await tap('menu');
+
+    // --- оплата: те же два режима ---
+    bdbT.addOp(uidT, cpT, { date: '2026-08-01', kind: 'Приход', credit: 20000 });
+    const balBefore = round2(bdbT.balanceOf(uidT, cpT).closing);
+    await say('проведи оплату по Тумблер 5000');
+    ok(round2(bdbT.balanceOf(uidT, cpT).closing) === balBefore,
+      'выключенный ассистент оплату не провёл', bdbT.balanceOf(uidT, cpT).closing);
+    ok(/нажмите/i.test(last()), 'а предложил нажать', last().slice(0, 80));
+
+    bdbT.setAiEnabled(uidT, true);
+    await say('проведи оплату по Тумблер 5000');
+    ok(round2(bdbT.balanceOf(uidT, cpT).closing) === round2(balBefore - 5000),
+      'включённый — провёл сам', bdbT.balanceOf(uidT, cpT).closing);
+  }
+
+  console.log('\n── названный клиент, которого нет ──');
+  {
+    /*
+     * Имя во фразе есть, а клиента такого нет.
+     *
+     * Молча заводить его нельзя: разбор отдаёт имя в том падеже, в каком его
+     * произнесли, и в базе появился бы «Заре» без ИНН и реквизитов — рядом с
+     * настоящей «ООО Заря». Но и делать вид, что имени не слышали, плохо.
+     * Поэтому предлагаем завести именно его, а решает человек.
+     */
+    const bdbN = require('./lib/bot-db');
+    const before = bdbN.listCps(fxUserId()).length;
+
+    await say('выставь Незнакомой Фирме счёт на 5000');
+    ok(/Незнакомой Фирме/.test(last()) && /пока нет/.test(last()),
+      'бот говорит, что такого клиента нет, и называет его', last().slice(0, 90));
+    ok(bdbN.listCps(fxUserId()).length === before,
+      'и НЕ заводит его молча', bdbN.listCps(fxUserId()).length);
+
+    const addBtn = button('Завести');
+    ok(Boolean(addBtn), 'есть кнопка завести именно этого клиента', addBtn);
+
+    await tap(addBtn);
+    ok(/Завожу клиента/.test(last()) || /ИНН/.test(last()),
+      'по кнопке открывается форма, а не пустое место', last().slice(0, 80));
+
+    // Имя подставлено: шаг «краткое имя» пропущен, спрашивают уже про ИНН.
+    const st = bdbN.getState(fxUserId());
+    ok(st.state === 'form:cpq' && st.data.values.name === 'Незнакомой Фирме',
+      'имя из фразы подставлено в форму', JSON.stringify(st.data.values));
+    ok(st.data.values.__then === 'sch',
+      'и бот помнит, ради какого документа всё начиналось', st.data.values.__then);
+
+    bdbN.clearState(fxUserId());
+  }
+
+  console.log('\n── короткие формы: клиент из ассистента и банк после документа ──');
+  {
+    const bdbQ = require('./lib/bot-db');
+    const Q = { id: 979003, first_name: 'Короткая' };
+    const qSay = (t) => handleUpdate(tg, { message: { chat: { id: Q.id }, from: Q, text: t } });
+    const qTap = (d) => handleUpdate(tg,
+      { callback_query: { id: 'c', from: Q, data: d, message: { chat: { id: Q.id } } } });
+    const qLast = () => (sent[sent.length - 1] || {}).text || '';
+    await qSay('/start');
+    const uidQ = bdbQ.getOrCreateUser(Q.id).id;
+
+    // «Добавить клиента» без имени во фразе — короткая анкета, а не 13 шагов.
+    await qTap('cp.q');
+    ok(bdbQ.getState(uidQ).state === 'form:cpq' && qLast().includes('из 3'),
+      'cp.q открывает короткую анкету клиента (3 шага)', qLast().slice(0, 30));
+    bdbQ.clearState(uidQ);
+
+    // Банк после документа: у фирмы есть всё, кроме банка; остальное не затираем.
+    bdbQ.saveMyOrg(uidQ, { name: 'ИП Тестов Т. Т.', full_name: 'Индивидуальный предприниматель Тестов Т. Т.',
+      inn: '183114389446', address: 'г Ижевск, ул Тестовая, 1', signer: 'Т. Т. Тестов' });
+    await qTap('org.bank');
+    ok(qLast().includes('Шаг 1 из 2') && qLast().includes('БИК'), 'банк: короткая форма из двух шагов, первым БИК', qLast().slice(0, 30));
+    await qSay('044525225');
+    await qSay('40702810900000012344');
+    const oq = bdbQ.currentOrg(uidQ);
+    ok(oq.bik === '044525225' && oq.acc === '40702810900000012344', 'БИК и счёт сохранены', `${oq.bik} ${oq.acc}`);
+    ok(oq.name === 'ИП Тестов Т. Т.' && oq.inn === '183114389446' && oq.signer === 'Т. Т. Тестов'
+      && oq.address === 'г Ижевск, ул Тестовая, 1' && oq.full_name.includes('Тестов'),
+    'остальные реквизиты фирмы не затёрты', JSON.stringify(oq));
+
+    // Человеческие слова: «Такого клиента нет в вашем списке», а не «Контрагент не найден».
+    await qTap('cp:99999999');
+    ok(qLast().includes('Такого клиента нет в вашем списке'), 'нет клиента — по-человечески', qLast().slice(0, 50));
+
+    // Пропуск обоих шагов ничего не стирает.
+    await qTap('org.bank');
+    ok(bdbQ.currentOrg(uidQ).acc === '40702810900000012344', 'повторное открытие не ломает сохранённое');
+    bdbQ.clearState(uidQ);
+  }
+
+  console.log('\n── авансы, корректировки, книга продаж ──');
+  {
+    const bdbK = require('./lib/bot-db');
+    const dsK = require('./lib/doc-service');
+    const { advanceVat } = require('./lib/avans');
+    const { correctionRow, correctionTotals } = require('./lib/ksf');
+    const { bookRow, buildKnigaProdazh } = require('./lib/xlsx-kniga');
+    const { vatMismatch } = require('./lib/nds-text');
+
+    /*
+     * Расчётная ставка — не «сумма × ставку».
+     *
+     * 22% сверху от 100 000 это 22 000 налога, а из полученных 100 000
+     * расчётной ставкой 22/122 — 18 032,79. Перепутать значит завысить налог
+     * почти на пятую часть и подарить разницу бюджету.
+     */
+    ok(advanceVat(100000, 22).vat === 18032.79, 'аванс: 22/122 от 100 000 = 18 032,79',
+      advanceVat(100000, 22).vat);
+    ok(advanceVat(105000, 5).vat === 5000, 'аванс: 5/105 от 105 000 = ровно 5 000',
+      advanceVat(105000, 5).vat);
+    ok(advanceVat(107000, 7).vat === 7000, 'аванс: 7/107 от 107 000 = ровно 7 000',
+      advanceVat(107000, 7).vat);
+    ok(advanceVat(100000, null).vat === 0, 'без ставки налога в авансе нет');
+
+    // Корректировка: было 10×1000, стало 8×900 при ставке 22% сверху.
+    const cr = correctionRow({ qty: 10, price: 1000 }, { qty: 8, price: 900 }, 22, false);
+    ok(cr.before.total === 12200 && cr.after.total === 8784 && cr.diff.total === -3416,
+      'корректировка считает «было / стало / разница»', JSON.stringify(cr.diff));
+    const ct = correctionTotals([cr]);
+    ok(ct.down.total === 3416 && ct.up.total === 0,
+      'уменьшение и увеличение разведены — это разные книги', JSON.stringify(ct));
+
+    // --- цепочка целиком ---
+    const uK = bdbK.getOrCreateUser(880101);
+    bdbK.saveMyOrg(uK.id, { name: 'ООО «Книга»', inn: '7701234567' });
+    bdbK.updateOrg(uK.id, bdbK.getDefaultOrg(uK.id).id, { vat_rate: '22' });
+    const cpK = bdbK.createCp(uK.id, { name: 'ООО «Покупатель»', inn: '7707654321', kind: 'customer', opening_date: '2026-01-01' });
+
+    const av = await dsK.issueFlat(uK.id, {
+      type: 'avans', cpId: cpK, date: '2026-09-01', skipQuota: true, total: 100000,
+      payload: { sum: 100000, vatRate: 22, subject: 'Предоплата', payDoc: '№ 55 от 01.09.2026' },
+    });
+    ok(av.ok, 'счёт-фактура на аванс выписывается', av.message);
+
+    /*
+     * Бланк и долг обязаны говорить одно и то же.
+     *
+     * При статусе 2 ставка принудительно обнулялась в lib/upd.js: документ
+     * печатал «без НДС» и 100 000, а в журнале и в долге лежало 122 000 —
+     * итог считается по настоящей ставке. Расхождение ровно на сумму налога:
+     * человек показывал клиенту одну бумагу, а требовал другую сумму.
+     *
+     * Статус 2 — это «передаточный документ БЕЗ счёта-фактуры», а не
+     * «поставка без налога»: счёт-фактура выставляется отдельно, но должен
+     * покупатель всё равно с налогом.
+     */
+    const { buildUpdHtml } = require('./lib/upd');
+    const s2 = await dsK.issueDocument(uK.id, {
+      type: 'upd', cpId: cpK, date: '2026-09-20', skipQuota: true,
+      items: [{ name: 'Работы', qty: 1, price: 100000, unit: 'шт' }],
+      extra: { status: 2, advDoc: '' },
+    });
+    ok(s2.ok, 'УПД статуса 2 выписывается плательщиком НДС', s2.message);
+    const s2doc = bdbK.getDoc(uK.id, s2.doc.id);
+    ok(s2doc.total === 122000, 'в журнале лежит сумма с налогом', String(s2doc.total));
+    const s2html = buildUpdHtml({
+      org: bdbK.getDefaultOrg(uK.id),
+      cp: bdbK.getCp(uK.id, cpK),
+      doc: { ...s2doc.payload, number: s2doc.number, date: s2doc.date },
+    });
+    const noSpace = (s) => s.replace(/[\s  ]/g, '');
+    ok(noSpace(s2html).includes('122000,00'), 'и ровно она напечатана на бланке');
+    ok(noSpace(s2html).includes('22000,00'), 'сумма налога в бланке выделена');
+    ok(!/без НДС/.test(s2html), 'и «без НДС» у плательщика больше не печатается');
+
+    /*
+     * А самозанятому налог не выделяется вовсе — и в долг он тоже не идёт.
+     * Ставку он мог выбрать: экраны «Самозанятость» и «НДС» независимы.
+     */
+    const npdU = bdbK.getOrCreateUser(880202);
+    bdbK.saveMyOrg(npdU.id, { name: 'ИП Петров', inn: '770123456789' });
+    const npdOrg = bdbK.getDefaultOrg(npdU.id);
+    bdbK.updateOrg(npdU.id, npdOrg.id, { vat_rate: '22', npd: 1 });
+    const npdCp = bdbK.createCp(npdU.id, { name: 'ООО «Заказчик»', inn: '7707654321', kind: 'customer', opening_date: '2026-01-01' });
+    // УПД самозанятому не выписывается (Р20) — проверяем то же самое на акте.
+    const npdDoc = await dsK.issueDocument(npdU.id, {
+      type: 'usl', cpId: npdCp, date: '2026-09-20', skipQuota: true,
+      items: [{ name: 'Работы', qty: 1, price: 100000, unit: 'шт' }],
+    });
+    if (npdDoc.ok) {
+      const nd = bdbK.getDoc(npdU.id, npdDoc.doc.id);
+      ok(nd.total === 100000, 'самозанятому налог в долг не приписан', String(nd.total));
+      ok(nd.payload.vatRate == null, 'и ставка в документе обнулена', String(nd.payload.vatRate));
+    } else {
+      ok(false, 'акт самозанятого выписывается', npdDoc.message);
+    }
+
+    /*
+     * Статус 1, попрошенный явно — кнопкой «Статус 1» в боте или полем status
+     * в приложении, — проходил мимо правила: самозанятый получал счёт-фактуру,
+     * а по п. 5 ст. 173 НК за выставленный счёт-фактуру платят налог. Теперь
+     * УПД ему не выписывается вовсе, с любым статусом.
+     */
+    const npdS1 = await dsK.issueDocument(npdU.id, {
+      type: 'upd', cpId: npdCp, date: '2026-09-20', skipQuota: true,
+      extra: { status: 1, vatRate: 22, priceIncludesVat: false },
+      items: [{ name: 'Работы', qty: 1, price: 1000, unit: 'шт' }],
+    });
+    ok(!npdS1.ok && npdS1.reason === 'npd',
+      'явно попрошенный УПД со статусом 1 самозанятому не выписывается',
+      npdS1.ok ? bdbK.getDoc(npdU.id, npdS1.doc.id).payload.status : npdS1.message);
+    const npdOrgNow = bdbK.getDefaultOrg(npdU.id);
+    const npdDog = require('./lib/dogovor').buildDogovorHtml({
+      org: npdOrgNow, cp: { name: 'ООО «Заказчик»' },
+      doc: { number: '1', date: '2026-09-20', subject: 'работы', price: 100000 },
+    });
+    ok(!/НДС 22%/.test(npdDog) && /профессиональный доход/.test(npdDog),
+      'в договоре самозанятого нет «НДС 22%», есть оговорка про НПД',
+      (/[^.]*НДС[^.]*\./.exec(npdDog) || [''])[0].replace(/\s+/g, ' ').slice(0, 120));
+    ok(/профессиональный доход/.test(require('./lib/doc-html').usnNote(npdOrgNow)),
+      'и в накладной с УПД оговорка про НПД печатается, хоть ставка и выбрана');
+
+    /*
+     * Город — из адреса. Раньше всем печаталось «г. Ижевск»: московское ООО
+     * подписывало договор, заключённый в Ижевске.
+     */
+    const dogIn = (address) => require('./lib/dogovor').buildDogovorHtml({
+      org: { name: 'ООО «Альфа»', inn: '7707083893', address }, cp: { name: 'ООО «Бета»' },
+      doc: { number: '1', date: '2026-09-20', subject: 'работы' },
+    });
+    ok(dogIn('123456, г. Москва, ул. Тверская, д. 1').includes('г. Москва ·'),
+      'договор московской фирмы заключён в Москве');
+    ok(dogIn('Удмуртская Респ, г Ижевск, ул Пушкинская, д 1').includes('г. Ижевск ·'),
+      'адрес в записи ФНС («г Ижевск») тоже понятен');
+    ok(!dogIn('').includes('г. '), 'без адреса город не выдумывается');
+
+    /*
+     * Без платёжки авансового счёта-фактуры не бывает.
+     *
+     * Строка 5 обязательна (п. 5.1 ст. 169 НК): документ выставляется на
+     * ПОЛУЧЕННЫЕ деньги, и без ссылки на платёжное поручение налоговая не
+     * свяжет его с поступлением. Раньше на её месте печатался прочерк — то
+     * есть выдавался заведомо дефектный документ, а покупатель узнавал об
+     * отказе в вычете уже от своей инспекции.
+     */
+    const noPay = await dsK.issueFlat(uK.id, {
+      type: 'avans', cpId: cpK, date: '2026-09-02', skipQuota: true, total: 50000,
+      payload: { sum: 50000, vatRate: 22, subject: 'Предоплата' },
+    });
+    ok(!noPay.ok && noPay.reason === 'payDoc', 'без платёжного поручения аванс не выписывается',
+      `${noPay.ok} / ${noPay.reason}`);
+    ok(/вычет/.test(noPay.message || ''), 'и объяснено, чем это грозит покупателю', noPay.message);
+
+    // Номера граф в бланке — по действующей форме: наименование это 1а, а не 1.
+    const { buildAvansHtml } = require('./lib/avans');
+    const avHtml = buildAvansHtml({
+      org: bdbK.getDefaultOrg(uK.id),
+      cp: bdbK.getCp(uK.id, cpK),
+      doc: { number: '1', date: '2026-09-01', sum: 100000, vatRate: 22, payDoc: '№ 55 от 01.09.2026' },
+    });
+    ok(/<div class="gr">1а<\/div>/.test(avHtml), 'наименование стоит в графе 1а');
+    ok(!/<div class="gr">1<\/div>/.test(avHtml), 'графы 1 в бланке нет — с 2021 года там «№ п/п»');
+
+    /*
+     * Строка 5б подтягивается сама — ради этого связь и заводилась.
+     * С 1 апреля 2026 отгрузочный счёт-фактура обязан ссылаться на авансовый
+     * (постановление № 26 от 23.01.2026).
+     */
+    const shK = await dsK.issueDocument(uK.id, {
+      type: 'upd', cpId: cpK, date: '2026-09-05', skipQuota: true,
+      items: [{ name: 'Монтаж', qty: 1, price: 150000 }],
+    });
+    const pK = bdbK.getDoc(uK.id, shK.doc.id).payload;
+    ok(pK.advDoc === `№ ${av.doc.number} от 01.09.2026`,
+      'отгрузка сама сослалась на аванс в строке 5б', pK.advDoc);
+
+    // Второй раз тот же аванс закрывать нельзя — он уже закрыт.
+    ok(bdbK.openAdvances(uK.id, cpK).length === 0,
+      'закрытый аванс больше не предлагается', bdbK.openAdvances(uK.id, cpK).length);
+
+    /*
+     * И повтор этой отгрузки не тащит за собой ссылку на аванс.
+     *
+     * И «Повторить», и ежемесячное повторение брали payload целиком, минус
+     * позиции. Настройки так и надо переносить — ставку, статус УПД, договор.
+     * Но строка 5б уходит в книгу продаж (графа 11а), и повтор закрывал бы
+     * тот же аванс второй раз: у покупателя один вычет, у продавца две
+     * записи, АСК НДС-2 сводит это в расхождение обеим сторонам. Заодно не
+     * переносим отметку «Исправление № N от…»: повтор родился бы
+     * исправлением документа, к которому не имеет отношения.
+     */
+    const reuse = dsK.reusablePayload({ ...pK, fix: { no: 2, date: '2026-09-06' } });
+    ok(!('advDoc' in reuse.extra), 'повтор не уносит с собой ссылку на аванс',
+      JSON.stringify(reuse.extra.advDoc));
+    ok(!('fix' in reuse.extra), 'и отметку об исправлении тоже не уносит');
+    ok(reuse.items.length === 1 && Number(reuse.extra.status) === 1,
+      'а позиции и статус УПД переносятся — их человек уже задал',
+      `${reuse.items.length} поз., статус ${reuse.extra.status}`);
+
+    /*
+     * Живьём — на отдельном человеке, чтобы не портить книгу продаж выше.
+     * Открытых авансов у него нет вовсе, значит и строки 5б быть не должно.
+     */
+    const uR = bdbK.getOrCreateUser(779070);
+    bdbK.saveMyOrg(uR.id, { name: 'ООО «Повтор»', inn: '7701234567' });
+    bdbK.updateOrg(uR.id, bdbK.getDefaultOrg(uR.id).id, { vat_rate: '22' });
+    const cpR = bdbK.createCp(uR.id, { name: 'ООО «Покупатель»', kind: 'customer', opening_date: '2026-01-01' });
+    const repK = await dsK.issueDocument(uR.id, {
+      type: 'upd', cpId: cpR, date: '2026-09-20', skipQuota: true,
+      items: reuse.items, extra: reuse.extra,
+    });
+    const pRep = bdbK.getDoc(uR.id, repK.doc.id).payload || {};
+    ok(!pRep.advDoc, 'повторный УПД вышел без чужой строки 5б', pRep.advDoc);
+
+    /*
+     * Частичный зачёт и год в номере.
+     *
+     * Зачёт был «всё или ничего»: отгрузка на 60 000 в счёт аванса на
+     * 100 000 закрывала его целиком, и остаток 40 000 из строки 5б следующей
+     * отгрузки пропадал — НДС с этой части не принимался к вычету (п. 8
+     * ст. 171 НК), то есть налог оставался переплаченным.
+     *
+     * А закрытость искалась подстрокой «№ N » без года, хотя нумерация
+     * сквозная ПО ГОДАМ: аванс № 1 за прошлый год гасился отгрузкой,
+     * сославшейся на № 1 за нынешний.
+     */
+    const uP = bdbK.getOrCreateUser(880303);
+    bdbK.saveMyOrg(uP.id, { name: 'ООО «Часть»', inn: '7701234567' });
+    bdbK.updateOrg(uP.id, bdbK.getDefaultOrg(uP.id).id, { vat_rate: '22' });
+    const cpP = bdbK.createCp(uP.id, { name: 'ООО «Пок»', inn: '7707654321', kind: 'customer', opening_date: '2025-01-01' });
+
+    const avP = await dsK.issueFlat(uP.id, {
+      type: 'avans', cpId: cpP, date: '2026-03-01', skipQuota: true, total: 100000,
+      payload: { sum: 100000, vatRate: 22, subject: 'Предоплата', payDoc: '№ 9 от 01.03.2026' },
+    });
+    ok(avP.ok, 'аванс на 100 000 выписан', avP.message);
+    const openP = bdbK.openAdvances(uP.id, cpP);
+    ok(openP.length === 1 && openP[0].left === 100000, 'весь аванс пока открыт',
+      JSON.stringify(openP.map((x) => x.left)));
+
+    // Отгружаем на 60 000 в счёт этого аванса.
+    await dsK.issueDocument(uP.id, {
+      type: 'upd', cpId: cpP, date: '2026-03-10', skipQuota: true,
+      items: [{ name: 'Часть работ', qty: 1, price: 60000, unit: 'шт' }],
+      extra: { status: 1, vatRate: null, advDoc: `№ ${avP.doc.number} от 01.03.2026` },
+    });
+    const afterP = bdbK.openAdvances(uP.id, cpP);
+    ok(afterP.length === 1 && afterP[0].left === 40000,
+      'после частичной отгрузки в авансе осталось 40 000',
+      JSON.stringify(afterP.map((x) => x.left)));
+
+    // И ссылка на номер другого года чужой аванс не гасит.
+    const avOld = await dsK.issueFlat(uP.id, {
+      type: 'avans', cpId: cpP, date: '2025-05-01', skipQuota: true, total: 7000,
+      payload: { sum: 7000, vatRate: 22, subject: 'Прошлогодний', payDoc: '№ 1 от 01.05.2025' },
+    });
+    if (avOld.ok) {
+      const openBoth = bdbK.openAdvances(uP.id, cpP);
+      ok(openBoth.some((x) => x.year === 2025 && x.left === 7000),
+        'прошлогодний аванс живёт своей жизнью и не гасится номером этого года',
+        JSON.stringify(openBoth.map((x) => `${x.year}:${x.number}:${x.left}`)));
+    } else {
+      ok(false, 'прошлогодний аванс выписывается', avOld.message);
+    }
+
+    const ksfK = await dsK.issueFlat(uK.id, {
+      type: 'ksf', cpId: cpK, date: '2026-09-10', skipQuota: true, total: 20000,
+      payload: { vatRate: 22, base: { number: shK.doc.number, date: '2026-09-05' },
+        reason: 'Соглашение № 3',
+        lines: [{ name: 'Монтаж', before: { qty: 1, price: 150000 }, after: { qty: 1, price: 130000 } }] },
+    });
+    ok(ksfK.ok, 'корректировочный счёт-фактура выписывается', ksfK.message);
+
+    /*
+     * Реквизиты бланка КСФ. Адресов сторон в нём не было вовсе, хотя строки
+     * 2а и 6а обязательны, а налоговая сверяет корректировочный с исходным:
+     * расхождение по составу реквизитов — повод для требования пояснений
+     * обеим сторонам. Заодно следим за шириной строк: колонки добавлялись,
+     * и разъехавшаяся таблица — первое, что при этом ломается.
+     */
+    const { buildKsfHtml } = require('./lib/ksf');
+    bdbK.updateOrg(uK.id, bdbK.getDefaultOrg(uK.id).id, { address: 'Москва, ул. Ленина, 1' });
+    bdbK.updateCp(uK.id, cpK, { address: 'Тула, ул. Мира, 5' });
+    const ksfHtml = buildKsfHtml({
+      org: bdbK.getDefaultOrg(uK.id),
+      cp: bdbK.getCp(uK.id, cpK),
+      doc: { number: '1', date: '2026-09-10', vatRate: 22, reason: 'Соглашение № 3',
+        lines: [{ name: 'Монтаж', unit: 'усл.', before: { qty: 1, price: 150000 }, after: { qty: 1, price: 130000 } }] },
+    });
+    ok(/Москва, ул\. Ленина, 1/.test(ksfHtml), 'адрес продавца в КСФ есть');
+    ok(/Тула, ул\. Мира, 5/.test(ksfHtml), 'адрес покупателя в КСФ есть');
+    ok(/усл\./.test(ksfHtml), 'единица измерения в строке есть');
+    {
+      const head = (ksfHtml.match(/<thead>[\s\S]*?<\/thead>/) || [''])[0];
+      const wide = (head.match(/<th[ >]/g) || []).length;
+      const body = (ksfHtml.match(/<tbody>[\s\S]*?<\/tbody>/) || [''])[0];
+      const bad = (body.match(/<tr[\s\S]*?<\/tr>/g) || []).filter((tr) => {
+        const cells = (tr.match(/<td/g) || []).length;
+        const span = Number((tr.match(/colspan="(\d+)"/) || [])[1] || 1);
+        return cells + span - 1 !== wide;
+      });
+      ok(wide === 9 && !bad.length, 'все строки таблицы КСФ одной ширины',
+        `шапка ${wide}, кривых строк ${bad.length}`);
+    }
+
+    // --- книга продаж ---
+    const docsK = bdbK.listDocs(uK.id, 50)
+      .map((d) => ({ ...d, cpName: 'ООО «Покупатель»', cpInn: '7707654321' }));
+    const rows = docsK.map(bookRow).filter(Boolean);
+    ok(rows.length === 2, 'в книгу продаж пошли ровно два документа', rows.length);
+    ok(rows.some((r) => r.code === '01' && r.vat === 33000), 'отгрузка — код 01',
+      JSON.stringify(rows.find((r) => r.code === '01')));
+    ok(rows.some((r) => r.code === '02' && r.vat === 18032.79), 'аванс — код 02',
+      JSON.stringify(rows.find((r) => r.code === '02')));
+    ok(!rows.some((r) => r.code === '18'),
+      'корректировка на УМЕНЬШЕНИЕ в книгу продаж не идёт — её место в книге покупок');
+
+    /*
+     * Корректировка на увеличение — наоборот, идёт, и кодом 01, а не 18.
+     *
+     * 18 в перечне ФНС (приказ № ММВ-7-3/136@) — это уменьшение, запись книги
+     * ПОКУПОК. Покупатель по тому же документу поставит 01; АСК НДС-2 сводит
+     * пары по коду, и при 18 пара не сойдётся у обеих сторон сразу.
+     */
+    const upRow = bookRow({ type: 'ksf', number: '2', date: '2026-09-11',
+      payload: { vatRate: 22, lines: [{ before: { qty: 1, price: 100 }, after: { qty: 1, price: 200 } }] } });
+    ok(upRow && upRow.code === '01' && upRow.vat === 22, 'корректировка на увеличение — код 01',
+      JSON.stringify(upRow));
+
+    const bufK = await buildKnigaProdazh({
+      org: bdbK.getDefaultOrg(uK.id), docs: docsK, from: '2026-09-01', to: '2026-09-30',
+    });
+    ok(bufK.length > 4000, 'файл книги продаж собирается', `${Math.round(bufK.length / 1024)} КБ`);
+
+    /*
+     * Каждый документ — в свою графу.
+     *
+     * В приложении 5 к постановлению № 1137 это разные графы: 3 — номер и
+     * дата счёта-фактуры, 4 — его исправления, 5 — корректировочного. Мы же
+     * писали номер любого документа в графу 3, и корректировочный ложился
+     * туда, где инспекция ждёт обычный счёт-фактуру. АСК НДС-2 сводит пары
+     * именно по этим графам: у покупателя корректировочный в своей, у нас в
+     * чужой — пара не сходится, и требование пояснений приходит обеим.
+     */
+    {
+      const ExcelJSK = require('exceljs');
+      const cpK2 = { cpName: 'ООО «Заря»', cpInn: '7707654321' };
+      const mix = [
+        { ...cpK2, type: 'upd', number: '10', date: '2026-09-01',
+          payload: { status: 1, vatRate: 22, items: [{ name: 'Т', qty: 1, price: 100000 }] } },
+        { ...cpK2, type: 'ksf', number: '2', date: '2026-09-10',
+          payload: { vatRate: 22, base: { number: '10', date: '2026-09-01' },
+            lines: [{ before: { qty: 1, price: 100000 }, after: { qty: 1, price: 120000 } }] } },
+        { ...cpK2, type: 'upd', number: '11', date: '2026-09-15',
+          payload: { status: 1, vatRate: 22, items: [{ name: 'Т', qty: 1, price: 50000 }],
+            fix: { no: 1, date: '2026-09-16' } } },
+      ];
+      const wbK = new ExcelJSK.Workbook();
+      await wbK.xlsx.load(await buildKnigaProdazh({
+        org: { name: 'ООО «Мы»', inn: '7701234567' }, docs: mix,
+        from: '2026-09-01', to: '2026-09-30',
+      }));
+      const wsK = wbK.getWorksheet('Книга продаж');
+      const grafa = wsK.getRow(5);
+      /** Значение по НОМЕРУ графы, а не по позиции: колонки ещё поедут. */
+      const g = (row, no) => {
+        for (let c = 1; c <= wsK.columnCount; c += 1) {
+          if (String(grafa.getCell(c).value) === no) return wsK.getRow(row).getCell(c).value;
+        }
+        return undefined;
+      };
+      ok(g(6, '3') === '10 от 01.09.2026' && !g(6, '5'),
+        'обычный счёт-фактура стоит в графе 3', `3=${g(6, '3')} 5=${g(6, '5')}`);
+      ok(g(7, '5') === '2 от 10.09.2026',
+        'корректировочный — в графе 5, а не в третьей', `5=${g(7, '5')}`);
+      ok(g(7, '3') === '10 от 01.09.2026',
+        'а в графе 3 у него исходный счёт-фактура — тот, что корректируем',
+        `3=${g(7, '3')}`);
+      ok(g(8, '4') === '1 от 16.09.2026',
+        'исправление — в графе 4: номер и дата документа при нём не меняются',
+        `4=${g(8, '4')}`);
+      // Суммы после появления новых граф обязаны остаться в графах своей
+      // ставки: смещение здесь молча уводит выручку в соседнюю колонку.
+      ok(g(6, '14') === 100000 && g(6, '17') === 22000,
+        'и суммы не уехали: стоимость и налог по ставке 22% на своих местах',
+        `14=${g(6, '14')} 17=${g(6, '17')}`);
+    }
+
+    /*
+     * И она доступна человеку из бота, а не только из кода.
+     *
+     * Ставку тестовому пользователю ставим явно: у него она сброшена в «без
+     * НДС» предыдущим разделом, а книга продаж неплательщику не положена — бот
+     * в этом случае честно отказывает, и проверять надо не отказ.
+     */
+    const orgFx = bdbK.getDefaultOrg(fxUserId());
+    bdbK.updateOrg(fxUserId(), orgFx.id, { vat_rate: '22' });
+    files.length = 0;
+    await tap('reg');
+    ok(button('Книга продаж') === 'kniga.p:quarter', 'в отчётах есть книга продаж',
+      button('Книга продаж'));
+    await tap('kniga.p:quarter');
+    ok(files.length === 1 && /Книга_продаж/.test(files[0].filename),
+      'и она приходит файлом', files.length ? files[0].filename : '—');
+    ok(/Счетов-фактур/.test((files[0] || {}).caption || ''), 'с итогом по налогу в подписи',
+      ((files[0] || {}).caption || '').slice(0, 60));
+
+    // Неплательщику книга не положена — и бот объясняет почему, а не молчит.
+    bdbK.updateOrg(fxUserId(), orgFx.id, { vat_rate: '' });
+    files.length = 0;
+    await tap('kniga.p:quarter');
+    ok(files.length === 0 && /без НДС/.test(last()),
+      'на «без НДС» книга не собирается, и сказано почему', last().slice(0, 70));
+
+    // Счёт-фактуру не выписывает тот, кто не плательщик НДС.
+    bdbK.updateOrg(uK.id, bdbK.getDefaultOrg(uK.id).id, { npd: 1 });
+    const npdTry = await dsK.issueFlat(uK.id, { type: 'avans', cpId: cpK, skipQuota: true,
+      total: 1000, payload: { sum: 1000, vatRate: 22 } });
+    ok(!npdTry.ok && npdTry.reason === 'npd',
+      'самозанятому счёт-фактуру на аванс не выписать', npdTry.message);
+    bdbK.updateOrg(uK.id, bdbK.getDefaultOrg(uK.id).id, { npd: 0 });
+
+    // --- назначение платежа против ставки документа ---
+    ok(/20%.*22%/.test(vatMismatch('Оплата по счёту 5, в том числе НДС 20%', { rate: 22, vat: 27000 })),
+      'прошлогодний НДС в назначении замечен',
+      vatMismatch('Оплата по счёту 5, в том числе НДС 20%', { rate: 22, vat: 27000 }));
+    ok(vatMismatch('Оплата по счёту 5, в том числе НДС 22%', { rate: 22, vat: 27000 }) === '',
+      'совпадающая ставка не тревожит зря');
+    ok(vatMismatch('Оплата по счёту 5', { rate: 22, vat: 27000 }) === '',
+      'про налог не написано — молчим');
+    ok(/без НДС/.test(vatMismatch('Оплата, без НДС', { rate: 22, vat: 27000 })),
+      '«без НДС» при ставке в документе — расхождение');
+    ok(/НДС 22%.*без НДС/.test(vatMismatch('Оплата, НДС 22%', { rate: null, vat: null })),
+      'и наоборот тоже', vatMismatch('Оплата, НДС 22%', { rate: null, vat: null }));
+    ok(/сумма НДС/.test(vatMismatch('Оплата, в т.ч. НДС 22% - 1000,00', { rate: 22, vat: 27000 })),
+      'разошлась сумма налога — тоже видно',
+      vatMismatch('Оплата, в т.ч. НДС 22% - 1000,00', { rate: 22, vat: 27000 }));
+  }
+
+  console.log('\n── экраны счетов-фактур в боте ──');
+  {
+    /*
+     * Проверяем путь, каким его проходит человек, а не только расчёт: до сих
+     * пор формы и книга существовали, а нажать было негде.
+     */
+    const bdbE = require('./lib/bot-db');
+    const uidE = fxUserId();
+    const orgE = bdbE.getDefaultOrg(uidE);
+    bdbE.updateOrg(uidE, orgE.id, { vat_rate: '22', npd: 0 });
+    const cpE = bdbE.createCp(uidE, { name: 'ООО «Экранов»', inn: '7707654321', kind: 'customer', opening_date: '2026-01-01' });
+
+    // --- аванс ---
+    await tap(`cp:${cpE}`);
+    ok(button('СФ на аванс') === `d.av:${cpE}`, 'в карточке клиента есть кнопка аванса', button('СФ на аванс'));
+
+    files.length = 0;
+    await tap(`d.av:${cpE}`);
+    ok(/расчётной ставкой 22\/122/.test(last()), 'бот сразу объясняет про расчётную ставку', last().slice(0, 90));
+    await say('100000');
+    ok(norm(last()).includes('18 032,79'), 'и показывает выделенный налог до выпуска', norm(last()).slice(0, 80));
+    ok(/строки 5/.test(last()), 'тут же просит платёжку и говорит зачем', last().slice(-90));
+    await say('№ 55 от 01.09.2026');
+    ok(/За что предоплата/.test(last()), 'потом спрашивает назначение', last().slice(0, 60));
+    await say('Монтаж по договору 7');
+    ok(files.length === 1 && /СФ_аванс/.test(files[0].filename), 'счёт-фактура на аванс пришёл файлом',
+      files.length ? files[0].filename : '—');
+    ok(/18 032,79/.test(norm(files[0].caption || '')), 'в подписи — сумма налога',
+      norm(files[0].caption || '').slice(0, 70));
+
+    // --- отгрузка подхватывает аванс в строку 5б ---
+    const docsBeforeShip = bdbE.listDocs(uidE, 200).length;
+    await tap(`d.upd:${cpE}`);
+    await tap(`upd.s1:${cpE}`);
+    await tap(`upd.r:${cpE}:22`);
+    await tap(`upd.g:${cpE}:22:0`);
+    await say('Монтаж; 1; 150000');
+    await tap('items.done');
+    await tap('doc.make');
+    ok(bdbE.listDocs(uidE, 200).length === docsBeforeShip + 1, 'УПД выписан');
+    const shipE = bdbE.listDocs(uidE, 1)[0];
+    // Дата в ссылке — та, которой выписан аванс (сегодня), а не выдуманная:
+    // проверяем сам факт ссылки и её вид, а не конкретное число.
+    ok(/^№ \d+ от \d{2}\.\d{2}\.\d{4}$/.test(String((shipE.payload || {}).advDoc || '')),
+      'строка 5б заполнилась сама ссылкой на аванс', (shipE.payload || {}).advDoc);
+
+    // --- исправление ---
+    await tap(`doc:${shipE.id}`);
+    ok(button('исправление') || button('Исправление'), 'у счёта-фактуры есть кнопка исправления',
+      button('исправление') || button('Исправление'));
+    files.length = 0;
+    await tap(`doc.fix:${shipE.id}`);
+    ok(files.length === 1, 'исправление пришло файлом', files.length);
+    // Файл выходит PDF, и искать текст в нём ненадёжно. Пометку проверяем на
+    // самом бланке — это тот же код, которым его собрали.
+    const { buildUpdHtml } = require('./lib/upd');
+    const fixHtml = buildUpdHtml({
+      org: { name: 'ООО «Мы»', inn: '7701234567' }, cp: { name: 'ООО «Они»', inn: '7707654321' },
+      doc: { number: '7', date: '2026-09-05', status: 1, vatRate: 22,
+        items: [{ name: 'Т', qty: 1, price: 100 }], fix: { no: 1, date: '2026-09-05' } },
+    });
+    ok(/ИСПРАВЛЕНИЕ № 1 от 05\.09\.2026/.test(fixHtml), 'в бланке печатается пометка исправления',
+      (fixHtml.match(/ИСПРАВЛЕНИЕ[^<]*/) || [])[0]);
+    /*
+     * И оно доходит до строки 1а. Раньше там всегда стояло «№ — от —»: бланк
+     * печатал пометку сверху и отрицал её ниже. Для налоговой значение имеет
+     * именно 1а, так что прочерк в ней означал «исправлений нет».
+     */
+    ok(/Исправление № 1 от 05\.09\.2026/.test(fixHtml), 'и попадает в строку 1а, а не только в шапку',
+      (fixHtml.match(/Исправление[^<]*/) || [])[0]);
+    ok(!/ИСПРАВЛЕНИЕ/.test(buildUpdHtml({
+      org: { name: 'ООО «Мы»', inn: '7701234567' }, cp: { name: 'ООО «Они»', inn: '7707654321' },
+      doc: { number: '7', date: '2026-09-05', status: 1, vatRate: 22, items: [{ name: 'Т', qty: 1, price: 100 }] },
+    })), 'а у обычного счёта-фактуры её нет');
+    const afterFix = bdbE.getDoc(uidE, shipE.id);
+    ok(Number(((afterFix.payload || {}).fix || {}).no) === 1,
+      'документ запомнил, что был исправлен', JSON.stringify((afterFix.payload || {}).fix));
+    ok(afterFix.number === shipE.number && afterFix.date === shipE.date,
+      'номер и дата счёта-фактуры при исправлении НЕ меняются');
+
+    // --- корректировочный ---
+    files.length = 0;
+    await tap(`d.ksf:${cpE}`);
+    ok(button(`№ ${shipE.number}`) === `ksf.b:${shipE.id}`, 'предлагает выбрать исходный счёт-фактуру',
+      button(`№ ${shipE.number}`));
+    await tap(`ksf.b:${shipE.id}`);
+    ok(/Было:/.test(last()) && /150000/.test(last()), 'показывает, что было', last().slice(0, 90));
+    await say('Монтаж; 1; 130000');
+    ok(/основании/.test(last()), 'спрашивает основание изменения', last().slice(0, 60));
+    await say('Соглашение № 3 от 04.09.2026');
+    ok(files.length === 1 && /КСФ/.test(files[0].filename), 'корректировочный пришёл файлом',
+      files.length ? files[0].filename : '—');
+    ok(/книгу покупок/.test(files[0].caption || ''),
+      'и сказано, что уменьшение идёт в книгу покупок', (files[0].caption || '').slice(-60));
+
+    // Число строк должно совпадать — иначе непонятно, что с чем сравнивать.
+    await tap(`d.ksf:${cpE}`);
+    await tap(`ksf.b:${shipE.id}`);
+    await say('Монтаж; 1; 130000\nЛишняя; 1; 100');
+    ok(/в том же порядке/.test(last()), 'лишняя строка отклоняется с объяснением', last().slice(0, 80));
+    await tap('menu');
+
+    // --- неплательщику ничего этого не показывается ---
+    bdbE.updateOrg(uidE, orgE.id, { vat_rate: '' });
+    await tap(`cp:${cpE}`);
+    ok(!button('СФ на аванс'), 'на «без НДС» кнопок счетов-фактур нет вовсе');
+    bdbE.updateOrg(uidE, orgE.id, { vat_rate: '22' });
+
+    bdbE.updateOrg(uidE, orgE.id, { npd: 1 });
+    await tap(`d.av:${cpE}`);
+    ok(/Самозанятый/.test(last()), 'самозанятому объясняют, почему нельзя', last().slice(0, 70));
+    bdbE.updateOrg(uidE, orgE.id, { npd: 0, vat_rate: '' });
+  }
+
+  console.log('\n── акт услуг: столбец сходится с итогом ──');
+  {
+    /*
+     * Строки печатали qty × price, а ИТОГО брало сумму с налогом: при 22%
+     * сверху столбец давал 1 000,00, ИТОГО — 1 220,00, и лишние 220 рублей
+     * появлялись из ниоткуда. Слова «НДС» в акте не было вовсе, так что
+     * объяснить расхождение было нечем — а подписывает акт живой человек,
+     * и первым делом он складывает столбец.
+     */
+    const { buildAktUslugHtml } = require('./lib/akt-uslug');
+    const plain = (rate, gross) => buildAktUslugHtml({
+      org: { name: 'ООО «Мы»', full_name: 'ООО «Мы»', inn: '7701234567' },
+      cp: { name: 'ООО «Они»', inn: '7707654321' },
+      doc: { number: '1', date: '2026-09-04', vatRate: rate, priceIncludesVat: gross,
+        items: [{ name: 'Услуга', qty: 1, unit: 'усл.', price: 1000 }] },
+    }).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+
+    const over = plain(22, false);
+    ok(/Итого: 1 000,00/.test(norm(over)), 'при налоге сверху «Итого» равно столбцу, а не сумме с налогом',
+      (norm(over).match(/Итого: [\d ,]+/) || [])[0]);
+    ok(/НДС \(22%\): 220,00/.test(norm(over)), 'налог назван отдельной строкой');
+    ok(/Всего к оплате: 1 220,00/.test(norm(over)), 'и «Всего к оплате» показывает сумму с налогом');
+    // «Плюс», а не «в том числе»: при налоге сверху он прибавлен к сумме, а
+    // не сидит внутри неё. Обратное было бы прямой неправдой в документе,
+    // который подписывает живой человек.
+    ok(/плюс НДС 22% — 220,00/.test(norm(over)), 'словами сказано «плюс», а не «в том числе»',
+      (norm(over).match(/на сумму:.{0,90}/) || [])[0]);
+
+    const inc = plain(22, true);
+    ok(/Итого: 1 000,00/.test(norm(inc)) && /В том числе НДС \(22%\): 180,33/.test(norm(inc)),
+      'при ценах с НДС налог выделяется из суммы, а столбец не меняется');
+    ok(/в т\.ч\. НДС 22% — 180,33/.test(norm(inc)), 'и словами — «в т.ч.»',
+      (norm(inc).match(/на сумму:.{0,90}/) || [])[0]);
+
+    ok(/без НДС/.test(plain(null, false)) && !/ИТОГО: 1 220/.test(plain(null, false)),
+      'без ставки акт остаётся прежним');
+  }
+
+  console.log('\n── ставка из кнопки проверяется, как и из сети ──');
+  {
+    const bdbV = require('./lib/bot-db');
+    const rateNow = () => bdbV.vatOf(bdbV.getDefaultOrg(fxUserId())).rate;
+
+    /*
+     * Ставим заведомо верную ставку и лишь потом подсовываем подделки.
+     *
+     * Сравнивать «до и после» на пустой настройке бесполезно: последняя
+     * подделка «абв» превращается в null, исходное значение тоже null — и
+     * проверка сходится даже когда защиты нет вовсе. На этом моя первая
+     * редакция этого теста и попалась: мутация её не уронила.
+     */
+    await tap('vat.set:22:0');
+    ok(rateNow() === 22, 'верная ставка сохраняется', rateNow());
+
+    // callback_data подделывается кем угодно: раньше «1e9» уходило в настройку
+    // как есть и печатало в счетах «НДС 1000000000%».
+    for (const bad of ['1e9', '-20', 'абв', '99', '0.5']) {
+      await tap(`vat.set:${bad}:0`);                 // eslint-disable-line no-await-in-loop
+      ok(rateNow() === 22, `подделка «${bad}» ставку не меняет`, rateNow());
+    }
+    await tap('vat.set:none:0');                     // возвращаем как было
+  }
+
+  console.log('\n── переход на свой ключ почты не роняет ящики ──');
+  {
+    const mb = require('./lib/mailbox');
+    const { db: rawDb } = require('./db');
+    const keepKey = process.env.MAIL_KEY;
+    const keepTok = process.env.BOT_TOKEN;
+    // Исходное положение: своего ключа нет, шифруем ключом из токена — так
+    // продукт работает «из коробки», и так живёт большинство установок.
+    delete process.env.MAIL_KEY;
+    process.env.BOT_TOKEN = '111:СТАРЫЙ-ТОКЕН';
+    const mu = require('./lib/bot-db').getOrCreateUser(779050).id;
+    const saved = await mb.save(mu, {
+      host: 'smtp.x.ru', port: 587, secure: 0, login: 'me@x.ru', pass: 'СЕКРЕТ-123',
+      from: 'me@x.ru', fromName: 'Я', imapHost: 'imap.x.ru',
+    });
+    ok(saved.ok, 'ящик подключён без своего ключа', saved.ok ? '' : saved.error);
+    const encBefore = (rawDb.prepare('SELECT pass_enc FROM mailboxes WHERE user_id = ?').get(mu) || {}).pass_enc;
+
+    /*
+     * Владелец делает то, что мы советуем, — задаёт свой ключ. Без мягкого
+     * перехода пароли всех подключённых ящиков разом перестали бы читаться,
+     * и верный совет наказывал бы того, кто ему последовал.
+     */
+    process.env.MAIL_KEY = 'своя-длинная-случайная-строка-для-прогона';
+    const got = mb.resolve(mu);
+    ok(got.ok && got.options.pass === 'СЕКРЕТ-123',
+      'после задания своего ключа пароль по-прежнему читается', got.ok ? 'да' : got.reason);
+    const encAfter = (rawDb.prepare("SELECT pass_enc FROM mailboxes WHERE user_id = ?").get(mu) || {}).pass_enc;
+    ok(encAfter !== encBefore, 'и запись перешифрована новым ключом, а не оставлена как была');
+
+    // Ради этого всё и затевалось: отзыв токена больше не ломает почту.
+    process.env.BOT_TOKEN = '222:ОТОЗВАННЫЙ-И-ЗАМЕНЁННЫЙ';
+    const after = mb.resolve(mu);
+    ok(after.ok && after.options.pass === 'СЕКРЕТ-123',
+      'и переживает отзыв токена', after.ok ? 'да' : after.reason);
+
+    if (keepKey === undefined) delete process.env.MAIL_KEY; else process.env.MAIL_KEY = keepKey;
+    process.env.BOT_TOKEN = keepTok;
+  }
+
+  console.log('\n── снимок счёта: слова модели проверяются ──');
+  {
+    const vision = require('./lib/vision');
+    const keepP = process.env.VISION_PROVIDER; const keepM = process.env.VISION_MOCK;
+    process.env.VISION_PROVIDER = 'mock';
+    /*
+     * Снимок — единственное место, где в разбор попадает текст, написанный
+     * посторонним: бумагу присылает контрагент. ИНН оттуда идёт на сравнение
+     * с картотекой, название и номер — человеку на экран, поэтому слова
+     * модели подрезаются и проверяются по форме.
+     */
+    process.env.VISION_MOCK = JSON.stringify({
+      date: 'вчера', amount: 1000, docNo: 'A'.repeat(300), inn: '77012345',
+      name: 'Х'.repeat(900), text: 'Счёт № 5 от 01.09.2026 ИНН 7701234567 Итого 1000,00',
+    });
+    const got = await vision.readInvoice(Buffer.from('x'), 'image/png');
+    const f = (got && got.fields) || {};
+    ok(f.date === '2026-09-01', 'кривую дату от модели отбросили и взяли свою', f.date);
+    ok(f.inn === '7701234567', 'ИНН не той длины отброшен', f.inn);
+    ok(String(f.docNo).length <= 40 && String(f.name).length <= 200,
+      'номер и название подрезаны', `${String(f.docNo).length} / ${String(f.name).length}`);
+    if (keepP === undefined) delete process.env.VISION_PROVIDER; else process.env.VISION_PROVIDER = keepP;
+    if (keepM === undefined) delete process.env.VISION_MOCK; else process.env.VISION_MOCK = keepM;
+  }
+
+  console.log('\n── повторения: отмена и пропущенный день ──');
+  {
+    const rc = require('./lib/recurring');
+    const at = (s) => new Date(`${s}T12:00:00Z`);
+    const due = (day, iso2, lastOffer) => rc.isDue({ active: 1, day, last_offer: lastOffer }, at(iso2));
+    ok(due(0, '2026-08-31', '2026-07') === true, 'в последний день месяца предложение положено');
+    ok(due(0, '2026-09-01', '2026-07') === true,
+      'служба лежала в тот день — предложение догоняет, а не пропадает навсегда');
+    ok(due(0, '2026-09-01', '2026-08') === false, 'а отработанный месяц второй раз не предлагаем');
+    ok(due(0, '2026-08-30', '') === false, 'без отметки правило не срывается в любой день');
+
+    const od = (payDay, iso2, lastDue) => rc.isOverdue({ active: 1, pay_day: payDay, last_due: lastDue }, at(iso2));
+    ok(od(25, '2026-08-26', '2026-07') === true, 'на следующий день после срока — просрочка');
+    ok(od(25, '2026-09-01', '2026-07') === true, 'и первого числа про прошлый месяц скажем');
+    ok(od(25, '2026-09-01', '2026-08') === false, 'о чём уже сказали — молчим');
+    ok(od(25, '2026-09-01', '') === false,
+      'а только что заведённое правило не пугает долгом за месяц, которого не видело');
+  }
+
+  console.log('\n── предоплата ──');
+  {
+    const bdbP = require('./lib/bot-db');
+    const dsP = require('./lib/doc-service');
+    const whoP = { id: 779210, first_name: 'Предоплатов', username: 'prepay' };
+    const sayP = (t) => handleUpdate(tg, { message: { chat: { id: whoP.id }, from: whoP, text: t } });
+    const tapP = (d) => handleUpdate(tg,
+      { callback_query: { id: 'cb', from: whoP, data: d, message: { chat: { id: whoP.id } } } });
+    const uP = bdbP.getOrCreateUser(whoP.id, 'Предоплатов');
+    const bank = { bank_name: 'ПАО Сбербанк', bik: '044525225', corr_acc: '30101810400000000225' };
+    bdbP.saveMyOrg(uP.id, { name: 'ИП Обедов', inn: '183112345678', acc: '40802810900000000009', ...bank });
+    const orgA = bdbP.getDefaultOrg(uP.id).id;
+    const cpP = bdbP.createCp(uP.id, { name: 'ООО «Заводская»', kind: 'customer', opening_date: '2026-01-01' });
+    const cpPlain = bdbP.createCp(uP.id, { name: 'ООО «Обычный»', kind: 'customer', opening_date: '2026-01-01' });
+    const torg = (cp, day, price = 50000) => dsP.issueDocument(uP.id, {
+      type: 'torg12', cpId: cp, date: `2026-10-${day}`, skipQuota: true,
+      items: [{ name: 'Обеды', qty: 1, price }],
+    });
+    const bal = (cp, org) => bdbP.balanceOf(uP.id, cp, org).closing;
+    const paidAt = (r) => bdbP.getDoc(uP.id, r.doc.id).paid_at;
+
+    // Ввод предоплаты кнопкой: бот спрашивает сумму и записывает одну строку «Оплата».
+    await tapP(`pp.in:${cpP}`);
+    ok(norm(last()).includes('предоплатой'), 'кнопка «Предоплата» спрашивает сумму');
+    await sayP('140 000');
+    ok(bal(cpP) === -140000 && bdbP.prepayFor(cpP, orgA).prepay,
+      'предоплата 140 000: сальдо −140 000 и режим включён', String(bal(cpP)));
+    const prepOps = bdbP.listOps(uP.id, cpP).filter((o) => o.kind === 'Оплата' && o.doc === 'Предоплата');
+    ok(prepOps.length === 1 && prepOps[0].doc_id === 0 && prepOps[0].debit === 140000,
+      'предоплата — одна свободная строка «Оплата», не привязанная к документу');
+
+    const r1 = await torg(cpP, '01'); const r2 = await torg(cpP, '02'); const r3 = await torg(cpP, '03');
+    ok(paidAt(r1) && paidAt(r2) && !paidAt(r3), 'две накладные по 50 000 оплачены предоплатой, третья — нет');
+    ok(r1.prepaid && r2.prepaid && !r3.prepaid, 'выпуск сообщает, что списал с предоплаты');
+    ok(bal(cpP) === 10000, 'долг 10 000: сальдо положительное', String(bal(cpP)));
+    ok(r2.prepay.left === 40000 && r3.prepay.debt === 10000, 'остаток считается верно: 40 000, затем долг 10 000');
+    ok(bdbP.unpaidDocs(uP.id).filter((d) => d.cp_id === cpP).map((d) => d.id).join() === String(r3.doc.id),
+      'в «Не оплачено» только третья накладная');
+    ok(!bdbP.listOps(uP.id, cpP).some((o) => o.doc_id === r1.doc.id && o.kind === 'Оплата'),
+      'второй проводки оплаты поверх предоплаты нет (ноль = закрыто свободной оплатой)');
+
+    // Пересчёт и повторное «Оплачено» не задваивают.
+    const before = bal(cpP);
+    bdbP.rebuildDebt(uP.id); bdbP.rebuildDebt(uP.id);
+    ok(bal(cpP) === before && bdbP.listOps(uP.id, cpP).filter((o) => o.kind === 'Оплата').length === 1,
+      'rebuildDebt не задваивает оплату и не двигает сальдо');
+    bdbP.markPaid(uP.id, r1.doc.id);
+    ok(bal(cpP) === before, 'повторная отметка «оплачено» у закрытой предоплатой накладной сальдо не меняет');
+
+    // Показ.
+    await tapP(`cp:${cpP}`);
+    ok(norm(last()).includes('Предоплата закончилась, долг 10 000'), 'карточка клиента: «Предоплата закончилась, долг 10 000 ₽»');
+    await tapP('debts');
+    ok(sent.slice(-3).some((m) => norm(m.text).includes('Предоплата закончилась, долг 10 000')),
+      '«Кто должен» показывает строку про предоплату');
+
+    // «Скоро кончится»: остаток ≤ 20% последней предоплаты.
+    bdbP.addPrepay(uP.id, cpP, 100000, '2026-10-04');       // сальдо 10 000 − 100 000 = −90 000
+    const r4 = await torg(cpP, '05', 70000);                  // остаток 20 000 = 20% от 100 000
+    ok(r4.prepaid && r4.prepay.left === 20000 && r4.prepay.low,
+      'остаток 20 000 при предоплате 100 000 — «скоро кончится»', JSON.stringify(r4.prepay));
+    ok(!(await torg(cpP, '06', 30000)).prepaid, 'накладная больше остатка не дробится и остаётся неоплаченной');
+
+    // Клиент без предоплаты — по-старому.
+    const rp = await torg(cpPlain, '01');
+    ok(!rp.prepaid && !paidAt(rp) && bal(cpPlain) === 50000 && rp.prepay === null,
+      'клиент без предоплаты: накладная неоплачена, долг как раньше');
+    ok(bdbP.prepayState(uP.id, cpPlain) === null, 'у обычного клиента нет состояния предоплаты');
+    // Старая кнопка «Акт за месяц» у клиента без предоплаты: акт был бы «оплачен» при долге по накладным.
+    {
+      const before = bdbP.listDocs(uP.id, 200, cpPlain).length;
+      await tapP(`pp.act:${cpPlain}:2026-10`);
+      ok(bdbP.listDocs(uP.id, 200, cpPlain).length === before && norm(last()).includes('на предоплате'),
+        'клиенту без предоплаты акт за месяц не выписывается, бот объясняет почему', norm(last()).slice(0, 80));
+    }
+
+    // Две организации не путаются.
+    const orgB = bdbP.createOrg(uP.id, { name: 'ООО «Вторая»', inn: '7707083893', acc: '40702810900000000002', ...bank });
+    bdbP.setActiveOrg(uP.id, orgB);
+    ok(!bdbP.prepayFor(cpP, orgB).prepay && bdbP.prepayState(uP.id, cpP) === null,
+      'предоплата первой фирмы не видна во второй');
+    const rB = await torg(cpP, '07');
+    ok(!rB.prepaid && !paidAt(rB), 'во второй фирме накладная того же клиента не гасится чужой предоплатой');
+    bdbP.setActiveOrg(uP.id, orgA);
+
+    // Акт за месяц: сумма отгрузок первой фирмы, долга не добавляет.
+    const sh = bdbP.shipmentsOfMonth(uP.id, cpP, '2026-10', orgA);
+    const debtBeforeAct = bal(cpP, orgA);
+    const docsBefore = bdbP.listDocs(uP.id, 200, cpP, orgA).length;
+    await tapP(`pp.act:${cpP}`);
+    ok(button('октябрь 2026') === `pp.act:${cpP}:2026-10`, 'выбор месяца предлагает октябрь с суммой');
+    await tapP(`pp.act:${cpP}:2026-10`);
+    const act = bdbP.monthActOf(uP.id, cpP, '2026-10', orgA);
+    ok(act && act.type === 'usl' && act.total === sh.sum && sh.sum === 250000,
+      'акт услуг выписан на сумму всех отгрузок за месяц (250 000)', act ? `${act.total} / ${sh.sum}` : 'нет');
+    ok(act && act.no_debt === 1, 'акт помечен «без долга» (no_debt)');
+    ok(bal(cpP, orgA) === debtBeforeAct && !bdbP.listOps(uP.id, cpP, orgA).some((o) => o.doc_id === act.id),
+      'акт не добавил долг и не создал проводку');
+    bdbP.rebuildDebt(uP.id);
+    ok(bal(cpP, orgA) === debtBeforeAct, 'пересчёт тоже не добавляет долг по акту');
+    // Р10: акт оплачен, только когда оплачены накладные месяца. Пока нет — он виден в списке,
+    // но суммой не считается: его деньги уже лежат в накладных, второй раз их ждать нельзя.
+    {
+      const us = bdbP.unpaidSummary(uP.id);
+      const row = us.docs.find((d) => d.id === act.id);
+      ok(!row || (row.pair === true && !act.paid_at), 'акт не считается вторым долгом в «Ждут оплаты»');
+    }
+    ok(bdbP.listDocs(uP.id, 200, cpP, orgA).length === docsBefore + 1, 'выписан ровно один акт');
+    ok(sent.slice(-3).some((m) => m.kb.some((row) => row.some((b) => b.callback_data === `d.sch:${cpP}`))
+      && m.kb.some((row) => row.some((b) => b.callback_data === `d.dog:${cpP}`))),
+    'после акта предложены счёт на новую предоплату и договор');
+    await tapP(`pp.act:${cpP}:2026-10`);
+    ok(bdbP.listDocs(uP.id, 200, cpP, orgA).length === docsBefore + 1, 'повторное нажатие второй акт не выписывает');
+
+    // Накладная, пришедшая ПОСЛЕ акта, в него не вошла: во второй акт идёт она одна, а не весь месяц заново.
+    const lateShip = await torg(cpP, '20', 10000);
+    const openLate = bdbP.openShipmentsOfMonth(uP.id, cpP, '2026-10', orgA);
+    ok(openLate.docs.length === 1 && openLate.docs[0].id === lateShip.doc.id && openLate.sum === 10000,
+      'не вошедшей в акт остаётся только новая накладная (10 000)', JSON.stringify(openLate.docs.map((d) => d.id)));
+    await tapP(`pp.act:${cpP}`);
+    ok((sent[sent.length - 1].kb || []).flat().some((b) => norm(b.text).includes('10 000') && b.text.includes('после акта')),
+      'выбор месяца предлагает только остаток, с пометкой «после акта»');
+    const debtBeforeSecond = bal(cpP, orgA);
+    await tapP(`pp.act:${cpP}:2026-10`);
+    const actsOct = bdbP.monthActsOf(uP.id, cpP, '2026-10', orgA);
+    ok(actsOct.length === 2 && actsOct[1].total === 10000 && actsOct[0].total === 250000,
+      'второй акт — на 10 000, только за новую накладную; первый не тронут', actsOct.map((a) => a.total).join(' / '));
+    ok(bal(cpP, orgA) === debtBeforeSecond, 'второй акт долг тоже не меняет');
+    bdbP.rebuildDebt(uP.id);
+    ok(bal(cpP, orgA) === debtBeforeSecond && bdbP.listOps(uP.id, cpP, orgA).every((o) => !actsOct.some((a) => a.id === o.doc_id)),
+      'и пересчёт не заводит проводок по актам');
+    ok(bdbP.openShipmentsOfMonth(uP.id, cpP, '2026-10', orgA).docs.length === 0, 'теперь все отгрузки месяца в актах');
+    await tapP(`pp.act:${cpP}:2026-10`);
+    ok(bdbP.monthActsOf(uP.id, cpP, '2026-10', orgA).length === 2, 'третье нажатие акт не выписывает');
+    bdbP.deleteDoc(uP.id, actsOct[1].id);
+    ok(bdbP.openShipmentsOfMonth(uP.id, cpP, '2026-10', orgA).docs.length === 1,
+      'удалили второй акт — его накладная снова свободна для акта');
+
+    // Текстом: «предоплата 140000 от <клиент>».
+    const ai = require('./lib/ai-agent');
+    const q = ai.quickParse('предоплата 140000 от Обычный');
+    ok(q && q.action === 'pay' && q.prepay && q.amount === 140000 && /Обычный/.test(q.who),
+      'фраза «предоплата 140000 от Обычный» разбирается', JSON.stringify(q));
+    const q2 = ai.quickParse('договор с предоплатой 30%');
+    ok(!q2 || !q2.prepay, 'слово «предоплатой» внутри фразы режим не включает');
+
+    /*
+     * Где в боте предоплата. Владелец не нашёл «внести предоплату» на клиенте:
+     * кнопка называлась «Предоплата» и у обычного клиента, и у того, кто уже
+     * на предоплате. Теперь у обычного она зовёт внести, а у клиента на
+     * предоплате открывает остаток, списанные накладные и «Пополнить».
+     */
+    const kbData = () => ((sent[sent.length - 1] || {}).kb || []).flat();
+    await tapP(`cp:${cpPlain}`);
+    ok(kbData().some((b) => b.text === '💰 Внести предоплату' && b.callback_data === `pp.in:${cpPlain}`),
+      'карточка обычного клиента: кнопка «💰 Внести предоплату»', kbData().map((b) => b.text).join('|'));
+    await tapP(`cp:${cpP}`);
+    ok(kbData().some((b) => b.text === '💰 Предоплата' && b.callback_data === `pp.view:${cpP}`)
+      && kbData().some((b) => b.callback_data === `pp.act:${cpP}`),
+    'карточка клиента на предоплате: «💰 Предоплата» (остаток) и «Акт за месяц»', kbData().map((b) => b.text).join('|'));
+    await tapP(`pp.view:${cpP}`);
+    ok(/Внесено 240 000/.test(norm(last())) && /Списано накладными/.test(last()) && /Сверх предоплаты: 20 000/.test(norm(last())),
+      '«Предоплата»: внесено, списанные накладные и красная строка «сверх предоплаты»', norm(last()).slice(0, 700));
+    ok(kbData().some((b) => b.text === '➕ Пополнить' && b.callback_data === `pp.in:${cpP}`), 'и кнопка «Пополнить»');
+    await tapP(`pp.view:${cpPlain}`);
+    ok(norm(last()).includes('предоплатой') && bdbP.prepayState(uP.id, cpPlain) === null,
+      'у обычного клиента «посмотреть» сразу спрашивает сумму, ничего не включая');
+    bdbP.clearState(uP.id);
+
+    // Остаток аванса — не «мы должны ему»: карточка и «Кто должен» называют его авансом.
+    const cpAv = bdbP.createCp(uP.id, { name: 'ООО «Аванс»', kind: 'customer', opening_date: '2026-01-01' });
+    bdbP.addPrepay(uP.id, cpAv, 150000, '2026-10-01');
+    for (const d of ['01', '02', '03', '04']) await torg(cpAv, d, 24200);
+    await tapP(`cp:${cpAv}`);
+    ok(/Осталось из предоплаты: 53 200/.test(norm(last()).replace(/<[^>]+>/g, '')) && /ещё можно отгрузить/.test(last())
+      && !/мы должны ему/.test(last()) && !/Баланс:/.test(last()),
+    'карточка в боте: «Осталось из предоплаты: 53 200», без «мы должны ему»', norm(last()).slice(0, 200));
+    await tapP('debts');
+    const dbt = sent.slice(-3).map((m) => norm(m.text)).join(' ');
+    ok(/На предоплате — аванс клиентов, не долг/.test(dbt) && /Аванс[^•]*осталось 53 200/.test(dbt),
+      '«Кто должен»: клиент в разделе «На предоплате», строка «осталось 53 200»', dbt.slice(0, 300));
+    ok(!/Мы должны[^•]*Аванс/.test(dbt.replace(/На предоплате[\s\S]*/, '')), 'и не в разделе «Мы должны»');
+
+    // «Заря внесла предоплату 150000» — разбор приводит к тому же doPrepay, что и кнопка.
+    const cpZar = bdbP.createCp(uP.id, { name: 'ООО «Заря»', kind: 'customer', opening_date: '2026-01-01' });
+    await sayP('Заря внесла предоплату 150000');
+    const confirmBtn = kbData().find((b) => /^pp\.do:/.test(b.callback_data || ''));
+    if (confirmBtn) await tapP(confirmBtn.callback_data);
+    const zarOps = bdbP.listOps(uP.id, cpZar).filter((o) => o.note === 'Предоплата');
+    ok(zarOps.length === 1 && zarOps[0].debit === 150000 && !zarOps[0].doc_id && bdbP.prepayFor(cpZar, orgA).prepay
+      && bdbP.prepayState(uP.id, cpZar).left === 150000,
+    '«Заря внесла предоплату 150000»: та же запись «Предоплата», режим включён, остаток 150 000',
+    `${last().slice(0, 80)} | ${JSON.stringify(zarOps)}`);
+    ok(/Предоплата.*150 000/.test(norm(last())) || /внесена/.test(last()), 'бот ответил, что предоплата внесена', last().slice(0, 100));
+  }
+
+  console.log('\n── «Повторить»: под выданным документом, в журнале, у оплаченного ──');
+  {
+    const bdbX = require('./lib/bot-db');
+    const dsX = require('./lib/doc-service');
+    const periodX = require('./lib/period');
+    const uX = fxUserId();
+    const orgX = bdbX.currentOrg(uX).id;
+    const today = periodX.todayISO();
+    const todayRu = today.split('-').reverse().join('.');
+
+    // Свой клиент и свой счёт, выписанный через бота: блок стоит в конце прогона и не зависит от прежних шагов.
+    const cpX = bdbX.createCp(uX, { name: 'ООО «Повторный»', kind: 'customer', opening_date: '2026-01-01' });
+    await tap(`d.sch:${cpX}`);
+    await say('Услуги; 2; 1500');
+    await tap('items.done');
+    await tap('doc.make');
+
+    // 1) Кнопка стоит сразу под выданным документом (последнее сообщение — «Что дальше?»).
+    // (после него бот может спросить «чем занимаетесь», поэтому ищем экран «Что дальше?», а не последнее сообщение)
+    const nextScreen = [...sent].reverse().find((m) => String(m.text).includes('Что дальше'));
+    const repBtn = buttonIn(nextScreen, 'Повторить');
+    ok(Boolean(repBtn) && repBtn.startsWith('d.rep:'), 'под выданным документом есть «🔁 Повторить»', repBtn);
+    ok(Boolean(buttonIn(nextScreen, 'Повторять по расписанию')), 'и ежемесячное повторение осталось рядом');
+
+    // 2) Повтор оплаченного документа: оплата не копируется, номер — следующий свободный.
+    const srcId = Number(repBtn.split(':')[1]);
+    bdbX.markPaid(uX, srcId, '2026-08-20');
+    const seqNext = bdbX.nextSeqForOrg(orgX, bdbX.getDoc(uX, srcId).type, Number(today.slice(0, 4)));
+    const mark = sent.length;
+    await tap(repBtn);
+    ok(sent.slice(mark).some((m) => m.text.includes(`дата — ${todayRu}`)),
+      'повтор называет сегодняшнюю дату', todayRu);
+    ok(sent.slice(mark).some((m) => m.text.includes(`Новый номер — ${seqNext}`)),
+      'и следующий свободный номер', String(seqNext));
+    ok(last().includes('Проверьте документ') && Boolean(button('Сформировать')),
+      'документ показан на проверку, а не выписан сразу');
+    ok(Boolean(button('Номер')) && Boolean(button('Дата')) && Boolean(button('Ещё позиция')),
+      'его можно поправить: номер, дата, позиции');
+    const countBefore = bdbX.listDocs(uX, 500).length;
+    await tap('doc.make');
+    const docsNow = bdbX.listDocs(uX, 500);
+    ok(docsNow.length === countBefore + 1, 'после «Сформировать» выписан ровно один документ');
+    const copy = docsNow.reduce((a, b) => (b.id > a.id ? b : a));
+    ok(!copy.paid_at, 'у копии нет отметки оплаты — она не переехала с оригинала', copy.paid_at);
+    ok(copy.date === today && String(copy.number) === String(seqNext), 'у копии сегодняшняя дата и ожидаемый номер',
+      `${copy.date} / ${copy.number}`);
+    ok(copy.id !== srcId && copy.total === bdbX.getDoc(uX, srcId).total, 'сумма та же, документ новый');
+
+    // 3) В журнале рядом со строкой — «🔁»: повтор в одно касание.
+    await tap('docs');
+    const listMsg = sent[sent.length - 1];
+    const rowWithRep = (listMsg.kb || []).find((row) => row.some((b) => b.callback_data === `d.rep:${copy.id}`));
+    ok(Boolean(rowWithRep) && rowWithRep.some((b) => b.callback_data === `doc:${copy.id}`),
+      'в «Последних документах» рядом со строкой есть «🔁»');
+    ok(!(listMsg.kb || []).flat().some((b) => b.callback_data === 'd.rep:undefined'), 'и ни одной битой кнопки');
+
+    // 4) УПД статус 1 и накладная: статус, ставка и основание едут в копию, чужой аванс и исправление — нет.
+    const cpU = bdbX.createCp(uX, { name: 'ООО «Повтор-УПД»', inn: '7707083893', kind: 'customer', opening_date: '2026-01-01' });
+    const srcUpd = await dsX.issueDocument(uX, {
+      type: 'upd', cpId: cpU, date: '2026-09-10', skipQuota: true,
+      items: [{ name: 'Товар', unit: 'шт.', qty: 2, price: 600 }],
+      extra: { status: 1, vatRate: 20, priceIncludesVat: true, basis: 'Договор № 5 от 01.02.2026', advDoc: '№ 9 от 01.03.2026' },
+    });
+    ok(srcUpd.ok, 'исходный УПД статуса 1 выписан', srcUpd.message);
+    await tap(`d.rep:${srcUpd.doc.id}`);
+    ok(last().includes('статус 1') && last().includes('НДС 20%') && last().includes('Договор № 5 от 01.02.2026'),
+      'в сводке повтора УПД — статус 1, ставка и основание прежние', last().slice(0, 140));
+    await tap('doc.make');
+    const updCopy = bdbX.listDocs(uX, 500).filter((d) => d.type === 'upd').reduce((a, b) => (b.id > a.id ? b : a));
+    const upl = bdbX.getDoc(uX, updCopy.id).payload;
+    ok(updCopy.id !== srcUpd.doc.id && Number(upl.status) === 1 && Number(upl.vatRate) === 20 && upl.priceIncludesVat === true
+      && upl.basis === 'Договор № 5 от 01.02.2026', 'копия УПД: тот же статус, ставка, «цены с НДС» и основание', JSON.stringify(upl));
+    ok(upl.advDoc !== '№ 9 от 01.03.2026', 'ссылка на закрытый аванс в копию не переехала', upl.advDoc);
+
+    const srcT = await dsX.issueDocument(uX, {
+      type: 'torg12', cpId: cpU, date: '2026-09-11', skipQuota: true,
+      items: [{ name: 'Бумага', unit: 'пачка', qty: 10, price: 300 }], extra: { basis: 'Заказ № 77' },
+    });
+    await tap(`d.rep:${srcT.doc.id}`);
+    ok(last().includes('Основание: <b>Заказ № 77</b>'), 'у накладной основание сохранилось в сводке повтора', last().slice(0, 120));
+    await tap('doc.make');
+    const tCopy = bdbX.listDocs(uX, 500).filter((d) => d.type === 'torg12').reduce((a, b) => (b.id > a.id ? b : a));
+    ok(tCopy.id !== srcT.doc.id && tCopy.date === today && !tCopy.paid_at, 'повтор накладной — новый документ сегодняшним числом, без оплаты');
+    bdbX.clearState(uX);
+  }
+
+  console.log('\n── вход на сайт: подтверждение в боте и сеансы ──');
+  {
+    const webAuth = require('./lib/web-auth');
+    const bdb = require('./lib/bot-db');
+    const { db: dbW } = require('./db');
+    const VERA = { id: 777881, first_name: 'Вера', username: 'vera_web' };
+    const sayAs = (u, text, chat) => handleUpdate(tg, { message: { chat: chat || { id: u.id }, from: u, text } });
+    const tapAs = (u, data, chat) => handleUpdate(tg,
+      { callback_query: { id: 'cb', from: u, data, message: { chat: chat || { id: u.id }, message_id: 42 } } });
+    const vera = bdb.getOrCreateUser(VERA.id, 'Вера', 'vera_web');
+    const UA_WIN = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+    const UA_IOS = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1';
+    const mark0 = sent.length;
+    const newLogin = (ua = UA_WIN) => webAuth.startLogin({ ip: '203.0.113.5', ua });
+
+    // Кнопки с числами под вопросом: [{n, data}] в порядке показа.
+    const numbersOf = (msg) => ((msg.kb[0]) || []).map((x) => ({ n: Number(x.text), data: x.callback_data }));
+    const idxOf = (msg, code) => numbersOf(msg).findIndex((x) => x.n === code);
+
+    // --- ссылка входа ---
+    const a = newLogin();
+    await sayAs(VERA, `/start login_${a.nonce}`);
+    const ask = sent[sent.length - 1];
+    ok(ask.text.includes('Вход в Первичку на сайте') && ask.text.includes('Chrome, Windows'),
+      'ссылка входа: бот называет вход и браузер', ask.text.slice(0, 120));
+    ok(/время: <b>\d\d:\d\d<\/b>/.test(ask.text), 'и время входа (чч:мм)', ask.text);
+    ok(ask.text.includes('нажмите число, которое сейчас крупно написано на экране сайта')
+      && ask.text.includes('нажмите «Нет» и никому не пересылайте это сообщение'),
+    'просит выбрать число с экрана сайта; «Нет» и «никому не пересылайте» на месте', ask.text);
+    const nums = numbersOf(ask);
+    ok(nums.length === 3 && new Set(nums.map((x) => x.n)).size === 3 && nums.every((x) => x.n >= 10 && x.n <= 99),
+      'три разные кнопки с двузначными числами', JSON.stringify(nums));
+    ok(nums.some((x) => x.n === a.code), 'верное число — среди трёх', `${a.code} ∈ ${nums.map((x) => x.n)}`);
+    ok(ask.kb[1] && ask.kb[1].length === 1 && ask.kb[1][0].text.includes('Нет') && /^wl\.no:[0-9a-f]{20}$/.test(ask.kb[1][0].callback_data),
+      'вторым рядом — «❌ Нет»');
+    ok(nums.every((x, i) => new RegExp(`^wl\\.n${i}:[0-9a-f]{20}$`).test(x.data)),
+      'в данных кнопки — её номер и идентификатор входа', JSON.stringify(nums.map((x) => x.data)));
+    ok(nums.every((x) => !x.data.includes(a.nonce) && Buffer.byteLength(x.data) <= 64),
+      'в данных кнопок нет nonce, и они короче 64 байт');
+    ok(!ask.text.includes(a.nonce), 'и в тексте сообщения nonce не повторяется');
+    ok(webAuth.checkLogin(a.nonce).status === 'wait', 'пока никто не нажал — вход ждёт');
+
+    // Повторное открытие той же ссылки — те же кнопки в том же порядке: перебрасывать нельзя.
+    await sayAs(VERA, `/start login_${a.nonce}`);
+    ok(JSON.stringify(numbersOf(sent[sent.length - 1]).map((x) => x.n)) === JSON.stringify(nums.map((x) => x.n)),
+      'ссылку открыли снова — числа и порядок те же (не перетасовать, пока не повезёт)');
+
+    // Числа выбираются случайно, а не по кругу: на двадцати входах верное стоит не всегда на одном месте.
+    {
+      const places = new Set();
+      const seenCodes = new Set();
+      for (let i = 0; i < 20; i += 1) {
+        const t = newLogin();
+        const pv = webAuth.previewLogin(t.nonce);
+        places.add(pv.choices.indexOf(t.code));
+        seenCodes.add(t.code);
+      }
+      ok(places.size > 1 && seenCodes.size > 5, 'верное число и его место меняются от входа к входу', `мест ${places.size}, чисел ${seenCodes.size}`);
+    }
+
+    // --- верное число ---
+    await tapAs(VERA, nums[idxOf(ask, a.code)].data);
+    ok(last().includes('Вход подтверждён') && last().includes('Сеансы на сайте'), 'верное число: вход подтверждён, сказано, где его закрыть', last().slice(0, 100));
+    const got = webAuth.checkLogin(a.nonce);
+    ok(got.status === 'ok' && got.userId === vera.id, 'сайт получает сессию того, кто нажал', JSON.stringify(got));
+    await tapAs(VERA, nums[idxOf(ask, a.code)].data);
+    ok(last().includes('Ссылка устарела'), 'повторное нажатие после подтверждения — «ссылка устарела»', last());
+    await sayAs(VERA, `/start login_${a.nonce}`);
+    ok(last().includes('Ссылка устарела') && !(sent[sent.length - 1].kb || []).length, 'использованную ссылку повторно не предлагают', last());
+
+    // --- неверное число отклоняет навсегда ---
+    const w = newLogin();
+    await sayAs(VERA, `/start login_${w.nonce}`);
+    const askW = sent[sent.length - 1];
+    const numsW = numbersOf(askW);
+    const wrongIdx = numsW.findIndex((x) => x.n !== w.code);
+    const rightIdx = idxOf(askW, w.code);
+    await tapAs(VERA, numsW[wrongIdx].data);
+    ok(last().includes('Число не совпало — вход отменён') && last().includes('кто-то пытался зайти в ваш аккаунт') && last().includes('ничего не делайте'),
+      'неверное число: «вход отменён», предупреждение, что делать', last());
+    ok(webAuth.checkLogin(w.nonce).status === 'denied', 'сайт узнаёт, что вход отклонён');
+    await tapAs(VERA, numsW[rightIdx].data);
+    ok(last().includes('Ссылка устарела'), 'после ошибки верное число уже не принимается — второй попытки нет', last());
+    ok(webAuth.checkLogin(w.nonce).status === 'denied', 'вход остался отклонённым');
+    await sayAs(VERA, `/start login_${w.nonce}`);
+    ok(last().includes('Ссылка устарела') && !(sent[sent.length - 1].kb || []).length, 'и открыть ту же ссылку заново нельзя');
+    for (let i = 0; i < 3; i += 1) {
+      if (i === wrongIdx) continue;
+      await tapAs(VERA, numsW[i].data);
+      if (!last().includes('Ссылка устарела')) { ok(false, `кнопка ${i} после ошибки сработала`, last()); break; }
+    }
+    ok(webAuth.listSessions(vera.id).length === 1, 'неверное число сессии не дало (осталась только первая)');
+
+    // Кнопка «Да, это я» из сообщений прежней версии ничего не подтверждает.
+    const old = newLogin();
+    await sayAs(VERA, `/start login_${old.nonce}`);
+    const oldId = webAuth.previewLogin(old.nonce).id;
+    await tapAs(VERA, `wl.ok:${oldId}`);
+    ok(last().includes('Ссылка устарела') && webAuth.checkLogin(old.nonce).status === 'wait', 'старая кнопка «wl.ok:» вход не подтверждает');
+
+    // --- «Нет» ---
+    const b = newLogin();
+    await sayAs(VERA, `/start login_${b.nonce}`);
+    const askB = sent[sent.length - 1];
+    await tapAs(VERA, askB.kb[1][0].callback_data);
+    ok(last().includes('вход отклонил') && last().includes('никому не пересылайте'), '«Нет»: вход отклонён, предупреждение про пересылку', last().slice(0, 100));
+    ok(webAuth.checkLogin(b.nonce).status === 'denied', 'сайт узнаёт, что вход отклонён');
+    await tapAs(VERA, numbersOf(askB)[idxOf(askB, b.code)].data);
+    ok(last().includes('Ссылка устарела'), 'после «Нет» число уже не принимается', last());
+
+    // --- истёкший, чужой и подложный ---
+    const c = newLogin();
+    dbW.prepare('UPDATE web_logins SET expires_at = ? WHERE nonce_hash = ?').run(new Date(Date.now() - 1000).toISOString(), webAuth.sha(c.nonce));
+    await sayAs(VERA, `/start login_${c.nonce}`);
+    ok(last().includes('Ссылка устарела, начните вход на сайте заново') || last().includes('Ссылка устарела. Начните вход на сайте заново'),
+      'истёкшая ссылка — понятный ответ', last());
+    ok(!(sent[sent.length - 1].kb || []).length, 'и без кнопок подтверждения');
+    await sayAs(VERA, '/start login_нетТакого');
+    ok(last().includes('Ссылка устарела'), 'ссылка с мусором вместо nonce — тот же ответ', last());
+    await sayAs(VERA, `/start login_${'A'.repeat(32)}`);
+    ok(last().includes('Ссылка устарела'), 'выдуманный nonce правильной формы — тот же ответ');
+    for (const bad of ['wl.n0:' + 'f'.repeat(20), 'wl.n1:zzz', 'wl.no:', 'wl.n2:' + 'a'.repeat(64), 'wl.n3:' + 'a'.repeat(20), 'wl.n-1:' + 'a'.repeat(20), 'wl.n0:%27%20OR%201=1', 'wl.']) {
+      await tapAs(VERA, bad);
+      if (!last().includes('Ссылка устарела')) { ok(false, `кнопка ${bad} не должна ничего подтверждать`, last()); break; }
+    }
+    ok(true, 'подложные данные кнопок (мусор, чужой или длинный id, номер кнопки вне 0–2) ничего не подтверждают');
+
+    // --- общий чат ---
+    const g = newLogin();
+    const GROUP = { id: -100500, type: 'supergroup' };
+    await sayAs(VERA, `/start login_${g.nonce}`, GROUP);
+    ok(last().includes('только в личной переписке') && !(sent[sent.length - 1].kb || []).length, 'в общем чате вход не предлагается', last());
+    ok(webAuth.checkLogin(g.nonce).status === 'wait', 'и остаётся неподтверждённым');
+    const gpre = webAuth.previewLogin(g.nonce);
+    const gid = gpre.id;
+    const gIdx = gpre.choices.indexOf(g.code);
+    await tapAs(VERA, `wl.n${gIdx}:${gid}`, GROUP);
+    ok(webAuth.checkLogin(g.nonce).status === 'wait', 'верное число, нажатое в общем чате, тоже ничего не подтверждает');
+
+    // Подтверждает тот, кто нажал, а не тот, кто открыл сайт.
+    const OLEG = { id: 777882, first_name: 'Олег' };
+    const olegRow = bdb.getOrCreateUser(OLEG.id, 'Олег', '');
+    await tapAs(OLEG, `wl.n${gIdx}:${gid}`);
+    const forOleg = webAuth.checkLogin(g.nonce);
+    ok(forOleg.status === 'ok' && forOleg.userId === olegRow.id, 'сессию получает тот, кто выбрал верное число в своём чате');
+
+    // --- обычный /start не сломан ---
+    await sayAs(VERA, '/start');
+    ok(last().includes('Первичка') && !last().includes('Вход в Первичку на сайте'), 'обычный /start показывает приветствие');
+
+    // --- сеансы на сайте ---
+    webAuth.logoutAll(vera.id);
+    await tapAs(VERA, 'ws');
+    ok(last().includes('нигде не вошли'), 'нет сеансов — так и сказано', last());
+    for (const ua of [UA_WIN, UA_IOS]) {
+      const n = newLogin(ua);
+      webAuth.confirmLogin(webAuth.previewLogin(n.nonce).id, vera.id);
+      webAuth.checkLogin(n.nonce, { ua });
+    }
+    await tapAs(VERA, 'more');
+    ok(button('Сеансы на сайте') === 'ws', 'в «Ещё» есть «Сеансы на сайте»');
+    await tapAs(VERA, 'ws');
+    const list = sent[sent.length - 1];
+    ok(list.text.includes('Сеансы на сайте') && list.text.includes('Chrome, Windows') && list.text.includes('Safari, iPhone'),
+      'список сеансов: браузеры узнаются', list.text);
+    ok(/последний раз \d\d\.\d\d в \d\d:\d\d/.test(list.text), 'у каждого — когда был последний раз', list.text);
+    ok(buttonIn(list, 'Завершить все') === 'ws.all', 'есть «Завершить все»');
+    await sayAs(VERA, '/sessions');
+    ok(last().includes('Сеансы на сайте'), 'команда /sessions открывает тот же список');
+    await tapAs(VERA, 'ws.all');
+    ok(last().includes('Завершил сеансы на сайте: 2'), '«Завершить все» закрывает оба', last());
+    ok(webAuth.listSessions(vera.id).length === 0, 'в базе сессий не осталось');
+    await tapAs(VERA, 'ws.all');
+    ok(last().includes('Открытых сеансов на сайте не было'), 'повторное «Завершить все» — честное «не было»');
+    // Чужие сеансы «Завершить все» не трогает.
+    ok(webAuth.listSessions(olegRow.id).length === 1, 'сеансы другого человека не затронуты');
+
+    // --- ничего секретного в сообщениях ---
+    const everything = sent.slice(mark0).map((m) => m.text + JSON.stringify(m.kb)).join('\n');
+    ok(!everything.includes(a.nonce) && !everything.includes(b.nonce) && !everything.includes(g.nonce),
+      'ни один nonce не попал в сообщения бота');
+    bdb.clearState(vera.id);
+  }
+
+  console.log('\n── «Оплатил» при свободной оплате: «Это она?» (Р2) ──');
+  {
+    /*
+     * Сценарий ревизора: накладные 3 000 и 4 000, оплата 3 000 внесена строкой,
+     * «Оплатил» на первой. Раньше те же деньги писались второй раз, и долг
+     * выходил 1 000 вместо 4 000. Теперь бот спрашивает, не она ли это.
+     */
+    const bdbR = require('./lib/bot-db');
+    const dsR = require('./lib/doc-service');
+    const uid = fxUserId();
+    const mk = async (cpId, price, date) => (await dsR.issueDocument(uid, {
+      type: 'torg12', cpId, date, skipQuota: true, items: [{ name: 'Обед', qty: 1, price }],
+    })).doc;
+    const bal = (cpId) => Math.round(bdbR.balanceOf(uid, cpId).closing * 100) / 100;
+    const mkCp = (name) => bdbR.createCp(uid, { name, kind: 'customer', opening_date: '2026-01-01' });
+
+    // «Да, это она»
+    const cpY = mkCp('ООО «Заря-Да»');
+    const y1 = await mk(cpY, 3000, '2026-10-01');
+    const y2 = await mk(cpY, 4000, '2026-10-02');
+    bdbR.addOp(uid, cpY, { date: '2026-10-12', kind: 'Оплата', doc: 'п/п 7', debit: 3000 });
+    ok(bal(cpY) === 4000, 'до отметки долг 4 000 (7 000 минус внесённые 3 000)', bal(cpY));
+    sent.length = 0;
+    await tap(`doc.paid:${y1.id}`);
+    ok(norm(last()).includes('уже есть оплата 3 000 ₽ от 12.10') && last().includes('Это она?'),
+      'вместо отметки — вопрос: «У клиента … есть оплата 3 000 ₽ от 12.10 … Это она?»', norm(last()).slice(0, 140));
+    ok(Boolean(button('Да, это она')) && Boolean(button('Нет, это новая оплата')), 'две кнопки: «Да, это она» и «Нет, это новая оплата»');
+    ok(!bdbR.getDoc(uid, y1.id).paid_at && bal(cpY) === 4000, 'пока человек не ответил, ничего не записано');
+    await tap(button('Да, это она'));
+    ok(bal(cpY) === 4000, 'Да: долг остался 4 000 — новой проводки нет', bal(cpY));
+    ok(bdbR.getDoc(uid, y1.id).paid_at === '2026-10-12', 'документ отмечен оплаченным датой самой оплаты');
+    ok(bdbR.listOps(uid, cpY).filter((o) => o.debit > 0).length === 1, 'проводка оплаты одна — прежняя, привязанная к документу');
+    ok(norm(sent.map((m) => m.text || '').join(' ')).includes('Привязал оплату 3 000'), 'бот сказал, что привязал оплату');
+    ok(bdbR.unpaidSummary(uid).docs.filter((d) => d.cp_id === cpY).map((d) => d.id).join() === String(y2.id),
+      'в «Не оплачено» у клиента осталась вторая накладная');
+
+    // «Нет, это новая оплата» — прежнее поведение
+    const cpN = mkCp('ООО «Заря-Нет»');
+    const n1 = await mk(cpN, 3000, '2026-10-01');
+    await mk(cpN, 4000, '2026-10-02');
+    bdbR.addOp(uid, cpN, { date: '2026-10-12', kind: 'Оплата', doc: 'п/п 8', debit: 3000 });
+    await tap(`doc.paid:${n1.id}`);
+    await tap(button('Нет, это новая оплата'));
+    ok(bal(cpN) === 1000, 'Нет: прежнее поведение — оплата записана заново, долг 1 000', bal(cpN));
+
+    // Несколько свободных оплат: до трёх, самые подходящие по сумме
+    const cpM = mkCp('ООО «Заря-Много»');
+    const m1 = await mk(cpM, 3000, '2026-10-01');
+    for (const amount of [1000, 3000, 5000, 3500]) bdbR.addOp(uid, cpM, { date: '2026-10-05', kind: 'Оплата', doc: `п/п ${amount}`, debit: amount });
+    sent.length = 0;
+    await tap(`doc.paid:${m1.id}`);
+    const many = sent[sent.length - 1];
+    const yes = many.kb.flat().filter((b) => /^Да:/.test(b.text));
+    ok(yes.length === 3, 'несколько оплат — предложено ровно три', yes.map((b) => b.text).join(' | '));
+    ok(norm(yes[0].text).includes('3 000'), 'первой — та, что точно равна остатку документа', yes[0].text);
+    ok(norm(many.text).includes('Какая из них'), 'вопрос про выбор, а не «Это она?»', norm(many.text).slice(0, 100));
+
+    // Оплата меньше остатка — частичная; больше — привязывается часть
+    const cpP = mkCp('ООО «Заря-Часть»');
+    const p1 = await mk(cpP, 3000, '2026-10-01');
+    bdbR.addOp(uid, cpP, { date: '2026-10-06', kind: 'Оплата', doc: 'п/п 1', debit: 1000 });
+    await tap(`doc.paid:${p1.id}`);
+    await tap(button('Да, это она'));
+    ok(!bdbR.getDoc(uid, p1.id).paid_at && bdbR.linkedPaid(p1.id) === 1000 && bal(cpP) === 2000,
+      'меньше остатка — частичная оплата: привязано 1 000, документ ещё ждёт', `${bdbR.linkedPaid(p1.id)} / ${bal(cpP)}`);
+    ok(norm(sent.map((m) => m.text || '').join(' ')).includes('Осталось получить 2 000'), 'бот назвал остаток');
+    const cpB = mkCp('ООО «Заря-Больше»');
+    const b1 = await mk(cpB, 3000, '2026-10-01');
+    bdbR.addOp(uid, cpB, { date: '2026-10-07', kind: 'Оплата', doc: 'п/п 2', debit: 5000 });
+    await tap(`doc.paid:${b1.id}`);
+    await tap(button('Да, это она'));
+    ok(bdbR.getDoc(uid, b1.id).paid_at && bdbR.linkedPaid(b1.id) === 3000 && bal(cpB) === -2000,
+      'больше остатка — привязано 3 000, ещё 2 000 свободны (сальдо те же)', `${bdbR.linkedPaid(b1.id)} / ${bal(cpB)}`);
+    ok(bdbR.freePaymentsFor(uid, (await mk(cpB, 1000, '2026-10-08')).id).some((x) => x.amount === 2000),
+      'остаток свободной оплатой предложится следующему документу');
+    // Снятие отметки не стирает деньги, которые пришли на самом деле
+    await tap(`doc.unpaid:${y1.id}`);
+    ok(bal(cpY) === 4000 && bdbR.listOps(uid, cpY).some((o) => o.debit === 3000 && !o.doc_id),
+      'снятие отметки возвращает оплату в свободные — деньги не пропадают', bal(cpY));
+  }
+
+  console.log('\n── баланс клиента по знаку (Д30) ──');
+  {
+    const bdbR = require('./lib/bot-db');
+    const uid = fxUserId();
+    const mkC = (name, kind) => bdbR.createCp(uid, { name, kind, opening_date: '2026-01-01' });
+    const pre = mkC('ООО «Предоплатный»', 'customer');
+    bdbR.addPrepay(uid, pre, 15000, '2026-10-01');
+    sent.length = 0;
+    await tap(`cp:${pre}`);
+    // Аванс клиента на предоплате не называем «мы должны ему»: владелец пугался красного долга. Слово — «осталось из предоплаты».
+    const plain = (t) => norm(t).replace(/<[^>]+>/g, '');
+    ok(plain(sent.map((m) => m.text || '').join(' ')).includes('Осталось из предоплаты: 15 000')
+      && !/мы должны ему/.test(sent.map((m) => m.text || '').join(' ')),
+    'Д30: при предоплате — «осталось из предоплаты 15 000», не «мы должны ему» и не «в нашу пользу»', norm(last()).slice(0, 160));
+    ok(!sent.map((m) => m.text || '').join(' ').includes('в нашу пользу'), 'старой подписи нет');
+    const dbtr = mkC('ООО «Должник-знак»', 'customer');
+    bdbR.addOp(uid, dbtr, { date: '2026-10-01', kind: 'Приход', doc: 'Счёт', credit: 54250 });
+    sent.length = 0;
+    await tap(`cp:${dbtr}`);
+    ok(norm(sent.map((m) => m.text || '').join(' ')).includes('должен нам 54 250'), 'должник — «должен нам 54 250»');
+    const sup = mkC('ИП Поставщик-знак', 'supplier');
+    bdbR.addOp(uid, sup, { date: '2026-10-01', kind: 'Приход', doc: 'ТН 1', credit: 5000 });
+    sent.length = 0;
+    await tap(`cp:${sup}`);
+    ok(norm(sent.map((m) => m.text || '').join(' ')).includes('мы должны ему 5 000'), 'поставщик с приходом — «мы должны ему 5 000»');
+    const zero = mkC('ООО «Нулевой»', 'customer');
+    sent.length = 0;
+    await tap(`cp:${zero}`);
+    ok(norm(sent.map((m) => m.text || '').join(' ')).includes('взаимных долгов нет'), 'ноль — «взаимных долгов нет»');
+  }
+
+  console.log('\n── напоминание о долге: список документов и «Напомнить» (Р9, Д11, Д12) ──');
+  {
+    const bdbR = require('./lib/bot-db');
+    const dsR = require('./lib/doc-service');
+    const uid = fxUserId();
+    const cpR = bdbR.createCp(uid, { name: 'ООО «Напоминаемый»', kind: 'customer', opening_date: '2026-01-01' });
+    const mk = async (price, date) => (await dsR.issueDocument(uid, {
+      type: 'torg12', cpId: cpR, date, skipQuota: true, items: [{ name: 'Канапе', qty: 1, price }],
+    })).doc;
+    const r1 = await mk(14000, '2026-09-02');
+    const r2 = await mk(7000, '2026-09-25');
+    sent.length = 0;
+    await tap('unpaid');
+    const un = sent[sent.length - 1];
+    const row = un.kb.flat().find((b) => b.callback_data === `doc:${r1.id}`);
+    ok(row && row.text.startsWith('ООО «Напоминаемый»'), 'Д11: в «Не оплачено» строка начинается с клиента', row && row.text);
+    ok(row && norm(row.text).includes(`ТОРГ-12 № ${r1.number} · 02.09 · 14 000 ₽`), 'Д11: дальше «ТОРГ-12 № N · 02.09 · 14 000 ₽» — без обрезки даты и суммы', row && row.text);
+    const rmBtn = un.kb.flat().find((b) => b.callback_data === `rm.one:${cpR}`);
+    ok(rmBtn && /Напомнить/.test(rmBtn.text), 'Д12: в «Не оплачено» есть «Напомнить» по этому клиенту', JSON.stringify(rmBtn));
+    sent.length = 0;
+    await tap(`rm.one:${cpR}`);
+    const letter = norm(sent.map((m) => m.text || '').join('\n'));
+    ok(letter.includes('Не оплачено:'), 'Р9: в напоминании есть список неоплаченных документов', letter.slice(0, 200));
+    ok(letter.includes(`ТОРГ-12 № ${r1.number} от 02.09.2026 — 14 000,00 руб.`) && letter.includes(`ТОРГ-12 № ${r2.number} от 25.09.2026 — 7 000,00 руб.`),
+      'Р9: номера, даты и суммы документов названы', letter.slice(0, 300));
+    ok(letter.includes('оплата на 21 000,00 руб'), 'и общая сумма долга, как раньше', letter.slice(0, 160));
+  }
+
+  console.log('\n── расписание «каждый день» и бесплатный лимит (Д19) ──');
+  {
+    const bdbR = require('./lib/bot-db');
+    const dsR = require('./lib/doc-service');
+    const recur = require('./lib/recurring');
+    const LIM19 = { id: 779301, first_name: 'Лимитчик', username: 'lim19' };
+    const lSay = (t) => handleUpdate(tg, { message: { chat: { id: LIM19.id }, from: LIM19, text: t } });
+    const lTap = (d) => handleUpdate(tg, { callback_query: { id: 'l19', from: LIM19, data: d, message: { chat: { id: LIM19.id } } } });
+    const lid = bdbR.getOrCreateUser(LIM19.id, 'Лимитчик', 'lim19').id;
+    bdbR.saveMyOrg(lid, { name: 'ИП Лимитов', inn: '183209316100', signer: 'Л. Л.' });
+    const cpL = bdbR.createCp(lid, { name: 'ООО «Обеды»', kind: 'customer', opening_date: '2026-01-01' });
+    const wasFree = process.env.FREE_DOCS;
+    process.env.FREE_DOCS = '3';
+    const made = await dsR.issueDocument(lid, { type: 'torg12', cpId: cpL, items: [{ name: 'Обед', qty: 20, price: 350 }] });
+    sent.length = 0;
+    await lTap(`rec.per:${made.doc.id}:d`);
+    const warn = norm(sent.map((m) => m.text || '').join(' '));
+    ok(warn.includes('около 30 документов в месяц') && warn.includes('осталось 2 из 3') && warn.includes('хватит на 2 дня'),
+      'Д19: «Каждый день» на бесплатном — предупреждение с цифрами', warn.slice(0, 220));
+    ok(recur.list(lid).length === 0, 'пока человек не подтвердил, расписания нет');
+    const okBtn = buttonIn(sent[sent.length - 1], 'Всё равно создать');
+    ok(Boolean(okBtn), 'есть кнопка «Всё равно создать расписание»');
+    await lTap(okBtn);
+    ok(recur.list(lid).length === 1 && recur.list(lid)[0].period === 'day', 'после подтверждения расписание создано');
+    // «По будням» — тоже предупреждение, но другой счёт; месячное — без вопросов.
+    sent.length = 0;
+    await lTap(`rec.per:${made.doc.id}:w`);
+    ok(norm(last()).includes('около 22 документов') && norm(last()).includes('рабочих дня'), 'по будням — около 22 документов', norm(last()).slice(0, 120));
+    sent.length = 0;
+    await lTap(`rec.add:${made.doc.id}:10`);
+    ok(!norm(sent.map((m) => m.text || '').join(' ')).includes('документов в месяц'), 'раз в месяц предупреждения нет');
+    process.env.FREE_DOCS = wasFree;
+  }
+
+  console.log('\n── письмо не ушло: человеческим языком и кнопка «Настройки почты» (Д14) ──');
+  {
+    const bdbR = require('./lib/bot-db');
+    const dsR = require('./lib/doc-service');
+    const mailboxLib = require('./lib/mailbox');
+    const net = require('node:net');
+    const uid = fxUserId();
+    // Свободный порт, на котором никто не слушает: соединение будет отвергнуто.
+    const deadPort = await new Promise((res) => {
+      const srv = net.createServer().listen(0, '127.0.0.1', () => { const p = srv.address().port; srv.close(() => res(p)); });
+    });
+    const saved = await mailboxLib.save(uid, {
+      preset: 'custom', host: '127.0.0.1', port: deadPort, secure: false, pass: 'x', from: 'sender@mycompany.ru',
+    });
+    ok(saved.ok, 'ящик с недоступным сервером заведён для проверки', JSON.stringify(saved));
+    const cpM = bdbR.createCp(uid, { name: 'ООО «Почтовый»', kind: 'customer', email: 'buh@client.ru', opening_date: '2026-01-01' });
+    const made = await dsR.issueDocument(uid, { type: 'sch', cpId: cpM, skipQuota: true, items: [{ name: 'Обед', qty: 1, price: 1000 }] });
+    sent.length = 0;
+    await tap(`doc.mail:${made.doc.id}`);
+    const said = norm(sent.map((m) => m.text || '').join(' '));
+    ok(said.includes('Письмо не ушло: не удалось связаться с почтовым сервером'),
+      'Д14: «Письмо не ушло: не удалось связаться с почтовым сервером»', said.slice(0, 160));
+    ok(!/ECONN|127\.0\.0\.1|getaddrinfo|ENOTFOUND/.test(said), 'Д14: сырые коды и адреса человеку не показаны', said.slice(0, 200));
+    ok(Boolean(button('Настройки почты')), 'Д14: рядом кнопка «Настройки почты»');
+    mailboxLib.remove(uid);
+  }
+
+  console.log('\n── копейки, предел суммы, длинное название, номера, реестр, бланки (Р13–Р19, Р7) ──');
+  {
+    const bdbR = require('./lib/bot-db');
+    const dsR = require('./lib/doc-service');
+    const mR = require('./lib/money');
+    const ExcelJS3 = require('exceljs');
+    const uid = fxUserId();
+    bdbR.saveMyOrg(uid, { name: 'ООО «Партия три»', inn: '7712345678', kpp: '771201001', signer: 'Иванов И. И.' });
+    const cpR = bdbR.createCp(uid, { name: 'ООО «Весы-3»', kind: 'customer', opening_date: '2026-01-01' });
+    const issueR = (items, more = {}) => dsR.issueDocument(uid, { type: 'torg12', cpId: cpR, items, skipQuota: true, ...more });
+
+    // Р13: половина копейки считается как на бумаге, а не как двоичная дробь.
+    ok(mR.lineSum(1.5, 99.99) === 149.99, 'Р13: 1,5 × 99,99 = 149,99 (раньше 149,98)', mR.lineSum(1.5, 99.99));
+    ok(mR.round2(1.005) === 1.01 && mR.round2(-1.005) === -1.01 && mR.round2(0.1 + 0.2) === 0.3,
+      'Р13: round2 — половина копейки от нуля, шум двоичной дроби не мешает');
+    ok(mR.round2(1e11 + 0.005) === 100000000000.01, 'Р13: и на больших суммах');
+    const sp = mR.vatSplit({ qty: 3, price: 100 }, 22, true);
+    ok(sp.total === 300 && sp.net === 245.9 && sp.vat === 54.1, 'Р13: НДС «в том числе»: 300 = 245,90 + 54,10', JSON.stringify(sp));
+    ok(mR.vatTotals([{ qty: 0.125, price: 800 }, { qty: 1.5, price: 99.99 }], null, false).total === 249.99,
+      'Р13: итог складывается копейками');
+
+    // Р14: сумма больше триллиона — отказ, а не «Один рублей».
+    const huge = await issueR([{ name: 'Золото', qty: 1e9, price: 1e9 }]);
+    ok(!huge.ok && huge.reason === 'total' && /лишний ноль/.test(huge.message), 'Р14: сумма 1e18 — понятный отказ', huge.message);
+    const edge = await issueR([{ name: 'Много', qty: 1e6, price: 1e6 }]);
+    ok(edge.ok && edge.total === 1e12 && /Один триллион рублей/.test(mR.amountInWords(edge.total)),
+      'Р14: ровно триллион ещё выписывается, прописью верно');
+
+    // Р15: длинное название — отказ с цифрами, а не молчаливая обрезка.
+    const longName = 'Поставка продукции '.repeat(20);   // 380 знаков
+    const longR = await issueR([{ name: longName, qty: 1, price: 10 }]);
+    ok(!longR.ok && longR.reason === 'items' && /300/.test(longR.message) && new RegExp(String(longName.trim().length)).test(longR.message),
+      'Р15: название длиннее 300 знаков — отказ с числами', longR.message);
+    const okName = await issueR([{ name: 'я'.repeat(300), qty: 1, price: 10 }]);
+    ok(okName.ok, 'Р15: ровно 300 знаков принимается');
+
+    // Р16: шесть выписок разом — шесть разных подряд идущих номеров, без исключений.
+    const many = await Promise.allSettled(Array.from({ length: 6 }, () => dsR.issueDocument(uid, {
+      type: 'sch', cpId: cpR, skipQuota: true, items: [{ name: 'Обед', qty: 1, price: 100 }] })));
+    const nums = many.filter((x) => x.status === 'fulfilled' && x.value.ok).map((x) => Number(x.value.doc.number)).sort((a, b) => a - b);
+    ok(nums.length === 6 && new Set(nums).size === 6 && nums[5] - nums[0] === 5,
+      'Р16: шесть одновременных выписок — шесть номеров подряд', JSON.stringify(many.map((x) => x.status === 'fulfilled' ? x.value.doc && x.value.doc.number : String(x.reason && x.reason.message))));
+
+    // Р17: акт сверки «за всё время» без пустой даты.
+    const { buildAktHtml } = require('./lib/akt-html');
+    const orgFull = bdbR.getDefaultOrg(uid);
+    const aktCp = { name: 'ООО «Весы-3»', opening_balance: 0, opening_date: '', period_end: '2026-10-18' };
+    const aktHtml = buildAktHtml({ org: orgFull, cp: aktCp, ops: [] });
+    ok(/с начала расчётов по 18\.10\.2026/.test(aktHtml) && !/на\s*<\/td>/.test(aktHtml) && !/— 18\.10\.2026/.test(aktHtml.replace(/\s+/g, ' ').replace(/с начала расчётов по 18\.10\.2026/g, '')),
+      'Р17: акт сверки без даты начала — «с начала расчётов по …», без пустого места');
+    ok(/Сальдо начальное \(на начало расчётов\)/.test(aktHtml), 'Р17: и строка начального сальдо читается');
+    const wbA = new ExcelJS3.Workbook();
+    await wbA.xlsx.load(await require('./lib/xlsx-akt').buildAkt({ org: orgFull, cp: aktCp, ops: [] }));
+    const aktText = [];
+    wbA.eachSheet((ws) => ws.eachRow((row) => row.eachCell((c) => aktText.push(String(c.value && c.value.result != null ? c.value.result : c.value)))));
+    ok(aktText.some((t) => /с начала расчётов по 18\.10\.2026/.test(t)) && !aktText.some((t) => /период: –|на\s*$/.test(t)),
+      'Р17: и в Excel-акте то же');
+
+    // Р18: двойной точки нет ни в одном бланке с НДС.
+    const { buildAktUslugHtml } = require('./lib/akt-uslug');
+    for (const [rate, gross] of [[20, false], [20, true], [null, false]]) {
+      const h = buildAktUslugHtml({ org: orgFull, cp: bdbR.getCp(uid, cpR), doc: { number: '1', date: '2026-10-01', items: [{ name: 'Услуга', qty: 1, price: 583.42 }], vatRate: rate, priceIncludesVat: gross } });
+      ok(!/руб\.\./.test(h) && !/НДС\.\./.test(h), `Р18: акт услуг, НДС ${rate}${gross ? ' в т.ч.' : ''} — без двойной точки`);
+      ok(/(руб\.|без НДС\.)<\/p>/.test(h.replace(/\s+/g, ' ')), `Р18: и предложение закрыто одной точкой (${rate})`);
+    }
+    const { buildSchetDogovorHtml } = require('./lib/schet-dogovor');
+    const sdH = buildSchetDogovorHtml({ org: orgFull, cp: bdbR.getCp(uid, cpR), doc: { number: '1', date: '2026-10-01', items: [{ name: 'Услуга', qty: 1, price: 100 }], vatRate: 20 } });
+    ok(!/руб\.\./.test(sdH), 'Р18: счёт-договор с НДС — без двойной точки');
+
+    // Р19: ТОРГ-12 — «Всего мест» без данных не печатаем, у организации есть строка бухгалтера.
+    const { buildTorg12Html } = require('./lib/torg12');
+    const docT = { number: '1', date: '2026-10-01', items: [{ name: 'Мясо', unit: 'кг', qty: 0.125, price: 800 }, { name: 'Доставка', unit: 'усл.', qty: 1, price: 100 }] };
+    const tOoo = buildTorg12Html({ org: orgFull, cp: bdbR.getCp(uid, cpR), doc: docT });
+    ok(!/Всего мест/.test(tOoo) && !/мест\b/.test(tOoo.replace(/Отпущено/g, '')), 'Р19: «Всего мест» без данных не печатается', (tOoo.match(/[^.]*мест[^.]*/) || [''])[0]);
+    ok(/Главный \(старший\) бухгалтер/.test(tOoo) && /Руководитель, Иванов И\. И\./.test(tOoo), 'Р19: у организации есть строка бухгалтера и должность руководителя');
+    ok(/Всего мест: 3 места/.test(buildTorg12Html({ org: orgFull, cp: bdbR.getCp(uid, cpR), doc: { ...docT, places: 3 } })), 'Р19: если число мест передали — печатаем');
+    const tIp = buildTorg12Html({ org: { ...orgFull, inn: '183209316100' }, cp: bdbR.getCp(uid, cpR), doc: docT });
+    ok(!/бухгалтер/.test(tIp) && /Индивидуальный предприниматель, Иванов/.test(tIp), 'Р19: у ИП бухгалтера нет, подписывает как предприниматель');
+
+    // Р7: реестр — только продажные документы, одна сделка один раз, у платёжки и акта сверки нет оплаты.
+    const cpS = bdbR.createCp(uid, { name: 'ООО «Реестровый»', kind: 'customer', opening_date: '2026-01-01' });
+    const mk = (type, items, more = {}) => dsR.issueDocument(uid, { type, cpId: cpS, skipQuota: true, date: '2026-09-10', items, ...more });
+    const dSch = await mk('sch', [{ name: 'Обед', qty: 1, price: 1000 }]);
+    const dTn = await mk('torg12', [{ name: 'Обед', qty: 1, price: 1000 }], { date: '2026-09-12' });
+    const dUsl = await mk('usl', [{ name: 'Консультация', qty: 1, price: 2500 }], { date: '2026-09-15' });
+    const dPp = await dsR.issuePlain(uid, { type: 'pp', cpId: cpS, date: '2026-09-16', fields: { amount: 1000, purpose: 'Оплата по счёту' }, skipQuota: true });
+    ok(dSch.ok && dTn.ok && dUsl.ok && dPp.ok, 'Р7: документы для реестра выписаны', JSON.stringify([dSch.message, dTn.message, dUsl.message, dPp.message]));
+    const reg = bdbR.registryDocs(uid, bdbR.docsBetween(uid, '2026-09-01', '2026-09-30').filter((d) => d.cp_id === cpS));
+    ok(reg.docs.length === 2 && reg.twins === 1 && reg.other === 1 && !reg.docs.some((d) => d.type === 'pp'),
+      'Р7: из четырёх документов остались две сделки; парный и платёжка не в счёт', JSON.stringify([reg.docs.map((d) => d.type), reg.twins, reg.other]));
+    const wbReg = new ExcelJS3.Workbook();
+    await wbReg.xlsx.load(await require('./lib/xlsx-registry').buildRegistry({ org: orgFull, docs: reg.docs, from: '2026-09-01', to: '2026-09-30', twins: reg.twins }));
+    const shReg = wbReg.getWorksheet('Реестр');
+    const regSum = [6, 7].reduce((a, r) => a + Number(shReg.getRow(r).getCell(7).value), 0);
+    ok(regSum === 3500 && String(shReg.getCell('A3').value).includes('2'), 'Р7: итог реестра 3 500 = выручка, а не 5 500', String(regSum));
+    ok(/парных документов не показано — 1/.test(String(shReg.getCell('A4').value)), 'Р7: под заголовком сказано про парный документ');
+    const pureFilter = await require('./lib/xlsx-registry').buildRegistry({ org: orgFull, from: '2026-09-01', to: '2026-09-30',
+      docs: [{ type: 'pp', date: '2026-09-16', number: '1', total: 1000, payload: {} }, { type: 'akt', date: '2026-09-30', number: '1', total: 5000, payload: {} }] });
+    const wbPure = new ExcelJS3.Workbook();
+    await wbPure.xlsx.load(pureFilter);
+    ok(/Всего документов: 0/.test(String(wbPure.getWorksheet('Реестр').getCell('A3').value)), 'Р7: платёжка и акт сверки в реестр не попадают даже напрямую');
+  }
+
+  console.log('\n── общий браузер для PDF ──');
+  const pdf = require('./lib/pdf');
+  if (pdf.pdfAvailable()) {
+    // Проверяем сам факт переиспользования, а не скорость: сравнение
+    // времени на общей машине то проходит, то нет, и ничего не доказывает.
+    await pdf.closePdf();
+    const launchesBefore = pdf.launches();
+    await pdf.htmlToPdf('<h1>раз</h1>');
+    await Promise.all([pdf.htmlToPdf('<h1>два</h1>'), pdf.htmlToPdf('<h1>три</h1>')]);
+    ok(pdf.launches() === launchesBefore + 1,
+      'три документа собраны на одном браузере, а не на трёх',
+      `запусков: ${pdf.launches() - launchesBefore}`);
+    /*
+     * Замер времени отсюда убран намеренно. Он сравнивал «холодный» старт с
+     * «тёплым» и падал на ровном месте: на быстрой машине оба выходят по
+     * 130 мс, и разницы нет. Переиспользование браузера проверяет счётчик
+     * запусков выше — он отвечает на тот же вопрос и не зависит от того,
+     * чем ещё занят сервер в эту секунду.
+     */
+    await pdf.closePdf();
+    const buf = await pdf.htmlToPdf('<h1>после закрытия</h1>');
+    ok(buf && buf.length > 500, 'после закрытия браузер поднимается заново');
+
+    // Ориентацию берём из бланка: УПД и ТОРГ-12 альбомные, счёт — книжный.
+    const box = (b) => {
+      const m = /\/MediaBox\s*\[\s*[\d.]+\s+[\d.]+\s+([\d.]+)\s+([\d.]+)/.exec(b.toString('latin1'));
+      return m ? { w: Number(m[1]), h: Number(m[2]) } : null;
+    };
+    const updPdf = box(await pdf.htmlToPdf(require('./lib/upd').buildUpdHtml({
+      org: { name: 'ООО «Альфа»', inn: '7707083893' }, cp: { name: 'ООО «Бета»' },
+      doc: { number: '1', date: '2026-09-20', status: 2, items: [{ name: 'Работа', qty: 1, price: 100 }] },
+    })));
+    ok(updPdf && updPdf.w > updPdf.h, 'УПД печатается альбомным, как задано в бланке', JSON.stringify(updPdf));
+    const plain = box(await pdf.htmlToPdf('<h1>счёт</h1>'));
+    ok(plain && plain.h > plain.w, 'а документ без размера в бланке — книжным A4', JSON.stringify(plain));
+    await pdf.closePdf();
+  } else {
+    console.log('  ·  Chromium недоступен, проверка пропущена');
+  }
+
+  console.log('\n── картинки документов ──');
+  const html = files.filter((f) => f.filename.endsWith('.html'));
+  for (const f of html) {
+    const png = path.join(OUT, f.filename.replace(/\.html$/, '.png'));
+    try {
+      await htmlToPng(fs.readFileSync(path.join(OUT, f.filename), 'utf8'), png);
+      console.log('  · ' + path.basename(png));
+    } catch (e) { console.log('  ! не отрисовал ' + f.filename + ': ' + e.message); }
+  }
+
+  console.log('\nфайлы в ' + OUT + ':');
+  files.forEach((f) => console.log(`  ${f.filename} — ${(f.size / 1024).toFixed(1)} КБ`));
+  console.log(bad ? `\nне прошло: ${bad}` : '\nбот работает целиком ✅');
+  process.exit(bad ? 1 : 0);
+})().catch((e) => { console.error('ПРОГОН УПАЛ:', e); process.exit(1); });

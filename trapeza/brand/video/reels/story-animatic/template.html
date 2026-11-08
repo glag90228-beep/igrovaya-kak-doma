@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="UTF-8" /><meta name="viewport" content="width=1080, height=1920" />
+<title>Аниматик: завайбкодили, клиентов нет</title>
+<script src="gsap.min.js"></script><script src="three.global.js"></script><script src="mascot3d.js"></script>
+<style>
+@font-face{font-family:Unb;font-weight:200 900;src:url(unbounded-cyrillic-wght-normal.woff2) format('woff2');unicode-range:U+0400-045F,U+2116,U+00AB,U+00BB,U+2014}
+@font-face{font-family:Unb;font-weight:200 900;src:url(unbounded-latin-wght-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+20BD,U+2212}
+@font-face{font-family:Man;font-weight:200 800;src:url(manrope-cyrillic-wght-normal.woff2) format('woff2');unicode-range:U+0400-045F,U+2116,U+00AB,U+00BB}
+@font-face{font-family:Man;font-weight:200 800;src:url(manrope-latin-wght-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+20BD,U+2212}
+html,body{margin:0;background:#04060F}
+#root{position:relative;width:1080px;height:1920px;overflow:hidden;font-family:Unb,Man,sans-serif;color:#fff;background:#04060F}
+.clip{position:absolute;inset:0}
+.scn{position:absolute;inset:0;opacity:0;overflow:hidden}
+.cam{position:absolute;inset:0}
+.bgd{background:radial-gradient(ellipse 90% 40% at 50% 100%,rgba(61,98,255,.5),rgba(30,45,140,.2) 55%,transparent 75%),radial-gradient(ellipse 120% 60% at 50% 0%,#0B1230,#04060F 70%)}
+.bgl{background:#F2F5FB}.bgg{background:#35D07F}.bgb{background:#2E3A8C}
+.hl{position:absolute;left:0;right:0;text-align:center;font-weight:800;text-transform:uppercase;line-height:1.1;letter-spacing:-.01em}
+.hl span{display:inline-block;opacity:0;margin:0 .12em}
+.sp{position:absolute;border-radius:50%}
+.st{position:absolute;filter:drop-shadow(0 18px 30px rgba(0,0,0,.35))}
+.card{position:absolute;border-radius:40px;box-sizing:border-box}
+.cap{position:absolute;left:50px;right:50px;top:1230px;text-align:center;font:800 54px/1.2 Man;opacity:0;z-index:60}
+.cap i{font-style:normal;display:inline-block;margin:0 .1em;color:rgba(255,255,255,.35);padding:0 .1em;border-radius:10px}
+.cap.l i{color:rgba(10,18,48,.3)}
+#dbg{position:absolute;left:24px;top:24px;z-index:80;font:700 24px/1.25 Man;color:#fff;background:rgba(0,0,0,.55);padding:10px 16px;border-radius:14px;max-width:660px}
+#dbg b{color:#43E895}
+#beat{position:absolute;right:24px;top:24px;z-index:80;width:46px;height:46px;border-radius:50%;background:#43E895;opacity:.25}
+#flash{background:#fff;opacity:0;z-index:90}
+#hcv{position:absolute;left:0;top:0;width:1080px;height:1920px}
+.ph{position:absolute;border:4px dashed rgba(120,140,200,.6);border-radius:24px;color:#6E7BA8;font:700 30px/1.3 Man;text-align:center;display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box}
+</style></head><body>
+<div id="root" data-composition-id="story-animatic" data-width="1080" data-height="1920" data-duration="__T__">
+  <section id="main" class="clip" data-start="0" data-duration="__T__" data-track-index="1"><div id="stage" class="clip"></div></section>
+  <section id="hostc" class="clip" data-start="0" data-duration="__T__" data-track-index="3" style="z-index:55"><canvas id="hcv" width="1080" height="1920"></canvas></section>
+  <section id="ui" class="clip" data-start="0" data-duration="__T__" data-track-index="4" style="z-index:70"><div id="caps"></div><div id="dbg"></div><div id="beat"></div></section>
+  <section id="flash" class="clip" data-start="0" data-duration="__T__" data-track-index="31"></section>
+  <audio id="sfx" src="audio.wav" data-start="0" data-duration="__T__" data-track-index="32"></audio>
+</div>
+<script>
+const D = __DATA__, T = D.T, BEAT = 60 / D.bpm;
+const tl = gsap.timeline({ paused: true, onUpdate: () => ST.render() });
+window.__timelines = window.__timelines || {}; window.__timelines['story-animatic'] = tl;
+// всё, что появляется позже, прячем с нуля: fromTo без этого оставляет элемент видимым до начала твина
+const _fromTo = tl.fromTo.bind(tl);
+tl.fromTo = (t, f, to, pos) => { if (typeof t !== 'string' && f && (f.autoAlpha === 0 || f.opacity === 0)) tl.set(t, f.autoAlpha === 0 ? { autoAlpha: 0 } : { opacity: 0 }, 0); return _fromTo(t, f, to, pos); };
+const $ = (s) => document.querySelector(s);
+const mk = (tag, cls, css, html, parent) => { const e = document.createElement(tag); if (cls) e.className = cls; if (css) Object.assign(e.style, css); if (html !== undefined) e.innerHTML = html; (parent || stage).appendChild(e); return e; };
+const stage = $('#stage');
+const flash = (t, a = 0.5, d = 0.14) => tl.fromTo('#flash', { opacity: a }, { opacity: 0, duration: d, ease: 'none', immediateRender: false }, t);
+const sticker = (p, f, css) => mk('img', 'st', Object.assign({ left: '0px', top: '0px' }, css), '', p).setAttribute('src', f) || p.lastChild;
+// ---------- сцены ----------
+const SC = {};
+D.scenes.forEach((s) => { const el = mk('div', 'scn', null, ''); el.id = s.id; const cam = mk('div', 'cam', null, '', el); SC[s.id] = { el, cam, ...s }; });
+const dark = (s) => { SC[s].cam.classList.add('bgd'); for (let k = 0; k < 40; k++) { const sz = 4 + (k * 7) % 6; const d = mk('i', 'sp', { left: ((k * 137) % 1080) + 'px', top: (80 + (k * 251) % 1500) + 'px', width: sz + 'px', height: sz + 'px', background: ['#FFD84D', '#8FB0FF', '#43E895', '#fff'][k % 4], boxShadow: '0 0 8px currentColor', opacity: .7 }, '', SC[s].cam); tl.to(d, { y: -140 - (k % 5) * 40, duration: SC[s].end - SC[s].start, ease: 'none' }, SC[s].start); } };
+const K = (s, v) => `<span style="color:${v}">`;
+// кинетический текст: слова по битам
+const kin = (sid, items, top, size, color, keyColor, t0, step) => { items.forEach((it, i) => {
+  const h = mk('div', 'hl', { top: (top + i * size * 1.12) + 'px', fontSize: size + 'px', color: it[1] ? keyColor : color }, `<span>${it[0]}</span>`, SC[sid].cam);
+  tl.fromTo(h.firstChild, { autoAlpha: 0, scale: 1.8, y: 30 }, { autoAlpha: 1, scale: 1, y: 0, duration: 0.18, ease: 'back.out(2.6)', immediateRender: false }, t0 + i * step);
+  flash(t0 + i * step, 0.12, 0.08); }); };
+// ---------- S1 ХУК: машина ----------
+dark('s1');
+{ const c = SC.s1.cam; const car = mk('img', 'st', { left: '190px', top: '470px', width: '700px' }, '', c); car.src = 'st-car.webp';
+  for (let k = 0; k < 9; k++) { const l = mk('i', '', { position: 'absolute', left: (200 + (k * 97) % 700) + 'px', top: (560 + (k * 61) % 520) + 'px', width: '300px', height: '4px', background: 'rgba(255,255,255,.55)', opacity: 0 }, '', c);
+    tl.fromTo(l, { x: 400, opacity: 0.8 }, { x: -700, opacity: 0, duration: 0.35, repeat: 7, ease: 'none', immediateRender: false }, 0.1 + (k % 3) * 0.1); }
+  for (let b = 1; b <= 5; b++) { tl.to(car, { x: (b % 2 ? 1 : -1) * 10, y: 6, duration: 0.05, yoyo: true, repeat: 3 }, b * BEAT); }
+  tl.to(car, { rotation: -6, y: 60, duration: 0.5, ease: 'power2.out' }, 3.0);
+  kin('s1', [['Завайбкодили', 0], ['продукт', 1]], 190, 78, '#fff', '#43E895', 1.0, BEAT);
+  const cl = mk('div', 'hl', { top: '1000px', fontSize: '70px', color: '#fff' }, `<span style="opacity:1">КЛИЕНТОВ: <b id="zero" style="color:#FF6369;font-size:150px;vertical-align:-24px">0</b></span>`, c);
+  tl.fromTo(cl, { autoAlpha: 0, scale: 2.2 }, { autoAlpha: 1, scale: 1, duration: 0.2, ease: 'back.out(2.6)', immediateRender: false }, 2.5); flash(2.5, 0.35);
+  // петля: к концу ролика первый кадр возвращается в исходное, чтобы стык с началом был без скачка
+  tl.set([...c.querySelectorAll('.hl')], { autoAlpha: 0 }, T - 0.45); tl.set(car, { rotation: 0, y: 0, x: 0 }, T - 0.45); }
+// ---------- S2 ИНТРИГА ----------
+SC.s2.cam.classList.add('bgl');
+{ const c = SC.s2.cam; const t = SC.s2.start;
+  const h1 = mk('div', 'hl', { top: '200px', fontSize: '74px', color: '#0A1230' }, '<span>Думали: кнопка</span>', c); const h2 = mk('div', 'hl', { top: '300px', fontSize: '110px', color: '#2E3A8C' }, '<span style="position:relative">«бабло»<i id="strk" style="position:absolute;left:0;top:50%;height:12px;width:100%;background:#FF6369;transform:scaleX(0);transform-origin:left"></i></span>', c);
+  [h1, h2].forEach((h, i) => tl.fromTo(h.firstChild, { autoAlpha: 0, y: 40 }, { autoAlpha: 1, y: 0, duration: 0.25, ease: 'back.out(2)', immediateRender: false }, t + 0.25 + i * 0.4));
+  const b = mk('img', 'st', { left: '290px', top: '620px', width: '500px' }, '', c); b.src = 'st-redbtn.webp';
+  tl.to(b, { scale: 0.88, duration: 0.1, ease: 'power2.in' }, t + 1.5); tl.to(b, { scale: 1, duration: 0.3, ease: 'elastic.out(1,.4)' }, t + 1.6);
+  const rp = mk('i', '', { position: 'absolute', left: '440px', top: '770px', width: '200px', height: '200px', borderRadius: '50%', border: '8px solid #FF6369', opacity: 0 }, '', c);
+  tl.fromTo(rp, { scale: 0.3, opacity: 0.9 }, { scale: 3, opacity: 0, duration: 0.6, ease: 'power2.out', immediateRender: false }, t + 1.5);
+  const m = mk('img', 'st', { left: '440px', top: '900px', width: '200px', opacity: 0 }, '', c); m.src = 'st-money.webp';
+  tl.fromTo(m, { opacity: 0, y: 60, scale: 0.4 }, { opacity: 1, y: -150, scale: 1, duration: 0.5, ease: 'power2.out', immediateRender: false }, t + 1.9); tl.to(m, { y: 400, opacity: 0, rotation: 40, duration: 0.5, ease: 'power2.in' }, t + 2.6);
+  tl.to('#strk', { scaleX: 1, duration: 0.2, ease: 'power3.out' }, t + 3.6);
+  const no = mk('div', 'hl', { top: '1010px', fontSize: '160px', color: '#FF6369', transform: 'rotate(-6deg)' }, '<span>НЕ ПОШЛИ</span>', c);
+  tl.fromTo(no.firstChild, { autoAlpha: 0, scale: 2.4 }, { autoAlpha: 1, scale: 1, duration: 0.15, ease: 'power4.in', immediateRender: false }, t + 3.6); flash(t + 3.6, 0.4); }
+// ---------- S3 БОЛЬ ----------
+dark('s3');
+{ const c = SC.s3.cam, t = SC.s3.start; const items = [['st-hourglass.webp', 'Ждали, что придут сами'], ['st-money.webp', 'Реклама наугад'], ['st-nosee.webp', 'Ни с кем не говорили']];
+  items.forEach(([img, txt], i) => { const y = 250 + i * 330, from = i % 2 ? 1200 : -1200;
+    const cd = mk('div', 'card', { left: '70px', top: y + 'px', width: '940px', height: '270px', background: 'rgba(255,255,255,.08)', border: '3px solid rgba(255,255,255,.2)' }, '', c);
+    const im = mk('img', 'st', { left: '40px', top: '45px', width: '180px' }, '', cd); im.src = img;
+    mk('div', '', { position: 'absolute', left: '260px', top: '70px', width: '640px', font: '800 54px/1.15 Unb', textTransform: 'uppercase' }, txt, cd);
+    const x = mk('img', 'st', { left: '720px', top: '120px', width: '170px', opacity: 0 }, '', cd); x.src = 'st-cross.webp';
+    tl.fromTo(cd, { x: from, autoAlpha: 0 }, { x: 0, autoAlpha: 1, duration: 0.22, ease: 'power3.out', immediateRender: false }, t + 0.6 + i * 2.0); flash(t + 0.7 + i * 2.0, 0.15, 0.08);
+    tl.fromTo(x, { opacity: 0, scale: 3, rotation: -30 }, { opacity: 1, scale: 1, rotation: 12, duration: 0.18, ease: 'power4.in', immediateRender: false }, t + 1.5 + i * 2.0);
+    tl.to(cd, { x: 6, duration: 0.04, yoyo: true, repeat: 3 }, t + 1.7 + i * 2.0); }); }
+// ---------- S4 ПОВОРОТ ----------
+SC.s4.cam.classList.add('bgg');
+{ const c = SC.s4.cam, t = SC.s4.start; const a = mk('div', 'hl', { top: '300px', fontSize: '150px', color: '#0A1230' }, '<span>ТОГДА</span>', c), b = mk('div', 'hl', { top: '500px', fontSize: '128px', color: '#fff' }, '<span>ПО-ДРУГОМУ</span>', c);
+  tl.fromTo(a.firstChild, { autoAlpha: 0, scale: 4 }, { autoAlpha: 1, scale: 1, duration: 0.25, ease: 'power4.out', immediateRender: false }, t + 0.3);
+  tl.fromTo(b.firstChild, { autoAlpha: 0, scale: 4 }, { autoAlpha: 1, scale: 1, duration: 0.25, ease: 'power4.out', immediateRender: false }, t + 0.8); flash(t + 0.8, 0.5);
+  const r = mk('img', 'st', { left: '340px', top: '820px', width: '400px' }, '', c); r.src = 'st-rocket.webp'; tl.fromTo(r, { y: 500, opacity: 0, rotation: -30 }, { y: 0, opacity: 1, rotation: 0, duration: 0.5, ease: 'back.out(1.6)', immediateRender: false }, t + 1.3); }
+// ---------- S5 ПЛАН ----------
+SC.s5.cam.classList.add('bgl');
+{ const c = SC.s5.cam, t = SC.s5.start; const steps = [['1', 'Нашли одного клиента', 'СКРИНШОТ: клиент и первый счёт'], ['2', 'Счёт голосом за минуту', 'СКРИНШОТ: бот + PDF с QR'], ['3', 'Спросили, что бесит', 'СКРИНШОТ: правка по замечанию']];
+  const win = mk('div', 'card', { left: '90px', top: '470px', width: '900px', height: '700px', background: '#fff', boxShadow: '0 40px 80px rgba(30,50,110,.25)', overflow: 'hidden' }, '<div style="height:70px;background:#E9EEF9;display:flex;align-items:center;gap:12px;padding:0 24px"><i style="width:18px;height:18px;border-radius:50%;background:#FF6369"></i><i style="width:18px;height:18px;border-radius:50%;background:#F5A524"></i><i style="width:18px;height:18px;border-radius:50%;background:#35D07F"></i><b style="margin-left:24px;font:700 26px Man;color:#5C6788">Первичка</b></div>', c);
+  tl.fromTo(win, { autoAlpha: 0, y: 200, scale: 0.9 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.45, ease: 'back.out(1.5)', immediateRender: false }, t + 0.2);
+  steps.forEach(([n, head, ph], i) => { const s0 = t + 0.3 + i * 3.8;
+    const hd = mk('div', 'hl', { top: '230px', fontSize: '66px', color: '#0A1230' }, `<span><b style="color:#35D07F">${n}</b> ${head}</span>`, c);
+    tl.fromTo(hd.firstChild, { autoAlpha: 0, y: 60, filter: 'blur(12px)' }, { autoAlpha: 1, y: 0, filter: 'blur(0px)', duration: 0.3, ease: 'power3.out', immediateRender: false }, s0);
+    tl.to(hd.firstChild, { autoAlpha: 0, y: -50, duration: 0.2 }, s0 + 3.4);
+    const pl = mk('div', 'ph', { left: '130px', top: '580px', width: '820px', height: '480px' }, ph, c);
+    tl.fromTo(pl, { autoAlpha: 0, x: 60 }, { autoAlpha: 1, x: 0, duration: 0.3, ease: 'power3.out', immediateRender: false }, s0 + 0.2); tl.to(pl, { autoAlpha: 0, x: -60, duration: 0.2 }, s0 + 3.4);
+    const rp = mk('i', '', { position: 'absolute', left: '480px', top: '960px', width: '120px', height: '120px', borderRadius: '50%', border: '8px solid #35D07F', opacity: 0 }, '', c);
+    tl.fromTo(rp, { scale: 0.3, opacity: 1 }, { scale: 2.2, opacity: 0, duration: 0.5, immediateRender: false }, s0 + 2.2); flash(s0 + 2.2, 0.1, 0.08);
+    const dot = mk('i', '', { position: 'absolute', left: (430 + i * 90) + 'px', top: '1188px', width: '34px', height: '34px', borderRadius: '50%', background: '#C9D4FF' }, '', c);
+    tl.to(dot, { background: '#35D07F', scale: 1.4, duration: 0.2 }, s0); });
+}
+// ---------- S6 РАСКРЫТИЕ ----------
+dark('s6');
+{ const c = SC.s6.cam, t = SC.s6.start;
+  const ring = mk('i', '', { position: 'absolute', left: '140px', top: '380px', width: '800px', height: '800px', borderRadius: '50%', border: '4px solid #43E895', opacity: 0 }, '', c); tl.fromTo(ring, { scale: 0.2, opacity: 1 }, { scale: 1.3, opacity: 0, duration: 1.1, ease: 'power2.out', immediateRender: false }, t + 0.3);
+  const lg = mk('div', 'hl', { top: '540px', fontSize: '112px', color: '#fff' }, '<span>Первичка</span>', c); tl.fromTo(lg.firstChild, { autoAlpha: 0, scale: 3 }, { autoAlpha: 1, scale: 1, duration: 0.3, ease: 'power4.out', immediateRender: false }, t + 0.3); flash(t + 0.3, 0.7);
+  ['СЧЁТ', 'АКТ', 'УПД', 'ТОРГ-12'].forEach((w, i) => { const ch = mk('div', 'card', { left: (140 + (i % 2) * 400) + 'px', top: (860 + Math.floor(i / 2) * 170) + 'px', width: '360px', height: '130px', background: i % 2 ? '#35D07F' : '#4F6BFF', font: '800 50px/130px Unb', textAlign: 'center' }, w, c); tl.fromTo(ch, { autoAlpha: 0, scale: 0.4, rotation: -8 }, { autoAlpha: 1, scale: 1, rotation: 0, duration: 0.25, ease: 'back.out(2.4)', immediateRender: false }, t + 1.2 + i * BEAT); }); }
+// ---------- S7 ПЕТЛЯ ----------
+dark('s7');
+{ const c = SC.s7.cam, t = SC.s7.start; const car = mk('img', 'st', { left: '190px', top: '470px', width: '700px' }, '', c); car.src = 'st-car.webp';
+  tl.fromTo(car, { x: -1000 }, { x: 0, duration: 0.7, ease: 'power3.out', immediateRender: false }, t + 0.1);
+  for (let k = 0; k < 9; k++) { const l = mk('i', '', { position: 'absolute', left: (200 + (k * 97) % 700) + 'px', top: (560 + (k * 61) % 520) + 'px', width: '300px', height: '4px', background: 'rgba(255,255,255,.55)', opacity: 0 }, '', c); tl.fromTo(l, { x: 400, opacity: 0.8 }, { x: -700, opacity: 0, duration: 0.35, repeat: 4, ease: 'none', immediateRender: false }, t + 0.1 + (k % 3) * 0.1); }
+  const cl = mk('img', 'st', { left: '470px', top: '420px', width: '150px', opacity: 0 }, '', c); cl.src = 'st-hand.webp'; tl.fromTo(cl, { opacity: 0, scale: 0.3 }, { opacity: 1, scale: 1, duration: 0.3, ease: 'back.out(2.4)', immediateRender: false }, t + 1.6);
+  kin('s7', [['Поехало', 1]], 190, 120, '#fff', '#43E895', t + 0.5, BEAT); }
+// ---------- S8 ПРИЗЫВ ----------
+dark('s8');
+{ const c = SC.s8.cam, t = SC.s8.start;
+  const a = mk('div', 'hl', { top: '330px', fontSize: '66px', color: '#A9B4D6' }, '<span>Напиши</span>', c), b = mk('div', 'hl', { top: '430px', fontSize: '210px', color: '#43E895' }, '<span>СЧЁТ</span>', c);
+  tl.fromTo(a.firstChild, { autoAlpha: 0, y: 30 }, { autoAlpha: 1, y: 0, duration: 0.25, immediateRender: false }, t + 0.2);
+  tl.fromTo(b.firstChild, { autoAlpha: 0, scale: 3 }, { autoAlpha: 1, scale: 1, duration: 0.25, ease: 'power4.out', immediateRender: false }, t + 0.7); flash(t + 0.7, 0.5);
+  const bt = mk('div', 'card', { left: '160px', top: '860px', width: '760px', height: '150px', background: '#fff', color: '#0A1230', font: '800 50px/150px Unb', textAlign: 'center', borderRadius: '75px' }, 'Открыть бота →', c); tl.fromTo(bt, { autoAlpha: 0, y: 60, scale: 0.8 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.35, ease: 'back.out(2)', immediateRender: false }, t + 1.2);
+  tl.to(bt, { scale: 1.05, duration: 0.25, yoyo: true, repeat: 3, ease: 'sine.inOut' }, t + 1.8);
+  const hd = mk('div', 'hl', { top: '1050px', fontSize: '44px', color: '#A9B4D6', fontFamily: 'Man' }, '<span>@pervichka_app_bot</span>', c); tl.fromTo(hd.firstChild, { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.3 }, t + 1.5); }
+// ---------- порядок показа и переходы ----------
+D.scenes.forEach((s, i) => { const o = SC[s.id], t = s.start;
+  tl.set(o.el, { autoAlpha: 1 }, t); if (i < D.scenes.length - 1) tl.set(o.el, { autoAlpha: 0 }, s.end + 0.04);
+  const inc = { flash: null, punch: { scale: 1.25 }, glitch: { x: 0 }, whip: { x: 1080, filter: 'blur(30px)' }, zoom: { scale: 2.6, filter: 'blur(14px)' } }[s.trans];
+  if (i > 0) { if (s.trans === 'punch') tl.fromTo(o.el, { scale: 1.25 }, { scale: 1, duration: 0.22, ease: 'power3.out', immediateRender: false }, t);
+    if (s.trans === 'whip') tl.fromTo(o.el, { x: 1080, filter: 'blur(30px)' }, { x: 0, filter: 'blur(0px)', duration: 0.26, ease: 'power3.out', immediateRender: false }, t);
+    if (s.trans === 'zoom') tl.fromTo(o.el, { scale: 2.6, filter: 'blur(14px)' }, { scale: 1, filter: 'blur(0px)', duration: 0.3, ease: 'power3.out', immediateRender: false }, t);
+    if (s.trans === 'glitch') { for (let k = 0; k < 6; k++) tl.fromTo(o.el, { x: (k % 2 ? -1 : 1) * (40 - k * 6), filter: `hue-rotate(${k * 60}deg) saturate(2)` }, { x: 0, filter: 'hue-rotate(0deg) saturate(1)', duration: 0.04, immediateRender: false }, t + k * 0.04); }
+    flash(t, s.trans === 'flash' ? 0.8 : 0.35, 0.16); }
+  // медленный наезд камеры внутри сцены
+  tl.fromTo(o.cam, { scale: 1 }, { scale: 1.06, duration: s.end - s.start, ease: 'none', immediateRender: false }, t); });
+// петля: последний кадр перетекает в первый
+tl.to('#s8', { autoAlpha: 0, duration: 0.4 }, T - 0.4); tl.set('#s1', { autoAlpha: 1 }, T - 0.4); tl.fromTo('#s1', { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.4, immediateRender: false }, T - 0.4);
+// ---------- голос: субтитры, рот героя ----------
+const WORDS = [];
+D.vo.forEach(([a, b, txt], li) => { const raw = txt.split(' '), tok = raw.map((w) => ({ w: w.replace(/\*/g, ''), key: w.includes('*') })); const wts = tok.map((x) => x.w.length + 2), sum = wts.reduce((p, q) => p + q, 0); let acc = a;
+  const cap = mk('div', 'cap', null, '', $('#caps')); const dk = !['s2', 's4', 's5'].includes(D.scenes.find((s) => a >= s.start && a < s.end).id); if (!dk) cap.classList.add('l');
+  const spans = tok.map((x, i) => { const sp = mk('i', '', null, x.w, cap); const t0 = acc, t1 = acc + (b - a) * wts[i] / sum; acc = t1; WORDS.push({ t: t0, key: x.key }); sp._t = t0; sp._key = x.key; return sp; });
+  tl.set(cap, { autoAlpha: 1 }, a); tl.set(cap, { autoAlpha: 0 }, b + 0.3);
+  spans.forEach((sp) => tl.set(sp, { color: sp._key ? '#43E895' : (dk ? '#fff' : '#0A1230') }, sp._t)); });
+// ---------- герой (3D-заглушка: рот двигается по словам) ----------
+const ST = makeStage($('#hcv'), { flat: true, dist: 15 }), P = ST.add(), H1 = 4.4 * ST.ppu;
+const place = (px, py, h) => Object.assign(ST.at(px, py), { s: h / H1 });
+Object.assign(P, place(900, 2100, 440), { rotY: -0.3, rotX: 0.04, rotZ: 0, yaw: 0, spin: 0, armL: 0.35, armR: 0.35, armLx: 0, armRx: 0, handR: 0, eyeS: 1, happy: 0, mouth: 1, jump: 0, sq: 0, look: -0.4, blink: 0, beret: 1, pencil: 1, hood: 0, glasses: 0, laptop: 0, doc: 0, shield: 0, det: 0, mag: 0, guard: 0, flash: 0, beam: 0, bulb: 0, lit: 0 });
+const hp = (t, o, d = 0.25, e = 'back.out(2)') => tl.to(P, Object.assign({ duration: d, ease: e }, o), t);
+const go = (t, px, py, h, extra = {}, d = 0.4) => { tl.to(P, Object.assign({ duration: d, ease: 'power2.inOut' }, place(px, py, h), extra), t); hp(t, { jump: 0.7 }, d / 2, 'power2.out'); hp(t + d / 2, { jump: 0 }, d / 2, 'power2.in'); };
+const hop = (t, h = 0.6) => { hp(t, { sq: 0.12 }, 0.08, 'power2.in'); hp(t + 0.08, { jump: h, sq: -0.06 }, 0.2, 'power2.out'); hp(t + 0.28, { jump: 0, sq: 0 }, 0.3, 'bounce.out'); };
+const hs = (id) => D.scenes.find((s) => s.id === id).start;
+go(hs('s1') + 3.4, 920, 1850, 440, { rotY: -0.4 });                       // S1: выглядывает на «ноль»
+go(hs('s2') + 1.2, 900, 1860, 440); hop(hs('s2') + 1.5, 0.5);             // S2: смотрит на кнопку
+go(hs('s3') + 0.2, 180, 1860, 440, { rotY: 0.4, look: 0.5 }); hp(hs('s3') + 0.5, { eyeS: 0.8 });   // S3: расстроен
+go(hs('s4') + 0.2, 540, 1880, 470, { rotY: 0 }); hop(hs('s4') + 0.9, 0.9); hp(hs('s4') + 0.9, { happy: 1, armR: 2.5, armL: 2.5 });  // S4: прыжок
+const s5 = hs('s5'); go(s5 + 0.2, 880, 1560, 400, { rotY: -0.5, happy: 0 }); [0, 1, 2].forEach((i) => { const t = s5 + 0.3 + i * 3.8; go(t + 1.6, 760, 1160, 330, { armR: 1.8, armRx: -0.5, rotY: -0.7 }, 0.5); hop(t + 2.2, 0.35); go(t + 2.9, 880, 1560, 400, { armR: 0.35, armRx: 0 }, 0.4); });
+go(hs('s6') + 0.5, 540, 1850, 560, { rotY: 0, happy: 1 }); hop(hs('s6') + 0.5, 0.8);               // S6: гордый
+go(hs('s7') + 1.0, 540, 700, 300, { rotY: -0.2, happy: 1 }); hop(hs('s7') + 1.6, 0.4);            // S7: на крыше машины
+go(hs('s8') + 0.3, 540, 1850, 520, { rotY: 0, happy: 1, armR: 2.7, armRx: -0.2 }); for (let k = 0; k < 8; k++) tl.to(P, { handR: k % 2 ? -0.5 : 0.5, duration: 0.2, ease: 'sine.inOut' }, hs('s8') + 0.8 + k * 0.2);
+go(T - 0.7, 900, 2100, 440, { happy: 0, armR: 0.35, armRx: 0 }, 0.5);   // петля: герой уходит вниз, как в первом кадре
+for (let t = 0, k = 0; t < T - 0.6; t += 1.1, k++) tl.to(P, { yaw: k % 2 ? -0.1 : 0.1, duration: 1.1, ease: 'sine.inOut' }, t);
+for (let t = 2.2; t < T - 0.8; t += 2.9) tl.to(P, { blink: 1, duration: 0.06, yoyo: true, repeat: 1 }, t);
+WORDS.forEach((w) => { tl.to(P, { mouth: w.key ? 1.9 : 1.55, duration: 0.07 }, w.t); tl.to(P, { mouth: 1, duration: 0.12 }, w.t + 0.1); });
+// ---------- подпись сцены и такт ----------
+D.scenes.forEach((s, i) => { tl.set('#dbg', { innerHTML: `<b>СЦЕНА ${i + 1} · ${s.name}</b> · переход: ${s.trans}<br>${s.plan}` }, s.start); });
+for (let b = 0; b * BEAT < T; b++) tl.fromTo('#beat', { opacity: 1, scale: 1.3 }, { opacity: 0.25, scale: 1, duration: BEAT * 0.8, ease: 'power2.out', immediateRender: false }, b * BEAT);
+tl.set({}, {}, T);
+</script>
+</body></html>

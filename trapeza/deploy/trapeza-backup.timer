@@ -1,0 +1,13 @@
+[Unit]
+Description=Первичка — ежедневная резервная копия базы
+
+[Timer]
+# Ночью, когда документы не выписывают. Persistent=true догоняет пропуск,
+# если сервер в это время был выключен, — иначе после перезагрузки в 3:20
+# копия за сутки просто не появилась бы.
+OnCalendar=*-*-* 03:20:00
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

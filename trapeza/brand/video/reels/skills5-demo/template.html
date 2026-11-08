@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="UTF-8" /><meta name="viewport" content="width=1080, height=1920" />
+<title>5 скиллов Claude Code — демо</title>
+<script src="gsap.min.js"></script>
+<style>
+@font-face{font-family:Unb;font-weight:200 900;src:url(unbounded-cyrillic-wght-normal.woff2) format('woff2');unicode-range:U+0400-045F,U+2116,U+00AB,U+00BB,U+2014}
+@font-face{font-family:Unb;font-weight:200 900;src:url(unbounded-latin-wght-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+20BD,U+2212}
+@font-face{font-family:Man;font-weight:200 800;src:url(manrope-cyrillic-wght-normal.woff2) format('woff2');unicode-range:U+0400-045F,U+2116,U+00AB,U+00BB}
+@font-face{font-family:Man;font-weight:200 800;src:url(manrope-latin-wght-normal.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+20BD,U+2212}
+@font-face{font-family:JBM;font-weight:400;src:url(jbm-cyrillic-400.woff2) format('woff2');unicode-range:U+0400-045F}
+@font-face{font-family:JBM;font-weight:400;src:url(jbm-latin-400.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+2192,U+2713}
+@font-face{font-family:JBM;font-weight:700;src:url(jbm-cyrillic-700.woff2) format('woff2');unicode-range:U+0400-045F}
+@font-face{font-family:JBM;font-weight:700;src:url(jbm-latin-700.woff2) format('woff2');unicode-range:U+0000-00FF,U+2000-206F,U+2192,U+2713}
+html,body{margin:0;background:#0F0E0C}
+#root{position:relative;width:1080px;height:1920px;overflow:hidden;font-family:Unb,Man,sans-serif;color:#fff;background:#0F0E0C}
+.clip{position:absolute;inset:0}
+#bg{background:radial-gradient(ellipse 90% 40% at 50% 100%,rgba(217,119,87,.5),rgba(140,70,45,.2) 55%,transparent 75%),radial-gradient(ellipse 120% 60% at 50% 0%,#1E1813,#0F0E0C 70%)}
+#floor{position:absolute;left:-120px;right:-120px;bottom:-80px;height:330px;border-radius:50%;background:radial-gradient(ellipse at 50% 30%,rgba(255,170,130,.85),rgba(217,119,87,.5) 35%,rgba(150,70,40,.12) 65%,transparent 72%);filter:blur(10px)}
+.sp{position:absolute;border-radius:50%}
+.scn{position:absolute;inset:0;opacity:0;overflow:hidden}
+.hl{position:absolute;left:0;right:0;text-align:center;font-weight:800;text-transform:uppercase;line-height:1.08;letter-spacing:-.01em;text-shadow:0 6px 24px rgba(0,0,0,.5)}
+.hl span{display:inline-block;opacity:0;margin:0 .1em}
+.ac{color:#FF9B73}
+.chip{position:absolute;left:50%;top:110px;transform:translateX(-50%);height:84px;border-radius:42px;background:rgba(255,255,255,.09);border:2px solid rgba(255,255,255,.26);display:flex;align-items:center;gap:16px;padding:0 34px 0 12px;font:700 32px JBM;white-space:nowrap;color:#fff;opacity:0}
+.chip .av{width:60px;height:60px;border-radius:50%;background:#E3E9FA url(hero2.png) no-repeat;background-size:136px auto;background-position:-32px -39px}
+.card{position:absolute;box-sizing:border-box;border-radius:36px}
+.st{position:absolute}
+.win{position:absolute;left:70px;width:940px;border-radius:30px;background:#1A1714;border:2px solid #4A3A31;box-shadow:0 0 90px rgba(217,119,87,.45),0 40px 80px rgba(0,0,0,.55);overflow:hidden;opacity:0}
+.win .bar{height:64px;background:#26201B;display:flex;align-items:center;gap:12px;padding:0 24px;font:400 24px JBM;color:#9C8F85}
+.win .bar i{width:18px;height:18px;border-radius:50%;display:block}
+.win .bd{position:absolute;left:0;right:0;top:64px;bottom:0;padding:28px 34px;font:400 29px/1.5 JBM;color:#E8DED5;display:flex;flex-direction:column;gap:6px}
+.ln{opacity:0;white-space:pre-wrap}
+.ln b{font-weight:700}
+.t{display:inline-block;clip-path:inset(0 100% 0 0)}
+.inp{border:2px solid #D97757;border-radius:14px;padding:12px 20px;margin-top:10px;color:#fff}
+.dim{color:#8D7F74}.org{color:#FF9B73}.grn{color:#3DDC84}.red{color:#FF5A4E}.yel{color:#FFC94D}
+.ex{position:absolute;padding:6px 16px;border-radius:10px;background:#FFE9A8;color:#6B4E00;font:800 22px Man;letter-spacing:.08em;z-index:5;opacity:0}
+.cmd{position:absolute;height:92px;border-radius:46px;background:rgba(217,119,87,.16);border:2px solid #D97757;color:#FFD2BF;font:700 36px/88px JBM;padding:0 34px;white-space:nowrap;opacity:0;box-shadow:0 0 40px rgba(217,119,87,.4)}
+.cap{position:absolute;left:60px;right:60px;top:1700px;text-align:center;font:800 48px/1.2 Man;opacity:0;z-index:60}
+.cap i{font-style:normal;display:inline-block;margin:0 .1em;color:rgba(255,255,255,.32)}
+.pz{position:absolute;left:0;bottom:0;height:100%;opacity:0;transform:translateX(-50%)}
+.pz img{height:100%;width:auto;display:block}
+.mo{position:absolute;border-radius:50%;background:#0B1550;transform:translate(-50%,-50%) scaleY(.1);box-shadow:inset 0 -.3em 0 rgba(255,110,140,.55)}
+#hero{position:absolute;width:0;z-index:50}
+#caps{position:absolute;inset:0;z-index:70}
+</style></head><body>
+<div id="root" data-composition-id="skills5-demo" data-width="1080" data-height="1920" data-duration="__T__">
+  <section id="bg" class="clip" data-start="0" data-duration="__T__" data-track-index="0"><div id="floor"></div><div id="sparks" class="clip"></div></section>
+  <section id="main" class="clip" data-start="0" data-duration="__T__" data-track-index="1"><div id="stage" class="clip"></div></section>
+  <section id="heroc" class="clip" data-start="0" data-duration="__T__" data-track-index="3" style="z-index:50"><div id="hero"></div></section>
+  <section id="ui" class="clip" data-start="0" data-duration="__T__" data-track-index="4" style="z-index:70"><div id="caps"></div></section>
+  <audio id="sfx" src="audio.wav" data-start="0" data-duration="__T__" data-track-index="32"></audio>
+</div>
+<script>
+const D = __DATA__, T = D.T, BEAT = 60 / D.bpm;
+const tl = gsap.timeline({ paused: true });
+window.__timelines = window.__timelines || {}; window.__timelines['skills5-demo'] = tl;
+const _fromTo = tl.fromTo.bind(tl);
+tl.fromTo = (t, f, to, pos) => { if (typeof t !== 'string' && f && (f.autoAlpha === 0 || f.opacity === 0)) tl.set(t, f.autoAlpha === 0 ? { autoAlpha: 0 } : { opacity: 0 }, 0); return _fromTo(t, f, to, pos); };
+const $ = (s) => document.querySelector(s), stage = $('#stage');
+const mk = (tag, cls, css, html, parent) => { const e = document.createElement(tag); if (cls) e.className = cls; if (css) Object.assign(e.style, css); if (html !== undefined) e.innerHTML = html; (parent || stage).appendChild(e); return e; };
+const sc = (id) => D.scenes.find((s) => s.id === id), S = (id) => sc(id).start;
+const GREEN = '#3DDC84';
+{ const SP = $('#sparks'); for (let k = 0; k < 60; k++) { const sz = 4 + (k * 7) % 7, c = ['#FFC94D', '#FF9B73', '#3DDC84', '#fff'][k % 4];
+  const d = mk('i', 'sp', { left: ((k * 137) % 1080) + 'px', top: (150 + (k * 251) % 1700) + 'px', width: sz + 'px', height: sz + 'px', background: c, boxShadow: `0 0 ${sz * 2}px ${c}`, opacity: .7 }, '', SP);
+  tl.to(d, { y: -(160 + (k % 5) * 70), x: k % 2 ? 36 : -36, duration: T, ease: 'none' }, 0);
+  tl.fromTo(d, { opacity: .2 }, { opacity: .95, duration: .7 + (k % 4) * .2, yoyo: true, repeat: Math.floor((T - 1) / (.7 + (k % 4) * .2)), ease: 'sine.inOut', immediateRender: false }, (k % 7) * .1); } }
+const SCN = {}; D.scenes.forEach((s) => { const el = mk('div', 'scn', null, ''); el.id = s.id; SCN[s.id] = el; });
+const chip = (id, text, top = 110) => { const c = mk('div', 'chip', { top: top + 'px' }, `<i class="av"></i>${text}`, SCN[id]); tl.fromTo(c, { autoAlpha: 0, y: -40, scale: .9 }, { autoAlpha: 1, y: 0, scale: 1, duration: .5, ease: 'expo.out', immediateRender: false }, S(id) + .5); return c; };
+const head = (id, lines, top, size, t0, keys = []) => lines.forEach((ln, i) => { const h = mk('div', 'hl' + (keys.includes(i) ? ' ac' : ''), { top: (top + i * size * 1.1) + 'px', fontSize: size + 'px' }, `<span>${ln}</span>`, SCN[id]);
+  tl.fromTo(h.firstChild, { autoAlpha: 0, y: 50, filter: 'blur(14px)' }, { autoAlpha: 1, y: 0, filter: 'blur(0px)', duration: .55, ease: 'expo.out', immediateRender: false }, t0 + i * .2); });
+// окно терминала: рамка выезжает, строки появляются по очереди, команда «печатается»
+const win = (id, y, h, t, title = 'claude — ~/project') => { const w = mk('div', 'win', { top: y + 'px', height: h + 'px' }, `<div class="bar"><i style="background:#FF5A4E"></i><i style="background:#FFC94D"></i><i style="background:#3DDC84"></i><span style="margin-left:18px">${title}</span></div><div class="bd"></div>`, SCN[id]);
+  tl.fromTo(w, { autoAlpha: 0, y: 160, scale: .94, rotationX: 14 }, { autoAlpha: 1, y: 0, scale: 1, rotationX: 0, duration: .85, ease: 'expo.out', immediateRender: false }, t); return w; };
+const line = (w, html, t, cls = '') => { const l = mk('div', 'ln ' + cls, null, html, w.querySelector('.bd')); tl.fromTo(l, { autoAlpha: 0, y: 14 }, { autoAlpha: 1, y: 0, duration: .35, ease: 'expo.out', immediateRender: false }, t); return l; };
+const typed = (w, text, t, dur, cls = 'inp') => { const l = mk('div', 'ln ' + cls, null, '<span class="org">&gt;</span> <span class="t"></span>', w.querySelector('.bd')); const tt = l.querySelector('.t'); tt.textContent = text;
+  tl.fromTo(l, { autoAlpha: 0 }, { autoAlpha: 1, duration: .2, immediateRender: false }, t); tl.fromTo(tt, { clipPath: 'inset(0 100% 0 0)' }, { clipPath: 'inset(0 0% 0 0)', duration: dur, ease: `steps(${text.length})`, immediateRender: false }, t + .2); return l; };
+const exm = (id, x, y, t) => { const e = mk('span', 'ex', { left: x + 'px', top: y + 'px' }, 'ПРИМЕР', SCN[id]); tl.fromTo(e, { autoAlpha: 0 }, { autoAlpha: 1, duration: .3 }, t); };
+const WIN_Y = 450, WIN_H = 740;
+
+// ---------- S1 ХУК ----------
+{ const id = 's1', t = 0; chip(id, 'Claude Code · 5 скиллов', 100);
+  head(id, ['Ты платишь', 'за Claude Code'], 240, 82, 0, []); head(id, ['и не пользуешься', 'половиной'], 480, 72, 0.5, [1]);
+  // окно терминала с пустым приглашением — пять команд влетают вокруг
+  const w = win(id, 760, 520, .1); line(w, '<span class="dim">✻ Welcome to Claude Code</span>', .5); typed(w, '/', 1.0, .2);
+  ['/simplify', '/loop', '/fewer-permission-prompts', '/run', '/security-review'].forEach((c, i) => { const left = [60, 640, 440, 690, 430][i], top = [670, 670, 1330, 1450, 1560][i]; const e = mk('div', 'cmd', { left: left + 'px', top: top + 'px', fontSize: c.length > 14 ? '26px' : '34px' }, c, SCN[id]);
+    tl.fromTo(e, { autoAlpha: 0, scale: .5, y: 60 }, { autoAlpha: 1, scale: 1, y: 0, duration: .55, ease: 'back.out(2.2)', immediateRender: false }, 3.7 + i * .35); tl.to(e, { y: '-=14', duration: 1.2, ease: 'sine.inOut', yoyo: true, repeat: 1 }, 4.4 + i * .1); }); }
+// ---------- S2 /simplify ----------
+{ const id = 's2', t = S(id); chip(id, '1 · /simplify'); head(id, ['Убирает повторы'], 240, 66, t + .35);
+  const w = win(id, WIN_Y, WIN_H, t + .3); typed(w, '/simplify', t + 1.0, .5);
+  line(w, '<span class="org">●</span> Reviewing your changes for reuse, simplification and efficiency…', t + 2.2);
+  const df = mk('div', '', { marginTop: '14px', borderRadius: '14px', background: '#14110F', border: '1px solid #3A2F28', padding: '18px 22px', fontSize: '23px', lineHeight: '1.5' }, '<div class="dim" style="margin-bottom:8px">src/format.js</div>', w.querySelector('.bd')); tl.fromTo(df, { autoAlpha: 0, y: 24 }, { autoAlpha: 1, y: 0, duration: .5, ease: 'expo.out', immediateRender: false }, t + 2.8);
+  const R = ['const fmtDate = (d) => d.toISOString().slice(0, 10)', 'const fmtDay = (d) => d.toISOString().slice(0, 10)', 'const fmtShort = (d) => d.toISOString().slice(0, 10)'].map((x) => mk('div', 'red', { background: 'rgba(255,90,78,.12)', borderRadius: '6px', padding: '2px 10px', overflow: 'hidden', whiteSpace: 'pre' }, '− ' + x, df));
+  const G = mk('div', 'grn', { background: 'rgba(61,220,132,.12)', borderRadius: '6px', padding: '2px 10px', whiteSpace: 'pre', opacity: 0 }, '+ // one shared fmtDate helper', df);
+  tl.fromTo(G, { autoAlpha: 0, y: 10 }, { autoAlpha: 1, y: 0, duration: .4, immediateRender: false }, t + 4.6);
+  R.slice(1).forEach((r, i) => tl.to(r, { height: 0, paddingTop: 0, paddingBottom: 0, opacity: 0, duration: .45, ease: 'expo.inOut' }, t + 4.9 + i * .25));
+  line(w, '<span class="grn">✓</span> Fixed: 3 duplicates → 1 helper', t + 6.0); exm(id, 840, 400, t + 5.6); }
+// ---------- S3 /loop ----------
+{ const id = 's3', t = S(id); chip(id, '2 · /loop'); head(id, ['Повторяет сам'], 240, 66, t + .35);
+  const w = win(id, WIN_Y, WIN_H, t + .3); typed(w, '/loop 5m check the deploy', t + 1.0, .9);
+  line(w, '<span class="org">●</span> Running every 5 minutes. I will report each check.', t + 2.4);
+  ['09:00  deploy ✓ healthy', '09:05  deploy ✓ healthy', '09:10  deploy ✓ healthy'].forEach((x, i) => line(w, `<span class="dim">${x.slice(0, 5)}</span>  <span class="grn">${x.slice(7)}</span>`, t + 3.4 + i * 1.3));
+  const ring = mk('div', '', { position: 'absolute', left: '700px', top: (WIN_Y + 350) + 'px', width: '200px', height: '200px' }, '<svg width="200" height="200" viewBox="0 0 200 200"><circle cx="100" cy="100" r="84" stroke="#3A2F28" stroke-width="14" fill="none"/><circle id="rg" cx="100" cy="100" r="84" stroke="#FF9B73" stroke-width="14" fill="none" stroke-linecap="round" stroke-dasharray="528" stroke-dashoffset="528" transform="rotate(-90 100 100)"/></svg>', SCN[id]);
+  tl.fromTo(ring, { autoAlpha: 0, scale: .6 }, { autoAlpha: 1, scale: 1, duration: .5, ease: 'back.out(2)', immediateRender: false }, t + 2.6);
+  for (let k = 0; k < 3; k++) tl.fromTo('#rg', { strokeDashoffset: 528 }, { strokeDashoffset: 0, duration: 1.2, ease: 'none', immediateRender: false }, t + 3.0 + k * 1.3);
+  exm(id, 840, 400, t + 3.4); }
+// ---------- S4 /fewer-permission-prompts ----------
+{ const id = 's4', t = S(id); chip(id, '3 · /fewer-permission-prompts'); head(id, ['Меньше вопросов'], 240, 66, t + .35);
+  const w = win(id, WIN_Y, WIN_H, t + .3);
+  const asks = ['Allow Bash(git status)?', 'Allow Bash(git diff)?', 'Allow Bash(ls)?'];
+  const L = asks.map((a, i) => line(w, `<span class="yel">?</span> ${a} <span class="dim">[y/n]</span>`, t + 1.0 + i * .5));
+  typed(w, '/fewer-permission-prompts', t + 3.0, 1.0);
+  line(w, '<span class="org">●</span> Scanning transcripts for common read-only commands…', t + 4.5);
+  L.forEach((l, i) => tl.to(l, { height: 0, opacity: 0, marginTop: 0, duration: .4, ease: 'expo.inOut' }, t + 4.8 + i * .1));
+  const js = mk('div', '', { marginTop: '14px', borderRadius: '14px', background: '#14110F', border: '1px solid #3A2F28', padding: '18px 22px', fontSize: '25px', lineHeight: '1.5', whiteSpace: 'pre' }, '<div class="dim" style="margin-bottom:6px">.claude/settings.json</div>{\n  "permissions": { "allow": [\n    <span class="grn">"Bash(git status)"</span>,\n    <span class="grn">"Bash(git diff:*)"</span>,\n    <span class="grn">"Bash(ls:*)"</span>\n  ] }\n}', w.querySelector('.bd')); tl.fromTo(js, { autoAlpha: 0, y: 30 }, { autoAlpha: 1, y: 0, duration: .6, ease: 'expo.out', immediateRender: false }, t + 5.6);
+  exm(id, 840, 400, t + 5.9); }
+// ---------- S5 /run ----------
+{ const id = 's5', t = S(id); chip(id, '4 · /run'); head(id, ['Запускает и смотрит'], 240, 62, t + .35);
+  const w = win(id, WIN_Y, WIN_H, t + .3); typed(w, '/run', t + 1.0, .3);
+  line(w, '<span class="org">●</span> Starting the app…', t + 1.9); line(w, '<span class="grn">✓</span> http://localhost:3000', t + 2.8);
+  const br = mk('div', 'card', { left: '210px', top: (WIN_Y + 400) + 'px', width: '660px', height: '330px', background: '#fff', color: '#14110F', boxShadow: '0 0 60px rgba(255,155,115,.5),0 30px 60px rgba(0,0,0,.5)', overflow: 'hidden' }, '<div style="height:52px;background:#ECECEC;display:flex;align-items:center;gap:10px;padding:0 20px;font:500 22px JBM;color:#666"><i style="width:14px;height:14px;border-radius:50%;background:#FF5A4E"></i><i style="width:14px;height:14px;border-radius:50%;background:#FFC94D"></i><i style="width:14px;height:14px;border-radius:50%;background:#3DDC84"></i><span style="margin-left:14px">localhost:3000</span></div><div style="padding:34px 40px"><div style="font:800 44px Man">Моё приложение</div><div style="margin-top:18px;height:20px;width:80%;background:#EEE;border-radius:10px"></div><div style="margin-top:12px;height:20px;width:60%;background:#EEE;border-radius:10px"></div><div id="okb" style="margin-top:26px;display:inline-block;padding:14px 30px;border-radius:30px;background:#3DDC84;color:#04230F;font:800 28px Man;opacity:0">✓ правка работает</div></div>', SCN[id]);
+  tl.fromTo(br, { autoAlpha: 0, y: 200, scale: .9 }, { autoAlpha: 1, y: 0, scale: 1, duration: .8, ease: 'expo.out', immediateRender: false }, t + 3.4); tl.fromTo('#okb', { autoAlpha: 0, scale: .6 }, { autoAlpha: 1, scale: 1, duration: .5, ease: 'back.out(2.4)', immediateRender: false }, t + 4.6);
+  line(w, '<span class="grn">✓</span> Change verified in the running app, not only by tests', t + 5.2); exm(id, 840, 400, t + 4.6); }
+// ---------- S6 /security-review ----------
+{ const id = 's6', t = S(id); chip(id, '5 · /security-review'); head(id, ['Ищет дыры'], 240, 66, t + .35);
+  const w = win(id, WIN_Y, WIN_H, t + .3); typed(w, '/security-review', t + 1.0, .7);
+  line(w, '<span class="org">●</span> Reviewing pending changes on the current branch…', t + 2.3);
+  const code = ['query = "SELECT * FROM users WHERE id=" + req.id', 'res.send(userInput)', 'const token = process.env.TOKEN'];
+  code.forEach((c, i) => line(w, `<span class="dim">${String(12 + i * 7).padStart(3, ' ')}</span>  ${c}`, t + 2.9 + i * .3));
+  const sh = mk('img', 'st', { left: '680px', top: (WIN_Y + 380) + 'px', width: '300px', opacity: 0 }, '', SCN[id]); sh.src = 'st-shield.webp';
+  tl.fromTo(sh, { autoAlpha: 0, scale: .5, rotation: -20 }, { autoAlpha: 1, scale: 1, rotation: 0, duration: .7, ease: 'back.out(2)', immediateRender: false }, t + 3.6); tl.to(sh, { scale: 1.06, duration: .6, ease: 'sine.inOut', yoyo: true, repeat: 3 }, t + 4.4);
+  const sc1 = mk('i', '', { position: 'absolute', left: '100px', width: '880px', height: '6px', background: '#FF9B73', boxShadow: '0 0 30px #FF9B73', opacity: 0, top: (WIN_Y + 460) + 'px' }, '', SCN[id]);
+  tl.fromTo(sc1, { opacity: 1, y: 0 }, { y: 230, duration: .9, ease: 'sine.inOut', yoyo: true, repeat: 3, immediateRender: false }, t + 3.4); tl.set(sc1, { opacity: 0 }, t + 7.2); exm(id, 840, 400, t + 3.9); }
+// ---------- S7 все пять ----------
+{ const id = 's7', t = S(id); chip(id, 'Команда в сборе'); head(id, ['Набери слэш —', 'все пять в списке'], 240, 62, t + .35, [1]);
+  const w = win(id, 500, 760, t + .3); typed(w, '/', t + .9, .15);
+  [['/simplify', 'Review changed code, apply fixes'], ['/loop', 'Run a prompt on a recurring interval'], ['/fewer-permission-prompts', 'Allowlist common read-only commands'], ['/run', 'Launch the app and verify a change'], ['/security-review', 'Review pending changes for vulnerabilities']].forEach(([c, d], i) => {
+    const l = line(w, `<span class="org"><b>${c}</b></span>\n<span class="dim" style="font-size:24px">${d}</span>`, t + 1.5 + i * .45); l.style.padding = '8px 0'; l.style.borderBottom = '1px solid #2E2620'; });
+  const bd = w.querySelector('.bd'); bd.style.gap = '4px'; }
+// ---------- S8 ПРИЗЫВ ----------
+{ const id = 's8', t = S(id);
+  head(id, ['Подпишись'], 560, 96, t + .3, [0]);
+  const m = mk('div', 'hl', { top: '760px', fontSize: '50px', fontFamily: 'Man', textTransform: 'none', color: '#D8CBC1' }, '<span>в следующем ролике — ещё пять</span>', SCN[id]); tl.fromTo(m.firstChild, { autoAlpha: 0, y: 30 }, { autoAlpha: 1, y: 0, duration: .5, ease: 'expo.out', immediateRender: false }, t + 1.0);
+  const b = mk('div', 'card', { left: '250px', top: '900px', width: '580px', height: '130px', background: '#FF9B73', color: '#2A1208', font: '800 44px/130px Unb', textAlign: 'center', borderRadius: '65px', boxShadow: '0 0 60px rgba(255,155,115,.5)' }, 'Подписаться', SCN[id]);
+  tl.fromTo(b, { autoAlpha: 0, y: 70, scale: .85 }, { autoAlpha: 1, y: 0, scale: 1, duration: .55, ease: 'expo.out', immediateRender: false }, t + 1.5); tl.to(b, { scale: 1.05, duration: BEAT / 2, yoyo: true, repeat: 5, ease: 'sine.inOut' }, t + 2.2); }
+// ---------- переходы ----------
+D.scenes.forEach((s, i) => { const o = SCN[s.id], t = s.start, prev = i ? SCN[D.scenes[i - 1].id] : null;
+  tl.set(o, { autoAlpha: 1 }, t);
+  if (prev) {
+    if (s.trans === 'zoom') { tl.fromTo(o, { scale: .88, opacity: 0, filter: 'blur(14px)' }, { scale: 1, opacity: 1, filter: 'blur(0px)', duration: .75, ease: 'expo.out', immediateRender: false }, t); tl.to(prev, { scale: 1.18, opacity: 0, filter: 'blur(14px)', duration: .55, ease: 'expo.in' }, t - .05); }
+    if (s.trans === 'circle') { tl.fromTo(o, { clipPath: 'circle(0px at 50% 88%)' }, { clipPath: 'circle(1800px at 50% 88%)', duration: .9, ease: 'expo.inOut', immediateRender: false }, t); tl.set(o, { clipPath: 'none' }, t + .95); tl.to(prev, { opacity: 0, duration: .5, ease: 'power2.in' }, t + .3); }
+    tl.set(prev, { autoAlpha: 0 }, t + 1.0); }
+  tl.fromTo(o, { scale: 1 }, { scale: 1.03, duration: s.end - s.start - .8, ease: 'none', immediateRender: false }, t + .8); });
+tl.to(SCN.s8, { opacity: 0, duration: .45, ease: 'power2.inOut' }, T - .45); tl.set('#s1', { autoAlpha: 1 }, T - .45);
+// ---------- субтитры ----------
+const WORDS = [];
+D.vo.forEach(([a, b, txt]) => { const tok = txt.split(' ').map((w) => ({ w: w.replace(/\*/g, ''), key: w.includes('*') })), wts = tok.map((x) => x.w.length + 2), sum = wts.reduce((p, q) => p + q, 0); let acc = a;
+  const cap = mk('div', 'cap', null, '', $('#caps'));
+  const sp = tok.map((x, i) => { const el = mk('i', '', null, x.w, cap); const t0 = acc, t1 = acc + (b - a) * wts[i] / sum; acc = t1; WORDS.push({ t0, t1, w: x.w, key: x.key }); el._t = t0; el._k = x.key; return el; });
+  tl.set(cap, { autoAlpha: 1 }, a); tl.set(cap, { autoAlpha: 0 }, b + .3);
+  sp.forEach((el) => tl.set(el, { color: el._k ? '#FF9B73' : '#fff' }, el._t)); });
+// ---------- герой: стоит под окном слева и показывает на него; на «Enter» подпрыгивает ----------
+const POSE = { 'hero1.png': { W: 876, H: 900 }, 'hero2.png': { W: 751, H: 900, m: { cx: 343, cy: 470, w: 84 } }, 'hero3.png': { W: 753, H: 900 }, 'hero4.png': { W: 620, H: 900 }, 'hero5.png': { W: 1112, H: 900, m: { cx: 554, cy: 780, w: 140 } } };
+const hero = $('#hero'), pz = {}, mouths = [];
+Object.entries(POSE).forEach(([f, p]) => { const z = mk('div', 'pz', { aspectRatio: p.W + '/' + p.H }, '', hero); const im = mk('img', '', null, '', z); im.src = f; pz[f] = z;
+  if (p.m) { const m = mk('i', 'mo', { left: (p.m.cx / p.W * 100) + '%', top: (p.m.cy / p.H * 100) + '%', width: (p.m.w / p.W * 100) + '%', aspectRatio: '2/1' }, '', z); mouths.push(m); } });
+tl.set(hero, { yPercent: -100, left: 900, top: 2300, height: 420 }, 0);
+const show = (t, f) => Object.entries(pz).forEach(([k, z]) => tl.set(z, { autoAlpha: k === f ? 1 : 0 }, t));
+const HX = 210, HY = 1650, HH = 390;
+show(2.4, 'hero2.png'); tl.set(hero, { left: HX, top: HY + 800, height: HH }, 2.39); tl.to(hero, { top: HY, duration: 1.0, ease: 'expo.out' }, 2.4);
+D.clicks.forEach((c) => { tl.to(hero, { y: -28, duration: .1, ease: 'power2.out' }, c - .1); tl.to(hero, { y: 0, duration: .35, ease: 'bounce.out' }, c); });
+// финал: радуется на «Команда в сборе», затем с телефоном — зовёт подписаться
+show(S('s7') + 3.4, 'hero3.png'); tl.to(hero, { y: -70, duration: .2, ease: 'power2.out' }, S('s7') + 3.4); tl.to(hero, { y: 0, duration: .4, ease: 'bounce.out' }, S('s7') + 3.6);
+show(S('s8') + .6, 'hero1.png'); tl.to(hero, { left: 540, top: 1650, height: 460, duration: .8, ease: 'expo.inOut' }, S('s8') + .6);
+tl.to(hero, { top: 2300, duration: .5, ease: 'expo.in' }, T - .8);
+for (let k = 0; k < 53; k++) tl.to(hero, { rotation: k % 2 ? -1.2 : 1.2, duration: 1.0, ease: 'sine.inOut' }, k);
+const vow = (w) => (w.toLowerCase().match(/[аеёиоуыэюяaeiouy]/g) || []).length || 1;
+WORDS.forEach((w) => { const n = vow(w.w), step = Math.max(.1, (w.t1 - w.t0) / n);
+  for (let k = 0; k < n; k++) { const t = w.t0 + k * step; mouths.forEach((m) => { tl.to(m, { scaleY: w.key ? 1 : .75, duration: .05, ease: 'power2.out' }, t); tl.to(m, { scaleY: .1, duration: .07, ease: 'power2.in' }, t + Math.min(step * .6, .12)); }); } });
+tl.set({}, {}, T);
+</script>
+</body></html>

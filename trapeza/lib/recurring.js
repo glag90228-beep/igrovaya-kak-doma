@@ -1,0 +1,598 @@
+'use strict';
+
+/**
+ * Регулярные документы: «каждый месяц выставлять счёт за аренду».
+ *
+ * Зачем. У арендодателя, обслуживающей компании, подписчика на услуги
+ * документы одни и те же из месяца в месяц: те же позиции, тот же клиент,
+ * меняются только номер и дата. Забыть выставить счёт — значит не получить
+ * деньги вовремя; выставить дважды — объясняться с бухгалтерией клиента.
+ *
+ * Как это устроено. Здесь хранится только договорённость: кому, что и
+ * какого числа. В нужный день бот приходит с готовым предложением и
+ * кнопками «Выписать» и «Пропустить месяц».
+ *
+ * Почему бот не выписывает сам. Документ забирает номер в сквозном ряду.
+ * Лишний счёт нельзя тихо удалить: в нумерации останется дыра, и её придётся
+ * объяснять при проверке. Поэтому автоматическим здесь может быть только
+ * напоминание, а решение — всегда за человеком. По той же причине никакие
+ * письма контрагентам отсюда не уходят: отправку клиенту человек
+ * подтверждает отдельно и видит текст.
+ *
+ * Периоды. Кроме «раз в месяц» бывает «каждый день», «по будням» и «раз в
+ * неделю»: ИП, который каждый день возит обеды одному клиенту, не станет
+ * выписывать накладные руками. Механика та же — предложение с проверкой
+ * («Всё верно» / «Поправить» / «Пропустить сегодня»), а не готовый документ:
+ * выписанный и тут же «пропущенный» документ оставил бы дыру в нумерации.
+ * Выписывается он по «Всё верно» обычным путём — долг считается тем же
+ * местом, что и при ручной выписке, и не задваивается.
+ */
+
+const { db } = require('../db');
+
+/** День «последнее число месяца» — 30-е и 31-е есть не в каждом месяце. */
+const LAST_DAY = 0;
+
+/** Как часто повторять. month — как было с самого начала. */
+const PERIODS = ['month', 'day', 'weekdays', 'week'];
+const isPeriodic = (rec) => Boolean(rec) && rec.period !== 'month' && PERIODS.includes(rec.period);
+
+const WEEKDAYS = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье'];
+// «в» или «во» и винительный падеж: «в среду», «во вторник» — как говорят.
+const WEEKDAYS_ON = ['в понедельник', 'во вторник', 'в среду', 'в четверг', 'в пятницу', 'в субботу', 'в воскресенье'];
+const WEEKDAYS_SHORT = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс'];
+
+/*
+ * Повторяющаяся операция журнала — второй вид правила, рядом с документами.
+ *
+ * Зачем отдельно. Выписка из банка закрывает ту часть, где двигались деньги.
+ * Но сальдо двигает и то, чего в банке не видно никогда: взаимозачёт по
+ * подписанному акту, ежемесячное списание задолженности, фиксированное
+ * начисление. Такую строку человек обязан помнить сам — и однажды забудет,
+ * а сальдо разъедется незаметно, до ближайшей сверки.
+ *
+ * Почему здесь бот вносит сам, а документ — нет. Документ забирает номер в
+ * сквозном ряду и уходит контрагенту; лишний счёт не отменить бесследно.
+ * Строка журнала внутренняя, её видит только владелец, и отмена убирает её
+ * вместе со следом в сальдо. Поэтому правило работает само, но каждый раз
+ * говорит об этом и даёт отменить в одно касание.
+ *
+ * Счётчик обязателен по той же причине. «Гашу долг пятью частями» — это
+ * ровно пять раз, а не «каждый месяц навсегда»: правило, пережившее свой
+ * долг, начнёт списывать то, чего уже нет.
+ */
+const OP_TYPE = 'op';
+const isOp = (rec) => Boolean(rec) && rec.type === OP_TYPE;
+
+/*
+ * Календарь здесь московский, тот же, что у документов (lib/period.js).
+ *
+ * Раньше месяц брался через toISOString(), то есть по UTC, а день месяца —
+ * через getDate(), то есть по поясу сервера. Две разные шкалы в одном
+ * условии: ежедневный обход просыпается в московскую полночь, а месяц в
+ * этот момент по UTC ещё прошлый — предложение выписать документ считалось
+ * уже сделанным и пропадало на весь месяц. Молча.
+ */
+const { iso, todayDate } = require('./period');
+
+/** Месяц как YYYY-MM. Правило «раз в месяц» проверяется именно по нему:
+ *  считать дни от прошлого запуска — верный способ ошибиться на границе. */
+const monthKey = (date = todayDate()) => iso(date).slice(0, 7);
+
+/** Ключ предыдущего месяца — им догоняют пропущенное, когда служба не работала. */
+const prevMonthKey = (date = todayDate()) => {
+  const d = new Date(date.getFullYear(), date.getMonth() - 1, 1, 12);
+  return iso(d).slice(0, 7);
+};
+
+function isLastDayOfMonth(date) {
+  const next = new Date(date.getTime());
+  next.setDate(next.getDate() + 1);
+  return next.getMonth() !== date.getMonth();
+}
+
+/** День недели 1 (пн) … 7 (вс). Date.getDay() считает с воскресенья — для людей это не так. */
+const dowOf = (date) => ((date.getDay() + 6) % 7) + 1;
+
+/** Понедельник недели, в которую попадает дата, — ключ недели. */
+function weekStart(date) {
+  const d = new Date(date.getFullYear(), date.getMonth(), date.getDate() - (dowOf(date) - 1), 12);
+  return iso(d);
+}
+
+/**
+ * Ключ периода: по нему помним, что предложение за этот период уже было.
+ * Месяц — «2026-10», день и неделя — дата (для недели — её понедельник).
+ * Строки одного периода сравниваются как строки, поэтому формат ISO обязателен.
+ */
+function periodKey(rec, date = todayDate()) {
+  if (!isPeriodic(rec)) return monthKey(date);
+  return rec.period === 'week' ? weekStart(date) : iso(date);
+}
+
+/** Допустимый день недели 1–7; всё остальное — понедельник, а не ошибка на ровном месте. */
+function normalizeWeekday(value) {
+  const n = Math.round(Number(value));
+  return n >= 1 && n <= 7 ? n : 1;
+}
+
+/** Допустимый день: 1–28 или 0 (последнее число). */
+function normalizeDay(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 1;
+  if (n === LAST_DAY) return LAST_DAY;
+  // 29, 30 и 31 не наступают каждый месяц. Молча сдвигать такой день —
+  // это счёт за февраль, выставленный третьего марта.
+  return Math.min(28, Math.max(1, Math.round(n)));
+}
+
+/** Короткая подпись: в списке она стоит рядом с названием документа,
+ *  и «в последний день месяца» вытесняло бы его целиком. */
+function dayLabel(day) {
+  return day === LAST_DAY ? 'в конце месяца' : `${day}-го числа`;
+}
+
+/** Расписание словами: «каждый день», «по будням (пн–пт)», «раз в неделю, в среду». */
+function periodText(rec) {
+  if (rec.period === 'day') return 'каждый день';
+  if (rec.period === 'weekdays') return 'по будням (пн–пт)';
+  if (rec.period === 'week') return `раз в неделю, ${WEEKDAYS_ON[normalizeWeekday(rec.weekday) - 1]}`;
+  return dayLabel(rec.day);
+}
+
+/**
+ * В какое число предлагать выписать документ.
+ *
+ * Обычно это просто day. У аренды иначе: платёж привязан к числу договора
+ * (pay_day), а счёт нужен заранее — за lead_days до него. Считаем день
+ * здесь, а не при заведении, потому что «за 3 дня до 5-го» — это 2-е, и
+ * запомнить готовое число значило бы потерять связь с договором: изменится
+ * срок — придётся пересчитывать руками.
+ */
+function offerDay(rec) {
+  if (!rec.pay_day) return rec.day;
+  const d = rec.pay_day - (rec.lead_days || 0);
+  // Ушли за начало месяца — предлагаем первого: выставить счёт раньше, чем
+  // начался месяц, всё равно нельзя, а пропускать платёж нельзя тем более.
+  return d < 1 ? 1 : d;
+}
+
+/** Срок оплаты этого месяца, ISO. Пусто — если срок не задан. */
+function dueDate(rec, date = todayDate()) {
+  if (!rec.pay_day) return '';
+  return `${monthKey(date)}-${String(rec.pay_day).padStart(2, '0')}`;
+}
+
+/**
+ * Пора ли предлагать.
+ *
+ * Условие «не раньше дня X», а не «ровно в день X»: если бот был выключен
+ * пятого числа, предложение должно прийти шестого, а не пропасть на месяц.
+ */
+function isDue(rec, date = todayDate()) {
+  if (!rec.active) return false;
+  if (isPeriodic(rec)) return isDuePeriodic(rec, date);
+  if (rec.last_offer === monthKey(date)) return false;
+  const day = offerDay(rec);
+  if (day === LAST_DAY) {
+    if (isLastDayOfMonth(date)) return true;
+    /*
+     * Догоняем пропущенный конец прошлого месяца.
+     *
+     * Обычное правило само себя догоняет условием «не раньше дня X»: не
+     * пришло пятого — придёт шестого. У «последнего дня» такого запаса нет,
+     * он выпадает ровно на один день в месяце. Служба не работала тридцать
+     * первого августа — и акт закрытия августа не предлагался уже никогда,
+     * хотя обещание в шапке этого модуля говорит обратное. Именно так и
+     * заводят акт закрытия месяца.
+     *
+     * Отличить «прошлый месяц пропустили» от «прошлый месяц отработали»
+     * позволяет сама отметка: после предложения в ней стоит тот месяц.
+     * Правило, заведённое в прошлом месяце, тоже несёт его в отметке — и
+     * это верно, за тот месяц документ уже выписан рукой человека.
+     *
+     * Пустая отметка сюда не пускается: она означает «ещё ни разу не
+     * предлагали», а не «прошлый месяц пропущен». Без этого условия правило
+     * предлагало бы себя в любой день месяца, а не в конце, — поймано
+     * прогоном на тридцатом августа.
+     */
+    return Boolean(rec.last_offer) && rec.last_offer !== prevMonthKey(date);
+  }
+  return date.getDate() >= day;
+}
+
+/**
+ * Пора ли предлагать по расписанию с короткой частотой.
+ *
+ * День — каждый день; будни — с понедельника по пятницу; неделя — в свой день
+ * недели, а если он пропущен (бот не работал), то в любой следующий день той же
+ * недели: накладную «на понедельник» лучше привезти во вторник, чем потерять
+ * на неделю. Вчерашний день не догоняем: накладная на вчерашнюю доставку с
+ * сегодняшней датой была бы неправдой, а за дату задним числом отвечает человек.
+ */
+function isDuePeriodic(rec, date) {
+  // Строки ISO упорядочены как даты: «уже предлагали за этот или более поздний период».
+  if (rec.last_offer && rec.last_offer >= periodKey(rec, date)) return false;
+  const dow = dowOf(date);
+  if (rec.period === 'day') return true;
+  if (rec.period === 'weekdays') return dow <= 5;
+  return dow >= normalizeWeekday(rec.weekday);
+}
+
+/**
+ * Ближайший день, в который предложение придёт после `date` (не считая её самой).
+ * Нужен, чтобы после «Пропустить» и после настройки сказать человеку конкретную
+ * дату, а не «потом». Для месячных не считается — у них свои правила.
+ * @returns {string} YYYY-MM-DD или '' для месячного расписания
+ */
+function nextDate(rec, date = todayDate()) {
+  if (!isPeriodic(rec)) return '';
+  const next = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n, 12);
+  if (rec.period === 'day') return iso(next(date, 1));
+  if (rec.period === 'weekdays') {
+    let d = next(date, 1);
+    while (dowOf(d) > 5) d = next(d, 1);
+    return iso(d);
+  }
+  const want = normalizeWeekday(rec.weekday);
+  let d = next(date, 1);
+  while (dowOf(d) !== want) d = next(d, 1);
+  return iso(d);
+}
+
+/** «чт, 17.10» — подпись дня в предложении: по ней видно, на какую доставку документ. */
+function dayCaption(date) {
+  const d = typeof date === 'string' ? new Date(`${date}T12:00:00`) : date;
+  return `${WEEKDAYS_SHORT[dowOf(d) - 1]}, ${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+/**
+ * За какой месяц предложение, которое isDue разрешило в этот день.
+ *
+ * Обычно — за текущий. Но «последний день», пойманный не в последний день,
+ * — это догонялка пропущенного прошлого месяца (см. isDue). Раньше отметка
+ * всегда ставилась текущим месяцем: пятого сентября догоняли август, а в
+ * отметку писали сентябрь — и тридцатого сентября собственный сентябрь уже
+ * не предлагался. Акт закрытия сентября терялся ровно так, как в шапке
+ * модуля обещано не терять.
+ */
+function offerMonth(rec, date = todayDate()) {
+  if (isPeriodic(rec)) return periodKey(rec, date);
+  if (offerDay(rec) === LAST_DAY && !isLastDayOfMonth(date)) return prevMonthKey(date);
+  return monthKey(date);
+}
+
+/**
+ * За какой месяц просрочка, которую isOverdue нашёл в этот день.
+ * После срока в этом месяце — этот; первого числа, догоняя, — прошлый.
+ */
+function dueMonth(rec, date = todayDate()) {
+  return date.getDate() > Number(rec.pay_day) ? monthKey(date) : prevMonthKey(date);
+}
+
+/**
+ * Наступила ли просрочка: срок оплаты прошёл, а этот месяц ещё не отмечен.
+ *
+ * Сообщаем со следующего дня после срока — «в первый же день неоплаты»,
+ * как это и делают вручную. Оплачен ли счёт на самом деле, здесь не видно:
+ * это проверяет вызывающий по журналу документов.
+ */
+function isOverdue(rec, date = todayDate()) {
+  if (!rec.active || !rec.pay_day) return false;
+  if (rec.last_due === monthKey(date)) return false;
+  if (date.getDate() > rec.pay_day) return true;
+  /*
+   * Догоняем прошлый месяц.
+   *
+   * Условие выше живёт внутри одного месяца: срок двадцать пятого, значит с
+   * двадцать шестого и до конца месяца. Первого числа оно перестаёт быть
+   * верным навсегда — про августовскую просрочку не сказали бы уже никогда,
+   * если служба лежала с двадцать шестого.
+   *
+   * Пустая отметка сюда не пускается намеренно. Она означает «за этим
+   * правилом ещё ни разу не следили», и без этого условия только что
+   * заведённое правило первого же числа объявляло бы просрочку за месяц,
+   * которого не видело. Лучше не догнать один случай, чем напугать человека
+   * долгом, которого нет; настоящая же защита от ложной тревоги — проверка
+   * неоплаченных документов у вызывающего.
+   */
+  return Boolean(rec.last_due) && rec.last_due !== prevMonthKey(date);
+}
+
+/**
+ * Прошёл ли уже в этом месяце день, на который заводят напоминание.
+ *
+ * Нужно, чтобы решить, ждать ли первого напоминания в этом месяце или в
+ * следующем. Сравнение нестрогое: если правило заводят прямо в свой день,
+ * напоминать через минуту о том, что человек сейчас настраивает, незачем.
+ */
+function dayPassed(day, date = todayDate()) {
+  const d = normalizeDay(day);
+  return d === LAST_DAY ? isLastDayOfMonth(date) : date.getDate() >= d;
+}
+
+/**
+ * Завести повторение.
+ *
+ * offeredThisMonth — считать ли текущий месяц отработанным. По умолчанию да:
+ * повторение обычно заводят следом за только что выписанным документом, и
+ * предлагать его второй раз в том же месяце — то самое задвоение, от
+ * которого мы бережём.
+ *
+ * Но есть и другой путь — напоминание заводят «с нуля», ничего не выписав
+ * (кнопка после выбора вида деятельности). Там отметка задним числом
+ * означала бы, что бот пообещал напомнить 24-го и промолчал до следующего
+ * месяца. Такой вызов передаёт сюда результат dayPassed().
+ */
+function add(userId, {
+  cpId, type, items, extra = {}, note = '', day = 1, payDay = 0, leadDays = 0,
+  offeredThisMonth = true, period = 'month', weekday = 0,
+}) {
+  const per = PERIODS.includes(period) ? period : 'month';
+  const wd = per === 'week' ? normalizeWeekday(weekday) : 0;
+  // Срок оплаты и «за сколько дней» — понятия аренды, у коротких периодов их нет.
+  const pay = per === 'month' && payDay ? normalizeDay(payDay) : 0;
+  /*
+   * «Этот период уже отработан» у коротких расписаний ставится осторожнее, чем у
+   * месячных. Неделя целиком отработанной считается, только если нужный день
+   * уже наступил: заведи человек «по пятницам» в понедельник, и отметка за всю
+   * неделю съела бы ближайшую пятницу.
+   */
+  let lastOffer = '';
+  if (offeredThisMonth) {
+    if (per === 'month') lastOffer = monthKey();
+    else if (per !== 'week' || dowOf(todayDate()) >= wd) lastOffer = periodKey({ period: per }, todayDate());
+  }
+  const info = db.prepare(`INSERT INTO recurring(user_id, cp_id, type, day, pay_day, lead_days,
+      items, extra, note, active, last_offer, created_at, period, weekday) VALUES(?,?,?,?,?,?,?,?,?,1,?,?,?,?)`)
+    .run(userId, Number(cpId), String(type), normalizeDay(day),
+      pay, pay ? Math.min(27, Math.max(0, Math.round(Number(leadDays) || 0))) : 0,
+      JSON.stringify(Array.isArray(items) ? items : []),
+      JSON.stringify(extra && typeof extra === 'object' ? extra : {}),
+      String(note).slice(0, 200), lastOffer, new Date().toISOString(), per, wd);
+  return Number(info.lastInsertRowid);
+}
+
+const json = (text, fallback) => {
+  try { return JSON.parse(text) || fallback; } catch (_) { return fallback; }
+};
+
+function parse(row) {
+  if (!row) return null;
+  // Ставка НДС и статус УПД лежат рядом с позициями: без них повторный
+  // документ вышел бы с настройками по умолчанию, а не такой же, как был.
+  const rec = {
+    ...row,
+    items: json(row.items, []),
+    extra: json(row.extra, {}),
+  };
+  rec.offerDay = offerDay(rec);
+  rec.periodic = isPeriodic(rec);
+  rec.dayText = rec.periodic ? periodText(rec) : row.pay_day
+    ? `${dayLabel(rec.offerDay)} (оплата ${row.pay_day}-го)`
+    : dayLabel(row.day);
+  if (isOp(rec)) {
+    const e = rec.extra;
+    rec.op = {
+      kind: e.opKind === 'Приход' ? 'Приход' : 'Оплата',
+      amount: Math.round((Number(e.amount) || 0) * 100) / 100,
+      note: String(e.note || ''),
+      times: Math.max(0, Math.round(Number(e.times) || 0)),   // 0 — без конца
+      done: Math.max(0, Math.round(Number(e.done) || 0)),
+      mailSelf: Boolean(e.mailSelf),
+    };
+    rec.op.left = rec.op.times ? Math.max(0, rec.op.times - rec.op.done) : 0;
+  }
+  return rec;
+}
+
+/** Повторения пользователя вместе с именем контрагента. */
+function list(userId, { activeOnly = true } = {}) {
+  return db.prepare(`SELECT r.*, c.name AS cp_name FROM recurring r
+      JOIN counterparties c ON c.id = r.cp_id
+      WHERE r.user_id = ?${activeOnly ? ' AND r.active = 1' : ''}
+      ORDER BY r.day, r.id`).all(userId).map(parse);
+}
+
+function get(userId, id) {
+  return parse(db.prepare(`SELECT r.*, c.name AS cp_name FROM recurring r
+      JOIN counterparties c ON c.id = r.cp_id
+      WHERE r.id = ? AND r.user_id = ?`).get(Number(id), userId));
+}
+
+/**
+ * Отметить, что операция по правилу проведена.
+ *
+ * Счётчик и месяц двигаем одной записью: если отметить месяц, а счётчик
+ * забыть, правило будет вносить строку вечно; если наоборот — внесёт её
+ * дважды в один месяц при перезапуске обхода.
+ *
+ * Дойдя до конца, правило выключается само. Пять частей долга — это пять
+ * раз; шестая строка списала бы то, чего уже нет.
+ *
+ * @param {number} step +1 при проведении, −1 при отмене
+ * @returns {{done:number, left:number, finished:boolean}|null}
+ */
+function bumpOp(userId, id, step = 1, date = todayDate(), month = monthKey(date)) {
+  const rec = get(userId, id);
+  if (!isOp(rec)) return null;
+  const done = Math.max(0, rec.op.done + step);
+  const extra = { ...rec.extra, done };
+  const finished = rec.op.times > 0 && done >= rec.op.times;
+
+  /*
+   * Отмена не воскрешает выключенное правило и не открывает месяц заново.
+   *
+   * Раньше active выставлялся как `finished ? 0 : 1`, то есть на откате —
+   * всегда в единицу, а last_offer обнулялся. Отсюда две беды. Человек
+   * нажимал «✖️ Больше не повторять», потом «↩️ Отменить» на том же
+   * сообщении — и правило оживало, продолжая списывать каждый месяц. А тот,
+   * кто просто отменил ошибочную строку, получал её обратно на ближайшем
+   * ночном обходе того же месяца, хотя кнопка обещает «в следующий раз».
+   *
+   * Различаем два выключения. Своё, по исчерпанию счётчика, откат обязан
+   * снять: пять частей долга внесены, шестой не будет, но если последнюю
+   * отменили — правилу снова есть что делать. Выключение рукой человека —
+   * его решение, и трогать его нечем.
+   */
+  const wasSpent = rec.op.times > 0 && rec.op.done >= rec.op.times;
+  if (step > 0) {
+    db.prepare('UPDATE recurring SET extra = ?, last_offer = ?, active = ? WHERE id = ? AND user_id = ?')
+      .run(JSON.stringify(extra), month, finished ? 0 : 1, Number(id), userId);
+  } else {
+    const active = wasSpent && !finished ? 1 : (rec.active ? 1 : 0);
+    db.prepare('UPDATE recurring SET extra = ?, active = ? WHERE id = ? AND user_id = ?')
+      .run(JSON.stringify(extra), active, Number(id), userId);
+  }
+  return { done, left: rec.op.times ? Math.max(0, rec.op.times - done) : 0, finished };
+}
+
+function setDay(userId, id, day) {
+  db.prepare('UPDATE recurring SET day = ? WHERE id = ? AND user_id = ?')
+    .run(normalizeDay(day), Number(id), userId);
+}
+
+function off(userId, id) {
+  db.prepare('UPDATE recurring SET active = 0 WHERE id = ? AND user_id = ?').run(Number(id), userId);
+}
+
+/**
+ * Что предложить сегодня.
+ *
+ * JOIN с контрагентами не для красоты: удалённый контрагент оставил бы
+ * повторение, которое каждый месяц предлагает выписать документ в пустоту.
+ */
+function due(date = todayDate(), { periodic = null } = {}) {
+  return db.prepare(`SELECT r.*, c.name AS cp_name FROM recurring r
+      JOIN counterparties c ON c.id = r.cp_id
+      WHERE r.active = 1 ORDER BY r.user_id, r.day`)
+    .all().map(parse)
+    // periodic: true — только короткие периоды (утренний обход), false — только месячные
+    // (ночной), null — все. Раздельно, потому что ночью «обеды на сегодня» никому не нужны.
+    .filter((r) => (periodic == null || r.periodic === periodic) && isDue(r, date));
+}
+
+/**
+ * Отметить, что за этот месяц предложение отправлено.
+ *
+ * Владельца проверяем, как и во всех остальных действиях над повторением:
+ * эту отметку ставит и кнопка «Пропустить» из чата, а номер правила в ней
+ * виден любому. Без проверки посторонний мог отключить чужое напоминание
+ * на месяц — и человек не выставил бы счёт за аренду, не поняв почему.
+ */
+/**
+ * Занять выпуск документа по правилу за месяц. true — выпускать можно.
+ *
+ * Кнопка «✅ Выписать» в напоминании не гаснет, и раньше каждое нажатие
+ * выпускало новый документ: двойной тап или возврат к вчерашнему
+ * сообщению давали два счёта с разными номерами — и долг клиента
+ * удваивался. Условие `last_issued <> ?` стоит в самом UPDATE: из двух
+ * одновременных нажатий строку сменит только одно.
+ *
+ * @param {string} month YYYY-MM — за какой месяц напоминание
+ * @returns {{ok: boolean, prev: string}} prev — чтобы вернуть, если выпуск не удался
+ */
+function claimIssue(userId, id, month) {
+  const row = db.prepare('SELECT last_issued, last_skip FROM recurring WHERE id = ? AND user_id = ?')
+    .get(Number(id), userId);
+  if (!row) return { ok: false, prev: '' };
+  // «Пропустить сегодня» нажато — по этому предложению документ не выписывается,
+  // даже если вернуться к нему кнопкой «Всё верно» из того же сообщения.
+  if (row.last_skip === month) return { ok: false, prev: row.last_issued, skipped: true };
+  const r = db.prepare('UPDATE recurring SET last_issued = ? WHERE id = ? AND user_id = ? AND last_issued <> ?')
+    .run(month, Number(id), userId, month);
+  return { ok: r.changes === 1, prev: row.last_issued };
+}
+
+/** Вернуть отметку, если выпуск не состоялся (лимит, ошибка сборки). */
+function releaseIssue(userId, id, month, prev) {
+  db.prepare('UPDATE recurring SET last_issued = ? WHERE id = ? AND user_id = ? AND last_issued = ?')
+    .run(prev || '', Number(id), userId, month);
+}
+
+/**
+ * Пропустить период: документа не будет, и вернуть его кнопкой из старого
+ * сообщения нельзя. Документ к этому моменту не создавался, так что в номерах
+ * и в долге следов нет. Владельца проверяем, как у всех действий над правилом.
+ */
+function skip(userId, id, key) {
+  return db.prepare('UPDATE recurring SET last_skip = ?, last_offer = ? WHERE id = ? AND user_id = ?')
+    .run(String(key), String(key), Number(id), userId).changes === 1;
+}
+
+/** month — за какой месяц предложение (offerMonth); по умолчанию текущий. */
+function markOffered(userId, id, date = todayDate(), month = monthKey(date)) {
+  db.prepare('UPDATE recurring SET last_offer = ? WHERE id = ? AND user_id = ?')
+    .run(month, Number(id), userId);
+}
+
+/**
+ * У кого сегодня первый день просрочки.
+ *
+ * Возвращает только тех, у кого задан срок оплаты и он прошёл. Оплачен ли
+ * счёт, здесь не проверяется: журнал документов лежит в другом модуле, и
+ * тянуть его сюда значило бы связать расписание с учётом. Вызывающий
+ * отсеивает оплаченных сам.
+ */
+function overdue(date = todayDate()) {
+  return db.prepare(`SELECT r.*, c.name AS cp_name FROM recurring r
+      JOIN counterparties c ON c.id = r.cp_id
+      WHERE r.active = 1 AND r.pay_day > 0 ORDER BY r.user_id, r.pay_day`)
+    .all().map(parse).filter((r) => isOverdue(r, date));
+}
+
+/** Отметить, что о просрочке за этот месяц уже сообщили. */
+/** month — за какой месяц просрочка (dueMonth); по умолчанию текущий. */
+function markDueNoticed(id, date = todayDate(), month = monthKey(date)) {
+  db.prepare('UPDATE recurring SET last_due = ? WHERE id = ?').run(month, Number(id));
+}
+
+/** Срок оплаты и предупреждение — вместе, одним вызовом для UI. */
+function setSchedule(userId, id, { payDay, leadDays }) {
+  const pay = payDay ? normalizeDay(payDay) : 0;
+  db.prepare('UPDATE recurring SET pay_day = ?, lead_days = ? WHERE id = ? AND user_id = ?')
+    .run(pay, pay ? Math.min(27, Math.max(0, Math.round(Number(leadDays) || 0))) : 0,
+      Number(id), userId);
+}
+
+/** Сколько документов в месяц даёт расписание: по одному на каждый срок. */
+const PER_MONTH = { day: 30, weekdays: 22, week: 4, month: 1 };
+const PERIOD_NAME = { day: 'Каждый день', weekdays: 'По будням', week: 'Раз в неделю' };
+
+/**
+ * Предупреждение о бесплатном лимите при выборе расписания — или '' если его нет.
+ *
+ * «Каждый день» на бесплатном тарифе съедает пять документов за пять дней, и
+ * человек, которому обещали «первые 5 документов бесплатно», узнаёт об этом на
+ * шестое утро, когда предложение приходит, а выписать его не получается.
+ * Говорим до сохранения расписания, с цифрами: сколько в месяц это даёт и на
+ * сколько хватит оставшихся бесплатных.
+ *
+ * Только для тех, у кого нет подписки и лимит действует: подписчику
+ * предупреждать не о чем.
+ */
+function freeLimitNote(userId, period) {
+  const per = PER_MONTH[period];
+  if (!per) return '';
+  const bdb = require('./bot-db');
+  const q = bdb.quota(userId);
+  if (q.paid || String(process.env.ENFORCE_LIMIT || '1') === '0' || per <= q.left) return '';
+  const unit = period === 'weekdays' ? ['рабочий день', 'рабочих дня', 'рабочих дней']
+    : period === 'week' ? ['неделя', 'недели', 'недель'] : ['день', 'дня', 'дней'];
+  const { plural } = require('./money');
+  const tail = q.left > 0
+    ? `Бесплатных в этом месяце осталось ${q.left} из ${q.limit} — хватит на ${q.left} ${plural(q.left, ...unit)}, `
+      + 'дальше нужна подписка.'
+    : `Бесплатные ${q.limit} на этот месяц уже закончились — для расписания нужна подписка.`;
+  return `«${PERIOD_NAME[period]}» — это около ${per} документов в месяц. ${tail}`;
+}
+
+module.exports = {
+  add, list, get, setDay, setSchedule, off, skip,
+  due, markOffered, claimIssue, releaseIssue, overdue, markDueNoticed, offerMonth, dueMonth,
+  isDue, isOverdue, offerDay, dueDate, dayPassed,
+  OP_TYPE, isOp, bumpOp,
+  monthKey, prevMonthKey, normalizeDay, dayLabel, LAST_DAY,
+  PERIODS, WEEKDAYS, WEEKDAYS_ON, isPeriodic, periodKey, periodText, normalizeWeekday,
+  nextDate, dayCaption, dowOf, weekStart, freeLimitNote,
+};

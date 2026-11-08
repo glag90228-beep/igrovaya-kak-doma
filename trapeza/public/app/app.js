@@ -1,0 +1,7005 @@
+'use strict';
+
+/*
+ * Мини-приложение «Первичка»: экраны и переходы.
+ *
+ * Без сборщика и без библиотек — файл открывается на телефоне, и каждый
+ * лишний килобайт это ожидание на медленной сети. Разметка собирается
+ * функцией h(): она кладёт пользовательский текст через textContent, поэтому
+ * название контрагента с угловыми скобками не превратится в разметку.
+ *
+ * Навигация — стек экранов, привязанный к системной кнопке «назад»
+ * Telegram: в мессенджере ждут именно её, а не своей стрелки в углу.
+ */
+
+/*
+ * Вне Telegram объект WebApp всё равно может существовать (скрипт мессенджера
+ * определяет его везде), но initData в нём пуст — подписать запрос нечем. Такой
+ * объект считаем отсутствующим: тогда все проверки «if (tg)» ниже сами
+ * превращаются в «это обычный браузер» и не дёргают то, чего там нет
+ * (MainButton, BackButton, haptic, openLink).
+ */
+const tgRaw = window.Telegram && window.Telegram.WebApp;
+const tg = tgRaw && tgRaw.initData ? tgRaw : null;
+// Открыто в обычном браузере: узнаём человека по сессии (cookie), а не по подписи.
+const WEB = !tg;
+// Узнал ли нас сервер. В Telegram подпись есть всегда; в вебе ответит первый запрос.
+let loggedIn = !WEB;
+
+// Момент запуска: от него считается, сколько заставке осталось висеть.
+const START = performance.now();
+
+// ---------- мелкие помощники ----------
+
+/** h('div', {class:'x'}, 'текст', child) → элемент. */
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k === 'text') el.textContent = v;
+    else if (k === 'html') el.innerHTML = v;          // только для своей разметки
+    else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
+    else if (k === 'dataset') Object.assign(el.dataset, v);
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const kid of kids.flat()) {
+    if (kid == null || kid === false) continue;
+    el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  }
+  return el;
+}
+
+/** Иконка из спрайта: <svg><use href="#i-…"> */
+function icon(name, cls = 'icon') {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', cls);
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+  use.setAttribute('href', `#i-${name}`);
+  svg.append(use);
+  return svg;
+}
+
+const rub = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const money = (n) => `${rub.format(Number(n) || 0)} ₽`;
+/* В сводке копейки только мешают: там важен порядок суммы, а точность
+   до копейки нужна в документе, и там она есть. */
+const rub0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
+/*
+ * Деньги в целых копейках — так же, как на сервере (lib/money.js).
+ *
+ * Подпись «Выписать на …» обязана совпасть с суммой документа до копейки.
+ * Умножение дробных в двойной точности и округление «на глаз» расходились с
+ * сервером: 1,5 × 99,99 здесь было 149,98, а в документе 149,99. Поэтому число
+ * раскладываем по его десятичной записи и считаем целыми (BigInt).
+ */
+function decimalOf(x) {
+  const v = Number(x);
+  if (!Number.isFinite(v)) return { m: 0n, s: 0 };
+  const [mant, exp] = String(v).toLowerCase().split('e');
+  const neg = mant.startsWith('-');
+  const [i, f = ''] = mant.replace('-', '').split('.');
+  let m = BigInt(i + f);
+  let sc = f.length - (exp ? Number(exp) : 0);
+  if (sc < 0) { m *= 10n ** BigInt(-sc); sc = 0; }
+  return { m: neg ? -m : m, s: sc };
+}
+/** Деление целых с округлением «половина от нуля»; d > 0. */
+function divRound(n, d) {
+  const a = n < 0n ? -n : n;
+  const q = (2n * a + d) / (2n * d);
+  return n < 0n ? -q : q;
+}
+/** Количество × цена в целых копейках. */
+function lineCents(qty, price) {
+  const a = decimalOf(qty); const b = decimalOf(price);
+  return divRound(a.m * b.m * 100n, 10n ** BigInt(a.s + b.s));
+}
+
+const money0 = (n) => `${rub0.format(Math.round(Number(n) || 0))} ₽`;
+const ru = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(iso || '')
+  ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : (iso || ''));
+/*
+ * Дата в ISO по местному времени телефона. Через toISOString() было бы
+ * короче, но она переводит в UTC: в Москве 1 августа в 00:30 «сегодня»
+ * превращалось в 31 июля, и период уезжал на день назад.
+ */
+const isoDate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const todayISO = () => isoDate(new Date());
+
+/** «3 документа» / «1 документ» — без этого текст читается коряво. */
+function plural(n, one, few, many) {
+  const a = Math.abs(n) % 100;
+  const b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b > 1 && b < 5) return few;
+  if (b === 1) return one;
+  return many;
+}
+
+function haptic(kind = 'light') {
+  try { tg.HapticFeedback.impactOccurred(kind); } catch (_) { /* не везде есть */ }
+}
+
+/*
+ * Итог действия — не «удар», а особая вибрация Telegram: «получилось» и «не
+ * вышло» телефон различает пальцем, не глядя на экран. Нет в старых клиентах —
+ * тогда молча остаётся обычный отклик.
+ */
+function hapticResult(ok) {
+  try { tg.HapticFeedback.notificationOccurred(ok ? 'success' : 'error'); } catch (_) { /* не везде есть */ }
+}
+
+/*
+ * Плавная прокрутка — только тем, кто не просил убрать движение. Системная
+ * настройка «уменьшить движение» касается и прокрутки: резкий прыжок к полю
+ * лучше, чем экран, который ползёт у человека с вестибулярным расстройством.
+ */
+const reducedMotion = () => Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+const smooth = () => (reducedMotion() ? 'auto' : 'smooth');
+
+let toastTimer = 0;
+/**
+ * Всплывающая подсказка. Необязательное действие — кнопка под текстом
+ * («Настройки почты»): по одному тексту ошибки человек не знает, куда идти.
+ * С кнопкой подсказка висит дольше — её надо успеть нажать.
+ */
+function toast(text, isError = false, ms = 0, action = null) {
+  const box = document.getElementById('toast');
+  box.textContent = text;
+  box.className = `toast${isError ? ' err' : ''}${action ? ' has-act' : ''}`;
+  // Ошибку программа чтения экрана должна зачитать сразу, а не после текущей фразы.
+  box.setAttribute('role', isError ? 'alert' : 'status');
+  box.setAttribute('aria-live', isError ? 'assertive' : 'polite');
+  if (isError) hapticResult(false);
+  if (action) {
+    box.append(h('button', {
+      class: 'toast-act', type: 'button',
+      onclick: () => { box.classList.remove('show'); box.hidden = true; action.onclick(); },
+    }, action.label));
+  }
+  box.hidden = false;
+  requestAnimationFrame(() => box.classList.add('show'));
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    box.classList.remove('show');
+    setTimeout(() => { box.hidden = true; }, 200);
+  }, ms || (action ? 9000 : (isError ? 5000 : 3000)));
+}
+
+/** Ошибка запроса — подсказкой; у письма, которое не ушло, рядом кнопка в настройки почты. */
+/**
+ * Переспросить перед необратимым. В Telegram — родное окно мессенджера,
+ * в браузере — обычный confirm. Возвращает true, если человек согласился.
+ */
+function askSure(text) {
+  if (tg && tg.showConfirm) return new Promise((done) => tg.showConfirm(text, (ok) => done(Boolean(ok))));
+  return Promise.resolve(window.confirm(text));
+}
+
+function toastError(e) {
+  // Нет реквизитов своей организации (любая выписка без них) — ведём их заполнять, а не оставляем с красной строкой.
+  if (e && e.payload && e.payload.reason === 'org' && current().name !== 'org') {
+    toast('Сначала заполните реквизиты своей организации', true);
+    go('org');
+    return;
+  }
+  // На самом экране настроек почты кнопка «Настройки почты» была бы ссылкой на себя.
+  if (e && e.payload && e.payload.reason === 'mail' && current().name !== 'mail') {
+    toast(e.message, true, 0, { label: 'Настройки почты', onclick: () => go('mail') });
+  } else {
+    toast(e.message, true);
+  }
+}
+
+// ---------- обращения к серверу ----------
+
+const initData = (tg && tg.initData) || '';
+
+/*
+ * X-Requested-With ставим на каждый запрос, и в Telegram тоже. Для запросов по
+ * cookie сервер без него отвечает отказом: чужая страница не может добавить
+ * свой заголовок к запросу на наш адрес, а значит, не сможет и воспользоваться
+ * нашей cookie (защита от подделки запросов с других сайтов).
+ *
+ * anon — запросы самого входа: они идут до сессии, и ответ 401 для них не
+ * «сеанс кончился».
+ */
+async function api(method, path, body, opts = {}) {
+  let res;
+  try {
+    res = await fetch(path, {
+      method,
+      credentials: 'same-origin',
+      headers: {
+        'X-Requested-With': 'pervichka',
+        ...(initData ? { Authorization: `tma ${initData}` } : {}),
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (_) {
+    /*
+     * Нет сети: браузер бросает голый TypeError с английским «Failed to fetch»
+     * (в Safari — «Load failed»), и человек видел это слово в красной
+     * всплывашке. Говорим по-человечески и помечаем — экран ошибки по метке
+     * сам предложит повторить, когда связь вернётся.
+     */
+    const err = new Error('Нет связи. Проверьте интернет — и повторите.');
+    err.offline = true;
+    throw err;
+  }
+  let data = {};
+  try { data = await res.json(); } catch (_) { /* пусто */ }
+  if (!res.ok || data.error) {
+    const err = new Error(data.error || `Ошибка ${res.status}`);
+    err.payload = data;
+    err.status = res.status;
+    // Сессия на сайте кончилась (вышли на другом устройстве, истёк срок):
+    // вместо ошибки на каждом экране показываем вход.
+    if (WEB && res.status === 401 && !opts.anon) {
+      err.unauth = true;
+      sessionLost();
+    }
+    throw err;
+  }
+  return data;
+}
+
+/** Кнопка, которая на время запроса показывает вращение и не нажимается. */
+async function withBusy(btn, fn) {
+  if (btn.disabled) return undefined;
+  const keep = btn.innerHTML;
+  // Пока идёт запрос, подпись короче прежней: без закреплённой ширины кнопка
+  // сжимается и тут же раздувается обратно — это дрожание заметно пальцем.
+  const keepMin = btn.style.minWidth;
+  btn.style.minWidth = `${btn.offsetWidth}px`;
+  btn.disabled = true;
+  btn.setAttribute('aria-busy', 'true');
+  btn.textContent = '';
+  btn.append(h('span', { class: 'spinner' }), 'Секунду…');
+  try {
+    return await fn();
+  } catch (e) {
+    toastError(e);
+    return undefined;
+  } finally {
+    btn.disabled = false;
+    btn.removeAttribute('aria-busy');
+    btn.style.minWidth = keepMin;
+    btn.innerHTML = keep;
+  }
+}
+
+// ---------- навигация ----------
+
+const app = document.getElementById('app');
+const tabsBox = document.getElementById('tabs');
+
+const TABS = [
+  { name: 'home', label: 'Главная', icon: 'home' },
+  { name: 'docs', label: 'Документы', icon: 'doc' },
+  { name: 'cps', label: 'Клиенты', icon: 'users' },
+  /*
+   * Вместо «Долгов»: мест в панели пять, а напоминания и заметки владелец
+   * искал и не находил — они жили в карточке клиента. Долги не пропали: они
+   * первой строкой на вкладке «Ещё» и под суммой на главной.
+   */
+  { name: 'crm', label: 'Дела', icon: 'bell' },
+  { name: 'more', label: 'Ещё', icon: 'more' },
+];
+
+let stack = [{ name: 'home', params: {} }];
+let cache = {};          // ответ /api/state
+// Напоминание про чек «Моего налога»: сервер сказал его показать после
+// отметки оплаты, а рисует карточка документа при следующей перерисовке.
+let pendingCheque = null;
+const screens = {};      // заполняется ниже
+
+function current() { return stack[stack.length - 1]; }
+
+/*
+ * Кнопка «назад» браузера.
+ *
+ * В Telegram возвращает системная BackButton, в браузере её нет — и стрелка
+ * браузера выбрасывала бы человека с сайта, хотя он всего лишь открыл карточку
+ * клиента. Поэтому в вебе каждый переход вперёд кладёт запись в историю, а
+ * возврат (своей стрелкой или браузерной) идёт через неё: так обе стрелки
+ * делают одно и то же и не расходятся со стопкой экранов.
+ */
+let histDepth = 0;
+
+/*
+ * Откуда пришёл экран: «fwd» — вглубь (открыли карточку), «back» — назад,
+ * «swap» — со вкладки на вкладку или после действия. От этого зависит, с какой
+ * стороны он выезжает: глубже — справа, назад — слева, как во всех телефонах.
+ * Рука «видит», куда шла, и не теряет, где находится.
+ */
+let navKind = 'swap';
+
+function go(name, params = {}) {
+  navKind = 'fwd';
+  stack.push({ name, params });
+  if (WEB) { histDepth += 1; try { history.pushState({ d: histDepth }, ''); } catch (_) { /* песочница */ } }
+  render();
+}
+
+/*
+ * Куда возвращаться, если в стопке ничего нет.
+ *
+ * Часть экранов открывается через reset — например, карточка клиента сразу
+ * после внесения оплаты. Стопка при этом схлопывается в один элемент, а
+ * кнопка «Назад» в шапке остаётся видимой (экран-то не вкладка) и не делает
+ * ничего. Со стороны это просто сломанная кнопка. Поэтому у каждого такого
+ * экрана есть родитель, и назад всегда есть куда.
+ */
+const PARENT = {
+  cp: 'cps', op: 'cps', doc: 'docs', new: 'docs', other: 'docs', why: 'home',
+  letter: 'inbox', inbox: 'more', mail: 'more', bank: 'more', org: 'more',
+  billing: 'more', support: 'more', help: 'more', vat: 'more', basis: 'more',
+  recurring: 'more', reminders: 'more', registry: 'docs', akt: 'docs',
+  unpaid: 'home', scan: 'docs', ops: 'cps', opcard: 'cps', prepay: 'cps', ask: 'home', bankclose: 'debts',
+  debts: 'more', monthact: 'cps', cheques: 'home', cbasis: 'cps',
+};
+
+/*
+ * Какая вкладка подсвечена. Внутри вложенного экрана панель остаётся на виду,
+ * и подсвечивать надо ту вкладку, откуда человек пришёл: карточку клиента
+ * можно открыть и из «Клиентов», и из «CRM», и из «Главной». Сама вкладка
+ * подсвечивается всегда; для вложенного экрана берём первый элемент
+ * стопки — это и есть начало пути; если он сам не вкладка (экран открыт
+ * через reset, например после внесения оплаты), идём по родителям.
+ */
+function tabOf(name) {
+  const isTab = (n) => TABS.some((t) => t.name === n);
+  if (isTab(name)) return name;
+  if (isTab(stack[0].name)) return stack[0].name;
+  for (let n = name, i = 0; n && i < 4; n = PARENT[n], i += 1) if (isTab(n)) return n;
+  return 'home';
+}
+
+function back() {
+  if (stack.length > 1) {
+    navKind = 'back';
+    if (WEB && histDepth > 0) { history.back(); return; }   // дальше поработает popstate
+    stack.pop(); render(); return;
+  }
+  const { name } = current();
+  if (TABS.some((t) => t.name === name)) return;   // вкладка — возвращаться некуда
+  reset(PARENT[name] || 'home', {}, 'back');
+}
+
+function reset(name, params = {}, kind = 'swap') {
+  navKind = kind;
+  stack = [{ name, params }];
+  render();
+}
+
+if (WEB) {
+  try { history.replaceState({ d: 0 }, ''); } catch (_) { /* песочница */ }
+  window.addEventListener('popstate', (e) => {
+    const d = (e.state && e.state.d) || 0;
+    const wasDeeper = d < histDepth;
+    histDepth = d;
+    if (!wasDeeper || !loggedIn) return;     // «вперёд» стопку не восстанавливает
+    navKind = 'back';
+    if (stack.length > 1) { stack.pop(); render(); return; }
+    const { name } = current();
+    if (!TABS.some((t) => t.name === name)) reset(PARENT[name] || 'home', {}, 'back');
+  });
+}
+
+/**
+ * После выписки — карточка самого документа, а не вопрос про устройство дела.
+ *
+ * Раньше человек, выписавший первый счёт, попадал на экран «Чем занимаетесь» —
+ * вопрос бухгалтерский, а он только что сделал то, за чем пришёл, и ждал, что
+ * будет дальше с документом. Теперь он видит документ и два действия: отметить
+ * оплату и прислать файл в чат. «Чем занимаетесь» спрашиваем один раз, мягко и
+ * здесь же (`askBiz` приходит с сервера один раз за всё время).
+ */
+async function afterIssue(docId = 0, askBiz = false) {
+  cache = {};
+  const st = await api('GET', '/api/state');
+  cache = st;
+  if (docId) { reset('doc', { id: docId, fresh: true, askBiz }); return; }
+  reset('home');
+}
+
+/*
+ * Счётчик на вкладке CRM: сколько напоминаний просрочено или назначено на
+ * сегодня. Это единственное, что должно звать человека во вкладку само —
+ * остальное он откроет, когда захочет.
+ *
+ * Запрашиваем не на каждый экран: счётчик не должен стоить запроса при любом
+ * переходе. Экраны, которые и так грузят напоминания, сообщают число сами
+ * (noteFollowups), а после «Сделано»/«Отложить» обновляем принудительно.
+ */
+let crmDue = 0;
+let crmAsked = 0;
+
+function crmBadgeEl() { return h('span', { class: 'tab-badge', hidden: true, 'aria-hidden': 'true' }); }
+
+function paintCrmBadge() {
+  for (const el of document.querySelectorAll('.tab-badge')) {
+    el.hidden = crmDue === 0;
+    el.textContent = crmDue > 9 ? '9+' : String(crmDue);
+  }
+  const btn = tabsBox.querySelector('[data-name="crm"]');
+  if (btn) {
+    btn.setAttribute('aria-label', crmDue
+      ? `Дела, ${crmDue} ${plural(crmDue, 'напоминание', 'напоминания', 'напоминаний')} на сегодня и раньше` : 'Дела');
+  }
+}
+
+/** Экран получил список напоминаний — заодно обновляем счётчик. */
+function noteFollowups(list) {
+  crmDue = list.filter((f) => f.overdue || f.today).length;
+  crmAsked = Date.now();
+  paintCrmBadge();
+}
+
+async function refreshCrmBadge(force) {
+  if (!loggedIn || (!force && Date.now() - crmAsked < 30000)) return;
+  crmAsked = Date.now();
+  try { noteFollowups((await api('GET', '/api/crm/followups')).followups); } catch (_) { /* счётчик не критичен */ }
+}
+
+// Значок строки ленты клиента: сервер отдаёт эмодзи (их же читает бот), приложению нужен значок из набора.
+const TL_ICON = { '✅': 'check', '📄': 'doc', '💰': 'wallet', '✉️': 'mail', '📝': 'pen' };
+
+// Заголовок шапки для экранов, которых нет во вкладках.
+const TITLES = {
+  cp: 'Клиент', op: 'Операция', doc: 'Документ', new: 'Новый документ',
+  inbox: 'Почта', letter: 'Письмо', mail: 'Почта', bank: 'Банк', org: 'Моя организация',
+  billing: 'Подписка', support: 'Поддержка', help: 'Помощь', ask: 'Помощник',
+  recurring: 'По расписанию', reminders: 'Напомнить о долге', unpaid: 'Ждут оплаты',
+  debts: 'Долги', monthact: 'Акт за месяц', cheques: 'Чеки «Мой налог»',
+};
+
+const topbar = document.getElementById('topbar');
+const drawer = document.getElementById('drawer');
+const scrim = document.getElementById('scrim');
+const DESKTOP = window.matchMedia('(min-width: 1024px)');
+
+function sectionTitle(name) {
+  const t = TABS.find((x) => x.name === name);
+  return t ? t.label : (TITLES[name] || 'Первичка');
+}
+
+/** Открыть/закрыть панель. На широком экране она стоит всегда — там нечего переключать. */
+function setDrawer(open) {
+  if (DESKTOP.matches) open = true;
+  drawer.hidden = false;
+  drawer.classList.toggle('open', open);
+  scrim.hidden = !open || DESKTOP.matches;
+  document.body.classList.toggle('drawer-open', open && !DESKTOP.matches);
+  // Пока панель закрыта, её ссылки не должны ловить Tab.
+  drawer.inert = !open;
+  const burger = document.getElementById('burger');
+  if (burger) burger.setAttribute('aria-expanded', String(open));
+  if (open && !DESKTOP.matches) drawer.querySelector('button')?.focus();
+}
+
+function userInfo() {
+  const u = (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) || {};
+  // В вебе подписанных данных нет — имя приходит с сервера вместе с состоянием.
+  const webName = WEB && cache.user && cache.user.name;
+  const name = webName || [u.first_name, u.last_name].filter(Boolean).join(' ') || 'Профиль';
+  return { name, initial: name.trim().charAt(0).toUpperCase() || '·', photo: u.photo_url };
+}
+
+function avatar(u) {
+  return u.photo
+    ? h('img', { class: 'avatar', src: u.photo, alt: '', referrerpolicy: 'no-referrer' })
+    : h('span', { class: 'avatar', 'aria-hidden': 'true', text: u.initial });
+}
+
+function closeActions() {
+  const m = document.getElementById('actions');
+  if (m) m.hidden = true;
+  document.getElementById('actions-btn')?.setAttribute('aria-expanded', 'false');
+}
+
+function buildChrome() {
+  const u = userInfo();
+
+  const go1 = (name) => { haptic(); closeActions(); setDrawer(false); reset(name); };
+
+  const menuItem = (label, iconName, name) => h('button', {
+    type: 'button', role: 'menuitem', class: 'menu-item', onclick: () => go1(name),
+  }, icon(iconName), h('span', { text: label }));
+
+  topbar.replaceChildren(
+    h('button', {
+      id: 'burger', class: 'tb-btn', type: 'button', 'aria-label': 'Меню',
+      'aria-controls': 'drawer', 'aria-expanded': 'false',
+      onclick: () => setDrawer(!drawer.classList.contains('open')),
+    }, icon('menu')),
+    h('button', { class: 'tb-btn tb-home', type: 'button', 'aria-label': 'Главная', onclick: () => go1('home') }, icon('home')),
+    h('div', { id: 'tb-title', class: 'tb-title' }),
+    h('span', { class: 'tb-user' }, avatar(u), h('span', { class: 'tb-name', text: u.name })),
+    h('div', { class: 'tb-actions' },
+      h('button', {
+        id: 'actions-btn', class: 'tb-btn', type: 'button', 'aria-label': 'Действия',
+        'aria-haspopup': 'menu', 'aria-expanded': 'false',
+        onclick: (e) => {
+          e.stopPropagation();
+          const m = document.getElementById('actions');
+          m.hidden = !m.hidden;
+          e.currentTarget.setAttribute('aria-expanded', String(!m.hidden));
+          if (!m.hidden) m.querySelector('button').focus();
+        },
+      }, icon('more')),
+      h('div', { id: 'actions', class: 'menu', role: 'menu', hidden: true },
+        menuItem('Почта', 'mail', 'inbox'),
+        menuItem('Помощь', 'help', 'help'),
+        menuItem('Поддержка', 'bot', 'support'))));
+
+  drawer.replaceChildren(
+    h('div', { class: 'drawer-head' },
+      avatar(u), h('div', {}, h('b', { text: u.name }), h('div', { class: 'small', text: 'Первичка' })),
+      h('button', { class: 'tb-btn drawer-close', type: 'button', 'aria-label': 'Закрыть меню', onclick: () => setDrawer(false) }, icon('close'))),
+    h('nav', { 'aria-label': 'Разделы' }, TABS.map((t) => h('button', {
+      class: 'drawer-item', type: 'button', dataset: { name: t.name },
+      onclick: () => go1(t.name),
+    }, icon(t.icon), h('span', { text: t.label }), t.name === 'crm' ? crmBadgeEl() : null))));
+
+  scrim.addEventListener('click', () => setDrawer(false));
+  document.addEventListener('click', (e) => { if (!e.target.closest('.tb-actions')) closeActions(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    closeActions();
+    if (drawer.classList.contains('open') && !DESKTOP.matches) { setDrawer(false); document.getElementById('burger').focus(); }
+  });
+  DESKTOP.addEventListener('change', () => setDrawer(DESKTOP.matches));
+  topbar.hidden = false;
+  setDrawer(DESKTOP.matches);
+}
+
+function syncChrome() {
+  const { name } = current();
+  const isTab = TABS.some((t) => t.name === name);
+  tabsBox.hidden = false;
+  const title = document.getElementById('tb-title');
+  if (title) title.textContent = sectionTitle(name);
+  const lit = tabOf(name);
+  for (const btn of drawer.querySelectorAll('.drawer-item')) {
+    if (btn.dataset.name === lit) btn.setAttribute('aria-current', 'page');
+    else btn.removeAttribute('aria-current');
+  }
+  for (const btn of tabsBox.children) {
+    const active = btn.dataset.name === lit;
+    if (active) btn.setAttribute('aria-current', 'page');
+    else btn.removeAttribute('aria-current');
+  }
+  if (!tg) return;
+  if (stack.length > 1 || !isTab) tg.BackButton.show(); else tg.BackButton.hide();
+}
+
+let renderSeq = 0;
+async function render() {
+  const { name, params } = current();
+  // Экраны грузят данные по сети. Если за это время человек ушёл дальше,
+  // запоздавший ответ не должен затирать новый экран старым.
+  const seq = ++renderSeq;
+  // Направление читаем один раз и сбрасываем: перерисовка того же экрана после
+  // действия («Отметить оплату») не должна заново выезжать сбоку.
+  const kind = navKind;
+  navKind = 'swap';
+  syncChrome();
+  refreshCrmBadge();
+  if (tg) tg.MainButton.hide();
+  const build = screens[name] || screens.home;
+  app.replaceChildren(skeleton(name));
+  try {
+    const node = await build(params);
+    if (seq !== renderSeq) return;
+    app.replaceChildren(node);
+    if (app.firstChild && app.firstChild.classList) {
+      app.firstChild.classList.add('screen');
+      if (kind !== 'swap') app.firstChild.classList.add(`nav-${kind}`);
+    }
+    window.scrollTo(0, 0);
+  } catch (e) {
+    if (seq !== renderSeq) return;
+    if (e && e.unauth) return;       // уже показан вход — ошибку поверх него не рисуем
+    app.replaceChildren(errorScreen(e));
+  }
+  dropSplash();
+}
+
+/**
+ * Убрать заставку, когда первый экран отрисован.
+ *
+ * Два условия сразу: экран готов И заставка показалась целиком. Только по
+ * готовности данных нельзя — на быстрой сети знак мигнёт и пропадёт, это
+ * выглядит дёрганием, а не оформлением. Только по времени тоже нельзя —
+ * на медленной сети человек досмотрит анимацию и упрётся в пустой экран.
+ *
+ * Отсчёт ведём от загрузки страницы, а не от вызова: к этому моменту
+ * анимация уже идёт, и ждать надо ровно остаток.
+ */
+// Перечисление (4 × 95 мс) + знак (700 мс) + уход (320 мс). Считается тем же
+// способом, что и задержки в app.css: если поменяете --w там, поправьте здесь.
+const SPLASH_MS = 1400;
+function dropSplash() {
+  const el = document.getElementById('splash');
+  if (!el || el.classList.contains('gone')) return;
+  const left = Math.max(0, SPLASH_MS - (performance.now() - START));
+  setTimeout(() => el.classList.add('gone'), left);
+}
+
+/*
+ * Заглушка на время загрузки — по форме того экрана, который сейчас приедет.
+ *
+ * Одна и та же серая «лента» под любым экраном обманывает глаз: на главной
+ * ждёшь крупную сумму, в форме — поля, а видишь список, и экран «перестраивается»
+ * при появлении. Три формы покрывают почти все экраны: с суммой сверху, форма
+ * ввода и список. Не угадали — получился обычный список, как раньше.
+ * Показывается не сразу, а через 150 мс (см. .sk-wrap): быстрый ответ не должен
+ * мигать серыми полосами.
+ */
+const SK_HERO = new Set(['home', 'unpaid', 'debts', 'ops', 'opcard', 'bank', 'monthact']);
+const SK_FORM = new Set(['new', 'org', 'op', 'avans', 'ksf', 'other', 'akt', 'cbasis', 'prepay', 'vat', 'basis', 'mail', 'support']);
+function skeleton(name) {
+  const row = (w) => h('div', { class: 'sk-row' },
+    h('span', { class: 'sk-dot' }),
+    h('div', { class: 'sk-col' }, h('div', { class: 'line', style: `width:${w}%` }), h('div', { class: 'line short' })));
+  const field = (w) => h('div', { class: 'sk-field' },
+    h('div', { class: 'line short' }), h('div', { class: 'line', style: `width:${w}%` }));
+  let body;
+  if (SK_HERO.has(name)) {
+    body = [
+      h('div', { class: 'skeleton sk-sum' }, h('div', { class: 'line short' }), h('div', { class: 'line huge' }), h('div', { class: 'line short' })),
+      h('div', { class: 'skeleton' }, row(65), row(80)),
+    ];
+  } else if (SK_FORM.has(name)) {
+    body = [
+      h('div', { class: 'sk-title' }, h('div', { class: 'line big', style: 'width:55%' })),
+      h('div', { class: 'skeleton' }, field(70), field(45), field(85)),
+    ];
+  } else {
+    body = [
+      h('div', { class: 'skeleton' }, h('div', { class: 'line big', style: 'width:45%' }), h('div', { class: 'line', style: 'width:70%' })),
+      h('div', { class: 'skeleton' }, row(65), row(80), row(55)),
+    ];
+  }
+  return h('div', { class: 'sk-wrap', role: 'status', 'aria-label': 'Загружаю' }, body);
+}
+
+function errorScreen(e) {
+  const node = h('div', { class: 'empty' },
+    h('div', { class: 'icon-box warn' }, icon('warn')),
+    h('h2', { text: e.offline ? 'Нет связи' : 'Не получилось загрузить' }),
+    h('p', { class: 'small', text: e.offline ? 'Проверьте интернет. Как только он появится, страница загрузится сама.' : e.message }),
+    h('div', { class: 'btn-wrap' }, h('button', { class: 'btn secondary', onclick: () => render() }, 'Повторить')));
+  /*
+   * Связь вернулась — загружаем сами. Иначе человек, въехавший в лифт и
+   * вышедший из него, смотрит на экран ошибки и не знает, что уже можно жать.
+   * Слушатель одноразовый и срабатывает, только если этот экран ещё на виду:
+   * ушёл дальше — перерисовывать нечего.
+   */
+  if (e.offline) {
+    window.addEventListener('online', () => { if (node.isConnected) render(); }, { once: true });
+  }
+  return node;
+}
+
+function empty(iconName, title, text, action) {
+  return h('div', { class: 'empty' },
+    h('div', { class: 'icon-box' }, icon(iconName)),
+    h('h2', { text: title }),
+    text && h('p', { class: 'small', text }),
+    action);
+}
+
+/*
+ * Кто кому должен по сальдо контрагента.
+ *
+ * У поставщика знак читается наоборот: его «приход» — это наш долг. Правило
+ * то же, что на сервере в debtors(); держать его в двух местах приходится,
+ * но расходиться им нельзя — иначе экран покажет зелёным то, что человек
+ * должен сам.
+ */
+const owesUs = (cp) => (cp.kind === 'supplier' ? cp.balance < 0 : cp.balance > 0);
+/*
+ * Заказчик на предоплате с остатком: кредитовое сальдо — это его аванс, а не «мы должны».
+ * По учёту знак тот же, но человек читал красное «Должны мы 53 200 ₽» и пугался: он ничего
+ * не должен, а должен отгрузить. Красный остаётся для настоящего долга: переплаты и возврата.
+ */
+const onPrepay = (cp) => cp.kind !== 'supplier' && Boolean(cp.prepay) && cp.prepay.left > 0 && !(cp.prepay.debt > 0);
+const balanceTone = (cp) => (!cp.balance || onPrepay(cp) ? '' : (owesUs(cp) ? 'in' : 'out'));
+
+/** Строка-ссылка в карточке: иконка, заголовок, пояснение, шеврон. */
+/*
+ * Что сказать после удаления документа.
+ *
+ * Раньше говорили просто «удалён», и человек шёл смотреть на долг клиента.
+ * Долг создаёт не всякий документ: при основании «по отгрузке» счёт проводки
+ * не делает, и сальдо после его удаления не меняется — законно, но со
+ * стороны неотличимо от поломки. Поэтому говорим прямо.
+ */
+function deletedText(d, r) {
+  const head = `${d.title} № ${d.number} удалён`;
+  if (r && Number(r.delta)) return `${head}. Долг изменился на ${money(Math.abs(r.delta))}`;
+  return `${head}. Баланс клиента не изменился — записи в журнале у него не было`;
+}
+
+function navRow(opts) {
+  return h('button', { class: 'row', onclick: () => { haptic(); opts.onclick(); } },
+    opts.icon && h('span', { class: `icon-box ${opts.tone || ''}` }, icon(opts.icon)),
+    h('span', { class: 'grow' },
+      h('div', { class: 'ellipsis', text: opts.title }),
+      (opts.sub || opts.badge) && h('div', { class: 'sub-line' },
+        opts.sub && h('span', { class: 'small muted nowrap', text: opts.sub }),
+        opts.badge && h('span', { class: `badge ${opts.badgeTone || ''}`, text: opts.badge }))),
+    opts.right && h('span', { class: `money nowrap ${opts.rightTone || ''}`, text: opts.right }),
+    icon('chev', 'chev'));
+}
+
+/** «№ 2» без разрыва: номер не должен оторваться от знака и уехать на другую строку. */
+const nb = (t) => String(t == null ? '' : t).replace(/№ /g, '№\u00A0');
+
+/** «02.09» — день и месяц. Год в строке списка лишний: он и так понятен. */
+const dm = (iso) => (/^\d{4}-\d{2}-\d{2}$/.test(iso || '') ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}` : (iso || ''));
+
+/*
+ * Строка документа в списках: заголовок — КЛИЕНТ, подпись — «ТОРГ-12 № 2 · 02.09 · 14 000 ₽».
+ *
+ * Раньше заголовком шло полное название («Товарная накладная ТОРГ-12 № 2»),
+ * и на узком экране оно обрезалось многоточием на самом нужном: непонятно ни
+ * кому, ни когда. Люди ищут документ по клиенту, а тип, номер, дату и сумму
+ * читают уже в подписи — она переносится на вторую строку, но не режется.
+ * Статус («Ждёт оплаты», «Оплачен») — отдельной строкой, чтобы ничего не отжимать.
+ */
+function docRow(d, opts = {}) {
+  const who = d.cpName || '';
+  const sum = opts.sum != null ? opts.sum : (d.total ? money0(d.total) : '');
+  const sub = opts.sub || [who ? `${d.short || d.title} № ${d.number}` : '', dm(d.date), sum]
+    .filter(Boolean).join(' · ');
+  return h('button', { class: 'row doc-row', onclick: () => { haptic(); opts.onclick(); } },
+    h('span', { class: `icon-box ${opts.tone || ''}` }, icon(opts.icon || 'doc')),
+    h('span', { class: 'grow' },
+      h('div', { class: 'ellipsis', text: who || `${d.title} № ${d.number}` }),
+      h('div', { class: 'small muted doc-sub', text: nb(sub || ru(d.date)) }),
+      opts.badge && h('div', { class: 'sub-line' }, h('span', { class: `badge ${opts.badgeTone || ''}`, text: opts.badge }))),
+    icon('chev', 'chev'));
+}
+
+/**
+ * Строка со вторым действием под ней — «Напомнить» у должника.
+ *
+ * Кнопка внутри кнопки в разметке нельзя, а вставлять действие справа
+ * нечем: имя клиента и сумма и так занимают всю ширину. Поэтому строка — это
+ * контейнер: сверху обычная строка-ссылка, под ней кнопка во всю ширину текста.
+ */
+function actionRow(rowEl, label, onAct) {
+  return h('div', { class: 'row-block' }, rowEl,
+    h('div', { class: 'row-actions' },
+      h('button', { class: 'pill-btn', onclick: (e) => { haptic(); onAct(e); } }, label)));
+}
+
+/**
+ * Приветствие по имени — если это имя, а не набор символов.
+ *
+ * В Telegram имя пишет сам человек, и там бывает что угодно: «;)», один
+ * смайлик, точка. «Здравствуйте, ;)» выглядит как поломка интерфейса, а не
+ * как обращение. Поэтому требуем хотя бы две настоящие буквы — любого
+ * алфавита, не только кириллицы: продукт русский, но имена бывают разные.
+ */
+function greetName(raw) {
+  const first = String(raw || '').trim().split(/\s+/)[0] || '';
+  const letters = (first.match(/\p{L}/gu) || []).length;
+  return letters >= 2 ? `Здравствуйте, ${first}` : 'Здравствуйте';
+}
+
+/**
+ * Чем считается долг — плашкой под числом, а не красным баннером.
+ *
+ * Основание менять можно и нужно, но это настройка, а не авария. Красный
+ * баннер с восклицательным знаком спорил с главной цифрой за внимание и
+ * читался как ошибка продукта. Подробный разбор с пересчётом никуда не
+ * делся — он открывается по нажатию, когда человек сам захочет разобраться.
+ */
+/*
+ * Режимов три, а подписей было две: «журнал веду сам» показывался как
+ * «Считаем по актам». Человек читал, что накладная попадёт в долг, выписывал
+ * её — и долг не появлялся, потому что в этом режиме документы журнал не
+ * трогают вовсе. Подпись обязана говорить ровно то, что делает учёт.
+ */
+const BASIS_CHIP = {
+  closing: 'Считаем по актам и накладным',
+  invoice: 'Считаем по счетам',
+  manual: 'Долг сам не считается',
+};
+
+function basisChip(s) {
+  const chip = h('button', { class: 'chip-basis' },
+    `${BASIS_CHIP[s.debtBasis] || BASIS_CHIP.closing} ▾`);
+  chip.onclick = () => { haptic(); go('why'); };
+  return chip;
+}
+
+/**
+ * Почему выписанный акт или накладная не попали в долг — или '' если попали.
+ *
+ * Закрывающий документ не создаёт долга при основании «по счёту» и в режиме
+ * «журнал веду сам». Так и задумано, но молчать об этом в момент выписки
+ * нельзя: человек идёт в карточку клиента, видит ноль и считает это
+ * поломкой. Про счёт не говорим — при основании «по отгрузке» он долга не
+ * создаёт у всех, это обычный порядок, а не сюрприз.
+ */
+function noDebtNote(type, r) {
+  // Клиент на предоплате: говорим, списалось ли с неё, — вместо «Оплачено».
+  if (r && r.debt && r.prepay && ['usl', 'upd', 'torg12'].includes(type)) {
+    return r.prepaid
+      ? `Списано с предоплаты. ${r.prepay.text}.`
+      : `Предоплата кончилась: ${r.prepay.text}.`;
+  }
+  if (!r || r.debt || !['usl', 'upd', 'torg12'].includes(type)) return '';
+  // Ноль рублей — не вопрос основания: быстрые позиции приходят без цены,
+  // и на нулевую сумму проводку не пишем. Говорим про цены, а не про настройку.
+  if (!(Number(r.total) > 0)) {
+    return 'Сумма документа 0 ₽ — долг клиента не записан: у позиций не указана цена. '
+      + 'Выпишите документ заново с ценами.';
+  }
+  if (r.debtBasis === 'manual') {
+    return 'В долг клиента не попал: выбрано «журнал веду сам». '
+      + 'Чтобы акты и накладные считались — плашка под суммой на главной.';
+  }
+  if (r.debtBasis === 'invoice') {
+    return 'Долг у вас считается по счетам, поэтому сам документ в долг клиента не попал. '
+      + 'Чтобы считались акты и накладные — плашка под суммой на главной.';
+  }
+  return '';
+}
+
+// ---------- экраны ----------
+
+screens.home = async function home() {
+  cache = await api('GET', '/api/state');
+  const s = cache;
+  const box = h('div', {});
+
+  /*
+   * Шапка. Сумма — крупнейшее на экране, и это не украшение: человек
+   * открывает приложение, чтобы узнать цифру, а не чтобы прочитать меню.
+   */
+  /*
+   * Одно число, а не три спорящих.
+   *
+   * Раньше экран показывал сразу «должны вам», плитку «ждут оплаты» и
+   * красный баннер «долг считается по актам, поэтому ноль». Три сигнала об
+   * одних и тех же деньгах, причём разные: человек не понимал, должны ему
+   * или нет. Ведущим делаем то, что он пришёл узнать, — сколько ему ДОЛЖНЫ
+   * прямо сейчас, а способ подсчёта уходит в спокойную плашку под числом.
+   */
+  const unpaid = s.unpaid || { count: 0, sum: 0 };
+  const lead = unpaid.sum || s.debts.owedToUs;
+  const sumBtn = h('button', { class: 'tap' },
+    h('div', { class: 'sum money', text: money0(lead) }),
+    // Янтарный, а не зелёный: зелёный в этом приложении значит «деньги
+    // получены». Ожидание оплаты — не получение.
+    lead
+      ? h('div', { class: 'sub wait' }, icon('clock', 'icon inline'), unpaid.count
+        ? `ждут оплаты · ${unpaid.count} ${plural(unpaid.count, 'счёт', 'счёта', 'счетов')}`
+        : `должны вам · ${s.counts.debtors} ${plural(s.counts.debtors, 'клиент', 'клиента', 'клиентов')}`,
+      icon('chev', 'icon inline'))
+      : h('div', { class: 'sub', text: 'все рассчитались' }),
+    /*
+     * Отдельной ссылки «Из чего эта сумма» здесь больше нет.
+     *
+     * Она вела туда же, куда плашка способа подсчёта ниже, и под числом
+     * выходило три строки подряд — разбор источников, статус и настройка.
+     * Главная жалоба «удалил документы, а сумма прежняя» никуда не делась:
+     * ответ на неё лежит там же, одним касанием, просто вход теперь один.
+     */);
+  sumBtn.onclick = () => { haptic(); go(unpaid.count ? 'unpaid' : 'why'); };
+
+  /*
+   * Сумма живёт в карточке и по центру, а не текстом на фоне.
+   *
+   * Голое число, прижатое влево, читалось как заголовок раздела: взгляд
+   * скользил по нему вниз, к кнопкам, вместо того чтобы на нём остановиться.
+   * Карточка отделяет «сколько мне должны» от всего остального экрана, а
+   * центр даёт числу вес — так это и было задумано в макете.
+   *
+   * Приветствие и остаток бесплатных документов остаются НАД карточкой: это
+   * не про деньги, и внутрь они бы шумели.
+   */
+  const q0 = s.quota || {};
+  /*
+   * Новичок — тот, у кого ещё нет ни одного документа.
+   *
+   * Ему «К получению 0 ₽ · все рассчитались» говорит ложное: рассчитываться
+   * ещё не с кем, и «все» — это никто. А три блока подряд про счёт («Выписать
+   * счёт», «Ваш первый счёт за 30 секунд», пример во фразе) не подсказывают
+   * порядка: с чего начать — с клиента? с реквизитов? Поэтому вместо суммы —
+   * три шага по порядку и одна кнопка, ведущая к ближайшему.
+   */
+  const newbie = !(s.docs || []).length;
+  const greetRow = h('div', { class: 'greet-row' },
+    h('span', { class: 'greet ellipsis', text: greetName(s.user.name) }),
+    h('span', { class: `badge ${q0.paid ? 'ok' : ''}`,
+      text: q0.paid ? 'подписка' : `осталось ${q0.left ?? 0} из ${q0.limit ?? 0}` }));
+
+  /*
+   * Неполные реквизиты — сверху, до суммы: это единственное, что мешает
+   * документам выходить с оплатой по QR. Раньше плашка стояла в самом низу
+   * длинной главной, а кнопка в ней была ниже пальца (32 px). Новичку она не
+   * нужна: первый шаг ниже и так про реквизиты.
+   */
+  if (!s.orgReady && !newbie) {
+    box.append(h('div', { class: 'banner', id: 'org-banner' }, icon('warn'),
+      h('div', {},
+        h('div', { text: 'Реквизиты заполнены не полностью' }),
+        h('div', { class: 'small muted', style: 'margin:2px 0 8px',
+          text: 'Без банка и счёта в документе не будет QR для оплаты.' }),
+        h('button', { class: 'pill-btn', onclick: () => { haptic(); go('org'); } }, 'Заполнить'))));
+  }
+
+  if (newbie) {
+    const hasOrg = Boolean(s.org && s.org.name);
+    const cpCount = (s.counts && s.counts.cps) || 0;
+    // Реквизиты «начаты», но без банка и счёта: шаг не выполнен, и в то же время дальше идти можно —
+    // счёт выпишется и без QR. Поэтому такой шаг помечаем янтарным и даём маленькую кнопку «Дописать»,
+    // а главная кнопка ведёт к следующему шагу.
+    const partial = hasOrg && !s.orgReady;
+    const steps = [
+      { done: s.orgReady, partial, title: 'Ваши реквизиты',
+        sub: !hasOrg ? 'Название, ИНН и счёт — они печатаются в документах'
+          : (s.orgReady ? 'Готово' : 'Название есть. Банк и счёт допишите — иначе в счёте не будет QR') },
+      { done: cpCount > 0, title: 'Первый клиент',
+        sub: cpCount ? `В списке: ${cpCount}` : 'Кому выписываем. Можно добавить и прямо в документе' },
+      { done: false, title: 'Первый документ', sub: 'Счёт с QR — клиент платит камерой банка' },
+    ];
+    // Ближайший шаг — первый невыполненный и не «начатый»; он подсвечен, и на нём единственная кнопка.
+    const now = steps.findIndex((x) => !x.done && !x.partial);
+    const go1 = [
+      ['Заполнить реквизиты', () => go('org')],
+      ['Добавить клиента', () => go('cp', {})],
+      ['Выписать счёт', () => go('new', { type: 'sch' })],
+    ][now];
+    box.append(h('div', { class: 'hero' }, greetRow));
+    box.append(h('div', { class: 'card steps', id: 'steps' }, steps.map((x, i) => h('div', {
+      class: `row step${x.done ? ' done' : ''}${x.partial ? ' part' : ''}${i === now ? ' now' : ''}`,
+    },
+    h('span', { class: `step-n${x.done ? ' ok' : ''}`, 'aria-hidden': 'true' },
+      x.done ? icon('check') : String(i + 1)),
+    h('span', { class: 'grow' },
+      h('div', { text: `${i + 1}. ${x.title}` }),
+      h('div', { class: 'small muted step-sub', text: x.sub }),
+      x.partial ? h('button', {
+        class: 'pill-btn', id: 'steps-finish-org', style: 'margin-top:8px',
+        onclick: () => { haptic(); go('org'); },
+      }, 'Дописать реквизиты') : null)))));
+    box.append(h('div', { class: 'btn-wrap' }, h('button', {
+      class: 'btn', id: 'steps-go', onclick: () => { haptic('medium'); go1[1](); },
+    }, go1[0])));
+  } else {
+    box.append(h('div', { class: 'hero' },
+      greetRow,
+      h('div', { class: 'hero-card' },
+        h('div', { class: 'cap', text: 'К получению' }),
+        sumBtn,
+        basisChip(s))));
+  }
+
+  // Самозанятому: чек надо пробить по каждому поступлению, срок жёсткий —
+  // поэтому напоминание стоит на виду, а не в глубине карточки документа.
+  if (s.cheques && s.cheques.open) {
+    box.append(h('div', { class: 'card', id: 'cheques-home', style: 'margin-top:12px' }, navRow({
+      icon: 'receipt', tone: 'warn',
+      title: `Чеки не пробиты: ${s.cheques.open}`,
+      // Подпись короткая: длиннее «ближайший срок …» не влезало в строку и обрезалось.
+      sub: `на ${money0(s.cheques.sum)}${s.cheques.nearest ? ` · до ${ru(s.cheques.nearest)}` : ''}`,
+      onclick: () => go('cheques'),
+    })));
+  }
+
+  /*
+   * Один вход вместо двух равнозначных.
+   *
+   * Раньше под суммой стояли две карточки одного веса: «Спросить словами» и
+   * «Выписать счёт». Новичок читал обе и выбирал, вместо того чтобы делать.
+   * Теперь фраза — строка ввода с примером прямо в ней (человек видит, что
+   * писать), а кнопка ниже — вторая дорога к тому же результату.
+   */
+  const askRow = h('button', { class: 'prompt' },
+    h('span', { class: 'icon-box' }, icon('mic')),
+    h('span', { class: 'grow' },
+      h('div', { text: 'Помощник: голос или текст' }),
+      h('div', { class: 'small muted ellipsis', text: '«Счёт Заре на 51 000 за банкет»' })),
+    h('span', { class: 'prompt-go' }, icon('chev')));
+  askRow.onclick = () => { haptic(); go('ask'); };
+  box.append(askRow);
+
+  // Одно главное действие, крупнее всего остального. У новичка его роль у
+  // кнопки шага выше — второй такой же «Выписать счёт» только путал бы.
+  const cta = newbie ? null : h('button', { class: 'cta' },
+    h('span', { class: 'cta-ico' }, icon('receipt')),
+    h('span', { class: 'grow' },
+      h('div', { class: 'cta-t', text: 'Выписать счёт' }),
+      h('div', { class: 'cta-s', text: 'с QR — клиент платит камерой банка' })),
+    icon('chev', 'chev'));
+  if (cta) {
+    cta.onclick = () => { haptic('medium'); go('new', { type: 'sch' }); };
+    box.append(cta);
+  }
+
+  /*
+   * Быстрое действие — от состояния, а не сеткой плиток.
+   *
+   * Плитки «Клиенты» и «Кто должен» дублировали таб-бар: они не давали
+   * ничего сверх него, занимали первый экран и отжимали ленту операций вниз.
+   * Новичку они вредили вдвойне — он нажимал и находил пустоту.
+   *
+   * Кнопка на главной должна быть ДЕЙСТВИЕМ, место — вкладкой. Поэтому здесь
+   * стоит то, чего вкладка выразить не может: новичку — первый шаг, тому, кто
+   * уже работает, — повтор последнего счёта. Свой долг никуда не делся, он на
+   * вкладке «Долги», просто перестал занимать половину главного экрана.
+   */
+  const lastSch = (s.docs || []).find((d) => d.type === 'sch' && d.cpId);
+  // Новичку — шаги наверху, второй «первый счёт» здесь был бы дублем.
+  if (newbie) {
+    // ничего: шаги и кнопка уже на экране
+  } else if (lastSch) {
+    // Сумму держим в подписи, а не отдельной колонкой справа: колонка
+    // отжимала название, и «ООО «Заря»» обрезалось до «ООО «З…».
+    const again = h('button', { class: 'row' },
+      h('span', { class: 'icon-box' }, icon('repeat')),
+      h('span', { class: 'grow' },
+        h('div', { class: 'ellipsis', text: `Повторить: ${lastSch.cpName || 'последний счёт'}` }),
+        h('div', { class: 'small muted ellipsis',
+          text: `№ ${lastSch.number} · ${money0(lastSch.total)} · сегодняшней датой` })),
+      icon('chev', 'chev'));
+    // Позиции и клиента берём из прошлого счёта, дату — сегодняшнюю: это
+    // повтор регулярной работы, а не копия документа задним числом.
+    again.onclick = () => repeatDoc(lastSch.id);
+    box.append(h('div', { class: 'card' }, again));
+  }
+
+
+  /*
+   * Напоминания и вход в клиентов — на виду, а не в глубине карточки.
+   * Владелец открыл приложение и мини-CRM не нашёл: она была только в боте.
+   */
+  const fuAll = await api('GET', '/api/crm/followups').catch(() => ({ followups: [] }));
+  noteFollowups(fuAll.followups);
+  const fuNow = fuAll.followups.filter((f) => f.overdue || f.today);
+  if (fuNow.length) {
+    box.append(h('div', { class: 'section-title', text: 'Напоминания' }),
+      h('div', { class: 'card' }, followupRows(fuNow.slice(0, 5), () => render(), true)));
+  }
+  box.append(h('div', { class: 'card' }, navRow({
+    icon: 'bell', title: 'Дела: напоминания и заметки',
+    sub: fuAll.followups.length
+      ? `${fuAll.followups.length} ${plural(fuAll.followups.length, 'напоминание', 'напоминания', 'напоминаний')} · заметки по клиентам`
+      : 'заметки по клиентам, «напомнить мне»',
+    onclick: () => reset('crm'),
+  })));
+
+  // У каждого типа своя иконка: четыре одинаковых листа бумаги не помогают
+  // выбрать, а взгляд цепляется за форму раньше, чем прочтёт подпись.
+  // Счёт уехал в главное действие наверху — в плитках он был бы вторым
+  // приглашением к тому же и размывал бы выбор.
+  const types = [
+    ['usl', 'doc-check', 'Акт услуг', 'подтверждает, что работа сделана'],
+    ['schdog', 'pen', 'Счёт-договор', 'заменяет договор'],
+    ['upd', 'docs2', 'УПД', 'счёт-фактура и накладная в одном'],
+    ['torg12', 'box', 'ТОРГ-12', 'накладная на товар'],
+    ['pp', 'wallet', 'Платёжка', 'платёжное поручение для банка'],
+    ['dog', 'pen', 'Договор', 'условия на бумаге'],
+  // Самозанятому УПД не предлагаем: счёт-фактуру он выставлять не вправе (422-ФЗ).
+  ].filter(([type]) => !(type === 'upd' && Number((s.org || {}).npd)));
+  box.append(h('div', { class: 'section-title', text: 'Другие документы' }));
+  const OTHER = ['pp', 'dog'];   // набираются полями, а не позициями
+  box.append(h('div', { class: 'tiles' }, types.map(([type, ico, title, sub]) => h('button', {
+    class: 'tile',
+    onclick: () => { haptic(); go(OTHER.includes(type) ? 'other' : 'new', { type }); },
+  },
+  h('span', { class: 'icon-box' }, icon(ico)),
+  h('span', { class: 't-title', text: title }),
+  h('span', { class: 't-sub', text: sub })))));
+
+  const q = s.quota;
+  box.append(h('div', { class: 'section-title', text: 'Доступ' }));
+  box.append(h('div', { class: 'card' },
+    navRow({
+      icon: q.paid ? 'star' : 'clock',
+      tone: q.paid ? 'ok' : '',
+      // Везде одна формула: «Осталось N из M» — остаток, а не то, сколько уже потрачено.
+      title: q.paid ? 'Подписка активна' : `Осталось ${q.left} из ${q.limit}`,
+      sub: q.paid
+        ? (s.access.until ? `действует до ${ru(s.access.until)}` : 'без ограничений')
+        : 'бесплатных документов в этом месяце',
+      onclick: () => go('billing'),
+    })));
+
+  box.append(h('div', { class: 'section-title', text: 'Последние документы' }));
+  if (!s.docs.length) {
+    box.append(h('div', { class: 'card' }, h('div', { class: 'row muted' }, 'Пока ничего не выписано')));
+  } else {
+    box.append(h('div', { class: 'card' }, s.docs.map((d) => navRow({
+      icon: 'doc',
+      title: `${d.title} № ${d.number}`,
+      sub: ru(d.date),
+      right: d.total ? money(d.total) : '',
+      onclick: () => go('doc', { id: d.id }),
+    }))));
+  }
+  return box;
+};
+
+/*
+ * Из чего складывается «должны вам».
+ *
+ * Экран отвечает на один вопрос, который задают чаще всего: почему цифра не
+ * шевелится, когда документы удаляются. Ответ почти всегда в том, что её
+ * держат не документы, — и пока это не сказано вслух, число выглядит мёртвым.
+ */
+screens.why = async function why() {
+  const b = await api('GET', '/api/debts/why');
+  const s = cache.org ? cache : await api('GET', '/api/state');
+  const box = h('div', {}, h('h1', { text: 'Из чего эта сумма' }));
+  box.append(h('div', { class: 'hero' }, h('div', { class: 'sum money', text: money0(b.total) })));
+
+  /*
+   * Основание долга — здесь, а не красным баннером на главной.
+   *
+   * Раньше на главной висела алая плашка с восклицательным знаком: она
+   * спорила с крупной цифрой за внимание и читалась как поломка продукта,
+   * хотя описывала настройку. Место объяснения — экран «из чего эта сумма»:
+   * человек приходит сюда именно с вопросом, почему число такое.
+   *
+   * Сам переключатель важен и остаётся: он пересчитывает уже выписанное.
+   */
+  {
+    const basis = BASIS_CHIP[s.debtBasis] ? s.debtBasis : 'closing';
+    const m = s.basisMismatch;
+    const switchTo = (value, label, cls) => {
+      const btn = h('button', { class: cls }, label);
+      btn.onclick = () => withBusy(btn, async () => {
+        const r = await api('POST', '/api/basis', { basis: value });
+        haptic('medium');
+        const f = r.fixed || {};
+        toast(f.added
+          ? `Пересчитал: долг появился по ${f.added} ${plural(f.added, 'документу', 'документам', 'документам')}`
+          : (f.paid ? `Пересчитал журнал: поправлено строк оплаты — ${f.paid}` : 'Готово'));
+        cache = {};
+        reset('home');
+      });
+      return btn;
+    };
+    /*
+     * Ручной режим — отдельный случай, а не «по актам».
+     *
+     * Раньше экран знал два состояния и в ручном режиме рассказывал, что долг
+     * возникает с актом или накладной, а кнопка предлагала перейти «на
+     * счета». Накладные при этом не считались ни до, ни после нажатия.
+     * Человеку в ручном режиме нужнее всего вернуть подсчёт по отгрузке,
+     * поэтому эта кнопка первая.
+     */
+    const head = {
+      closing: ['Долг считается по актам и накладным',
+        'Обязательство возникает, когда подписан акт, УПД или накладная. Счёт долга не создаёт.'],
+      invoice: ['Долг считается по счетам',
+        'Обязательство возникает, когда выписан счёт. Акт, УПД и накладная долга не создают.'],
+      manual: ['Долг сам не считается',
+        'Журнал ведёте вы: ни акты, ни накладные, ни счета в долг не попадают — '
+        + 'приход и оплату вносите руками.'],
+    }[basis];
+    const buttons = {
+      closing: [switchTo('invoice', 'Считать долг по счетам', 'btn secondary')],
+      invoice: [switchTo('closing', 'Считать долг по актам и накладным', 'btn secondary')],
+      manual: [switchTo('closing', 'Считать долг по актам и накладным', 'btn'),
+        switchTo('invoice', 'Считать по счетам', 'btn secondary')],
+    }[basis];
+    box.append(h('div', { class: 'card' },
+      h('div', { class: 'row' },
+        h('span', { class: 'icon-box' }, icon('wallet')),
+        h('span', { class: 'grow' },
+          h('div', { text: head[0] }),
+          h('div', { class: 'small muted', text: head[1] }))),
+      // Про расхождение говорим, только когда оно есть на самом деле.
+      m ? h('div', { class: 'row muted small' },
+        `Поэтому ${m.count} ${plural(m.count, 'документ', 'документа', 'документов')} `
+        + `на ${money0(m.sum)} ${m.advance ? 'показаны авансом, будто должны вы' : 'в долг не попали'}. `
+        + 'Переключите — пересчитаю прошлые.') : null,
+      buttons.map((b) => h('div', { class: 'btn-wrap' }, b))));
+  }
+
+  const parts = [
+    ['Долг на начало', b.opening, 'долг, который был до Первички — из карточек клиентов', 'cps'],
+    ['Документы', b.docs, 'акты, УПД, накладные и счета — уходит вместе с документом', 'docs'],
+    ['Внесено руками', b.manual, 'операции из журнала и банковской выписки', 'debts'],
+  ].filter(([, v]) => v);
+
+  const lost = (b.orphanCount || 0) + (b.orphanOther || 0);
+  if (!parts.length && !lost) {
+    box.append(empty('wallet', 'Никто не должен', 'Все расчёты сошлись.'));
+    return box;
+  }
+
+  if (parts.length) {
+    box.append(h('div', { class: 'card' }, parts.map(([title, v, sub, screen]) => navRow({
+      icon: 'wallet', title, sub, right: money(v), onclick: () => go(screen),
+    }))));
+
+    // Слово «удалил» звучит в каждой жалобе, поэтому объясняем именно его.
+    box.append(h('div', { class: 'card' }, h('div', { class: 'row muted small' },
+      'Удаление документа снимает только его строку. Долг на начало правится '
+      + 'в карточке клиента, ручные операции — в журнале.')));
+  }
+
+  if (lost) {
+    // Сирот, сидящих в самой сумме, и сирот у остальных контрагентов
+    // называем врозь: одним числом вышло бы «три операции держат 3 000»,
+    // хотя держит одна, а две другие гасят друг друга у другого клиента.
+    // Считаем держащими только тех, кто действительно что-то держит: две
+    // операции, гасящие друг друга, дали бы «0,00 ₽ держат 2 операции».
+    const held = b.orphan ? b.orphanCount : 0;
+    const rest = lost - held;
+    const here = held
+      ? `${money(b.orphan)} в этой сумме держат ${held} `
+        + `${plural(held, 'операция', 'операции', 'операций')}`
+      : 'На саму сумму они не влияют, но в журнале есть';
+    const other = rest
+      ? `${held ? '. Ещё' : ':'} ${rest} `
+        + `${plural(rest, 'такая операция', 'такие операции', 'таких операций')}`
+      : '';
+    box.append(h('div', { class: 'card' }, h('div', { class: 'row' },
+      h('span', { class: 'icon-box warn' }, icon('warn')),
+      h('span', { class: 'grow' },
+        h('div', { text: 'Строки без документа' }),
+        h('div', { class: 'small muted', text: `${here}${other}. Они остались от документов, `
+          + 'удалённых старой версией бота. Из приложения их не убрать — напишите в поддержку.' }))),
+    h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn secondary', onclick: () => { haptic(); go('support'); } },
+        'Написать в поддержку'))));
+  }
+  return box;
+};
+
+/** «Счёт на оплату» → «счёт на оплату», но «УПД» и «ТОРГ-12» остаются как есть. */
+function lowerTitle(t) {
+  return String(t || '').split(' ').map((w) => (/^[А-ЯЁ0-9-]{2,}$/.test(w) ? w : w.toLowerCase())).join(' ');
+}
+
+/**
+ * «Повторить»: открывает форму нового документа с теми же клиентом, позициями,
+ * ставкой НДС и основанием. Данные берём с сервера, а не из списка документов:
+ * в списке одни позиции, и копия теряла бы налог и основание накладной.
+ * Выписывает по-прежнему человек — кнопкой в форме, после проверки.
+ */
+async function repeatDoc(docId, fix = null) {
+  try {
+    const r = await api('GET', `/api/doc/repeat?id=${docId}`);
+    haptic('medium');
+    if (fix) go('new', { ...r.draft, ...fix, fix: { ...r.from } });
+    else go('new', { ...r.draft, repeat: { ...r.from, otherOrg: r.otherOrg, orgName: r.orgName } });
+  } catch (e) { toast(e.message, true); }
+}
+
+screens.docs = async function docs({ cp, from, to } = {}) {
+  // Сервер умеет отдавать журнал по одному клиенту — в приложении этим
+  // никто не пользовался, хотя из его карточки это первое, что нужно.
+  // И за период: так открывает помощник на «покажи документы за август».
+  const q = new URLSearchParams();
+  if (cp) q.set('cp', String(cp));
+  if (to) { if (from) q.set('from', from); q.set('to', to); }
+  const { docs: list } = await api('GET', `/api/docs${q.toString() ? `?${q}` : ''}`);
+  // Режим НДС нужен, чтобы решить, показывать ли счета-фактуры. Кэш может
+  // быть пуст, если на этот экран пришли сразу по ссылке.
+  const st = cache.org ? cache : await api('GET', '/api/state');
+  const box = h('div', {}, h('h1', { text: 'Документы' }));
+  // Период назван — говорим, какой, и даём выйти к полному журналу.
+  const scoped = Boolean(to);
+  if (scoped) {
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px', id: 'docs-range',
+      text: `За период ${from ? `${ru(from)} — ` : 'по '}${ru(to)}: ${list.length} ${plural(list.length, 'документ', 'документа', 'документов')}.` }));
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn secondary', id: 'docs-all', onclick: () => { haptic(); go('docs', cp ? { cp } : {}); } }, 'Все документы')));
+  }
+  if (!list.length && scoped) {
+    box.append(empty('doc', 'За этот период ничего нет', 'Выберите другой период или откройте все документы.'));
+    return box;
+  }
+  if (!list.length) {
+    /*
+     * Пустой журнал — не значит «денег нет». Оплаты и приходы вносят руками,
+     * и они живут отдельно от документов: человек видел здесь пустоту и
+     * тупик, хотя за клиентами числились суммы. Поэтому второй выход —
+     * в журнал операций.
+     */
+    box.append(empty('doc', 'Документов пока нет',
+      'Здесь появятся выписанные документы — их можно переслать заново или повторить '
+      + 'новым номером. Оплаты и приходы вносятся отдельно, в журнале операций.',
+      h('div', { class: 'btn-wrap' },
+        h('button', { class: 'btn', onclick: () => { haptic('medium'); go('new', { type: 'sch', cpId: cp }); } },
+          'Выписать счёт'),
+        h('button', {
+          class: 'btn secondary',
+          onclick: () => { haptic(); go(cp ? 'ops' : 'cps', cp ? { cpId: cp } : {}); },
+        }, 'Внести оплату или приход'))));
+    return box;
+  }
+  // Оплачен или нет — то, ради чего в журнал и заходят. Без метки строки
+  // отличаются только суммой, и статус приходится помнить в голове.
+  const paidBadge = (d) => (d.paidAt ? { badge: 'Оплачен', badgeTone: 'ok' }
+    : (['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) ? { badge: 'Ждёт оплаты' } : {}));
+  box.append(h('div', { class: 'btn-wrap' },
+    h('button', { class: 'btn', onclick: () => { haptic('medium'); go('new', { type: 'sch' }); } },
+      'Выписать документ')));
+  /*
+   * Счета-фактуры — отдельным рядом и только плательщику НДС. Кнопка, ведущая
+   * к отказу, хуже отсутствующей: человек решит, что сломано, а не что нельзя.
+   */
+  if (cp && st.org && st.org.vat_rate && !Number(st.org.npd)) {
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn secondary', onclick: () => { haptic('medium'); go('avans', { cpId: cp }); } },
+        'СФ на аванс'),
+      h('button', { class: 'btn secondary', onclick: () => { haptic('medium'); go('ksf', { cpId: cp }); } },
+        'Корректировка')));
+  }
+
+  box.append(h('div', { class: 'card' }, list.map((d) => swipeToDelete(
+    docRow(d, { ...paidBadge(d), onclick: () => go('doc', { id: d.id }) }),
+    {
+      label: `Удалить ${d.title} № ${d.number}`,
+      onDelete: async () => {
+        const r = await api('POST', '/api/doc/delete', { id: d.id });
+        haptic('medium');
+        toast(deletedText(d, r));
+        render();
+      },
+    },
+  ))));
+  return box;
+};
+
+/**
+ * Смахивание влево — «Удалить», как в списках на iPhone.
+ *
+ * Две вещи делают жест безопасным. Во-первых, удаляет не сам свайп, а
+ * появившаяся кнопка: смахнуть можно случайно, пролистывая, а документ
+ * уходит вместе с проводкой и долгом, и вернуть его нечем. Во-вторых,
+ * вертикальное движение отдаётся странице — иначе список перестал бы
+ * прокручиваться на телефоне.
+ *
+ * @param {HTMLElement} row строка, которую двигаем
+ * @param {{label: string, onDelete: Function}} opts
+ */
+function swipeToDelete(row, opts) {
+  const WIDTH = 92;                     // ширина кнопки под строкой
+  const del = h('button', {
+    class: 'swipe-del', type: 'button', 'aria-label': opts.label,
+    onclick: (e) => {
+      e.stopPropagation();
+      withBusy(e.currentTarget, opts.onDelete);
+    },
+  }, icon('trash'));
+
+  const wrap = h('div', { class: 'swipe' }, del, row);
+  row.classList.add('swipe-face');
+
+  let x0 = 0; let y0 = 0; let dx = 0;
+  let axis = '';                        // '', 'x' или 'y' — решается один раз за жест
+  let open = false;
+
+  const put = (v, animate) => {
+    row.style.transition = animate ? 'transform .18s ease' : '';
+    row.style.transform = `translateX(${v}px)`;
+  };
+  const close = () => { open = false; put(0, true); };
+
+  row.addEventListener('touchstart', (e) => {
+    const t = e.touches[0];
+    x0 = t.clientX; y0 = t.clientY; dx = 0; axis = '';
+    row.style.transition = '';
+  }, { passive: true });
+
+  row.addEventListener('touchmove', (e) => {
+    const t = e.touches[0];
+    const mx = t.clientX - x0;
+    const my = t.clientY - y0;
+    if (!axis) {
+      if (Math.abs(mx) < 8 && Math.abs(my) < 8) return;
+      axis = Math.abs(mx) > Math.abs(my) ? 'x' : 'y';
+    }
+    if (axis !== 'x') return;           // это прокрутка списка, не наше дело
+    // Тянуть влево можно до ширины кнопки, вправо — только закрывая.
+    dx = Math.max(-WIDTH, Math.min(0, (open ? -WIDTH : 0) + mx));
+    put(dx, false);
+  }, { passive: true });
+
+  row.addEventListener('touchend', () => {
+    if (axis !== 'x') return;
+    // Порог — половина кнопки: иначе строка застревает в промежуточном
+    // положении, где непонятно, открыта она или нет.
+    open = dx < -WIDTH / 2;
+    put(open ? -WIDTH : 0, true);
+    if (open) haptic();
+  });
+
+  // Нажатие по строке в открытом состоянии — сначала закрыть, а не открыть
+  // карточку: иначе жест выглядит как случайное срабатывание.
+  row.addEventListener('click', (e) => {
+    if (open) { e.preventDefault(); e.stopPropagation(); close(); }
+  }, true);
+
+  return wrap;
+}
+
+/** Что сказать, когда свободная оплата привязана к документу («Да, это она»). */
+function linkedToast(r) {
+  const l = (r && r.linked) || {};
+  const head = l.partial
+    ? `Привязал ${money(l.amount)}. Осталось получить ${money(l.left)}`
+    : `Привязал оплату ${money(l.amount)} — документ оплачен`;
+  return `${head}. Новой оплаты в журнал не добавлено.`
+    + (l.rest ? ` Ещё ${money(l.rest)} остались оплатой клиента без документа.` : '');
+}
+
+screens.doc = async function docScreen({ id, fresh = false, askBiz = false, justPaid = false }) {
+  const { docs: list } = await api('GET', '/api/docs');
+  const d = list.find((x) => x.id === Number(id));
+  if (!d) return empty('warn', 'Документ не найден', 'Возможно, он был убран из журнала.');
+
+  // Кому выписан — первое, что ищут в карточке. Раньше здесь были только
+  // дата и сумма, и понять, чей это документ, было нельзя.
+  const cpsList = (await api('GET', '/api/cps')).cps;
+  const cpOf = cpsList.find((x) => x.id === d.cpId) || null;
+
+  const box = h('div', {}, h('h1', { text: `${d.title} № ${d.number}` }));
+
+  /*
+   * Только что выписанный документ: сверху — что с ним делать дальше.
+   *
+   * Это и есть ответ на «выписал — а дальше?». Два действия, ради которых
+   * документ заводят: отметить оплату, когда она придёт, и прислать файл ещё
+   * раз (в чат с ботом — оттуда его пересылают клиенту). Остальное — ниже, на
+   * той же карточке. Вопрос «чем занимаетесь» — отдельной тихой строкой после
+   * них, один раз: ответ не обязателен, документ уже выписан.
+   */
+  if (fresh) {
+    const payable = ['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) && d.total && !d.paidAt;
+    // Зелёная плашка с «вспыхивающей» галочкой: выписать документ — то, за чем пришли,
+    // и этот момент должен ощущаться как итог, а не как ещё одно сообщение.
+    box.append(h('div', { class: 'banner ok', id: 'fresh-doc' }, h('span', { class: 'ok-badge' }, icon('check')),
+      h('div', {},
+        h('div', { text: 'Документ выписан' }),
+        h('div', { class: 'small muted', style: 'margin-top:2px', text: 'Что дальше?' }),
+        h('div', { class: 'btn-col', style: 'margin-top:10px' },
+          payable ? h('button', {
+            class: 'btn', id: 'fresh-pay',
+            // Нажимаем настоящую кнопку оплаты ниже: вопрос «это она?» живёт там.
+            onclick: () => {
+              const real = box.querySelector('#pay-main');
+              if (!real) return;
+              real.scrollIntoView({ block: 'center', behavior: smooth() });
+              real.click();
+            },
+          }, 'Отметить оплату') : null,
+          h('button', {
+            class: payable ? 'btn secondary' : 'btn', id: 'fresh-send',
+            onclick: (e) => withBusy(e.currentTarget, async () => {
+              const r = await api('POST', '/api/doc/resend', { id: d.id });
+              haptic('medium');
+              toast('Файл отправлен в чат с ботом');
+              download(r.file);
+            }),
+          }, 'Прислать в чат')))));
+    if (askBiz) {
+      box.append(h('div', { class: 'card', id: 'ask-biz' }, navRow({
+        icon: 'office', title: 'Чем занимаетесь?',
+        sub: 'Один вопрос — спрашиваю один раз',
+        onclick: () => go('basis'),
+      })));
+    }
+  }
+
+  /*
+   * Напоминание про чек «Моего налога». Живёт до следующего перерисовывания
+   * экрана: сообщением-всплывашкой его бы закрыли не читая, а в карточке оно
+   * остаётся на виду ровно столько, сколько человек здесь находится.
+   */
+  if (pendingCheque) {
+    const note = pendingCheque;
+    pendingCheque = null;
+    box.append(h('div', { class: 'banner info', id: 'cheque-note' }, icon('receipt'),
+      h('div', {},
+        h('div', { style: 'white-space:pre-line', text: note.text }),
+        h('button', {
+          class: 'btn secondary',
+          style: 'margin-top:10px',
+          onclick: () => openOutside(note.url),
+        }, 'Открыть «Мой налог»'),
+        note.cheque ? h('button', {
+          class: 'btn', id: 'cheque-done', style: 'margin-top:8px',
+          onclick: (e) => withBusy(e.currentTarget, async () => {
+            await api('POST', '/api/cheques/done', { id: note.cheque.id });
+            haptic('medium');
+            toast('Отмечено: чек пробит');
+            render();
+          }),
+        }, 'Чек пробил') : null,
+        h('div', { class: 'small muted', style: 'margin-top:6px',
+          text: 'Не сейчас — не страшно: напомню на главной и в утренней сводке, пока чек не отмечен.' }))));
+  }
+  box.append(h('div', { class: 'card' },
+    cpOf ? h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Кому' }),
+      h('span', { class: 'ellipsis', text: cpOf.name })) : null,
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Дата' }), h('span', { text: ru(d.date) })),
+    d.total ? h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Сумма' }),
+      h('span', { class: 'money', text: money(d.total) })) : null));
+
+  /*
+   * Платёжный QR — видно до того, как счёт уйдёт клиенту.
+   *
+   * Раньше код жил только внутри PDF: чтобы его увидеть, надо было открыть
+   * файл. А это ровно та секунда, когда ошибку в реквизитах или сумме ещё
+   * дёшево исправить — наведя камеру банка на собственный экран.
+   *
+   * Если реквизитов не хватает, честно говорим, каких именно, вместо пустого
+   * места: кода по ГОСТ Р 56042 без счёта, БИК и корр. счёта не существует, и
+   * обещать его нельзя.
+   */
+  if (['sch', 'schdog'].includes(d.type) && d.total) {
+    const qrCard = h('div', { class: 'card qr-card' },
+      h('div', { class: 'muted small', text: 'Загружаю код…' }));
+    box.append(h('div', { class: 'section-title', text: 'Оплата по QR' }), qrCard);
+    api('GET', `/api/doc/qr?id=${d.id}`).then((r) => {
+      qrCard.textContent = '';
+      if (r.svg) {
+        const wrap = h('div', { class: 'qr-wrap' });
+        // Код приходит готовым SVG с сервера — тем же, что рисуется в PDF,
+        // чтобы превью и файл не разошлись.
+        wrap.innerHTML = r.svg;
+        qrCard.append(wrap, h('div', { class: 'small muted center',
+          text: 'Клиент наводит камеру в приложении банка — платёжка заполнится сама' }));
+        return;
+      }
+      const why = (r.problems || []).join(', ');
+      qrCard.append(h('div', { class: 'row' },
+        h('span', { class: 'icon-box warn' }, icon('warn')),
+        h('span', { class: 'grow' },
+          h('div', { text: 'QR пока не собрать' }),
+          h('div', { class: 'small muted', text: why ? `Не хватает: ${why}.` : 'Не хватает реквизитов.' }))),
+        h('div', { class: 'btn-wrap' }, h('button', {
+          class: 'btn secondary', onclick: () => { haptic(); go('org'); },
+        }, 'Заполнить реквизиты')));
+    }).catch(() => { qrCard.textContent = ''; qrCard.append(h('div', { class: 'muted small', text: 'Код не загрузился.' })); });
+  }
+
+  /*
+   * Оплата. В боте отметить её было можно, а в приложении — нет: обработчик
+   * на сервере есть, кнопки не было. Для счёта это половина смысла карточки:
+   * отметка закрывает долг в журнале и убирает документ из «не оплачено».
+   */
+  if (['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) && d.total) {
+    const paid = Boolean(d.paidAt);
+    box.append(h('div', { class: 'section-title', text: 'Оплата' }));
+    const payCard = h('div', { class: 'card' },
+      h('div', { class: 'row' },
+        // justPaid — оплату только что отметили: значок «всплывает» один раз, как итог действия.
+        h('span', { class: `icon-box ${paid ? 'ok' : ''}${paid && justPaid ? ' pop' : ''}` }, icon(paid ? 'check' : 'clock')),
+        h('span', { class: 'grow' },
+          h('div', { text: paid ? 'Оплачен' : 'Ждёт оплаты' }),
+          h('div', {
+            class: 'small muted',
+            text: paid ? `отмечено ${ru(d.paidAt)}`
+              : (d.noDebt ? 'долг по этому документу отменён вручную' : 'долг числится за клиентом'),
+          }))));
+    box.append(payCard);
+    /*
+     * Оплату отметили внизу карточки, а экран перерисовался и вернулся наверх:
+     * человек нажимал на кнопку у самого низа и видел начало страницы, не
+     * понимая, сработало ли. Подводим экран к строке «Оплачен». Через таймер:
+     * сразу после сборки render() сам прокручивает наверх, и наша прокрутка
+     * должна идти за ней, а не перед ней.
+     */
+    if (paid && justPaid) {
+      setTimeout(() => payCard.scrollIntoView({ block: 'center', behavior: smooth() }), 80);
+    }
+    // Отмену проводки надо уметь отменить: без этой кнопки документ навсегда
+    // выпадал из долга, продолжая числиться в ожидающих оплаты.
+    if (d.noDebt) {
+      box.append(h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn secondary',
+        onclick: (e) => withBusy(e.currentTarget, async () => {
+          await api('POST', '/api/doc/debt', { id: d.id });
+          haptic('medium');
+          toast('Документ вернулся в долг');
+          render();
+        }),
+      }, 'Вернуть в долг')));
+    }
+    /*
+     * Есть свободная оплата клиента — сервер сначала спрашивает, не она ли это
+     * (`ask`), и вопрос рисуется на месте кнопки. Иначе те же деньги
+     * записались бы вторым разом: человек внёс «пришло 3 000» строкой, а потом
+     * нажал «Оплатил» на накладной на те же 3 000.
+     */
+    const payZone = h('div', {});
+    const afterPay = (r, text, marked = false) => {
+      if (marked) hapticResult(true); else haptic('medium');
+      toast(text);
+      // Самозанятому именно сейчас надо выдать чек: счёт и акт доход не
+      // закрывают. Момент единственный — деньги переводом приходят молча,
+      // документ уже выписан, и всё выглядит законченным.
+      if (r && r.npd) pendingCheque = r.npd;
+      // Верхняя плашка «Документ выписан» своё сказала — после действия она не нужна.
+      Object.assign(current().params, { fresh: false, askBiz: false, justPaid: marked });
+      render();
+    };
+    const askFree = (ask) => {
+      const answer = (free) => (e) => withBusy(e.currentTarget, async () => {
+        const r = await api('POST', '/api/doc/paid', { id: d.id, free });
+        afterPay(r, free === 'new' ? 'Отмечено как оплаченный' : linkedToast(r), true);
+      });
+      const several = ask.options.length > 1;
+      payZone.replaceChildren(h('div', { class: 'banner info', id: 'free-pay-ask' }, icon('wallet'),
+        h('div', {},
+          h('div', { text: ask.question }),
+          h('div', { class: 'btn-col', style: 'margin-top:10px' },
+            ...ask.options.map((o) => h('button', { class: 'btn', onclick: answer(o.opId) },
+              several ? `Да: ${o.label}` : 'Да, это она')),
+            h('button', { class: 'btn secondary', onclick: answer('new') }, 'Нет, это новая оплата'),
+            h('div', { class: 'small muted',
+              text: 'Если «да» — новой оплаты в журнал не добавится: эти деньги там уже есть.' })))));
+    };
+    payZone.append(h('div', { class: 'btn-wrap' }, h('button', {
+      id: 'pay-main',
+      class: paid ? 'btn ghost' : 'btn',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        const r = await api('POST', '/api/doc/paid', { id: d.id, paid: !paid });
+        if (r && r.ask) { haptic(); askFree(r.ask); return; }
+        afterPay(r, !paid ? 'Отмечено как оплаченный'
+          : r && r.kept ? `Отметка снята. ${money(r.kept)} из выписки остались в журнале оплатой клиента`
+            : 'Отметка снята', !paid);
+      }),
+    }, paid ? 'Снять отметку об оплате' : 'Отметить оплату')));
+    box.append(payZone);
+  }
+
+  // Чек «Мой налог»: пробит ли, и ссылка на него — прямо в карточке документа.
+  if (d.cheque) {
+    const c = d.cheque;
+    box.append(h('div', { class: 'section-title', text: 'Чек «Мой налог»' }));
+    box.append(h('div', { class: 'card', id: 'doc-cheque' },
+      h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Состояние' }),
+        h('span', { text: c.status === 'done' ? 'пробит' : `не пробит, до ${ru(c.due)}` })),
+      c.number ? h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Номер' }),
+        h('span', { text: c.number })) : null,
+      c.link ? navRow({ icon: 'receipt', title: 'Открыть чек', onclick: () => openOutside(c.link) }) : null,
+      navRow({
+        icon: 'receipt',
+        title: c.status === 'done' ? (c.link ? 'Заменить ссылку на чек' : 'Приложить ссылку на чек') : 'Данные для чека',
+        onclick: () => go('cheques'),
+      })));
+  }
+
+  if (d.items && d.items.length) {
+    box.append(h('div', { class: 'section-title', text: 'Позиции' }));
+    box.append(h('div', { class: 'card' }, d.items.map((it) => h('div', { class: 'row' },
+      h('span', { class: 'grow' },
+        h('div', { class: 'ellipsis', text: it.name }),
+        h('div', { class: 'small muted', text: `${it.qty} ${it.unit || 'шт.'} × ${money(it.price)}` })),
+      h('span', { class: 'money nowrap', text: money((Number(it.qty) || 0) * (Number(it.price) || 0)) })))));
+  }
+
+  /*
+   * Штампы на копии. Акт сверки сюда не попадает: он приходит таблицей
+   * Excel, а не бланком, и штамповать в нём нечего.
+   *
+   * Состояние живёт прямо здесь, а не в базе: штамп — это свойство копии,
+   * которую сейчас печатают, а не самого документа. Один и тот же счёт
+   * сегодня уходит клиенту со штампом «Оплачено», а завтра подшивается
+   * без него.
+   */
+  const stamp = { paid: false, copy: false };
+  if (d.type !== 'akt') {
+    const chip = (key, label) => {
+      const b = h('button', { class: 'chip', type: 'button', 'aria-pressed': 'false' }, label);
+      b.onclick = () => {
+        stamp[key] = !stamp[key];
+        b.setAttribute('aria-pressed', String(stamp[key]));
+        haptic('light');
+      };
+      return b;
+    };
+    const chips = [chip('copy', 'Копия')];
+    // «Оплачено» предлагаем только тогда, когда оплата отмечена в журнале.
+    // Штамп — это утверждение о деньгах, и придумывать его нельзя.
+    if (d.paidAt) chips.unshift(chip('paid', `Оплачено ${ru(d.paidAt)}`));
+    box.append(h('div', { class: 'section-title', text: 'Надпись на файле' }));
+    box.append(h('div', { class: 'chips' }, chips));
+    box.append(h('p', { class: 'small muted', style: 'margin:-4px 18px 8px',
+      text: 'Отметьте — и надпись («Копия», «Оплачено») появится на файле, который вы пришлёте или отправите клиенту.' }));
+    if (!d.paidAt && ['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) && d.total) {
+      box.append(h('p', {
+        class: 'small muted',
+        style: 'margin:-4px 18px 8px',
+        text: 'Штамп «Оплачено» появится здесь, когда вы отметите оплату.',
+      }));
+    }
+  }
+
+  /*
+   * Ссылка на документ.
+   *
+   * Счёт клиенту чаще отправляют в переписке, чем почтой, а файл в переписке
+   * живёт плохо: на телефоне открывается через раз, в общем чате теряется, а
+   * после правки у получателя остаётся старая бумага. По ссылке документ
+   * собирается заново в момент открытия — и всегда свежий.
+   *
+   * Ссылка временная и её можно отозвать: кто её получил, тот и видит
+   * реквизиты с суммами, поэтому лежать в чужом чате вечно она не должна.
+   */
+  {
+    const info = await api('GET', `/api/doc/link?id=${d.id}`);
+    const linkBox = h('div', {});
+    const drawLink = (links) => {
+      linkBox.textContent = '';
+      if (!links.length) {
+        linkBox.append(h('p', {
+          class: 'small muted',
+          style: 'margin:0 18px 8px',
+          text: `Короткий адрес на этот документ — отправить клиенту в переписку. `
+            + `Действует ${info.days} ${plural(info.days, 'день', 'дня', 'дней')}, отозвать можно в любой момент.`,
+        }));
+        linkBox.append(h('div', { class: 'btn-wrap' }, h('button', {
+          class: 'btn secondary',
+          onclick: (e) => withBusy(e.currentTarget, async () => {
+            const r = await api('POST', '/api/doc/link', { id: d.id, stamp });
+            haptic('medium');
+            drawLink([r.link]);
+          }),
+        }, 'Сделать ссылку')));
+        return;
+      }
+      const one = links[0];
+      const box2 = h('div', { class: 'card' },
+        h('div', { class: 'row' },
+          h('span', { class: 'grow ellipsis small', text: one.url })),
+        h('div', { class: 'row' },
+          h('span', { class: 'grow muted small', text: `Действует до ${ru(one.expiresAt.slice(0, 10))}` }),
+          h('span', {
+            class: 'small muted',
+            text: one.opens ? `открывали ${one.opens} ${plural(one.opens, 'раз', 'раза', 'раз')}` : 'ещё не открывали',
+          })));
+      linkBox.append(box2);
+      linkBox.append(h('div', { class: 'btn-wrap' },
+        h('button', {
+          class: 'btn secondary',
+          onclick: () => shareToTelegram(one.url,
+            `${d.title} № ${d.number} от ${ru(d.date)}`),
+        }, 'Отправить в Telegram'),
+        h('button', {
+          class: 'btn ghost',
+          onclick: async (e) => {
+            try {
+              await navigator.clipboard.writeText(one.url);
+              haptic('medium');
+              toast('Ссылка скопирована');
+            } catch (_) {
+              // Буфер даёт не всякий браузер. Выделяем — скопирует руками.
+              toast('Скопируйте адрес вручную', true);
+              e.currentTarget.blur();
+            }
+          },
+        }, 'Скопировать'),
+        h('button', {
+          class: 'btn ghost',
+          onclick: (e) => withBusy(e.currentTarget, async () => {
+            await api('POST', '/api/doc/link/revoke', { id: d.id });
+            haptic('medium');
+            toast('Ссылка больше не работает');
+            drawLink([]);
+          }),
+        }, 'Отозвать')));
+    };
+    if (info.available) {
+      box.append(h('div', { class: 'section-title', text: 'Ссылка на документ' }));
+      drawLink(info.links || []);
+      box.append(linkBox);
+    }
+  }
+
+  // Главное действие на экране одно. Если у счёта не отмечена оплата —
+  // главное это она; пересылка файла тогда вторична.
+  box.append(h('div', { class: 'btn-wrap' },
+    h('button', {
+      class: ['sch', 'schdog', 'usl', 'upd', 'torg12'].includes(d.type) && d.total && !d.paidAt ? 'btn secondary' : 'btn',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        const r = await api('POST', '/api/doc/resend', { id: d.id, stamp });
+        toast('Файл отправлен в чат с ботом');
+        haptic('medium');
+        download(r.file);
+      }),
+    }, 'Прислать файл заново в чат с ботом')));
+
+  /*
+   * Исправление — только у счёта-фактуры (УПД со статусом 1).
+   *
+   * Пересобирает тот же документ по текущим данным: поправили ИНН клиента в
+   * карточке — исправление выйдет с верным. Номер и дата остаются прежними.
+   * Для изменения стоимости по договорённости это не годится: там
+   * корректировочный, и это другой документ.
+   */
+  if (d.type === 'upd' && d.status === 1) {
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', {
+        class: 'btn secondary',
+        onclick: (e) => withBusy(e.currentTarget, async () => {
+          try {
+            const r = await api('POST', '/api/doc/fix', { id: d.id });
+            haptic('medium');
+            toast(`Исправление № ${r.no} готово`);
+            download(r.file);
+          } catch (err) { toast(err.message, true); }
+        }),
+      }, d.fixNo ? `Исправление № ${d.fixNo + 1}` : 'Выставить исправление')));
+    box.append(h('p', { class: 'small muted', style: 'margin:4px 18px',
+      text: 'Номер и дата счёта-фактуры не изменятся — так и должно быть. '
+        + 'Если меняется стоимость по договорённости, нужен корректировочный.' }));
+  }
+
+  /*
+   * Отправка клиенту на почту — если она настроена на сервере.
+   *
+   * Акт сверки отсюда исключался, потому что не умел пересобираться: он
+   * строится из журнала операций, а не из позиций. Теперь умеет, а
+   * отправляют его чаще прочего — сверка нужна не себе, а контрагенту.
+   */
+  const st = cache.features ? cache : await api('GET', '/api/state');
+  if (st.features && st.features.mail) {
+    const cp = cpOf || {};
+    const mailField = field('email', 'Почта получателя', cp.email, {
+      type: 'email', placeholder: 'buh@company.ru',
+      hint: cp.email ? 'Сохранена у клиента' : 'Запомню её для этого клиента',
+    });
+    box.append(h('div', { class: 'section-title', text: 'Отправить клиенту' }));
+    if (d.type === 'akt') {
+      box.append(h('p', { class: 'small muted', style: 'margin:0 18px 8px',
+        text: 'В письме будет просьба сверить и ответить: подписать, если сходится, '
+          + 'или назвать строку, если нет.' }));
+    }
+    box.append(h('div', { class: 'card' }, mailField));
+    box.append(h('div', { class: 'btn-wrap' }, h('button', {
+      class: 'btn secondary',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        clearErrors({ mailField });
+        const to = mailField.input.value.trim();
+        if (!to) { showError(mailField, 'Без адреса отправить некуда'); return; }
+        const r = await api('POST', '/api/doc/mail', { id: d.id, email: to, stamp });
+        toast(`Отправлено на ${r.sent}`);
+        haptic('medium');
+      }),
+    }, 'Отправить на почту')));
+  }
+
+  if (d.items && d.items.length) {
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', {
+        class: 'btn secondary', id: 'doc-fix',
+        // Ошибся в позициях — исправляем этот же документ, номер и дата остаются.
+        onclick: (e) => withBusy(e.currentTarget, () => repeatDoc(d.id, { replaceId: d.id, number: d.number, date: d.date })),
+      }, 'Исправить — номер тот же'),
+      h('button', {
+        class: 'btn secondary',
+        onclick: (e) => withBusy(e.currentTarget, () => repeatDoc(d.id)),
+      }, 'Повторить')));
+  }
+  if (d.type !== 'akt') {
+    // Номер ставит человек, и ошибается: удалил № 7, выписал заново — вышел № 22.
+    const numIn = h('input', { class: 'input', id: 'renum-input', value: d.number, inputmode: 'numeric', style: 'display:none' });
+    const numSave = h('button', {
+      class: 'btn', id: 'renum-save', style: 'display:none',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        const r = await api('POST', '/api/doc/renumber', { id: d.id, number: numIn.value.trim() });
+        toast(`Номер изменён на ${r.number}`);
+        haptic('medium');
+        download(r.file);
+        render();
+      }),
+    }, 'Сохранить номер');
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', {
+        class: 'btn secondary', id: 'renum-open',
+        onclick: (e) => { e.currentTarget.style.display = 'none'; numIn.style.display = ''; numSave.style.display = ''; numIn.focus(); },
+      }, 'Изменить номер'), numIn, numSave));
+  }
+  if (d.items && d.items.length) {
+    /*
+     * Повторение заводится отсюда: позиции уже проверены человеком, остаётся
+     * назвать число. 29–31 в списке нет — таких чисел нет в каждом месяце.
+     *
+     * У счёта спрашиваем не «когда напомнить», а число из договора: платят
+     * к нему, счёт нужен заранее, а на следующий день после срока — сигнал
+     * о просрочке. Одно число задаёт весь цикл.
+     */
+    const isBill = ['sch', 'schdog'].includes(d.type);
+    // panel — «раз в месяц» (числа); над ним выбор частоты: день, будни, неделя, месяц.
+    const panel = h('div', { hidden: true });
+
+    // Предупреждение о бесплатном лимите: «Каждый день» съедает его за несколько дней.
+    const warnBox = h('div', {});
+    const askFreeLimit = (text, body) => { warnBox.replaceChildren(h('div', { class: 'banner', id: 'rec-warn' },
+      icon('warn'),
+      h('div', {},
+        h('div', { text }),
+        h('div', { class: 'btn-col', style: 'margin-top:10px' },
+          h('button', {
+            class: 'btn', id: 'rec-warn-ok',
+            onclick: (e) => save({ ...body, confirmFree: true }, e.currentTarget),
+          }, 'Всё равно создать расписание'),
+          h('button', { class: 'btn secondary', onclick: () => warnBox.replaceChildren() }, 'Выбрать другое')))));
+      // Строка, которую нажали, ниже плашки: без прокрутки её можно не заметить.
+      warnBox.scrollIntoView({ block: 'center', behavior: smooth() });
+    };
+
+    const save = (body, done) => withBusy(done, async () => {
+      const r = await api('POST', '/api/recurring', { docId: d.id, ...body });
+      if (r.warn) { haptic(); askFreeLimit(r.warn, body); return; }
+      haptic('medium');
+      toast(r.payDay ? `Счёт ${r.offerDay}-го, оплата ${r.payDay}-го`
+        : body.period && body.period !== 'month' ? `Расписание: ${r.dayText}` : `Напомню ${r.dayText}`);
+      go('recurring');
+    });
+
+    const dayRows = (onPick, label) => h('div', { class: 'card' },
+      [1, 5, 10, 15, 20, 25, 0].map((day) => h('button', {
+        class: 'row',
+        onclick: (e) => onPick(day, e.currentTarget),
+      },
+      h('span', { class: 'icon-box' }, icon('clock')),
+      h('span', { class: 'grow', text: label(day) }))));
+
+    if (isBill) {
+      const lead = h('div', { hidden: true });
+      panel.append(
+        h('div', { class: 'section-title', text: 'Какого числа клиент платит по договору' }),
+        dayRows((day, btn) => {
+          if (!day) { save({ day: 0 }, btn); return; }
+          // Второй шаг вместо готового ответа: «за 3 дня» — обычай, а не
+          // правило, и в договоре может стоять другой срок.
+          lead.replaceChildren(
+            h('div', { class: 'section-title', text: `Оплата ${day}-го. Выставлять счёт` }),
+            h('div', { class: 'card' }, [3, 5, 7, 0].map((days) => h('button', {
+              class: 'row',
+              onclick: (e) => save({ payDay: day, leadDays: days }, e.currentTarget),
+            },
+            h('span', { class: 'icon-box' }, icon('send')),
+            h('span', { class: 'grow', text: days ? `за ${days} ${plural(days, 'день', 'дня', 'дней')}` : 'в день оплаты' })))));
+          lead.hidden = false;
+          lead.scrollIntoView({ behavior: smooth(), block: 'nearest' });
+          haptic();
+        }, (day) => (day ? `${day}-го числа` : 'В последний день месяца')),
+        lead,
+      );
+    } else {
+      panel.append(
+        h('div', { class: 'section-title', text: 'Какого числа напоминать' }),
+        dayRows((day, btn) => save({ day }, btn),
+          (day) => (day ? `${day}-го числа` : 'В последний день месяца')),
+      );
+    }
+
+    /*
+     * Частота. «Каждый день», «по будням» и «раз в неделю» — для тех, кто возит
+     * одно и то же одному клиенту: обеды, воду, хлеб. Бот пришлёт документ на
+     * проверку, а выпишется он по «Всё верно» — не заранее, чтобы пропущенный
+     * день не оставил дыру в нумерации.
+     */
+    const weekPanel = h('div', { hidden: true },
+      h('div', { class: 'section-title', text: 'В какой день недели' }),
+      h('div', { class: 'card' }, ['понедельник', 'вторник', 'среду', 'четверг', 'пятницу', 'субботу', 'воскресенье']
+        .map((name, i) => h('button', {
+          class: 'row', id: `rec-wd-${i + 1}`,
+          onclick: (e) => save({ period: 'week', weekday: i + 1 }, e.currentTarget),
+        },
+        h('span', { class: 'icon-box' }, icon('clock')),
+        h('span', { class: 'grow', text: `${i === 1 ? 'Во' : 'В'} ${name}` })))));
+    const monthPanel = h('div', { hidden: true }, panel);
+    panel.hidden = false;
+
+    const pickPeriod = (title, sub, ico, onclick, id) => h('button', { class: 'row', id, onclick },
+      h('span', { class: 'icon-box' }, icon(ico)),
+      h('span', { class: 'grow' },
+        h('div', { text: title }),
+        sub ? h('div', { class: 'small muted', text: sub }) : null));
+    const outer = h('div', { hidden: true },
+      h('div', { class: 'section-title', text: 'Как часто' }),
+      warnBox,
+      h('div', { class: 'card' },
+        pickPeriod('Каждый день', 'и по выходным', 'repeat',
+          (e) => save({ period: 'day' }, e.currentTarget), 'rec-day'),
+        pickPeriod('По будням', 'с понедельника по пятницу', 'repeat',
+          (e) => save({ period: 'weekdays' }, e.currentTarget), 'rec-weekdays'),
+        pickPeriod('Раз в неделю', 'в выбранный день', 'clock', () => {
+          weekPanel.hidden = !weekPanel.hidden; monthPanel.hidden = true; haptic();
+        }, 'rec-week'),
+        pickPeriod('Раз в месяц', 'в выбранное число', 'clock', () => {
+          monthPanel.hidden = !monthPanel.hidden; weekPanel.hidden = true; haptic();
+        }, 'rec-month')),
+      h('p', { class: 'small muted', style: 'margin:8px 18px',
+        text: 'Документ сам не выпишется и клиенту не уйдёт: утром придёт предложение с проверкой — '
+          + '«Всё верно», «Поправить» или «Пропустить сегодня».' }),
+      weekPanel, monthPanel);
+
+    const repeat = h('button', { class: 'btn secondary', id: 'rec-open' }, icon('repeat', 'icon inline'), 'Повторять по расписанию');
+    repeat.onclick = () => {
+      outer.hidden = !outer.hidden;
+      haptic();
+    };
+    box.append(h('div', { class: 'btn-wrap' }, repeat), outer);
+  }
+
+  /*
+   * Удаление — с подтверждением в две ступени, без модального окна.
+   * Документ уходит вместе со своей проводкой, и вернуть его нельзя:
+   * спрашиваем прямо, а не прячем предупреждение мелким шрифтом.
+   */
+  const del = h('button', { class: 'btn danger' }, 'Удалить документ');
+  del.onclick = () => {
+    const sure = h('button', { class: 'btn danger' }, 'Да, удалить безвозвратно');
+    sure.onclick = () => withBusy(sure, async () => {
+      const r = await api('POST', '/api/doc/delete', { id: d.id });
+      haptic('medium');
+      toast(deletedText(d, r));
+      reset('docs');
+    });
+    del.replaceWith(h('div', {},
+      h('p', { class: 'small muted', style: 'margin:0 6px 10px', text: d.debt
+        ? `Документ исчезнет из журнала вместе со своей записью в журнале: долг клиента изменится на ${money(Math.abs(d.debt))}.`
+        : 'Документ исчезнет из журнала. Записи в журнале у него нет — баланс клиента не изменится.' }),
+      sure));
+  };
+  box.append(h('div', { class: 'btn-wrap' }, del));
+  return box;
+};
+
+
+/*
+ * Мини-CRM: напоминания, заметки, лента клиента.
+ *
+ * Раньше всё это было только в боте, и из приложения клиента «с историей»
+ * было не найти. Серверная логика общая (lib/crm.js); бот по-прежнему сам
+ * присылает напоминание в срок, здесь его можно увидеть и закрыть.
+ */
+const FU_DAYS = [[1, 'Завтра'], [3, 'Через 3 дня'], [7, 'Через неделю'], [14, 'Через 2 недели']];
+
+/** Строки напоминаний с «Сделано» и «Отложить на 3 дня»; after — перерисовать. */
+function followupRows(list, after, withCp) {
+  return list.map((f) => {
+    const late = f.overdue;
+    const act = async (path, body, msg) => {
+      try { await api('POST', path, body); toast(msg); haptic('medium'); refreshCrmBadge(true); await after(); }
+      catch (e) { toast(e.message, true); }
+    };
+    return h('div', { class: 'row fu-row' },
+      h('span', { class: `icon-box ${late ? 'warn' : ''}` }, icon('clock')),
+      h('span', { class: 'grow' },
+        h('div', { text: nb(f.text) }),
+        h('div', { class: `small ${late ? 'fu-late' : 'muted'}`,
+          text: `${late ? 'просрочено · ' : (f.today ? 'сегодня · ' : '')}${ru(f.due)}${withCp && f.cpName ? ` · ${f.cpName}` : ''}` }),
+        h('div', { class: 'fu-btns' },
+          h('button', { class: 'btn small-btn', onclick: () => act('/api/crm/followup/done', { id: f.id }, 'Отмечено') }, 'Сделано'),
+          h('button', { class: 'btn secondary small-btn', onclick: () => act('/api/crm/followup/snooze', { id: f.id, days: 3 }, 'Отложил на 3 дня') }, 'Отложить на 3 дня'),
+          withCp && f.cpId && h('button', { class: 'btn ghost small-btn', onclick: () => go('cp', { id: f.cpId }) }, 'К клиенту'))));
+  });
+}
+
+/** Блок «История клиента» в карточке: заметка, напоминание, напоминания, лента. */
+function crmBlock(cpId) {
+  const wrap = h('div', {});
+  const draw = async () => {
+    const { items, followups } = await api('GET', `/api/crm/timeline?cpId=${cpId}`);
+    const note = h('textarea', { id: 'crm-note', placeholder: 'Например: договорились на пятницу', maxlength: '1000', rows: '2' });
+    const saveNote = async (e) => withBusy(e.currentTarget, async () => {
+      if (!note.value.trim()) { toast('Напишите, что записать', true); return; }
+      await api('POST', '/api/crm/note', { cpId, text: note.value.trim() });
+      toast('Заметка сохранена'); haptic('medium'); await draw();
+    });
+    const fuText = h('input', { id: 'crm-fu-text', type: 'text', maxlength: '300', placeholder: 'О чём напомнить (можно пусто)', autocomplete: 'off' });
+    const fuBtns = h('div', { class: 'fu-btns' }, FU_DAYS.map(([days, label]) => h('button', {
+      class: 'btn secondary small-btn',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        await api('POST', '/api/crm/followup', { cpId, days, text: fuText.value.trim() });
+        toast(`Напомню: ${label.toLowerCase()}`); haptic('medium'); refreshCrmBadge(true); await draw();
+      }),
+    }, label)));
+    /*
+     * Нажимаются только строки, за которыми есть что открыть: документ и
+     * запись журнала. Заметка и напоминание целиком уже на экране, и рисовать
+     * их кнопкой со стрелкой значило бы обещать переход, которого нет.
+     */
+    const tlRow = (it) => {
+      const target = it.docId ? () => go('doc', { id: it.docId })
+        : (it.opId ? () => go('opcard', { cpId, opId: it.opId }) : null);
+      const kids = [
+        h('span', { class: 'tl-ico' }, icon(TL_ICON[it.icon] || 'doc', 'icon inline')),
+        h('span', { class: 'grow' },
+          h('div', { text: nb(it.text) }),
+          h('div', { class: 'small muted', text: ru(String(it.at).slice(0, 10)) })),
+      ];
+      if (!target) return h('div', { class: 'row tl-row' }, kids);
+      return h('button', { class: 'row tl-row', onclick: () => { haptic(); target(); } }, kids, icon('chev', 'chev'));
+    };
+    const feed = items.length
+      ? items.map(tlRow)
+      : [h('div', { class: 'row muted', text: 'Пока пусто: документы, оплаты и заметки появятся здесь' })];
+    /*
+     * Пустые блоки отсеиваем здесь, а не передаём null: replaceChildren, в
+     * отличие от h(), превращает null в текст «null». Он и висел над историей
+     * у каждого клиента без открытых напоминаний.
+     */
+    wrap.replaceChildren(...[
+      h('div', { class: 'section-title', text: 'История клиента' }),
+      h('div', { class: 'card crm-form' },
+        h('div', { class: 'field' }, h('label', { for: 'crm-note' }, icon('pen', 'icon inline'), 'Заметка'), note,
+          h('button', { class: 'btn secondary', onclick: saveNote }, 'Сохранить заметку')),
+        h('div', { class: 'field' }, h('label', { for: 'crm-fu-text' }, icon('bell', 'icon inline'), 'Напомнить мне'), fuText, fuBtns)),
+      followups.length ? h('div', { class: 'card' }, followupRows(followups, draw, false)) : null,
+      h('div', { class: 'card' }, feed),
+    ].filter(Boolean));
+  };
+  draw().catch((e) => wrap.replaceChildren(h('div', { class: 'row muted', text: e.message })));
+  return wrap;
+}
+
+/*
+ * Вкладка CRM: всё, что нужно не забыть, и что происходило у клиентов.
+ *
+ * Раньше напоминания и заметки жили только внутри карточки клиента — зайти
+ * туда можно, лишь уже помня, о ком речь, а CRM нужна ровно наоборот: чтобы
+ * приложение само напомнило. Поэтому наверху — что горит, ниже — что скоро,
+ * в конце — свежие события по всем клиентам сразу. Править и добавлять
+ * заметки по-прежнему удобнее в карточке клиента (кнопка «К клиенту»).
+ */
+const FEED_ICON = { note: 'pen', doc: 'doc', paid: 'doc-check' };
+
+screens.crm = async function crmScreen() {
+  const [fu, feed, cpsRes] = await Promise.all([
+    api('GET', '/api/crm/followups'),
+    api('GET', '/api/crm/feed').catch(() => ({ items: [] })),
+    api('GET', '/api/cps').catch(() => ({ cps: [] })),
+  ]);
+  noteFollowups(fu.followups);
+  const box = h('div', {}, h('h1', { text: 'Дела' }));
+  const list = cpsRes.cps;
+  const redraw = () => render();
+
+  // Быстрое «напомнить»: клиент, о чём, когда. Свёрнуто в кнопку: вкладку
+  // открывают, чтобы увидеть дела, и форма над ними вытесняла сами дела.
+  // Для длинных заметок — карточка клиента.
+  if (list.length) {
+    const who = h('select', { id: 'crm-cp' }, list.map((c) => h('option', { value: c.id, text: c.name })));
+    const text = h('input', { id: 'crm-q-text', type: 'text', maxlength: '300', autocomplete: 'off', placeholder: 'Например: позвонить по счёту' });
+    const days = h('div', { class: 'fu-btns' }, FU_DAYS.map(([d, label]) => h('button', {
+      class: 'btn secondary small-btn',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        await api('POST', '/api/crm/followup', { cpId: Number(who.value), days: d, text: text.value.trim() });
+        toast(`Напомню: ${label.toLowerCase()}`); haptic('medium');
+        refreshCrmBadge(true); redraw();
+      }),
+    }, label)));
+    const form = h('div', { class: 'card crm-form', id: 'crm-new', hidden: true },
+      h('div', { class: 'field' }, h('label', { for: 'crm-cp', text: 'Клиент' }), who),
+      h('div', { class: 'field' }, h('label', { for: 'crm-q-text', text: 'О чём напомнить' }), text, days));
+    const openBtn = h('button', {
+      class: 'btn secondary small-btn', id: 'crm-new-btn', 'aria-expanded': 'false', 'aria-controls': 'crm-new',
+      onclick: () => {
+        const show = form.hidden;
+        form.hidden = !show;
+        openBtn.setAttribute('aria-expanded', String(show));
+        openBtn.textContent = show ? 'Свернуть' : '+ Напоминание';
+        if (show) text.focus();
+      },
+    }, '+ Напоминание');
+    box.append(h('div', { class: 'btn-wrap crm-add' }, openBtn), form);
+  }
+
+  const groups = [
+    ['Просрочено', fu.followups.filter((f) => f.overdue)],
+    ['Сегодня', fu.followups.filter((f) => f.today)],
+    ['Скоро', fu.followups.filter((f) => !f.overdue && !f.today)],
+  ];
+  if (!fu.followups.length) {
+    box.append(empty('bell', 'Напоминаний пока нет',
+      list.length
+        ? 'Нажмите «+ Напоминание», выберите клиента, напишите, о чём напомнить, и укажите срок. В этот день бот напишет вам сам.'
+        : 'Сначала добавьте клиента — потом к нему можно привязать напоминание и заметки.',
+      list.length ? null : h('div', { class: 'btn-wrap' },
+        h('button', { class: 'btn', onclick: () => go('cp', {}) }, 'Добавить клиента'))));
+  }
+  for (const [title, rows] of groups) {
+    if (!rows.length) continue;
+    box.append(h('div', { class: 'section-title', text: `${title} · ${rows.length}` }),
+      h('div', { class: 'card' }, followupRows(rows, redraw, true)));
+  }
+
+  box.append(h('div', { class: 'section-title', text: 'Недавно у клиентов' }));
+  box.append(h('div', { class: 'card' }, feed.items.length
+    ? feed.items.map((it) => h('button', { class: 'row', onclick: () => { haptic(); go('cp', { id: it.cpId }); } },
+      h('span', { class: 'icon-box' }, icon(FEED_ICON[it.kind] || 'doc')),
+      h('span', { class: 'grow' },
+        h('div', { class: 'feed-text', text: it.text }),
+        h('div', { class: 'small muted ellipsis', text: `${it.cpName} · ${ru(String(it.at).slice(0, 10))}` })),
+      icon('chev', 'chev')))
+    : h('div', { class: 'row muted', text: 'Пока тихо: заметки и выписанные документы появятся здесь.' })));
+  return box;
+};
+
+/*
+ * Акт за месяц: один акт услуг на все накладные и УПД клиента за месяц.
+ *
+ * Сначала человек видит, ЧТО войдёт (позиции и сумму), и только потом жмёт
+ * «Создать»: акт подписывает клиент, а отгрузки, уже вошедшие в прежний акт,
+ * в новый не попадают — это решает сервер (lib/month-act.js), здесь только
+ * показ. Долг акт не меняет: сумма уже учтена накладными.
+ */
+const SHIP_NAME = { torg12: 'Накладная', upd: 'УПД' };
+
+screens.monthact = async function monthActScreen({ cpId, ym }) {
+  const r = await api('GET', `/api/month-act?cpId=${cpId}`);
+  const box = h('div', {}, h('h1', { text: 'Акт за месяц' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 8px',
+    text: `${String(r.cp.name).replace(/\.$/, '')}. Один акт услуг на все накладные и УПД за месяц, по которым акта ещё не было. `
+      + 'Он подтверждает месяц целиком, поэтому нового долга не создаёт: сумма уже учтена по накладным.' }));
+
+  // Открываем тот месяц, что просили; иначе — первый, где есть что оформлять.
+  let cur = r.months.find((m) => m.ym === ym) || r.months.find((m) => m.docs.length) || r.months[0];
+  const LABELS = ['Этот месяц', 'Прошлый месяц'];
+  const chips = h('div', { class: 'chips' });
+  const body = h('div', {});
+  const cap = (t) => t.charAt(0).toUpperCase() + t.slice(1);
+
+  const create = async (btn) => withBusy(btn, async () => {
+    try {
+      const made = await api('POST', '/api/month-act', { cpId, ym: cur.ym });
+      haptic('heavy');
+      toast(made.sentToChat ? 'Акт выписан — файл отправлен в чат' : 'Акт выписан');
+      download(made.file);
+      current().params = { cpId, ym: cur.ym };
+      render();
+    } catch (e) {
+      if (e.payload && e.payload.reason === 'quota') { toast(e.message, true); go('billing'); return; }
+      throw e;
+    }
+  });
+
+  const draw = () => {
+    chips.replaceChildren(...r.months.map((m, i) => h('button', {
+      class: 'chip', type: 'button', 'aria-pressed': String(m.ym === cur.ym),
+      onclick: () => { cur = m; haptic(); draw(); },
+    }, LABELS[i] || cap(m.title))));
+
+    const last = cur.acts[cur.acts.length - 1];
+    const parts = [h('div', { class: 'section-title', text: cap(cur.title) })];
+    if (cur.docs.length) {
+      if (last) {
+        parts.push(h('div', { class: 'banner info', id: 'monthact-after' }, icon('doc-check'),
+          h('div', {}, `За этот месяц уже есть акт № ${last.number}. Здесь только то, что пришло после него.`)));
+      }
+      parts.push(h('div', { class: 'card', id: 'monthact-list' },
+        cur.docs.map((d) => navRow({
+          icon: 'doc', title: `${SHIP_NAME[d.type] || 'Документ'} № ${d.number}`, sub: ru(d.date),
+          right: money0(d.total), onclick: () => go('doc', { id: d.id }),
+        })),
+        h('div', { class: 'row' }, h('span', { class: 'grow', text: 'Итого в акте' }),
+          h('span', { class: 'money', text: money(cur.sum) }))),
+      h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn', id: 'monthact-make', onclick: (e) => create(e.currentTarget),
+      }, `Создать акт на ${money(cur.sum)}`)));
+    } else if (last) {
+      parts.push(empty('doc-check', 'Всё за месяц уже в акте',
+        `Акт № ${last.number} от ${ru(last.date)} на ${money(last.total)}. Новых накладных и УПД после него нет.`,
+        h('div', { class: 'btn-wrap' }, h('button', {
+          class: 'btn secondary', onclick: () => go('doc', { id: last.id }),
+        }, 'Открыть акт'))));
+    } else {
+      parts.push(empty('doc', 'Накладных и УПД за этот месяц нет',
+        'Акту не на чем строиться: он складывается из накладных и УПД этого клиента.'));
+    }
+    body.replaceChildren(...parts);
+  };
+  draw();
+  box.append(chips, body);
+  return box;
+};
+
+screens.cps = async function cps() {
+  const { cps: list } = await api('GET', '/api/cps');
+  const box = h('div', {}, h('h1', { text: 'Клиенты' }));
+  // Сами напоминания переехали на вкладку CRM; здесь остаётся короткая
+  // дорожка к ним — в список заходят, в том числе, чтобы вспомнить, кому позвонить.
+  const fu = await api('GET', '/api/crm/followups').catch(() => ({ followups: [] }));
+  noteFollowups(fu.followups);
+  if (fu.followups.length) {
+    const hot = fu.followups.filter((f) => f.overdue || f.today).length;
+    box.append(h('div', { class: 'card' }, navRow({
+      icon: 'bell', tone: hot ? 'warn' : '',
+      title: `${fu.followups.length} ${plural(fu.followups.length, 'напоминание', 'напоминания', 'напоминаний')}`,
+      sub: hot ? `${hot} — срок сегодня или уже прошёл` : 'ближайшие — на вкладке «Дела»',
+      onclick: () => reset('crm'),
+    })));
+  }
+  if (list.length) box.append(h('div', { class: 'small muted crm-hint', text: 'Откройте клиента — там история, заметки и «напомнить мне».' }));
+  if (!list.length) {
+    box.append(empty('users', 'Пока никого нет',
+      'Добавьте заказчика или поставщика — реквизиты подставятся в документы автоматически.',
+      h('div', { class: 'btn-wrap' }, h('button', { class: 'btn', onclick: () => go('cp', {}) }, 'Добавить клиента'))));
+    return box;
+  }
+  /*
+   * Пометка «чужой» — только когда фирм больше одной.
+   *
+   * Список контрагентов общий на аккаунт: один и тот же клиент обслуживается
+   * от обеих фирм, и заводить его дважды значит развести реквизиты. Но без
+   * пометки выписать документ не от той организации — дело одного промаха, а
+   * замечают это уже у контрагента.
+   *
+   * Пока организация одна, «свои» — вообще все, и метка была бы шумом на
+   * ровном месте. Поэтому её здесь просто нет.
+   */
+  const multiOrg = list.some((c) => !c.mine);
+  box.append(h('div', { class: 'card' }, list.map((cp) => navRow({
+    icon: 'users',
+    title: cp.name,
+    sub: (multiOrg && !cp.mine ? 'другая ваша фирма · ' : '')
+      + (onPrepay(cp) ? 'на предоплате · ' : (cp.prepay ? `${cp.prepay.text} · ` : ''))
+      + (cp.inn ? `ИНН ${cp.inn}` : (cp.kind === 'supplier' ? 'поставщик' : 'заказчик')),
+    right: cp.balance ? money(Math.abs(cp.balance)) : '',
+    // Сумма без знака непонятна: в списке рядом стоят и должники, и те,
+    // кому должны мы, а цифра у обоих выглядела одинаково.
+    rightTone: balanceTone(cp),
+    onclick: () => go('cp', { id: cp.id }),
+  }))));
+  box.append(h('div', { class: 'btn-wrap' },
+    h('button', { class: 'btn secondary', onclick: () => go('cp', {}) }, 'Добавить клиента')));
+  return box;
+};
+
+/** Поле формы с подписью, подсказкой и местом под ошибку. */
+function field(name, label, value, opts = {}) {
+  const input = h(opts.multiline ? 'textarea' : 'input', {
+    id: `f-${name}`, name, value: value || '',
+    inputmode: opts.inputmode, placeholder: opts.placeholder,
+    type: opts.type || 'text', autocomplete: 'off',
+  });
+  if (opts.multiline) input.value = value || '';
+  const wrap = h('div', { class: 'field' },
+    h('label', { for: `f-${name}` }, label, opts.required ? h('span', { class: 'req', text: ' *' }) : null),
+    input,
+    opts.hint && h('div', { class: 'hint', text: opts.hint }));
+  wrap.input = input;
+  if (opts.how) addHow(wrap, label, opts.how);
+  return wrap;
+}
+
+/**
+ * «Где это взять» — раскрывающаяся подсказка у поля.
+ *
+ * Человек останавливается на «КПП» или «Корр. счёт» не потому, что ленится, а
+ * потому что не знает, откуда брать число. Ответ нужен прямо у поля, а не в
+ * справке, куда надо идти отдельно. Скрыт по умолчанию — тем, кто знает, он не мешает.
+ */
+function addHow(wrap, label, text) {
+  const panel = h('div', { class: 'how', id: `how-${wrap.input.name}`, role: 'region' },
+    h('div', {}, h('div', { class: 'how-in', text })));
+  const btn = h('button', {
+    type: 'button', class: 'how-btn', 'aria-expanded': 'false',
+    'aria-controls': panel.id, 'aria-label': `Где взять: ${label}`,
+    onclick: () => {
+      const open = !wrap.classList.contains('how-open');
+      wrap.classList.toggle('how-open', open);
+      btn.setAttribute('aria-expanded', String(open));
+    },
+  }, icon('help'));
+  wrap.classList.add('has-how');
+  wrap.append(btn, panel);
+}
+
+function values(fields) {
+  const out = {};
+  for (const [key, f] of Object.entries(fields)) out[key] = f.input.value.trim();
+  return out;
+}
+
+/** Показать ошибку под конкретным полем и увести туда фокус. */
+function showError(f, message) {
+  f.classList.add('invalid');
+  f.querySelectorAll('.err').forEach((n) => n.remove());
+  f.append(h('div', { class: 'err' }, icon('warn', 'icon'), h('span', { text: message })));
+  f.input.focus();
+}
+/**
+ * Ошибка сервера про конкретное поле (неверный ИНН, БИК, счёт) — под самим полем.
+ *
+ * Раньше она приходила тостом внизу, а поле с опечаткой оставалось где-то за
+ * экраном и ничем не отмечалось: человек читал «ИНН не сходится», не видя, где
+ * его править. Сервер называет поле в `field` — подсвечиваем его и увозим экран туда.
+ *
+ * @returns {boolean} true, если ошибку показали у поля
+ */
+function fieldFail(e, fields) {
+  const key = e && e.payload && e.payload.field;
+  if (!key || !fields[key] || !fields[key].input) return false;
+  showError(fields[key], e.message);
+  fields[key].scrollIntoView({ behavior: smooth(), block: 'center' });
+  return true;
+}
+function clearErrors(fields) {
+  for (const f of Object.values(fields)) {
+    f.classList.remove('invalid');
+    f.querySelectorAll('.err').forEach((n) => n.remove());
+  }
+}
+
+/* ---------- Помощник реквизитов ---------- */
+
+/*
+ * Проверка прямо при вводе. Алгоритмы — те же, что на сервере
+ * (lib/requisites-check.js): сервер остаётся последней инстанцией, а здесь
+ * человек узнаёт об опечатке сразу, пока цифры ещё перед глазами, а не после
+ * нажатия «Сохранить», когда надо искать, где именно ошибся.
+ * Меняя одно — меняй и другое.
+ */
+const onlyDigits = (v) => String(v == null ? '' : v).replace(/\D/g, '');
+
+function innSum(d, w) {
+  return (w.reduce((a, k, i) => a + k * Number(d[i]), 0) % 11) % 10;
+}
+function innOk(d) {
+  if (d.length === 10) return innSum(d, [2, 4, 10, 3, 5, 9, 4, 6, 8]) === Number(d[9]);
+  return innSum(d, [7, 2, 4, 10, 3, 5, 9, 4, 6, 8]) === Number(d[10])
+    && innSum(d, [3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8]) === Number(d[11]);
+}
+function accOk(acc, bik, corr) {
+  const full = (corr ? `0${bik.slice(4, 6)}` : bik.slice(6, 9)) + acc;
+  const w = [7, 1, 3];
+  return full.split('').reduce((s, c, i) => s + ((w[i % 3] * Number(c)) % 10), 0) % 10 === 0;
+}
+
+/**
+ * Что сказать про значение поля сейчас.
+ * state: empty — пусто; wait — человек ещё набирает; ok — сходится; bad — опечатка.
+ * `need` и `have` — для полоски: сколько знаков нужно и сколько есть.
+ */
+function reqState(kind, raw, bikRaw) {
+  const d = onlyDigits(raw);
+  const left = (n, one, few, many) => `Ещё ${n} ${plural(n, one, few, many)}`;
+  if (kind === 'inn') {
+    if (!d) return { state: 'empty' };
+    if (d.length < 10) return { state: 'wait', have: d.length, need: 10, msg: `${left(10 - d.length, 'цифра', 'цифры', 'цифр')} — у организации 10, у ИП 12` };
+    if (d.length === 11) return { state: 'wait', have: 11, need: 12, msg: 'Ещё одна цифра — это ИНН предпринимателя' };
+    if (d.length > 12) return { state: 'bad', have: 12, need: 12, msg: `Лишние цифры: в ИНН 10 или 12, здесь ${d.length}` };
+    if (!innOk(d)) return { state: 'bad', have: d.length, need: d.length, msg: 'Цифры не сходятся — проверьте, нет ли опечатки' };
+    return { state: 'ok', have: d.length, need: d.length, msg: d.length === 12 ? 'ИНН сходится — индивидуальный предприниматель' : 'ИНН сходится — организация' };
+  }
+  if (kind === 'kpp') {
+    const v = String(raw || '').trim().toUpperCase();
+    if (!v) return { state: 'empty' };
+    if (v.length < 9) return { state: 'wait', have: v.length, need: 9, msg: `${left(9 - v.length, 'знак', 'знака', 'знаков')} из девяти` };
+    return /^\d{4}[\dA-Z]{2}\d{3}$/.test(v)
+      ? { state: 'ok', have: 9, need: 9, msg: 'КПП на месте' }
+      : { state: 'bad', have: 9, need: 9, msg: 'КПП — девять знаков, например 771501001' };
+  }
+  if (kind === 'ogrnip') {
+    if (!d) return { state: 'empty' };
+    if (d.length < 15) return { state: 'wait', have: d.length, need: 15, msg: `${left(15 - d.length, 'цифра', 'цифры', 'цифр')} из 15` };
+    return d.length === 15
+      ? { state: 'ok', have: 15, need: 15, msg: 'ОГРНИП на месте' }
+      : { state: 'bad', have: 15, need: 15, msg: `В ОГРНИП 15 цифр, здесь ${d.length}` };
+  }
+  if (kind === 'bik') {
+    if (!d) return { state: 'empty' };
+    if (d.length < 9) return { state: 'wait', have: d.length, need: 9, msg: `${left(9 - d.length, 'цифра', 'цифры', 'цифр')} из девяти` };
+    if (d.length > 9) return { state: 'bad', have: 9, need: 9, msg: `В БИК девять цифр, здесь ${d.length}` };
+    return /^04/.test(d)
+      ? { state: 'ok', have: 9, need: 9, msg: 'БИК на месте' }
+      : { state: 'bad', have: 9, need: 9, msg: 'Российский БИК начинается с 04' };
+  }
+  if (kind === 'acc' || kind === 'corr_acc') {
+    const corr = kind === 'corr_acc';
+    if (!d) return { state: 'empty' };
+    if (d.length < 20) return { state: 'wait', have: d.length, need: 20, msg: `${left(20 - d.length, 'цифра', 'цифры', 'цифр')} из 20` };
+    if (d.length > 20) return { state: 'bad', have: 20, need: 20, msg: `В номере счёта 20 цифр, здесь ${d.length}` };
+    const b = onlyDigits(bikRaw);
+    if (b.length !== 9) return { state: 'ok', have: 20, need: 20, msg: 'Двадцать цифр. Сверю с БИК, когда он появится' };
+    return accOk(d, b, corr)
+      ? { state: 'ok', have: 20, need: 20, msg: 'Счёт сходится с БИК' }
+      : { state: 'bad', have: 20, need: 20, msg: corr ? 'Не сходится с БИК — проверьте обе строки' : 'Не сходится с БИК — обычно переставлены две цифры. Платёж по такому счёту не пройдёт' };
+  }
+  return { state: 'empty' };
+}
+
+/**
+ * Оживляет поля реквизитов: полоска набранных знаков, зелёная галочка, когда
+ * число сходится, и понятная фраза, когда нет. Не блокирует ввод и не
+ * ругается на недописанное — только подсказывает.
+ *
+ * Лишние пробелы и дефисы из вставленного номера убираются сразу: так вставка
+ * «40702 810 …» из письма работает с первого раза.
+ */
+function reqLive(f) {
+  const KINDS = ['inn', 'kpp', 'ogrnip', 'bik', 'acc', 'corr_acc'];
+  const DIGITS = new Set(['inn', 'ogrnip', 'bik', 'acc', 'corr_acc']);
+  const nodes = {};
+  const paint = (kind) => {
+    const w = f[kind]; const n = nodes[kind];
+    if (!w || !n) return;
+    const r = reqState(kind, w.input.value, f.bik && f.bik.input.value);
+    w.dataset.live = r.state;
+    n.bar.style.setProperty('--p', r.need ? Math.min(1, r.have / r.need) : 0);
+    n.msg.replaceChildren();
+    if (r.msg) {
+      n.msg.append(icon(r.state === 'bad' ? 'warn' : r.state === 'ok' ? 'check' : 'clock', 'icon'), h('span', { text: r.msg }));
+    }
+    n.msg.hidden = !r.msg;
+  };
+  const all = () => KINDS.forEach(paint);
+  for (const kind of KINDS) {
+    const w = f[kind];
+    if (!w) continue;
+    const bar = h('div', { class: 'live-bar', 'aria-hidden': 'true' }, h('i'));
+    const msg = h('div', { class: 'live-msg', role: 'status', 'aria-live': 'polite', hidden: true });
+    const anchor = w.querySelector('.hint');
+    w.input.after(bar, msg);
+    if (anchor) msg.after(anchor);               // «подсказка» остаётся ниже проверки
+    nodes[kind] = { bar, msg };
+    w.input.addEventListener('input', () => {
+      if (DIGITS.has(kind)) {
+        const clean = onlyDigits(w.input.value);
+        if (clean !== w.input.value) w.input.value = clean;
+      }
+      w.classList.remove('invalid');
+      w.querySelectorAll('.err').forEach((x) => x.remove());
+      kind === 'bik' ? all() : paint(kind);
+    });
+  }
+  all();
+  return all;
+}
+
+/**
+ * Записать в поле значение, найденное самим приложением (из реестра, из
+ * вставленного текста), и показать, что оно изменилось: короткая подсветка.
+ * Без неё автозаполнение выглядит как «что-то поменялось само» — а человек
+ * должен видеть, что именно ему подставили, и проверить.
+ */
+function fillAuto(f, key, value) {
+  const w = f[key];
+  if (!w || value == null || value === '') return false;
+  if (w.input.value === String(value)) return false;
+  w.input.value = value;
+  w.input.dispatchEvent(new Event('input', { bubbles: true }));
+  w.classList.remove('auto-filled');
+  void w.offsetWidth;                    // перезапуск анимации, если поле заполняют второй раз
+  w.classList.add('auto-filled');
+  setTimeout(() => w.classList.remove('auto-filled'), 1600);
+  return true;
+}
+
+/**
+ * Кольцо «заполнено N из M» и подсказка, что делать дальше.
+ *
+ * Реквизиты вводят один раз и бросают на середине: форма из десяти полей не
+ * говорит, сколько осталось и зачем оно нужно. Кольцо показывает прогресс, а
+ * строка под ним называет следующее поле и то, что без него не получится, — по
+ * нажатию экран сам подъезжает к нему. Когда всё заполнено, кольцо
+ * зеленеет, и это единственный «праздник» на экране.
+ *
+ * @param {object} f      поля формы
+ * @param {Array<[string,string]>} plan поле → что даст его заполнение
+ */
+function reqProgress(f, plan) {
+  const R = 20; const C = 2 * Math.PI * R;
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 48 48');
+  svg.setAttribute('class', 'rp-ring');
+  svg.setAttribute('aria-hidden', 'true');
+  const track = document.createElementNS(NS, 'circle');
+  const arc = document.createElementNS(NS, 'circle');
+  for (const c of [track, arc]) {
+    c.setAttribute('cx', '24'); c.setAttribute('cy', '24'); c.setAttribute('r', String(R));
+    c.setAttribute('fill', 'none'); c.setAttribute('stroke-width', '5');
+  }
+  track.setAttribute('class', 'rp-track');
+  arc.setAttribute('class', 'rp-arc');
+  arc.setAttribute('stroke-linecap', 'round');
+  arc.setAttribute('stroke-dasharray', String(C));
+  arc.setAttribute('stroke-dashoffset', String(C));
+  svg.append(track, arc);
+
+  const count = h('div', { class: 'rp-count' });
+  const next = h('button', { type: 'button', class: 'rp-next' });
+  const card = h('div', { class: 'rp', role: 'group', 'aria-label': 'Сколько реквизитов заполнено' },
+    h('div', { class: 'rp-ringbox' }, svg, h('span', { class: 'rp-pct' })),
+    h('div', { class: 'rp-text' }, count, next));
+  const pct = card.querySelector('.rp-pct');
+
+  const refresh = () => {
+    const live = plan.filter(([k]) => f[k] && !f[k].hidden);
+    const done = live.filter(([k]) => f[k].input.value.trim() && f[k].dataset.live !== 'bad');
+    const total = live.length || 1;
+    const share = done.length / total;
+    arc.setAttribute('stroke-dashoffset', String(C * (1 - share)));
+    pct.textContent = `${done.length}/${total}`;
+    count.textContent = done.length === total
+      ? 'Всё заполнено' : `Заполнено ${done.length} из ${total}`;
+    const left = live.find(([k]) => !done.some(([d]) => d === k));
+    card.classList.toggle('complete', done.length === total);
+    if (!left) {
+      next.textContent = 'Реквизиты подставятся во все документы';
+      next.disabled = true;
+      return;
+    }
+    next.disabled = false;
+    next.textContent = `Дальше: ${left[1]}`;
+    next.onclick = () => {
+      const w = f[left[0]];
+      w.scrollIntoView({ behavior: smooth(), block: 'center' });
+      w.input.focus({ preventScroll: true });
+    };
+  };
+  for (const [k] of plan) {
+    if (f[k]) f[k].input.addEventListener('input', refresh);
+  }
+  refresh();
+  card.refresh = refresh;
+  return card;
+}
+
+/**
+ * Расписания клиента: что и как часто повторяется именно для него. Без блока
+ * человек видел их только общим списком в «Ещё», а искать расписание «обедов
+ * для ООО Заря» удобнее там, где живёт сам клиент. Остановить — одним касанием.
+ */
+async function schedulesBlock(cpId) {
+  const { items } = await api('GET', `/api/recurring?cp=${cpId}`);
+  const list = items.filter((r) => !r.isOp);
+  if (!list.length) return null;
+  const wrap = h('div', { id: 'cp-schedules' }, h('div', { class: 'section-title', text: 'По расписанию' }));
+  wrap.append(h('div', { class: 'card' }, list.map((r) => h('div', { class: 'row' },
+    h('span', { class: 'icon-box' }, icon('repeat')),
+    h('span', { class: 'grow' },
+      h('div', { class: 'ellipsis', text: r.title }),
+      h('div', { class: 'small muted ellipsis', text: r.periodic && r.next ? `${r.dayText} · дальше ${ru(r.next)}` : r.dayText })),
+    h('span', { class: 'money nowrap', text: money0(r.total) }),
+    h('button', {
+      class: 'row-act', 'aria-label': `Остановить: ${r.title}`,
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        if (!(await askSure(`Остановить расписание «${r.title}»? Предложения по нему перестанут приходить.`))) return;
+        await api('POST', '/api/recurring/off', { id: r.id });
+        haptic('medium');
+        toast('Расписание остановлено');
+        render();
+      }),
+    }, icon('trash'))))));
+  return wrap;
+}
+
+/*
+ * Блок «Предоплата» в карточке клиента.
+ *
+ * rep — отчёт сервера (bdb.prepayReport) или null, если клиент на обычных
+ * условиях. Здесь только показ: ни остаток, ни список накладных не
+ * пересчитываются в браузере, иначе цифры разошлись бы с ботом.
+ * «Акт за месяц» живёт в этом же блоке: он есть только у клиента на
+ * предоплате (иначе акт сразу «оплачен», а накладные висят долгом).
+ */
+function prepayBlock(cp, rep) {
+  const id = cp.id;
+  const wrap = h('div', { id: 'prepay-block' });
+  if (!rep) {
+    wrap.append(h('div', { class: 'card prepay' },
+      h('div', { class: 'row' },
+        h('span', { class: 'icon-box' }, icon('wallet')),
+        h('span', { class: 'grow' },
+          h('div', { text: 'Предоплата' }),
+          h('div', { class: 'small muted', text: 'Клиент заплатил вперёд? Его накладные будут отмечаться оплаченными сами, пока хватает денег.' }))),
+      h('div', { class: 'btn-wrap' },
+        h('button', { class: 'btn', id: 'prepay-add', onclick: () => { haptic(); go('prepay', { cpId: id }); } }, 'Внести предоплату'))));
+    return wrap;
+  }
+
+  const ended = rep.left <= 0;
+  const low = Boolean(rep.state && rep.state.low);
+  const pct = rep.paid > 0 ? Math.max(0, Math.min(100, Math.round((rep.left / rep.paid) * 100))) : 0;
+  const docRowOf = (d) => navRow({
+    icon: 'doc', title: `${d.short || d.title} № ${d.number}`, sub: ru(d.date), right: money0(d.sum || d.total),
+    onclick: () => go('doc', { id: d.id }),
+  });
+  const card = h('div', { class: 'card prepay' },
+    h('div', { class: 'pp-top' },
+      /*
+       * Крупная сумма остатка стоит в строке баланса выше («Осталось из предоплаты»);
+       * здесь она одной строкой вместе с внесённым и списанным, а не вторым большим числом.
+       * Крупно — только слова «Предоплата кончилась»: у них сумм нет.
+       */
+      h('div', { class: `small ${ended ? 'muted' : 'pp-sum'}`, id: 'pp-line',
+        text: (rep.paid > 0 ? `Предоплата ${money0(rep.paid)} · списано ${money0(rep.spent)}` : 'Клиент на предоплате')
+          + (ended ? '' : ` · осталось ${money0(rep.left)}`) }),
+      ended && h('div', { class: `pp-left money${rep.debt > 0 ? ' out' : ''}`, id: 'pp-left', text: 'Предоплата кончилась' }),
+      rep.paid > 0 && h('div', { class: `pp-bar${low || rep.debt > 0 ? ' low' : ''}`, role: 'progressbar', 'aria-label': 'Остаток предоплаты',
+        'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': String(pct) }, h('i', { style: `width:${pct}%` })),
+      low && h('div', { class: 'small pp-warn', text: 'Скоро кончится — пора выставить счёт на новую предоплату.' }),
+      rep.before > 0 && h('div', { class: 'small muted', id: 'pp-before',
+        text: `Накладные на ${money0(rep.before)} были выписаны до предоплаты — они уже вычтены из остатка.` })),
+    rep.covered.length > 0 && h('details', { class: 'pp-list', id: 'pp-covered', open: rep.covered.length <= 5 },
+      h('summary', { text: `Списано накладными · ${rep.covered.length}` }),
+      rep.covered.map(docRowOf)),
+    h('div', { class: 'btn-wrap pp-actions' },
+      h('button', { class: 'btn', id: 'prepay-add', onclick: () => { haptic(); go('prepay', { cpId: id }); } }, 'Пополнить'),
+      h('button', { class: 'btn secondary', id: 'prepay-act', onclick: () => { haptic(); go('monthact', { cpId: id }); } }, 'Акт за месяц')));
+  wrap.append(card);
+
+  if (rep.debt > 0) {
+    wrap.append(h('div', { class: 'banner', id: 'pp-over' }, icon('warn'),
+      h('div', {},
+        h('b', { text: `Сверх предоплаты: ${money(rep.debt)} — это долг` }),
+        h('div', { class: 'small', style: 'margin-top:4px',
+          text: rep.over.length
+            ? `Эти накладные не поместились целиком${rep.partial > 0 ? `: ${money0(rep.partial)} предоплаты ушло на них, остальное — долг` : ''}:`
+            : 'Остатка не хватило, клиент должен разницу.' }),
+        rep.over.slice(0, 5).map((d) => h('div', { class: 'small', style: 'margin-top:2px', text: nb(`${d.short || d.title} № ${d.number} · ${ru(d.date)} · ${money0(d.sum || d.total)}`) })))));
+  }
+  return wrap;
+}
+
+/** Внести или пополнить предоплату: сумма, дата и договор, по которому внесли. */
+screens.cbasis = async function cbasisScreen({ cpId }) {
+  const [{ cps }, info] = await Promise.all([api('GET', '/api/cps'), api('GET', `/api/cp/basis?cpId=${Number(cpId) || 0}`)]);
+  const cp = cps.find((c) => c.id === Number(cpId));
+  if (!cp) return empty('warn', 'Клиент не найден');
+  const box = h('div', {}, h('h1', { text: 'Основание накладных' }));
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Клиент' }), h('span', { class: 'ellipsis', text: cp.name })),
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Сейчас' }),
+      h('span', { class: 'ellipsis', id: 'cb-now', text: info.basis || (info.contract ? `договор из карточки: ${info.contract}` : 'без договора') })),
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Накладных и УПД выписано' }), h('span', { text: String(info.total) }))));
+  const basis = field('basis', 'Основание', info.basis || '', { placeholder: 'Договор № 12 от 01.03.2026' });
+  box.append(h('div', { class: 'card' }, basis));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Это надпись в бланке: суммы, номера и долг не меняются. Само запоминается, если вписать одно и то же основание в три накладные подряд.' }));
+
+  const run = (scope, btn) => withBusy(btn, async () => {
+    clearErrors({ basis });
+    const value = basis.input.value.trim();
+    if (scope !== 'reset' && !value) { showError(basis, 'Напишите основание'); return; }
+    const r = await api('POST', '/api/cp/basis', { cpId: cp.id, basis: value, scope });
+    haptic('medium');
+    if (scope === 'reset') toast('Сбросил: дальше печатаю договор из карточки');
+    else if (!r.changed) toast('Готово: новые накладные и УПД — с этим основанием');
+    else toast(r.files ? `Основание поставлено у ${r.changed}. Исправленные файлы придут в чат архивом` : `Основание поставлено у ${r.changed}`, false, 6000);
+    reset('cp', { id: cp.id });
+  });
+  const mk = (id, cls, text, scope) => { const b = h('button', { class: cls, id }, text); b.onclick = () => run(scope, b); return b; };
+  box.append(h('div', { class: 'btn-col' },
+    info.total ? mk('cb-all', 'btn', `Всем выписанным (${info.total}) и на будущее`, 'all') : null,
+    info.prev && info.prev !== info.total ? mk('cb-prev', 'btn secondary', `Только за ${info.prevTitle} (${info.prev}) и на будущее`, 'prev') : null,
+    mk('cb-new', 'btn secondary', 'Только на будущее', 'new'),
+    info.basis ? mk('cb-reset', 'btn secondary', 'Сбросить запомненное', 'reset') : null));
+  return box;
+};
+
+screens.prepay = async function prepayScreen({ cpId }) {
+  const { cps } = await api('GET', '/api/cps');
+  const cp = cps.find((c) => c.id === Number(cpId));
+  if (!cp) return empty('warn', 'Клиент не найден');
+  const box = h('div', {}, h('h1', { text: cp.prepay ? 'Пополнить предоплату' : 'Предоплата' }));
+  const amount = field('amount', 'Сумма, ₽', '', { inputmode: 'decimal', required: true });
+  const date = field('date', 'Дата', todayISO(), { type: 'date' });
+  const doc = field('doc', 'Договор или допсоглашение', '', { placeholder: 'Например: договор № 7 или допсоглашение № 2' });
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Клиент' }), h('span', { class: 'ellipsis', text: cp.name })),
+    cp.prepay && h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Сейчас' }), h('span', { text: cp.prepay.text }))));
+  box.append(h('div', { class: 'card' }, amount, date, doc));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Деньги лягут в журнал одной записью «Предоплата». Дальше накладные, акты и УПД этого клиента отмечаются оплаченными сами, пока хватает остатка. Ошиблись — запись можно отменить в журнале.' }));
+  const save = h('button', { class: 'btn', id: 'prepay-save' }, cp.prepay ? 'Пополнить' : 'Внести предоплату');
+  save.onclick = () => withBusy(save, async () => {
+    clearErrors({ amount });
+    const sum = Number(String(amount.input.value).replace(/\s/g, '').replace(',', '.'));
+    if (!(sum > 0)) { showError(amount, 'Укажите сумму'); return; }
+    const saved = await api('POST', '/api/op', {
+      cpId: cp.id, amount: sum, kind: 'prepay', date: date.input.value, doc: doc.input.value.trim(),
+    });
+    haptic('medium');
+    const left = saved && saved.cp && saved.cp.prepay ? saved.cp.prepay.left : 0;
+    toast(`Предоплата внесена. Осталось ${money(left)}`);
+    reset(saved && saved.npd ? 'cheques' : 'cp', saved && saved.npd ? {} : { id: cp.id });
+  });
+  box.append(h('div', { class: 'btn-wrap' }, save));
+  return box;
+};
+
+screens.cp = async function cpScreen({ id, name }) {
+  let cp = {};
+  if (id) {
+    const { cps: list } = await api('GET', '/api/cps');
+    cp = list.find((x) => x.id === Number(id)) || {};
+  } else if (name) {
+    // Имя, названное в чате. Подставляем как заготовку — заводит запись
+    // всё равно человек, нажав «Сохранить».
+    cp = { name: String(name) };
+  }
+  const f = {
+    name: field('name', 'Краткое название', cp.name, { required: true, placeholder: 'ООО «Заря»' }),
+    full_name: field('full_name', 'Полное наименование', cp.full_name),
+    inn: field('inn', 'ИНН', cp.inn, { inputmode: 'numeric', hint: 'Заполним остальное из реестра' }),
+    kpp: field('kpp', 'КПП', cp.kpp, { inputmode: 'numeric' }),
+    address: field('address', 'Адрес', cp.address),
+    opening_balance: field('opening_balance', 'Долг на начало, ₽', cp.opening_balance || '', {
+      inputmode: 'decimal',
+      hint: 'Сколько числилось за клиентом на эту дату. Всё, что в журнале раньше неё, считается уже вошедшим в эту сумму',
+    }),
+    opening_date: field('opening_date', 'На какую дату', cp.opening_date || '', {
+      type: 'date', hint: 'С неё начинается акт сверки',
+    }),
+    email: field('email', 'Почта', cp.email, {
+      type: 'email', placeholder: 'buh@company.ru',
+      hint: 'Туда уйдут счета и акты, если отправлять из приложения',
+    }),
+    bank_name: field('bank_name', 'Банк', cp.bank_name),
+    bik: field('bik', 'БИК', cp.bik, { inputmode: 'numeric' }),
+    acc: field('acc', 'Расчётный счёт', cp.acc, { inputmode: 'numeric' }),
+    corr_acc: field('corr_acc', 'Корр. счёт', cp.corr_acc, { inputmode: 'numeric' }),
+  };
+  const liveAll = reqLive(f);     // проверка цифр при вводе, как в «Моей организации»
+
+  const kindSel = h('select', { id: 'f-kind' },
+    h('option', { value: 'customer', selected: cp.kind !== 'supplier' }, 'Заказчик — платит нам'),
+    h('option', { value: 'supplier', selected: cp.kind === 'supplier' }, 'Поставщик — платим мы'));
+
+  const lookup = h('button', {
+    class: 'btn secondary',
+    onclick: (e) => withBusy(e.currentTarget, async () => {
+      const v = values(f);
+      if (!v.inn && !v.bik) { toast('Заполните ИНН или БИК', true); return; }
+      const r = await api('POST', '/api/lookup', { inn: v.inn, bik: v.bik });
+      if (r.party) {
+        f.name.input.value = r.party.name || f.name.input.value;
+        f.full_name.input.value = r.party.full_name || '';
+        f.kpp.input.value = r.party.kpp || '';
+        f.address.input.value = r.party.address || '';
+      }
+      if (r.bank) {
+        f.bank_name.input.value = r.bank.bank_name || '';
+        f.corr_acc.input.value = r.bank.corr_acc || '';
+      }
+      liveAll();
+      toast('Заполнил из реестра');
+      haptic('medium');
+    }),
+  }, 'Заполнить по ИНН и БИК');
+
+  // То же самое, но без нажатия: дописали ИНН — поля заполнились.
+  autoLookup(f, (r) => {
+    if (r.party) {
+      if (!f.name.input.value) f.name.input.value = r.party.name || '';
+      f.full_name.input.value = r.party.full_name || f.full_name.input.value;
+      f.kpp.input.value = r.party.kpp || f.kpp.input.value;
+      f.address.input.value = r.party.address || f.address.input.value;
+      toast(`Нашёл: ${r.party.name}`);
+    }
+    if (r.bank) {
+      f.bank_name.input.value = r.bank.bank_name || f.bank_name.input.value;
+      f.corr_acc.input.value = r.bank.corr_acc || f.corr_acc.input.value;
+      toast(`Банк: ${r.bank.bank_name}`);
+    }
+    liveAll();
+  });
+
+  const box = h('div', {}, h('h1', { text: id ? cp.name || 'Клиент' : 'Новый клиент' }));
+
+  /*
+   * Действия по клиенту — сверху, перед полями. В карточку заходят, чтобы
+   * выписать счёт, внести оплату или собрать акт сверки, а реквизиты правят
+   * раз в жизни. Раньше здесь были только поля, и всё это жило в боте.
+   */
+  /*
+   * Строка сальдо ведёт к начальному сальдо — по ней и тыкают.
+   *
+   * Раньше это был мёртвый div: выглядел как соседние строки, стоял первым
+   * в карточке и на нажатие не отвечал ничем. Человек, которому нужно
+   * выставить долг «с прошлого года», жмёт именно на цифру — а поля для
+   * него лежат экраном ниже, за реквизитами и почтой, и найти их нельзя.
+   */
+  const openingHint = () => {
+    const v = Number(cp.opening_balance) || 0;
+    if (!v) return 'Указать долг на начало';
+    return `Начали с ${money(Math.abs(v))}${cp.opening_date ? ` на ${ru(cp.opening_date)}` : ''}`;
+  };
+  // Долг на начало спрятан в «Дополнительно»: новичку, у которого долгов не было, он только мешает.
+  const openingBox = h('details', { class: 'more-fields', id: 'opening-box' });
+  const gotoOpening = () => {
+    openingBox.open = true;
+    const el = f.opening_balance.input;
+    el.scrollIntoView({ behavior: smooth(), block: 'center' });
+    // preventScroll — иначе браузер дёрнет экран второй раз, поверх плавного.
+    setTimeout(() => el.focus({ preventScroll: true }), 350);
+  };
+
+  if (id) {
+    /*
+     * Сумма стоит отдельной строкой, а не справа от заголовка.
+     *
+     * Справа ей не хватало места: подпись «Начали с 105 691,30 ₽ на
+     * 01.08.2026» шире половины экрана, и шестизначная сумма налезала на
+     * слова «Должен нам». А это главная цифра карточки — ради неё сюда и
+     * заходят, ей и место построчнее.
+     */
+    const balanceRow = h('button', { class: 'row balance' },
+      h('span', { class: 'grow' },
+        h('div', { class: 'ellipsis muted small',
+          text: onPrepay(cp) ? 'Осталось из предоплаты'
+            : (cp.balance ? (owesUs(cp) ? 'Должен нам' : 'Должны мы') : 'Баланс') }),
+        h('div', { class: `v money ${balanceTone(cp)}`, text: money(Math.abs(cp.balance || 0)) }),
+        onPrepay(cp) && h('div', { class: 'small muted', id: 'balance-advance', text: 'Столько ещё можно отгрузить в счёт аванса' }),
+        h('div', { class: 'hint', text: openingHint() })),
+      icon('chev', 'chev'));
+    balanceRow.onclick = () => { haptic(); gotoOpening(); };
+
+    box.append(h('div', { class: 'card' }, balanceRow));
+    /*
+     * Предоплата — своим блоком сразу под суммой, а не строкой среди остальных.
+     * Режим был, но его включало «Внести оплату» с переключателем «Предоплата»
+     * внутри: владелец искал «внести предоплату» на клиенте и не находил.
+     * Поставщику блок не нужен: предоплату вносит заказчик, а не мы.
+     */
+    if (cp.kind !== 'supplier') {
+      const rep = cp.prepay
+        ? await api('GET', `/api/prepay?cp=${id}`).then((r) => r.prepay).catch(() => null)
+        : null;
+      box.append(prepayBlock(cp, rep));
+    }
+    box.append(h('div', { class: 'card' },
+      navRow({ icon: 'list', title: 'Журнал операций', sub: 'внесённое руками и из выписки',
+        onclick: () => go('ops', { cpId: id }) }),
+      navRow({ icon: 'receipt', title: 'Выписать счёт', onclick: () => go('new', { type: 'sch', cpId: id }) }),
+      navRow({ icon: 'wallet', title: 'Внести оплату или приход', onclick: () => go('op', { cpId: id }) }),
+      navRow({ icon: 'doc', title: 'Акт сверки', sub: 'таблица операций в Excel',
+        onclick: async () => {
+          try {
+            const r = await api('GET', `/api/akt?cp=${id}`);
+            toast('Акт сверки готов');
+            download(r.file);
+          } catch (e) { toast(e.message, true); }
+        } }),
+      navRow({ icon: 'docs2', title: 'Документы клиента', onclick: () => go('docs', { cp: id }) }),
+      navRow({ icon: 'pen', title: 'Основание накладных', sub: 'что печатать в графе «Основание» у ТОРГ-12 и УПД',
+        onclick: () => go('cbasis', { cpId: id }) })));
+    const schedules = await schedulesBlock(id);
+    if (schedules) box.append(schedules);
+    box.append(crmBlock(id));
+    box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
+  }
+
+  box.append(h('div', { class: 'card' }, f.name, f.full_name,
+    h('div', { class: 'field' }, h('label', { for: 'f-kind', text: 'Кто это' }), kindSel)));
+  if (!id) box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
+  box.append(h('div', { class: 'card' }, f.inn, f.kpp, f.address, f.email));
+  // Автозаполнение — сразу под ИНН, а не после поля про долг, куда его раньше загоняло.
+  box.append(h('div', { class: 'btn-wrap' }, lookup));
+
+  /*
+   * Начальное сальдо. Без него акт сверки открывается нулём, и клиент,
+   * у которого долг тянется с прошлого года, такой акт не подпишет.
+   * В боте это спрашивали при заведении, в приложении задать было негде.
+   */
+  openingBox.open = Boolean(Number(cp.opening_balance) || cp.opening_date);
+  openingBox.append(h('summary', {}, 'Дополнительно: с чего начинаем расчёты'),
+    h('div', { class: 'card' }, f.opening_balance, f.opening_date));
+  box.append(openingBox);
+  box.append(h('div', { class: 'section-title', text: 'Банк' }));
+  box.append(h('div', { class: 'card' }, f.bank_name, f.bik, f.acc, f.corr_acc));
+
+  const save = async () => {
+    clearErrors(f);
+    const v = values(f);
+    if (!v.name) { showError(f.name, 'Без названия документ не подписать'); return; }
+    let saved;
+    try {
+      saved = await api('POST', '/api/cp', {
+        id: id || 0, ...v, kind: kindSel.value,
+        opening_balance: f.opening_balance.input.value.trim(),
+        opening_date: f.opening_date.input.value,
+      });
+    } catch (e) {
+      if (fieldFail(e, f)) return;
+      throw e;
+    }
+    toast(saved && saved.note ? saved.note : (id ? 'Сохранил' : 'Клиент добавлен'));
+    haptic('medium');
+    back();
+  };
+
+  box.append(h('div', { class: 'btn-wrap' },
+    h('button', { class: 'btn', onclick: (e) => withBusy(e.currentTarget, save) }, 'Сохранить')));
+  return box;
+};
+
+screens.org = async function orgScreen() {
+  const s = cache.org ? cache : await api('GET', '/api/state');
+  const o = s.org || {};
+  const f = {
+    name: field('name', 'Краткое название', o.name, { required: true, placeholder: 'ИП Иванов И. И.' }),
+    full_name: field('full_name', 'Полное наименование', o.full_name),
+    inn: field('inn', 'ИНН', o.inn, {
+      inputmode: 'numeric',
+      how: 'Он в свидетельстве о постановке на учёт и в личном кабинете налогоплательщика на nalog.ru. '
+        + 'У организации 10 цифр, у предпринимателя 12. Введёте ИНН — остальное подставим из реестра.',
+    }),
+    kpp: field('kpp', 'КПП', o.kpp, {
+      inputmode: 'numeric', hint: 'У ИП его нет — оставьте пустым',
+      how: 'Девять знаков, указан в том же свидетельстве, что и ИНН организации. Подставится сам, когда введёте ИНН.',
+    }),
+    ogrnip: field('ogrnip', 'ОГРНИП', o.ogrnip, {
+      inputmode: 'numeric', hint: 'Подставится по ИНН; печатается в УПД',
+      how: 'Пятнадцать цифр. Указан в выписке из ЕГРИП и в свидетельстве о регистрации предпринимателя.',
+    }),
+    signer: field('signer', 'Кто подписывает', o.signer, { placeholder: 'И. И. Иванов' }),
+    address: field('address', 'Адрес', o.address),
+    bank_name: field('bank_name', 'Банк', o.bank_name),
+    bik: field('bik', 'БИК', o.bik, {
+      inputmode: 'numeric',
+      how: 'Девять цифр, начинаются с 04. Есть в банковском приложении в «Реквизитах счёта». '
+        + 'Введёте БИК — название банка и корр. счёт подставим сами.',
+    }),
+    acc: field('acc', 'Расчётный счёт', o.acc, {
+      inputmode: 'numeric', hint: 'Нужен для QR-кода в счёте',
+      how: 'Двадцать цифр. Откройте счёт в банковском приложении и найдите «Реквизиты» — '
+        + 'там можно скопировать номер целиком. Номер из карты не подойдёт: он другой.',
+    }),
+    corr_acc: field('corr_acc', 'Корр. счёт', o.corr_acc, {
+      inputmode: 'numeric',
+      how: 'Двадцать цифр, принадлежит банку, а не вам. Подставится сам по БИК; '
+        + 'если банк его не отдал — возьмите в тех же «Реквизитах счёта».',
+    }),
+  };
+
+  /*
+   * Переключатель фирм — только когда их несколько.
+   *
+   * У подавляющего большинства организация одна, и выпадающий список из
+   * одной строки на видном месте — это вопрос без ответа: человек не
+   * понимает, что от него хотят. Кнопка «Добавить организацию» нужна всегда:
+   * иначе второй фирме взяться неоткуда.
+   */
+  const { orgs = [], active } = await api('GET', '/api/orgs').catch(() => ({ orgs: [] }));
+  const orgPicker = h('div');
+  if (orgs.length > 1) {
+    const sel = h('select', { id: 'f-active-org' },
+      orgs.map((x) => h('option', { value: x.id, selected: x.id === active }, x.name || 'без названия')));
+    sel.onchange = async () => {
+      try {
+        await api('POST', '/api/org/use', { id: Number(sel.value) });
+        cache.org = null;                    // реквизиты на экранах теперь другие
+        haptic('medium');
+        toast('Работаем от другой фирмы');
+        go('org');
+      } catch (e) { toast(e.message, true); }
+    };
+    orgPicker.append(h('div', { class: 'field' },
+      h('label', { for: 'f-active-org', text: 'Работаем от' }), sel,
+      h('div', {
+        class: 'hint',
+        text: 'У каждой фирмы свой ряд номеров и свой баланс с клиентами — '
+          + 'смешать их нельзя, это разные юрлица.',
+      })));
+  }
+  orgPicker.append(h('div', { class: 'btn-wrap' }, h('button', {
+    class: 'btn secondary',
+    onclick: (e) => withBusy(e.currentTarget, async () => {
+      await api('POST', '/api/org/add');
+      cache.org = null;
+      toast('Заполните реквизиты новой организации');
+      go('org');
+    }),
+  }, icon('plus', 'icon inline'), 'Добавить организацию')));
+
+  const paste = h('textarea', {
+    id: 'f-paste', placeholder: 'Вставьте блок реквизитов из письма или договора целиком',
+  });
+  const parseBtn = h('button', {
+    class: 'btn secondary',
+    onclick: (e) => withBusy(e.currentTarget, async () => {
+      const text = paste.value.trim();
+      if (!text) { toast('Сначала вставьте текст', true); return; }
+      const { fields } = await api('POST', '/api/parse', { text });
+      let filled = 0;
+      for (const [k, v] of Object.entries(fields)) {
+        if (f[k] && v) { fillAuto(f, k, v); filled += 1; }
+      }
+      toast(filled ? `Разобрал ${filled} ${plural(filled, 'поле', 'поля', 'полей')}` : 'Ничего не нашёл', !filled);
+      haptic('medium');
+    }),
+  }, 'Разобрать текст');
+
+  /*
+   * У предпринимателя нет КПП, у организации нет ОГРНИП. Показывать оба
+   * поля всем значит просить человека решать, что из этого про него, —
+   * а он впишет наугад. Определяем по длине ИНН и прячем лишнее.
+   */
+  let progress = null;
+  const ipFields = () => {
+    const ip = String(f.inn.input.value || '').replace(/\D/g, '').length === 12;
+    f.kpp.hidden = ip;
+    f.ogrnip.hidden = !ip;
+    if (progress) progress.refresh();
+  };
+  f.inn.input.addEventListener('input', ipFields);
+
+  reqLive(f);
+  progress = reqProgress(f, [
+    ['name', 'название — оно в шапке каждого документа'],
+    ['inn', 'ИНН — печатается во всех документах'],
+    ['kpp', 'КПП — у организации печатается рядом с ИНН'],
+    ['ogrnip', 'ОГРНИП — печатается в УПД'],
+    ['signer', 'кто подписывает — подставится под документом'],
+    ['address', 'адрес — печатается в шапке документов'],
+    ['bank_name', 'банк — для платёжных реквизитов'],
+    ['bik', 'БИК — по нему подставим банк и корр. счёт'],
+    ['acc', 'расчётный счёт — нужен для QR-кода в счёте'],
+    ['corr_acc', 'корр. счёт — подставится по БИК'],
+  ]);
+  ipFields();
+
+  autoLookup(f, (r) => {
+    if (r.party) {
+      if (!f.name.input.value) fillAuto(f, 'name', r.party.name || '');
+      fillAuto(f, 'full_name', r.party.full_name);
+      fillAuto(f, 'kpp', r.party.kpp);
+      fillAuto(f, 'address', r.party.address);
+      fillAuto(f, 'ogrnip', r.party.ogrnip);
+      if (r.party.signer && !f.signer.input.value) fillAuto(f, 'signer', r.party.signer);
+      ipFields();
+      toast(`Нашёл: ${r.party.name}`);
+    }
+    if (r.bank) {
+      fillAuto(f, 'bank_name', r.bank.bank_name);
+      fillAuto(f, 'corr_acc', r.bank.corr_acc);
+      toast(`Банк: ${r.bank.bank_name}`);
+    }
+  });
+
+  const box = h('div', {}, h('h1', { text: 'Моя организация' }));
+  box.append(h('div', { class: 'banner info' }, icon('help'),
+    h('div', { text: 'Эти реквизиты подставляются во все документы. Заполняются один раз.' })));
+  box.append(progress);
+
+  // Выбор фирмы — выше реквизитов: сначала «чьи», потом «какие».
+  if (orgs.length > 1) box.append(h('div', { class: 'section-title', text: 'Фирма' }));
+  box.append(orgs.length > 1 ? h('div', { class: 'card' }, orgPicker) : orgPicker);
+
+  box.append(h('div', { class: 'section-title', text: 'Быстрый ввод' }));
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'field' }, h('label', { for: 'f-paste', text: 'Вставить блок реквизитов' }), paste)));
+  box.append(h('div', { class: 'btn-wrap' }, parseBtn));
+
+  box.append(h('div', { class: 'section-title', text: 'Реквизиты' }));
+  box.append(h('div', { class: 'card' }, f.name, f.full_name, f.inn, f.kpp, f.ogrnip, f.signer, f.address));
+  box.append(h('div', { class: 'btn-wrap' }, h('button', {
+    class: 'btn secondary',
+    onclick: (e) => withBusy(e.currentTarget, async () => {
+      const v = values(f);
+      if (!v.inn && !v.bik) { toast('Заполните ИНН или БИК', true); return; }
+      const r = await api('POST', '/api/lookup', { inn: v.inn, bik: v.bik });
+      if (r.party) {
+        fillAuto(f, 'name', r.party.name);
+        f.full_name.input.value = r.party.full_name || '';
+        f.kpp.input.value = r.party.kpp || '';
+        f.address.input.value = r.party.address || '';
+        // ОГРНИП раньше не подставлялся ниоткуда: поле было, в УПД
+        // печаталось, и всегда пустовало.
+        if (r.party.ogrnip) fillAuto(f, 'ogrnip', r.party.ogrnip);
+        if (r.party.signer) fillAuto(f, 'signer', r.party.signer);
+        for (const k of ['full_name', 'kpp', 'address']) f[k].input.dispatchEvent(new Event('input', { bubbles: true }));
+        ipFields();
+      }
+      if (r.bank) {
+        f.bank_name.input.value = r.bank.bank_name || '';
+        fillAuto(f, 'corr_acc', r.bank.corr_acc);
+        f.bank_name.input.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      toast('Заполнил из реестра');
+    }),
+  }, 'Заполнить по ИНН и БИК')));
+
+  box.append(h('div', { class: 'section-title', text: 'Банк' }));
+  box.append(h('div', { class: 'card' }, f.bank_name, f.bik, f.acc, f.corr_acc));
+
+  box.append(h('div', { class: 'btn-wrap' }, h('button', {
+    class: 'btn',
+    onclick: (e) => withBusy(e.currentTarget, async () => {
+      clearErrors(f);
+      const v = values(f);
+      if (!v.name) { showError(f.name, 'Укажите, как называется организация'); return; }
+      try {
+        await api('POST', '/api/org', v);
+      } catch (e) {
+        if (fieldFail(e, f)) return;
+        throw e;
+      }
+      cache = {};
+      toast('Реквизиты сохранены');
+      haptic('medium');
+      back();
+    }),
+  }, 'Сохранить')));
+
+  box.append(h('div', { class: 'section-title', text: 'Подпись и печать' }));
+  box.append(facsimileCard(s.facsimile));
+  return box;
+};
+
+/**
+ * Уменьшает выбранное фото перед отправкой.
+ *
+ * Снимок подписи с телефона весит 3–5 МБ, а на документе она занимает
+ * полтора сантиметра — гнать мегабайты незачем, да и сервер такое не примет.
+ * Ужимаем по длинной стороне до 1400 px прямо в браузере: и загрузка
+ * быстрее, и человеку не приходится ничего готовить заранее.
+ */
+/** Примерный вес data-URI в байтах — считать по длине дешевле, чем декодировать. */
+const dataUrlBytes = (url) => Math.ceil((url.length - url.indexOf(',') - 1) * 0.75);
+
+/**
+ * Закодировать холст, проверив, что браузер послушался.
+ *
+ * toDataURL при незнакомом типе молча отдаёт PNG. Без этой проверки мы бы
+ * считали, что отправляем WebP на 400 КБ, а отправляли бы PNG на 2,5 МБ —
+ * ровно та ошибка, из-за которой не грузилась печать.
+ */
+function encodeCanvas(canvas, type, quality) {
+  const url = canvas.toDataURL(type, quality);
+  return url.startsWith(`data:${type}`) ? url : null;
+}
+
+/**
+ * Уменьшить картинку и уложиться в отведённый вес.
+ *
+ * Раньше здесь всегда был PNG. Для подписи на белом листе это работало —
+ * такой снимок сжимается хорошо, — а фотография печати весила 2,5 МБ при
+ * пределе в 1 МБ, и человек видел отказ, ничего не сделав неправильно.
+ * PNG хорош для рисунков, а тут всегда фотография: берём WebP, затем JPEG,
+ * и только если браузер не умеет ни того, ни другого — PNG.
+ *
+ * Прозрачность заливаем белым в любом случае: на документе факсимиле
+ * ложится умножением, где белое становится невидимым.
+ */
+function shrinkImage(file, maxSide = 1400, maxBytes = 900 * 1024) {
+  return new Promise((done, fail) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+
+      const render = (side) => {
+        const scale = Math.min(1, side / Math.max(img.width, img.height));
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      };
+
+      try {
+        let best = null;
+        // Сначала качество, потом размер: замыленная печать читается хуже
+        // мелкой, поэтому уменьшаем сторону только когда сжатие не помогло.
+        for (const side of [maxSide, Math.round(maxSide * 0.72), Math.round(maxSide * 0.5)]) {
+          render(side);
+          for (const [type, q] of [
+            ['image/webp', 0.95], ['image/webp', 0.85], ['image/webp', 0.7],
+            ['image/jpeg', 0.9], ['image/jpeg', 0.75],
+          ]) {
+            const out = encodeCanvas(canvas, type, q);
+            if (!out) continue;                 // формат браузеру незнаком
+            best = out;
+            if (dataUrlBytes(out) <= maxBytes) { done(out); return; }
+          }
+        }
+        // Ни WebP, ни JPEG — старый браузер. PNG хотя бы попробуем.
+        render(Math.round(maxSide * 0.5));
+        const png = best || canvas.toDataURL('image/png');
+        if (dataUrlBytes(png) <= maxBytes) { done(png); return; }
+        fail(new Error('Снимок слишком тяжёлый. Сфотографируйте ближе или обрежьте лишнее.'));
+      } catch (e) {
+        fail(new Error('Не смог обработать картинку'));
+      }
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); fail(new Error('Это не картинка')); };
+    img.src = url;
+  });
+}
+
+/**
+ * Подставить реквизиты из реестра, как только ИНН или БИК дописан.
+ *
+ * В боте это происходит само — там ИНН это отдельный шаг. В приложении
+ * рядом стояла кнопка «Заполнить по ИНН и БИК», и человек, который её не
+ * заметил, набирал название и адрес руками, хотя они есть в реестре.
+ *
+ * Срабатывает при уходе из поля, а не на каждый набранный символ: иначе
+ * на каждую цифру уходил бы запрос в справочник. И только когда поле
+ * дописано до правильной длины — 10 или 12 цифр у ИНН, 9 у БИКа.
+ *
+ * @param {object} f поля формы
+ * @param {Function} apply что сделать с ответом
+ */
+function autoLookup(f, apply) {
+  let last = '';
+  const run = async (kind) => {
+    const inn = String(f.inn.input.value || '').replace(/\D/g, '');
+    const bik = String((f.bik && f.bik.input.value) || '').replace(/\D/g, '');
+    const okInn = inn.length === 10 || inn.length === 12;
+    const okBik = bik.length === 9;
+    if (kind === 'inn' && !okInn) return;
+    if (kind === 'bik' && !okBik) return;
+    const key = `${kind}:${kind === 'inn' ? inn : bik}`;
+    if (key === last) return;                 // тот же номер — не дёргаем справочник
+    last = key;
+    try {
+      const r = await api('POST', '/api/lookup',
+        kind === 'inn' ? { inn } : { bik });
+      apply(r);
+      haptic();
+    } catch (_) {
+      // Молча: человек мог просто ошибиться цифрой, а кнопка рядом никуда
+      // не делась. Ругаться на ввод, который он ещё правит, — навязчиво.
+    }
+  };
+  f.inn.input.addEventListener('change', () => run('inn'));
+  if (f.bik) f.bik.input.addEventListener('change', () => run('bik'));
+}
+
+/**
+ * Подпись и печать: загрузка картинкой, предпросмотр и выбор, куда ставить.
+ * Файл читаем прямо в браузере и шлём как data-URI — так не нужен ни
+ * multipart на сервере, ни отдельное хранилище на диске.
+ */
+function facsimileCard(state) {
+  const card = h('div', { class: 'card' });
+
+  const redraw = (fresh) => {
+    const fx = fresh || state;
+    card.replaceChildren();
+
+    for (const [kind, label] of [['sign', 'Подпись'], ['stamp', 'Печать']]) {
+      const has = fx[kind];
+      const file = h('input', {
+        type: 'file', accept: 'image/png,image/jpeg,image/webp',
+        id: `fx-${kind}`, style: 'display:none',
+      });
+      file.addEventListener('change', async () => {
+        const chosen = file.files && file.files[0];
+        if (!chosen) return;
+        try {
+          // Сервер принимает факсимиле до 1 МБ — оставляем запас на служебные
+          // байты запроса, чтобы отказ не приходил из-за пары килобайт.
+          const dataUrl = await shrinkImage(chosen, 1400, 900 * 1024);
+          const r = await api('POST', '/api/facsimile', { kind, dataUrl });
+          toast(`${label} загружена`);
+          haptic('medium');
+          cache = {};
+          redraw(r.facsimile);
+        } catch (e) { toast(e.message, true); }
+      });
+
+      // Текст ужимается многоточием, а не переносится: иначе строка
+      // распухает на две и наезжает на предпросмотр.
+      card.append(h('div', { class: 'row' },
+        h('span', { class: `icon-box ${has ? 'ok' : ''}` }, icon(has ? 'check' : 'plus')),
+        h('span', { class: 'grow' },
+          h('div', { class: 'ellipsis', text: label }),
+          h('div', {
+            class: 'small muted ellipsis',
+            text: has ? `${Math.round(has.size / 1024)} КБ` : 'не загружена',
+          })),
+        // Миниатюра всегда на белом: умножение на тёмном фоне съело бы
+        // картинку, а показать надо ровно то, что ляжет на бумагу.
+        has && h('img', {
+          src: has.preview, alt: `${label} — предпросмотр`,
+          style: 'height:34px;width:auto;max-width:58px;flex:none;object-fit:contain;'
+            + 'background:#fff;border-radius:6px;padding:2px',
+        }),
+        file,
+        h('button', {
+          class: 'btn ghost', style: 'width:auto;flex:none;min-height:44px;padding:0 8px',
+          onclick: () => { haptic(); file.click(); },
+        }, has ? 'Заменить' : 'Загрузить'),
+        has && h('button', {
+          class: 'iconbtn danger', style: 'width:44px', 'aria-label': `Убрать: ${label}`,
+          onclick: async (e) => {
+            e.stopPropagation();
+            const r = await api('POST', '/api/facsimile/delete', { kind });
+            toast(`${label} убрана`);
+            cache = {};
+            redraw(r.facsimile);
+          },
+        }, icon('trash'))));
+    }
+
+    const sel = h('select', { id: 'fx-scope' },
+      Object.entries(fx.scopes).map(([key, label]) => h('option', {
+        value: key, selected: key === fx.scope,
+      }, label)));
+    sel.addEventListener('change', async () => {
+      try {
+        const r = await api('POST', '/api/facsimile/scope', { scope: sel.value });
+        toast('Сохранил');
+        cache = {};
+        redraw(r.facsimile);
+      } catch (e) { toast(e.message, true); }
+    });
+    card.append(h('div', { class: 'field' },
+      h('label', { for: 'fx-scope', text: 'Ставить' }), sel,
+      h('div', {
+        class: 'hint',
+        text: 'Снимите подпись на белом листе — фон бот уберёт сам. На платёжное '
+          + 'поручение и договор подпись-картинка не ставится: там нужна живая подпись. '
+          + 'На счета-фактуры тоже — по такому документу покупателю откажут '
+          + 'в вычете (п. 6 ст. 169 НК).',
+      })));
+  };
+
+  redraw();
+  return card;
+}
+
+screens.debts = async function debts() {
+  const { debtors } = await api('GET', '/api/debtors');
+  const box = h('div', {}, h('h1', { text: 'Долги' }));
+  if (!debtors.length) {
+    box.append(empty('wallet', 'Долгов нет',
+      'Как только появятся долги по актам или счетам — зависит от вашего дела.'));
+    return box;
+  }
+  const them = debtors.filter((d) => d.theyOwe);
+  const pre = debtors.filter((d) => d.prepaid);
+  const us = debtors.filter((d) => !d.theyOwe && !d.prepaid);
+  // Цвет суммы тот же, что на главной: зелёная — нам, красная — мы.
+  // Одинаково окрашенные столбцы цифр заставляют читать заголовок раздела.
+  const block = (title, list, tone) => (list.length ? [
+    h('div', { class: 'section-title', text: title }),
+    h('div', { class: 'card' }, list.map((d) => {
+      const row = navRow({
+        icon: 'users',
+        title: d.name,
+        sub: d.days == null ? '' : (d.days === 0 ? 'движение было сегодня' : `без движения ${d.days} ${plural(d.days, 'день', 'дня', 'дней')}`),
+        right: money(d.amount),
+        rightTone: tone,
+        tone: d.days > 30 ? 'warn' : '',
+        onclick: () => go('cp', { id: d.cpId }),
+      });
+      // Напомнить — прямо из строки должника: раньше путь шёл через общую
+      // кнопку внизу и список всех сразу, а нужен был один клиент.
+      return d.theyOwe ? actionRow(row, 'Напомнить', () => go('reminders', { cpId: d.cpId })) : row;
+    })),
+  ] : []);
+  // append массив не разворачивает — он бы превратился в строку.
+  box.append(...block('Должны нам', them, 'in'), ...block('Должны мы', us, 'out'),
+    // Аванс клиентов — отдельно и без цвета долга: это не наш долг, а будущие отгрузки.
+    ...block('На предоплате: сколько ещё отгрузить', pre, ''));
+  if (them.length) {
+    // Акты сверки всем сразу: в боте это одна кнопка, а в приложении
+    // приходилось заходить в каждого клиента по очереди.
+    box.append(h('div', { class: 'btn-wrap' }, h('button', {
+      class: 'btn',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        const r = await api('GET', '/api/akt/all');
+        haptic('medium');
+        toast(`${r.count} ${plural(r.count, 'акт', 'акта', 'актов')} сверки — в чате с ботом`);
+      }),
+    }, `Акты сверки всем должникам (${them.length})`)));
+    box.append(h('div', { class: 'btn-wrap', style: 'padding-top:0' }, h('button', {
+      class: 'btn secondary', onclick: () => go('reminders'),
+    }, 'Напомнить всем должникам')));
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+      text: 'Файлы и тексты бот присылает вам — вашим клиентам он не пишет.' }));
+  }
+  return box;
+};
+
+screens.more = async function more() {
+  const s = cache.user ? cache : await api('GET', '/api/state');
+  const box = h('div', {}, h('h1', { text: 'Ещё' }));
+  box.append(h('div', { class: 'card' },
+    navRow({ icon: 'office', title: 'Моя организация', sub: (s.org && s.org.name) || 'не заполнена', onclick: () => go('org') }),
+    navRow({
+      icon: 'star',
+      tone: s.quota.paid ? 'ok' : '',
+      title: 'Подписка',
+      sub: s.quota.paid ? `до ${ru(s.access.until)}` : `осталось ${s.quota.left} из ${s.quota.limit}`,
+      onclick: () => go('billing'),
+    })));
+  box.append(h('div', { class: 'section-title', text: 'Работа' }));
+  box.append(h('div', { class: 'card' },
+    navRow({
+      icon: 'wallet',
+      title: 'Долги',
+      sub: s.counts && s.counts.debtors
+        ? `${s.counts.debtors} ${plural(s.counts.debtors, 'клиент', 'клиента', 'клиентов')} · ${money0(s.debts.owedToUs)} вам`
+        : 'долгов нет',
+      onclick: () => go('debts'),
+    }),
+    navRow({
+      icon: 'clock',
+      title: 'Ждут оплаты',
+      sub: s.unpaid && s.unpaid.count
+        ? `${s.unpaid.count} ${plural(s.unpaid.count, 'счёт', 'счёта', 'счетов')} на ${money0(s.unpaid.sum)}`
+        : 'всё оплачено',
+      onclick: () => go('unpaid'),
+    }),
+    navRow({
+      icon: 'mail',
+      tone: s.mailbox ? 'ok' : '',
+      title: 'Почта',
+      sub: s.mailbox ? s.mailbox.from : 'ящик не подключён',
+      onclick: () => go('mail'),
+    }),
+    navRow({
+      icon: 'doc-check',
+      title: 'Акт сверки',
+      sub: 'таблица операций с клиентом в Excel',
+      onclick: () => go('akt'),
+    }),
+    navRow({
+      icon: 'docs2',
+      title: 'Реестр документов',
+      sub: 'выгрузка за период в Excel',
+      onclick: () => go('registry'),
+    }),
+    navRow({
+      icon: 'box',
+      title: 'Выписка из банка',
+      sub: 'отметить оплаты по выгрузке',
+      onclick: () => go('bank'),
+    }),
+    navRow({
+      icon: 'repeat',
+      title: 'По расписанию',
+      sub: s.recurring
+        ? `${s.recurring} ${plural(s.recurring, 'документ', 'документа', 'документов')} на повторе`
+        : 'счета и акты по расписанию',
+      onclick: () => go('recurring'),
+    }),
+    navRow({
+      icon: 'search',
+      title: 'Снимок счёта',
+      sub: 'сфотографировать и разобрать',
+      onclick: () => go('scan'),
+    })));
+
+  box.append(h('div', { class: 'section-title', text: 'Настройки учёта' }));
+  box.append(h('div', { class: 'card' },
+    navRow({
+      icon: 'receipt',
+      title: 'НДС',
+      sub: vatLabel(s.org),
+      onclick: () => go('vat'),
+    }),
+    navRow({
+      icon: 'person',
+      title: 'Самозанятость',
+      sub: s.org && Number(s.org.npd)
+        ? 'напомню про чек в «Моём налоге»' : 'если платите налог на профдоход',
+      onclick: () => go('npd'),
+    }),
+    navRow({
+      icon: 'briefcase',
+      title: 'Чем занимаетесь',
+      sub: (() => {
+        const t = (s.bizTypes || []).find((x) => x.key === s.bizType);
+        const basis = BASIS_LABEL[s.debtBasis] || '';
+        return t ? `${t.name}${basis ? ` · ${basis}` : ''}` : 'чтобы долги считались верно';
+      })(),
+      onclick: () => go('basis'),
+    })));
+
+  box.append(h('div', { class: 'section-title', text: 'Помощник' }));
+  box.append(h('div', { class: 'card' },
+    navRow({
+      icon: 'bot',
+      tone: s.aiEnabled !== false ? 'ok' : '',
+      title: s.aiEnabled !== false ? 'Помощник включён' : 'Помощник выключен',
+      sub: s.aiEnabled !== false
+        ? 'понимает фразы, фото и голос'
+        : 'выключен — только ручной ввод',
+      onclick: async () => {
+        haptic('medium');
+        const next = !(s.aiEnabled !== false);
+        try {
+          await api('POST', '/api/user/ai', { enabled: next });
+          s.aiEnabled = next;
+          toast(next ? 'Помощник включён' : 'Помощник выключен');
+          go('more');
+        } catch (e) { toast(e.message, true); }
+      },
+    })));
+
+  // Выход нужен только тому, кто вошёл с сайта: в Telegram «выйти» — закрыть окно.
+  if (WEB) {
+    box.append(h('div', { class: 'section-title', text: 'Вход на сайте' }));
+    box.append(h('div', { class: 'card' },
+      navRow({
+        icon: 'logout',
+        title: 'Выйти',
+        sub: 'закрыть вход в этом браузере',
+        onclick: () => signOut(false),
+      }),
+      navRow({
+        icon: 'logout',
+        title: 'Выйти на всех устройствах',
+        sub: 'закрыть все входы с сайта, в том числе чужие',
+        onclick: () => {
+          if (window.confirm('Выйти на всех устройствах? Входить придётся заново, через Telegram.')) signOut(true);
+        },
+      })));
+  }
+
+  box.append(h('div', { class: 'section-title', text: 'Помощь' }));
+  box.append(h('div', { class: 'card' },
+    navRow({
+      icon: 'help',
+      title: 'Как пользоваться',
+      sub: 'короткая инструкция',
+      onclick: () => go('help'),
+    }),
+    navRow({
+      icon: 'send',
+      title: 'Написать в поддержку',
+      sub: 'ответим в чате с ботом',
+      onclick: () => go('support'),
+    })));
+  return box;
+};
+
+/** Выйти с сайта: на этом устройстве или везде. После — страница загружается заново и просит войти. */
+async function signOut(everywhere) {
+  try {
+    await api('POST', everywhere ? '/api/logout/all' : '/api/logout', {}, { anon: true });
+  } catch (e) {
+    // Сессии уже нет — выходить не из чего, остальное покажем как есть.
+    if (e.status !== 401) { toast(e.message, true); return; }
+  }
+  location.reload();
+}
+
+/** Человеческое название режима НДС — то же, что в боте. */
+function vatLabel(org) {
+  if (!org || !org.vat_rate || Number(org.npd)) return 'без НДС';
+  return `${org.vat_rate}%${org.vat_rate === '0' ? '' : (org.vat_gross ? ', цены с НДС' : ', сверху')}`;
+}
+
+const BASIS_LABEL = {
+  closing: 'по акту, УПД или накладной',
+  invoice: 'по выставленному счёту',
+  manual: 'не считать — журнал веду сам',
+};
+
+/* ---------- почта ---------- */
+
+/**
+ * Почта клиента: с какого адреса уходят документы.
+ *
+ * Экрана долго не было вовсе — обработчики на сервере есть с самого начала,
+ * а в приложении подключить ящик было нельзя. Половина ежедневной работы
+ * бухгалтера это почта, и держать её только в боте неправильно.
+ */
+screens.mail = async function mail() {
+  const s = await api('GET', '/api/state');
+  const box = h('div', {}, h('h1', { text: 'Почта' }));
+  const mb = s.mailbox;
+
+  if (mb) {
+    box.append(h('div', { class: 'card' },
+      h('div', { class: 'row' },
+        h('span', { class: `icon-box ${mb.checkedAt ? 'ok' : ''}` }, icon(mb.checkedAt ? 'check' : 'clock')),
+        h('span', { class: 'grow' },
+          h('div', { class: 'ellipsis', text: mb.from }),
+          h('div', { class: 'small muted', text: mb.checkedAt ? 'проверена, письма уходят' : 'ещё не проверена' }))),
+      h('div', { class: 'row' },
+        h('span', { class: 'grow muted', text: 'Сервер' }),
+        h('span', { class: 'small', text: `${mb.host}:${mb.port}` }))));
+
+    if (mb.canRead) {
+      box.append(h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn', onclick: () => { haptic('medium'); go('inbox'); },
+      }, 'Посмотреть входящие')));
+    }
+
+    box.append(h('div', { class: 'btn-wrap' }, h('button', {
+      class: 'btn secondary',
+      onclick: (e) => withBusy(e.currentTarget, async () => {
+        const r = await api('POST', '/api/mailbox/test');
+        toast(`Письмо ушло на ${r.sent} — проверьте ящик`);
+        render();
+      }),
+    }, 'Отправить проверочное письмо')));
+
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn ghost', onclick: () => go('mail.new') }, 'Подключить другой ящик'),
+      h('button', {
+        class: 'btn danger',
+        onclick: (e) => withBusy(e.currentTarget, async () => {
+          await api('POST', '/api/mailbox/delete');
+          toast('Почта отключена');
+          render();
+        }),
+      }, 'Отключить почту')));
+    return box;
+  }
+
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'row' },
+      h('span', { class: 'icon-box' }, icon('mail')),
+      h('span', { class: 'grow' },
+        h('div', { text: 'Ящик не подключён' }),
+        h('div', { class: 'small muted', text: 'документы придётся пересылать вручную' })))));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Подключите свой ящик — и счета будут уходить клиентам с вашего адреса. '
+      + 'С чужого адреса письма попадают в спам, а получатель видит незнакомого отправителя.' }));
+  box.append(h('div', { class: 'btn-wrap' },
+    h('button', { class: 'btn', onclick: () => go('mail.new') }, 'Подключить ящик')));
+  return box;
+};
+
+/** Подключение ящика: адрес, пароль и — для своего домена — сервер. */
+screens['mail.new'] = async function mailNew() {
+  const box = h('div', {}, h('h1', { text: 'Подключить почту' }));
+
+  const email = field('email', 'Адрес почты', '', { type: 'email', placeholder: 'buh@yandex.ru', required: true });
+  const pass = field('pass', 'Пароль', '', { type: 'password', required: true,
+    hint: 'У Яндекса и Mail.ru нужен пароль приложения, а не обычный от почты' });
+  const host = field('host', 'Сервер SMTP', '', { placeholder: 'smtp.вашдомен.ру',
+    hint: 'Только для своего домена — у известных сервисов подставлю сам' });
+  const imap = field('imapHost', 'Сервер IMAP', '', { placeholder: 'imap.вашдомен.ру',
+    hint: 'Нужен, чтобы читать входящие. Можно оставить пустым' });
+  const fromName = field('fromName', 'Имя отправителя', '', { placeholder: 'ООО «Ромашка»' });
+
+  // Ссылка на страницу пароля появляется, как только понятен сервис:
+  // описание пути по меню устаревает раньше, чем мы выпускаем обновление.
+  const linkBox = h('div', { class: 'btn-wrap', style: 'display:none' });
+  const link = h('a', { class: 'btn secondary', target: '_blank', rel: 'noopener' }, 'Где взять пароль');
+  linkBox.append(link);
+  const PASS_URL = {
+    yandex: 'https://id.yandex.ru/security/app-passwords',
+    mailru: 'https://account.mail.ru/user/2-step-auth/passwords',
+    gmail: 'https://myaccount.google.com/apppasswords',
+    rambler: 'https://mail.rambler.ru/settings/mailapps',
+  };
+  const guess = (addr) => {
+    const d = String(addr).split('@')[1] || '';
+    if (/yandex|ya\.ru|narod/i.test(d)) return 'yandex';
+    if (/mail\.ru|inbox\.ru|list\.ru|bk\.ru|internet\.ru/i.test(d)) return 'mailru';
+    if (/gmail|googlemail/i.test(d)) return 'gmail';
+    if (/rambler|lenta\.ru/i.test(d)) return 'rambler';
+    return 'custom';
+  };
+  email.input.addEventListener('input', () => {
+    const p = guess(email.input.value);
+    host.style.display = p === 'custom' ? '' : 'none';
+    imap.style.display = p === 'custom' ? '' : 'none';
+    if (PASS_URL[p]) { link.href = PASS_URL[p]; linkBox.style.display = ''; } else { linkBox.style.display = 'none'; }
+  });
+  host.style.display = 'none';
+  imap.style.display = 'none';
+
+  box.append(h('div', { class: 'card' }, email, pass, host, imap, fromName));
+  box.append(linkBox);
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Пароль хранится в зашифрованном виде и нигде не показывается. '
+      + 'Сразу после сохранения я отправлю проверочное письмо вам же.' }));
+
+  const save = h('button', { class: 'btn' }, 'Подключить и проверить');
+  save.onclick = () => withBusy(save, async () => {
+    clearErrors({ email, pass });
+    if (!email.input.value.trim()) { showError(email, 'Без адреса не обойтись'); return; }
+    if (!pass.input.value) { showError(pass, 'Нужен пароль'); return; }
+    let r;
+    try {
+      r = await api('POST', '/api/mailbox', {
+        email: email.input.value.trim(),
+        pass: pass.input.value,
+        host: host.input.value.trim(),
+        imapHost: imap.input.value.trim(),
+        fromName: fromName.input.value.trim(),
+      });
+    } catch (e) {
+      // Ящик сохранён, но письмо не ушло — почти всегда это пароль.
+      // Показываем ошибку у поля пароля, а не общим красным всплытием:
+      // так видно, что исправлять.
+      if (e.payload && e.payload.saved) {
+        showError(pass, e.message);
+        return;
+      }
+      throw e;
+    }
+    haptic('medium');
+    toast(r.sent ? `Письмо ушло на ${r.sent} — проверьте ящик` : 'Почта подключена');
+    reset('mail');
+  });
+  box.append(h('div', { class: 'btn-wrap' }, save));
+  return box;
+};
+
+/** Входящие письма с документами. */
+screens.inbox = async function inbox() {
+  const box = h('div', {}, h('h1', { text: 'Входящие' }));
+  let r;
+  try {
+    r = await api('GET', '/api/inbox');
+  } catch (e) {
+    box.append(empty('warn', 'Не смог прочитать почту', e.message,
+      h('div', { class: 'btn-wrap' }, h('button', { class: 'btn secondary', onclick: () => go('mail') }, 'Настройки почты'))));
+    return box;
+  }
+  if (!r.letters.length) {
+    box.append(empty('mail', 'Новых документов нет',
+      `Просмотрел ${r.looked} ${plural(r.looked, 'письмо', 'письма', 'писем')} за две недели. `
+      + 'Ищу вложения: счета, акты, УПД, накладные — PDF, Word, Excel и сканы.'));
+    return box;
+  }
+  box.append(h('div', { class: 'card' }, r.letters.map((l) => navRow({
+    icon: 'mail',
+    title: l.files.map((f) => f.kind).filter(Boolean).join(', ') || 'Документ',
+    sub: l.fromName || l.from,
+    badge: l.cp ? l.cp.name : '',
+    onclick: () => go('letter', { uid: l.uid, data: l }),
+  }))));
+  return box;
+};
+
+/** Карточка письма: что внутри и что с этим сделать. */
+screens.letter = async function letter({ data }) {
+  const l = data || {};
+  const box = h('div', {}, h('h1', { text: l.subject || 'Письмо' }));
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'От кого' }),
+      h('span', { class: 'ellipsis', text: l.fromName || l.from })),
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Адрес' }),
+      h('span', { class: 'small ellipsis', text: l.from }))));
+
+  box.append(h('div', { class: 'section-title', text: 'Вложения' }));
+  box.append(h('div', { class: 'card' }, (l.files || []).map((f) => h('div', { class: 'row' },
+    h('span', { class: 'icon-box' }, icon('doc')),
+    h('span', { class: 'grow' },
+      h('div', { class: 'ellipsis', text: f.name }),
+      h('div', { class: 'small muted', text: `${f.kind || 'документ'} · ${Math.round(f.size / 1024)} КБ` }))))));
+
+  if (l.cp) {
+    // Контрагент здесь угадан по заголовку письма, а он подделывается
+    // тривиально — ни SPF, ни DKIM не проверяются. Поддельный счёт от
+    // знакомого поставщика — самая частая схема обмана в малом бизнесе, и
+    // молчаливо подставленное имя работало на неё. Кнопку не убираем: почти
+    // всегда письмо настоящее. Но говорим правду.
+    if (l.cp.guessed) {
+      box.append(h('div', { class: 'card' },
+        h('div', { class: 'row' },
+          h('span', { class: 'icon-box warn' }, icon('warn')),
+          h('span', { class: 'grow' },
+            h('div', { text: 'Отправителя я не проверяю' }),
+            h('div', { class: 'small muted',
+              text: 'Адрес в письме подделать несложно. Перед оплатой сверьте счёт и '
+                + 'реквизиты — особенно если они изменились с прошлого раза.' })))));
+    }
+    box.append(h('div', { class: 'btn-wrap' }, h('button', {
+      class: 'btn', onclick: () => go('op', { cpId: l.cp.id, doc: l.subject }),
+    }, `Внести операцию по ${l.cp.name}`)));
+  }
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Сам файл лежит у вас в почте — бот его не хранит. Здесь видно, что пришло, '
+      + 'и можно сразу занести сумму в журнал.' }));
+  return box;
+};
+
+/* ---------- НДС и основание долга ---------- */
+
+/** Ставка НДС организации. */
+screens.vat = async function vat() {
+  const s = await api('GET', '/api/state');
+  const org = s.org || {};
+  const cur = org.vat_rate === '' || org.vat_rate == null ? null : String(org.vat_rate);
+  const gross = Boolean(org.vat_gross);
+  const box = h('div', {}, h('h1', { text: 'НДС' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Ставка подставляется во все счета. У отдельного счёта её можно поменять.' }));
+
+  /*
+   * Самозанятому говорим до кнопок, а не после.
+   *
+   * Экраны «Самозанятость» и «НДС» независимы, и ставка поверх включённого
+   * НПД ставилась беспрепятственно. Счёт-фактура с выделенным налогом от
+   * неплательщика обязывает его уплатить этот НДС в бюджет (п. 5 ст. 173 НК),
+   * а заказчик вычет всё равно не получит.
+   */
+  if (Number(org.npd)) {
+    box.append(h('p', { class: 'small', style: 'margin:8px 18px; color:var(--warn, #b26a00)' },
+      icon('warn', 'icon inline'),
+      'У вас включена самозанятость. Плательщик НПД не может быть плательщиком '
+        + 'НДС — оставьте «Без НДС». Если с НПД снялись, выключите галочку в разделе '
+        + '«Самозанятость».'));
+  }
+
+  const pick = async (rate, isGross) => {
+    await api('POST', '/api/vat', { rate, gross: isGross });
+    haptic('medium');
+    toast('Сохранено');
+    back();
+  };
+  const opt = (title, sub, active, onclick) => h('button', { class: 'row', onclick },
+    h('span', { class: `icon-box ${active ? 'ok' : ''}` }, icon(active ? 'check' : 'receipt')),
+    h('span', { class: 'grow' },
+      h('div', { text: title }),
+      h('div', { class: 'small muted', text: sub })));
+
+  box.append(h('div', { class: 'card' },
+    opt('Без НДС', 'упрощёнка до 20 млн, патент, самозанятость', cur === null, () => pick(null, false)),
+    opt('22% сверху', 'общая ставка с 2026, цены без налога', cur === '22' && !gross, () => pick(22, false)),
+    opt('22% в том числе', 'общая ставка, цены уже с налогом', cur === '22' && gross, () => pick(22, true)),
+    // Ставка привязана к дате отгрузки, а не к дате договора: с 1 января 2026
+    // отгрузка идёт по 22% независимо от того, когда договор подписан. Прежняя
+    // подсказка «старые договоры» толкала выбрать 20% там, где нужна 22%, —
+    // это уже налоговая ошибка, а не описка.
+    opt('20% сверху', 'для документов за 2025 год и правок к ним', cur === '20' && !gross, () => pick(20, false)),
+    opt('20% в том числе', 'то же, цены с налогом', cur === '20' && gross, () => pick(20, true)),
+    opt('10% сверху', 'льготная ставка', cur === '10' && !gross, () => pick(10, false)),
+    opt('10% в том числе', 'льготная, цены с налогом', cur === '10' && gross, () => pick(10, true)),
+    // У пониженных ставок УСН тоже две формы: расчётные 5/105 и 7/107 — это
+    // п. 4 ст. 164 НК. Была одна кнопка «сверху», и продавец с ценами,
+    // включающими налог, не мог выписать верный документ из приложения
+    // вообще: ставка сюда приходит только из этой настройки.
+    opt('5% сверху', 'пониженная для упрощёнки, цены без налога', cur === '5' && !gross, () => pick(5, false)),
+    opt('5% в том числе', 'пониженная, цены уже с налогом', cur === '5' && gross, () => pick(5, true)),
+    opt('7% сверху', 'пониженная для упрощёнки, цены без налога', cur === '7' && !gross, () => pick(7, false)),
+    opt('7% в том числе', 'пониженная, цены уже с налогом', cur === '7' && gross, () => pick(7, true)),
+    opt('0%', 'экспорт и особые случаи', cur === '0', () => pick(0, false))));
+  return box;
+};
+
+/**
+ * Самозанятость. Одна галочка, и та не про документы.
+ *
+ * Спрашиваем прямо, потому что вывести режим неоткуда: по ИНН видно только,
+ * ИП это или организация, а НПД применяют и физлица, и предприниматели.
+ */
+screens.npd = async function npdScreen() {
+  const s = await api('GET', '/api/state');
+  const on = Boolean(s.org && Number(s.org.npd));
+  const box = h('div', {}, h('h1', { text: 'Налог на профессиональный доход' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Если вы самозанятый или ИП на НПД, счёт и акт сами по себе доход не закрывают — '
+      + 'его закрывает чек из «Моего налога». Включите, и после каждой отметки об оплате '
+      + 'я дам данные для чека и буду помнить, пока вы не отметите его пробитым.' }));
+
+  const pick = async (value) => {
+    await api('POST', '/api/npd', { on: value });
+    haptic('medium');
+    toast('Сохранено');
+    back();
+  };
+  const opt = (value, title, sub) => h('button', { class: 'row', onclick: () => pick(value) },
+    h('span', { class: `icon-box ${on === value ? 'ok' : ''}` },
+      icon(on === value ? 'check' : 'receipt')),
+    h('span', { class: 'grow' },
+      h('div', { text: title }),
+      h('div', { class: 'small muted', text: sub })));
+
+  box.append(h('div', { class: 'card' },
+    opt(true, 'Применяю НПД', 'самозанятый или ИП на НПД'),
+    opt(false, 'Не применяю', 'УСН, патент, общая система')));
+
+  box.append(h('p', { class: 'small muted', style: 'margin:12px 18px',
+    text: 'Сам чек не выписываю и выписывать не буду: это заявление в налоговую от вашего '
+      + 'имени, его делаете вы.' }));
+  box.append(h('div', { class: 'btn-wrap' }, h('button', {
+    class: 'btn secondary',
+    onclick: () => openOutside('https://lknpd.nalog.ru/'),
+  }, 'Открыть «Мой налог»')));
+  return box;
+};
+
+/*
+ * Чеки «Мой налог»: что самозанятому ещё надо пробить.
+ *
+ * Приложение чек не пробивает и не умеет: официального доступа к «Моему
+ * налогу» у нас нет. Оно готовит данные — что вписать в чек — и запоминает,
+ * что чек пробит. Ссылку на чек можно приложить: она потом лежит в карточке
+ * документа. Принимаются только ссылки самого сервиса (проверяет сервер).
+ */
+screens.cheques = async function chequesScreen() {
+  const r = await api('GET', '/api/cheques');
+  const box = h('div', {}, h('h1', { text: 'Чеки «Мой налог»' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 8px',
+    text: 'На каждое поступление самозанятому нужен чек. При оплате на счёт — до 9-го числа '
+      + 'следующего месяца. Пробейте его в «Мой налог» и отметьте здесь.' }));
+  if (!r.items.length) {
+    box.append(empty('check', 'Все чеки пробиты', 'Когда отметите оплату документа, чек появится здесь.'));
+    return box;
+  }
+  for (const c of r.items) {
+    const link = field(`chq-${c.id}`, 'Ссылка на чек (необязательно)', '', {
+      placeholder: 'https://lknpd.nalog.ru/…', inputmode: 'url',
+    });
+    const done = h('button', { class: 'btn', id: `cheque-ok-${c.id}` }, 'Чек пробил');
+    done.onclick = () => withBusy(done, async () => {
+      try {
+        await api('POST', '/api/cheques/done', { id: c.id, link: link.input.value.trim() });
+        haptic('medium');
+        toast('Отмечено: чек пробит');
+        render();
+      } catch (e) { showError(link, e.message); }
+    });
+    box.append(h('div', { class: 'section-title', text: `${money(c.amount)} · ${c.cpName || 'клиент'}` }),
+      h('div', { class: 'card cheque-card' },
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Наименование' }),
+          h('span', { class: 'ellipsis', text: c.service })),
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Сумма' }),
+          h('span', { class: 'money', text: money(c.amount) })),
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Покупатель' }),
+          h('span', { class: 'ellipsis', text: c.buyer })),
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Пробить до' }),
+          h('span', { text: ru(c.due) })),
+        link),
+      h('div', { class: 'btn-wrap' }, done),
+      h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn secondary', onclick: () => openOutside(r.lkUrl),
+      }, 'Открыть «Мой налог»')));
+  }
+  return box;
+};
+
+/** Из чего возникает долг контрагента. */
+screens.basis = async function basis() {
+  const s = await api('GET', '/api/state');
+  const box = h('div', {}, h('h1', { text: s.bizType ? 'Откуда берётся долг' : 'Чем занимаетесь' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Это про устройство вашего дела, а не про настройку. Выбор один на организацию: '
+      + 'иначе долг задвоится — сначала по счёту, потом по акту на ту же сделку.' }));
+
+  const pick = async (value) => {
+    await api('POST', '/api/basis', { basis: value });
+    haptic('medium');
+    toast('Сохранено');
+    back();
+  };
+  const opt = (value, title, sub) => h('button', { class: 'row', onclick: () => pick(value) },
+    h('span', { class: `icon-box ${s.debtBasis === value ? 'ok' : ''}` },
+      icon(s.debtBasis === value ? 'check' : 'wallet')),
+    h('span', { class: 'grow' },
+      h('div', { text: title }),
+      h('div', { class: 'small muted', text: sub })));
+
+  box.append(h('div', { class: 'card' },
+    opt('closing', 'По акту, УПД или накладной', 'подряд, услуги, торговля: счёт лишь просьба заплатить'),
+    opt('invoice', 'По выставленному счёту', 'аренда и субаренда: акта по закону может не быть'),
+    opt('manual', 'Не считать', 'журнал веду сам')));
+
+  // Выход для того, кто не знает ответа. Это единственная настройка, где
+  // человек может застрять: вопрос бухгалтерский, а пришёл он выставить счёт.
+  box.append(h('div', { class: 'section-title', text: 'Не знаете, что выбрать?' }));
+  box.append(h('div', { class: 'card' }, (s.bizTypes || []).map((t) => h('button', {
+    class: 'row',
+    onclick: (e) => withBusy(e.currentTarget, async () => {
+      const r = await api('POST', '/api/biztype', { key: t.key });
+      haptic('medium');
+      toast(r.why || 'Сохранено');
+      back();
+    }),
+  },
+  h('span', { class: `icon-box ${s.bizType === t.key ? 'ok' : ''}` },
+    icon(s.bizType === t.key ? 'check' : 'office')),
+  h('span', { class: 'grow' },
+    h('div', { text: t.name }),
+    h('div', { class: 'small muted', text: t.hint }))))));
+  return box;
+};
+
+/**
+ * Регулярные документы.
+ *
+ * Только список и выключение: заводятся они на карточке уже выписанного
+ * документа, где позиции проверены человеком. Ничего не выписывается само —
+ * бот приносит предложение с кнопкой.
+ */
+screens.recurring = async function recurringScreen() {
+  const { items } = await api('GET', '/api/recurring');
+  const box = h('div', {}, h('h1', { text: 'По расписанию' }));
+  if (!items.length) {
+    box.append(empty('repeat', 'Пока ничего не повторяется',
+      'Откройте выписанный счёт, накладную или акт и нажмите «Повторять по расписанию» — '
+      + 'каждый день, по будням, раз в неделю или раз в месяц бот пришлёт такой же документ на проверку.'));
+    return box;
+  }
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 10px',
+    text: items.some((r) => r.isOp)
+      ? 'Документы сами не выписываются и клиенту бот не пишет: в нужный день придёт '
+        + 'предложение с кнопкой. Операции журнала бот вносит сам — они внутренние, '
+        + 'никуда не уходят, — но каждый раз сообщает и даёт отменить.'
+      : 'Ничего не выписывается само и клиенту бот не пишет: в нужный день '
+        + 'придёт предложение с проверкой — документ выпишется после «Всё верно».' }));
+
+  for (const r of items) {
+    const card = h('div', { class: 'card' });
+    // Заголовок строки — имя клиента: по нему её и узнают. Название документа
+    // уходит вниз, иначе оно съедает ширину и обрывает как раз имя.
+    card.append(h('div', { class: 'row' },
+      h('span', { class: 'icon-box' }, icon('repeat')),
+      h('span', { class: 'grow' },
+        h('div', { class: 'ellipsis', text: r.cpName }),
+        h('div', { class: 'small muted', text: r.title })),
+      // Без копеек: сумма здесь для узнавания, а не для сверки.
+      h('span', { class: 'money nowrap', text: money0(r.total) }),
+      h('button', {
+        class: 'row-act',
+        'aria-label': `Остановить: ${r.title} для ${r.cpName}`,
+        onclick: (e) => withBusy(e.currentTarget, async () => {
+          if (!(await askSure(`Остановить расписание «${r.title}» для ${r.cpName}? Предложения по нему перестанут приходить.`))) return;
+          await api('POST', '/api/recurring/off', { id: r.id });
+          haptic('medium');
+          toast('Расписание остановлено');
+          render();
+        }),
+      }, icon('trash'))));
+
+    /*
+     * Календарь цикла целиком, а не одна дата. Человек настраивает аренду
+     * одним числом из договора, но следит бот за тремя событиями — и если
+     * не показать все, напоминание о просрочке придёт неожиданно и будет
+     * выглядеть ошибкой.
+     */
+    /*
+     * У операции журнала цикл другой и говорить о нём надо иначе: её бот
+     * вносит сам. Умолчать об этом нельзя — человек должен понимать, откуда
+     * в журнале возьмётся строка, которую он не заводил.
+     */
+    const steps = r.isOp
+      ? [[r.dayText, 'внесу в журнал сам'],
+        ...(r.op && r.op.times
+          ? [['осталось', `${r.op.left} из ${r.op.times} — потом выключится`]] : []),
+        ...(r.op && r.op.mailSelf ? [['после', 'пришлю вам акт сверки на почту']] : [])]
+      : r.payDay
+        ? [[`${r.offerDay}-го`, 'выставить счёт'],
+          [`${r.payDay}-го`, 'срок оплаты по договору'],
+          [`${r.payDay + 1}-го`, 'напомню, если денег нет']]
+        : r.periodic
+          ? [[r.dayText, 'пришлю на проверку'], ...(r.next ? [[ru(r.next), 'следующее предложение']] : [])]
+          : [[r.dayText, 'выписать документ']];
+    card.append(h('div', { class: 'plan' }, steps.map(([when, what]) => h('div', { class: 'plan-row' },
+      h('span', { class: 'plan-when', text: when }),
+      h('span', { class: 'plan-what', text: what })))));
+    box.append(card);
+  }
+  return box;
+};
+
+/* ---------- операции и неоплаченные ---------- */
+
+/** Внести приход или оплату в журнал контрагента. */
+screens.op = async function op({ cpId, doc }) {
+  const { cps } = await api('GET', '/api/cps');
+  const cp = cps.find((c) => c.id === Number(cpId));
+  if (!cp) return empty('warn', 'Клиент не найден');
+
+  const box = h('div', {}, h('h1', { text: 'Операция' }));
+  let kind = 'payment';
+  const amount = field('amount', 'Сумма, ₽', '', { inputmode: 'decimal', required: true });
+  const date = field('date', 'Дата', todayISO(), { type: 'date' });
+  const docF = field('doc', 'Основание', doc || '', { placeholder: 'Счёт № 12 или Оплата' });
+
+  const btn = (val, text) => {
+    const b = h('button', { class: `btn ${kind === val ? '' : 'secondary'}`, style: 'flex:1' }, text);
+    b.onclick = () => {
+      kind = val;
+      for (const x of picker.children) x.className = 'btn secondary';
+      b.className = 'btn';
+      haptic();
+    };
+    return b;
+  };
+  const picker = h('div', { class: 'btn-wrap', style: 'display:flex;gap:10px' });
+  picker.append(btn('payment', 'Оплата'), btn('prepay', 'Предоплата'), btn('income', 'Приход'));
+
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Клиент' }),
+      h('span', { class: 'ellipsis', text: cp.name }))));
+  box.append(picker);
+  box.append(h('div', { class: 'card' }, amount, date, docF));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Оплата уменьшает долг клиента, приход — увеличивает. Предоплата — деньги вперёд: накладные клиента дальше отмечаются оплаченными сами, пока хватает остатка. После предоплаты в карточке клиента появится «Акт за месяц» — один акт на все его накладные.' }));
+
+  const save = h('button', { class: 'btn' }, 'Внести в журнал');
+  save.onclick = () => withBusy(save, async () => {
+    clearErrors({ amount });
+    const sum = Number(String(amount.input.value).replace(/\s/g, '').replace(',', '.'));
+    if (!sum) { showError(amount, 'Укажите сумму'); return; }
+    const saved = await api('POST', '/api/op', {
+      cpId: cp.id, amount: sum, kind, date: date.input.value, doc: docF.input.value.trim(),
+    });
+    haptic('medium');
+    toast('Записано в журнал');
+    // Самозанятому поступление — это чек «Мой налог»; говорим сразу, не через неделю.
+    reset(saved && saved.npd ? 'cheques' : 'cp', saved && saved.npd ? {} : { id: cp.id });
+  });
+  box.append(h('div', { class: 'btn-wrap' }, save));
+  return box;
+};
+
+/*
+ * Журнал операций контрагента.
+ *
+ * До сих пор внесённое руками можно было только добавить: увидеть строки и
+ * убрать лишнюю было негде — в боте отменялась лишь последняя. А именно эти
+ * строки чаще всего и держат сумму на главной, из-за которой «удаляю
+ * документы, а цифра стоит». Поэтому здесь они видны все и смахиваются.
+ */
+screens.ops = async function opsScreen({ cpId }) {
+  const j = await api('GET', `/api/ops?cp=${cpId}`);
+  const box = h('div', {}, h('h1', { text: 'Журнал операций' }));
+  box.append(h('div', { class: 'hero' },
+    h('div', { class: 'greet', text: j.cp.name }),
+    h('div', { class: 'sum money', text: money0(Math.abs(j.closing)) }),
+    h('div', { class: 'sub', text: j.closing ? 'баланс сейчас' : 'расчёты сошлись' })));
+
+  const add = h('button', { class: 'btn' }, 'Внести оплату или приход');
+  add.onclick = () => { haptic('medium'); go('op', { cpId }); };
+  box.append(h('div', { class: 'btn-wrap' }, add));
+
+  if (j.opening) {
+    box.append(h('div', { class: 'card' }, navRow({
+      icon: 'clock',
+      title: 'Долг на начало',
+      sub: j.openingDate ? `на ${ru(j.openingDate)}` : 'до начала расчётов',
+      right: money(j.opening),
+      // Строка не из журнала: правится в карточке, а не смахиванием.
+      onclick: () => go('cp', { id: cpId }),
+    })));
+  }
+
+  if (!j.ops.length) {
+    box.append(empty('list', 'Операций нет',
+      j.opening
+        ? 'Баланс держит долг на начало из карточки клиента.'
+        : 'Здесь появятся оплаты и приходы — внесённые руками и из выписки.'));
+    return box;
+  }
+
+  const rows = j.ops.map((o) => {
+    const row = navRow({
+      icon: o.delta > 0 ? 'plus' : 'minus',
+      title: o.kind || (o.delta > 0 ? 'Приход' : 'Оплата'),
+      sub: [ru(o.date), o.doc, o.fromDoc ? 'из документа' : ''].filter(Boolean).join(' · '),
+      right: money(Math.abs(o.delta)),
+      rightTone: o.delta > 0 ? 'in' : 'out',
+      /*
+       * Стрелка справа обещает переход, поэтому он есть у каждой строки.
+       * Здесь стоял пустой обработчик: строка выглядела нажимаемой, нажималась
+       * и молчала. Из документа — карточка документа; свободная запись
+       * (оплата руками, предоплата) — карточка записи с «Отменить».
+       */
+      onclick: () => (o.docId ? go('doc', { id: o.docId }) : go('opcard', { cpId, opId: o.id })),
+    });
+    // Строки, пришедшие из документа, смахиванием не убираем: их снимает сам
+    // документ, а убрать проводку в обход него — значит развести журнал с
+    // тем, что напечатано на бумаге.
+    if (o.fromDoc) return row;
+    return swipeToDelete(row, {
+      label: 'Убрать операцию',
+      onDelete: async () => {
+        const r = await api('POST', '/api/op/delete', { id: o.id, cpId });
+        haptic('medium');
+        toast(`Убрано. Баланс: ${money(Math.abs(r.balance))}`);
+        render();                        // перерисовать, не теряя дорогу назад
+      },
+    });
+  });
+  box.append(h('div', { class: 'card' }, rows));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Нажмите на строку, чтобы открыть. Убрать внесённую руками запись можно смахиванием влево или в её карточке. Строки из документов убираются вместе с документом.' }));
+  return box;
+};
+
+/*
+ * Карточка записи журнала: то, что внесено руками (оплата, предоплата, приход).
+ *
+ * Строка в журнале показывает сумму и две подписи, а комментарий, вид и дату
+ * целиком не покажет. Отмену здесь спрашиваем отдельно: смахивание можно
+ * сделать случайно, а запись уходит из баланса.
+ */
+screens.opcard = async function opCardScreen({ cpId, opId }) {
+  const j = await api('GET', `/api/ops?cp=${cpId}`);
+  const o = j.ops.find((x) => x.id === Number(opId));
+  if (!o) {
+    return empty('list', 'Этой записи уже нет', 'Её убрали — баланс клиента посчитан без неё.',
+      h('div', { class: 'btn-wrap' }, h('button', { class: 'btn', onclick: () => back() }, 'Назад')));
+  }
+  const kind = o.kind || (o.delta > 0 ? 'Приход' : 'Оплата');
+  const sum = Math.abs(o.delta);
+  const row = (label, value) => h('div', { class: 'row' },
+    h('span', { class: 'muted', text: label }), h('span', { class: 'grow', style: 'text-align:right;overflow-wrap:anywhere', text: value }));
+  const note = o.note && o.note !== o.doc && !String(o.doc).startsWith(o.note) ? o.note : '';
+
+  const box = h('div', {}, h('h1', { text: 'Запись журнала' }));
+  box.append(h('div', { class: 'hero' },
+    h('div', { class: 'greet', text: j.cp.name }),
+    h('div', { class: 'sum money', text: money(sum) }),
+    h('div', { class: 'sub', text: `${kind} · ${ru(o.date)}` })));
+  box.append(h('div', { class: 'card', id: 'opcard-info' },
+    row('Вид', kind),
+    row('Дата', ru(o.date)),
+    row('Сумма', `${o.delta > 0 ? '+' : '−'}${money(sum)}`),
+    o.doc && row('Основание', o.doc),
+    note && row('Комментарий', note)));
+
+  const cancel = h('button', { class: 'btn danger', id: 'opcard-cancel' }, 'Отменить запись');
+  cancel.onclick = async () => {
+    // Спрашиваем до «Секунду…»: иначе кнопка зависает в ожидании окна подтверждения.
+    if (!await askSure(`Отменить запись «${kind}» на ${money(sum)} от ${ru(o.date)}? Баланс клиента изменится.`)) return;
+    await withBusy(cancel, async () => {
+      const r = await api('POST', '/api/op/delete', { id: o.id, cpId });
+      haptic('medium');
+      toast(`Запись отменена. Баланс: ${money(Math.abs(r.balance))}`);
+      back();
+    });
+  };
+  box.append(h('div', { class: 'btn-wrap' }, cancel));
+  if (/предоплат/i.test(`${o.doc} ${o.note}`)) {
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+      text: 'Это предоплата: после отмены деньги уйдут из остатка. Клиент при этом останется на предоплате.' }));
+  }
+  return box;
+};
+
+/*
+ * Запись голоса в браузере.
+ *
+ * MediaRecorder не годится: он отдаёт WebM (в Safari — MP4), а распознавание
+ * ни того, ни другого не принимает, и перекодировать нечем — ffmpeg на
+ * сервере нет. Поэтому пишем звук сами через Web Audio и собираем WAV: его
+ * принимают все, а заголовок у WAV — сорок четыре байта.
+ *
+ * Сразу к 16 кГц моно: речи этого хватает с запасом, а байтов выходит втрое
+ * меньше — тридцать секунд укладываются в мегабайт и уходят «быстрым»
+ * методом распознавания, который отвечает сразу.
+ */
+const REC_RATE = 16000;
+const REC_MAX_SEC = 30;
+
+async function recordWav(onTick) {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createMediaStreamSource(stream);
+  const node = ctx.createScriptProcessor(4096, 1, 1);
+  const chunks = [];
+  let total = 0;
+  const step = Math.max(1, Math.round(ctx.sampleRate / REC_RATE));
+
+  node.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    const out = new Int16Array(Math.floor(input.length / step));
+    for (let i = 0; i < out.length; i += 1) {
+      // Усредняем группу отсчётов, а не берём каждый третий: прореживание
+      // без усреднения даёт скрежет на шипящих, и слова теряются.
+      let sum = 0;
+      for (let k = 0; k < step; k += 1) sum += input[i * step + k] || 0;
+      const v = Math.max(-1, Math.min(1, sum / step));
+      out[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+    }
+    chunks.push(out);
+    total += out.length;
+    // Громкость куска — для режима разговора: по ней понимаем, что человек
+    // договорил, и не заставляем его жать кнопку после каждой фразы.
+    let sq = 0;
+    for (let i = 0; i < input.length; i += 1) sq += input[i] * input[i];
+    if (onTick) onTick(total / REC_RATE, Math.sqrt(sq / (input.length || 1)));
+  };
+  src.connect(node);
+  node.connect(ctx.destination);
+
+  const stop = async () => {
+    node.disconnect();
+    src.disconnect();
+    stream.getTracks().forEach((t) => t.stop());
+    await ctx.close().catch(() => {});
+
+    const pcm = new Int16Array(total);
+    let at = 0;
+    for (const c of chunks) { pcm.set(c, at); at += c.length; }
+
+    const buf = new ArrayBuffer(44 + pcm.length * 2);
+    const view = new DataView(buf);
+    const put = (off, s) => { for (let i = 0; i < s.length; i += 1) view.setUint8(off + i, s.charCodeAt(i)); };
+    put(0, 'RIFF'); view.setUint32(4, 36 + pcm.length * 2, true); put(8, 'WAVE');
+    put(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true); view.setUint32(24, REC_RATE, true);
+    view.setUint32(28, REC_RATE * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    put(36, 'data'); view.setUint32(40, pcm.length * 2, true);
+    new Int16Array(buf, 44).set(pcm);
+
+    let bin = '';
+    const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return { audio: btoa(bin), seconds: Math.round(total / REC_RATE) };
+  };
+
+  return { stop };
+}
+
+/*
+ * Переписка с агентом.
+ *
+ * Рамки объявлены первой же строкой, до того как человек начал печатать:
+ * бот работает с документами и расчётами и не ведёт налоги. Узнать это
+ * после третьего вопроса про взносы — обидно; узнать сразу — честно.
+ *
+ * Агент ничего не выписывает сам. Он понимает фразу и открывает нужный
+ * экран с заполненными полями — кнопку жмёт человек. Документ забирает
+ * номер в сквозном ряду, и лишний счёт нельзя тихо удалить.
+ */
+/*
+ * Ответ голосом.
+ *
+ * Играем через Web Audio, а не через <audio>: Safari на iPhone разрешает
+ * звук только из обработчика нажатия, и ответ, пришедший через три секунды
+ * после него, молчал бы. Один AudioContext, «разбуженный» нажатием на
+ * микрофон или «Разговор», дальше играет без новых нажатий.
+ */
+const voicePlayer = (() => {
+  let ctx = null;
+  let current = null;
+  const unlock = () => {
+    try {
+      if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (ctx.state === 'suspended') ctx.resume();
+      const b = ctx.createBuffer(1, 1, 22050);
+      const s = ctx.createBufferSource();
+      s.buffer = b; s.connect(ctx.destination); s.start(0);
+    } catch (_) { /* без звука — ответ всё равно есть текстом */ }
+  };
+  const stop = () => {
+    try { if (current) current.stop(); } catch (_) { /* уже кончился */ }
+    current = null;
+  };
+  const play = async (b64) => {
+    unlock();
+    stop();
+    if (!ctx) return;
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+    // Старый Safari знает только вариант с колбэками — поддерживаем оба.
+    const buf = await new Promise((res, rej) => {
+      const p = ctx.decodeAudioData(bytes.buffer, res, rej);
+      if (p && p.then) p.then(res, rej);
+    });
+    await new Promise((resolve) => {
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.onended = () => { if (current === src) current = null; resolve(); };
+      current = src;
+      src.start(0);
+    });
+  };
+  return { unlock, play, stop };
+})();
+
+const ASK_GO = {
+  debts: ['Открыть долги', 'debts'],
+  unpaid: ['Кто не заплатил', 'unpaid'],
+  docs: ['Открыть документы', 'docs'],
+  cps: ['Открыть клиентов', 'cps'],
+  org: ['Открыть реквизиты', 'org'],
+  recurring: ['Открыть повторения', 'recurring'],
+  billing: ['Открыть подписку', 'billing'],
+  akt: ['Собрать акт сверки', 'akt'],
+};
+
+screens.ask = async function ask() {
+  /*
+   * «Отвечать голосом» — на голосовой вопрос; помним в браузере, это
+   * удобство, а не данные. «Разговор» — руки свободны: сказал, помощник
+   * ответил голосом и снова слушает, пока не нажмёте ещё раз.
+   */
+  let speakOn = true;
+  try { speakOn = localStorage.getItem('ask.speak') !== '0'; } catch (_) { /* приватный режим */ }
+  let talk = false;
+  const speakBtn = h('button', { class: 'chip' });
+  const talkBtn = h('button', { class: 'chip talk' });
+  const paintChips = () => {
+    speakBtn.replaceChildren(icon(speakOn ? 'speaker' : 'speaker-off', 'icon inline'),
+      speakOn ? 'Отвечать голосом' : 'Отвечать текстом');
+    speakBtn.setAttribute('aria-pressed', String(speakOn));
+    talkBtn.replaceChildren(icon(talk ? 'stop' : 'mic', 'icon inline'), talk ? 'Закончить разговор' : 'Разговор');
+    talkBtn.setAttribute('aria-pressed', String(talk));
+  };
+  paintChips();
+  const box = h('div', {}, h('h1', { text: 'Помощник' }), h('div', { class: 'ask-modes' }, speakBtn, talkBtn));
+  const log = h('div', { class: 'chat' });
+
+  /* Вносит проводку и показывает, что получилось, с отменой в одно нажатие. */
+  const doPay = async (cpId, cpName, amount, kind, date) => {
+    try {
+      const res = await api('POST', '/api/pay', { cpId, amount, kind, ...(date ? { date } : {}) });
+      haptic('heavy');
+      const undo = h('button', { class: 'btn secondary' }, 'Отменить запись');
+      undo.onclick = async () => {
+        await api('POST', '/api/op/delete', { id: res.id, cpId });
+        haptic('medium');
+        say('bot', 'Запись убрана.');
+      };
+      const left = Number(res.balance) || 0;
+      say('bot', `Внёс: ${res.kind} ${money(res.sum)} по «${res.cpName}». `
+        + (left > 0 ? `Остаток долга ${money(left)}.`
+          : left < 0 ? `Переплата ${money(Math.abs(left))}.` : 'Расчёты закрыты.')
+        + (res.npd ? ' Не забудьте пробить чек в «Мой налог» — данные на экране «Чеки».' : ''), undo);
+    } catch (e) { say('bot', e.message); }
+  };
+
+  const say = (who, text, action) => {
+    const bubble = h('div', { class: `bubble ${who}` }, h('div', { text }));
+    if (action) bubble.append(h('div', { class: 'btn-wrap' }, action));
+    log.append(bubble);
+    /*
+     * Прокручиваем страницу до конца, а не scrollIntoView по пузырю.
+     * Для браузера пузырь «виден», если попал в окно, — а его закрывает
+     * строка ввода, которая приклеена поверх. Отступ снизу у ленты как раз
+     * на её высоту, поэтому конец страницы — это и есть нужное место.
+     */
+    requestAnimationFrame(() => {
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: smooth() });
+    });
+  };
+
+  try {
+    const hist = await api('GET', '/api/ask/history');
+    if (hist && Array.isArray(hist.messages) && hist.messages.length > 0) {
+      for (const m of hist.messages) {
+        const who = m.role === 'user' ? 'me' : 'bot';
+        const micTag = m.type === 'voice' && m.audioSeconds ? ` (голосом, ${Math.round(m.audioSeconds)} с)` : '';
+        say(who, (m.text || '') + (who === 'me' ? micTag : ''));
+      }
+    } else {
+      say('bot', 'Я помогаю с документами и расчётами: счета, акты, УПД, накладные, '
+        + 'договоры и платёжки, кто сколько должен, акт сверки.\n\n'
+        + 'Налоги, взносы, КУДиР, отчётность и зарплату не веду — у меня нет доступа '
+        + 'к вашему банку и кассе, а ошибиться в этом дорого.\n\n'
+        + 'Скажите или напишите, что нужно. Например: «выставь счёт Заре на 30 тысяч за аренду».');
+    }
+  } catch (_) {
+    say('bot', 'Я помогаю с документами и расчётами: счета, акты, УПД, накладные, '
+      + 'договоры и платёжки, кто сколько должен, акт сверки.\n\n'
+      + 'Налоги, взносы, КУДиР, отчётность и зарплату не веду — у меня нет доступа '
+      + 'к вашему банку и кассе, а ошибиться в этом дорого.\n\n'
+      + 'Скажите или напишите, что нужно. Например: «выставь счёт Заре на 30 тысяч за аренду».');
+  }
+
+  const field = h('input', { class: 'ask-input', type: 'text', placeholder: 'Что нужно сделать?',
+    enterkeyhint: 'send', autocomplete: 'off' });
+
+  /*
+   * «Повтори …»: сервер решил (ai.planRepeat — то же, что в боте), здесь только
+   * кнопки. Повтор всегда открывает форму на проверку: копия чужого решения
+   * не выписывается сама, даже у включённого ассистента.
+   */
+  const showRepeat = (rep, text) => {
+    const again = (d, label) => h('button', { class: 'btn', onclick: () => { haptic('medium'); repeatDoc(d.id); } }, label);
+    if (rep.kind === 'choices') {
+      say('bot', text, h('div', { class: 'btn-wrap' }, rep.choices.map((c) => h('button', {
+        class: 'btn secondary',
+        onclick: async () => {
+          try {
+            const q = new URLSearchParams({ cp: String(c.id), type: rep.type || '', date: rep.date || '' });
+            const x = await api('GET', `/api/repeat/find?${q}`);
+            showRepeat(x.repeat, x.text);
+          } catch (e) { say('bot', e.message); }
+        },
+      }, c.name))));
+      return;
+    }
+    if (rep.kind === 'pick') {
+      say('bot', text, h('div', { class: 'btn-wrap' }, rep.docs.map((d) => h('button', {
+        class: 'btn secondary', onclick: () => { haptic('medium'); repeatDoc(d.id); },
+      }, `${d.cpName || '—'} · ${d.short} № ${d.number} · ${money(d.total)}`))));
+      return;
+    }
+    if (rep.kind === 'one' || rep.kind === 'fallback') {
+      say('bot', text, again(rep.doc, rep.kind === 'one' ? 'Повторить' : `Повторить № ${rep.doc.number}`));
+      return;
+    }
+    if (rep.kind === 'ask') {
+      say('bot', text, h('button', { class: 'btn', onclick: () => { haptic('medium'); go('docs'); } }, 'Открыть документы'));
+      return;
+    }
+    say('bot', text);
+  };
+
+  // Акт сверки за период из фразы — тот же запрос, что на экране «Акт сверки».
+  const makeAkt = async (cpId, range, periodText) => {
+    try {
+      const q = new URLSearchParams({ cp: String(cpId) });
+      if (range.from) q.set('from', range.from);
+      q.set('to', range.to);
+      const x = await api('GET', `/api/akt?${q}`);
+      haptic('medium');
+      const other = h('button', { class: 'btn secondary' }, 'Другой период');
+      other.onclick = () => { haptic(); go('akt', { from: range.from, to: range.to }); };
+      say('bot', `Собрал акт сверки за ${periodText}. Баланс на конец: ${money(Math.abs(x.closing))}, операций ${x.ops}.`, other);
+      download(x.file);
+    } catch (e) { say('bot', e.message); }
+  };
+
+  // Асинхронный: оплату ассистент вносит сам, а это обращение к серверу.
+  const answer = async (r) => {
+    if (r.heard) say('me', r.heard);
+    if (r.error) { say('bot', r.error); return; }
+    // Свободный вопрос — ответ помощника приходит готовым текстом.
+    if (r.consult) { say('bot', r.replyText); return; }
+
+    if (r.action === 'draft') {
+      const open = (extra) => () => {
+        haptic('medium');
+        go('new', {
+          type: r.docType,
+          items: r.items || [],
+          vatRate: r.vatRate,
+          priceIncludesVat: r.priceIncludesVat,
+          // Дата, названная во фразе («вчерашним числом»), в форме уже стоит.
+          date: r.date,
+          ...extra,
+        });
+      };
+
+      // Несколько похожих — спрашиваем, кого именно, а не берём наугад.
+      if (r.cpChoices && r.cpChoices.length) {
+        const box2 = h('div', { class: 'btn-wrap' },
+          r.cpChoices.map((c) => h('button', { class: 'btn secondary', onclick: open({ cpId: c.id }) }, c.name)));
+        say('bot', `Кого именно вы имели в виду — «${r.who}»? `
+          + (r.auto ? 'Выберите — и выпишу.'
+            : 'Выберите — покажу документ на проверку, сам я ничего не выписываю.'), box2);
+        return;
+      }
+      // Названного клиента нет: заводить молча нельзя, но и промолчать плохо.
+      if (r.cpMissing) {
+        const add = h('button', { class: 'btn' }, `Завести «${r.who}»`);
+        add.onclick = () => { haptic('medium'); go('cp', { name: r.who }); };
+        // Обещание «сам я ничего не выписываю» повторяем и здесь: оно должно
+        // звучать на каждой ветке, а не только когда всё сошлось.
+        say('bot', `Клиента «${r.who}» у вас пока нет. Могу завести — имя подставлю, `
+          + 'останется ИНН и реквизиты.'
+          + (r.auto ? '' : ' А сам я ничего не выписываю — документ выпустите вы кнопкой.'), add);
+        return;
+      }
+      /*
+       * Включённый ассистент доводит до файла сам, выключенный — открывает
+       * форму с кнопкой. В этом и весь смысл тумблера; текст поэтому зависит
+       * от режима, а не прибит гвоздями.
+       */
+      // Дата из будущего выписывается только после взгляда на форму, даже у включённого ассистента.
+      if (r.auto && !r.dateFuture && r.cpId && (r.items || []).length) {
+        try {
+          const payload = {
+            type: r.docType, cpId: r.cpId, date: r.date || todayISO(),
+            items: r.items,
+          };
+          if (r.vatRate !== undefined) {
+            payload.vatRate = r.vatRate;
+            payload.priceIncludesVat = Boolean(r.priceIncludesVat);
+          }
+          const made = await api('POST', '/api/doc', payload);
+          haptic('heavy');
+          const openDoc = h('button', { class: 'btn secondary' }, 'Открыть документ');
+          openDoc.onclick = () => { haptic(); download(made.file); };
+          const note = noDebtNote(r.docType, made);
+          say('bot', `Выписал: ${made.doc.title} № ${made.doc.number} для «${r.cpName}» `
+            + `на ${money(made.total)}. Файл в чате с ботом; отсюда — кнопкой ниже. `
+            + 'Ненужное удаляется из журнала смахиванием.'
+            + (note ? ` ${note}` : ''), openDoc);
+          download(made.file);
+        } catch (e) { say('bot', e.message); }
+        return;
+      }
+      const btn = h('button', { class: 'btn' }, 'Заполнить документ');
+      btn.onclick = open(r.cpId ? { cpId: r.cpId } : {});
+      say('bot', r.cpName
+        ? `Готовлю документ для «${r.cpName}». Проверьте поля и нажмите выпуск`
+          + (r.auto ? '.' : ' — сам я ничего не выписываю.')
+        : 'Готовлю документ. Клиента выберете на следующем экране.', btn);
+      return;
+    }
+    /*
+     * Оплата — ассистент вносит её сам, а не отправляет в карточку клиента.
+     * Ровно то, ради чего его и включают.
+     */
+    if (r.action === 'pay') {
+      if (r.cpChoices && r.cpChoices.length) {
+        const pick = h('div', { class: 'btn-wrap' }, r.cpChoices.map((c) => h('button', {
+          class: 'btn secondary',
+          onclick: () => doPay(c.id, c.name, r.amount, r.kind, r.date),
+        }, c.name)));
+        say('bot', `По кому вносим — «${r.who}»?`, pick);
+        return;
+      }
+      if (r.cpMissing || !r.cpId) {
+        say('bot', r.who
+          ? `Клиента «${r.who}» у вас нет — по кому вносить оплату, непонятно.`
+          : 'По кому вносим? Назовите клиента, например «проведи оплату по Заре 50000».');
+        return;
+      }
+      if (!r.amount) {
+        const owed = Number(r.balance) || 0;
+        if (owed <= 0) {
+          say('bot', `За «${r.cpName}» долга сейчас нет. Назовите сумму — «оплата 50000».`);
+          return;
+        }
+        const yes = h('button', { class: 'btn' }, `Внести ${money(owed)}`);
+        yes.onclick = () => doPay(r.cpId, r.cpName, owed, r.kind, r.date);
+        say('bot', `За «${r.cpName}» числится ${money(owed)}. Внести эту сумму?`, yes);
+        return;
+      }
+      // Дата из будущего — всегда на подтверждение: в прошедшем времени так не говорят, вероятно, ошиблось распознавание.
+      if (!r.auto || r.dateFuture) {
+        const go2 = h('button', { class: 'btn' }, `Внести ${money(r.amount)}`);
+        go2.onclick = () => doPay(r.cpId, r.cpName, r.amount, r.kind, r.date);
+        say('bot', `Подготовил: ${r.kind} ${money(r.amount)} по «${r.cpName}»${r.dateText ? ` от ${r.dateText}` : ''}. `
+          + (r.dateFuture ? 'Эта дата ещё впереди — проверьте, что она верная. ' : '')
+          + 'Сам я ничего не провожу — нажмите, и внесу.', go2);
+        return;
+      }
+      await doPay(r.cpId, r.cpName, r.amount, r.kind, r.date);
+      return;
+    }
+    if (r.action === 'outofscope') {
+      /*
+       * Текст берём с сервера, а не пишем свой.
+       *
+       * Свой тут уже был, и он разошёлся с ботом: «а подскажу неверно —
+       * платить штраф вам» — порядок слов вывихнут, а смысл тот же.
+       * Кнопок и подстановок в этом ответе нет, держать его в двух местах
+       * незачем. Запасной текст оставлен на случай старого сервера.
+       */
+      say('bot', r.replyText
+        || 'Налоги, взносы, отчётность и зарплату я не веду. Спросите про документы, долги или сверку.');
+      return;
+    }
+    // Книга учёта: текст с сервера — куда прислать выписку.
+    if (r.action === 'kudir') { say('bot', r.replyText); return; }
+    // Напомнить должнику: экран «Напомнить о долге» с текстом; письмо уходит только кнопкой на нём.
+    if (r.action === 'remind') {
+      if (r.cpChoices && r.cpChoices.length) {
+        say('bot', r.replyText, h('div', { class: 'btn-wrap' }, r.cpChoices.map((c) => h('button', {
+          class: 'btn secondary', onclick: () => { haptic('medium'); go('reminders', { cpId: c.id }); },
+        }, c.name))));
+        return;
+      }
+      if (r.cpMissing || (r.cpId && !r.owes)) { say('bot', r.replyText); return; }
+      const open = h('button', { class: 'btn' }, r.cpId ? 'Открыть напоминание' : r.all ? 'Напомнить должникам' : 'Выбрать должника');
+      open.onclick = () => { haptic('medium'); go('reminders', r.cpId ? { cpId: r.cpId } : {}); };
+      say('bot', r.replyText, open);
+      return;
+    }
+    if (r.action === 'repeat') { showRepeat(r.repeat, r.replyText); return; }
+    if (r.action === 'akt') {
+      const range = r.period && r.period.to ? { from: r.period.from, to: r.period.to } : null;
+      if (r.cpMissing) { say('bot', r.replyText); return; }
+      if (r.cpChoices && r.cpChoices.length) {
+        say('bot', r.replyText, h('div', { class: 'btn-wrap' }, r.cpChoices.map((c) => h('button', {
+          class: 'btn secondary',
+          onclick: () => (range ? makeAkt(c.id, range, r.periodText) : go('akt')),
+        }, c.name))));
+        return;
+      }
+      if (r.cpId && range) {
+        // Период назван — не переспрашиваем: включённый ассистент собирает сразу, выключенный даёт кнопку.
+        if (r.auto) { await makeAkt(r.cpId, range, r.periodText); return; }
+        const make = h('button', { class: 'btn' }, 'Собрать акт');
+        make.onclick = () => makeAkt(r.cpId, range, r.periodText);
+        say('bot', r.replyText, make);
+        return;
+      }
+      const pick = h('button', { class: 'btn' }, range ? 'Выбрать клиента' : 'Выбрать период');
+      pick.onclick = () => { haptic('medium'); go('akt', range || {}); };
+      say('bot', r.replyText, pick);
+      return;
+    }
+    const known = ASK_GO[r.action];
+    if (known) {
+      // Журнал и «Ждут оплаты» за названный период открываются сразу на нём; поменять можно на самом экране.
+      const range = (r.action === 'docs' || r.action === 'unpaid') && r.period && r.period.to
+        ? { from: r.period.from, to: r.period.to } : null;
+      const btn = h('button', { class: 'btn' }, range ? `${known[0]} за ${r.periodText}` : known[0]);
+      btn.onclick = () => { haptic('medium'); go(known[1], range || {}); };
+      say('bot', range ? r.replyText : 'Понял.', btn);
+      return;
+    }
+    if (r.source === 'limit') {
+      say('bot', 'Разбор фраз на этот месяц исчерпан. Кнопки и команды работают как обычно.');
+      return;
+    }
+    if (r.source === 'off') {
+      say('bot', 'Свободный ввод сейчас выключен — пользуйтесь кнопками, они умеют всё то же самое.');
+      return;
+    }
+    // Отказ разбора — не то же самое, что «не понял». Раньше этой ветки не
+    // было, и человек с истёкшим ключом весь месяц правил формулировки,
+    // считая, что бот его не понимает.
+    if (r.source === 'error') {
+      say('bot', 'Разбор фраз сейчас не отвечает — это у меня, а не у вас. '
+        + 'Кнопки работают как обычно.');
+      return;
+    }
+    say('bot', 'Не понял. Скажите иначе — например: «кто мне должен» или «выставь счёт Заре на 30 тысяч».');
+  };
+
+  const send = async () => {
+    const text = field.value.trim();
+    if (!text) return;
+    field.value = '';
+    try { await answer(await api('POST', '/api/ask', { text })); } catch (e) { say('bot', e.message); }
+  };
+  field.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); send(); } };
+
+  const mic = h('button', { class: 'mic', 'aria-label': 'Записать голосом' }, icon('mic'));
+  let rec = null;
+  const micIdle = () => { mic.classList.remove('on'); mic.replaceChildren(icon('mic')); };
+
+  /* Остановить запись, отправить, показать ответ и, если он голосом, проиграть. */
+  const finish = async () => {
+    if (!rec) return;
+    const r0 = rec; rec = null;
+    micIdle();
+    const { audio, seconds } = await r0.stop();
+    if (!seconds) { say('bot', 'Запись пустая — кажется, микрофон не слышит.'); talk = false; paintChips(); return; }
+    say('bot', 'Слушаю…');
+    let r;
+    try { r = await api('POST', '/api/ask/voice', { audio, seconds, speak: speakOn || talk }); } catch (e) {
+      say('bot', e.message); talk = false; paintChips(); return;
+    }
+    await answer(r);
+    if (r.audio) await voicePlayer.play(r.audio).catch(() => {});
+    if (talk) listen();
+  };
+
+  /*
+   * Слушать. В режиме разговора запись останавливается сама: человек
+   * заговорил, потом секунду с лишним тишины — значит, договорил. Если за
+   * семь секунд не сказал ничего — выходим из разговора, а не слушаем пустоту.
+   */
+  const listen = async () => {
+    if (rec) return;
+    let spoke = false;
+    let quiet = 0;
+    let last = 0;
+    try {
+      haptic('medium');
+      mic.classList.add('on');
+      rec = await recordWav((sec, level) => {
+        mic.replaceChildren(h('span', { class: 'rec-sec', text: String(Math.floor(sec)) }));
+        const dt = sec - last; last = sec;
+        if (talk) {
+          if (level > 0.035) { spoke = true; quiet = 0; } else if (spoke) quiet += dt;
+          if (spoke && quiet > 1.3) { finish(); return; }
+          if (!spoke && sec > 7) {
+            const r0 = rec; rec = null; micIdle();
+            if (r0) r0.stop();
+            talk = false; paintChips();
+            say('bot', 'Не слышу вас — закончил разговор. Нажмите «Разговор», чтобы продолжить.');
+            return;
+          }
+        }
+        // Больше тридцати секунд «быстрый» метод не берёт, и ждать
+        // распознавания пришлось бы вдвое дольше самой записи.
+        if (sec >= REC_MAX_SEC) finish();
+      });
+    } catch (_) {
+      rec = null;
+      micIdle();
+      talk = false; paintChips();
+      say('bot', 'Не дали доступ к микрофону. Напишите текстом — пойму так же.');
+    }
+  };
+
+  mic.onclick = async () => {
+    voicePlayer.unlock();
+    voicePlayer.stop();
+    if (rec) { await finish(); return; }
+    listen();
+  };
+  speakBtn.onclick = () => {
+    speakOn = !speakOn;
+    try { localStorage.setItem('ask.speak', speakOn ? '1' : '0'); } catch (_) { /* не запомним — не беда */ }
+    haptic();
+    paintChips();
+  };
+  talkBtn.onclick = () => {
+    voicePlayer.unlock();
+    talk = !talk;
+    paintChips();
+    haptic('medium');
+    if (talk) {
+      say('bot', 'Слушаю. Говорите — я отвечу голосом и снова буду слушать.');
+      listen();
+    } else {
+      voicePlayer.stop();
+      if (rec) { const r0 = rec; rec = null; micIdle(); r0.stop(); }
+    }
+  };
+
+  const sendBtn = h('button', { class: 'mic send', 'aria-label': 'Отправить' }, icon('send'));
+  sendBtn.onclick = send;
+
+  box.append(log, h('div', { class: 'ask-bar' }, field, mic, sendBtn));
+  return box;
+};
+
+/** Счета, по которым не отметили оплату. */
+screens.unpaid = async function unpaid({ from, to } = {}) {
+  const [{ docs: list, count, sum }, { debtors }] = await Promise.all([
+    api('GET', `/api/unpaid${to ? `?${new URLSearchParams({ from: from || '', to })}` : ''}`),
+    api('GET', '/api/debtors'),
+  ]);
+  const box = h('div', {}, h('h1', { text: 'Ждут оплаты' }));
+  // За период — так открывает помощник на «неоплаченные за сентябрь»; полный список — кнопкой.
+  if (to) {
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px', id: 'unpaid-range',
+      text: `За период ${from ? `${ru(from)} — ` : 'по '}${ru(to)}.` }));
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn secondary', id: 'unpaid-all', onclick: () => { haptic(); go('unpaid'); } }, 'Все неоплаченные')));
+  }
+  if (!list.length) {
+    box.append(empty('check', to ? 'За этот период всё оплачено' : 'Всё оплачено',
+      'Здесь появятся счета, по которым не отмечена оплата.'));
+    return box;
+  }
+  /*
+   * Сумму и счётчик берём с сервера, а не складываем список.
+   * На одну сделку выписывают счёт и закрывающий его акт — складывая
+   * оба, экран показывал вдвое больше плитки, с которой на него пришли.
+   */
+  box.append(h('div', { class: 'hero' },
+    h('div', { class: 'sum money', text: money0(sum) }),
+    // Счётчик считает сделки, а строк ниже больше: подпись обязана это
+    // сказать, иначе «2 документа» над тремя строками выглядит ошибкой.
+    h('div', {
+      class: 'sub',
+      text: `${count} ${plural(count, 'сделка', 'сделки', 'сделок')} `
+        + `${plural(count, 'ждёт', 'ждут', 'ждут')} оплаты`
+        + (list.length > count
+          ? ` · ${list.length} ${plural(list.length, 'документ', 'документа', 'документов')}` : ''),
+    })));
+  // Напомнить можно только тому, кто сейчас действительно должен: без долга
+  // у клиента экран напоминаний был бы пустым, и кнопка вела бы в тупик.
+  const owing = new Set(debtors.filter((x) => x.theyOwe).map((x) => x.cpId));
+  box.append(h('div', { class: 'card' }, list.map((d) => {
+    /*
+     * Подпись — «ТОРГ-12 № 2 · 02.09 · 14 000 ₽», а клиент — заголовок.
+     * Второй документ сделки показываем, но помечаем: иначе непонятно,
+     * почему пять строк складываются в сумму четырёх.
+     * Акт за месяц сам долга не создаёт — его деньги уже в накладных месяца, — и суммой не считается.
+     */
+    const head = `${d.short} № ${d.number} · ${dm(d.date)}`;
+    const sub = d.pair && d.noDebt ? `${head} · деньги уже в накладных`
+      : d.pair ? `${head} · та же сделка`
+        : d.paid > 0 ? `${head} · осталось ${money0(d.left)} из ${money0(d.total)}`
+          : `${head} · ${money0(d.total)}`;
+    const row = docRow(d, { icon: 'clock', sub, onclick: () => go('doc', { id: d.id }) });
+    return !d.pair && owing.has(d.cpId)
+      ? actionRow(row, 'Напомнить', () => go('reminders', { cpId: d.cpId }))
+      : row;
+  })));
+  return box;
+};
+
+/** Реестр всех документов за период — файлом в Excel. */
+/**
+ * Как пользоваться.
+ *
+ * Раньше этот пункт просто закрывал приложение и высаживал человека в чат
+ * искать сообщение бота. Инструкция должна быть там, где возник вопрос.
+ */
+screens.help = async function help() {
+  const s = cache.quota ? cache : await api('GET', '/api/state');
+  const box = h('div', {}, h('h1', { text: 'Как пользоваться' }));
+
+  const step = (n, title, text) => h('div', { class: 'row' },
+    h('span', { class: 'icon-box' }, h('span', { class: 'num', style: 'font-weight:700', text: String(n) })),
+    h('span', { class: 'grow' },
+      h('div', { text: title }),
+      h('div', { class: 'small muted', text })));
+
+  box.append(h('div', { class: 'section-title', text: 'С чего начать' }));
+  box.append(h('div', { class: 'card' },
+    step(1, 'Заполните свою организацию', 'Введите ИНН — название и адрес подставятся сами. '
+      + 'Банк и счёт нужны, чтобы в счёте появился QR: клиент платит камерой.'),
+    step(2, 'Добавьте клиента', 'Тоже по ИНН. Реквизиты и почта запомнятся.'),
+    step(3, 'Нажмите «Выписать счёт»',
+      'Позиции запоминаются. Акт, УПД, накладная, договор и платёжка — плитками ниже. Сверка — в «Ещё».')));
+
+  box.append(h('div', { class: 'section-title', text: 'Полезно знать' }));
+  box.append(h('div', { class: 'card' },
+    navRow({ icon: 'wallet', title: 'Долг считается сам', sub: 'по акту или по счёту — зависит от вашего дела', onclick: () => go('basis') }),
+    navRow({ icon: 'box', title: 'Оплаты — из выписки банка', sub: 'не отмечать каждую руками', onclick: () => go('bank') }),
+    navRow({ icon: 'repeat', title: 'Одинаковые документы — по расписанию', sub: 'бот напомнит, выпишете кнопкой', onclick: () => go('recurring') }),
+    navRow({ icon: 'pen', title: 'Подпись и печать', sub: 'ложатся на документ снимком', onclick: () => go('org') })));
+
+  box.append(h('div', { class: 'section-title', text: 'Порядок в документах' }));
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'row' }, h('span', { class: 'grow' },
+      h('div', { text: 'Номера бот ведёт сам' }),
+      h('div', { class: 'small muted', text: 'сквозным рядом по годам, отдельно на каждый тип. '
+        + 'Перед выпуском номер и дату можно поправить.' }))),
+    h('div', { class: 'row' }, h('span', { class: 'grow' },
+      h('div', { text: 'Файл пересобирается по данным' }),
+      h('div', { class: 'small muted', text: 'поэтому документ можно выслать заново или повторить '
+        + 'новым номером даже спустя месяцы.' }))),
+    h('div', { class: 'row' }, h('span', { class: 'grow' },
+      h('div', { text: 'Вашим клиентам бот не пишет' }),
+      h('div', { class: 'small muted', text: 'напоминания и акты приходят вам — отправляете вы сами.' })))));
+
+  box.append(h('div', { class: 'section-title', text: 'Сколько осталось' }));
+  box.append(h('div', { class: 'card' }, h('div', { class: 'row' },
+    h('span', { class: `icon-box ${s.quota.paid ? 'ok' : ''}` }, icon(s.quota.paid ? 'check' : 'clock')),
+    h('span', { class: 'grow' },
+      h('div', { text: s.quota.paid ? 'Подписка активна' : `Осталось ${s.quota.left} из ${s.quota.limit}` }),
+      h('div', { class: 'small muted', text: s.quota.paid ? `до ${ru(s.access.until)}` : 'бесплатных документов в этом месяце' })))));
+
+  box.append(h('div', { class: 'btn-wrap' }, h('button', {
+    class: 'btn secondary', onclick: () => go('support'),
+  }, 'Остались вопросы — напишите нам')));
+  return box;
+};
+
+/**
+ * Акт сверки: выбор клиента.
+ *
+ * Раньше акт жил только внутри карточки клиента, и найти его снаружи было
+ * нельзя — приходилось знать, что он там. Документ, которым закрывают
+ * квартал, не должен требовать знания, где он спрятан.
+ */
+screens.akt = async function aktScreen(params = {}) {
+  const { cps: list } = await api('GET', '/api/cps');
+  const box = h('div', {}, h('h1', { text: 'Акт сверки' }));
+  if (!list.length) {
+    box.append(empty('users', 'Клиентов пока нет', 'Сверять не с кем — сначала добавьте клиента.',
+      h('div', { class: 'btn-wrap' }, h('button', { class: 'btn', onclick: () => go('cp', {}) }, 'Добавить клиента'))));
+    return box;
+  }
+
+  /*
+   * Период выбирается здесь. Раньше конец периода запоминался в карточке
+   * при первом акте и больше не менялся: второй акт печатал в шапке старую
+   * дату, а в таблицу складывал всё по сегодняшний день.
+   */
+  const now = new Date();
+  const iso = isoDate;
+  // Период мог прийти из фразы помощника («акт сверки за сентябрь») — тогда он уже стоит в полях.
+  const from = field('from', 'С какой даты', params.from || '', { type: 'date' });
+  const to = field('to', 'По какую', params.to || iso(now), { type: 'date' });
+
+  const setRange = (a, b) => {
+    from.input.value = a;
+    to.input.value = b;
+    haptic();
+  };
+  // Набор периодов тот же, что кнопками в боте (lib/period.js), чтобы
+  // «прошлый месяц» значил одно и то же и там, и здесь.
+  const qm = Math.floor(now.getMonth() / 3) * 3;
+  const quarterStart = new Date(now.getFullYear(), qm, 1);
+  const chips = h('div', { class: 'chips' },
+    h('button', { class: 'chip', onclick: () => setRange(iso(new Date(now.getFullYear(), now.getMonth(), 1)), iso(now)) }, 'Этот месяц'),
+    h('button', { class: 'chip', onclick: () => setRange(iso(new Date(now.getFullYear(), now.getMonth() - 1, 1)), iso(new Date(now.getFullYear(), now.getMonth(), 0))) }, 'Прошлый месяц'),
+    h('button', { class: 'chip', onclick: () => setRange(iso(quarterStart), iso(now)) }, 'Квартал'),
+    h('button', { class: 'chip', onclick: () => setRange(iso(new Date(now.getFullYear(), qm - 3, 1)), iso(new Date(now.getFullYear(), qm, 0))) }, 'Прошлый квартал'),
+    h('button', { class: 'chip', onclick: () => setRange(`${now.getFullYear()}-01-01`, iso(now)) }, 'Год'),
+    h('button', { class: 'chip', onclick: () => setRange('', iso(now)) }, 'За всё время'));
+
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Excel с журналом операций и балансом придёт в чат с ботом. Пустая дата начала — '
+      + 'от начала расчётов, с долгом на начало из карточки клиента.' }));
+  box.append(h('div', { class: 'section-title', text: 'Период' }));
+  box.append(h('div', { class: 'card' }, from, to), chips);
+
+  box.append(h('div', { class: 'section-title', text: 'С кем сверяемся' }));
+  const sorted = [...list].sort((a, b) => Math.abs(b.balance || 0) - Math.abs(a.balance || 0));
+  box.append(h('div', { class: 'card' }, sorted.map((c) => navRow({
+    icon: 'users',
+    title: c.name,
+    sub: c.balance ? (onPrepay(c) ? 'на предоплате' : (owesUs(c) ? 'должен нам' : 'должны мы')) : 'расчёты закрыты',
+    right: c.balance ? money0(Math.abs(c.balance)) : '',
+    rightTone: balanceTone(c),
+    onclick: async () => {
+      try {
+        const q = new URLSearchParams({ cp: String(c.id) });
+        if (from.input.value) q.set('from', from.input.value);
+        if (to.input.value) q.set('to', to.input.value);
+        const r = await api('GET', `/api/akt?${q}`);
+        haptic('medium');
+        toast(`Баланс на конец: ${money0(Math.abs(r.closing))} · операций ${r.ops}`);
+        download(r.file);
+      } catch (e) { toast(e.message, true); }
+    },
+  }))));
+  return box;
+};
+
+screens.registry = async function registry() {
+  const now = new Date();
+  const first = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+  const box = h('div', {}, h('h1', { text: 'Реестр документов' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Таблица всех выписанных документов за период — с суммами, клиентами и итогом. '
+      + 'Открывается в Excel, годится для сдачи бухгалтеру.' }));
+  const from = field('from', 'С какого числа', first, { type: 'date' });
+  const to = field('to', 'По какое', todayISO(), { type: 'date' });
+  box.append(h('div', { class: 'card' }, from, to));
+
+  const make = h('button', { class: 'btn' }, 'Собрать реестр');
+  make.onclick = () => withBusy(make, async () => {
+    const r = await api('GET', `/api/registry?from=${from.input.value}&to=${to.input.value}`);
+    if (!r.count) { toast('За этот период документов нет', true); return; }
+    haptic('medium');
+    toast(`${r.count} ${plural(r.count, 'документ', 'документа', 'документов')} на ${money0(r.total)}`);
+    download(r.file);
+  });
+  box.append(h('div', { class: 'btn-wrap' }, make));
+  return box;
+};
+
+/* ---------- платёжка и договор ---------- */
+
+/**
+ * Документы, которые набираются не позициями, а парой полей.
+ *
+ * Платёжку выписывают поставщику, чтобы отдать в банк; договор — чтобы
+ * закрепить условия. В боте это было с самого начала, в приложении не было
+ * вовсе, и половина типов документов оставалась недоступна.
+ */
+screens.other = async function other({ type, cpId }) {
+  const isPp = type === 'pp';
+  const { cps } = await api('GET', '/api/cps');
+  if (!cps.length) {
+    return empty('users', 'Сначала добавьте клиента',
+      'Документ выписывается на кого-то — без второй стороны его не собрать.',
+      h('div', { class: 'btn-wrap' }, h('button', { class: 'btn', onclick: () => go('cp', {}) }, 'Добавить клиента')));
+  }
+
+  const box = h('div', {}, h('h1', { text: isPp ? 'Платёжное поручение' : 'Договор' }));
+  // Реквизитов своей организации нет — документ без них не собрать; говорим об этом до формы (как в новом документе).
+  const stO = cache.user ? cache : await api('GET', '/api/state').catch(() => ({}));
+  if (stO && stO.user && !stO.org) {
+    box.append(h('div', { class: 'banner', id: 'need-org' }, icon('warn'),
+      h('div', {},
+        h('div', { text: 'Сначала — ваши реквизиты' }),
+        h('div', { class: 'small muted', style: 'margin-top:2px',
+          text: 'В документе печатаются ваше название и расчётный счёт. Это один раз.' }),
+        h('button', {
+          class: 'btn', style: 'margin-top:10px', id: 'need-org-go',
+          onclick: () => { haptic(); go('org'); },
+        }, 'Заполнить реквизиты'))));
+  }
+  const who = h('select', { id: 'f-cp' }, cps.map((c) => h('option', {
+    value: c.id, selected: Number(cpId) === c.id,
+  }, c.name)));
+  const date = field('date', 'Дата', todayISO(), { type: 'date' });
+  const num = field('number', 'Номер', '', { placeholder: 'подставлю сам' });
+
+  const fields = isPp
+    ? {
+      amount: field('amount', 'Сумма, ₽', '', { inputmode: 'decimal', required: true }),
+      purpose: field('purpose', 'Назначение платежа', '', {
+        multiline: true, required: true,
+        placeholder: 'Оплата по счёту № 12 от 01.08.2026, в том числе НДС 22%',
+      }),
+    }
+    : {
+      subject: field('subject', 'Предмет договора', '', {
+        multiline: true, required: true,
+        placeholder: 'услуги по организации фуршетного обслуживания',
+      }),
+      amount: field('amount', 'Сумма договора, ₽', '', {
+        inputmode: 'decimal', hint: 'Ноль — если платим по счетам',
+      }),
+      term: field('term', 'Действует до', '', { placeholder: '31.12.2026' }),
+    };
+
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'field' },
+      h('label', { for: 'f-cp', text: isPp ? 'Получатель платежа' : 'Вторая сторона' }), who),
+    date, num));
+  const stdCard = h('div', { class: 'card' }, Object.values(fields));
+  box.append(stdCard);
+
+  /*
+   * Свой договор. Есть шаблон (для этого клиента или для всех) — вместо
+   * трёх полей типового спрашиваем поля шаблона. «Типовой вместо своего» —
+   * на случай, когда для этой сделки свой не подходит.
+   */
+  let tplActive = null;
+  let typical = false;
+  const tplInputs = {};
+  const tplCard = h('div', { class: 'card' });
+  const paintTpl = () => {
+    const useTpl = Boolean(tplActive) && !typical;
+    stdCard.style.display = useTpl ? 'none' : '';
+    tplCard.style.display = tplActive ? '' : 'none';
+    tplCard.replaceChildren();
+    Object.keys(tplInputs).forEach((k) => { delete tplInputs[k]; });
+    if (!tplActive) return;
+    if (useTpl) {
+      tplCard.append(h('p', { class: 'small muted', style: 'margin:12px 16px 0', text: `По вашему договору «${tplActive.title}». Реквизиты сторон подставятся сами.` }));
+      for (const f of tplActive.fields) {
+        const fl = field(`t-${f.key}`, f.label, '', {
+          inputmode: f.type === 'money' || f.type === 'number' ? 'decimal' : undefined,
+          placeholder: f.example || '',
+        });
+        tplInputs[f.key] = fl;
+        tplCard.append(fl);
+      }
+      tplCard.append(h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn secondary', onclick: () => { typical = true; paintTpl(); },
+      }, 'Типовой договор вместо своего')));
+    } else {
+      tplCard.append(h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn secondary', onclick: () => { typical = false; paintTpl(); },
+      }, `Вернуть свой договор «${tplActive.title}»`)));
+    }
+  };
+  const loadTpl = async () => {
+    if (isPp) return;
+    try { tplActive = (await api('GET', `/api/mycontract?cpId=${Number(who.value)}`)).active; } catch (_) { tplActive = null; }
+    paintTpl();
+  };
+  if (!isPp) {
+    box.append(tplCard);
+    who.addEventListener('change', loadTpl);
+    await loadTpl();
+    box.append(ownContractCard({ cpId: () => Number(who.value), cpName: () => (who.selectedOptions[0] || {}).textContent || '', reload: loadTpl }));
+  }
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: isPp
+      ? 'Форма 0401060 — та, что принимает банк. Ваши реквизиты и реквизиты получателя подставятся сами.'
+      : 'Простой договор на услуги: реквизиты обеих сторон, предмет, сумма и срок. Подпись и печать не ставятся — договор подписывают живой рукой.' }));
+
+  const make = h('button', { class: 'btn' }, 'Выписать');
+  make.onclick = () => withBusy(make, async () => {
+    clearErrors(fields);
+    const amount = Number(String((fields.amount.input.value) || '').replace(/\s/g, '').replace(',', '.')) || 0;
+    if (isPp && !amount) { showError(fields.amount, 'Укажите сумму'); return; }
+    if (isPp && !fields.purpose.input.value.trim()) { showError(fields.purpose, 'Банк не примет платёж без назначения'); return; }
+    const useTpl = !isPp && tplActive && !typical;
+    if (!isPp && !useTpl && !fields.subject.input.value.trim()) { showError(fields.subject, 'Без предмета договор не собрать'); return; }
+    const tplPart = useTpl
+      ? { tplId: tplActive.id, values: Object.fromEntries(Object.entries(tplInputs).map(([k, fl]) => [k, fl.input.value.trim()])) }
+      : {};
+    const r = await api('POST', '/api/doc/other', {
+      ...tplPart,
+      type,
+      cpId: Number(who.value),
+      date: date.input.value,
+      number: num.input.value.trim(),
+      amount,
+      purpose: isPp ? fields.purpose.input.value.trim() : '',
+      subject: isPp ? '' : fields.subject.input.value.trim(),
+      term: isPp ? '' : fields.term.input.value.trim(),
+    });
+    haptic('medium');
+    toast('Готово — файл в чате с ботом');
+    download(r.file);
+    await afterIssue(r.doc && r.doc.id);
+  });
+  box.append(h('div', { class: 'btn-wrap' }, make));
+  return box;
+};
+
+/* ---------- свой договор и разбор чужого ---------- */
+
+/** Файл → dataUrl. Фото ужимаем: тело запроса не больше двух мегабайт. */
+async function fileToDataUrl(file) {
+  if (/^image\//.test(file.type)) return shrinkImage(file, 2200, 1300 * 1024);
+  if (file.size > 1400 * 1024) throw new Error('Файл больше 1,4 МБ — пришлите его в чат с ботом, там до 20 МБ.');
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(fr.result);
+    fr.onerror = () => rej(new Error('Не удалось прочитать файл.'));
+    fr.readAsDataURL(file);
+  });
+}
+
+function pickFile(accept, onFile) {
+  const inp = h('input', { type: 'file', accept, style: 'display:none' });
+  inp.onchange = () => { const f = inp.files && inp.files[0]; inp.value = ''; if (f) onFile(f); };
+  return inp;
+}
+
+/*
+ * Карточка «Свой договор» на экране договора: загрузить свой (бот найдёт,
+ * что меняется) и проверить чужой (риски, сроки, деньги).
+ */
+function ownContractCard({ cpId, cpName, reload }) {
+  const out = h('div', {});
+  const ACCEPT = '.docx,.pdf,image/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  const upInput = pickFile(ACCEPT, async (file) => {
+    out.replaceChildren(h('p', { class: 'small muted', style: 'margin:12px 18px', text: 'Читаю договор — это до минуты…' }));
+    try {
+      const r = await api('POST', '/api/mycontract/analyze', { dataUrl: await fileToDataUrl(file), name: file.name });
+      const t = r.template;
+      const save = async (forCp) => {
+        await api('POST', '/api/mycontract/save', { template: t, cpId: forCp ? cpId() : 0 });
+        haptic('medium');
+        toast(`Сохранил «${t.title}»`);
+        out.replaceChildren();
+        await reload();
+      };
+      out.replaceChildren(h('div', { class: 'card' },
+        h('p', { style: 'margin:12px 16px 4px', text: `${t.title} — прочитал.` }),
+        h('p', { class: 'small muted', style: 'margin:0 16px 8px', text: r.ask.length
+          ? `Буду спрашивать: ${r.ask.map((f) => f.label).join(', ')}. Клиента, реквизиты, номер и дату подставлю сам.`
+          : 'Меняющихся мест, кроме клиента и реквизитов, не нашёл.' }),
+        h('div', { class: 'btn-wrap' },
+          h('button', { class: 'btn', onclick: () => save(false) }, 'Сохранить для всех клиентов'),
+          h('button', { class: 'btn secondary', onclick: () => save(true) }, `Только для «${cpName()}»`))));
+    } catch (e) { out.replaceChildren(h('p', { class: 'small', style: 'margin:12px 18px', text: e.message })); }
+  });
+  const revInput = pickFile(ACCEPT, async (file) => {
+    out.replaceChildren(h('p', { class: 'small muted', style: 'margin:12px 18px', text: 'Разбираю договор — это до минуты…' }));
+    try {
+      const { review: rv } = await api('POST', '/api/contract/review', { dataUrl: await fileToDataUrl(file), name: file.name });
+      const LEVEL = { high: 'высокий риск', medium: 'средний риск', low: 'небольшой риск' };
+      const row = (t, v) => (v ? h('p', { class: 'small', style: 'margin:4px 16px' }, h('b', { text: `${t}: ` }), v) : null);
+      out.replaceChildren(h('div', { class: 'card' },
+        h('p', { style: 'margin:12px 16px 4px;font-weight:600', text: `${rv.title}${rv.ref ? ` · ${rv.ref}` : ''}` }),
+        rv.summary ? h('p', { class: 'small', style: 'margin:4px 16px 8px', text: rv.summary }) : null,
+        row('Предмет', rv.subject), row('Сумма', rv.amount), row('Оплата', rv.payment),
+        row('Сроки', rv.dates), row('Штрафы', rv.penalties), row('Расторжение', rv.termination),
+        ...(rv.risks || []).map((x) => h('p', { class: 'small', style: 'margin:6px 16px' },
+          h('span', { class: `risk-dot ${LEVEL[x.level] ? x.level : 'medium'}`, title: LEVEL[x.level] || LEVEL.medium }), x.text, x.fix ? h('div', { class: 'muted', text: `Как поправить: ${x.fix}` }) : null)),
+        h('p', { class: 'small muted', style: 'margin:10px 16px 14px',
+          text: 'Это справка, а не юридическое заключение — серьёзные риски покажите юристу. Вопросы по договору можно задать «Помощнику».' })));
+    } catch (e) { out.replaceChildren(h('p', { class: 'small', style: 'margin:12px 18px', text: e.message })); }
+  });
+  return h('div', {},
+    h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn secondary', onclick: () => upInput.click() }, icon('upload', 'icon inline'), 'Загрузить свой договор'),
+      h('button', { class: 'btn secondary', onclick: () => revInput.click() }, icon('search', 'icon inline'), 'Проверить чужой договор')),
+    upInput, revInput, out);
+}
+
+/* ---------- напоминания должникам ---------- */
+
+/**
+ * Готовый текст для каждого должника.
+ *
+ * Писать контрагентам сами мы не будем: согласия на это они не давали, а
+ * адресов у нас нет. Отдаём текст — человек отправит его от своего имени.
+ */
+screens.reminders = async function reminders({ cpId } = {}) {
+  const all = await api('GET', '/api/reminders');
+  const { canMail } = all;
+  // Пришли из строки одного должника — показываем только его.
+  const list = cpId ? all.reminders.filter((r) => r.cpId === Number(cpId)) : all.reminders;
+  const box = h('div', {}, h('h1', { text: 'Напомнить о долге' }));
+  if (!list.length) {
+    box.append(empty('check', 'Должников нет', 'Некому напоминать — все рассчитались.'));
+    return box;
+  }
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: canMail
+      ? 'Текст можно поправить и отправить с вашей почты — вместе с актом сверки. '
+        + 'Или скопировать и отправить как удобно.'
+      : 'Скопируйте текст и отправьте должнику сами. Чтобы отправлять письмом '
+        + 'прямо отсюда, подключите свою почту.' }));
+  if (!canMail) {
+    box.append(h('div', { class: 'btn-wrap' }, h('button', { class: 'btn secondary', id: 'rm-connect', onclick: () => go('mail') },
+      icon('mail', 'icon inline'), 'Подключить почту')));
+  }
+
+  for (const r of list) {
+    const card = h('div', { class: 'card' });
+    card.append(h('div', { class: 'row' },
+      h('span', { class: 'icon-box' }, icon('users')),
+      h('span', { class: 'grow' },
+        h('div', { class: 'ellipsis', text: r.name }),
+        h('div', { class: 'small muted', text: 'должен нам' })),
+      h('span', { class: 'money in nowrap', text: money0(r.amount) })));
+
+    /*
+     * Текст правится прямо здесь. Готовая формулировка подходит не всякому
+     * клиенту: с одним говорят строже, с другим мягче, а с третьим уже
+     * договорились по телефону. Отправлять чужими словами то, что испортит
+     * отношения с плательщиком, — плохая услуга.
+     */
+    const text = h('textarea', { class: 'remind-text', id: `rm-${r.cpId}` });
+    text.value = r.text;
+    // Высота по содержимому: письмо, обрезанное на полуслове, не перечитают,
+    // а перечитать его — весь смысл этого экрана.
+    const grow = () => { text.style.height = 'auto'; text.style.height = `${text.scrollHeight}px`; };
+    text.addEventListener('input', grow);
+    /*
+     * Письмо — в раскрывающемся блоке. Три должника подряд давали три письма
+     * по тридцать строк, а кнопка «Отправить» уезжала под них. Теперь у каждого
+     * видна строка с суммой, почта и «Отправить», а текст открывается по
+     * нажатию (у одного должника он открыт сразу — читать там больше нечего).
+     */
+    const letter = h('details', { class: 'letter', ...(list.length === 1 ? { open: '' } : {}) },
+      h('summary', {}, 'Текст письма', h('span', { class: 'small muted', text: ' — прочитать и поправить' })),
+      h('div', { class: 'field' }, h('label', { class: 'sr-only', for: `rm-${r.cpId}`, text: 'Текст письма' }), text));
+    letter.addEventListener('toggle', () => { if (letter.open) grow(); });
+    requestAnimationFrame(grow);
+
+    const copy = h('button', { class: 'btn secondary' }, 'Скопировать');
+    copy.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(text.value);
+        haptic('medium');
+        toast('Текст скопирован');
+      } catch (_) {
+        toast('Скопируйте вручную — браузер не дал доступ к буферу', true);
+      }
+    };
+
+    if (!canMail) {
+      card.append(letter);
+      box.append(card, h('div', { class: 'btn-wrap' }, copy));
+      continue;
+    }
+
+    const mail = field('to', 'Почта клиента', r.email, {
+      type: 'email', placeholder: 'buh@company.ru',
+      hint: r.email ? 'Сохранена в карточке клиента' : 'Запомню её для этого клиента',
+    });
+    card.append(mail, letter);
+
+    const send = h('button', { class: 'btn' }, 'Отправить с моей почты');
+    send.onclick = (e) => withBusy(e.currentTarget, async () => {
+      clearErrors({ mail });
+      const to = mail.input.value.trim();
+      if (!to) { showError(mail, 'Некуда отправлять — укажите почту'); return; }
+      const res = await api('POST', '/api/reminder/mail', {
+        cpId: r.cpId, email: to, text: text.value,
+      });
+      haptic('medium');
+      toast(res.withAkt ? `Отправлено на ${res.sent} вместе с актом сверки` : `Отправлено на ${res.sent}`);
+    });
+
+    box.append(card, h('div', { class: 'btn-wrap' }, send),
+      h('div', { class: 'btn-wrap', style: 'padding-top:0' }, copy));
+  }
+  return box;
+};
+
+/* ---------- поддержка ---------- */
+
+screens.support = async function support() {
+  const box = h('div', {}, h('h1', { text: 'Поддержка' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Опишите, что случилось. Ответим в чате с ботом — там же, где приходят документы.' }));
+  const text = field('text', 'Сообщение', '', {
+    multiline: true, required: true,
+    placeholder: 'Например: счёт выписался без QR-кода, хотя банк заполнен',
+  });
+  box.append(h('div', { class: 'card' }, text));
+  const send = h('button', { class: 'btn' }, 'Отправить');
+  send.onclick = () => withBusy(send, async () => {
+    clearErrors({ text });
+    if (text.input.value.trim().length < 5) { showError(text, 'Пары слов мало — опишите подробнее'); return; }
+    const r = await api('POST', '/api/support', { text: text.input.value.trim() });
+    haptic('medium');
+    toast(r.sent ? 'Отправлено — ответим в чате' : 'Поддержка сейчас недоступна, напишите боту');
+    back();
+  });
+  box.append(h('div', { class: 'btn-wrap' }, send));
+
+  const supInfo = h('div', { class: 'small muted legal-links', style: 'margin:24px 18px 12px; line-height:1.7; text-align:center;' });
+  supInfo.innerHTML = 'Telegram: <a href="https://t.me/flowcraft_agent" target="_blank" style="color:var(--accent);">@flowcraft_agent</a> · Email: <a href="mailto:support@pervichkaru.ru" style="color:var(--accent);">support@pervichkaru.ru</a><br>'
+    + '<a href="/terms" target="_blank" style="color:var(--accent);">Пользовательское соглашение</a> · '
+    + '<a href="/privacy" target="_blank" style="color:var(--accent);">Конфиденциальность</a> · '
+    + '<a href="/tariffs" target="_blank" style="color:var(--accent);">Тарифы</a><br>'
+    + '<span style="font-family:monospace; font-size:11px; opacity:0.65;">Проверочный код: plat chek</span>';
+  box.append(supInfo);
+
+  return box;
+};
+
+/* ---------- снимок счёта ---------- */
+
+/**
+ * Фотография счёта от поставщика: распознаём сумму и дату, чтобы не
+ * перебивать их руками. Работает, только если подключён внешний сервис —
+ * и об этом говорим прямо, а не молчим.
+ */
+/**
+ * Загрузка банковской выписки.
+ *
+ * Экран показывает найденные поступления и то, кому они, по нашему мнению,
+ * относятся, — но ничего не заносит сам. Галочки проставлены только там, где
+ * клиент угадан уверенно; остальное человек либо выбирает руками, либо
+ * оставляет как есть. Автоматически закрытый не тот долг обнаруживается
+ * через месяц и стоит дороже, чем минута на проверку.
+ */
+screens.bank = async function bankScreen() {
+  const box = h('div', {}, h('h1', { text: 'Выписка из банка' }));
+  /*
+   * Три шага вместо абзаца. Сплошной текст читали до половины и не видели, что
+   * от человека нужно одно действие — выбрать файл; кнопка прижималась к
+   * последней строке. Слова прежние, только разложены по порядку, в котором
+   * всё и происходит.
+   */
+  const bankStep = (n, title, sub) => h('div', { class: 'row step plain' },
+    h('span', { class: 'step-n', 'aria-hidden': 'true', text: String(n) }),
+    h('span', { class: 'grow' },
+      h('div', { text: title }),
+      h('div', { class: 'small muted step-sub', text: sub })));
+  box.append(h('div', { class: 'card steps', id: 'bank-steps' },
+    bankStep(1, 'Выгрузите выписку', 'В интернет-банке: 1С «Клиент-Банк», Excel, OFX или CSV'),
+    bankStep(2, 'Пришлите файл сюда', 'Найду поступления и покажу, от кого они'),
+    bankStep(3, 'Отметьте нужные', 'Они попадут в журнал как оплаты')));
+
+  const cps = (await api('GET', '/api/cps')).cps || [];
+  const input = h('input', {
+    type: 'file',
+    accept: '.csv,.txt,.ofx,.qfx,.xlsx,.xls,.pdf,text/csv,text/plain,'
+      + 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    style: 'display:none',
+  });
+  const pick = h('button', { class: 'btn' }, icon('upload', 'icon inline'), 'Выбрать файл выписки');
+  const result = h('div', {});
+  pick.onclick = () => input.click();
+
+  input.addEventListener('change', async () => {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    if (file.size > 1.4 * 1024 * 1024) {
+      result.replaceChildren(h('div', { class: 'banner' }, icon('warn'),
+        h('div', { text: 'Файл больше 1,4 МБ. Выгрузите выписку за месяц, а не за год.' })));
+      return;
+    }
+    result.replaceChildren(h('div', { class: 'boot' }, h('span', { class: 'spinner' }), 'Читаю выписку…'));
+    try {
+      const dataUrl = await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onload = () => resolve(String(fr.result));
+        fr.onerror = () => reject(new Error('Не удалось прочитать файл.'));
+        fr.readAsDataURL(file);        // байты как есть: кодировку разберёт сервер
+      });
+      const r = await api('POST', '/api/bank/parse', { dataUrl });
+      result.replaceChildren(bankRows(r, cps));
+      haptic('medium');
+    } catch (e) {
+      result.replaceChildren(h('div', { class: 'banner' }, icon('warn'), h('div', { text: e.message })));
+    }
+  });
+
+  box.append(h('div', { class: 'btn-wrap' }, pick), input);
+  // Книга учёта собирается в чате: сюда за ней приходили и не находили.
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Книгу учёта доходов собирает бот: пришлите этот же файл в чат с ботом — '
+      + 'под разбором будет кнопка «Собрать книгу».' }));
+  box.append(result);
+  return box;
+};
+
+/** Разобранная выписка: список поступлений с выбором клиента. */
+function bankRows(r, cps) {
+  const box = h('div', {});
+  const fresh = r.rows.filter((t) => !t.known);
+
+  const sum = fresh.reduce((a, t) => a + t.amount, 0);
+  box.append(h('div', { class: 'hero' },
+    h('div', { class: 'sum money in', text: money0(sum) }),
+    // «Найдено», а не «занесено»: крупная зелёная сумма иначе читается как
+    // итог операции, хотя в журнал попадёт только отмеченное ниже.
+    h('div', { class: 'sub',
+      text: `найдено ${fresh.length} ${plural(fresh.length, 'поступление', 'поступления', 'поступлений')}`
+        + ` · разобрано строк ${r.total}`
+        + (r.outgoing ? `, списаний ${r.outgoing}` : '')
+        + (r.rows.length - fresh.length ? `, уже загружено ${r.rows.length - fresh.length}` : '') })));
+
+  if (!fresh.length) {
+    box.append(empty('check', 'Новых поступлений нет',
+      'Все строки этой выписки уже занесены в журнал — повторно они не пройдут.'));
+    return box;
+  }
+
+  const chosen = new Map();          // key → cpId
+  const card = h('div', { class: 'card' });
+  const save = h('button', { class: 'btn' }, 'Занести оплаты');
+
+  const relabel = () => {
+    const n = chosen.size;
+    save.textContent = n
+      ? `Занести ${n} ${plural(n, 'оплату', 'оплаты', 'оплат')}`
+      : 'Выберите клиентов';
+    save.disabled = !n;
+  };
+
+  for (const t of fresh) {
+    // Предполагаемого клиента ставим первым в списке и подписываем: строка
+    // сама его не выберет, но искать его среди полусотни имён не придётся.
+    const order = t.cp
+      ? [...cps.filter((c) => c.id === t.cp.id), ...cps.filter((c) => c.id !== t.cp.id)]
+      : cps;
+    const sel = h('select', {},
+      h('option', { value: '', text: '— не заносить —' }),
+      order.map((c) => h('option', {
+        value: String(c.id),
+        text: t.cp && c.id === t.cp.id && t.confidence < 60 ? `${c.name} — похоже` : c.name,
+      })));
+    // Уверенное совпадение отмечаем сразу, сомнительное показываем, но не
+    // выбираем: молча угаданный клиент — это и есть ошибочная проводка.
+    if (t.cp && t.confidence >= 60) {
+      sel.value = String(t.cp.id);
+      chosen.set(t.key, t.cp.id);
+    }
+    sel.onchange = () => {
+      if (sel.value) chosen.set(t.key, Number(sel.value));
+      else chosen.delete(t.key);
+      relabel();
+      haptic();
+    };
+
+    card.append(h('div', { class: 'pay' },
+      h('div', { class: 'row' },
+        h('span', { class: 'grow' },
+          h('div', { class: 'ellipsis', text: t.name || 'без названия' }),
+          h('div', { class: 'sub-line' },
+            h('span', { class: 'small muted nowrap', text: ru(t.date) }),
+            // Кого именно предлагаем — видно в списке ниже, поэтому здесь
+            // только повод присмотреться, без имени: оно всё равно не
+            // помещается в строку и обрывается многоточием.
+            t.cp && t.confidence < 60 && h('span', { class: 'badge', text: 'проверьте клиента' }),
+            // Ничья и «никого не нашли» — разные вещи, и раньше выглядели
+            // одинаково: бот обещал «выберите нужного в приложении», а
+            // приложение показывало «клиент не найден» и полный список.
+            !t.cp && t.ambiguous && h('span', { class: 'badge', text: 'совпал с двумя' }),
+            !t.cp && !t.ambiguous && h('span', { class: 'badge', text: 'клиент не найден' }))),
+        h('span', { class: 'money in nowrap', text: money(t.amount) })),
+      t.purpose && h('div', { class: 'pay-note small muted', text: t.purpose }),
+      !t.cp && t.ambiguous && (t.rivals || []).length && h('div', {
+        class: 'pay-note small muted',
+        text: `Похоже сразу на двоих: ${(t.rivals || []).join(' и ')}. Выберите нужного.`,
+      }),
+      h('div', { class: 'pay-pick' }, sel)));
+  }
+  relabel();
+
+  save.onclick = () => withBusy(save, async () => {
+    const rows = fresh.filter((t) => chosen.has(t.key)).map((t) => ({
+      key: t.key, cpId: chosen.get(t.key), amount: t.amount, date: t.date,
+      doc: t.doc ? `Оплата, п/п № ${t.doc}` : 'Оплата по выписке',
+      // Назначение платежа нужно серверу, чтобы найти документ по номеру («по накладной № 3»).
+      purpose: t.purpose || '',
+    }));
+    if (!rows.length) { toast('Не выбран ни один клиент', true); return; }
+    const res = await api('POST', '/api/bank/import', { rows });
+    haptic('medium');
+    toast(res.added
+      ? `Занесено ${res.added} ${plural(res.added, 'оплата', 'оплаты', 'оплат')}`
+      : 'Ничего не занесено');
+    /*
+     * Деньги в журнале, но счета всё ещё висят в «не оплачено». Связь
+     * «пришло 30 000 от Зари — значит, счёт № 7 закрыт» видна из сумм, и
+     * незачем заставлять человека проходить её руками по одному документу.
+     *
+     * Показываем и ждём нажатия: закрыть долг за человека нельзя. Ошибку
+     * заметят через месяц, когда клиент не заплатит, а счёт уже помечен.
+     */
+    // Самозанятому каждое поступление — отдельный чек; про него говорим сразу, как только деньги легли.
+    if (Array.isArray(res.deals) && res.deals.length) {
+      reset('bankclose', { deals: res.deals, leftovers: res.leftovers || [], npd: Boolean(res.npd) });
+      return;
+    }
+    reset(res.npd ? 'cheques' : 'debts');
+  });
+  box.append(card, h('div', { class: 'btn-wrap' }, save));
+  return box;
+}
+
+/**
+ * Второй шаг после выписки: какие счета закрыли пришедшие деньги.
+ *
+ * Отдельным экраном, а не галочками рядом с оплатами: это другое решение.
+ * Первое — «эти деньги пришли», второе — «и они закрывают вот эти счета».
+ * Смешав их в один список, мы бы получили нажатие, после которого человек
+ * не знает точно, что именно подтвердил.
+ *
+ * Экран строится из того, что уже посчитал сервер: заново он ничего не
+ * подбирает. Человек подтверждает ровно тот список, который видит.
+ */
+screens.bankclose = async function bankClose(params) {
+  const deals = Array.isArray(params.deals) ? params.deals : [];
+  const leftovers = Array.isArray(params.leftovers) ? params.leftovers : [];
+  const box = h('div', {}, h('h1', { text: 'Эти счета закрыты' }));
+  if (!deals.length) {
+    box.append(empty('check', 'Нечего закрывать',
+      'Пришедшие деньги не закрыли ни одного счёта целиком.'));
+    return box;
+  }
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Деньги уже в журнале. Осталось снять счета с ожидания — проверьте и подтвердите.' }));
+
+  /*
+   * Строки не нажимаются: это список на подтверждение, а не меню. Поэтому
+   * обычный div, а не navRow — тот рисует стрелку, а стрелка обещает
+   * переход, которого не будет.
+   */
+  const line = (ic, title, sub, right, tone) => h('div', { class: 'row' },
+    h('span', { class: `icon-box ${tone || ''}` }, icon(ic)),
+    h('span', { class: 'grow' },
+      h('div', { class: 'ellipsis', text: title }),
+      sub && h('div', { class: 'sub-line' }, h('span', { class: 'small muted', text: sub }))),
+    h('span', { class: 'money nowrap', text: right }));
+
+  // Частичная оплата: плательщик назвал документ в назначении, но денег пришло
+  // меньше, чем надо. Документ остаётся неоплаченным на остаток.
+  box.append(h('div', { class: 'card' }, deals.map((d) => line(
+    'doc-check', d.title,
+    d.partial
+      ? `${d.cpName} · частично, останется ${money0(d.left)}`
+      : (d.alsoTitle ? `${d.cpName} · и ${d.alsoTitle} — та же сделка` : d.cpName),
+    money0(d.total), d.partial ? '' : 'ok'))));
+  if (leftovers.length) {
+    box.append(h('div', { class: 'section-title', text: 'Не легло ни на один счёт' }));
+    box.append(h('div', { class: 'card' }, leftovers.map((l) => line(
+      'wallet', l.cpName, 'счёт не выписан или оплата частичная', money0(l.amount)))));
+  }
+
+  const docs = deals.filter((d) => !d.partial).reduce((n, d) => n + (d.twinId ? 2 : 1), 0);
+  const done = h('button', { class: 'btn' }, docs ? `Отметить оплаченными (${docs})` : 'Привязать оплату');
+  done.onclick = () => withBusy(done, async () => {
+    const res = await api('POST', '/api/bank/close', { deals });
+    haptic('medium');
+    toast(res.docs
+      ? `Отмечено ${res.docs} ${plural(res.docs, 'документ', 'документа', 'документов')}`
+      : (res.partial ? 'Оплата привязана к документу' : 'Ничего не отмечено'));
+    // Через выписку закрывают сразу пачку, и про чек тут забывают вернее
+    // всего: человек ничего не выписывал, он просто прислал файл.
+    // Баннер карточки документа сюда не годится (документов много) — ведём на список чеков.
+    reset((res && res.npd) || params.npd ? 'cheques' : 'debts');
+  });
+  const skip = h('button', { class: 'btn ghost' }, 'Не сейчас');
+  skip.onclick = () => reset('debts');
+  box.append(h('div', { class: 'btn-wrap' }, done), h('div', { class: 'btn-wrap' }, skip));
+  return box;
+};
+
+screens.scan = async function scan() {
+  const box = h('div', {}, h('h1', { text: 'Снимок счёта' }));
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: 'Сфотографируйте счёт от поставщика — вытащу сумму, дату и номер и предложу '
+      + 'внести операцию. Сам файл никуда не сохраняется.' }));
+
+  const input = h('input', { type: 'file', accept: 'image/*', capture: 'environment', style: 'display:none' });
+  const pick = h('button', { class: 'btn' }, 'Выбрать снимок');
+  const result = h('div', {});
+  pick.onclick = () => input.click();
+
+  input.addEventListener('change', async () => {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    result.replaceChildren(h('div', { class: 'boot' }, h('span', { class: 'spinner' }), 'Распознаю…'));
+    try {
+      // Распознаванию нужнее разрешение, чем факсимиле, но и тело запроса
+      // ограничено двумя мегабайтами — берём с запасом.
+      const dataUrl = await shrinkImage(file, 1600, 1400 * 1024);
+      const r = await api('POST', '/api/scan', { dataUrl });
+      const f = r.fields || {};
+      result.replaceChildren(h('div', { class: 'card' },
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Сумма' }),
+          h('span', { class: 'money', text: f.amount ? money(f.amount) : 'не разобрал' })),
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Дата' }),
+          h('span', { text: f.date ? ru(f.date) : 'не разобрал' })),
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Номер' }),
+          h('span', { text: f.docNo || '—' })),
+        h('div', { class: 'row' }, h('span', { class: 'grow muted', text: 'Кто' }),
+          h('span', { class: 'ellipsis', text: (r.cp && r.cp.name) || f.name || 'не опознан' }))));
+      if (r.cp && f.amount) {
+        result.append(h('div', { class: 'btn-wrap' }, h('button', {
+          class: 'btn',
+          onclick: () => go('op', { cpId: r.cp.id, doc: f.docNo ? `Счёт № ${f.docNo}` : 'Счёт' }),
+        }, 'Внести операцию')));
+      }
+      haptic('medium');
+    } catch (e) {
+      result.replaceChildren(h('div', { class: 'banner' }, icon('warn'), h('div', { text: e.message })));
+    }
+  });
+
+  box.append(h('div', { class: 'btn-wrap' }, pick), input, result);
+  return box;
+};
+
+screens.billing = async function billing() {
+  const s = await api('GET', '/api/state');
+  const box = h('div', {}, h('h1', { text: 'Подписка' }));
+  const q = s.quota;
+
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'row' },
+      h('span', { class: `icon-box ${q.paid ? 'ok' : ''}` }, icon(q.paid ? 'check' : 'clock')),
+      h('span', { class: 'grow' },
+        h('div', { text: q.paid ? 'Подписка активна' : 'Бесплатный режим' }),
+        h('div', {
+          class: 'small muted',
+          text: q.paid
+            ? `действует до ${ru(s.access.until)}`
+            : `осталось ${q.left} из ${q.limit} в этом месяце`,
+        })))));
+
+  if (!q.paid) {
+    box.append(h('div', { class: 'section-title', text: 'Что даёт подписка' }));
+    box.append(h('div', { class: 'card' },
+      ['Документы без ограничений', 'Счета, акты, УПД, накладные, договоры и платёжки', 'Автозаполнение по ИНН и БИК', 'Поддержка в чате']
+        .map((t) => h('div', { class: 'row' }, h('span', { class: 'icon-box ok' }, icon('check')), h('span', { class: 'grow', text: t })))));
+
+    /*
+     * Цена — до кнопки, а не после перехода на оплату. Раньше её не было
+     * нигде: ни в боте, ни здесь, — и человек узнавал стоимость, только
+     * уйдя на сторонний сайт. Берётся из тарифов, по которым считается срок
+     * доступа, поэтому разойтись с реальной ценой не может.
+     */
+    /*
+     * Тарифы строками, а не фразой.
+     *
+     * Раньше здесь стояло «390 ₽ в месяц или 2990 ₽ в год» одной строкой,
+     * и справа значок выгоды. На узком экране фраза рвалась посреди числа:
+     * «2990» на одной строке, «₽ в год» на другой. Число, оторванное от
+     * знака рубля, читается как ошибка — а это цена, по ней принимают
+     * решение. Теперь у каждого срока своя строка: слева название, справа
+     * сумма, которую не разлучить переносом.
+     */
+    const list = (s.price && s.price.plans) || [];
+    if (list.length) {
+      box.append(h('div', { class: 'section-title', text: 'Сколько стоит' }));
+      box.append(h('div', { class: 'card' }, list.map((p) => {
+        const best = s.price.saving > 0 && p.days >= 350;
+        return h('div', { class: 'row' },
+          h('span', { class: 'grow' },
+            h('div', { text: p.title }),
+            best ? h('div', { class: 'small ok', text: `выгода ${money0(s.price.saving)} за год` }) : null),
+          h('span', { class: 'price money nowrap', text: money0(p.amount) }));
+      })));
+    } else if (s.price && s.price.text) {
+      // Тарифов списком нет — показываем как есть, но не выдумываем цену.
+      box.append(h('div', { class: 'card' },
+        h('div', { class: 'row' }, h('span', { class: 'grow', text: s.price.text }))));
+    }
+
+    if (s.plategaConfigured || s.payUrl) {
+      box.append(h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn',
+        onclick: async () => {
+          haptic('medium');
+          if (s.plategaConfigured) {
+            toast('Открываю оплату СБП...');
+            // Сумму не шлём: её назначает сервер по тарифу. Присланная клиентом
+            // цена — это цена, которую назначил себе плательщик.
+            const r = await api('POST', '/api/pay/create', { plan: 'month', paymentMethod: 2 });
+            if (r.ok && r.redirect) {
+              if (tg && tg.openLink) tg.openLink(r.redirect); else window.open(r.redirect, '_blank');
+              return;
+            }
+          }
+          if (s.payUrl) {
+            if (tg && tg.openLink) tg.openLink(s.payUrl); else window.open(s.payUrl, '_blank');
+          }
+        },
+      }, icon('bolt', 'icon inline'), 'Оформить подписку')));
+
+      /*
+       * «Я оплатил» прямо здесь. Раньше приложение отправляло человека
+       * обратно в чат — он платил и упирался в надпись «вернитесь в бота».
+       * Платёж не привязывается к аккаунту сам: платят из браузера, и
+       * связать оплату с человеком можно только по почте, которую он там
+       * указал.
+       */
+      const paid = field('paidmail', 'Почта, указанная при оплате', '', {
+        type: 'email', placeholder: 'vy@mail.ru',
+        hint: 'Вышлю на неё код подтверждения',
+      });
+      /*
+       * Второй шаг — код из письма.
+       *
+       * Одного адреса мало: ничьим приходит каждый платёж, и раньше знания
+       * чужой почты хватало, чтобы забрать чужую подписку. Поле кода скрыто,
+       * пока письмо не ушло, чтобы человек не гадал, что сюда вводить.
+       */
+      const codeF = field('paidcode', 'Код из письма', '', {
+        inputmode: 'numeric', placeholder: '123456',
+        hint: 'Шесть цифр, действует 30 минут',
+      });
+      const codeBox = h('div', { hidden: true }, h('div', { class: 'card' }, codeF),
+        h('div', { class: 'btn-wrap' }, h('button', {
+          class: 'btn',
+          onclick: (e) => withBusy(e.currentTarget, async () => {
+            clearErrors({ codeF });
+            const code = codeF.input.value.replace(/\D/g, '');
+            if (code.length !== 6) { showError(codeF, 'Код — шесть цифр из письма'); return; }
+            const r = await api('POST', '/api/pay/claim/confirm', { code });
+            haptic('medium');
+            toast(r.found
+              ? `Нашёл ${r.found} ${plural(r.found, 'оплату', 'оплаты', 'оплат')} — доступ до ${ru(r.until)}`
+              : `Эта оплата уже зачтена — доступ до ${ru(r.until)}`);
+            render();
+          }),
+        }, 'Подтвердить')));
+
+      const claim = h('button', { class: 'btn secondary' }, 'Я оплатил');
+      const claimBox = h('div', { hidden: true }, h('div', { class: 'card' }, paid),
+        h('div', { class: 'btn-wrap' }, h('button', {
+          class: 'btn',
+          onclick: (e) => withBusy(e.currentTarget, async () => {
+            clearErrors({ paid });
+            const mail = paid.input.value.trim();
+            if (!mail) { showError(paid, 'Без адреса платёж не найти'); return; }
+            await api('POST', '/api/pay/claim', { email: mail });
+            haptic('medium');
+            // Одинаковый ответ на «нашлась» и «не нашлась» — намеренно: иначе
+            // перебором адресов видно, кто у нас платил.
+            toast('Если оплата с этого адреса есть, код уже в письме');
+            codeBox.hidden = false;
+          }),
+        }, 'Выслать код')), codeBox);
+      claim.onclick = () => { claimBox.hidden = !claimBox.hidden; haptic(); };
+      box.append(h('div', { class: 'btn-wrap', style: 'padding-top:0' }, claim), claimBox);
+    }
+  }
+
+  // Код доступа виден всегда: по нему и открывают доступ до подключения
+  // оплаты, и продлевают уже действующую подписку.
+  box.append(h('div', { class: 'section-title', text: 'Код доступа' }));
+  const code = field('promo', 'Код', '', { placeholder: 'Введите код' });
+  code.input.autocapitalize = 'characters';
+  box.append(h('div', { class: 'card' }, code));
+  const apply = h('button', { class: 'btn secondary' }, 'Активировать');
+  apply.onclick = async () => {
+    const value = code.input.value.trim();
+    if (!value) { showError(code, 'Введите код.'); return; }
+    apply.disabled = true;
+    try {
+      const r = await api('POST', '/api/promo', { code: value });
+      haptic('medium');
+      toast(`Код принят: ${r.days} ${plural(r.days, 'день', 'дня', 'дней')} без ограничений`);
+      go('billing');
+    } catch (e) {
+      showError(code, e.message);
+    } finally {
+      apply.disabled = false;
+    }
+  };
+  box.append(h('div', { class: 'btn-wrap' }, apply));
+  box.append(h('p', {
+    class: 'small muted',
+    style: 'margin:0 16px 12px',
+    text: q.paid
+      ? 'Если есть ещё один код, дни прибавятся к оплаченным — ничего не сгорит.'
+      : 'Код выдаёт поддержка — например, на время знакомства с сервисом.',
+  }));
+
+  const billingLegal = h('div', { class: 'small muted legal-links', style: 'margin:20px 16px 12px; text-align:center; line-height:1.7;' });
+  billingLegal.innerHTML = 'Оплата означает согласие с <a href="/terms" target="_blank" style="color:var(--accent);">офертой</a> и <a href="/privacy" target="_blank" style="color:var(--accent);">политикой конфиденциальности</a>.<br>'
+    + '<a href="/tariffs" target="_blank" style="color:var(--accent);">Тарифы</a> · Поддержка: <a href="mailto:support@pervichkaru.ru" style="color:var(--accent);">support@pervichkaru.ru</a><br>'
+    + '<span style="font-family:monospace; font-size:11px; opacity:0.65;">Проверочный код: plat chek</span>';
+  box.append(billingLegal);
+
+  return box;
+};
+
+// ---------- выписка документа ----------
+
+/** Скачивание готового файла: ссылка одноразовая, живёт пять минут. */
+/*
+ * Отдать файл человеку.
+ *
+ * Обычная ссылка с download внутри Telegram не работает: встроенный браузер
+ * блокирует скачивания, которые страница начинает сама. Нажатие выглядело
+ * как «кнопка не работает» — так и было с реестром и актом сверки.
+ *
+ * Поэтому по порядку: родное окно загрузки Telegram, если оно есть; иначе
+ * открыть ссылку во внешнем браузере; и только в обычном вебе — ссылка.
+ */
+function download(file) {
+  if (!file || !file.url) return;
+  const url = file.url.startsWith('http') ? file.url : window.location.origin + file.url;
+  if (tg && typeof tg.downloadFile === 'function') {
+    try { tg.downloadFile({ url, file_name: file.name }); return; } catch (_) { /* ниже */ }
+  }
+  if (tg && typeof tg.openLink === 'function') { tg.openLink(url); return; }
+  const a = h('a', { href: url, download: file.name });
+  document.body.append(a);
+  a.click();
+  a.remove();
+}
+
+/**
+ * Отправить ссылку в Telegram — выбрать чат и переслать.
+ *
+ * openTelegramLink, а не openLink: первый открывает выбор чата внутри
+ * приложения, второй уводит в браузер, где та же ссылка просто снова
+ * попросит открыть Telegram. Если ни того, ни другого нет (открыли в
+ * обычном вебе), остаётся обычный переход.
+ */
+/**
+ * Открыть внешний адрес. Внутри Telegram — его же средствами: обычный
+ * window.open в мини-приложении открывает пустую вкладку и всё.
+ */
+function openOutside(url) {
+  if (tg && typeof tg.openLink === 'function') { tg.openLink(url); return; }
+  window.open(url, '_blank');
+}
+
+function shareToTelegram(url, text) {
+  const share = `https://t.me/share/url?url=${encodeURIComponent(url)}`
+    + `&text=${encodeURIComponent(text || '')}`;
+  haptic('medium');
+  if (tg && typeof tg.openTelegramLink === 'function') { tg.openTelegramLink(share); return; }
+  if (tg && typeof tg.openLink === 'function') { tg.openLink(share); return; }
+  window.open(share, '_blank');
+}
+
+/*
+ * ---------- счета-фактуры: аванс и корректировка ----------
+ *
+ * Отдельными экранами, а не строкой в общем мастере: у аванса нет позиций, у
+ * корректировки строки парные «было/стало». Ни то, ни другое обычной таблицей
+ * позиций не набирается.
+ */
+
+/** Счёт-фактура на полученную предоплату. */
+screens.avans = async function avansScreen(params) {
+  const s = await api('GET', '/api/state');
+  const org = s.org || {};
+  const rate = org.vat_rate ? Number(org.vat_rate) : null;
+  const box = h('div', {}, h('h1', { text: 'Счёт-фактура на аванс' }));
+
+  // Неплательщику этот документ не положен — говорим прямо, а не показываем
+  // форму, которая закончится отказом.
+  if (rate == null || Number(org.npd)) {
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+      text: Number(org.npd)
+        ? 'Самозанятый не выставляет счета-фактуры: он не плательщик НДС (422-ФЗ).'
+        : 'Счёт-фактура выставляется со ставкой НДС, а у вас выбрано «без НДС».' }));
+    box.append(h('div', { class: 'btn-wrap' },
+      h('button', { class: 'btn', onclick: () => go(Number(org.npd) ? 'npd' : 'vat') }, 'Открыть настройку')));
+    return box;
+  }
+
+  const { cps } = await api('GET', '/api/cps');
+  const cpSel = h('select', { id: 'a-cp' },
+    cps.map((c) => h('option', { value: c.id, selected: c.id === Number(params.cpId) }, c.name)));
+  const sum = field('sum', 'Получено, ₽', '', { inputmode: 'decimal', required: true,
+    hint: 'Введите сумму целиком, как пришла: налог в ней уже сидит' });
+  const payDoc = field('payDoc', 'Платёжное поручение', '', {
+    placeholder: '№ 55 от 01.09.2026',
+    hint: 'Обязательный реквизит: по нему налоговая свяжет счёт-фактуру с деньгами',
+  });
+  const subject = field('subject', 'За что', '', { placeholder: 'Монтаж по договору № 7' });
+
+  // Налог показываем сразу, пока человек печатает: ошибку видно там, где её
+  // ещё можно исправить, а не в готовом документе.
+  const calc = h('p', { class: 'small muted', style: 'margin:4px 18px' });
+  const recalc = () => {
+    const v = Number(String(sum.input.value).replace(',', '.')) || 0;
+    const vat = v > 0 ? Math.round((v * rate) / (100 + rate) * 100) / 100 : 0;
+    calc.textContent = v > 0
+      ? `Расчётная ставка ${rate}/${100 + rate}: налог ${money(vat)} из ${money(v)}`
+      : `Ставка ${rate}% — налог выделю расчётным путём, ${rate}/${100 + rate}`;
+  };
+  sum.input.oninput = recalc;
+  recalc();
+
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'field' }, h('label', { for: 'a-cp', text: 'От кого' }), cpSel),
+    sum, payDoc, subject));
+  box.append(calc);
+
+  const btn = h('button', { class: 'btn' }, 'Выписать');
+  btn.onclick = () => withBusy(btn, async () => {
+    try {
+      const r = await api('POST', '/api/doc/avans', {
+        cpId: Number(cpSel.value),
+        sum: Number(String(sum.input.value).replace(',', '.')),
+        payDoc: payDoc.input.value,
+        subject: subject.input.value,
+      });
+      haptic('heavy');
+      toast(`Выписан № ${r.doc.number}, налог ${money(r.vat)}`);
+      download(r.file);
+      go('docs');
+    } catch (e) { toast(e.message, true); }
+  });
+  box.append(h('div', { class: 'btn-wrap' }, btn));
+  return box;
+};
+
+/** Корректировочный счёт-фактура: выбрать исходный, ввести новые строки. */
+screens.ksf = async function ksfScreen(params) {
+  const box = h('div', {}, h('h1', { text: 'Корректировочный счёт-фактура' }));
+  const { docs } = await api('GET', `/api/doc/correctable?cpId=${Number(params.cpId) || 0}`);
+
+  if (!docs.length) {
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+      text: 'Корректировать нечего: по этому клиенту нет ни одного счёта-фактуры. '
+        + 'Корректировочный выставляют к уже выданному, когда стороны договорились '
+        + 'об изменении стоимости.' }));
+    return box;
+  }
+
+  // Шаг 1 — какой документ правим.
+  if (!params.baseId) {
+    box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+      text: 'К какому счёту-фактуре корректировка?' }));
+    box.append(h('div', { class: 'card' }, docs.map((d) => navRow({
+      icon: 'doc',
+      title: `№ ${d.number} от ${ru(d.date)}`,
+      sub: money(d.total),
+      onclick: () => go('ksf', { cpId: params.cpId, baseId: d.id }),
+    }))));
+    return box;
+  }
+
+  // Шаг 2 — новые значения, строка в строку.
+  const base = docs.find((d) => d.id === Number(params.baseId));
+  if (!base) { box.append(h('p', { class: 'small muted', text: 'Документ не найден.' })); return box; }
+
+  box.append(h('p', { class: 'small muted', style: 'margin:0 18px 12px',
+    text: `К счёту-фактуре № ${base.number} от ${ru(base.date)}. Укажите, что стало — `
+      + 'строки идут в том же порядке.' }));
+
+  // Идентификаторы полей — по номеру строки: в названии позиции бывают
+  // пробелы и кавычки, а из них выходит невалидный id.
+  const rows = base.items.map((it, i) => ({
+    it,
+    q: field(`ksfq${i}`, `${it.name} — количество`, it.qty, { inputmode: 'decimal' }),
+    pr: field(`ksfp${i}`, `${it.name} — цена`, it.price, { inputmode: 'decimal' }),
+  }));
+  const card = h('div', { class: 'card' });
+  for (const r of rows) {
+    card.append(h('p', { class: 'small muted', style: 'margin:10px 14px 0',
+      text: `Было: ${r.it.qty} × ${money(r.it.price)}` }));
+    card.append(r.q, r.pr);
+  }
+  box.append(card);
+
+  const reason = field('reason', 'Основание изменения', '', {
+    required: true, placeholder: 'Соглашение № 3 от 04.09.2026',
+    hint: 'Без основания корректировочный недействителен',
+  });
+  box.append(h('div', { class: 'card' }, reason));
+
+  const btn = h('button', { class: 'btn' }, 'Выписать корректировочный');
+  btn.onclick = () => withBusy(btn, async () => {
+    try {
+      const r = await api('POST', '/api/doc/ksf', {
+        baseId: base.id,
+        reason: reason.input.value,
+        lines: rows.map((x) => ({
+          name: x.it.name,
+          qty: Number(String(x.q.input.value).replace(',', '.')),
+          price: Number(String(x.pr.input.value).replace(',', '.')),
+        })),
+      });
+      haptic('heavy');
+      const up = (r.up || {}).total || 0;
+      const down = (r.down || {}).total || 0;
+      toast(up ? `Увеличение ${money(up)}` : `Уменьшение ${money(down)}`);
+      download(r.file);
+      go('docs');
+    } catch (e) { toast(e.message, true); }
+  });
+  box.append(h('div', { class: 'btn-wrap' }, btn));
+  box.append(h('p', { class: 'small muted', style: 'margin:8px 18px',
+    text: 'Увеличение попадёт в книгу продаж, уменьшение — в книгу покупок: это ваш вычет.' }));
+  return box;
+};
+
+const UNITS = ['шт.', 'усл.', 'кг', 'г', 'л', 'м', 'м²', 'м³', 'час', 'сут.', 'мес.', 'упак.', 'компл.'];
+
+screens.new = async function newDoc(params) {
+  const TITLES = {
+    sch: 'Счёт на оплату', schdog: 'Счёт-договор', usl: 'Акт об оказании услуг',
+    upd: 'УПД', torg12: 'Товарная накладная ТОРГ-12',
+  };
+  const type = TITLES[params.type] ? params.type : 'sch';
+  const [{ cps }, st] = await Promise.all([
+    api('GET', '/api/cps'),
+    api('GET', '/api/state').catch(() => ({})),
+  ]);
+  const myOrg = (st && st.org) || {};
+
+  const draft = {
+    /*
+     * Первого из списка подставляем, ТОЛЬКО если он там один.
+     *
+     * Раньше подставлялся всегда: экран, открытый без cpId, молча выбирал
+     * cps[0]. Из чата это выглядело так — бот пишет «Готовлю документ для
+     * „Заря“», а в поле «Кому» стоит совсем другая фирма, и человек этого не
+     * ждёт и не перепроверяет. Когда клиент один, выбирать не из чего;
+     * когда их несколько — пусть лучше поле будет пустым и потребует ответа.
+     */
+    cpId: Number(params.cpId) || (cps.length === 1 ? cps[0].id : 0),
+    date: params.date || todayISO(),
+    items: (params.items || []).map((it) => ({ ...it })),
+    // Ставка, названную во фразе («…с НДС 22%»), доносим до выпуска. Не
+    // передали — поля не будет вовсе, и документ возьмёт ставку организации:
+    // отсутствие ключа и null означают разное.
+    vatRate: params.vatRate,
+    priceIncludesVat: params.priceIncludesVat,
+  };
+  if (!draft.items.length) draft.items.push({ name: '', unit: 'шт.', qty: 1, price: 0 });
+
+  const box = h('div', {}, h('h1', { text: TITLES[type] }));
+
+  /*
+   * Повтор: говорим, чей это документ и что будет с номером и датой. Форма
+   * ниже обычная — поправить можно всё, а выпишется он только по кнопке.
+   */
+  if (params.fix) {
+    box.append(h('div', { class: 'banner info', id: 'fix-note' }, icon('repeat'),
+      h('div', {},
+        h('div', { text: `Исправление: ${lowerTitle(params.fix.title)} № ${params.number} от ${ru(params.date)}` }),
+        h('div', { class: 'small muted', text: 'Номер и дата остаются прежними. Прежний документ заменится, когда выпишете исправленный.' }))));
+  }
+  if (params.repeat) {
+    const rp = params.repeat;
+    box.append(h('div', { class: 'banner info', id: 'repeat-note' }, icon('repeat'),
+      h('div', {},
+        h('div', { text: `Повтор: ${lowerTitle(rp.title)} № ${rp.number} от ${ru(rp.date)}` }),
+        h('div', { class: 'small muted', text: 'Те же клиент и позиции. Номер — следующий по порядку, дата — сегодняшняя; проверьте и поправьте.' }),
+        rp.otherOrg ? h('div', { class: 'small', style: 'margin-top:6px',
+          text: `Исходный документ выписан от другой фирмы. Повтор выйдет от «${rp.orgName || 'текущей'}»; нужна прежняя — смените фирму в «Моя организация».` }) : null)));
+  }
+
+  /*
+   * От какой фирмы выписываем — надписью под заголовком, и только когда их
+   * несколько. Ошибиться организацией тут дороже всего: документ уйдёт
+   * клиенту с чужими реквизитами и чужим номером, а заметят это у него.
+   * При одной фирме строка была бы шумом на каждой выписке.
+   */
+  /*
+   * Своих реквизитов ещё нет — говорим об этом ДО формы, а не ответом на
+   * «Выписать». Документ без них не собрать: в нём печатаются название и счёт
+   * продавца. Форму при этом открытой оставляем — позиции можно набрать, они
+   * сохранятся (см. saveDraft), а кнопка ведёт прямо на реквизиты.
+   */
+  // Состояние не загрузилось (st пуст) — молчим: ложное «нет реквизитов» хуже отсутствия подсказки.
+  if (st && st.user && !st.org) {
+    box.append(h('div', { class: 'banner', id: 'need-org' }, icon('warn'),
+      h('div', {},
+        h('div', { text: 'Сначала — ваши реквизиты' }),
+        h('div', { class: 'small muted', style: 'margin-top:2px',
+          text: 'В документе печатаются ваше название и расчётный счёт. Это один раз; '
+            + 'форму можно заполнить уже сейчас — она сохранится.' }),
+        h('button', {
+          class: 'btn', style: 'margin-top:10px', id: 'need-org-go',
+          onclick: () => { haptic(); Object.assign(current().params, saveDraft()); go('org'); },
+        }, 'Заполнить реквизиты'))));
+  }
+
+  const mineOrgs = (st && st.orgs) || [];
+  if (mineOrgs.length > 1) {
+    box.append(h('div', { class: 'banner info' }, icon('receipt'),
+      h('div', {}, 'Выписываем от ', h('b', { text: myOrg.name || '—' }),
+        h('div', { class: 'small muted', text: 'Сменить фирму — в «Моя организация».' }))));
+  }
+
+  /*
+   * Форма открывается ВСЕГДА, даже когда клиентов ещё нет.
+   *
+   * Раньше здесь стоял экран-заглушка «Сначала добавьте контрагента»: человек
+   * нажимал «Выписать счёт», а попадал в справочник — то есть в работу, о
+   * которой не просил, и до счёта доходил не каждый. Клиент теперь заводится
+   * не вместо счёта, а по дороге, в том же поле «Кому».
+   *
+   * Заводится с подтверждением, а не молча. Это сознательное отступление от
+   * исходного замысла «создавать на лету»: тихо появившийся дубль «ООО Заря»
+   * рядом с «ООО «Заря»» потом расходится по документам и разъезжается в акте
+   * сверки, а найти его человек не может — он не знал, что что-то создалось.
+   */
+  const dateInput = h('input', { id: 'f-date', type: 'date', value: draft.date });
+  const cpField = h('div', { class: 'field' });
+
+  /*
+   * Основание — только у накладной и УПД: в их бланке есть такая графа.
+   * Пустое поле не ошибка: сервер ничего не передаёт, и шаблон печатает
+   * договор из карточки клиента, а без него — «Без договора». Что именно
+   * выйдет, пишем под полем, чтобы пустое поле не выглядело забытым.
+   */
+  const basisInput = ['torg12', 'upd'].includes(type)
+    ? h('input', { id: 'f-basis', autocomplete: 'off', maxlength: 200, placeholder: 'Договор № … от …', value: params.basis || '' })
+    : null;
+  const basisHint = h('div', { class: 'small muted', style: 'margin-top:4px' });
+  function drawBasisHint() {
+    if (!basisInput) return;
+    const c = known.find((x) => x.id === draft.cpId) || {};
+    basisHint.textContent = c.basis
+      ? `Оставите пустым — напечатаем запомненное для клиента: «${c.basis}»`
+      : (c.contract
+        ? `Оставите пустым — напечатаем договор из карточки: «${c.contract}»`
+        : 'Оставите пустым — напечатаем «Без договора»');
+  }
+
+  box.append(h('div', { class: 'card' }, cpField,
+    h('div', { class: 'field' }, h('label', { for: 'f-date', text: 'Дата' }), dateInput),
+    basisInput ? h('div', { class: 'field' },
+      h('label', { for: 'f-basis', text: 'Основание' }), basisInput, basisHint) : null));
+
+  // Список пополняется прямо здесь, поэтому держим свою копию: перерисовывать
+  // весь экран ради одной новой строки незачем.
+  const known = cps.slice();
+  const found = h('div', { class: 'cp-found', hidden: true });
+  const search = h('input', {
+    id: 'f-cp', autocomplete: 'off',
+    placeholder: 'Название или ИНН', 'aria-label': 'Кому выписываем',
+  });
+  const chosenName = () => (known.find((c) => c.id === draft.cpId) || {}).name || '';
+
+  function drawCp() {
+    cpField.textContent = '';
+    drawBasisHint();
+    if (draft.cpId) {
+      // Выбранного показываем строкой, а не полем: главное здесь — увидеть,
+      // ЧТО выбрано. Ошибка в получателе документа дороже лишнего нажатия.
+      const chip = h('button', { class: 'cp-chip' },
+        h('span', { class: 'grow ellipsis', text: chosenName() }),
+        h('span', { class: 'small muted nowrap', text: 'изменить' }));
+      chip.onclick = () => { haptic(); draft.cpId = 0; search.value = ''; drawCp(); };
+      cpField.append(h('label', { text: 'Кому' }), chip);
+      return;
+    }
+    cpField.append(h('label', { for: 'f-cp', text: 'Кому' }), search, found);
+  }
+
+  /** Совпадения среди своих — и по названию, и по ИНН. */
+  function matches(q) {
+    const s = q.trim().toLowerCase();
+    if (!s) return known.slice(0, 6);
+    return known.filter((c) => String(c.name || '').toLowerCase().includes(s)
+      || String(c.inn || '').includes(s)).slice(0, 6);
+  }
+
+  function pick(cp) {
+    draft.cpId = cp.id;
+    found.hidden = true;
+    haptic();
+    drawCp();
+    recalc();
+    drawChips();
+  }
+
+  let lookupTimer = 0;
+  // ИНН, которого не нашлось в реестре: человек вводит название, и клиент заводится с ним.
+  let pendingInn = '';
+
+  /*
+   * «Добавить «Ромашка»» — когда такого клиента среди своих нет.
+   *
+   * Раньше поле «Кому» на незнакомое имя отвечало молчанием: пустой список, и
+   * человек не знал, что делать дальше — идти в «Клиенты» и терять форму или
+   * искать другое написание. Теперь тут же предлагается завести клиента по
+   * одному названию. Нажатие — и есть подтверждение: тихо созданный дубль
+   * («Заря» рядом с «ООО „Заря“») потом расходится по документам, поэтому молча
+   * ничего не заводим. ИНН и адрес допишутся в карточке, когда понадобятся.
+   */
+  function addOption(q) {
+    const name = q.trim().slice(0, 200);
+    const btn = h('button', { class: 'cp-opt add', id: 'cp-add' },
+      h('span', { class: 'grow ellipsis', text: `Добавить «${name}»` }),
+      h('span', { class: 'small muted nowrap', text: pendingInn ? `ИНН ${pendingInn}` : 'новый клиент' }));
+    btn.onclick = () => withBusy(btn, async () => {
+      // Берём то, что в поле сейчас: подпись кнопки обновляется с паузой, и быстрый палец мог опередить её.
+      const made = await api('POST', '/api/cp', { name: search.value.trim().slice(0, 200) || name, inn: pendingInn, kind: 'customer' });
+      const cp = made.cp || made;
+      const row = { id: cp.id, name: cp.name || name, inn: pendingInn };
+      known.push(row);
+      pendingInn = '';
+      toast(`Добавил «${row.name}». ИНН и адрес допишите в карточке клиента, когда понадобятся.`);
+      pick(row);
+    });
+    return btn;
+  }
+
+  async function suggest() {
+    const q = search.value;
+    const digits = q.replace(/\D/g, '');
+    const list = matches(q);
+    found.textContent = '';
+    for (const c of list) {
+      const row = h('button', { class: 'cp-opt' },
+        h('span', { class: 'grow ellipsis', text: c.name }),
+        c.inn ? h('span', { class: 'small muted nowrap', text: `ИНН ${c.inn}` }) : null);
+      row.onclick = () => pick(c);
+      found.append(row);
+    }
+    if (!q.trim()) pendingInn = '';
+    // Название с буквами, которого нет среди своих (в точности), — можно добавить.
+    const typed = q.trim();
+    const exact = known.some((c) => String(c.name || '').trim().toLowerCase() === typed.toLowerCase());
+    const canAdd = typed.length >= 2 && /[A-Za-zА-Яа-яЁё]/.test(typed) && !exact;
+    if (canAdd) { found.append(addOption(typed)); found.hidden = false; }
+
+    /*
+     * ИНН — заодно способ завести клиента, не уходя с формы.
+     *
+     * Десять цифр у организации, двенадцать у ИП. Справочник спрашиваем,
+     * только когда своих совпадений нет: иначе каждый ввод тратил бы общую
+     * квоту, а человек всего лишь искал того, кто у него уже есть.
+     */
+    if ((digits.length === 10 || digits.length === 12) && !list.length) {
+      const wait = h('div', { class: 'cp-opt muted small', text: 'Ищу в реестре…' });
+      found.append(wait);
+      found.hidden = false;
+      try {
+        const r = await api('POST', '/api/lookup', { inn: digits });
+        const p = r.party;
+        wait.remove();
+        if (!p || !p.name) throw new Error('не нашлось');
+        const add = h('button', { class: 'cp-opt ok' },
+          h('span', { class: 'grow' },
+            h('div', { class: 'ellipsis', text: p.name }),
+            h('div', { class: 'small muted ellipsis',
+              text: `ИНН ${digits}${p.address ? ` · ${p.address}` : ''}` })),
+          h('span', { class: 'badge ok nowrap', text: 'в ЕГРЮЛ' }));
+        add.onclick = () => withBusy(add, async () => {
+          const made = await api('POST', '/api/cp', {
+            name: p.name, full_name: p.full_name || '', inn: digits, kpp: p.kpp || '',
+            address: p.address || '', kind: 'customer',
+          });
+          const cp = made.cp || made;
+          const row = { id: cp.id, name: cp.name || p.name, inn: digits };
+          known.push(row);
+          toast(`Добавил ${row.name}`);
+          pick(row);
+        });
+        found.append(add);
+      } catch (_) {
+        pendingInn = digits;
+        wait.textContent = 'В реестре такого ИНН нет. Впишите название клиента — добавлю его с этим ИНН.';
+      }
+      return;
+    }
+    found.hidden = !list.length && !canAdd;
+  }
+
+  search.addEventListener('input', () => {
+    draft.cpId = 0;
+    clearTimeout(lookupTimer);
+    // Пауза перед обращением в справочник: без неё десять цифр ИНН — это до
+    // десяти запросов к общей квоте вместо одного.
+    lookupTimer = setTimeout(suggest, 260);
+    recalc();
+  });
+  search.addEventListener('focus', suggest);
+  drawCp();
+
+  // --- позиции ---
+  const itemsCard = h('div', { class: 'card' });
+  const totalEl = h('span', { class: 'money', text: money(0) });
+
+  /*
+   * Ставка, по которой выйдет документ: названная во фразе — если назвали,
+   * иначе своя, из настроек организации. Ровно тот же порядок, что в
+   * lib/doc-service.js: отсутствие ключа и null означают разное.
+   */
+  const docRate = () => {
+    // Самозанятому сервер ставку обнуляет при любых настройках — и кнопка
+    // обязана считать так же, иначе обещает на налог больше, чем выйдет.
+    if (Number(myOrg.npd)) return null;
+    if (draft.vatRate !== undefined) return draft.vatRate == null ? null : Number(draft.vatRate);
+    return myOrg.vat_rate ? Number(myOrg.vat_rate) : null;
+  };
+  const docGross = () => (draft.vatRate !== undefined
+    ? Boolean(draft.priceIncludesVat) : Boolean(myOrg.vat_gross));
+
+  /*
+   * Кнопка обязана называть ту сумму, что выйдет в документе.
+   *
+   * Считалось количество на цену — и всё. При ставке «сверху» кнопка обещала
+   * «Выписать на 100 000», а счёт выходил на 122 000: человек отправлял
+   * клиенту документ на другие деньги, чем собирался, и узнавал об этом от
+   * клиента. Наценка налога — не мелочь в подписи.
+   *
+   * Складываем по позициям и округляем каждую отдельно — как это делает
+   * vatSplit в lib/money.js. Одним умножением итога вышло бы на копейку
+   * иначе, и подпись снова разошлась бы с документом.
+   */
+  function draftTotal() {
+    const rate = docRate();
+    const gross = docGross();
+    const r = rate == null ? null : decimalOf(rate);
+    let cents = 0n;
+    for (const it of draft.items) {
+      const line = lineCents(it.qty, it.price);
+      // При ценах «с НДС» налог уже внутри строки, добавлять нечего.
+      cents += r == null || gross ? line : line + divRound(line * r.m, 100n * 10n ** BigInt(r.s));
+    }
+    return Number(cents) / 100;
+  }
+
+  function recalc() {
+    const sum = draftTotal();
+    const text = money(sum);
+    /*
+     * Итог «вздрагивает», когда число поменялось. Сумма в форме — то, что
+     * человек сверяет глазами с тем, что имел в виду; живой отклик на каждую
+     * цифру показывает, что поле принято, а не зависло. Первая отрисовка и
+     * неизменная сумма не двигаются.
+     */
+    if (totalEl.textContent !== text && totalEl.dataset.ready) {
+      totalEl.classList.remove('bump');
+      void totalEl.offsetWidth;   // перезапуск анимации: без чтения вёрстки класс «слипается»
+      totalEl.classList.add('bump');
+    }
+    totalEl.dataset.ready = '1';
+    totalEl.textContent = text;
+    if (tg) {
+      // Клиент — часть готовности, а не отдельная проверка после нажатия.
+      // Активная кнопка, которая в ответ говорит «выберите, кому», обманывает.
+      // Кнопка остаётся на месте и сама говорит, чего не хватает: раньше она
+      // пряталась, и человек не понимал, почему «Выписать» исчезло.
+      const lacks = draft.cpId <= 0 ? 'Выберите, кому выписать'
+        : (!draft.items.some((it) => it.name.trim()) ? 'Добавьте позицию'
+          : (sum > 0 ? '' : 'Укажите цену'));
+      tg.MainButton.setParams({ text: lacks || `Выписать на ${money(sum)}`, is_active: !lacks });
+      tg.MainButton.show();
+    }
+  }
+
+  function itemRow(it, index) {
+    const name = h('input', {
+      class: 'name', value: it.name, placeholder: 'Наименование',
+      'aria-label': `Наименование позиции ${index + 1}`,
+    });
+    name.addEventListener('input', () => { it.name = name.value; recalc(); });
+
+    // Число, которое надо перебить, выделяется целиком при входе в поле: иначе
+    // «1» перед набором «12» превращается в «112», а «0» — в «0500».
+    const selectOnFocus = (input) => input.addEventListener('focus', () => setTimeout(() => {
+      try { input.select(); } catch (_) { /* не у всех типов полей */ }
+    }, 0));
+
+    const qty = h('input', { value: it.qty, inputmode: 'decimal', 'aria-label': 'Количество' });
+    qty.addEventListener('input', () => { it.qty = Number(qty.value.replace(',', '.')) || 0; recalc(); lineTotal(); });
+    selectOnFocus(qty);
+
+    // Единицу раньше выбрать было нельзя — всегда «шт.», хотя продают и по весу, и услугами.
+    const unitList = UNITS.includes(it.unit) || !it.unit ? UNITS : [it.unit, ...UNITS];
+    const unit = h('select', { class: 'unit', 'aria-label': 'Единица измерения' },
+      unitList.map((u) => h('option', { value: u, ...(u === (it.unit || 'шт.') ? { selected: '' } : {}) }, u)));
+    unit.addEventListener('change', () => { it.unit = unit.value; });
+
+    /*
+     * Цена 0 в пустой позиции — не ответ, а отсутствие ответа. Раньше в поле
+     * стоял настоящий «0», который приходилось стирать, и он же выглядел
+     * введённым. Теперь поле пустое, а «0» — подсказка серым. В данных ничего
+     * не меняется: пустое поле — это 0, как и было.
+     */
+    const price = h('input', { value: it.price || '', placeholder: '0', inputmode: 'decimal', 'aria-label': 'Цена' });
+    price.addEventListener('input', () => { it.price = Number(price.value.replace(',', '.')) || 0; recalc(); lineTotal(); });
+    selectOnFocus(price);
+
+    const sumEl = h('span', { class: 'line-total money' });
+    /*
+     * Позицию назвали, а цены нет — говорим об этом тут же, у строки, а не
+     * неактивной кнопкой внизу. Не красным: это ещё не ошибка, человек просто
+     * не дошёл до поля. Подсказка исчезает, как только цена появилась.
+     */
+    const need = h('div', { class: 'item-need', hidden: true, role: 'status' }, icon('warn'), h('span', { text: 'Укажите цену — без неё сумма нулевая' }));
+    // Пока название набирают, цену не требуем — человек до неё ещё не дошёл.
+    // Позиция, пришедшая уже названной (повтор, голосовой черновик), проверяется сразу.
+    let named = Boolean(it.name.trim());
+    const lineTotal = () => {
+      sumEl.textContent = money(Number(lineCents(it.qty, it.price)) / 100);
+      need.hidden = !(named && it.name.trim() && !(it.price > 0));
+    };
+    lineTotal();
+    name.addEventListener('blur', () => { named = true; lineTotal(); });
+    name.addEventListener('input', lineTotal);
+
+    const del = h('button', {
+      class: 'iconbtn danger', 'aria-label': `Убрать позицию ${index + 1}`,
+      onclick: () => {
+        draft.items.splice(index, 1);
+        if (!draft.items.length) draft.items.push({ name: '', unit: 'шт.', qty: 1, price: 0 });
+        drawItems();
+        haptic();
+      },
+    }, icon('trash'));
+
+    // Подписи видны всегда: два одинаковых поля без слов — это угадайка, где «количество», а где «цена».
+    const cap = (text, input) => h('label', { class: 'num' }, h('span', { class: 'cap', text }), input);
+    return h('div', { class: 'item' },
+      h('div', { class: 'top' }, name, del),
+      h('div', { class: 'nums' }, cap('Кол-во', qty), cap('Ед.', unit), h('span', { class: 'x', text: '×' }), cap('Цена, ₽', price)),
+      need,
+      h('div', { class: 'line-sum' }, h('span', { class: 'muted', text: 'Сумма' }), sumEl));
+  }
+
+  function drawItems() {
+    itemsCard.replaceChildren(
+      ...draft.items.map(itemRow),
+      h('div', { class: 'total-row' }, h('span', { text: 'Итого' }), totalEl),
+    );
+    recalc();
+  }
+
+  box.append(h('div', { class: 'section-title', text: 'Позиции' }));
+  box.append(itemsCard);
+  drawItems();
+
+  box.append(h('div', { class: 'btn-wrap' }, h('button', {
+    class: 'btn secondary',
+    onclick: () => { draft.items.push({ name: '', unit: 'шт.', qty: 1, price: 0 }); drawItems(); haptic(); },
+  }, 'Добавить позицию')));
+
+  /*
+   * Подсказки позиций — по клиенту и виду документа: что выписывали ЭТОМУ клиенту
+   * именно в таком документе. Общий список по всему аккаунту подсовывал на
+   * накладную позиции из чужих счетов. Перерисовывается при выборе клиента;
+   * «×» убирает подсказку.
+   */
+  const chipsBox = h('div', {});
+  let chipsAsk = 0;
+  async function drawChips() {
+    // Ответы на частую смену клиента могут прийти не по порядку: рисуем только последний.
+    const mine = ++chipsAsk;
+    let list = [];
+    try {
+      const r = await api('GET', `/api/templates?cpId=${draft.cpId || 0}&type=${encodeURIComponent(type)}`);
+      list = r.templates || [];
+    } catch (_) { list = []; }
+    if (mine !== chipsAsk) return;
+    chipsBox.textContent = '';
+    if (!list.length) return;
+    chipsBox.append(h('div', { class: 'section-title', text: draft.cpId && !list[0].global ? 'Выписывали этому клиенту' : 'Частые позиции' }));
+    // «×» — отдельная кнопка рядом, а не внутри кнопки подсказки: нажатие внутри
+    // кнопки браузер отдаёт ей самой, и убрать подсказку было невозможно.
+    chipsBox.append(h('div', { class: 'chips' }, list.map((t) => h('span', { class: 'chip-wrap', style: 'display:inline-flex;gap:2px;align-items:center' },
+      h('button', {
+        class: 'chip',
+        onclick: () => {
+          const blank = draft.items.findIndex((it) => !it.name.trim());
+          const row = { name: t.name, unit: t.unit || 'шт.', qty: 1, price: t.price };
+          if (blank >= 0) draft.items[blank] = row; else draft.items.push(row);
+          drawItems();
+          haptic();
+        },
+      }, icon('plus'), t.name),
+      h('button', {
+        class: 'chip chip-x', title: 'Убрать из подсказок', 'aria-label': `Убрать «${t.name}» из подсказок`, style: 'opacity:.75',
+        onclick: async () => {
+          await api('POST', '/api/templates/hide', { cpId: draft.cpId || 0, name: t.name, global: t.global }).catch(() => {});
+          drawChips();
+        },
+      }, '×')))));
+  }
+  box.append(chipsBox);
+  drawChips();
+
+  // Что набрано в форме — в виде параметров экрана, чтобы вернуться к ней без потерь.
+  const saveDraft = () => ({
+    items: draft.items.map((it) => ({ ...it })), cpId: draft.cpId, date: dateInput.value,
+    vatRate: draft.vatRate, priceIncludesVat: draft.priceIncludesVat,
+    basis: basisInput ? basisInput.value : params.basis,
+  });
+
+  /*
+   * Чего не хватает — показываем на самом месте, а не только всплывашкой.
+   * Всплывашка пропадает через три секунды и не говорит, куда смотреть; а
+   * отметка у поля остаётся, пока его не поправят, и экран сам подъезжает к ней.
+   */
+  cpField.input = search;
+  search.addEventListener('input', () => {
+    cpField.classList.remove('invalid');
+    cpField.querySelectorAll('.err').forEach((n) => n.remove());
+  });
+  function flagNoItems() {
+    const first = itemsCard.querySelector('.item');
+    const input = first && first.querySelector('input.name');
+    if (!first || !input) return;
+    first.classList.add('item-bad');
+    first.querySelectorAll('.err').forEach((n) => n.remove());
+    first.querySelector('.top').after(h('div', { class: 'err', role: 'alert' }, icon('warn'), h('span', { text: 'Впишите, что продаёте' })));
+    const clear = () => {
+      first.classList.remove('item-bad');
+      first.querySelectorAll('.err').forEach((n) => n.remove());
+    };
+    input.addEventListener('input', clear, { once: true });
+    first.scrollIntoView({ behavior: smooth(), block: 'center' });
+    input.focus({ preventScroll: true });
+  }
+
+  const issue = async () => {
+    const items = draft.items.filter((it) => it.name.trim());
+    if (!items.length) { toast('Добавьте хотя бы одну позицию', true); flagNoItems(); return; }
+    if (!draft.cpId) {
+      toast('Выберите, кому выписываем', true);
+      showError(cpField, 'Выберите, кому выписываем');
+      cpField.scrollIntoView({ behavior: smooth(), block: 'center' });
+      return;
+    }
+    try {
+      if (tg) tg.MainButton.showProgress();
+      const payload = { type, cpId: draft.cpId, date: dateInput.value, items };
+      if (params.replaceId) { payload.replaceId = params.replaceId; payload.number = params.number; }
+      if (basisInput && basisInput.value.trim()) payload.basis = basisInput.value.trim();
+      if (draft.vatRate !== undefined) {
+        payload.vatRate = draft.vatRate;
+        payload.priceIncludesVat = Boolean(draft.priceIncludesVat);
+      }
+      const r = await api('POST', '/api/doc', payload);
+      hapticResult(true);
+      const note = noDebtNote(type, r);
+      if (note) toast(`Документ выписан. ${note}`, false, 8000);
+      else toast(r.sentToChat ? 'Готово — файл отправлен в чат' : 'Документ выписан');
+      download(r.file);
+      await afterIssue(r.doc && r.doc.id, Boolean(r.askBiz));
+    } catch (e) {
+      if (e.payload && e.payload.reason === 'quota') { toast(e.message, true); go('billing'); return; }
+      /*
+       * Реквизитов своей организации нет — ведём их заполнять, а форму
+       * сохраняем. Раньше человек, набравший позиции, видел красную
+       * всплывашку «заполните реквизиты» и оставался с формой, из которой
+       * некуда идти; уйдя сам, он возвращался к пустой.
+       *
+       * Черновик кладём в параметры текущего экрана: «назад» из реквизитов
+       * перерисует эту форму уже с ним.
+       */
+      if (e.payload && e.payload.reason === 'org') {
+        Object.assign(current().params, saveDraft());
+        toast('Сначала заполните реквизиты — форма сохранена', true);
+        go('org');
+        return;
+      }
+      toast(e.message, true);
+    } finally {
+      if (tg) tg.MainButton.hideProgress();
+    }
+  };
+
+  const hasMainButton = Boolean(tg && tg.MainButton && tg.MainButton.setParams);
+  if (hasMainButton) {
+    tg.MainButton.offClick(issue);
+    tg.MainButton.onClick(issue);
+  } else {
+    // Запасная кнопка для старых клиентов и для открытия вне Telegram.
+    // Когда главная кнопка есть, второй такой же на экране быть не должно.
+    box.append(h('div', { class: 'btn-wrap' }, h('button', {
+      class: 'btn', onclick: (e) => withBusy(e.currentTarget, issue),
+    }, 'Выписать документ')));
+  }
+
+  return box;
+};
+
+// ---------- запуск ----------
+
+/*
+ * Назад пальцем от левого края.
+ *
+ * Так возвращаются во всех телефонах, и руке это привычнее, чем тянуться к
+ * шапке. Начало жеста ограничено полосой у края: строки списков смахиваются
+ * влево для удаления, и если ловить движение по всему экрану, одно будет
+ * мешать другому. Порог по горизонтали больше вертикального разброса —
+ * иначе прокрутка списка иногда уводила бы с экрана.
+ */
+function edgeSwipeBack() {
+  const EDGE = 28;          // откуда считаем жест краевым
+  const NEED = 70;          // сколько надо протянуть
+  let x0 = 0;
+  let y0 = 0;
+  let live = false;
+
+  document.addEventListener('touchstart', (e) => {
+    const t = e.touches[0];
+    live = t.clientX <= EDGE;
+    x0 = t.clientX;
+    y0 = t.clientY;
+  }, { passive: true });
+
+  document.addEventListener('touchmove', (e) => {
+    if (!live) return;
+    const t = e.touches[0];
+    if (Math.abs(t.clientY - y0) > Math.abs(t.clientX - x0)) live = false;   // это прокрутка
+  }, { passive: true });
+
+  document.addEventListener('touchend', (e) => {
+    if (!live) return;
+    live = false;
+    const t = e.changedTouches[0];
+    if (t.clientX - x0 >= NEED && Math.abs(t.clientY - y0) < NEED) { haptic(); back(); }
+  }, { passive: true });
+}
+
+function buildTabs() {
+  tabsBox.replaceChildren(...TABS.map((t) => h('button', {
+    class: 'tab', dataset: { name: t.name }, type: 'button',
+    onclick: () => { haptic(); reset(t.name); },
+  }, h('span', { class: 'tab-ico' }, icon(t.icon), t.name === 'crm' ? crmBadgeEl() : null),
+  h('span', { text: t.label }))));
+}
+
+// Вход для снимков экранов (miniapp-preview.js): открыть любой экран без
+// нажатий. Ничего не решает и ничего не открывает сверх того, что человек
+// и так может нажать сам, — поэтому оставлен и в рабочей сборке.
+window.__go = (name, params) => go(name, params || {});
+
+/* ---------- вход с сайта ---------- */
+
+/** Сессия кончилась посреди работы: показываем вход, а не ошибку на каждом экране. */
+function sessionLost() {
+  if (!loggedIn) return;
+  showLogin('Вход закончился — войдите снова.');
+}
+
+function hideChrome() {
+  tabsBox.hidden = true;
+  topbar.hidden = true;
+  drawer.hidden = true;
+  scrim.hidden = true;
+  document.body.classList.remove('drawer-open');
+}
+
+function showLogin(note) {
+  loggedIn = false;
+  renderSeq += 1;                 // запоздавшие ответы старого экрана не должны его затереть
+  document.body.classList.add('is-login');
+  hideChrome();
+  app.replaceChildren(loginScreen(note));
+  window.scrollTo(0, 0);
+  dropSplash();
+}
+
+/**
+ * Экран «Войти через Telegram».
+ *
+ * Пароля нет: человека узнаёт сам Telegram. Сайт получает одноразовый код,
+ * человек открывает бота по ссылке с этим кодом и выбирает там число, которое
+ * крупно показано на этом экране (так чужая ссылка, присланная вслепую, не проходит);
+ * страница каждые две секунды спрашивает, подтвердили ли, и как только
+ * подтвердили — перезагружается уже со входом.
+ *
+ * QR показываем только на широком экране: на телефоне наводить камеру
+ * на собственный экран некуда, там нужна кнопка.
+ */
+function loginScreen(note) {
+  const box = h('div', { class: 'login' });
+  const card = h('div', { class: 'login-card' });
+  box.append(card);
+  let timer = 0;
+
+  const stop = () => { clearTimeout(timer); timer = 0; };
+  const alive = () => box.isConnected;
+
+  function intro(message, isError) {
+    stop();
+    // replaceChildren сам превращает undefined в слово «undefined», поэтому пустое отсеиваем.
+    card.replaceChildren(...[
+      h('div', { class: 'login-mark', 'aria-hidden': 'true' }, icon('doc-check')),
+      h('h1', { text: 'Вход в Первичку' }),
+      message ? h('p', { class: `login-note${isError ? ' err' : ''}`, role: isError ? 'alert' : null, text: message }) : null,
+      h('p', { class: 'login-text', text: 'Пароль не нужен: вход подтверждается в Telegram. Нажмите кнопку — здесь появится число, его нужно будет выбрать в боте.' }),
+      h('div', { class: 'btn-wrap' }, h('button', {
+        class: 'btn', type: 'button', onclick: (e) => withBusy(e.currentTarget, begin),
+      }, icon('send'), 'Войти через Telegram')),
+      h('p', { class: 'small muted login-foot', text: 'Если приложение открывается у вас прямо в Telegram, входить здесь не нужно.' }),
+    ].filter(Boolean));
+  }
+
+  async function begin() {
+    let r;
+    try {
+      r = await api('POST', '/api/login/start', {}, { anon: true });
+    } catch (e) {
+      intro(e.message || 'Не получилось начать вход. Попробуйте ещё раз.', true);
+      return;
+    }
+    waiting(r);
+  }
+
+  function waiting(r) {
+    const until = Date.parse(r.expiresAt) || (Date.now() + (r.ttl || 300) * 1000);
+    const left = h('span', { class: 'login-left' });
+    card.replaceChildren(
+      h('h1', { text: 'Подтвердите вход в Telegram' }),
+      // Число видно только здесь: в ссылке и в QR его нет. Кто пришёл в бота
+      // по чужой ссылке, экрана не видел и верное число не знает.
+      h('div', { class: 'login-code', role: 'status', 'aria-label': `Нажмите в боте число ${r.code}` },
+        h('span', { class: 'login-code-lead', text: 'Нажмите в боте число' }),
+        h('span', { class: 'login-code-num', text: String(r.code) })),
+      h('p', { class: 'login-text', text: 'Откройте бота по кнопке: он покажет три числа. Эта страница откроется сама.' }),
+      h('div', { class: 'btn-wrap' }, h('a', {
+        class: 'btn', href: r.link, target: '_blank', rel: 'noopener noreferrer',
+      }, icon('send'), 'Открыть Telegram')),
+      // QR рисует сервер из нашей же ссылки, в нём только пути и квадраты.
+      h('div', { class: 'login-qr', html: r.qr }),
+      h('p', { class: 'small muted login-qr-cap', text: 'Или наведите на код камеру телефона.' }),
+      h('p', { class: 'login-wait', role: 'status' }, h('span', { class: 'spinner', 'aria-hidden': 'true' }), 'Ждём подтверждения в Telegram… ', left),
+      h('p', { class: 'small muted login-foot', text: 'Если вы ничего не нажимали на сайте — нажмите в боте «Нет». Выбирайте число только с этого экрана, даже если просят.' }),
+      h('button', { class: 'btn secondary', type: 'button', onclick: () => intro() }, 'Отмена'));
+
+    const paintLeft = () => {
+      const secs = Math.max(0, Math.round((until - Date.now()) / 1000));
+      left.textContent = `(осталось ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')})`;
+      return secs;
+    };
+    paintLeft();
+    const tick = async () => {
+      if (!alive()) return;
+      if (paintLeft() <= 0) { intro('Время вышло. Начните вход заново.', true); return; }
+      try {
+        const st = await api('POST', '/api/login/check', { nonce: r.nonce }, { anon: true });
+        if (!alive()) return;
+        if (st.status === 'ok') {
+          // Cookie уже стоит. Перезагрузка — самый простой способ начать
+          // приложение с чистого листа уже как вошедший.
+          location.reload();
+          return;
+        }
+        if (st.status === 'denied') { intro('Вход отклонён в Telegram. Если это были вы — начните заново.', true); return; }
+        if (st.status === 'expired') { intro('Время вышло. Начните вход заново.', true); return; }
+      } catch (e) {
+        if (!alive()) return;
+        // 404 — такого входа уже нет. Остальное (429, обрыв сети) — просто ждём дальше.
+        if (e.status === 404) { intro('Этот вход уже не действует. Начните заново.', true); return; }
+      }
+      timer = setTimeout(tick, 2000);
+    };
+    timer = setTimeout(tick, 2000);
+  }
+
+  intro(note, Boolean(note));
+  return box;
+}
+
+function start() {
+  buildTabs();
+
+  if (WEB) {
+    // Обычный браузер. Спрашиваем сервер, помнит ли он нас: да — рисуем
+    // приложение, нет (401) — вход. buildChrome после ответа, а не до: в шапке
+    // имя человека, а оно приходит с сервера.
+    api('GET', '/api/state', null, { anon: true }).then((st) => {
+      cache = st;
+      loggedIn = true;
+      buildChrome();
+      render();
+    }).catch((e) => {
+      if (e.status === 401) { showLogin(); return; }
+      hideChrome();
+      app.replaceChildren(h('div', { class: 'empty' },
+        h('div', { class: 'icon-box warn' }, icon('warn')),
+        h('h2', { text: 'Не получилось загрузить' }),
+        h('p', { class: 'small', text: e.message }),
+        h('div', { class: 'btn-wrap' }, h('button', { class: 'btn secondary', onclick: () => location.reload() }, 'Повторить'))));
+      dropSplash();
+    });
+    return;
+  }
+
+  buildChrome();
+  tg.ready();
+  tg.expand();
+  tg.BackButton.onClick(back);
+  edgeSwipeBack();
+  if (tg.setHeaderColor) { try { tg.setHeaderColor('secondary_bg_color'); } catch (_) { /* старый клиент */ } }
+  if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); // чтобы список не закрывал окно
+
+  render();
+}
+
+start();

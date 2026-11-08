@@ -1,0 +1,36 @@
+# Ruflo local secrets and runtime data
+.env
+.env.local
+.env.*.local
+.claude-flow/data/
+.claude-flow/logs/
+.claude-flow/sessions/
+
+# Базы роя. Их создаёт ruflo при первом запуске у каждого на своей машине:
+# это локальная память агентов, а не исходники. В git от них только
+# конфликты — файлы двоичные и по паре мегабайт.
+.swarm/
+ruvector.db
+
+# Состояние роя на конкретной машине: id запущенного роя, счётчики воркеров,
+# метрики, путь к npx-кэшу. Меняется при каждом запуске и у каждого своё —
+# в репозитории от этого только конфликты. Общая настройка роя лежит рядом,
+# в .claude-flow/config.yaml, и она в git остаётся.
+.claude-flow/daemon-state.json
+# pid живущего процесса: появляется сам при любой команде ruflo, потому что
+# она поднимает фоновый демон, и исчезает при его остановке.
+.claude-flow/daemon.pid
+.claude-flow/harness-active-policy.json
+.claude-flow/memory-package.json
+.claude-flow/metrics/
+.claude-flow/policy/
+.claude-flow/security/
+.claude-flow/swarm/
+# Сюда пишет замеры проверка здоровья роя (system_health) — тот же род, что metrics/.
+.claude-flow/system/
+
+# Отдельные рабочие копии агентов. Каждому пишущему агенту рой выдаёт свой
+# worktree — полный checkout проекта рядом с основным. Это черновик на время
+# одной задачи: агент, проверяющий тесты мутациями, специально ломает в нём
+# код, и такая копия в git означала бы заведомо испорченный проект в истории.
+.claude/worktrees/

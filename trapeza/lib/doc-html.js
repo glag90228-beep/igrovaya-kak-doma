@@ -1,0 +1,344 @@
+'use strict';
+
+// Общая обёртка и стиль для документов-PDF «Трапезы» (акт услуг, счёт, платёжка).
+// Палитра бренда, официальный сдержанный вид, печать под А4.
+
+const { formatMoney, formatPrice, formatRub, amountInWords } = require('./money');
+
+/*
+ * Кавычки экранируются наравне с угловыми скобками.
+ *
+ * Сейчас пользовательские данные в атрибуты нигде не подставляются, и без
+ * кавычек всё работало. Но при недоступном Chromium документ отдаётся как
+ * text/html и открывается inline на том же домене, что и мини-приложение
+ * (lib/doc-service.js, miniapp.js). Значит первая же будущая строка вида
+ * title="${esc(x)}" стала бы дырой на origin приложения. Дешевле закрыть
+ * заранее, чем помнить об этом при каждой правке бланка.
+ */
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
+  ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+
+/** ISO yyyy-mm-dd → dd.mm.yyyy; иначе как есть */
+function ru(iso) {
+  if (!iso) return '';
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso));
+  return m ? `${m[3]}.${m[2]}.${m[1]}` : String(iso);
+}
+
+/*
+ * Период акта сверки словами. У клиента без даты начала расчётов (акт «за всё
+ * время») раньше выходило «за период: – 18.10.2026» и «Сальдо начальное на »
+ * с пустым местом: контрагент подписывает бумагу, где не сказано, с какого
+ * дня считать. Теперь прямо пишем «с начала расчётов».
+ */
+function periodLabel(from, to) {
+  return from ? `${ru(from)} — ${ru(to)}` : `с начала расчётов по ${ru(to)}`;
+}
+/** «Сальдо начальное» + «на 01.01.2026» или «(на начало расчётов)». */
+function openingLabel(date) {
+  return date ? `Сальдо начальное на ${ru(date)}` : 'Сальдо начальное (на начало расчётов)';
+}
+
+const CSS = `
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: Arial, "DejaVu Sans", sans-serif; color: #14171f; font-size: 12px; line-height: 1.4; }
+  /* position: relative нужен штампам ниже — они висят поверх бланка. */
+  .doc { padding: 4px 2px; position: relative; }
+  h1 { font-size: 20px; color: #1f2760; margin: 0 0 2px; }
+  h1.center, .center { text-align: center; }
+  .muted { color: #5a6172; }
+  .small { font-size: 10.5px; }
+  .brand { font-size: 15px; font-weight: bold; color: #2e3a8c; }
+  .rule { height: 2px; background: #2e3a8c; margin: 8px 0 12px; border: 0; }
+  table { border-collapse: collapse; width: 100%; }
+  .items { margin: 10px 0; font-size: 11.5px; }
+  .items th { background: #2e3a8c; color: #fff; font-weight: bold; padding: 6px 7px; border: 1px solid #2e3a8c; text-align: center; }
+  .items td { border: 1px solid #c3c9dc; padding: 6px 7px; vertical-align: top; }
+  .items tbody tr:nth-child(even) td { background: #f4f6fc; }
+  .r { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .c { text-align: center; }
+  .b { font-weight: bold; }
+  .total td { background: #e3e8f8; font-weight: bold; }
+  .reqs { width: 100%; margin: 6px 0; }
+  .reqs td { border: 1px solid #c3c9dc; padding: 6px 8px; vertical-align: top; }
+  .reqs .k { background: #f4f6fc; font-weight: bold; width: 26%; }
+  .two { display: flex; gap: 24px; justify-content: space-between; margin-top: 8px; }
+  .two > div { flex: 1; }
+  .sign { margin-top: 34px; display: flex; justify-content: space-between; gap: 30px; }
+  .sign .line { border-top: 1px solid #333; margin-top: 26px; padding-top: 3px; font-size: 10.5px; }
+  .note { font-size: 10.5px; color: #4a5162; margin-top: 10px; }
+  .box { border: 1px solid #333; }
+  /* Итог и платёжный QR стоят рядом: код не уводит подписи на второй лист. */
+  .pay { display: flex; gap: 18px; align-items: flex-start; margin-top: 10px; }
+  .pay__text { flex: 1; }
+  .pay__text p:first-child { margin-top: 0; }
+  .pay__qr { width: 150px; text-align: center; border: 1px solid #c3c9dc;
+             border-radius: 4px; padding: 8px 8px 6px; background: #fff; }
+  .pay__qr svg { display: block; width: 100%; height: auto; }
+  .pay__cap { font-size: 10px; margin-top: 4px; font-weight: bold; line-height: 1.25; }
+  .pay__cap .muted { font-weight: normal; }
+
+  /* Факсимиле: подпись и печать над линией подписи.
+     Блок нулевой высоты — картинки висят поверх и не двигают вёрстку.
+     mix-blend-mode: multiply убирает белый фон снимка: подпись почти
+     всегда сфотографирована с листа, вырезать фон в проекте нечем, а
+     умножение делает белое невидимым и оставляет тёмные штрихи. */
+  .fx-box { position: relative; display: block; height: 0; }
+  .fx { position: absolute; mix-blend-mode: multiply; pointer-events: none; }
+  .fx-sign { left: 10px; bottom: -10px; height: 54px; width: auto;
+             filter: contrast(1.35) saturate(.85); }
+  /* Печать — у правого конца линии подписи и большей частью ниже неё.
+     Это единственное место, свободное во всех наших бланках: слева на
+     линии стоит подпись, сверху название графы, снизу расшифровка — а
+     правый конец линии пуст везде. 108px ≈ 28 мм, как печать ИП. */
+  .fx-stamp { right: 12px; bottom: -62px; height: 108px; width: auto;
+              opacity: .85; filter: contrast(1.1); }
+  /* ТОРГ-12 и блок передачи УПД плотнее: там под линией сразу следующая
+     графа, поэтому печать меньше и прижата ближе к линии. */
+  .fx-stamp--tight { height: 78px; bottom: -46px; right: 8px; }
+  /* Штампы «Оплачено» и «Копия» — оттиск в правом нижнем углу бланка.
+     Наклон и полупрозрачность не украшение: живой штамп ложится криво и
+     просвечивает бумагу под собой, а ровный непрозрачный прямоугольник
+     читается как часть бланка, а не как отметка поверх него.
+
+     Под штампы отводится место внизу листа (.has-stamps), и вот почему.
+     У правого конца линии подписи висит факсимильная печать (.fx-stamp) —
+     она уходит на 62px ниже линии, то есть ровно туда, где иначе оказался
+     бы штамп. Наложить синее «ОПЛАЧЕНО» на оттиск печати — испортить оба.
+     Поэтому штамп встаёт под подписями, а не поверх них. */
+  .doc.has-stamps { padding-bottom: 156px; }
+  .stamps { position: absolute; right: 0; bottom: 6px; display: flex;
+            flex-direction: column; align-items: flex-end; gap: 8px; }
+  .stamp { border: 2px solid currentColor; border-radius: 3px;
+           padding: 3px 12px 4px; text-align: center; opacity: .8;
+           transform: rotate(-7deg); }
+  .stamp b { display: block; font-size: 16px; letter-spacing: .09em; }
+  .stamp i { display: block; font-style: normal; font-weight: bold;
+             font-size: 10px; letter-spacing: .04em; margin-top: 1px; }
+  .stamp--paid { color: #1b56b4; }
+  .stamp--copy { color: #6a7185; }
+  @media print {
+    .fx, .stamp { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  }
+`;
+
+/**
+ * Разметка факсимиле над линией подписи. Живёт здесь, а не в facsimile.js,
+ * чтобы шаблоны документов оставались чистыми: они получают готовые
+ * картинки в org.fx и ничего не знают про базу.
+ *
+ * @param {{sign?:string, stamp?:string}} fx data-URI картинок
+ * @param {{stamp?:boolean, tight?:boolean}} opts печать ставим один раз на
+ *        документ — у подписи руководителя, а не в каждой строке подписей;
+ *        tight — для бланков, где над линией подписи почти нет места
+ */
+function fxHtml(fx, opts = {}) {
+  if (!fx || (!fx.sign && !fx.stamp)) return '';
+  const parts = [];
+  if (fx.sign) parts.push(`<img class="fx fx-sign" src="${fx.sign}" alt="">`);
+  if (fx.stamp && opts.stamp) {
+    const cls = `fx fx-stamp${opts.tight ? ' fx-stamp--tight' : ''}`;
+    parts.push(`<img class="${cls}" src="${fx.stamp}" alt="">`);
+  }
+  return parts.length ? `<span class="fx-box">${parts.join('')}</span>` : '';
+}
+
+/**
+ * Штампы «Оплачено» и «Копия».
+ *
+ * Зачем. Счёт, по которому деньги пришли, и счёт, который ждёт оплаты, —
+ * это два разных документа для того, кто держит их в руках. В базе отметка
+ * об оплате есть (documents.paid_at), но в файле её не было видно, и
+ * бухгалтерия покупателя, получив копию, снова шла спрашивать, оплачено или
+ * нет. Штамп отвечает на этот вопрос с одного взгляда.
+ *
+ * Дата в штампе — та самая, что стоит в базе, а не «сегодня». Штамп с
+ * произвольной датой был бы выдумкой в документе, который уходит наружу.
+ *
+ * @param {{paid?:boolean, paidAt?:string, copy?:boolean}} stamp
+ */
+function stampsHtml(stamp) {
+  if (!stamp) return '';
+  const out = [];
+  if (stamp.paid) {
+    const when = ru(stamp.paidAt || '');
+    out.push('<span class="stamp stamp--paid"><b>ОПЛАЧЕНО</b>'
+      + (when ? `<i>${esc(when)}</i>` : '') + '</span>');
+  }
+  if (stamp.copy) out.push('<span class="stamp stamp--copy"><b>КОПИЯ</b></span>');
+  return out.length ? `<div class="stamps">${out.join('')}</div>` : '';
+}
+
+/**
+ * Вклеивает штампы в собранный бланк.
+ *
+ * Отдельной функцией, а не параметром page(), намеренно: шаблонов документов
+ * семь, и каждому пришлось бы тащить через себя поле, к содержанию документа
+ * отношения не имеющее. Штамп — это то, что делают с готовой бумагой, вот и
+ * в коде он накладывается на готовый HTML.
+ */
+function withStamps(html, stamp) {
+  const mark = stampsHtml(stamp);
+  if (!mark) return html;
+  return html.replace('<div class="doc">', `<div class="doc has-stamps">${mark}`);
+}
+
+/**
+ * Индивидуальный предприниматель это или организация.
+ *
+ * Определяем по длине ИНН: у физлица и ИП он двенадцатизначный, у
+ * организации — десятизначный. Отдельного поля не заводим, потому что ИНН
+ * есть всегда и подделать его длину случайно нельзя, а лишняя галочка в
+ * анкете — это ещё один вопрос, на который человек ответит наугад.
+ */
+const isIp = (org) => String((org && org.inn) || '').replace(/\D/g, '').length === 12;
+
+/**
+ * Самозанятый — физическое лицо без статуса ИП.
+ *
+ * ИНН у него двенадцатизначный, как и у ИП, поэтому isIp принимает его за
+ * предпринимателя. Различить их можно только по названию: плательщик НПД
+ * бывает и ИП (тогда в названии «ИП …»), и просто гражданином. Подпись
+ * «Индивидуальный предприниматель» у гражданина — должность, которой у него
+ * нет, а спор подсуден не арбитражному суду.
+ *
+ * ИП узнаём по ОГРНИП или по слову «ИП» в начале названия. Не нашли — подпись
+ * «Исполнитель»: она нейтральна и верна в обоих случаях, тогда как «ИП» у
+ * гражданина — ложное звание.
+ */
+const isSelfEmployed = (org) => Boolean(org && Number(org.npd)) && !String(org.ogrnip || '').trim()
+  // \b в JS знает только латиницу, поэтому «ИП» отделяем от «Ипатов» проверкой следующей буквы.
+  && ![org.full_name, org.name].some((n) => /^\s*(ип(?![а-яё])|индивидуальн)/i.test(String(n || '')));
+
+/**
+ * Пометка про налог в счёте, акте и счёте-договоре самозанятого.
+ *
+ * В накладной и УПД есть usnNote с полной ссылкой на закон, а счёт и акт
+ * ограничивались строкой «Без налога (НДС): —», из которой покупатель не
+ * поймёт, почему налога нет. Бухгалтерия клиента НДС к вычету не примет и
+ * спросит основание: отвечаем в самом документе. Ссылку на статью здесь не
+ * даём — достаточно названия режима, ошибиться в номере нормы дороже.
+ */
+function npdNote(org) {
+  if (!org || !Number(org.npd)) return '';
+  return '<p class="note b">Без НДС, применяется НПД (налог на профессиональный доход).</p>';
+}
+
+/** «арбитражном суде» — для организаций и ИП; у гражданина спор уходит в суд общей юрисдикции. */
+const courtOf = (org) => (isSelfEmployed(org) ? 'суде' : 'арбитражном суде');
+
+/**
+ * Подписи под документом.
+ *
+ * У ИП нет ни руководителя, ни главного бухгалтера: он подписывает сам за
+ * себя. Печатать «Руководитель И.Н. Сарычев» под счётом предпринимателя —
+ * это должность, которой у него нет, и такой счёт бухгалтерия покупателя
+ * законно возвращает на переделку. Организация подписывает двумя строками:
+ * руководитель и бухгалтер.
+ *
+ * @param {object} org организация из базы (нужны inn и signer)
+ * @param {Function} fx готовая разметка факсимиле — передаём снаружи, чтобы
+ *        модуль не решал за шаблон, где ставить печать
+ */
+function signRows(org, fx = () => '') {
+  const who = esc((org && org.signer) || '');
+  // Самозанятый без статуса ИП — не предприниматель и не организация:
+  // одна строка «Исполнитель», без руководителя и бухгалтера.
+  if (isSelfEmployed(org)) {
+    return [{ title: 'Исполнитель', html: `${fx({ stamp: true })}${who}` }];
+  }
+  if (isIp(org)) {
+    // Одна подпись — и она же с печатью, если печать загружена.
+    return [{ title: 'Индивидуальный предприниматель', html: `${fx({ stamp: true })}${who}` }];
+  }
+  /*
+   * Строка бухгалтера — пустая, под подпись от руки.
+   *
+   * Сюда печатались имя и факсимиле руководителя: документ утверждал, что
+   * бухгалтером расписался директор. Так бывает (ст. 7 402-ФЗ разрешает
+   * руководителю вести учёт самому), но знать этого мы не можем — графы
+   * «главный бухгалтер» у организации нет. Пустая строка честнее: кто
+   * подписывает, тот и распишется.
+   */
+  return [
+    { title: 'Руководитель', html: `${fx({ stamp: true })}${who}` },
+    { title: 'Бухгалтер', html: '' },
+  ];
+}
+
+/**
+ * Оговорка «поставщик НДС не платит».
+ *
+ * Печаталась в накладной и в УПД безусловно. Для плательщика НДС это прямая
+ * неправда в документе, который уходит покупателю: его бухгалтерия по такой
+ * строке не примет налог к вычету, а при проверке расхождение документа с
+ * налоговым режимом объяснять придётся продавцу.
+ *
+ * Режим при этом называем только когда знаем его.
+ *
+ * Раньше любому неплательщику печаталось «применяет упрощённую систему
+ * (гл. 26.2 НК РФ)». Но экран «НДС» в самом приложении честно пишет, что
+ * «Без НДС» — это «упрощёнка до 20 млн, патент, самозанятость», то есть три
+ * разных режима. Самозанятому такая строка приписывала чужую главу кодекса —
+ * при том, что про НПД мы знаем точно, галочка стоит отдельно. Патентщику —
+ * тем более: его режим гл. 26.5, и УСН он может не применять вовсе.
+ *
+ * Документ уходит контрагенту и живёт у него в учёте, поэтому пишем в нём
+ * только то, за что можем ответить: НПД называем прямо, в остальных случаях
+ * сообщаем сам факт — налог не предъявляется.
+ *
+ * @param {object} org организация (смотрим vat_rate и npd)
+ * @param {string} tail что дописать, если оговорка уместна
+ */
+function usnNote(org, tail = '') {
+  const raw = org && org.vat_rate;
+  // Самозанятый не плательщик НДС при любой ставке в настройках.
+  const payer = !(raw === '' || raw == null) && Number.isFinite(Number(raw)) && !Number(org.npd);
+  if (payer) return '';
+  const add = tail ? ` ${esc(tail)}` : '';
+  if (org && Number(org.npd)) {
+    return `<p class="note">Поставщик применяет специальный налоговый режим «Налог на
+       профессиональный доход» и не является плательщиком НДС
+       (ч. 9 ст. 2 Федерального закона от 27.11.2018 № 422-ФЗ).${add}</p>`;
+  }
+  return `<p class="note">Поставщик не является плательщиком НДС, налог покупателю
+     не предъявляется.${add}</p>`;
+}
+
+/**
+ * Город для шапки договора и акта — из адреса организации.
+ *
+ * Отдельной графы «город» у организации нет, и шаблоны подставляли
+ * «Ижевск» всем: московское ООО подписывало договор, «заключённый в
+ * Ижевске». Место заключения — условие договора (ст. 444 ГК), выдумывать
+ * его нельзя. Берём из адреса: «г. Москва», «г Ижевск» (так пишет ФНС),
+ * город федерального значения без «г.». Не нашли — пусто, и шаблон
+ * печатает одну дату.
+ */
+function cityOf(org) {
+  if (org && String(org.city || '').trim()) return String(org.city).trim();
+  const addr = String((org && org.address) || '');
+  const m = /(?:^|[\s,])(?:г\.|г|город)\s+([^,\d]+)/u.exec(addr);
+  if (m && m[1].trim()) return m[1].trim();
+  const fed = /(Москва|Санкт-Петербург|Севастополь)/u.exec(addr);
+  return fed ? fed[1] : '';
+}
+
+/** «г. Москва · 01.09.2026» или просто дата, если город неизвестен. */
+function placeDate(org, iso) {
+  const city = cityOf(org);
+  return `${city ? `г. ${esc(city)} · ` : ''}${ru(iso)}`;
+}
+
+function page(title, body) {
+  return `<!doctype html><html lang="ru"><head><meta charset="utf-8">`
+    + `<title>${esc(title)}</title><style>${CSS}</style></head>`
+    + `<body><div class="doc">${body}</div></body></html>`;
+}
+
+module.exports = {
+  esc, ru, periodLabel, openingLabel, page, fxHtml, stampsHtml, withStamps, isIp, isSelfEmployed, npdNote, courtOf, signRows, usnNote, cityOf, placeDate,
+  formatMoney, formatPrice, formatRub, amountInWords,
+};
