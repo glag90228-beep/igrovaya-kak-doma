@@ -114,6 +114,18 @@
   --wait: #9a5f05;
   --money-out: #e5484d;
   --success: #0f9d58;
+  /*
+   * Те же зелёный и красный, но для МЕЛКОГО текста на светлом фоне.
+   *
+   * Фирменные #0f9d58 и #e5484d дают 3,5:1 и 3,9:1 — для крупных сумм (3:1)
+   * этого хватает, а для строки «+5 000 ₽», бейджа «в ЕГРЮЛ» и пометки «ИНН
+   * верный» мелким шрифтом нужно 4,5:1. Тон тот же, только темнее на пятую
+   * часть: 5,4:1 и 5,9:1. В тёмной теме исходные цвета и так светлые — там
+   * значения те же, что у основных.
+   */
+  --money-in-ink: color-mix(in srgb, var(--money-in) 78%, #000);
+  --money-out-ink: color-mix(in srgb, var(--money-out) 78%, #000);
+  --success-ink: color-mix(in srgb, var(--success) 78%, #000);
 
   --border: color-mix(in srgb, var(--muted) 20%, transparent);
   --hairline: color-mix(in srgb, var(--muted) 14%, transparent);
@@ -174,6 +186,9 @@
     --wait: #f5a524;
     --money-out: #ff6369;
     --success: #35d07f;
+    --money-in-ink: var(--money-in);
+    --money-out-ink: var(--money-out);
+    --success-ink: var(--success);
     --shadow-1: none;
     --shadow-2: none;
 
@@ -263,8 +278,11 @@ h2 { font: 600 17px/1.35 var(--font); margin: 0 0 2px; }
 .nowrap { white-space: nowrap; }
 /* Знак денег в списках: зелёное — нам, красное — мы. Те же два цвета, что
    в сводке на главной, иначе пришлось бы каждый раз читать заголовок. */
-.money.in { color: var(--money-in); font-weight: 600; }
-.money.out { color: var(--money-out); font-weight: 600; }
+.money.in { color: var(--money-in-ink); font-weight: 600; }
+.money.out { color: var(--money-out-ink); font-weight: 600; }
+/* Крупная сумма держит фирменный тон: на 44 px 3:1 достаточно, а яркость нужна. */
+.hero .sum.money.in { color: var(--money-in); }
+.hero .sum.money.out { color: var(--money-out); }
 
 /* ---------- секции-карточки (идиома Telegram/iOS) ---------- */
 
@@ -796,7 +814,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   background: var(--group); color: var(--muted);
   white-space: nowrap;
 }
-.badge.ok { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success); }
+.badge.ok { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success-ink); }
 .badge.warn { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
 
 /* Текст напоминания правят перед отправкой, поэтому поле сразу высокое:
@@ -857,7 +875,7 @@ svg.icon { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap:
   background: var(--group); color: var(--muted);
   font: 700 16px/1 var(--font-num);
 }
-.step-n.ok { background: color-mix(in srgb, var(--money-in) 16%, transparent); color: var(--money-in); }
+.step-n.ok { background: color-mix(in srgb, var(--money-in) 16%, transparent); color: var(--money-in-ink); }
 .step.now .step-n { background: var(--primary); color: var(--on-primary); }
 .step.part .step-n { background: color-mix(in srgb, var(--wait) 20%, transparent); color: var(--wait); }
 .step.now .grow > div:first-child { font-weight: 700; }
@@ -1119,7 +1137,7 @@ body.drawer-open { overflow: hidden; }
 /* Цена в строке тарифа: крупнее обычного текста, но не как сальдо —
    выбирают между двумя числами, и их надо сравнить одним взглядом. */
 .price { font: 700 19px/1.2 var(--font); letter-spacing: -.02em; }
-.small.ok { color: var(--money-in); }
+.small.ok { color: var(--money-in-ink); }
 
 /* ---------- переписка с агентом ---------- */
 
@@ -1419,7 +1437,7 @@ body.drawer-open { overflow: hidden; }
   animation: live-in .22s ease-out;
 }
 .live-msg .icon { width: 16px; height: 16px; flex: none; margin-top: 1px; }
-.field[data-live="ok"] .live-msg { color: var(--success); }
+.field[data-live="ok"] .live-msg { color: var(--success-ink); }
 .field[data-live="ok"] .live-msg .icon { animation: live-pop .38s cubic-bezier(.3, 1.6, .5, 1); }
 .field[data-live="bad"] .live-msg { color: var(--danger); }
 .field[data-live="bad"] .live-msg .icon { animation: live-shake .34s ease-out; }
